@@ -11,6 +11,8 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("application.h");
         fn run_application() -> i32;
+        fn rendered_frames() -> u64;
+        fn request_probe(nonce: u64);
         fn request_frame(token: i32);
         fn exit_application();
         fn resume_for_show();
@@ -31,6 +33,15 @@ pub mod ffi {
         fn dispatch(self: Pin<&mut BenchBridge>, request: QString);
         #[qinvokable]
         fn request_frame(self: Pin<&mut BenchBridge>, token: i32);
+        #[qinvokable]
+        fn finish_probe(
+            self: Pin<&mut BenchBridge>,
+            nonce: QString,
+            created: i32,
+            live: i32,
+            visible: i32,
+            scroll: i32,
+        );
         #[qinvokable]
         fn finish(
             self: Pin<&mut BenchBridge>,

@@ -52,3 +52,25 @@ Hide/Show дают hidden/shown report, scroll — frame с индексом. Qu
 320 px, footer 40 px. Строка: country 30 px, name/host раздельно 14 px, latency,
 кнопка избранного; внутренние отступы 12 px, gap 14 px. Различия нативных
 виджетов фиксируются как ограничение; состав и viewport должны совпадать.
+
+## Пассивный native counter (benchmark-only)
+
+`Command::Probe{nonce:u64}` / `Event::Probe{nonce:u64}` не меняет Model,
+revision или snapshot, не требует кадра и обрабатывается GUI thread до очереди
+ожидающих frame событий, включая hidden. Quit завершает actor/GUI loop и
+отменяет оставшуюся работу. Невалидный nonce (тип, диапазон, неизвестные поля)
+отклоняется тем же bounded input parser, что остальные команды.
+
+`report_probe(toolkit,nonce,rendered_frames,snapshot,created_total,alive_rows,
+visible_rows,scroll_index)` пишет legacy state report с event=`probe` плюс
+ровно два поля `nonce` и `rendered_frames`. Legacy `report(...)` и его 14 полей
+не меняются. Счётчик u64 монотонный; насыщение в u64::MAX — необратимый invalid
+sentinel, report_probe возвращает ошибку вместо валидного report.
+
+Определения различаются: Qt считает каждый QQuickWindow::frameSwapped; Slint —
+каждый RenderingState::AfterRendering до проверки pending ack; GTK — каждый
+GdkFrameClock::after-paint постоянным observer. GTK paint cycle не равен
+presentation. Observer не ставит tick/timer, не request_phase/update/queue_draw.
+GTK одноразовый frame_report по-прежнему запрашивает кадр для legacy ack;
+пассивный observer этого не делает. Probe сам не изменяет UI/модель и не
+инициирует redraw. Native callback не доказывает физическую видимость пикселей.

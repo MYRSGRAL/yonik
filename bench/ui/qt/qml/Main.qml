@@ -42,7 +42,8 @@ ApplicationWindow {
         servers.forceLayout()
         bridge.request_frame(pendingToken)
     }
-    function report(event) {
+    function probe(nonce) { report("probe", nonce) }
+    function report(event, nonce) {
         let live = 0
         let visibleRows = 0
         for (let key in delegates) {
@@ -53,7 +54,10 @@ ApplicationWindow {
             if (root.visible && item.visible && point.y < servers.height && point.y + item.height > 0)
                 ++visibleRows
         }
-        bridge.finish(event, createdTotal, live, visibleRows, scrollIndex)
+        if (event === "probe")
+            bridge.finish_probe(nonce, createdTotal, live, visibleRows, scrollIndex)
+        else
+            bridge.finish(event, createdTotal, live, visibleRows, scrollIndex)
     }
     // Вызывается C++ только в GUI thread после frameSwapped нужного token.
     function acknowledgeFrame(token) {

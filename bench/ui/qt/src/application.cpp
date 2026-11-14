@@ -12,6 +12,15 @@ namespace {
 QQuickWindow* window = nullptr;
 std::atomic<std::int32_t> requested{0};
 std::int32_t synchronizedToken = 0;
+std::atomic<std::uint64_t> frames{0};
+}
+
+std::uint64_t rendered_frames() { return frames.load(std::memory_order_acquire); }
+
+void request_probe(std::uint64_t nonce)
+{
+    if (window) QMetaObject::invokeMethod(window, "probe", Qt::DirectConnection,
+        Q_ARG(QVariant, QVariant(QString::number(nonce))));
 }
 
 void request_frame(std::int32_t token)
@@ -52,6 +61,8 @@ int run_application()
         synchronizedToken = requested.load(std::memory_order_acquire);
     }, Qt::DirectConnection);
     QObject::connect(window, &QQuickWindow::frameSwapped, window, [quick = window] {
+        const auto count = frames.load(std::memory_order_relaxed);
+        frames.store(count == UINT64_MAX ? count : count + 1, std::memory_order_release);
         const auto token = synchronizedToken;
         QMetaObject::invokeMethod(quick, "acknowledgeFrame", Qt::QueuedConnection,
                                   Q_ARG(QVariant, QVariant(token)));

@@ -51,6 +51,9 @@ pub enum Command {
     Scroll {
         index: usize,
     },
+    Probe {
+        nonce: u64,
+    },
     Hide,
     Show,
     Quit,
@@ -75,6 +78,9 @@ enum WireCommand {
     Scroll {
         index: usize,
     },
+    Probe {
+        nonce: u64,
+    },
     Hide {},
     Show {},
     Quit {},
@@ -97,6 +103,7 @@ impl<'de> Deserialize<'de> for Command {
             WireCommand::Select { id } => Self::Select { id },
             WireCommand::Favorite { id, value } => Self::Favorite { id, value },
             WireCommand::Scroll { index } => Self::Scroll { index },
+            WireCommand::Probe { nonce } => Self::Probe { nonce },
             WireCommand::Hide {} => Self::Hide,
             WireCommand::Show {} => Self::Show,
             WireCommand::Quit {} => Self::Quit,
@@ -113,6 +120,7 @@ pub enum Control {
 }
 #[derive(Clone, Debug)]
 pub enum Event {
+    Probe { nonce: u64 },
     Snapshot(Snapshot),
     Control(Control),
 }
@@ -237,6 +245,7 @@ impl Model {
                 self.rows[id as usize - 1].favorite = value;
             }
             Command::Scroll { index } => return Ok(Event::Control(Control::Scroll(index))),
+            Command::Probe { nonce } => return Ok(Event::Probe { nonce }),
             Command::Hide => return Ok(Event::Control(Control::Hide)),
             Command::Show => return Ok(Event::Control(Control::Show)),
             Command::Quit => return Ok(Event::Control(Control::Quit)),
@@ -461,7 +470,31 @@ fn write_report(
     visible_rows: Option<usize>,
     scroll_index: usize,
 ) -> io::Result<()> {
-    let report = Report {
+    let report = state_report(
+        toolkit,
+        event,
+        snapshot,
+        created_total,
+        alive_rows,
+        visible_rows,
+        scroll_index,
+    );
+    serde_json::to_writer(&mut *writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn state_report<'a>(
+    toolkit: &'a str,
+    event: &'a str,
+    snapshot: &'a Snapshot,
+    created_total: u64,
+    alive_rows: Option<usize>,
+    visible_rows: Option<usize>,
+    scroll_index: usize,
+) -> Report<'a> {
+    Report {
         toolkit,
         event,
         revision: snapshot.revision,
@@ -476,10 +509,57 @@ fn write_report(
         alive_rows,
         visible_rows,
         scroll_index,
+    }
+}
+
+#[derive(Serialize)]
+struct ProbeReport<'a> {
+    #[serde(flatten)]
+    state: Report<'a>,
+    nonce: u64,
+    rendered_frames: u64,
+}
+
+/// Пассивный снимок: u64::MAX — необратимый sentinel переполнения счётчика.
+#[allow(clippy::too_many_arguments)]
+pub fn report_probe(
+    toolkit: &str,
+    nonce: u64,
+    rendered_frames: u64,
+    snapshot: &Snapshot,
+    created_total: u64,
+    alive_rows: Option<usize>,
+    visible_rows: Option<usize>,
+    scroll_index: usize,
+) -> io::Result<()> {
+    if rendered_frames == u64::MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame counter overflow",
+        ));
+    }
+    let value = ProbeReport {
+        state: state_report(
+            toolkit,
+            "probe",
+            snapshot,
+            created_total,
+            alive_rows,
+            visible_rows,
+            scroll_index,
+        ),
+        nonce,
+        rendered_frames,
     };
-    serde_json::to_writer(&mut *writer, &report)?;
+    let mut writer = io::stdout().lock();
+    serde_json::to_writer(&mut writer, &value)?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+/// Насыщение сохраняет sentinel: ни wrap, ни сброс не маскируют overflow.
+pub fn count_frame(counter: &mut u64) {
+    *counter = counter.saturating_add(1);
 }
 
 #[cfg(test)]
@@ -509,7 +589,104 @@ mod tests {
             .expect("валидный запрос")
         {
             Event::Snapshot(snapshot) => snapshot,
-            Event::Control(_) => panic!("запрос должен возвращать snapshot"),
+            Event::Probe { .. } | Event::Control(_) => panic!("запрос должен возвращать snapshot"),
+        }
+    }
+
+    #[test]
+    fn probe_shape_preserves_legacy_state_and_u64_precision() {
+        let snapshot = Model::new(1000).snapshot();
+        let mut probe = serde_json::to_value(super::ProbeReport {
+            state: super::state_report("test", "probe", &snapshot, 9, None, None, 7),
+            nonce: u64::MAX,
+            rendered_frames: u64::MAX - 1,
+        })
+        .expect("probe");
+        assert_eq!(probe.as_object().expect("object").len(), 16);
+        assert_eq!(probe["nonce"].as_u64(), Some(u64::MAX));
+        let fields = probe.as_object_mut().expect("object");
+        fields.remove("nonce");
+        fields.remove("rendered_frames");
+        let mut legacy = Vec::new();
+        write_report(&mut legacy, "test", "probe", &snapshot, 9, None, None, 7).expect("legacy");
+        assert_eq!(
+            probe,
+            serde_json::from_slice::<serde_json::Value>(&legacy).expect("json")
+        );
+    }
+
+    #[test]
+    fn actor_probe_then_quit_cancels_following_commands() {
+        let harness = launch(1000, false);
+        assert!(matches!(
+            harness.events.recv_timeout(Duration::from_secs(2)),
+            Ok(Event::Snapshot(_))
+        ));
+        harness
+            .commands
+            .send(Command::Probe { nonce: 7 })
+            .expect("actor");
+        harness.commands.send(Command::Quit).expect("actor");
+        let _ = harness.commands.send(Command::Probe { nonce: 8 });
+        assert!(matches!(
+            harness.events.recv_timeout(Duration::from_secs(2)),
+            Ok(Event::Probe { nonce: 7 })
+        ));
+        assert!(matches!(
+            harness.events.recv_timeout(Duration::from_secs(2)),
+            Ok(Event::Control(Control::Quit))
+        ));
+        assert!(matches!(
+            harness.events.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn counter_overflow_is_permanent_and_invalid() {
+        let mut counter = u64::MAX - 1;
+        super::count_frame(&mut counter);
+        super::count_frame(&mut counter);
+        assert_eq!(counter, u64::MAX);
+        assert!(
+            super::report_probe(
+                "test",
+                1,
+                counter,
+                &Model::new(1).snapshot(),
+                0,
+                None,
+                None,
+                0
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn probe_preserves_model_and_validates_nonce() {
+        let mut model = Model::new(1000);
+        let before = serde_json::to_value(model.snapshot()).expect("snapshot");
+        let command: Command =
+            serde_json::from_str(r#"{"op":"probe","nonce":18446744073709551615}"#)
+                .expect("u64 nonce");
+        assert!(matches!(
+            model.apply(command),
+            Ok(Event::Probe { nonce: u64::MAX })
+        ));
+        assert_eq!(
+            before,
+            serde_json::to_value(model.snapshot()).expect("snapshot")
+        );
+        for wire in [
+            r#"{"op":"probe","nonce":-1}"#,
+            r#"{"op":"probe","nonce":true}"#,
+            r#"{"op":"probe","nonce":1.5}"#,
+            r#"{"op":"probe","nonce":18446744073709551616}"#,
+            r#"{"op":"probe"}"#,
+            r#"{"op":"probe","nonce":1,"extra":0}"#,
+        ] {
+            assert!(serde_json::from_str::<Command>(wire).is_err(), "{wire}");
         }
     }
 

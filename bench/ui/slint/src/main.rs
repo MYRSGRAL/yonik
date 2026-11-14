@@ -17,6 +17,7 @@ struct UiState {
     shown_pending: bool,
     frame_event: &'static str,
     created_total: u64,
+    rendered_frames: u64,
     scroll_index: usize,
 }
 
@@ -43,6 +44,28 @@ fn emit(state: &UiState, event: &str) {
     {
         fail(error);
     }
+}
+
+fn probe(nonce: u64) {
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(snapshot) = &state.snapshot {
+            if let Err(error) = ui_bench_model::report_probe(
+                "slint",
+                nonce,
+                state.rendered_frames,
+                snapshot,
+                state.created_total,
+                None,
+                None,
+                state.scroll_index,
+            ) {
+                fail(error);
+            }
+        } else {
+            fail("probe before snapshot");
+        }
+    });
 }
 
 fn apply_snapshot(app: &AppWindow, snapshot: &Snapshot) {
@@ -84,6 +107,7 @@ fn drain(app: &AppWindow) {
         });
         let Some(event) = event else { return };
         match event {
+            Event::Probe { nonce } => probe(nonce),
             Event::Snapshot(snapshot) => {
                 apply_snapshot(app, &snapshot);
                 app.set_scroll_y(0.0);
@@ -212,6 +236,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let completed = STATE.with(|state| {
             let mut state = state.borrow_mut();
+            ui_bench_model::count_frame(&mut state.rendered_frames);
             if !state.frame_pending {
                 return false;
             }
@@ -246,6 +271,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                             if let Err(error) = slint::quit_event_loop() {
                                 fail(error);
                             }
+                            return;
+                        }
+                        if let Event::Probe { nonce } = event {
+                            probe(nonce);
                             return;
                         }
                         STATE.with(|state| state.borrow_mut().queue.push_back(event));

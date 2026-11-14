@@ -59,3 +59,8 @@ backend — сохранённый blocker, а не успешная прове�
 драйвер прервёт visible idle. Три повтора — повторные process startup, без
 обещания холодного файлового кеша. Это только стоимость synthetic UI процесса,
 без controller/tray/engine baseline и аппаратной энергии, не закрытие G-POWER.
+
+Частный X11 preflight с passive Probe/native counters находится в
+`private-x11-preflight.py`; его evidence и границы acceptance описаны в
+[preflight](../../docs/validation/ui-private-preflight/README.md).
+Этот отдельный runner не ослабляет Wayland/session guards основного драйвера.

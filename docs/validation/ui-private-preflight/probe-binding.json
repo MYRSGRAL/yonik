@@ -1,0 +1,75 @@
+{
+  "native_manifest_sha256": "475ce052ffb21b496eb6aeeb760d9f6808208ca0ea8454b3c96b152e0ec74d6b",
+  "native_build_source_subtree": "85f392227d51e9801670cdce9e10a090144529ce",
+  "current_fixture_subtree": "aecbe04ffee46e388939ec26bf8ac60d921ec386",
+  "subtree_scope": "bench/ui only; no root tree claim",
+  "compiled_inputs": {
+    "bench/ui/Cargo.lock": "aed1e31ff1e82271e416c439278c9984c3371ec38729b64a076060cc4b6a6ce9",
+    "bench/ui/Cargo.toml": "9bac28b9b2c493a73b88350d7e226d5abd14289d119ff8bf1606f8ff5e73b397",
+    "bench/ui/gtk/Cargo.toml": "0d55c17a8150d87b93d32441d9f7237915e66a26dedc2625e84a25518ecfa02c",
+    "bench/ui/gtk/src/main.rs": "63582162af8d9ae40b38a673ce8fdf660a93acffdcca8e40afbf37a9d70ad3f8",
+    "bench/ui/model/Cargo.toml": "a63bc9a022ea37b2c06ab2a0bd17b97f5a15fe70054e36cb98f8dde343de109e",
+    "bench/ui/model/src/lib.rs": "98f3122249e20bfe0fec6cdcff6c97ad8c083e9bbf86e3d38381082d9fed4b99",
+    "bench/ui/qt/Cargo.toml": "fd165e52453a44bfd0a146c52d94d3c96b846f1a8b71cbf210dfe2a02c695ea0",
+    "bench/ui/qt/build.rs": "d8d526ff966497b90b5c547e2466938e74974bc197e5d699d7aba5a99df24eab",
+    "bench/ui/qt/qml/Main.qml": "fdb5bbe447b8a5683f7cf9ce64e6f1886a09f04b5e3b315ff04322ae6957a524",
+    "bench/ui/qt/src/application.cpp": "18d01215f342777c238c9bbbeb22a953db9357dde504803041cc4de83f4b346a",
+    "bench/ui/qt/src/application.h": "04bcca18ec3bf45089313453cbef0befa099abe137197273ce42d8b3ec5399b1",
+    "bench/ui/qt/src/bridge.rs": "be17997f715f4e3e463ad7a29405742701ec4ccdd9d230cfeacea2710b2b9e97",
+    "bench/ui/qt/src/main.rs": "8445e5bef5b91636e5f4567be15958e26ba6b45330e6ac1a4856c4fda549ee95",
+    "bench/ui/slint/Cargo.toml": "720d210f49caa748da5d2066905b532b2496383e8a71fb6133e1fb5703de5a0e",
+    "bench/ui/slint/build.rs": "e7633e1cf3784835363479d9a90080df78dfd2d5de0bc056b0de6eef146e67e3",
+    "bench/ui/slint/src/main.rs": "68585224f514f4095dbc16487c77af1fb014590c916c76f9465488a59431ced6",
+    "bench/ui/slint/ui/app.slint": "728f4c925ed1d282537a12cc23c4750300c1ba9bc8832afd7f71a5481642b2c1"
+  },
+  "compiled_inputs_match": true,
+  "files": {
+    "bench/ui/.gitignore": "350a62e46b4056b9c92a29f41f1f1a9c4ae5eb77ba0344f0356a1e441cd61272",
+    "bench/ui/Cargo.lock": "aed1e31ff1e82271e416c439278c9984c3371ec38729b64a076060cc4b6a6ce9",
+    "bench/ui/Cargo.toml": "9bac28b9b2c493a73b88350d7e226d5abd14289d119ff8bf1606f8ff5e73b397",
+    "bench/ui/DRIVER.md": "da0e3f81087dd89c5dc8bacba448331d8b00c79fd5316d53d45445f191fc2572",
+    "bench/ui/PROTOCOL.md": "82ab62b47175e1ec9cc3812667e357fc92f389d4666c87ada44c71f0a4da7d8a",
+    "bench/ui/README.md": "8b854e33d32753d2c76e2b8abe97304e57bb902908b0f161b0eb38d684519e2e",
+    "bench/ui/check-offscreen.py": "c8e8f13e7073082ef4450eaa1ac0dc028f8c619c27fc645abb027034377de222",
+    "bench/ui/gtk/Cargo.toml": "0d55c17a8150d87b93d32441d9f7237915e66a26dedc2625e84a25518ecfa02c",
+    "bench/ui/gtk/src/main.rs": "63582162af8d9ae40b38a673ce8fdf660a93acffdcca8e40afbf37a9d70ad3f8",
+    "bench/ui/model/Cargo.toml": "a63bc9a022ea37b2c06ab2a0bd17b97f5a15fe70054e36cb98f8dde343de109e",
+    "bench/ui/model/src/lib.rs": "98f3122249e20bfe0fec6cdcff6c97ad8c083e9bbf86e3d38381082d9fed4b99",
+    "bench/ui/private-x11-preflight.py": "cbcf393bffd671a558992fc28cd7f2910a0a052e15b343391c163b1cc3899e8f",
+    "bench/ui/qt/Cargo.toml": "fd165e52453a44bfd0a146c52d94d3c96b846f1a8b71cbf210dfe2a02c695ea0",
+    "bench/ui/qt/build.rs": "d8d526ff966497b90b5c547e2466938e74974bc197e5d699d7aba5a99df24eab",
+    "bench/ui/qt/qml/Main.qml": "fdb5bbe447b8a5683f7cf9ce64e6f1886a09f04b5e3b315ff04322ae6957a524",
+    "bench/ui/qt/src/application.cpp": "18d01215f342777c238c9bbbeb22a953db9357dde504803041cc4de83f4b346a",
+    "bench/ui/qt/src/application.h": "04bcca18ec3bf45089313453cbef0befa099abe137197273ce42d8b3ec5399b1",
+    "bench/ui/qt/src/bridge.rs": "be17997f715f4e3e463ad7a29405742701ec4ccdd9d230cfeacea2710b2b9e97",
+    "bench/ui/qt/src/main.rs": "8445e5bef5b91636e5f4567be15958e26ba6b45330e6ac1a4856c4fda549ee95",
+    "bench/ui/run-comparison.sh": "2ff1dfd8b7a1af26ec7ffcf0be1f7c5f65e9ff3f7e0a659b753617c437222810",
+    "bench/ui/slint/Cargo.toml": "720d210f49caa748da5d2066905b532b2496383e8a71fb6133e1fb5703de5a0e",
+    "bench/ui/slint/README.md": "040d6ffc4df0f1c819a3537bdc5fde058748dad4513e2471dfaadbf82d501edb",
+    "bench/ui/slint/build.rs": "e7633e1cf3784835363479d9a90080df78dfd2d5de0bc056b0de6eef146e67e3",
+    "bench/ui/slint/src/main.rs": "68585224f514f4095dbc16487c77af1fb014590c916c76f9465488a59431ced6",
+    "bench/ui/slint/ui/app.slint": "728f4c925ed1d282537a12cc23c4750300c1ba9bc8832afd7f71a5481642b2c1",
+    "bench/ui/test_private_x11_preflight.py": "05fa6a7311cb765faae2589bd8666bb7c8eacd2623de326d8f8c6e3a5db5a75c",
+    "bench/ui/test_probe_oracle.py": "1ba4af8e30d2cdc74aa165ece99a5425c02cbb36aafe37b4646a4881db6bcaa3"
+  },
+  "noncompiled_changes_since_build": [
+    "bench/ui/private-x11-preflight.py"
+  ],
+  "binary": {
+    "yonik-bench-qt": {
+      "sha256": "17327809c3695ddad629d527e93ac511f0db212ccb0f992976b11a0d3eb19f34",
+      "bytes": 1843712
+    },
+    "yonik-bench-gtk": {
+      "sha256": "7b67c230e520f27e42dc2c2bb0d0e60a202de89d23b6d8e9f6837c4c07182dc2",
+      "bytes": 778576
+    },
+    "yonik-bench-slint": {
+      "sha256": "1def798736dbf7f3252ecf170675271d896fd78f969287feeae884ca6e6c6934",
+      "bytes": 16552968
+    }
+  },
+  "artifact_path": "/home/myrs/projects/yonik/local/artifacts/ui-probe-191-20261114-v1",
+  "source_archive": "source-bench-ui-final.tar.gz",
+  "source_archive_sha256": "fd4fb226a8f167a777d353a3723dfddb5ff174056277612b95672136cedfa676"
+}

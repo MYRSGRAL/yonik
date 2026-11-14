@@ -68,6 +68,10 @@ mod bridge_impl {
                                     ffi::exit_application();
                                     return;
                                 }
+                                if let Event::Probe { nonce } = event {
+                                    ffi::request_probe(nonce);
+                                    return;
+                                }
                                 if matches!(event, Event::Control(Control::Show)) {
                                     ffi::resume_for_show();
                                 }
@@ -104,6 +108,40 @@ mod bridge_impl {
 
         pub fn request_frame(self: Pin<&mut Self>, token: i32) {
             ffi::request_frame(token);
+        }
+
+        pub fn finish_probe(
+            self: Pin<&mut Self>,
+            nonce: QString,
+            created: i32,
+            live: i32,
+            visible: i32,
+            scroll: i32,
+        ) {
+            let result = nonce
+                .to_string()
+                .parse::<u64>()
+                .map_err(std::io::Error::other)
+                .and_then(|nonce| {
+                    let snapshot = self
+                        .snapshot
+                        .as_ref()
+                        .ok_or_else(|| std::io::Error::other("probe before snapshot"))?;
+                    ui_bench_model::report_probe(
+                        "qt",
+                        nonce,
+                        ffi::rendered_frames(),
+                        snapshot,
+                        created.max(0) as u64,
+                        Some(live.max(0) as usize),
+                        Some(visible.max(0) as usize),
+                        scroll.max(0) as usize,
+                    )
+                });
+            if let Err(error) = result {
+                eprintln!("Qt probe: {error}");
+                ffi::exit_application();
+            }
         }
 
         pub fn finish(
@@ -152,6 +190,10 @@ mod bridge_impl {
             };
             self.as_mut().rust_mut().waiting = true;
             match event {
+                Event::Probe { nonce } => {
+                    ffi::request_probe(nonce);
+                    self.as_mut().rust_mut().waiting = false;
+                }
                 Event::Snapshot(snapshot) => {
                     let json = match serde_json::to_string(&snapshot) {
                         Ok(json) => json,

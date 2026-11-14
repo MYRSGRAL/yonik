@@ -135,7 +135,10 @@ fn query(
     );
 }
 
-fn build(harness: ui_bench_model::Harness) -> Result<gtk::Window, Box<dyn Error>> {
+fn build(
+    harness: ui_bench_model::Harness,
+    main_loop: glib::MainLoop,
+) -> Result<gtk::Window, Box<dyn Error>> {
     let ui_state: Rc<RefCell<Option<Snapshot>>> = Rc::default();
     let stats = Rc::new(RowStats::default());
     let scroll_index = Rc::new(Cell::new(0usize));
@@ -443,6 +446,18 @@ fn build(harness: ui_bench_model::Harness) -> Result<gtk::Window, Box<dyn Error>
                 }
             }
         })?;
+    let frames = Rc::new(Cell::new(0_u64));
+    let observed = frames.clone();
+    window.connect_realize(move |window| {
+        if let Some(clock) = window.frame_clock() {
+            let frames = observed.clone();
+            clock.connect_after_paint(move |_| {
+                let mut count = frames.get();
+                ui_bench_model::count_frame(&mut count);
+                frames.set(count);
+            });
+        }
+    });
     let weak_window = window.downgrade();
     glib::MainContext::default().spawn_local(async move {
         let mut backlog = VecDeque::new();
@@ -453,9 +468,37 @@ fn build(harness: ui_bench_model::Harness) -> Result<gtk::Window, Box<dyn Error>
             };
             match message {
                 UiMessage::FrameDone => awaiting_frame = false,
+                UiMessage::Backend(Event::Probe { nonce }) => {
+                    if !cancelled.get() {
+                        let state = ui_state.borrow();
+                        let snapshot = state.as_ref().ok_or("GTK probe before snapshot");
+                        let result = snapshot
+                            .map_err(std::io::Error::other)
+                            .and_then(|snapshot| {
+                                let (alive, visible) = stats.counts(&viewport);
+                                ui_bench_model::report_probe(
+                                    "gtk",
+                                    nonce,
+                                    frames.get(),
+                                    snapshot,
+                                    stats.created.get(),
+                                    Some(alive),
+                                    Some(visible),
+                                    scroll_index.get(),
+                                )
+                            });
+                        if let Err(error) = result {
+                            eprintln!("GTK probe: {error}");
+                            cancelled.set(true);
+                            main_loop.quit();
+                            break;
+                        }
+                    }
+                }
                 UiMessage::Backend(Event::Control(Control::Quit)) => {
                     cancelled.set(true);
                     backlog.clear();
+                    main_loop.quit();
                     window.destroy();
                     break;
                 }
@@ -481,6 +524,11 @@ fn build(harness: ui_bench_model::Harness) -> Result<gtk::Window, Box<dyn Error>
                     break;
                 };
                 match event {
+                    Event::Probe { .. } => {
+                        eprintln!("GTK: probe ошибочно попал в backlog");
+                        main_loop.quit();
+                        return;
+                    }
                     Event::Snapshot(snapshot) => {
                         applying.set(true);
                         let objects: Vec<_> = snapshot
@@ -559,6 +607,7 @@ fn build(harness: ui_bench_model::Harness) -> Result<gtk::Window, Box<dyn Error>
                                 }
                             }
                             Control::Quit => {
+                                main_loop.quit();
                                 window.destroy();
                                 break;
                             }
@@ -590,8 +639,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
-    let window = build(ui_bench_model::start(rows))?;
     let main_loop = glib::MainLoop::new(None, false);
+    let window = build(ui_bench_model::start(rows), main_loop.clone())?;
     let quit = main_loop.clone();
     window.connect_destroy(move |_| quit.quit());
     window.present();
