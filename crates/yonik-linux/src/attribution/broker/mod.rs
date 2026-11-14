@@ -238,6 +238,7 @@ impl BrokerLookupView {
 
 /// Не Deserialize: worker PID и UID никогда не берутся из запроса.
 pub struct TrustedContext {
+    scope: Option<crate::helper::native_bootstrap::RuntimeScopeStamp>,
     worker: Process,
     lookup_view: BrokerLookupView,
     target_uid: u32,
@@ -247,7 +248,42 @@ pub struct TrustedContext {
     revoked: bool,
     cancelled: Arc<AtomicBool>,
 }
+pub(crate) struct VerifiedLookupScope {
+    context: TrustedContext,
+}
+impl VerifiedLookupScope {
+    pub(crate) fn verify(
+        scope: crate::helper::native_bootstrap::RuntimeScopeStamp,
+    ) -> Result<Self, Unavailable> {
+        scope.validate().map_err(|_| Unavailable::Authority)?;
+        let (worker_pid, worker_uid, owner) = scope.lookup_binding();
+        let view = BrokerLookupView::capture()?;
+        if view.namespaces[0] != owner.namespace() {
+            return Err(Unavailable::Coverage);
+        }
+        let (nonce, _, _, _, epoch, digest) = scope.context();
+        let context = TrustedContext {
+            worker: Process::capture(worker_pid, worker_uid)?,
+            lookup_view: view,
+            target_uid: owner.owner_uid(),
+            epoch,
+            nonce,
+            digest,
+            revoked: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            scope: Some(scope),
+        };
+        Ok(Self { context })
+    }
+}
 impl TrustedContext {
+    fn validate_scope(&self) -> Result<(), Unavailable> {
+        if let Some(scope) = &self.scope {
+            scope.validate().map_err(|_| Unavailable::Revoked)?;
+        }
+        self.lookup_view.validate()
+    }
+
     pub fn from_host(
         worker_pid: u32,
         worker_uid: u32,
@@ -260,6 +296,7 @@ impl TrustedContext {
             return Err(Unavailable::Authority);
         }
         Ok(Self {
+            scope: None,
             worker: Process::capture(worker_pid, worker_uid).map_err(|e| {
                 if e == Unavailable::Coverage {
                     Unavailable::WorkerViewUnavailable
@@ -329,7 +366,13 @@ pub(super) enum ProjectedLookup {
 }
 
 impl Broker {
+    pub(crate) fn from_verified(scope: VerifiedLookupScope) -> Result<Self, Unavailable> {
+        Self::build(scope.context, false)
+    }
     pub fn new(context: TrustedContext) -> Result<Self, Unavailable> {
+        Self::build(context, true)
+    }
+    fn build(context: TrustedContext, legacy: bool) -> Result<Self, Unavailable> {
         if rustix::process::getuid().as_raw() != context.target_uid
             || rustix::process::geteuid().as_raw() != context.target_uid
         {
@@ -349,9 +392,9 @@ impl Broker {
         rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
             .map_err(|_| Unavailable::Authority)?;
         context.worker.validate()?;
-        context.lookup_view.validate()?;
+        context.validate_scope()?;
         // Legacy direct-proc admission сохраняет прежний контракт общего scope.
-        if context.worker.namespaces != context.lookup_view.namespaces {
+        if legacy && context.worker.namespaces != context.lookup_view.namespaces {
             return Err(Unavailable::Coverage);
         }
         Ok(Self {
@@ -392,6 +435,7 @@ impl Broker {
         if self.context.cancelled.load(Ordering::Acquire) {
             return Err(Unavailable::Cancelled);
         }
+        self.context.validate_scope()?;
         self.context.worker.validate()?;
         let (bytes, c) = match receive_frame(socket) {
             Ok(frame) => frame,
@@ -402,6 +446,7 @@ impl Broker {
             Err(error) => return Err(error),
         };
         self.context.worker.accept_credentials(c)?;
+        self.context.validate_scope()?;
         self.context.worker.validate()?;
         if self.context.cancelled.load(Ordering::Acquire) {
             return Err(Unavailable::Cancelled);

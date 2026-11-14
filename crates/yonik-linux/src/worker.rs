@@ -32,10 +32,60 @@ use yonik_engine::{CompiledConfig, Engine};
 #[cfg(test)]
 mod output_transport;
 
+// Frozen c083 receipt helper: форматирование не меняет проверенные байты.
+#[rustfmt::skip]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64", target_env = "gnu"))]
+mod fixed_fence_receipt;
 pub mod anchor_exchange;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_pointer_width = "64",
+    target_env = "gnu"
+))]
+mod native_data;
 pub mod role_handoff;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+fn remaining_budget(deadline: Instant) -> Result<Duration, WorkerError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or(WorkerError::Timeout)
+}
+fn write_before(
+    stream: &mut &UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), WorkerError> {
+    while !bytes.is_empty() {
+        stream
+            .set_write_timeout(Some(remaining_budget(deadline)?))
+            .map_err(|_| WorkerError::Io)?;
+        let n = stream.write(bytes).map_err(|_| WorkerError::Io)?;
+        if n == 0 {
+            return Err(WorkerError::Io);
+        }
+        bytes = &bytes[n..];
+    }
+    Ok(())
+}
+fn read_before(
+    stream: &mut &UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<(), WorkerError> {
+    while !bytes.is_empty() {
+        stream
+            .set_read_timeout(Some(remaining_budget(deadline)?))
+            .map_err(|_| WorkerError::Io)?;
+        let n = stream.read(bytes).map_err(|_| WorkerError::Io)?;
+        if n == 0 {
+            return Err(WorkerError::Protocol);
+        }
+        bytes = &mut bytes[n..];
+    }
+    Ok(())
+}
 const HEADER_LEN: usize = 80;
 const BUNDLE_HEADER_LEN: usize = 96;
 #[derive(Clone, Copy)]
@@ -349,25 +399,33 @@ impl WorkerPayload {
         mode: WorkerMode,
         output: Option<crate::output_transport::ValidatedWriters>,
     ) -> Result<WorkerAck, WorkerError> {
+        self.send_output_before(stream, mode, output, Instant::now() + TIMEOUT)
+    }
+    pub(crate) fn send_output_before(
+        &self,
+        stream: &UnixStream,
+        mode: WorkerMode,
+        output: Option<crate::output_transport::ValidatedWriters>,
+        deadline: Instant,
+    ) -> Result<WorkerAck, WorkerError> {
+        #[cfg(test)]
+        let started = Instant::now();
         if output.is_some() && mode != WorkerMode::Run {
             return Err(WorkerError::Protocol);
         }
-        let started = Instant::now();
         stream
-            .set_read_timeout(Some(TIMEOUT))
+            .set_read_timeout(Some(remaining_budget(deadline)?))
             .map_err(|_| WorkerError::Io)?;
         stream
-            .set_write_timeout(Some(TIMEOUT))
+            .set_write_timeout(Some(remaining_budget(deadline)?))
             .map_err(|_| WorkerError::Io)?;
         if self.needs_tmpfs_assets() {
             let mut preflight = b"YNKSHM\0\x01".to_vec();
             preflight.push(if mode == WorkerMode::Check { 1 } else { 2 });
             let mut channel = stream;
-            channel.write_all(&preflight).map_err(|_| WorkerError::Io)?;
+            write_before(&mut channel, &preflight, deadline)?;
             let mut proof = [0u8; 32];
-            channel
-                .read_exact(&mut proof)
-                .map_err(|_| WorkerError::Protocol)?;
+            read_before(&mut channel, &mut proof, deadline)?;
             if &proof[..8] != b"YNKSHMOK"
                 || proof[8..16] == [0; 8]
                 || proof[16..24] == [0; 8]
@@ -411,6 +469,9 @@ impl WorkerPayload {
         if !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
             return Err(WorkerError::Protocol);
         }
+        stream
+            .set_write_timeout(Some(remaining_budget(deadline)?))
+            .map_err(|_| WorkerError::Io)?;
         let n = sendmsg(
             stream,
             &[IoSlice::new(&header)],
@@ -422,11 +483,7 @@ impl WorkerPayload {
         let mut remaining = &header[n..];
         while !remaining.is_empty() {
             stream
-                .set_write_timeout(Some(
-                    TIMEOUT
-                        .checked_sub(started.elapsed())
-                        .ok_or(WorkerError::Timeout)?,
-                ))
+                .set_write_timeout(Some(remaining_budget(deadline)?))
                 .map_err(|_| WorkerError::Io)?;
             let written = stream.write(remaining).map_err(|_| WorkerError::Io)?;
             if written == 0 {
@@ -438,21 +495,13 @@ impl WorkerPayload {
             .shutdown(Shutdown::Write)
             .map_err(|_| WorkerError::Io)?;
         stream
-            .set_read_timeout(Some(
-                TIMEOUT
-                    .checked_sub(started.elapsed())
-                    .ok_or(WorkerError::Timeout)?,
-            ))
+            .set_read_timeout(Some(remaining_budget(deadline)?))
             .map_err(|_| WorkerError::Io)?;
         let mut ack = [0; 9];
         let mut offset = 0;
         while offset < ack.len() {
             stream
-                .set_read_timeout(Some(
-                    TIMEOUT
-                        .checked_sub(started.elapsed())
-                        .ok_or(WorkerError::Timeout)?,
-                ))
+                .set_read_timeout(Some(remaining_budget(deadline)?))
                 .map_err(|_| WorkerError::Io)?;
             let read = stream.read(&mut ack[offset..]).map_err(|error| {
                 #[cfg(test)]
@@ -1015,4 +1064,27 @@ fn decode_output_header(bytes: &[u8]) -> Result<Vec<u8>, WorkerError> {
     }
     decode_bundle_header(&legacy)?;
     Ok(legacy)
+}
+
+#[cfg(test)]
+mod native_budget_tests {
+    use super::*;
+    #[test]
+    fn expired_admission_never_receives_fresh_payload_budget() {
+        assert!(matches!(
+            remaining_budget(Instant::now()),
+            Err(WorkerError::Timeout)
+        ));
+        let deadline = Instant::now() + Duration::from_millis(50);
+        assert!(remaining_budget(deadline).unwrap() <= Duration::from_millis(50));
+    }
+    #[test]
+    fn owned_ipc_expired_payload_read_does_not_wait_for_peer() {
+        let (_peer, worker) = UnixStream::pair().unwrap();
+        let mut stream = &worker;
+        assert!(matches!(
+            read_before(&mut stream, &mut [0; 1], Instant::now()),
+            Err(WorkerError::Timeout)
+        ));
+    }
 }

@@ -238,7 +238,7 @@ fn capture(context: &TrustedContext, flow: Flow) -> Result<Option<OwnerSnapshot>
         return Err(Unavailable::Cancelled);
     }
     context.worker.validate()?;
-    context.lookup_view.validate()?;
+    context.validate_scope()?;
     if ![2, 10].contains(&flow.family) || ![6, 17].contains(&flow.protocol) {
         return Err(Unavailable::Malformed);
     }
@@ -428,7 +428,7 @@ pub(super) fn revalidate(
         return Err(Unavailable::Timeout);
     }
     context.worker.validate()?;
-    context.lookup_view.validate()?;
+    context.validate_scope()?;
     let process = Process::capture(s.pid, context.target_uid)?;
     if process.start != s.start_time || process.namespaces != context.lookup_view.namespaces {
         return Err(Unavailable::Authority);

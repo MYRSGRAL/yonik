@@ -9,6 +9,21 @@ pub(super) struct NativeArtifactStamp {
     generation: u64,
 }
 
+/// Создаётся только consuming commit после exact record/queue проверки.
+pub(in crate::helper) struct OwnerBinding {
+    owner: crate::managed_network::Ownership,
+    session: [u8; 16],
+    generation: u64,
+    epoch: u64,
+}
+impl OwnerBinding {
+    pub(in crate::helper) fn context(&self) -> ([u8; 16], u64, u64) {
+        (self.session, self.generation, self.epoch)
+    }
+    pub(in crate::helper) fn ownership(&self) -> crate::managed_network::Ownership {
+        self.owner
+    }
+}
 // Поля удерживают exact immutable artifact/queue и целый authorized run.
 // Пока runtime caller запрещён, эти типы создаются только закрытым producer.
 #[allow(dead_code)]
@@ -125,7 +140,10 @@ impl<A, Q, R> Drop for NativeOwnerState<A, Q, R> {
 
 // Нет constructor из caller данных: record создаётся только после async проверок.
 #[allow(dead_code)]
-struct VerifiedNativeNetworkCommit<A = SessionArtifact, Q = crate::managed_network::tun::BoundTun> {
+pub(super) struct VerifiedNativeNetworkCommit<
+    A = SessionArtifact,
+    Q = crate::managed_network::tun::BoundTun,
+> {
     artifact: Arc<A>,
     queue: Arc<Q>,
     stamp: crate::NetworkStamp,
@@ -157,7 +175,7 @@ impl<A, Q> VerifiedNativeNetworkCommit<A, Q> {
 // Закрытая граница: production caller и compile stamping ещё не подключаются.
 #[allow(dead_code)]
 impl super::Backend {
-    async fn verify_native_network(
+    pub(super) async fn verify_native_network(
         &mut self,
         artifact: Arc<SessionArtifact>,
         index: u32,
@@ -269,7 +287,43 @@ impl super::Backend {
                 .map_err(super::unavailable)
         })
     }
-    fn commit_native_owner(
+    pub(super) async fn start_committed_native(
+        &mut self,
+        cancel: &mut crate::Cancellation,
+    ) -> Result<crate::helper::systemd_worker::WorkerTicket, ServiceError> {
+        self.supervisor().await?;
+        let pending = self
+            .native_owner
+            .lease
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?;
+        let mut nonce = [0; 32];
+        getrandom::getrandom(&mut nonce).map_err(super::unavailable)?;
+        let authorization = pending
+            .authority
+            .authorize(nonce)
+            .map_err(super::unavailable)?;
+        let (topology, _) = crate::network::read_topology_captured(cancel, super::DEADLINE)
+            .await
+            .map_err(super::unavailable)?;
+        self.worker_uncertain = true;
+        self.supervisor
+            .as_mut()
+            .ok_or(ServiceError::Unavailable)?
+            .start_native(
+                Arc::clone(&pending.artifact.payload),
+                &pending.authority,
+                authorization,
+                Arc::clone(&pending.queue),
+                self.journal.as_ref().ok_or(ServiceError::Unavailable)?,
+                topology,
+                pending.network_epoch,
+                cancel,
+            )
+            .await
+            .map_err(super::unavailable)
+    }
+    pub(super) fn commit_native_owner(
         &mut self,
         record: VerifiedNativeNetworkCommit,
     ) -> Result<(), ServiceError> {
@@ -280,8 +334,12 @@ impl super::Backend {
             .as_ref()
             .ok_or(ServiceError::Unavailable)?;
         self.native_owner.consume(stamp)?;
-        let authority = RunAuthority::new(stamp.session, stamp.generation, record.epoch)
-            .map_err(|_| ServiceError::Unavailable)?;
+        let authority = RunAuthority::from_bound(OwnerBinding {
+            owner: record.owner,
+            session: stamp.session,
+            generation: stamp.generation,
+            epoch: record.epoch,
+        });
         self.native_owner.lease = Some(NativeOwnerLease {
             artifact: record.artifact,
             queue: record.queue,

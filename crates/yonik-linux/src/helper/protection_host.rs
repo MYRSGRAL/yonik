@@ -19,7 +19,7 @@ use std::{
 use yonik_application::{ConfigDigest, EnvironmentStamp};
 
 #[path = "session_host.rs"]
-mod session_host;
+pub(super) mod session_host;
 use session_host::{ActiveSession, HelperTunCustody, SessionArtifact};
 
 const STATE_PATH: &str = "/run/yonik/network";

@@ -289,6 +289,10 @@ impl Fixture {
             }
         }
         let supervisor = SystemWorkerSupervisor {
+            native_runtime: None,
+            native_transfer: None,
+            native_admission: None,
+            native_custody: None,
             connection: bus.connect().await,
             owner: server.unique_name().unwrap().to_string(),
             permit: Arc::new(Permit),

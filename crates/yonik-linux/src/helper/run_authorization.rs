@@ -40,6 +40,7 @@ impl RunRevocation {
 // Producer подключается W4 после проверки реального owner/network context.
 #[allow(dead_code)]
 pub(crate) struct RunAuthority {
+    owner_binding: Option<super::protection_host::session_host::native_owner::OwnerBinding>,
     session: [u8; 16],
     generation: u64,
     network_epoch: u64,
@@ -48,6 +49,7 @@ pub(crate) struct RunAuthority {
 }
 #[allow(dead_code)]
 impl RunAuthority {
+    #[cfg(test)]
     pub(crate) fn new(
         session: [u8; 16],
         generation: u64,
@@ -57,12 +59,31 @@ impl RunAuthority {
             return Err(RunAuthorizationError::InvalidContext);
         }
         Ok(Self {
+            owner_binding: None,
             session,
             generation,
             network_epoch,
             issued: AtomicBool::new(false),
             revoked: Arc::new(RunRevocation::new()),
         })
+    }
+    pub(super) fn from_bound(
+        binding: super::protection_host::session_host::native_owner::OwnerBinding,
+    ) -> Self {
+        let (session, generation, network_epoch) = binding.context();
+        Self {
+            owner_binding: Some(binding),
+            session,
+            generation,
+            network_epoch,
+            issued: AtomicBool::new(false),
+            revoked: Arc::new(RunRevocation::new()),
+        }
+    }
+    pub(crate) fn bound_to(&self, ownership: crate::managed_network::Ownership) -> bool {
+        self.owner_binding
+            .as_ref()
+            .is_some_and(|binding| binding.ownership() == ownership)
     }
     pub(crate) fn authorize(
         &self,
@@ -78,6 +99,7 @@ impl RunAuthority {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| RunAuthorizationError::Consumed)?;
         let token = RunAuthorization {
+            owner_binding: self.owner_binding.as_ref().map(|b| b.ownership()),
             session: self.session,
             nonce,
             generation: self.generation,
@@ -102,6 +124,7 @@ impl Drop for RunAuthority {
 }
 
 pub(crate) struct RunAuthorization {
+    owner_binding: Option<crate::managed_network::Ownership>,
     session: [u8; 16],
     nonce: [u8; 32],
     generation: u64,
@@ -109,6 +132,13 @@ pub(crate) struct RunAuthorization {
     revoked: Arc<RunRevocation>,
 }
 impl RunAuthorization {
+    pub(crate) fn owner_binding(
+        &self,
+    ) -> Result<crate::managed_network::Ownership, RunAuthorizationError> {
+        self.validate()?;
+        self.owner_binding
+            .ok_or(RunAuthorizationError::InvalidContext)
+    }
     pub(super) fn validate(&self) -> Result<(), RunAuthorizationError> {
         if self.revoked.load(Ordering::Acquire) {
             return Err(RunAuthorizationError::Revoked);

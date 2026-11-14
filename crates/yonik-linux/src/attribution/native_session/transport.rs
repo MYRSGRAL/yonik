@@ -29,8 +29,19 @@ fn receive(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, Unavailable> {
+    receive_inner(socket, Some(deadline), cancel)
+}
+fn receive_inner(
+    socket: &OwnedFd,
+    deadline: Option<Instant>,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, Unavailable> {
     loop {
-        fence(deadline, cancel)?;
+        if let Some(deadline) = deadline {
+            fence(deadline, cancel)?;
+        } else if cancel.load(Ordering::Acquire) {
+            return Err(Unavailable::Cancelled);
+        }
         let mut bytes = [0; wire::MAX_FRAME + 1];
         let mut space =
             [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1), ScmCredentials(1))];
@@ -55,7 +66,11 @@ fn receive(
                 if msg.bytes == 0 {
                     return Err(Unavailable::Disconnected);
                 }
-                fence(deadline, cancel)?;
+                if let Some(deadline) = deadline {
+                    fence(deadline, cancel)?;
+                } else if cancel.load(Ordering::Acquire) {
+                    return Err(Unavailable::Cancelled);
+                }
                 return Ok(bytes[..msg.bytes].to_vec());
             }
             Err(rustix::io::Errno::AGAIN) => std::thread::sleep(TICK),
@@ -142,11 +157,24 @@ impl Session {
     /// Потребляет все роли. metadata — только от helper resource owner.
     /// cancel не является authority и может только отозвать существующую сессию.
     pub fn serve(mut self, cancel: &AtomicBool) -> Result<(), Unavailable> {
-        let result = self.serve_inner(cancel);
+        let result = self.serve_inner(cancel, || Ok(()));
         self.close();
         result
     }
-    fn serve_inner(&mut self, cancel: &AtomicBool) -> Result<(), Unavailable> {
+    pub fn serve_with_ready(
+        mut self,
+        cancel: &AtomicBool,
+        on_ready: impl FnOnce() -> Result<(), Unavailable>,
+    ) -> Result<(), Unavailable> {
+        let result = self.serve_inner(cancel, on_ready);
+        self.close();
+        result
+    }
+    fn serve_inner(
+        &mut self,
+        cancel: &AtomicBool,
+        on_ready: impl FnOnce() -> Result<(), Unavailable>,
+    ) -> Result<(), Unavailable> {
         let socket = rustix::io::fcntl_dupfd_cloexec(
             &self.roles.as_ref().ok_or(Unavailable::Authority)?.worker,
             0,
@@ -166,14 +194,15 @@ impl Session {
         drop(fd);
         let ack = receive(&socket, expires, cancel)?;
         self.acknowledge(&ack).map_err(|_| Unavailable::Malformed)?;
+        on_ready()?;
         loop {
-            let bytes = receive(&socket, expires, cancel)?;
+            let bytes = receive_inner(&socket, None, cancel)?;
             let header = self.header(&bytes).map_err(|_| Unavailable::Malformed)?;
             if header.kind == Kind::Revoke {
                 self.revoke(&bytes).map_err(|_| Unavailable::Malformed)?;
                 return Ok(());
             }
-            let deadline = (Instant::now() + Duration::from_nanos(wire::OWNER_TTL_NS)).min(expires);
+            let deadline = Instant::now() + Duration::from_nanos(wire::OWNER_TTL_NS);
             #[cfg(test)]
             BEFORE_LOOKUP.with(|hook| {
                 if let Some(callback) = hook.borrow_mut().take() {
@@ -730,6 +759,37 @@ pub(super) mod tests {
             .unwrap();
             assert_eq!(thread.join().unwrap(), Err(Unavailable::Malformed));
         }
+    }
+    #[test]
+    fn owned_ipc_ready_after_ack_runtime_survives_bootstrap_deadline() {
+        let (session, peer, _) = fixture();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cancel);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            session.serve_with_ready(&flag, || {
+                ready_tx.send(()).map_err(|_| Unavailable::Disconnected)
+            })
+        });
+        handshake(&peer, true);
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_nanos(wire::BOOTSTRAP_NS) + Duration::from_millis(30));
+        assert!(!thread.is_finished());
+        cancel.store(true, Ordering::Release);
+        assert_eq!(thread.join().unwrap(), Err(Unavailable::Cancelled));
+    }
+    #[test]
+    fn owned_ipc_missing_ack_never_signals_ready() {
+        let (session, peer, _) = fixture();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            session.serve_with_ready(&AtomicBool::new(false), || {
+                ready_tx.send(()).map_err(|_| Unavailable::Disconnected)
+            })
+        });
+        handshake(&peer, false);
+        assert_eq!(thread.join().unwrap(), Err(Unavailable::Timeout));
+        assert!(ready_rx.try_recv().is_err());
     }
     #[test]
     fn socket_ack_timeout_and_revoke() {

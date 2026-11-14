@@ -278,6 +278,26 @@ pub(crate) fn receive_run_handoff(
     Ok(RunHandoff { permit, transport })
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_pointer_width = "64",
+    target_env = "gnu"
+))]
+pub(super) fn receive_v4_handoff(
+    socket: &OwnedFd,
+    challenge: &[u8; 128],
+    helper_pid: u32,
+    deadline: Instant,
+    produced: super::native_data::ProducedV4,
+) -> Result<RunHandoff, WorkerError> {
+    let transport = receive_verified_transport(socket, challenge, helper_pid, deadline)?;
+    produced.matches(&transport.binding)?;
+    Ok(RunHandoff {
+        permit: ProductionPermit { _private: () },
+        transport,
+    })
+}
+
 /// Единственный receiver-конструктор: caller bytes и Roles сами по себе не proof.
 fn receive_verified_transport(
     socket: &OwnedFd,
@@ -351,6 +371,33 @@ impl ProductionPermit {
     ) -> Result<(), WorkerError> {
         transport_send(socket, roles, binding, worker_pid, worker_uid, deadline)
     }
+}
+/// Consuming sender сохраняет owning stamp у supervisor до первой отправки.
+#[allow(clippy::too_many_arguments)] // Frozen роли, binding и authenticated peer остаются раздельными.
+pub(crate) fn handoff_verified_run(
+    run: crate::helper::native_bootstrap::RunRole,
+    socket: &OwnedFd,
+    roles: Roles,
+    binding: &Binding,
+    pid: u32,
+    uid: u32,
+    deadline: Instant,
+    retain: impl FnOnce(crate::helper::native_bootstrap::RuntimeScopeStamp),
+) -> Result<(), WorkerError> {
+    run.validate().map_err(|_| WorkerError::Peer)?;
+    let (nonce, session, generation, invocation, epoch, digest) =
+        run.context().map_err(|_| WorkerError::Peer)?;
+    if nonce != binding.nonce
+        || session != binding.session
+        || generation != binding.generation
+        || invocation != binding.invocation
+        || epoch != binding.epoch
+        || digest != binding.digest
+    {
+        return Err(WorkerError::Peer);
+    }
+    retain(run.into_guard());
+    transport_send(socket, roles, binding, pid, uid, deadline)
 }
 fn transport_send(
     socket: &OwnedFd,

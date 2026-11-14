@@ -6,6 +6,8 @@
 
 pub mod fence;
 mod kernel_evidence;
+pub(crate) mod native_bootstrap;
+mod native_profile;
 mod protection_host;
 mod session_network;
 pub use session_network::SessionNetworkPlan;

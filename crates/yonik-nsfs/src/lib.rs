@@ -1,5 +1,9 @@
 //! Узкие safe nsfs/TUN API. Нет raw FD, generic ioctl или setns API.
 #![cfg(target_os = "linux")]
+// Байты c083 сохраняются для аудита; изменяется только безопасный protocol layer.
+#[rustfmt::skip]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64", target_env = "gnu"))]
+pub mod fixed_self_fence;
 pub mod kernel_probe;
 pub mod kernel_probe_v2;
 /// Fixed parent-death adapter локального sealed core; отдельное unsafe approval.
