@@ -1,0 +1,88 @@
+{
+  "status": "READONLY_CLOSURE_VERIFIED_DRY_RUN_ONLY",
+  "snapshot": "/home/myrs/projects/yonik/local/evidence/p02-one-pair-closure-b1b9ce1",
+  "snapshot_manifest_sha256": "21f90aa0776ba26870c0e691c7479d9a122efbd64e961ae4beac8d781b51033e",
+  "reviewed_selector_commit": "b1b9ce10525082039ecbdf87a6abbf33fc11449f",
+  "reviewed_guard_commit": "51fd15a3a94c1e5e2ca400e1dcd7ccf26438715e",
+  "selector_sha256": "cf898d917d0c425f1e6583b175cc10d649254a3b4928da40790be3dc1c391fc6",
+  "files": {
+    "tools/p02/one_pair.py": {
+      "sha256": "cf898d917d0c425f1e6583b175cc10d649254a3b4928da40790be3dc1c391fc6",
+      "bytes": 7876,
+      "source_commit": "b1b9ce10525082039ecbdf87a6abbf33fc11449f",
+      "role": "Python source/import closure"
+    },
+    "tools/p02/connected_idle.py": {
+      "sha256": "508f837200ffa07aaaca6e88cc296c41dd789bf6dfbd9aa054d6bd8c43536f23",
+      "bytes": 36253,
+      "source_commit": "51fd15a3a94c1e5e2ca400e1dcd7ccf26438715e",
+      "role": "Python source/import closure"
+    },
+    "tools/engine_host.py": {
+      "sha256": "823989baaec22e4ff2a1f38995b2871c35f63b746ac3a63248030df5b5bb72bf",
+      "bytes": 19537,
+      "source_commit": "b1b9ce10525082039ecbdf87a6abbf33fc11449f",
+      "role": "Python source/import closure"
+    },
+    "tools/engine_compile.py": {
+      "sha256": "c7abdf38dc71c619211810c5e6c689cf3425969a7462f67d6aa3b5f1ad729d86",
+      "bytes": 15834,
+      "source_commit": "b1b9ce10525082039ecbdf87a6abbf33fc11449f",
+      "role": "Python source/import closure"
+    },
+    "tools/engine_smoke.py": {
+      "sha256": "8d23004f00c66bd7b27a92131f742416c9dc20b358e8c3b0551d64a5b93a545f",
+      "bytes": 6191,
+      "source_commit": "b1b9ce10525082039ecbdf87a6abbf33fc11449f",
+      "role": "Python source/import closure"
+    },
+    "tools/traffic_echo.py": {
+      "sha256": "2bc21663cec8d4743bcc146ac1d377b1e0dbc893e1f4d6a03d54e6865100d935",
+      "bytes": 2399,
+      "source_commit": "b1b9ce10525082039ecbdf87a6abbf33fc11449f",
+      "role": "Python source/import closure"
+    },
+    "tools/p02/tray_fixture.py": {
+      "sha256": "29e9fad8ab766997ede880f6e2925a544e9fbd92439a406f5c8d63cb8f313a33",
+      "bytes": 1250,
+      "source_commit": "b1b9ce10525082039ecbdf87a6abbf33fc11449f",
+      "role": "Python source/import closure"
+    },
+    "crates/yonik-desktop/qml/Main.qml": {
+      "sha256": "d6646815e76876b801ef2260ea628bd42de8421be998d4cc09618ab898f324bf",
+      "bytes": 130478,
+      "source_commit": "b1b9ce10525082039ecbdf87a6abbf33fc11449f",
+      "role": "qrc hash reference; GUI QML itself embedded in ELF"
+    }
+  },
+  "host_inputs_verified_count": 28,
+  "external_artifacts": {
+    "/home/myrs/projects/yonik/local/evidence/p02-short-private-20261114/yonik-desktop": "e3aee54cab750d072dc1f9d075a3c5eb4b0911d96360d834d5680f3bd812e8f8",
+    "/home/myrs/projects/yonik/local/evidence/p02-short-private-20261114/observer.so": "e7c94f3a66b6f6c7d439ea35ca6f0b867170aff4ee0d000a9c45be4b90b092d5",
+    "/home/myrs/projects/yonik/local/engines/sing-box-1.14.4/sing-box": "1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a"
+  },
+  "isolated_exact_argv": [
+    "env",
+    "-i",
+    "PATH=/usr/bin:/bin",
+    "LANG=C.UTF-8",
+    "PYTHONDONTWRITEBYTECODE=1",
+    "/usr/bin/python3",
+    "-B",
+    "/home/myrs/projects/yonik/local/evidence/p02-one-pair-closure-b1b9ce1/tools/p02/one_pair.py"
+  ],
+  "cwd": "/",
+  "fixed_output": "/home/myrs/projects/yonik/local/evidence/p02-replacement-sb2-reviewed",
+  "fixed_output_absent": true,
+  "runtime_events": [],
+  "owned_background_handles": [],
+  "permissions": "all snapshot dirs 0555/files 0444; no symlinks; owner can chmod, not kernel immutable flag",
+  "gate": "Root-owned toolkit terminal COMPLETE + owned cleanup required; not polled, no waiter/autolaunch",
+  "verification_evidence": "/home/myrs/projects/yonik/local/evidence/p02-closure-verification-b1b9ce1",
+  "scope_notes": [
+    "Readonly file/hash closure, not a frozen OS image; system runtime updates require host-input recheck.",
+    "GI/dbus host package locations hashed without running tray/native GUI.",
+    "Main.qml copied for source-bound qrc hash check; other QML embedded in unchanged ELF.",
+    "Unused linux-composition metadata retained only in verification evidence, not runtime closure."
+  ]
+}

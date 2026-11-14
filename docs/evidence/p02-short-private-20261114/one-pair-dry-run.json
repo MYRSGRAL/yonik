@@ -1,0 +1,29 @@
+{
+  "mode": "dry-run",
+  "core": "sing-box",
+  "replaces_old_pair": 2,
+  "windows": [
+    {
+      "group": "full",
+      "seconds": 900
+    },
+    {
+      "group": "engine",
+      "seconds": 900
+    }
+  ],
+  "output": "/home/myrs/projects/yonik/local/evidence/p02-replacement-sb2-reviewed",
+  "bindings": {
+    "/home/myrs/projects/yonik/local/evidence/p02-short-private-20261114/yonik-desktop": "e3aee54cab750d072dc1f9d075a3c5eb4b0911d96360d834d5680f3bd812e8f8",
+    "/home/myrs/projects/yonik/local/evidence/p02-short-private-20261114/observer.so": "e7c94f3a66b6f6c7d439ea35ca6f0b867170aff4ee0d000a9c45be4b90b092d5",
+    "/home/myrs/projects/yonik/local/engines/sing-box-1.14.4/sing-box": "1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a",
+    "/home/myrs/.t3/worktrees/yonik/t3-aef0f1a8-4b0e7a90d95fae43/tools/p02/connected_idle.py": "508f837200ffa07aaaca6e88cc296c41dd789bf6dfbd9aa054d6bd8c43536f23"
+  },
+  "selector_sha256": "cf898d917d0c425f1e6583b175cc10d649254a3b4928da40790be3dc1c391fc6",
+  "guard_source": "51fd15a3a94c1e5e2ca400e1dcd7ccf26438715e",
+  "controls": "reuse unchanged /home/myrs/projects/yonik/local/evidence/p02-r2-targeted-20261114/completion.json",
+  "config": "actual full GUI captured bytes -> same bytes object to engine_only; no recompilation",
+  "fixture": "existing private loopback HTTPS/peer/gui helpers; free owned ports; no caller config",
+  "environment": "GUI/private bus/SecretService via gui(); engine LANG=C, SSL_CERT_FILE=own CA; same fixture/CA",
+  "acceptance": "bounded observational reuse only; replacement still requires review"
+}

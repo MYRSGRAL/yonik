@@ -1,0 +1,34 @@
+{
+  "outcome": "BLOCKED_TOOLING_PREFLIGHT_NOT_RUNTIME_GATE",
+  "base": "a29ea61610ea5de9fd188e65198295d71e9f2278",
+  "branch": "test/performance-p02-short-independent",
+  "uid": 1000,
+  "namespaces": {
+    "pid": "pid:[4026531836]",
+    "user": "user:[4026531837]",
+    "net": "net:[4026531833]",
+    "mnt": "mnt:[4026531832]"
+  },
+  "source_sha256": {
+    "crates/yonik-desktop/src/application.cpp": "e3ac3a61c4ad6c657e8c55b2f0a14926295be804b9e96c29a6f00cb5ca79b770",
+    "crates/yonik-desktop/src/main.rs": "a65e26873d34f79a85c24a7b7432a8c91374000d4e27d23a4bdec6ee990c7e59",
+    "crates/yonik-desktop/src/backend.rs": "d6b8f560dadbbec9d78f4afe34d55a6f2ed88ff99c502f876a9d823426c3a328",
+    "crates/yonik-desktop/build.rs": "5e7afaf20e6e9e6b1638782226632d4e3f3474bbf230eb1473b2ef3c3c5d8ae5",
+    "docs/specs/performance.md": "d6fbdcd826ec3b39a9d687652ed5d0319c89aca02b92954b16a5dd7d3c0004b0"
+  },
+  "observations": {
+    "script_periodic_timer_25ms": true,
+    "smoke_shutdown_deadline_45000ms": true,
+    "p07_hidden_observer_in_base": false
+  },
+  "measurement_runs": 0,
+  "resource_variance": null,
+  "wakeups": null,
+  "wakeups_reason": "Не измерялись: runtime oracle preflight не выполнен; отсутствие данных, не нулевые wakeups.",
+  "processes_launched": [],
+  "limitations": [
+    "Статический preflight; positive/negative peer controls не запускались.",
+    "Идентичность фактического runtime config и process accounting не установлена.",
+    "Не является P02 SHORT PASS, P02 8h energy или G-POWER."
+  ]
+}

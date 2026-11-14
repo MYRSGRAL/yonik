@@ -1,0 +1,47 @@
+{
+  "status": "CHECKPOINT_REVIEW_REQUIRED; campaign already launched before checkpoint; NOT_SHORT_PASS",
+  "production_source": "a29ea61610ea5de9fd188e65198295d71e9f2278",
+  "artifact_root": "/home/myrs/projects/yonik/local/evidence/p02-short-private-20261114",
+  "live_session_handle": 57793,
+  "live_campaign": {
+    "pid": 1658427,
+    "starttime": "4662119",
+    "deadline_unix": 1794628424.0076032,
+    "terminal_files": [
+      "result.json",
+      "failure.json"
+    ]
+  },
+  "binary_sha256": "e3aee54cab750d072dc1f9d075a3c5eb4b0911d96360d834d5680f3bd812e8f8",
+  "observer_sha256": "e7c94f3a66b6f6c7d439ea35ca6f0b867170aff4ee0d000a9c45be4b90b092d5",
+  "source_main_archive_sha256": "e7306c6b729aab9b2ff405aa3a50854865db5655069e5138da8a994e01d200c9",
+  "harness_sources": {
+    "tools/p02/private_preflight.py": "e1100b662c93a4cda374cd12da70ee60bd6043ce746fe86dd92ba18ffd6055d0",
+    "tools/p02/tray_fixture.py": "29e9fad8ab766997ede880f6e2925a544e9fbd92439a406f5c8d63cb8f313a33",
+    "tools/p02/connected_idle.py": "4e51d4676132da15e957479c84b404c3e3be0aa9adb31a766d796cfb0ff47ce7",
+    "tools/p02/test_sampler.py": "0e7aa31f707e8af56101a09d7da3d76ccb03c6beadefa9e70427af33a52aeb85",
+    "tools/p02/private_observer.cpp": "cb29c0524cba3653feb989331a32a2e3ee657f1b3f399a275d9d89bb72a9c671"
+  },
+  "oracles": {
+    "sing-box-oracle": {
+      "outcome": "SHORT_ORACLE_PASS_NOT_900S",
+      "config_sha256": "25103d35b60c55e4b682eb2b36b1484990db083ddbe36cb846ee6b9ac61f9a5d"
+    },
+    "xray-oracle": {
+      "outcome": "SHORT_ORACLE_PASS_NOT_900S",
+      "config_sha256": "4f998308c405747d62fe8812a09f962ec0f0772eeea0e025eb8f7b58ee20752a"
+    }
+  },
+  "baseline_oracle_samples": {
+    "sing-box-baseline-oracle": 2,
+    "xray-baseline-oracle": 2
+  },
+  "qrc_negative": {
+    "outcome": "FAILED_NOT_SHORT_PASS",
+    "error": "RuntimeError('actual qrc source hash mismatch')"
+  },
+  "scope": "dev/unoptimized actual GUI; LocalSocks; private SecretService+SNI fixture; no energy/physicalPlasma/fullTUN",
+  "long_samples_at_checkpoint": [
+    "sing-box-1-full"
+  ]
+}

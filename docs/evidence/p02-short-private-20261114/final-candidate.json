@@ -1,0 +1,226 @@
+{
+  "classification": "CANDIDATE_NOT_ACCEPTED",
+  "measurement_source": "35408d531a86ec858e1d2fc3489e8e092fda5d27",
+  "validator_source": "51fd15a3a94c1e5e2ca400e1dcd7ccf26438715e",
+  "validator_sha256": "508f837200ffa07aaaca6e88cc296c41dd789bf6dfbd9aa054d6bd8c43536f23",
+  "checked_at_unix": 1794627310.0541916,
+  "windows": [
+    {
+      "window": "sing-box-1-full",
+      "rows": 31,
+      "duration_s": 900.0028438419977,
+      "sample_sha256": "45a7c6e3ee82e455dd748c81f37a163a2568aec3f7de645879de7c47ef91d45a",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "sing-box-1-engine",
+      "rows": 31,
+      "duration_s": 900.029156620003,
+      "sample_sha256": "b26a79871e485c5fe52185362ea54f3ef4d79954299628193ea047f9426f29f8",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "sing-box-2-full",
+      "rows": 31,
+      "duration_s": 900.022437231004,
+      "sample_sha256": "b6c607e7e655852daddc24fdd2ff2a5baddab428a78b1c0f67c820bcaa5af68e",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "sing-box-2-engine",
+      "rows": 31,
+      "duration_s": 900.0285381299982,
+      "sample_sha256": "03ad23f14b7f20e7ccebfde3ab499c44bfc9bd1ecb7c55f75603068b0e3d92ab",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "sing-box-3-full",
+      "rows": 31,
+      "duration_s": 900.0283917339984,
+      "sample_sha256": "8a538207efe923ff8687ca700b573dafd81f6df6a6f652c6d3f14797787f518b",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "sing-box-3-engine",
+      "rows": 31,
+      "duration_s": 900.0202461840017,
+      "sample_sha256": "87f36b05671048e86a3adaff371d8f6741c96edb4b5478900e87855d4161cc9d",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "xray-1-full",
+      "rows": 31,
+      "duration_s": 900.0268471119998,
+      "sample_sha256": "c008706b125f41e098dc0e940c7c257f927f0b38a06c928b0225df4a923ed748",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "xray-1-engine",
+      "rows": 31,
+      "duration_s": 900.0294039340006,
+      "sample_sha256": "16d427ac3a1afac3738e231655bfbfc82a7ce67fb197573c178e93c7cf15bedc",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "xray-2-full",
+      "rows": 31,
+      "duration_s": 900.0289861170022,
+      "sample_sha256": "4d14957b2bc7116263727fd02c66ad9958d2739ff64bc9f7aced490bd5363910",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "xray-2-engine",
+      "rows": 31,
+      "duration_s": 900.0016065379968,
+      "sample_sha256": "399edbbfaf8ded8ef252b5d072e9e56989e4187c664ba895ee76f6fb6f6787c0",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "xray-3-full",
+      "rows": 31,
+      "duration_s": 900.0009938160001,
+      "sample_sha256": "30e6b8f975893401747554f06363892ef39917bc926f4da162903aff68866fdd",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    },
+    {
+      "window": "xray-3-engine",
+      "rows": 31,
+      "duration_s": 900.0026320930046,
+      "sample_sha256": "0e35723519e63b5622bb017170762e0e4e7d016e81dcb15ee8d3c5a5cc7a56ba",
+      "errors": [],
+      "known_product_identities_still_alive": []
+    }
+  ],
+  "pairs": [
+    {
+      "core": "sing-box",
+      "repeat": 1,
+      "bytes_identical": true,
+      "config_sha256": "25103d35b60c55e4b682eb2b36b1484990db083ddbe36cb846ee6b9ac61f9a5d"
+    },
+    {
+      "core": "sing-box",
+      "repeat": 2,
+      "bytes_identical": true,
+      "config_sha256": "25103d35b60c55e4b682eb2b36b1484990db083ddbe36cb846ee6b9ac61f9a5d"
+    },
+    {
+      "core": "sing-box",
+      "repeat": 3,
+      "bytes_identical": true,
+      "config_sha256": "25103d35b60c55e4b682eb2b36b1484990db083ddbe36cb846ee6b9ac61f9a5d"
+    },
+    {
+      "core": "xray",
+      "repeat": 1,
+      "bytes_identical": true,
+      "config_sha256": "4f998308c405747d62fe8812a09f962ec0f0772eeea0e025eb8f7b58ee20752a"
+    },
+    {
+      "core": "xray",
+      "repeat": 2,
+      "bytes_identical": true,
+      "config_sha256": "4f998308c405747d62fe8812a09f962ec0f0772eeea0e025eb8f7b58ee20752a"
+    },
+    {
+      "core": "xray",
+      "repeat": 3,
+      "bytes_identical": true,
+      "config_sha256": "4f998308c405747d62fe8812a09f962ec0f0772eeea0e025eb8f7b58ee20752a"
+    }
+  ],
+  "variance": {
+    "sing-box": {
+      "engine": {
+        "cpu_s": {
+          "min": 0.01,
+          "max": 0.04,
+          "median": 0.03
+        },
+        "pss_end_kib": {
+          "min": 38248,
+          "max": 41006,
+          "median": 40143
+        },
+        "private_dirty_end_kib": {
+          "min": 14372,
+          "max": 16396,
+          "median": 16172
+        }
+      },
+      "full": {
+        "cpu_s": {
+          "min": 0.02,
+          "max": 0.03,
+          "median": 0.02
+        },
+        "pss_end_kib": {
+          "min": 133490,
+          "max": 149069,
+          "median": 142404
+        },
+        "private_dirty_end_kib": {
+          "min": 88992,
+          "max": 98012,
+          "median": 95204
+        }
+      }
+    },
+    "xray": {
+      "engine": {
+        "cpu_s": {
+          "min": 0.02,
+          "max": 0.03,
+          "median": 0.02
+        },
+        "pss_end_kib": {
+          "min": 33752,
+          "max": 33844,
+          "median": 33840
+        },
+        "private_dirty_end_kib": {
+          "min": 8412,
+          "max": 8500,
+          "median": 8440
+        }
+      },
+      "full": {
+        "cpu_s": {
+          "min": 0.02,
+          "max": 0.04,
+          "median": 0.04
+        },
+        "pss_end_kib": {
+          "min": 121979,
+          "max": 124450,
+          "median": 122599
+        },
+        "private_dirty_end_kib": {
+          "min": 68196,
+          "max": 70384,
+          "median": 68356
+        }
+      }
+    }
+  },
+  "noise_windows": [
+    "sing-box-2-full"
+  ],
+  "limitations": [
+    "Posthoc rows only; new runtime guards not retroactively executed.",
+    "Control overlap noise in sing-box-2-full; cannot claim three clean repetitions per core.",
+    "Dev/unoptimized/offscreen/private SNI; not release/physical Plasma/8h energy/full TUN."
+  ],
+  "targeted_controls_completion": "/home/myrs/projects/yonik/local/evidence/p02-r2-targeted-20261114/completion.json"
+}
