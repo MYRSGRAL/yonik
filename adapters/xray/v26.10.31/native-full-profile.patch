@@ -1196,11 +1196,11 @@
 +	p = &ProfileRuntime{done: make(chan struct{})}
 +	p.ctx, p.cancel = context.WithCancel(context.Background())
 +	success := false
-+	defer func() {
++	defer func(runtime *ProfileRuntime) {
 +		if !success {
-+			_ = p.closeFiles()
++			_ = runtime.closeFiles()
 +		}
-+	}()
++	}(p)
 +	var files [4]*os.File
 +	var numbers [4]int
 +	for i, name := range profileLocatorNames {
@@ -1519,7 +1519,7 @@
 +}
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux_test.go
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,27 @@
 +//go:build linux
 +
 +package nativehooks
@@ -1528,6 +1528,15 @@
 +	"context"
 +	"testing"
 +)
++
++func TestProfileInvalidLocatorReturnsErrorWithoutPanic(t *testing.T) {
++	// Отказ до потребления FD: проверяется настоящий OS wrapper без OS I/O.
++	t.Setenv(profileLocatorNames[0], "invalid")
++	runtime, err := openProfileRuntime(nil)
++	if err != errProfile || runtime != nil {
++		t.Fatal("повреждённый locator должен вернуть отказ без runtime")
++	}
++}
 +
 +func TestProfileUnknownCleanupRetainsCustody(t *testing.T) {
 +	p := &ProfileRuntime{ctx: context.Background(), admission: profileAdmission{state: profileUnknown}}

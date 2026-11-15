@@ -414,6 +414,17 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
+- Go milestone a004e92 добавил launch/admission consumer до config parser и
+  feature construction. Он влит как промежуточный SOURCE, builder gate закрыт.
+  R7 нашёл P2: named result p становился nil до deferred cleanup при отказе.
+  Root захватил исходный runtime аргументом defer и добавил чистый regression
+  invalid locator, не потребляющий FD и не выполняющий OS/network operations.
+  RED подтвердил panic (exit2); GREEN regression и все TestProfile pure tests
+  прошли. Source, compiler binding и ELF сохранены до исполнения; evidence
+  p4-root-defer-fix вне TTL. Strict patch dry-run, pins, gofmt, Python2tests,
+  Ruff и diff-check PASS; собственный Go cache/build root очищен и удалён.
+  FlowGrant/ingress/transport/DNS-query hooks всё ещё отсутствуют; полный P4
+  и runtime не PASS. Rust shared codec/capsule counterpart продолжает работу.
 
 ## Ограничения
 
