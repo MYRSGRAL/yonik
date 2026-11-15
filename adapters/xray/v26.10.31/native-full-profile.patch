@@ -1,0 +1,59 @@
+--- a/app/dns/nameserver_local.go
++++ b/app/dns/nameserver_local.go
+@@ -19,7 +19,7 @@
+ // QueryIP implements Server.
+ func (s *LocalNameServer) QueryIP(ctx context.Context, domain string, option dns.IPOption) (ips []net.IP, ttl uint32, err error) {
+ 	start := time.Now()
+-	ips, ttl, err = s.client.LookupIP(domain, option)
++	ips, ttl, err = s.client.LookupIPWithContext(ctx, domain, option)
+ 
+ 	if len(ips) > 0 {
+ 		errors.LogInfo(ctx, "Localhost got answer: ", domain, " -> ", ips)
+--- a/features/dns/localdns/client.go
++++ b/features/dns/localdns/client.go
+@@ -31,12 +31,20 @@
+ 
+ // LookupIP implements Client.
+ func (c *Client) LookupIP(host string, option dns.IPOption) ([]net.IP, uint32, error) {
++	return c.LookupIPWithContext(context.Background(), host, option)
++}
++
++// LookupIPWithContext сохраняет отмену и закрытые значения исходного запроса.
++func (c *Client) LookupIPWithContext(ctx context.Context, host string, option dns.IPOption) ([]net.IP, uint32, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, 0, err
++	}
+ 	var ips []net.IP
+ 	var err error
+ 	if len(internet.Controllers) > 0 {
+-		ips, err = c.r.LookupIP(context.Background(), "ip", host)
++		ips, err = c.r.LookupIP(ctx, "ip", host)
+ 	} else {
+-		ips, err = net.LookupIP(host)
++		ips, err = net.DefaultResolver.LookupIP(ctx, "ip", host)
+ 	}
+ 	if err != nil {
+ 		return nil, 0, err
+--- /dev/null
++++ b/features/dns/localdns/yonik_context_test.go
+@@ -0,0 +1,20 @@
++package localdns
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/xtls/xray-core/features/dns"
++)
++
++func TestYonikCancelledQueryDoesNotResolve(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	// nil resolver выявляет любую попытку продолжить запрос после отмены.
++	c := &Client{}
++	ips, ttl, err := c.LookupIPWithContext(ctx, "synthetic.invalid", dns.IPOption{IPv4Enable: true})
++	if !errors.Is(err, context.Canceled) || len(ips) != 0 || ttl != 0 {
++		t.Fatalf("отменённый запрос: ips=%d ttl=%d err=%v", len(ips), ttl, err)
++	}
++}
