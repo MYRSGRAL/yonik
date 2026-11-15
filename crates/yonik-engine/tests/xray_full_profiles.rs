@@ -18,12 +18,18 @@ fn profile(v: &Value) -> NativeProfile {
         _ => panic!("Нужен native profile"),
     }
 }
-fn plan() -> OwnedRuntimePlan {
+fn unbound_plan() -> OwnedRuntimePlan {
     OwnedRuntimePlan::new(
         NonZeroU16::new(10808).unwrap(),
         NonZeroU16::new(10809).unwrap(),
     )
     .unwrap()
+}
+fn plan() -> OwnedRuntimePlan {
+    // SYNTHETIC: даже отсутствие DNS app включает native localdns fallback.
+    unbound_plan()
+        .bind_system_resolver(&SyntheticBindings)
+        .unwrap()
 }
 fn emitted(c: &yonik_engine::CompiledConfig) -> Value {
     let mut b = Vec::new();
@@ -249,6 +255,8 @@ fn runtime_bytes_bind_ports_semantics_and_random_probe_credentials() {
         NonZeroU16::new(12000).unwrap(),
         NonZeroU16::new(12001).unwrap(),
     )
+    .unwrap()
+    .bind_system_resolver(&SyntheticBindings)
     .unwrap();
     let b = emitted(&compile_profile_local(&p, &runtime).unwrap());
     assert_ne!(a["inbounds"][0]["port"], b["inbounds"][0]["port"]);
@@ -412,7 +420,7 @@ fn seven_full_provider_shapes_preserve_dns_routing_and_owned_aliases() {
             ProviderIngressProtocol::Http
         );
         assert!(matches!(
-            compile_profile_local(&p, &plan()),
+            compile_profile_local(&p, &unbound_plan()),
             Err(ProfileCompileError::ResourceRequired)
         ));
         for system in [false, true] {
@@ -500,7 +508,7 @@ fn system_resolver_binding_is_required_without_replacing_provider_dns() {
     v["dns"] = json!({"servers":["localhost"]});
     let p = profile(&v);
     assert!(matches!(
-        compile_profile_local(&p, &plan()),
+        compile_profile_local(&p, &unbound_plan()),
         Err(ProfileCompileError::ResourceRequired)
     ));
     let rt = plan().bind_system_resolver(&SyntheticBindings).unwrap();
@@ -512,6 +520,86 @@ fn system_resolver_binding_is_required_without_replacing_provider_dns() {
         emitted(&compile_profile_local(&p, &rt).unwrap())["dns"],
         v["dns"]
     );
+}
+
+#[test]
+fn external_matchers_and_inverted_geoip_require_explicit_ownership() {
+    for (field, matcher) in [
+        ("domain", "ext-site:provider.dat:TEST"),
+        ("domain", "ext-domain:provider.dat:TEST"),
+        ("domain", "ext:provider.dat:TEST"),
+        ("ip", "ext-ip:provider.dat:TEST"),
+        ("ip", "!ext:provider.dat:TEST"),
+        ("ip", "!!!ext-ip:provider.dat:TEST"),
+        ("ip", "!geoip:TEST"),
+        ("ip", "!!geoip:TEST"),
+    ] {
+        let mut v = profiles().remove(3);
+        v["routing"] = json!({"rules":[{"type":"field",field:[matcher],"outboundTag":"edge"}]});
+        assert_eq!(
+            validate_profile(&profile(&v)).unwrap_err(),
+            ProfileCompileError::ResourceRequired
+        );
+    }
+    for matcher in [
+        "ext-site:provider.dat:TEST",
+        "ext-domain:provider.dat:TEST",
+        "ext:provider.dat:TEST",
+    ] {
+        let mut v = profiles().remove(3);
+        v["dns"] = json!({"servers":[{"address":"192.0.2.53","domains":[matcher]}]});
+        assert_eq!(
+            validate_profile(&profile(&v)).unwrap_err(),
+            ProfileCompileError::ResourceRequired
+        );
+        v["dns"] = json!({"hosts":{matcher:"192.0.2.1"},"servers":["192.0.2.53"]});
+        assert_eq!(
+            validate_profile(&profile(&v)).unwrap_err(),
+            ProfileCompileError::ResourceRequired
+        );
+    }
+    let mut v = profiles().remove(3);
+    v["routing"] = json!({"rules":[{"type":"field","domain":["regexp:^ext-site:literal$","!geoip:literal"],"outboundTag":"edge"}]});
+    let p = profile(&v);
+    assert!(validate_profile(&p).unwrap().resources().is_empty());
+    assert_eq!(
+        emitted(&compile_profile_local(&p, &plan()).unwrap())["routing"],
+        v["routing"]
+    );
+}
+
+#[test]
+fn implicit_system_dns_requires_binding_in_both_modes() {
+    for dns in [
+        None,
+        Some(json!({})),
+        Some(json!({"servers":[]})),
+        Some(json!({"tag":"dns-owned","servers":[]})),
+    ] {
+        let mut v = profiles().remove(3);
+        if let Some(dns) = dns {
+            v["dns"] = dns;
+        } else {
+            v.as_object_mut().unwrap().remove("dns");
+        }
+        let p = profile(&v);
+        let graph = validate_profile(&p).unwrap();
+        assert_eq!(graph.egress().system_resolvers().len(), 1);
+        assert_eq!(
+            compile_profile_local(&p, &unbound_plan()).unwrap_err(),
+            ProfileCompileError::ResourceRequired
+        );
+        let tun = || SystemTun::new(1, 1500, 42, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        assert!(matches!(
+            compile_profile_system(&p, &unbound_plan().with_system(tun())),
+            Err(ProfileCompileError::ResourceRequired)
+        ));
+        let rt = plan().bind_system_resolver(&SyntheticBindings).unwrap();
+        let local = emitted(&compile_profile_local(&p, &rt).unwrap());
+        assert_eq!(local.get("dns"), v.get("dns"));
+        let system = compile_profile_system(&p, &rt.with_system(tun())).unwrap();
+        assert_eq!(emitted(system.config()).get("dns"), v.get("dns"));
+    }
 }
 #[test]
 fn resource_budget_counts_unique_dats_and_rejects_conflicting_descriptors() {

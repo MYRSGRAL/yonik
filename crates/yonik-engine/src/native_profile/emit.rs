@@ -100,7 +100,7 @@ pub(super) fn emit(
         for rule in rules {
             for key in ["domain", "ip"] {
                 if let Some(list) = rule.get_mut(key) {
-                    bind_resources(list, runtime)?;
+                    bind_resources(list, runtime, key == "ip")?;
                 }
             }
         }
@@ -112,7 +112,7 @@ pub(super) fn emit(
     {
         for server in servers {
             if let Some(list) = server.get_mut("domains") {
-                bind_resources(list, runtime)?;
+                bind_resources(list, runtime, false)?;
             }
         }
     }
@@ -206,10 +206,10 @@ pub(super) fn emit(
     }
     Ok((config, graph))
 }
-fn bind_resources(value: &mut Value, runtime: &OwnedRuntimePlan) -> Result<(), Error> {
+fn bind_resources(value: &mut Value, runtime: &OwnedRuntimePlan, ip: bool) -> Result<(), Error> {
     match value {
         Value::String(s) => {
-            if let Some(requirement) = super::validate::resource(s)? {
+            if let Some(requirement) = super::validate::resource(s, ip)? {
                 let (_, reference) = runtime
                     .resources
                     .iter()
@@ -220,12 +220,12 @@ fn bind_resources(value: &mut Value, runtime: &OwnedRuntimePlan) -> Result<(), E
         }
         Value::Array(a) => {
             for v in a {
-                bind_resources(v, runtime)?;
+                bind_resources(v, runtime, ip)?;
             }
         }
         Value::Object(o) => {
             for v in o.values_mut() {
-                bind_resources(v, runtime)?;
+                bind_resources(v, runtime, ip)?;
             }
         }
         _ => (),

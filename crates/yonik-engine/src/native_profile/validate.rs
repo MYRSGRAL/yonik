@@ -88,29 +88,39 @@ fn ports(s: &str) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn resource(s: &str) -> Result<Option<OwnedResourceRequirement>> {
+pub(super) fn resource(s: &str, ip: bool) -> Result<Option<OwnedResourceRequirement>> {
     use crate::resource_bundle::ResourceKind;
-    if s.starts_with("ext:") || s.starts_with("ext-ip:") || s.starts_with("ext-domain:") {
+    // Native IP parser снимает все ! до распознавания DAT; domain parser этого
+    // не делает. Инвертированные geoip пока не имеют owned representation.
+    let matcher = if ip { s.trim_start_matches('!') } else { s };
+    let external = if ip {
+        &["ext:", "ext-ip:"][..]
+    } else {
+        &["ext:", "ext-domain:", "ext-site:"][..]
+    };
+    if external.iter().any(|prefix| matcher.starts_with(prefix))
+        || (ip && matcher != s && matcher.starts_with("geoip:"))
+    {
         return Err(Error::ResourceRequired);
     }
-    for (prefix, kind) in [
-        ("geoip:", ResourceKind::Cidrs),
-        ("geosite:", ResourceKind::Domains),
-    ] {
-        if let Some(category) = s.strip_prefix(prefix) {
-            if category.is_empty()
-                || category.len() > 128
-                || !category
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.@!".contains(&b))
-            {
-                return Err(Error::Schema);
-            }
-            return Ok(Some(OwnedResourceRequirement {
-                kind,
-                category: category.to_owned(),
-            }));
+    let (prefix, kind) = if ip {
+        ("geoip:", ResourceKind::Cidrs)
+    } else {
+        ("geosite:", ResourceKind::Domains)
+    };
+    if let Some(category) = matcher.strip_prefix(prefix) {
+        if category.is_empty()
+            || category.len() > 128
+            || !category
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.@!".contains(&b))
+        {
+            return Err(Error::Schema);
         }
+        return Ok(Some(OwnedResourceRequirement {
+            kind,
+            category: category.to_owned(),
+        }));
     }
     Ok(None)
 }
@@ -652,7 +662,7 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
             }
             for key in ["domain", "ip"] {
                 for s in strings(rule, key)? {
-                    if let Some(r) = resource(&s)? {
+                    if let Some(r) = resource(&s, key == "ip")? {
                         if !resources.contains(&r) {
                             resources.push(r);
                         }
@@ -742,7 +752,11 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
     let (resolvers, system_resolvers) = if let Some(dns) = value.get("dns") {
         dns_validate(dns, &mut resources)?
     } else {
-        (Vec::new(), Vec::new())
+        // core/xray.go устанавливает localdns.New при отсутствии DNS app.
+        (
+            Vec::new(),
+            vec![SystemResolverRequirement { subject: None }],
+        )
     };
     let mut ingresses = Vec::new();
     let mut ingress_tags = HashSet::new();
@@ -869,7 +883,7 @@ fn dns_validate(
     choice(dns, "queryStrategy", &["UseIP", "UseIPv4", "UseIPv6"])?;
     if let Some(h) = dns.get("hosts") {
         for (key, v) in h.as_object().ok_or(Error::Schema)? {
-            if resource(key)?.is_some() {
+            if resource(key, false)?.is_some() {
                 return Err(Error::ResourceRequired);
             }
             if v.as_str().is_none() {
@@ -877,7 +891,14 @@ fn dns_validate(
             }
         }
     }
-    for server in array(dns, "servers")? {
+    let servers = array(dns, "servers")?;
+    if servers.is_empty() {
+        // DNS app с пустым clients также включает NewLocalDNSClient.
+        system_resolvers.push(SystemResolverRequirement {
+            subject: dns.get("tag").and_then(Value::as_str).map(str::to_owned),
+        });
+    }
+    for server in servers {
         let address = if let Some(s) = server.as_str() {
             s
         } else {
@@ -893,7 +914,7 @@ fn dns_validate(
                 ],
             )?;
             for d in strings(server, "domains")? {
-                if let Some(r) = resource(&d)? {
+                if let Some(r) = resource(&d, false)? {
                     if !resources.contains(&r) {
                         resources.push(r);
                     }

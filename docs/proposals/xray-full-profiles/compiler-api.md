@@ -168,3 +168,16 @@ localdns client + fake/in-memory tests (Rust P3 эти Go-файлы не мен
 FlowGrant/ProbeGrant и session/digest/generation binding из reviewed contracts
 остаются обязательными. Ни core/config-check, ни network, services или Linux
 acceptance в этой фазе не выполнялись.
+
+### Уточнение resource/DNS admission после source review
+
+Классификация DAT учитывает отдельную pinned grammar domain/IP. Внешние
+`ext:`, `ext-domain:`, `ext-site:` в domain/DNS и `ext:`, `ext-ip:` после всех
+IP inversion prefixes отвергаются. Инвертированный `geoip:` пока явно
+отклоняется как `ResourceRequired`; подстановка не теряет инверсию молча.
+Обычные domain/regexp строки не интерпретируются как IP resources.
+
+Пустой `dns`, отсутствующий/пустой `servers` и отсутствие всего DNS app требуют
+system resolver binding: native DNS app и core fallback включают localdns.
+Provider DNS при этом не подменяется. Это полнота requirement manifest, а не
+доказательство actual resolver snapshot или полномочий его сокетов.
