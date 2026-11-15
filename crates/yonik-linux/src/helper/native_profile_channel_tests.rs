@@ -965,12 +965,14 @@ struct FakeIo {
     state: std::cell::RefCell<IoState>,
     wrong_ack: bool,
     service: bool,
+    user_dns: bool,
 }
 #[derive(Default)]
 struct IoState {
     incoming: VecDeque<Vec<u8>>,
     sent: Vec<Vec<u8>>,
     finished: bool,
+    dns_private: Option<(u64, u64)>,
 }
 impl FakeIo {
     fn push(
@@ -1053,6 +1055,16 @@ impl Channel for FakeIo {
                     );
                     return Ok(true);
                 }
+                if self.user_dns {
+                    self.push(
+                        &mut state,
+                        3,
+                        0,
+                        wire::Kind::OpenIngress,
+                        open(Mode::System, 32001),
+                    );
+                    return Ok(true);
+                }
                 self.push(
                     &mut state,
                     3,
@@ -1093,6 +1105,68 @@ impl Channel for FakeIo {
                     },
                 );
             }
+            wire::Message::IngressReply {
+                status: wire::Status::Allow,
+                flow,
+                revision,
+                required: true,
+            } if self.user_dns => {
+                state.dns_private = Some((flow, revision));
+                self.push(
+                    &mut state,
+                    4,
+                    0,
+                    wire::Kind::Authorize,
+                    wire::Message::Authorize(wire::Authorize {
+                        source_flow: flow,
+                        class: 3,
+                        subject: u16::MAX,
+                        chain: u16::MAX,
+                        transport: u16::MAX,
+                        scope: u16::MAX,
+                        branch: 0,
+                        original: original(),
+                        effective: wire::Destination {
+                            protocol: 17,
+                            family: 4,
+                            port: 53,
+                            bytes: &[192, 0, 2, 53],
+                        },
+                        resolver: 0,
+                        query: "query.invalid",
+                        receipt: wire::Receipt {
+                            kind: wire::ReceiptKind::None,
+                            id: 0,
+                        },
+                    }),
+                );
+            }
+            wire::Message::Grant {
+                class: 3,
+                flow,
+                revision,
+                required: true,
+                fresh,
+                receipt,
+                ..
+            } if self.user_dns => {
+                assert_eq!(Some((flow, revision)), state.dns_private);
+                assert!(fresh > 0 && fresh <= 20_000_000);
+                assert_eq!(receipt.kind, wire::ReceiptKind::SidebandOperation);
+                assert_ne!(receipt.id, 0);
+                self.push(
+                    &mut state,
+                    5,
+                    0,
+                    wire::Kind::Cancel,
+                    wire::Message::Cancel {
+                        target: 2,
+                        reason: 1,
+                        id: flow,
+                    },
+                );
+            }
+            wire::Message::CloseAck { target: 2, .. } if self.user_dns => state.finished = true,
             wire::Message::Grant {
                 flow: 0,
                 grant,
@@ -1147,6 +1221,7 @@ fn actual_driver_commits_exact_ack_drains_cancel_and_preserves_neighbor() {
         state: Default::default(),
         wrong_ack: false,
         service: false,
+        user_dns: false,
     };
     let ready = AtomicBool::new(false);
     assert!(run_issuer(&mut issuer, &io, 8, 997, &AtomicBool::new(false), &ready).is_err());
@@ -1183,6 +1258,7 @@ fn wrong_manifest_ack_never_commits_or_mints() {
         state: Default::default(),
         wrong_ack: true,
         service: false,
+        user_dns: false,
     };
     let ready = AtomicBool::new(false);
     assert!(run_issuer(&mut issuer, &io, 8, 997, &AtomicBool::new(false), &ready).is_err());
@@ -1200,6 +1276,7 @@ fn actual_driver_service_dispatch_drains_cancel_before_allow_and_retires_grant()
         state: Default::default(),
         wrong_ack: false,
         service: true,
+        user_dns: false,
     };
     assert!(
         run_issuer(
@@ -1239,6 +1316,58 @@ fn actual_driver_service_dispatch_drains_cancel_before_allow_and_retires_grant()
     }
     assert_eq!(allowed, vec![4]);
     assert_eq!(issuer.authority.released, vec![1, 2]);
+}
+#[test]
+fn r14_actual_system_user_dns_producer_preserves_private_flow_revision_and_owner_tail() {
+    let mut issuer = issuer(Mode::System);
+    let io = FakeIo {
+        record: issuer.record,
+        state: Default::default(),
+        wrong_ack: false,
+        service: false,
+        user_dns: true,
+    };
+    assert!(
+        run_issuer(
+            &mut issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    let state = io.state.borrow();
+    assert!(state.finished);
+    let private = state.dns_private.unwrap();
+    let mut grants = 0;
+    for bytes in &state.sent {
+        let frame = wire::Frame::decode(bytes, issuer.record.binding, Mode::System, true).unwrap();
+        if let wire::Message::Grant {
+            class: 3,
+            flow,
+            revision,
+            required,
+            fresh,
+            receipt,
+            grant,
+            ..
+        } = frame.message
+        {
+            grants += 1;
+            assert_eq!((flow, revision), private);
+            assert!(required);
+            assert!(fresh > 0 && fresh <= 20_000_000);
+            assert_eq!((frame.header.reply_to, frame.header.object_id), (4, grant));
+            assert_eq!(receipt.kind, wire::ReceiptKind::SidebandOperation);
+            assert_ne!(receipt.id, 0);
+        }
+    }
+    assert_eq!(grants, 1);
+    assert!(issuer.services.is_empty());
+    assert!(issuer.grants.is_empty());
+    assert!(issuer.flows.is_empty());
 }
 struct Backpressure {
     elapsed: Arc<std::sync::atomic::AtomicU64>,
