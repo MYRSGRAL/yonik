@@ -218,4 +218,3 @@ SS/Hysteria UDP каждый payload проверяет actual payload.UDP (и e
 не cached cone destination. Scope не разрешает arbitrary resolved peer/port:
 snapshot/provenance и mandatory dynamic firewall checks остаются обязательными.
 Не копировать protocol account/first stream attribution на next logical flow.
-

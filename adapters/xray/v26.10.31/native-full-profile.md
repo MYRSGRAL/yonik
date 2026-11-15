@@ -102,6 +102,11 @@ Issuer проверяет admitted run, trusted provenance, manifest subject/cha
 transport/resolver scope и mandatory constraints. App ACL проверяется только
 существующей trusted active policy. Xray policy.Manager — timeout/stats/buffer,
 не executable ACL. Provider rule tags, UI required, account email не authority.
+Для пользовательского System flow app_required=true означает свежий Known
+owner proof. Отсутствие отключённой optional App ACL само по себе не Allow
+и не Deny: issuer ещё обязан проверить manifest/mandatory constraints.
+Обязательная trusted active App ACL продолжает enforced-проверку; Unknown
+owner всегда deny. UI не может превратить required в false.
 
 System owner freshness остаётся ≤20ms исходного observation, RTT/очередь его
 не продлевают. Общий сериализованный owner backend возвращает один result для

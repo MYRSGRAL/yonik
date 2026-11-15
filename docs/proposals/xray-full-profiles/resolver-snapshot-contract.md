@@ -77,6 +77,16 @@ String: byteLength u16 + canonical ASCII bytes≤253; DNS root/trailing dot и
 case-folding следуют pinned netgo rules. Одинаковые aliases coalesce с сохранением
 порядка IP; неоднозначная normalization не выбирает произвольную запись.
 Парсер отвергает caps overflow до materialization, ничего не обрезает.
+Peers — effective ordered list pinned netgo, не все nameserver строки:
+`dnsReadConfig` берёт первые три записи, чей IP проходит `netip.ParseAddr`,
+в исходном порядке и с сохранением duplicates. При нуле допустимых записей
+в successfully captured config используется exact pinned defaultNS:
+`127.0.0.1:53`, затем `[::1]:53`. Storage cap16 не расширяет этот effective
+list и не позволяет обратиться к четвёртому серверу. Несовместимый с typed
+format/mandatory constraints выбранный peer (например zone address) даёт
+Unsupported всего snapshot, а не заменяется следующим сервером. При ошибке
+open/stat обязательного source нет proof для этого capture: admission отказывает,
+не перечитывая live config и не создавая неподтверждённый defaultNS post-admission.
 Отсутствие hosts file обозначается отдельной trusted source observation и
 пустым списком, не утверждением из UI; отсутствие/нечитабельность прочих
 обязательных источников даёт Unsupported до admission.
@@ -108,9 +118,13 @@ files/dns/resolve declarations и stub/search/options, а не чтением us
 В mappingVersion3 таблица11 ResolverSnapshotRef имеет count0/1. При отсутствии
 system resolver requirement — 0; при его наличии — ровно1. Row payload76 bytes:
 sourceDigest[32], assetHash[32], assetBytes u32, format u16=1, reserved u16=0,
-sourceFlags u32 (hosts-absent bit0, остальные0). Header ADMIT resolverSnapshotHash
-и system rows table5 snapshotHash равны sourceDigest. Manifest hash включает
-таблицу11; consumer acceptance подтверждает sourceDigest и assetHash.
+sourceFlags u32 (hosts-absent bit0, остальные0). Все system rows table5
+snapshotHash обязаны равняться единственному table11.sourceDigest; при count0
+system rows запрещены. Отдельного resolverSnapshotHash в ADMIT header нет и
+добавлять его не требуется. Manifest hash включает таблицу11. Существующий
+ADMIT_ACK с Allow по exact manifestHash/admissionId означает, что consumer
+проверил и принял все referenced assets, включая sourceDigest и assetHash
+таблицы11; дополнительных неописанных полей в ACK не появляется.
 Provider resolvers остаются отдельными table5 rows и не заменяются этим asset.
 
 Snapshot asset вместе с DAT входит в existing private asset storage budget:
@@ -142,6 +156,8 @@ synthetic fixtures. Доставка реальных data files/root-owned cata
 ## Проверки
 
 Pure fixtures сравнивают эффективный order/search/options с pinned Go vectors;
+проверяют четыре nameserver строки, duplicate order, пустой/invalid nameserver
+list с defaultNS и Unsupported для неподдержанного selected peer;
 проверяют оба family, files hit/DNS fallback, CNAME/full RRset, expiry/cancel,
 wrong peer/namespace/snapshot и cache waiter isolation. FD-backed/mocked identity
 tests проверяют symlink replacement, mutation и Unknown retaining custody.

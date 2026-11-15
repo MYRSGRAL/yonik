@@ -1,5 +1,5 @@
 ---
-status: proposed_for_source_review
+status: proposed_for_user_approval
 implementation_approved: false
 session_id: 2026-11-15-happ-full-profiles
 ---
@@ -25,6 +25,14 @@ snapshot. Private child-bound канал не даёт TUN/firewall/OS-attributi
 existing `app_required=true`, verified RuntimeScopeStamp и один owner backend.
 Xray выбирает provider route; issuer проверяет разрешённый scope и обязательные
 ограничения, не реализуя второй provider routing evaluator.
+`app_required=true` для пользовательского System flow требует свежего Known
+owner proof, а не обязательного существования optional global App ACL.
+Если optional App ACL отключена, её отсутствие само по себе не выдаёт grant
+и не означает deny: после Known owner issuer всё равно проверяет manifest и
+все mandatory constraints. Если trusted admission требует активную App ACL,
+её enforcement сохраняется. Unknown owner всегда deny. UI не может снять
+required; отдельные служебные Probe/DNS grants остаются service authority,
+не подставляют себе attribution пользовательского flow.
 
 ## Дополнительные Go callsites
 
