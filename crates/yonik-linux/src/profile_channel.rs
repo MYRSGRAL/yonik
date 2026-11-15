@@ -10,6 +10,141 @@ pub(crate) const LAUNCH_FD_LOCATOR: &str = "YONIK_PROFILE_LAUNCH_FD";
 pub(crate) const PEER_PIDFD_LOCATOR: &str = "YONIK_PROFILE_PEER_PIDFD";
 pub(crate) const ASSET_ROOT_FD_LOCATOR: &str = "YONIK_PROFILE_ASSET_ROOT_FD";
 
+#[derive(Clone, Copy)]
+pub(crate) struct ExecDelivery {
+    pub launch: LaunchRecord,
+    pub image: [u8; 32],
+    pub image_bytes: u64,
+    pub config_bytes: u32,
+}
+impl ExecDelivery {
+    pub(crate) fn encode(self) -> Result<[u8; 256]> {
+        if self.launch.mode != Mode::System
+            || self.image == [0; 32]
+            || self.image_bytes == 0
+            || self.image_bytes > 128 * 1024 * 1024
+            || self.config_bytes == 0
+            || self.config_bytes > 65536
+        {
+            return Err(Error::Bounds);
+        }
+        self.launch.encode()?;
+        let mut out = [0; 256];
+        out[..8].copy_from_slice(b"YNKEXC01");
+        put16(&mut out, 8, 1);
+        put16(&mut out, 10, 256);
+        put16(&mut out, 12, 2);
+        out[16..128].copy_from_slice(&self.launch.encode()?[16..128]);
+        put32(&mut out, 128, self.launch.child_pid);
+        put64(&mut out, 136, self.launch.child_start);
+        out[144..176].copy_from_slice(&self.image);
+        out[176..208].copy_from_slice(&self.launch.binding.digest);
+        out[208..240].copy_from_slice(&self.launch.manifest);
+        put64(&mut out, 240, self.image_bytes);
+        put32(&mut out, 248, self.config_bytes);
+        Ok(out)
+    }
+    pub(crate) fn decode(bytes: &[u8], launch: LaunchRecord) -> Result<Self> {
+        if bytes.len() != 256 {
+            return Err(Error::Bounds);
+        }
+        let value = Self {
+            launch,
+            image: bytes[144..176].try_into().map_err(|_| Error::Bounds)?,
+            image_bytes: u64::from_be_bytes(bytes[240..248].try_into().map_err(|_| Error::Bounds)?),
+            config_bytes: u32::from_be_bytes(
+                bytes[248..252].try_into().map_err(|_| Error::Bounds)?,
+            ),
+        };
+        if value.encode()?.as_slice() != bytes {
+            return Err(Error::Binding);
+        }
+        Ok(value)
+    }
+    pub(crate) fn ack(self) -> Result<[u8; 40]> {
+        extension_ack(b"YNKEXA01", &self.encode()?)
+    }
+}
+pub(crate) fn proof_bootstrap(launch: LaunchRecord) -> Result<[u8; 128]> {
+    if launch.mode != Mode::System {
+        return Err(Error::Binding);
+    }
+    let record = launch.encode()?;
+    let mut out = [0; 128];
+    out[..8].copy_from_slice(b"YNKPF001");
+    put16(&mut out, 8, 1);
+    put16(&mut out, 10, 128);
+    put16(&mut out, 12, 1);
+    out[16..].copy_from_slice(&record[16..128]);
+    Ok(out)
+}
+pub(crate) fn proof_bootstrap_ack(launch: LaunchRecord) -> Result<[u8; 40]> {
+    extension_ack(b"YNKPFA01", &proof_bootstrap(launch)?)
+}
+fn extension_ack(magic: &[u8; 8], record: &[u8]) -> Result<[u8; 40]> {
+    let mut out = [0; 40];
+    out[..8].copy_from_slice(magic);
+    out[8..].copy_from_slice(&Sha256::digest(record));
+    Ok(out)
+}
+#[derive(Clone, Copy)]
+pub(crate) struct SocketRecord {
+    pub request: u64,
+    pub proof: u64,
+    pub ingress: u16,
+    pub tuple: Tuple,
+}
+impl SocketRecord {
+    pub(crate) fn encode(self, launch: LaunchRecord) -> Result<[u8; 192]> {
+        proof_bootstrap(launch)?;
+        if [self.request, self.proof]
+            .iter()
+            .any(|id| *id == 0 || *id == u64::MAX)
+            || self.tuple.protocol != 6
+            || usize::from(self.ingress) >= TABLE_CAPS[4]
+        {
+            return Err(Error::Schema);
+        }
+        self.tuple.owner_flow()?;
+        let b = launch.binding;
+        let mut out = [0; 192];
+        out[..8].copy_from_slice(b"YNKSPF01");
+        put16(&mut out, 8, 1);
+        put16(&mut out, 10, 192);
+        put16(&mut out, 12, 1);
+        out[16..48].copy_from_slice(&b.digest);
+        out[48..64].copy_from_slice(&b.session);
+        out[64..80].copy_from_slice(&b.invocation);
+        put64(&mut out, 80, b.generation);
+        put64(&mut out, 88, b.epoch);
+        out[96..128].copy_from_slice(&launch.nonce);
+        put64(&mut out, 128, self.request);
+        put64(&mut out, 136, self.proof);
+        put16(&mut out, 144, self.ingress);
+        out[146] = 2;
+        self.tuple.write(&mut Writer {
+            bytes: &mut out[148..188],
+            position: 0,
+        })?;
+        Ok(out)
+    }
+    pub(crate) fn decode(bytes: &[u8], launch: LaunchRecord) -> Result<Self> {
+        if bytes.len() != 192 {
+            return Err(Error::Bounds);
+        }
+        let value = Self {
+            request: u64::from_be_bytes(bytes[128..136].try_into().map_err(|_| Error::Bounds)?),
+            proof: u64::from_be_bytes(bytes[136..144].try_into().map_err(|_| Error::Bounds)?),
+            ingress: u16::from_be_bytes(bytes[144..146].try_into().map_err(|_| Error::Bounds)?),
+            tuple: Tuple::read(&mut Reader::new(&bytes[148..188]))?,
+        };
+        if value.encode(launch)?.as_slice() != bytes {
+            return Err(Error::Binding);
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PeerIdentity {
     pid: u32,
@@ -2829,6 +2964,131 @@ impl Sequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn socket_record_constructor_rejects_invalid_tuple_and_ingress() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/system-proof-extension-v1.json"
+        ))
+        .unwrap();
+        let launch = LaunchRecord::decode(
+            &unhex(fixture["launch_hex"].as_str().unwrap()),
+            Mode::System,
+        )
+        .unwrap();
+        let socket =
+            SocketRecord::decode(&unhex(fixture["socket_hex"].as_str().unwrap()), launch).unwrap();
+        for tuple in [
+            Tuple {
+                local_port: 0,
+                ..socket.tuple
+            },
+            Tuple {
+                remote_port: 0,
+                ..socket.tuple
+            },
+            Tuple {
+                family: 0,
+                ..socket.tuple
+            },
+        ] {
+            assert!(SocketRecord { tuple, ..socket }.encode(launch).is_err());
+        }
+        for ingress in [64, u16::MAX] {
+            assert!(SocketRecord { ingress, ..socket }.encode(launch).is_err());
+        }
+    }
+    #[test]
+    fn independent_system_proof_extension_wire_and_hashes() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/system-proof-extension-v1.json"
+        ))
+        .unwrap();
+        let bytes = |key: &str| unhex(fixture[key].as_str().unwrap());
+        let launch = LaunchRecord::decode(&bytes("launch_hex"), Mode::System).unwrap();
+        let delivery = ExecDelivery::decode(&bytes("exec_hex"), launch).unwrap();
+        assert_eq!(delivery.image, [12; 32]);
+        assert_eq!((delivery.image_bytes, delivery.config_bytes), (4096, 64));
+        assert_eq!(delivery.ack().unwrap().as_slice(), bytes("exec_ack_hex"));
+        assert_eq!(
+            proof_bootstrap(launch).unwrap().as_slice(),
+            bytes("bootstrap_hex")
+        );
+        assert_eq!(
+            proof_bootstrap_ack(launch).unwrap().as_slice(),
+            bytes("bootstrap_ack_hex")
+        );
+        let socket = SocketRecord::decode(&bytes("socket_hex"), launch).unwrap();
+        assert_eq!((socket.request, socket.proof, socket.ingress), (3, 1, 0));
+        assert_eq!(
+            (socket.tuple.local_port, socket.tuple.remote_port),
+            (32001, 1080)
+        );
+        for key in ["exec_hex", "socket_hex"] {
+            let wire = bytes(key);
+            for length in 0..wire.len() {
+                assert!(if key == "exec_hex" {
+                    ExecDelivery::decode(&wire[..length], launch).is_err()
+                } else {
+                    SocketRecord::decode(&wire[..length], launch).is_err()
+                });
+            }
+            for offset in if key == "exec_hex" {
+                vec![
+                    0, 8, 10, 12, 14, 16, 48, 80, 96, 112, 120, 128, 132, 136, 176, 208, 252,
+                ]
+            } else {
+                vec![0, 8, 10, 12, 14, 16, 48, 64, 80, 88, 96, 146, 147, 188]
+            } {
+                let mut bad = wire.clone();
+                bad[offset] ^= 1;
+                assert!(
+                    if key == "exec_hex" {
+                        ExecDelivery::decode(&bad, launch).is_err()
+                    } else {
+                        SocketRecord::decode(&bad, launch).is_err()
+                    },
+                    "{key} offset {offset}"
+                );
+            }
+        }
+        for id in [0, u64::MAX] {
+            assert!(
+                SocketRecord {
+                    request: id,
+                    ..socket
+                }
+                .encode(launch)
+                .is_err()
+            );
+            assert!(
+                SocketRecord {
+                    proof: id,
+                    ..socket
+                }
+                .encode(launch)
+                .is_err()
+            );
+        }
+        assert!(
+            SocketRecord {
+                tuple: Tuple {
+                    protocol: 17,
+                    ..socket.tuple
+                },
+                ..socket
+            }
+            .encode(launch)
+            .is_err()
+        );
+        let local = LaunchRecord {
+            mode: Mode::Local,
+            child_pid: 0,
+            child_start: 0,
+            ..launch
+        };
+        assert!(proof_bootstrap(local).is_err());
+        assert!(ExecDelivery::decode(&bytes("exec_hex"), local).is_err());
+    }
     #[test]
     fn initiator_tuple_r8_matches_independent_open_ingress_vectors() {
         let f: serde_json::Value = serde_json::from_str(include_str!(

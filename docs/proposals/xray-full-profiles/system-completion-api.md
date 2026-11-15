@@ -291,7 +291,12 @@ Pure проверка driver использует injected Channel/Authority: sy
 refresh, receipt kind и rollback/Unknown custody. OS wrappers только компилируются;
 tests не вызывают process, proc, NSS, socketpair, systemd или kernel backend.
 
-## R10 System proof proposal — SOURCE, ещё не implementation
+## R10/R12 System extension — Rust implementation, gate закрыт
+
+Уточнения R12 реализованы в Rust producer/consumer; Go counterpart этой extension
+и runtime acceptance этим документом не подтверждаются. Независимые synthetic
+wire vectors: `tests/fixtures/xray-profile-channel-v3/system-proof-extension-v1.json`.
+Тесты используют только fake controls/in-memory state; ioctl/exec/network не запускались.
 
 Подтверждённый gap в b04c2c0: `native_profile_channel.rs::Peer::system/capture`
 (1635–1725) читает `/proc/<worker>/exe`; `Peer::socket` (1726–1790) сканирует
@@ -318,7 +323,7 @@ Cross-UID ptrace checks нельзя заменить Root UID, marker/env ил�
   actual initiator ownership. Exec delivery/socket custody их не заменяют;
   unchanged tuple, receipt kind/id и original expiry20ms обязательны.
 
-### Предлагаемый exec delivery proof без cross-UID proc
+### Exec delivery proof без cross-UID proc
 
 Worker удерживает duplicate существующего authenticated handoff FD до exec.
 После native payload/staging, перед `command.exec`, он посылает отдельный
@@ -331,7 +336,7 @@ binding/лишние rights закрывают всё; Unknown сохраняе�
 record/FD counts и YNKEXT01/ACK не меняются — exchange идёт отдельным сообщением
 после существующего payload ACK, на retained authenticated handoff.
 
-Минимальный proposed YNKEXC01 record256 (big endian): prefix16 содержит
+YNKEXC01 record256 (big endian): prefix16 содержит
 magic8/version u16=1/length u16=256/rights u16=2/reserved u16=0;
 nonce32@16,digest32@48,session16@80,invocation16@96,generation8@112,epoch8@120,
 taskPID4@128,reserved4@132,taskStart8@136,imageHash32@144,configHash32@176,
@@ -362,9 +367,15 @@ format даёт отказ. Старый Go consumer не считается с�
 versioned extension для root/Go review, не изменение frozen ABI/четырёх locators
 и не разрешение ancillary в runtime frame decoder.
 
+Bootstrap ACK ровно40 bytes: `YNKPFA01` + SHA256 всех128 bytes bootstrap record,
+без rights. Helper посылает ровно один bootstrap, принимает exact ACK от admitted
+task PID/UID в исходном admission deadline (дополнительно ≤1s). EOF, лишние rights,
+wrong digest/peer/replay/timeout закрывают setup. Затем HELLO и runtime frames
+не меняются; SCM_RIGHTS в runtime запрещены. Четыре locator env неизменны.
+
 На proof channel admitted Go передаёт accepted socket через SCM_RIGHTS с exact
 binding/request/source tuple/provenance. Полученный FD — actual kernel object,
-а не новый FlowGrant. Proposed YNKSPF01/version1 record192: prefix16
+а не новый FlowGrant. YNKSPF01/version1 record192: prefix16
 (magic/version/length192/rights1/reserved0),binding80@16,nonce32@96,
 runtimeRequestSequence8@128,monotonicProofId8@136,ingressIndex2@144,
 provenance1@146,reserved1@147,tuple40@148,reserved4@188. Exactly1 socket FD;
@@ -374,6 +385,15 @@ OPEN_INGRESS sequence/tuple/ingress/provenance один раз, без доба�
 pending≤64 с existing deadline; wrong/late/replay proof закрывает все rights.
 Runtime и proof channels обслуживаются одним issuer loop; RemoteLookup по-прежнему
 имеет единственного serial owner. Proof-channel EOF отзывает context.
+Proof может прийти до OPEN: `Rendezvous` удерживает owned FD под exact request
+sequence, но не создаёт source/owner/FlowGrant до matching OPEN. Обратный порядок
+также допустим. Совокупно pending+ready proofs≤64, queued runtime frames≤64;
+128KiB credit до создания очередей/чтения покрывает metadata и один fixed scratch
+FD. Первоначальный deadline каждого pending сообщения ≤1s не продлевается другим
+сообщением. ProofId строго возрастает; ноль/MAX, duplicate/late sequence и wrap
+запрещены. Один `SystemChannel` ждёт readiness обоих FD и revoke Notify, без
+нового owner reader или busy polling. Tokio UnixDatagram здесь владеет seqpacket
+FD только для readiness/try_io; raw recvmsg сохраняет packet/ancillary grammar.
 Порядок binding80 в новой extension: digest32,session16,invocation16,generation8,
 epoch8; это явный новый layout, не копирование runtime header128.
 Переданный FD — kernel object,
@@ -383,9 +403,23 @@ initiator tuple. Для namespace нужна **независимая** связ
 SIOCGSKNS на полученном socket FD и сравнение actual nsfs identity с retained
 RuntimeScopeStamp namespace. Existing CAP_NET_ADMIN применима только если
 подтверждена относительно socket net->user_ns; иначе Unsupported, без новых
-capabilities. Потребуется узкий safe nsfs ioctl wrapper с pure injected tests
-и отдельным source approval: он не входит в одобренное R10 Local расширение.
+capabilities. Узкий safe `yonik_nsfs::socket_namespace::socket_namespace`
+реализован в явно расширенном R12 ownership; fixed SIOCGSKNS, type/netns/CLOEXEC,
+pure injected controls, без общего ioctl API.
 Child-supplied namespace FD рядом с socket FD не доказывает эту связь.
+
+Production callers: `receive_verified_transport` удерживает CLOEXEC duplicate
+authenticated handoff до `RunHandoff::exec`; это сделано до `worker::serve_stream`
+drop payload stream. Consuming full-profile exec проверяет exact program FD и
+`run -c stdin:` args, ставит stdin из actual sealed config, передаёт readonly
+duplicates actual image/config и ждёт YNKEXA01. Никакого alternate fallback.
+`systemd_worker::start_native` после payload ACK вызывает `receive_exec_delivery`;
+он проверяет peer/record/type/seals/hash против retained WorkerPayload, резервирует
+executable budget до FD read и передаёт opaque VerifiedExecDelivery bounded queue.
+`ProfileRuntime::start_system` удерживает token и его budget в SystemResources
+до KnownClosed, включая ошибки bootstrap/HELLO и Unknown. Peer не читает чужой
+exe/fd table: System использует retained delivery FD и stamp/pidfd/start/UID.
+Local path сохраняет принятые R11 проверки и bootstrap не получает.
 
 После independent socket/namespace verification helper делает обычный fresh
 owner lookup инициаторного tuple и связывает flow с FD/cookie, source/provenance,

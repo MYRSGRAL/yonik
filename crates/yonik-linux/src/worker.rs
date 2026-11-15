@@ -374,6 +374,31 @@ impl WorkerPayload {
     pub(crate) fn image_hash(&self) -> [u8; 32] {
         self.header.binary_hash
     }
+    pub(crate) fn exec_delivery(
+        &self,
+        launch: crate::profile_channel::LaunchRecord,
+    ) -> Result<crate::profile_channel::ExecDelivery, WorkerError> {
+        let profile = self.full_profile().ok_or(WorkerError::Peer)?;
+        let capsule = crate::profile_channel::Capsule::decode(
+            profile.capsule_bytes(),
+            &self.header.config_hash,
+        )
+        .map_err(|_| WorkerError::Peer)?;
+        if launch.binding.digest != self.header.config_hash || launch.manifest != capsule.manifest {
+            return Err(WorkerError::Peer);
+        }
+        Ok(crate::profile_channel::ExecDelivery {
+            launch,
+            image: self.image_hash(),
+            image_bytes: self
+                .binary
+                .file
+                .metadata()
+                .map_err(|_| WorkerError::Io)?
+                .len(),
+            config_bytes: u32::try_from(self.header.length).map_err(|_| WorkerError::Limit)?,
+        })
+    }
     pub(crate) fn new_bundle(
         binary: BinarySnapshot,
         config: CompiledConfig,
@@ -1268,6 +1293,8 @@ async fn serve_stream(mut stream: UnixStream, mode: WorkerMode) -> Result<(), Wo
     };
     stream.write_all(&ack).map_err(|_| WorkerError::Io)?;
     if mode == WorkerMode::Run {
+        // Authenticated role handoff уже удержан отдельным CLOEXEC duplicate;
+        // payload stream не является каналом consuming exec-delivery ACK.
         drop(stream);
         let mut command = match configured_assets(&binary, &config.file, false, assets.as_ref()) {
             Ok(command) => command,
@@ -1286,6 +1313,7 @@ async fn serve_stream(mut stream: UnixStream, mode: WorkerMode) -> Result<(), Wo
                 &mut command,
                 profile_capsule.as_deref(),
                 &config.file,
+                &binary.file,
                 assets.as_ref().map(native_assets::Assets::root_fd),
             );
             if let Some(assets) = assets.as_mut() {
