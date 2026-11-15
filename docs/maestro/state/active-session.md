@@ -26,6 +26,9 @@ p3_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa92
 p3_candidate: d380fa0b5096679e4f0fbde1363262430e951f92
 p3_candidate_status: source_compile_gate_accepted
 p3_review: scoped_clean
+p4_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A9d8c0a75-f89f-43f3-bf56-c9bac29fe61a
+p5_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A391a88b9-8afd-4ac6-ab7a-4e7c426ea289
+p45_base: 7d9ae80eb3977aa0c0b8766830b9de84346e5874
 p3_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A5434d2cc-828c-4b95-9bca-caa3d24f6c63
 p3_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3Ac73e19e2-1c96-4434-a0a5-2023682cf7b6
 localdns_go_scope: approved
@@ -67,8 +70,8 @@ phases:
       assumptions: ['HTTP scenarios compile-only', 'Activation and production capability are P4/P5/P6']
       warnings: ['Numeric native/server IDs use separate namespaces', 'Ambiguous favorites remain unavailable for reselection', 'Global database antirollback outside this change']
   - {id: 3, name: Xray compiler, agent: coder, status: completed, parallel: true, blocked_by: [1], retry_count: 1}
-  - {id: 4, name: Native transport, agent: coder, status: pending, parallel: true, blocked_by: [3]}
-  - {id: 5, name: System helper, agent: coder, status: pending, parallel: true, blocked_by: [3]}
+  - {id: 4, name: Native transport, agent: coder, status: in_progress, parallel: true, blocked_by: [3]}
+  - {id: 5, name: System helper, agent: coder, status: in_progress, parallel: true, blocked_by: [3]}
   - {id: 6, name: Desktop и Connect, agent: coder, status: pending, parallel: false, blocked_by: [2, 4, 5]}
   - {id: 7, name: Независимое review, agent: code-reviewer, status: pending, parallel: false, blocked_by: [6]}
   - {id: 8, name: Сборка и установка, agent: coder, status: pending, parallel: false, blocked_by: [7]}
@@ -228,6 +231,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   затронутые связи закрыты source-only. P3 SOURCE/COMPILE/PURE gate принят;
   P4/P5 могут стартовать из единой интегрированной базы. Это не actual runtime,
   DAT/category proof или подтверждение resolver socket ownership.
+- P4/P5 запущены параллельно в двух T3 worktrees из 7d9ae80. P4 владеет
+  versioned Go patch/builder tests, включая явно разрешённые два localdns files.
+  P5 владеет Rust helper/System и новым bounded typed intent codec; при
+  необходимости его размещения в engine разрешён новый native_profile/intent.rs
+  и только module/export declarations mod.rs, без изменения P3 semantics.
+  Shared writable files нет; frozen ABI260/старые receipts не изменять.
+  Native/Host/services/network execution остаётся закрыто.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
