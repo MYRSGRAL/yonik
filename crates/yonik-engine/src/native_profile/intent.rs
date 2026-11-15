@@ -31,6 +31,49 @@ pub enum WireSecurity {
     Reality = 2,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WireNetwork {
+    Tcp = 6,
+    Udp = 17,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WireAction {
+    PhysicalStatic = 1,
+    Chain = 2,
+    DirectDynamic = 3,
+    NoDial = 4,
+}
+
+/// Заимствованная DATA-проекция. Не выбирает actual mux branch и не даёт grant.
+/// Конструктор закрыт: значения выводятся из тех же private typed fields.
+pub struct BranchProjection<'a> {
+    dial: Option<WireNetwork>,
+    carrier: Option<WireNetwork>,
+    active_stream: bool,
+    action: WireAction,
+    next_subject: Option<&'a str>,
+}
+impl BranchProjection<'_> {
+    pub fn dial(&self) -> Option<WireNetwork> {
+        self.dial
+    }
+    pub fn carrier(&self) -> Option<WireNetwork> {
+        self.carrier
+    }
+    pub fn active_stream(&self) -> bool {
+        self.active_stream
+    }
+    pub fn action(&self) -> WireAction {
+        self.action
+    }
+    pub fn next_subject(&self) -> Option<&str> {
+        self.next_subject
+    }
+}
+
 // Все extension objects закрыты. Семантический validator P3 остаётся единственным
 // источником правил protocol/reference/chain/resource, wire его не заменяет.
 macro_rules! object {
@@ -236,6 +279,64 @@ impl fmt::Debug for ProfileIntent {
     }
 }
 impl ProfileIntent {
+    /// Вычисляет P→D→C. При mux_worker вход proxy синтетический TCP;
+    /// caller обязан отдельно доказать actual native mux decision.
+    pub fn project_branch(
+        &self,
+        subject: &str,
+        input: WireNetwork,
+        mux_worker: bool,
+    ) -> Result<BranchProjection<'_>, Error> {
+        let outbound = self.outbound(subject)?;
+        let protocol = outbound.protocol.as_ref().ok_or(Error::Schema)?;
+        if matches!(protocol, Protocol::Blackhole | Protocol::Dns) {
+            return Ok(BranchProjection {
+                dial: None,
+                carrier: None,
+                active_stream: false,
+                action: WireAction::NoDial,
+                next_subject: None,
+            });
+        }
+        let input = if mux_worker { WireNetwork::Tcp } else { input };
+        let dial = match protocol {
+            Protocol::Vless | Protocol::Hysteria => WireNetwork::Tcp,
+            _ => input,
+        };
+        let (kind, security) = self.transport_kind(subject)?;
+        let stream = outbound.stream_settings.as_ref();
+        let exact_h3 = stream
+            .and_then(|s| s.tls_settings.as_ref())
+            .and_then(|tls| tls.alpn.as_ref())
+            .is_some_and(|alpn| alpn.0.len() == 1 && alpn.0[0] == "h3");
+        let carrier = if dial == WireNetwork::Udp
+            || matches!(protocol, Protocol::Hysteria)
+            || kind == WireTransportKind::Hysteria
+            || (kind == WireTransportKind::Xhttp && security == WireSecurity::Tls && exact_h3)
+        {
+            WireNetwork::Udp
+        } else {
+            WireNetwork::Tcp
+        };
+        let next_subject = outbound
+            .proxy_settings
+            .as_ref()
+            .and_then(|c| c.tag.as_deref());
+        let action = if next_subject.is_some() {
+            WireAction::Chain
+        } else if matches!(protocol, Protocol::Freedom) {
+            WireAction::DirectDynamic
+        } else {
+            WireAction::PhysicalStatic
+        };
+        Ok(BranchProjection {
+            dial: Some(dial),
+            carrier: Some(carrier),
+            active_stream: dial == WireNetwork::Tcp,
+            action,
+            next_subject,
+        })
+    }
     pub fn decode(wire: &str) -> Result<Self, Error> {
         if wire.len() > MAX_INTENT_BYTES {
             return Err(Error::Budget);
@@ -484,6 +585,66 @@ impl<'de> Visitor<'de> for Scan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn closed_carrier_projection_preserves_raw_udp_and_exact_h3() {
+        let wire = serde_json::json!({"version":1,"graph":{"outbounds":[
+            {"tag":"ss","protocol":"shadowsocks","settings":{"servers":[{"address":"192.0.2.1","port":443,"method":"aes-128-gcm","password":"fixture"}]},"streamSettings":{"network":"grpc"}},
+            {"tag":"v","protocol":"vless","settings":{"vnext":[{"address":"192.0.2.2","port":443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3"]}}}
+        ]}});
+        let intent = ProfileIntent::decode(&wire.to_string()).unwrap();
+        let ss = intent
+            .project_branch("ss", WireNetwork::Udp, false)
+            .unwrap();
+        assert_eq!(ss.dial(), Some(WireNetwork::Udp));
+        assert_eq!(ss.carrier(), Some(WireNetwork::Udp));
+        assert!(!ss.active_stream());
+        let v = intent.project_branch("v", WireNetwork::Udp, false).unwrap();
+        assert_eq!(v.dial(), Some(WireNetwork::Tcp));
+        assert_eq!(v.carrier(), Some(WireNetwork::Udp));
+        assert!(v.active_stream());
+        assert_eq!(v.action(), WireAction::PhysicalStatic);
+    }
+    #[test]
+    fn closed_projection_keeps_chain_carrier_separate_from_original_input() {
+        let wire = serde_json::json!({"version":1,"graph":{"outbounds":[
+            {"tag":"a","protocol":"shadowsocks","settings":{"servers":[{"address":"192.0.2.1","port":443,"method":"aes-128-gcm","password":"fixture"}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3","h2"]}},"proxySettings":{"tag":"b","transportLayer":true}},
+            {"tag":"b","protocol":"shadowsocks","settings":{"servers":[{"address":"192.0.2.2","port":443,"method":"aes-128-gcm","password":"fixture"}]}},
+            {"tag":"direct","protocol":"freedom"},
+            {"tag":"drop","protocol":"blackhole"}
+        ]}});
+        let intent = ProfileIntent::decode(&wire.to_string()).unwrap();
+        let normal = intent.project_branch("a", WireNetwork::Udp, false).unwrap();
+        assert_eq!(normal.action(), WireAction::Chain);
+        assert_eq!(normal.next_subject(), Some("b"));
+        assert_eq!(normal.carrier(), Some(WireNetwork::Udp));
+        let worker = intent.project_branch("a", WireNetwork::Udp, true).unwrap();
+        assert_eq!(worker.dial(), Some(WireNetwork::Tcp));
+        assert_eq!(worker.carrier(), Some(WireNetwork::Tcp));
+        let next = intent
+            .project_branch("b", worker.carrier().unwrap(), false)
+            .unwrap();
+        assert_eq!(next.action(), WireAction::PhysicalStatic);
+        assert_eq!(
+            intent
+                .project_branch("direct", WireNetwork::Tcp, false)
+                .unwrap()
+                .action(),
+            WireAction::DirectDynamic
+        );
+        assert_eq!(next.dial(), Some(WireNetwork::Tcp));
+        let drop = intent
+            .project_branch("drop", WireNetwork::Tcp, false)
+            .unwrap();
+        assert_eq!(drop.action(), WireAction::NoDial);
+        assert_eq!(drop.dial(), None);
+        assert_eq!(drop.carrier(), None);
+        assert!(!drop.active_stream());
+        assert!(
+            intent
+                .project_branch("missing", WireNetwork::Tcp, false)
+                .is_err()
+        );
+    }
     #[test]
     fn typed_seven_shapes_roundtrip_through_closed_validation() {
         let fixtures: Vec<serde_json::Value> = serde_json::from_str(include_str!(
