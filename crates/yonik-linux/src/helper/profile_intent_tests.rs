@@ -80,6 +80,10 @@ fn resolver_sources_are_exact_and_no_live_fallback_grammar_is_accepted() {
     let bytes = b"nameserver 192.0.2.53\nnameserver 2001:db8::53\n";
     let (servers, digest) = resolver_content(bytes, b"hosts: dns\n").unwrap();
     assert_eq!(servers.len(), 2);
+    assert_eq!(
+        resolver_content(bytes, b"hosts \t: dns\n").unwrap().0,
+        servers
+    );
     assert_ne!(
         resolver_content(bytes, b"# changed\nhosts: dns\n")
             .unwrap()
@@ -97,6 +101,8 @@ fn resolver_sources_are_exact_and_no_live_fallback_grammar_is_accepted() {
         "hosts: resolve dns",
         "hosts: dns [NOTFOUND=return]",
         "hosts: dns\nhosts: dns",
+        "hosts : files\nhosts: dns\n",
+        "hosts\t: resolve dns\nhosts: dns\n",
         "hosts: mdns",
     ] {
         assert!(resolver_content(bytes, nss.as_bytes()).is_err());

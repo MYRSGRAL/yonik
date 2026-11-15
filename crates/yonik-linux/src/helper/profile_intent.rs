@@ -546,7 +546,8 @@ fn resolver_content(resolv: &[u8], nss: &[u8]) -> Result<(Vec<SocketAddr>, [u8; 
     let mut hosts = nss
         .lines()
         .filter_map(|line| line.split('#').next())
-        .filter_map(|line| line.trim().strip_prefix("hosts:"));
+        .filter_map(|line| line.split_once(':'))
+        .filter_map(|(database, sources)| (database.trim() == "hosts").then_some(sources));
     if hosts.next().map(str::trim) != Some("dns") || hosts.next().is_some() {
         return Err(EgressError::Resolver);
     }
