@@ -28,6 +28,8 @@ p3_candidate_status: source_compile_gate_accepted
 p3_review: scoped_clean
 p4_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A9d8c0a75-f89f-43f3-bf56-c9bac29fe61a
 p4_partial_candidate: 6acfecb459a9d60c59a6cb794c89ea0b578965ff
+p4_issuer_proposal: 57f929683feb959ad87fd5e503acf3ee1932df0a
+p4_design_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A957fec20-7af1-463b-abd0-6e5975f32de5
 p4_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3Ac77cd132-0611-4814-b7e3-9bcb3da5f8b8
 p5_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A391a88b9-8afd-4ac6-ab7a-4e7c426ea289
 p45_base: 7d9ae80eb3977aa0c0b8766830b9de84346e5874
@@ -256,6 +258,12 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   digest/session/generation/invocation/epoch из VerifiedCoverage.expected;
   YNKROLE1 и DATA4 связывают этот контекст, bind_run одноразовый. Это не
   доказательство допустимости новой authority из session metadata.
+- P4 SOURCE proposal 57f9296 описал YNKCAP01 и семь дополнительных Go
+  callsites; implementation/scope не принят. Root запустил independent R4
+  feasibility review: проверить минимальность carrier и Local protected launcher,
+  отличие owner proof от action grant, конкретные System Rust issuer callsites.
+  Новых product/build/runtime изменений в этой подзадаче нет. P5 продолжает
+  независимую scoped Rust работу; P4 candidate пока не интегрирован.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
