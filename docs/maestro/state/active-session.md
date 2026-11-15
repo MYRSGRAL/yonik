@@ -23,7 +23,7 @@ p2_review: scoped_clean
 p2_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A59cadea6-d4a8-4b5e-8885-104af87bb83d
 p2_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A5dd29e5f-cb87-4ca3-8de1-045356518667
 p3_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A8ac093d3-885f-48c8-a51b-dd536829e681
-p3_candidate: d380fa0b5096679e4f0fbde1363262430e951f92
+p3_candidate: 0aace3297274851bf9ee9a2842d9e695c23196a2
 p3_candidate_status: source_compile_gate_accepted
 p3_review: scoped_clean
 p4_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A9d8c0a75-f89f-43f3-bf56-c9bac29fe61a
@@ -41,7 +41,7 @@ p5_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-979
 p5_partial_candidate: 13f89190331c36266e8eae973b5cc059893f2457
 p5_codec_candidate: dac3076644e11e3297fc835daa4b28bd38bba368
 p5_codec_review: scoped_clean
-p5_custody_review: nss_finding_corrected_pending_narrow_review
+p5_custody_review: scoped_clean_after_nss_fix
 p5_nss_fix: fa2699c418eabdd7360d36d65a73b8b3f6b9ff5c
 p5_native_narrow_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A2d0ea589-02ea-4d74-96cb-068cd20f9cf2
 p3_native_schema_fix: 0aace3297274851bf9ee9a2842d9e695c23196a2
@@ -349,6 +349,18 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
 - Новый R5 narrow 2d0ea589 проверяет только NSS finding и три pinned-native
   corrections base d64f9fb → 0aace32. Повторных полных reviews/сборок ожидания нет;
   P4/P5 runtime gates остаются закрыты.
+- R5 narrow 2d0ea589 — scoped CLEAN: NSS finding и все три native schema/carrier
+  corrections закрыты source-only. Source/PURE gate P3 восстановлен; P5 codec/
+  текущий fail-closed custody component принят, production integration не готова.
+- Дополнение completion-scope теперь предложено для source review: десять
+  дополнительных Go callsites, отдельные Local/System каналы и production
+  payload/custody integration Rust. capsule-mapping.md разделяет unique subjects,
+  protocol scopes/branches, actual chain carrier и aliases; mappingVersion3,
+  tableCount11 включает ResolverSnapshotRef. resolver-snapshot-contract.md
+  предлагает CGO-disabled netgo snapshot, sealed asset/source pins, fixed
+  root-owned catalog и отдельный future provisioning. Код новых областей
+  implementation не разрешён; user scope approval потребуется после проверки
+  согласованности этих новых договоров. Host config/runtime не исследовались.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
