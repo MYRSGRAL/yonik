@@ -1,7 +1,229 @@
 use super::*;
+#[test]
+fn native_delivery_total_includes_snapshot_and_rejects_overflow_before_staging() {
+    assert!(delivery_preflight([1; 16]).is_ok());
+    assert_eq!(delivery_preflight([1; 17]), Err(EgressError::Budget));
+    assert!(delivery_preflight([64 * 1024 * 1024 - 8192]).is_ok());
+    assert_eq!(
+        delivery_preflight([64 * 1024 * 1024 - 8192, 120]),
+        Err(EgressError::Budget)
+    );
+    assert_eq!(delivery_preflight([u64::MAX]), Err(EgressError::Budget));
+}
 use serde_json::json;
 use yonik_engine::native_profile::{TransportProtocol, validate_profile};
 use yonik_import::{NativeProfile, ProfileEntry, import_profiles};
+
+#[test]
+fn failed_source_identity_check_is_sticky_and_never_recaptures_as_fresh() {
+    let invalid = std::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        revalidate_source(&invalid, || Err(EgressError::Stale)),
+        Err(EgressError::Stale)
+    );
+    assert_eq!(
+        revalidate_source(&invalid, || panic!(
+            "Не перечитывать утраченную source authority"
+        )),
+        Err(EgressError::Stale)
+    );
+}
+
+#[test]
+fn netgo_snapshot_matches_independent_binary_golden_and_checks_hash_before_layout() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/xray-profile-channel-v3/resolver-snapshot-v1.json"
+    ))
+    .unwrap();
+    let get = |name: &str| vector[name].as_str().unwrap();
+    let hex = |value: &str| {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let data = resolver_snapshot_data(
+        get("nss").as_bytes(),
+        get("resolv").as_bytes(),
+        Some(get("hosts").as_bytes()),
+        get("hostname").as_bytes(),
+    )
+    .unwrap();
+    let wire = data.encode().unwrap();
+    assert_eq!(wire, hex(get("wireHex")));
+    assert_eq!(data.source.as_slice(), hex(get("sourceSha256")));
+    let mut reference = crate::profile_channel::SnapshotRef {
+        source: data.source,
+        asset: hex(get("assetSha256")).try_into().unwrap(),
+        bytes: wire.len() as u32,
+        flags: 0,
+    };
+    crate::profile_channel::verify_resolver_asset(&wire, reference).unwrap();
+    reference.asset[0] ^= 1;
+    assert_eq!(
+        crate::profile_channel::verify_resolver_asset(&wire, reference),
+        Err(crate::profile_channel::Error::Hash)
+    );
+    for (offset, value) in [
+        (8, 1),
+        (112, 1),
+        (152, 5),
+        (153, 16),
+        (154, 6),
+        (155, 1),
+        (162, 255),
+        (203, 0),
+    ] {
+        let mut bad = wire.clone();
+        bad[offset] = value;
+        assert!(
+            crate::profile_channel::validate_resolver_asset(&bad, data.source, 0).is_err(),
+            "offset {offset}"
+        );
+    }
+}
+
+#[test]
+fn netgo_snapshot_preserves_order_defaults_duplicates_search_and_hosts() {
+    let nss = b"passwd: files\nhosts: files resolve [!UNAVAIL=return] dns\n";
+    let resolv = b"nameserver invalid\nnameserver 127.0.0.53\nnameserver ::1\nnameserver 127.0.0.53\nnameserver 192.0.2.4\nsearch Example.INVALID . internal\noptions ndots:3 timeout:2 attempts:4 rotate single-request-reopen trust-ad use-vc\n";
+    let hosts = b"127.0.0.1 LOCALHOST Example.Invalid\n::1 localhost\n127.0.0.1 localhost\ninvalid ignored\n";
+    let snapshot =
+        resolver_snapshot_data(nss, resolv, Some(hosts), b"host.example.invalid").unwrap();
+    assert_eq!(snapshot.order, 3);
+    assert_eq!(
+        (
+            snapshot.ndots,
+            snapshot.timeout_ms,
+            snapshot.attempts,
+            snapshot.flags
+        ),
+        (3, 2000, 4, 31)
+    );
+    assert_eq!(
+        snapshot.peers,
+        [
+            "127.0.0.53:53".parse().unwrap(),
+            "[::1]:53".parse().unwrap(),
+            "127.0.0.53:53".parse().unwrap()
+        ]
+    );
+    assert_eq!(snapshot.search, ["Example.INVALID.", "internal."]);
+    assert_eq!(snapshot.hosts[0].alias, "localhost");
+    assert_eq!(snapshot.hosts[0].addresses.len(), 3);
+    assert_eq!(snapshot.hosts[1].alias, "example.invalid.");
+    let bytes = snapshot.encode().unwrap();
+    crate::profile_channel::validate_resolver_asset(&bytes, snapshot.source, snapshot.source_flags)
+        .unwrap();
+    for length in 0..bytes.len() {
+        assert!(
+            crate::profile_channel::validate_resolver_asset(
+                &bytes[..length],
+                snapshot.source,
+                snapshot.source_flags
+            )
+            .is_err()
+        );
+    }
+    let empty = resolver_snapshot_data(b"", b"nameserver invalid\n", None, b"host.example.invalid")
+        .unwrap();
+    assert_eq!(empty.order, 3);
+    assert_eq!(
+        empty.peers,
+        ["127.0.0.1:53".parse().unwrap(), "[::1]:53".parse().unwrap()]
+    );
+    assert_eq!(empty.search, ["example.invalid."]);
+    assert_eq!(empty.source_flags, 1);
+    let blocked = resolver_snapshot_data(
+        b"hosts: files dns\n",
+        b"",
+        Some(b"0.0.0.0 blocked.invalid\n"),
+        b"host",
+    )
+    .unwrap();
+    assert!(blocked.hosts[0].addresses[0].is_unspecified());
+    blocked.encode().unwrap();
+    assert_ne!(
+        empty.source,
+        resolver_snapshot_data(
+            b"",
+            b"nameserver invalid\n",
+            Some(b""),
+            b"host.example.invalid"
+        )
+        .unwrap()
+        .source
+    );
+}
+
+#[test]
+fn netgo_snapshot_rejects_unrepresentable_semantics_before_materialization() {
+    for resolv in [
+        b"nameserver fe80::1%lo\n".as_slice(),
+        b"options attempts:6\n",
+        b"options timeout:31\n",
+        b"options unknown\n",
+        b"search a b c d e f g\n",
+        b"search example.invalid # inline-comment\n",
+        b"search example.invalid..\n",
+    ] {
+        assert!(resolver_snapshot_data(b"hosts: files dns\n", resolv, Some(b""), b"host").is_err());
+    }
+    for (nss, order) in [
+        ("hosts: dns files", 4),
+        ("hosts: resolve files", 4),
+        ("hosts: files resolve", 3),
+        ("hosts: files resolve dns", 3),
+        ("hosts: files", 1),
+        ("hosts: dns", 2),
+    ] {
+        assert_eq!(
+            resolver_snapshot_data(nss.as_bytes(), b"", Some(b""), b"host")
+                .unwrap()
+                .order,
+            order
+        );
+    }
+    assert!(resolver_snapshot_data(b"hosts: files\nhosts: dns\n", b"", None, b"host").is_err());
+    assert!(resolver_snapshot_data(b"hosts: files [oops]\n", b"", None, b"host").is_err());
+    assert!(resolver_snapshot_data(b"", b"", None, b"host\n").is_err());
+    assert!(resolver_snapshot_data(b"", b"", Some(&vec![0; 1024 * 1024 + 1]), b"host").is_err());
+    let mut hosts = String::new();
+    for _ in 0..17 {
+        hosts.push_str("127.0.0.1 localhost\n");
+    }
+    assert!(resolver_snapshot_data(b"", b"", Some(hosts.as_bytes()), b"host").is_err());
+}
+
+#[test]
+fn native_catalog_is_closed_bounded_and_uses_only_digest_basenames() {
+    let hash = [1u8; 32];
+    let basename = format!("{}.dat", "01".repeat(32));
+    let valid = json!({"version":1,"resources":[{"kind":"geoip","sha256":hash,"bytes":32,"records":1,"basename":basename}]});
+    assert!(parse_native_catalog(&serde_json::to_vec(&valid).unwrap()).is_ok());
+    for bad in [
+        json!({"version":2,"resources":[]}),
+        json!({"version":1,"resources":[],"url":"https://example.invalid"}),
+        json!({"version":1,"resources":[valid["resources"][0].clone(),valid["resources"][0].clone()]}),
+        json!({"version":1,"resources":vec![valid["resources"][0].clone();17]}),
+    ] {
+        assert!(parse_native_catalog(&serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+    for name in [
+        "../01.dat",
+        "/tmp/01.dat",
+        "01.dat",
+        "https://example.invalid/data.dat",
+    ] {
+        let mut bad = valid.clone();
+        bad["resources"][0]["basename"] = json!(name);
+        assert!(parse_native_catalog(&serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+    let encoded = serde_json::to_string(&valid).unwrap();
+    assert!(parse_native_catalog(format!("{{\"version\":1,{}", &encoded[1..]).as_bytes()).is_err());
+    assert!(parse_native_catalog(&vec![b' '; 65537]).is_err());
+}
 
 fn profile(count: usize) -> NativeProfile {
     from_value(&document(count))
@@ -351,6 +573,37 @@ fn sealed_runtime_retains_exact_bytes_and_rejects_forged_binding() {
     };
     let mut value = document(1);
     value["dns"] = json!({"servers":["192.0.2.53"]});
+    let plan = OwnedRuntimePlan::new(
+        NonZeroU16::new(10808).unwrap(),
+        NonZeroU16::new(10809).unwrap(),
+    )
+    .unwrap()
+    .with_system(SystemTun::new(1, 1500, 42, vec!["198.18.0.1/30".parse().unwrap()]).unwrap());
+    // Numeric/provider-DNS fixture: prepare не открывает catalog/resolver sources.
+    let request = FullProfileRequest::new(
+        yonik_engine::native_profile::ProfileIntent::from_profile(&from_value(&value)).unwrap(),
+        7,
+        [3; 32],
+        true,
+    )
+    .unwrap();
+    let (_keep, cancel) = Cancellation::new();
+    let prepared = request.prepare_system(plan, 1, 1, &cancel).unwrap();
+    let mut exact = Vec::new();
+    prepared
+        .retained()
+        .compiled()
+        .config()
+        .write_sensitive(&mut exact)
+        .unwrap();
+    assert_eq!(
+        prepared.retained().digest(),
+        &<[u8; 32]>::from(Sha256::digest(exact))
+    );
+    crate::profile_channel::Capsule::decode(prepared.capsule_bytes(), prepared.retained().digest())
+        .unwrap();
+    assert!(prepared.resolver().is_none());
+    prepared.revalidate(&cancel).unwrap();
     let plan = OwnedRuntimePlan::new(
         NonZeroU16::new(10808).unwrap(),
         NonZeroU16::new(10809).unwrap(),

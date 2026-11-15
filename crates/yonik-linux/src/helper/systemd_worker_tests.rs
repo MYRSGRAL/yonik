@@ -290,6 +290,7 @@ impl Fixture {
         }
         let supervisor = SystemWorkerSupervisor {
             native_runtime: None,
+            retired_profile: None,
             native_transfer: None,
             native_admission: None,
             native_custody: None,

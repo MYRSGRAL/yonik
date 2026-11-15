@@ -9,6 +9,7 @@ fn actor_fixture() -> super::super::SystemProtectionHost {
         operations: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         stop_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         backend: std::sync::Arc::new(std::sync::Mutex::new(super::Backend {
+            profile_owner: None,
             path: "/run/yonik/unused-actor-test".into(),
             journal: None,
             watch: monitor.watch(),
@@ -260,6 +261,7 @@ fn hostname_and_unbound_transport_are_denied_before_effects() {
 async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_worker() {
     let monitor = crate::NetworkMonitor::start().unwrap();
     let mut backend = super::Backend {
+        profile_owner: None,
         path: "/run/yonik/unused-denied-session-test".into(),
         journal: None,
         watch: monitor.watch(),

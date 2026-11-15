@@ -79,6 +79,35 @@ fn receive_inner(
         }
     }
 }
+fn receive_once(socket: &OwnedFd) -> Result<Option<Vec<u8>>, Unavailable> {
+    let mut bytes = [0; wire::MAX_FRAME + 1];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1), ScmCredentials(1))];
+    let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+    match net::recvmsg(
+        socket,
+        &mut [IoSliceMut::new(&mut bytes)],
+        &mut ancillary,
+        RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC,
+    ) {
+        Ok(msg) => {
+            let unexpected = ancillary.drain().count() != 0;
+            if unexpected
+                || msg
+                    .flags
+                    .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
+                || msg.bytes > wire::MAX_FRAME
+            {
+                return Err(Unavailable::Malformed);
+            }
+            if msg.bytes == 0 {
+                return Err(Unavailable::Disconnected);
+            }
+            Ok(Some(bytes[..msg.bytes].to_vec()))
+        }
+        Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => Ok(None),
+        Err(_) => Err(Unavailable::Disconnected),
+    }
+}
 fn send_once(socket: &OwnedFd, bytes: &[u8], fd: Option<&OwnedFd>) -> Result<bool, Unavailable> {
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut ancillary = SendAncillaryBuffer::new(&mut space);
@@ -196,7 +225,20 @@ impl Session {
         self.acknowledge(&ack).map_err(|_| Unavailable::Malformed)?;
         on_ready()?;
         loop {
-            let bytes = receive_inner(&socket, None, cancel)?;
+            let bytes = if self.owner_receiver.is_some() {
+                loop {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(Unavailable::Cancelled);
+                    }
+                    if let Some(bytes) = receive_once(&socket)? {
+                        break bytes;
+                    }
+                    self.poll_owner_operation()?;
+                    std::thread::sleep(TICK);
+                }
+            } else {
+                receive_inner(&socket, None, cancel)?
+            };
             let header = self.header(&bytes).map_err(|_| Unavailable::Malformed)?;
             if header.kind == Kind::Revoke {
                 self.revoke(&bytes).map_err(|_| Unavailable::Malformed)?;
@@ -210,20 +252,46 @@ impl Session {
                 }
                 Ok(())
             })?;
+            let (credit, denial) = match self
+                .owner_budget
+                .as_ref()
+                .map(|budget| budget.reserve())
+                .transpose()
+            {
+                Ok(credit) => (credit, None),
+                Err(reason) => (None, Some(reason)),
+            };
             let lookup = self
-                .lookup_and_project(&bytes)
+                .lookup_and_project(&bytes, denial)
                 .map_err(|_| Unavailable::Malformed)?;
             let snapshot_expiry = match &lookup {
                 ProjectedLookup::Known(projection) => Some(projection.expiry()?),
                 _ => None,
             };
             fence(deadline, cancel)?;
-            let mut reply = self.reply(header.request_id, lookup)?;
+            let flow = wire::lookup_flow(&bytes).map_err(|_| Unavailable::Malformed)?;
+            let (mut reply, retained) = self.reply(header.request_id, lookup, credit)?;
             send_reply(&socket, &mut reply, snapshot_expiry, deadline, cancel)?;
+            if self.owner_receiver.is_some() {
+                if let Some(observation) = retained {
+                    self.owner_queries.sent_frozen(
+                        header.request_id,
+                        flow,
+                        observation,
+                        Instant::now(),
+                    )?;
+                }
+            }
         }
     }
-    fn reply(&self, id: u64, lookup: ProjectedLookup) -> Result<Vec<u8>, Unavailable> {
+    fn reply(
+        &self,
+        id: u64,
+        lookup: ProjectedLookup,
+        credit: Option<super::OwnerCredit>,
+    ) -> Result<(Vec<u8>, Option<super::OwnerObservation<super::OwnerRecord>>), Unavailable> {
         let mut bytes = vec![0; 160];
+        let mut retained = None;
         Header {
             kind: Kind::Reply,
             request_id: id,
@@ -236,6 +304,7 @@ impl Session {
         let (status, reason) = match lookup {
             ProjectedLookup::Unknown => (2, 0),
             ProjectedLookup::Known(projection) => {
+                let expiry = projection.expiry()?;
                 let (owner, path, ttl) = projection.into_parts();
                 bytes.resize(160 + path.len(), 0);
                 Header {
@@ -254,6 +323,14 @@ impl Session {
                 bytes[136..144].copy_from_slice(&owner.executable.0.to_be_bytes());
                 bytes[144..152].copy_from_slice(&owner.executable.1.to_be_bytes());
                 bytes[160..].copy_from_slice(path.as_bytes());
+                retained = Some(super::OwnerObservation {
+                    value: super::OwnerRecord {
+                        owner,
+                        path,
+                        _credit: credit,
+                    },
+                    expiry,
+                });
                 (1, 0)
             }
             ProjectedLookup::Unavailable(reason) => (
@@ -272,7 +349,7 @@ impl Session {
         bytes[96] = status;
         bytes[97] = reason;
         Header::decode(&bytes, 0).map_err(|_| Unavailable::Malformed)?;
-        Ok(bytes)
+        Ok((bytes, retained))
     }
 }
 

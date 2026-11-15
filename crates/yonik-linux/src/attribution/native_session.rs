@@ -6,7 +6,332 @@ use super::{
     native_wire::{self as wire, Header, Kind, Malformed, Sequence},
 };
 use crate::managed_network::tun::BoundTun;
+use crate::profile_channel::ReceiptKind;
+use std::{collections::VecDeque, time::Instant};
 use std::{os::fd::OwnedFd, sync::Arc};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnerReference {
+    pub kind: ReceiptKind,
+    pub id: u64,
+}
+impl OwnerReference {
+    pub(crate) const NONE: Self = Self {
+        kind: ReceiptKind::None,
+        id: 0,
+    };
+}
+struct OwnerObservation<T> {
+    value: T,
+    expiry: Instant,
+}
+struct OwnerReceiptEntry<T> {
+    reference: OwnerReference,
+    flow: super::broker::Flow,
+    source_flow: Option<u64>,
+    value: Arc<T>,
+    expiry: Instant,
+}
+struct OwnerProof<T> {
+    reference: OwnerReference,
+    value: Arc<T>,
+    expiry: Instant,
+}
+struct OwnerQueries<T> {
+    entries: VecDeque<OwnerReceiptEntry<T>>,
+    next_operation: u64,
+    last_frozen: u64,
+    revoked: bool,
+}
+impl<T> OwnerQueries<T> {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            next_operation: 0,
+            last_frozen: 0,
+            revoked: false,
+        }
+    }
+    fn insert(&mut self, entry: OwnerReceiptEntry<T>, now: Instant) -> Result<(), Unavailable> {
+        if self.revoked {
+            return Err(Unavailable::Revoked);
+        }
+        if entry.expiry <= now {
+            return Err(Unavailable::Timeout);
+        }
+        if entry.expiry > now + super::broker::DEADLINE {
+            return Err(Unavailable::Malformed);
+        }
+        self.entries.retain(|entry| entry.expiry > now);
+        if self.entries.len() == 64 {
+            self.entries.pop_front();
+        }
+        if self.entries.capacity() < 64 {
+            self.entries
+                .try_reserve_exact(64 - self.entries.len())
+                .map_err(|_| Unavailable::Limit)?;
+        }
+        self.entries.push_back(entry);
+        Ok(())
+    }
+    /// Вызывается transport только ПОСЛЕ successful actual send_reply.
+    fn sent_frozen(
+        &mut self,
+        id: u64,
+        flow: super::broker::Flow,
+        observation: OwnerObservation<T>,
+        now: Instant,
+    ) -> Result<(), Unavailable> {
+        if id == 0 || id <= self.last_frozen {
+            return Err(Unavailable::Malformed);
+        }
+        self.last_frozen = id;
+        self.insert(
+            OwnerReceiptEntry {
+                reference: OwnerReference {
+                    kind: ReceiptKind::FrozenSent,
+                    id,
+                },
+                flow,
+                source_flow: None,
+                value: Arc::new(observation.value),
+                expiry: observation.expiry,
+            },
+            now,
+        )
+    }
+    fn resolve(
+        &mut self,
+        source_flow: u64,
+        flow: super::broker::Flow,
+        reference: OwnerReference,
+        clock: impl Fn() -> Instant,
+        lookup: impl FnOnce() -> Result<OwnerObservation<T>, Unavailable>,
+    ) -> Result<OwnerProof<T>, Unavailable> {
+        if self.revoked {
+            return Err(Unavailable::Revoked);
+        }
+        if source_flow == 0 || (reference.kind == ReceiptKind::None) != (reference.id == 0) {
+            return Err(Unavailable::Malformed);
+        }
+        let now = clock();
+        self.entries.retain(|entry| entry.expiry > now);
+        if reference.kind != ReceiptKind::None {
+            if let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.reference == reference)
+            {
+                if entry.flow != flow || entry.source_flow.is_some_and(|id| id != source_flow) {
+                    return Err(Unavailable::Authority);
+                }
+                entry.source_flow = Some(source_flow);
+                return Ok(OwnerProof {
+                    reference,
+                    value: Arc::clone(&entry.value),
+                    expiry: entry.expiry,
+                });
+            }
+        }
+        // Резервируем monotonic ID до RPC/allocations; неудачная операция может
+        // оставить gap, но не переиспользует ID и не выдаёт synthetic receipt.
+        self.next_operation = match self.next_operation.checked_add(1) {
+            Some(id) => id,
+            None => {
+                self.revoke();
+                return Err(Unavailable::Limit);
+            }
+        };
+        let reference = OwnerReference {
+            kind: ReceiptKind::SidebandOperation,
+            id: self.next_operation,
+        };
+        // Unknown/evicted reference: ровно один real backend lookup.
+        let observation = lookup()?;
+        let now = clock();
+        if observation.expiry <= now {
+            return Err(Unavailable::Timeout);
+        }
+        let value = Arc::new(observation.value);
+        let expiry = observation.expiry;
+        self.insert(
+            OwnerReceiptEntry {
+                reference,
+                flow,
+                source_flow: Some(source_flow),
+                value: Arc::clone(&value),
+                expiry,
+            },
+            now,
+        )?;
+        Ok(OwnerProof {
+            reference,
+            value,
+            expiry,
+        })
+    }
+    fn cancel_source(&mut self, id: u64) {
+        self.entries.retain(|entry| entry.source_flow != Some(id));
+    }
+    fn revoke(&mut self) {
+        self.revoked = true;
+        self.entries = VecDeque::new();
+    }
+}
+
+struct OwnerRecord {
+    owner: super::broker::OwnerSnapshot,
+    path: String,
+    _credit: Option<OwnerCredit>,
+}
+const OWNER_BUDGET_BYTES: usize = 512 * 1024;
+struct OwnerBudget {
+    _memory: crate::helper::memory::ByteLease,
+    bytes: crate::helper::memory::ByteBudget,
+}
+struct OwnerCredit {
+    _budget: Arc<OwnerBudget>,
+    _bytes: crate::helper::memory::ByteLease,
+}
+impl OwnerBudget {
+    fn new() -> Result<Arc<Self>, Unavailable> {
+        let memory = crate::helper::memory::config_budget()
+            .reserve(OWNER_BUDGET_BYTES)
+            .map_err(|_| Unavailable::Limit)?;
+        Ok(Arc::new(Self {
+            _memory: memory,
+            bytes: crate::helper::memory::ByteBudget::new(OWNER_BUDGET_BYTES - 64 * 1024),
+        }))
+    }
+    fn reserve(self: &Arc<Self>) -> Result<OwnerCredit, Unavailable> {
+        // MAX_PATH=512 + OwnerSnapshot/Arc/allocator overhead; reservation
+        // предшествует backend RPC и остаётся с shared proof до последнего Drop.
+        let bytes = self.bytes.reserve(2048).map_err(|_| Unavailable::Limit)?;
+        Ok(OwnerCredit {
+            _budget: Arc::clone(self),
+            _bytes: bytes,
+        })
+    }
+}
+enum OwnerOperation {
+    Lookup {
+        source_flow: u64,
+        flow: super::broker::Flow,
+        reference: OwnerReference,
+        deadline: Instant,
+        reply: std::sync::mpsc::SyncSender<Result<OwnerProof<OwnerRecord>, Unavailable>>,
+    },
+    CancelSource(u64),
+}
+/// Только from_verified Session выпускает endpoint. Он не владеет RemoteLookup.
+pub(crate) struct OwnerEndpoint {
+    sender: std::sync::mpsc::SyncSender<OwnerOperation>,
+    scope: crate::helper::native_bootstrap::RuntimeScopeStamp,
+}
+pub(crate) struct KnownOwnerProof {
+    proof: OwnerProof<OwnerRecord>,
+    source_flow: u64,
+    flow: super::broker::Flow,
+    scope: crate::helper::native_bootstrap::RuntimeScopeStamp,
+}
+impl KnownOwnerProof {
+    pub(crate) fn original_expiry(&self) -> Instant {
+        self.proof.expiry
+    }
+    pub(crate) fn checked(
+        &self,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        source_flow: u64,
+        flow: super::broker::Flow,
+    ) -> Result<
+        (
+            &super::broker::OwnerSnapshot,
+            &str,
+            std::time::Duration,
+            OwnerReference,
+        ),
+        Unavailable,
+    > {
+        if !self.scope.same_scope(scope) || self.source_flow != source_flow || self.flow != flow {
+            return Err(Unavailable::Authority);
+        }
+        if self.proof.value._credit.is_none() {
+            return Err(Unavailable::Authority);
+        }
+        self.scope.validate().map_err(|_| Unavailable::Revoked)?;
+        let remaining = self.proof.expiry.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Unavailable::Timeout);
+        }
+        Ok((
+            &self.proof.value.owner,
+            &self.proof.value.path,
+            remaining.min(super::broker::DEADLINE),
+            self.proof.reference,
+        ))
+    }
+}
+impl OwnerEndpoint {
+    pub(crate) fn lookup(
+        &self,
+        source_flow: u64,
+        flow: super::broker::Flow,
+        reference: OwnerReference,
+        deadline: Instant,
+    ) -> Result<KnownOwnerProof, Unavailable> {
+        if source_flow == 0 || (reference.kind == ReceiptKind::None) != (reference.id == 0) {
+            return Err(Unavailable::Malformed);
+        }
+        self.scope.validate().map_err(|_| Unavailable::Revoked)?;
+        let deadline = deadline.min(Instant::now() + super::broker::DEADLINE);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Unavailable::Timeout);
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        self.sender
+            .try_send(OwnerOperation::Lookup {
+                source_flow,
+                flow,
+                reference,
+                deadline,
+                reply: sender,
+            })
+            .map_err(|e| match e {
+                std::sync::mpsc::TrySendError::Full(_) => Unavailable::Limit,
+                std::sync::mpsc::TrySendError::Disconnected(_) => Unavailable::Disconnected,
+            })?;
+        let proof = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|e| match e {
+                std::sync::mpsc::RecvTimeoutError::Timeout => Unavailable::Timeout,
+                std::sync::mpsc::RecvTimeoutError::Disconnected => Unavailable::Disconnected,
+            })??;
+        let proof = KnownOwnerProof {
+            proof,
+            source_flow,
+            flow,
+            scope: self.scope.fork_lookup(),
+        };
+        proof.checked(&self.scope, source_flow, flow)?;
+        Ok(proof)
+    }
+    pub(crate) fn cancel_source(&self, source_flow: u64) -> Result<(), Unavailable> {
+        if source_flow == 0 {
+            return Err(Unavailable::Malformed);
+        }
+        self.sender
+            .try_send(OwnerOperation::CancelSource(source_flow))
+            .map_err(|e| match e {
+                std::sync::mpsc::TrySendError::Full(_) => Unavailable::Limit,
+                std::sync::mpsc::TrySendError::Disconnected(_) => Unavailable::Disconnected,
+            })
+    }
+}
+
+#[cfg(test)]
+#[path = "native_session/owner_tests.rs"]
+mod owner_tests;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
@@ -31,6 +356,9 @@ pub struct Session {
     roles: Option<Roles>,
     sequence: Sequence,
     scope: Option<crate::helper::native_bootstrap::RuntimeScopeStamp>,
+    owner_queries: OwnerQueries<OwnerRecord>,
+    owner_receiver: Option<std::sync::mpsc::Receiver<OwnerOperation>>,
+    owner_budget: Option<Arc<OwnerBudget>>,
 }
 struct Roles {
     tun: TunRole,
@@ -93,6 +421,101 @@ impl TunRole {
 }
 
 impl Session {
+    pub(crate) fn owner_endpoint(&mut self) -> Result<OwnerEndpoint, Unavailable> {
+        if self.phase != Phase::Hello || !self.app_required || self.owner_receiver.is_some() {
+            return Err(Unavailable::Authority);
+        }
+        let scope = self.scope.as_ref().ok_or(Unavailable::Authority)?;
+        scope
+            .validate_admission()
+            .map_err(|_| Unavailable::Authority)?;
+        let memory = OwnerBudget::new()?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(64);
+        let endpoint = OwnerEndpoint {
+            sender,
+            scope: scope.fork_lookup(),
+        };
+        self.owner_receiver = Some(receiver);
+        self.owner_budget = Some(memory);
+        Ok(endpoint)
+    }
+    fn poll_owner_operation(&mut self) -> Result<(), Unavailable> {
+        let Some(receiver) = self.owner_receiver.as_ref() else {
+            return Ok(());
+        };
+        let operation = match receiver.try_recv() {
+            Ok(operation) => operation,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(Unavailable::Disconnected);
+            }
+        };
+        self.scope
+            .as_ref()
+            .ok_or(Unavailable::Authority)?
+            .validate()
+            .map_err(|_| Unavailable::Revoked)?;
+        match operation {
+            OwnerOperation::CancelSource(id) => self.owner_queries.cancel_source(id),
+            OwnerOperation::Lookup {
+                source_flow,
+                flow,
+                reference,
+                deadline,
+                reply,
+            } => {
+                let result = if Instant::now() >= deadline {
+                    Err(Unavailable::Timeout)
+                } else {
+                    let roles = self.roles.as_mut().ok_or(Unavailable::Authority)?;
+                    let epoch = self.epoch;
+                    let budget = self.owner_budget.as_ref().ok_or(Unavailable::Authority)?;
+                    self.owner_queries
+                        .resolve(source_flow, flow, reference, Instant::now, || {
+                            let credit = budget.reserve()?;
+                            match roles.project(flow, epoch) {
+                                super::broker::ProjectedLookup::Known(projection) => {
+                                    let expiry = projection.expiry()?;
+                                    let (owner, path, _) = projection.into_parts();
+                                    Ok(OwnerObservation {
+                                        value: OwnerRecord {
+                                            owner,
+                                            path,
+                                            _credit: Some(credit),
+                                        },
+                                        expiry,
+                                    })
+                                }
+                                super::broker::ProjectedLookup::Unknown => {
+                                    Err(Unavailable::Authority)
+                                }
+                                super::broker::ProjectedLookup::Unavailable(reason) => Err(reason),
+                            }
+                        })
+                };
+                let result = result.and_then(|proof| {
+                    self.scope
+                        .as_ref()
+                        .ok_or(Unavailable::Authority)?
+                        .validate()
+                        .map_err(|_| Unavailable::Revoked)?;
+                    if Instant::now() >= deadline || Instant::now() >= proof.expiry {
+                        return Err(Unavailable::Timeout);
+                    }
+                    Ok(proof)
+                });
+                // Receiver может уже отменить operation. Не блокируем owner actor
+                // и не публикуем grant: endpoint получает только owner proof.
+                match reply.try_send(result) {
+                    Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        return Err(Unavailable::Malformed);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn from_verified(
         role: crate::helper::native_bootstrap::SessionRole,
         remote: super::broker::RemoteLookup,
@@ -120,6 +543,9 @@ impl Session {
             }),
             sequence: Sequence::default(),
             scope: Some(scope),
+            owner_queries: OwnerQueries::new(),
+            owner_receiver: None,
+            owner_budget: None,
         })
     }
 
@@ -132,6 +558,9 @@ impl Session {
         if let Some(scope) = self.scope.take() {
             scope.revoke();
         }
+        self.owner_queries.revoke();
+        self.owner_receiver.take();
+        self.owner_budget.take();
         self.phase = Phase::Closed;
         self.sequence.retire();
         if let Some(mut roles) = self.roles.take() {
@@ -258,6 +687,7 @@ impl Session {
     fn lookup_and_project(
         &mut self,
         bytes: &[u8],
+        denial: Option<Unavailable>,
     ) -> Result<super::broker::ProjectedLookup, Malformed> {
         let result = (|| {
             if self.phase != Phase::Active {
@@ -269,10 +699,14 @@ impl Session {
             }
             let flow = wire::lookup_flow(bytes)?;
             self.sequence.begin(header.request_id)?;
-            let result = self.roles.as_mut().map_or(
-                super::broker::ProjectedLookup::Unavailable(Unavailable::Authority),
-                |roles| roles.project(flow, self.epoch),
-            );
+            let result = if let Some(reason) = denial {
+                super::broker::ProjectedLookup::Unavailable(reason)
+            } else {
+                self.roles.as_mut().map_or(
+                    super::broker::ProjectedLookup::Unavailable(Unavailable::Authority),
+                    |roles| roles.project(flow, self.epoch),
+                )
+            };
             self.sequence.complete(header.request_id)?;
             Ok(result)
         })();
@@ -342,6 +776,9 @@ mod tests {
                     remote: None,
                 }),
                 scope: None,
+                owner_queries: OwnerQueries::new(),
+                owner_receiver: None,
+                owner_budget: None,
                 sequence: Sequence::new(),
             },
             peer,

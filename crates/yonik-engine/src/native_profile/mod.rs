@@ -36,6 +36,20 @@ pub enum OwnedIngress {
     System,
 }
 impl OwnedRuntimePlan {
+    pub fn ingress_mappings(&self) -> impl Iterator<Item = (&str, OwnedIngress)> {
+        self.ingress
+            .iter()
+            .map(|(tag, owned)| (tag.as_str(), *owned))
+    }
+    pub fn local_port(&self) -> NonZeroU16 {
+        self.port
+    }
+    pub fn probe_port(&self) -> NonZeroU16 {
+        self.probe_port
+    }
+    pub fn is_system(&self) -> bool {
+        self.tun.is_some()
+    }
     pub fn new(port: NonZeroU16, probe_port: NonZeroU16) -> Result<Self, ProfileCompileError> {
         if port == probe_port {
             return Err(ProfileCompileError::Ownership);

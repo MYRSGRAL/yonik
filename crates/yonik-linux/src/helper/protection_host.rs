@@ -81,6 +81,7 @@ pub struct SystemProtectionHost {
     _safety: Option<session_host::SafetyTask>,
 }
 struct Backend {
+    profile_owner: Option<(std::sync::Weak<Mutex<Backend>>, tokio::runtime::Handle)>,
     path: PathBuf,
     journal: Option<Journal>,
     watch: NetworkWatch,
@@ -102,6 +103,7 @@ enum Operation {
     NativeEligibility,
     Prepare(u32, bool),
     PrepareProfile(u32, Box<super::service::SystemProfileRequest>),
+    PrepareFullProfile(u32, Box<super::profile_intent::FullProfileRequest>),
     PrepareBundle(u32, Box<super::service::SystemBundleRequest>),
     Apply(u32, GuardPlan, NetworkStamp),
     ApplyProfile(
@@ -173,6 +175,7 @@ impl SystemProtectionHost {
             }
             let _fixture_only = isolated;
             Ok::<_, ServiceError>(Backend {
+                profile_owner: None,
                 path,
                 journal,
                 watch,
@@ -195,6 +198,8 @@ impl SystemProtectionHost {
         .map_err(unavailable)??;
         let backend = Arc::new(Mutex::new(backend));
         let runtime = tokio::runtime::Handle::current();
+        backend.lock().map_err(unavailable)?.profile_owner =
+            Some((Arc::downgrade(&backend), runtime.clone()));
         let operations = Arc::new(tokio::sync::Semaphore::new(1));
         let safety = session_host::spawn_safety(
             session_host::SessionEvents::new(monitor.watch(), exited),
@@ -419,6 +424,10 @@ impl Backend {
                 .prepare_profile(uid, *request, &mut cancel)
                 .await
                 .map(Reply::Prepared),
+            Operation::PrepareFullProfile(uid, request) => self
+                .prepare_full_profile(uid, *request, &mut cancel)
+                .await
+                .map(Reply::Prepared),
             Operation::ApplyProfile(uid, artifact, stamp, output) => self
                 .apply_profile(uid, artifact, stamp, output, &mut cancel)
                 .await
@@ -585,6 +594,27 @@ fn compile_protection(
 }
 impl ProtectionHost for SystemProtectionHost {
     type Artifact = GuardArtifact;
+    async fn prepare_full_profile(
+        &mut self,
+        uid: u32,
+        request: super::profile_intent::FullProfileRequest,
+        cancel: Cancellation,
+    ) -> Result<(GuardArtifact, PreparedContext), ServiceError> {
+        let Reply::Prepared(artifact) = self
+            .job(
+                Operation::PrepareFullProfile(uid, Box::new(request)),
+                cancel,
+            )
+            .await?
+        else {
+            return Err(ServiceError::Unavailable);
+        };
+        let context = self.context(uid)?;
+        if !self._monitor.watch().current().is_current(artifact.stamp) {
+            return Err(stale());
+        }
+        Ok((artifact, context))
+    }
     async fn native_prepare_eligibility(
         &mut self,
         cancel: Cancellation,

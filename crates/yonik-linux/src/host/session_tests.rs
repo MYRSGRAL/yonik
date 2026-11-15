@@ -118,6 +118,7 @@ async fn native_readers_are_joined_after_local_start_failure() {
     )
     .unwrap();
     let checked = super::CheckedConfig {
+        profile: None,
         binary,
         bytes: b"{}".to_vec(),
         digest: ConfigDigest::new([0; 32]),

@@ -216,7 +216,6 @@ fn config_file() -> Result<File, WorkerError> {
         .map_err(|_| WorkerError::Io)?;
     Ok(file)
 }
-#[cfg(test)]
 fn sealed_config(bytes: &[u8]) -> Result<File, WorkerError> {
     let mut file = config_file()?;
     file.write_all(bytes).map_err(|_| WorkerError::Io)?;
@@ -293,9 +292,14 @@ pub struct WorkerPayload {
     resources: Option<std::sync::Arc<crate::resource_fd_receiver::RebuiltBatch>>,
     resource_session: Option<ResourceSession>,
     _native_work: Option<crate::resource_fd_receiver::Reservation>,
+    full_profile: Option<std::sync::Arc<crate::helper::profile_intent::PreparedFullProfile>>,
+    native_payload: Option<native_resources::TrustedNativePayload>,
 }
 impl WorkerPayload {
     pub fn new(binary: BinarySnapshot, config: CompiledConfig) -> Result<Self, WorkerError> {
+        Self::from_config(binary, &config)
+    }
+    fn from_config(binary: BinarySnapshot, config: &CompiledConfig) -> Result<Self, WorkerError> {
         if config.engine() != binary.engine {
             return Err(WorkerError::Engine);
         }
@@ -337,7 +341,38 @@ impl WorkerPayload {
             resources: None,
             resource_session: None,
             _native_work: None,
+            full_profile: None,
+            native_payload: None,
         })
+    }
+    pub(crate) fn new_full_profile(
+        binary: BinarySnapshot,
+        profile: std::sync::Arc<crate::helper::profile_intent::PreparedFullProfile>,
+        cancel: &crate::Cancellation,
+    ) -> Result<Self, WorkerError> {
+        if binary.engine != Engine::Xray {
+            return Err(WorkerError::Engine);
+        }
+        profile
+            .revalidate(cancel)
+            .map_err(|_| WorkerError::Protocol)?;
+        let native_payload = native_resources::TrustedNativePayload::capture(&profile, cancel)?;
+        let mut payload = Self::from_config(binary, profile.retained().compiled().config())?;
+        if payload.header.config_hash != *profile.retained().digest() {
+            return Err(WorkerError::Protocol);
+        }
+        payload.resource_session = Some(ResourceSession::fresh()?);
+        payload.full_profile = Some(profile);
+        payload.native_payload = Some(native_payload);
+        Ok(payload)
+    }
+    pub(crate) fn full_profile(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::helper::profile_intent::PreparedFullProfile>> {
+        self.full_profile.as_ref()
+    }
+    pub(crate) fn image_hash(&self) -> [u8; 32] {
+        self.header.binary_hash
     }
     pub(crate) fn new_bundle(
         binary: BinarySnapshot,
@@ -382,10 +417,14 @@ impl WorkerPayload {
         self._lease.bytes()
     }
     pub fn needs_tmpfs_assets(&self) -> bool {
-        self.has_resources() && self.engine() == Engine::Xray
+        self.full_profile.is_some() || self.has_resources() && self.engine() == Engine::Xray
     }
     pub fn has_resources(&self) -> bool {
         self.resources.is_some()
+            || self
+                .native_payload
+                .as_ref()
+                .is_some_and(|p| !p.assets.is_empty())
     }
     pub fn engine(&self) -> Engine {
         self.header.engine
@@ -435,6 +474,22 @@ impl WorkerPayload {
             }
         }
         let mut header = self.header.encode().to_vec();
+        if let (Some(profile), Some(native)) = (&self.full_profile, &self.native_payload) {
+            let session = self.resource_session.ok_or(WorkerError::Protocol)?;
+            let descriptors = native
+                .assets
+                .iter()
+                .map(|a| a.descriptor)
+                .collect::<Vec<_>>();
+            header = encode_native_header(
+                &self.header,
+                mode,
+                session,
+                &descriptors,
+                profile.capsule_bytes(),
+                output.is_some(),
+            )?;
+        }
         if let Some(resources) = &self.resources {
             use yonik_engine::resource_bundle::VerifiedCatalog;
             header[7] = 2;
@@ -446,11 +501,13 @@ impl WorkerPayload {
                 encode_resource(&mut header, resource);
             }
         }
-        header[8] = match mode {
-            WorkerMode::Check => 1,
-            WorkerMode::Run => 2,
-        };
-        if output.is_some() {
+        if self.full_profile.is_none() {
+            header[8] = match mode {
+                WorkerMode::Check => 1,
+                WorkerMode::Run => 2,
+            };
+        }
+        if output.is_some() && self.full_profile.is_none() {
             let resources = header.split_off(BUNDLE_HEADER_LEN.min(header.len()));
             header.resize(112, 0);
             header[7] = 3;
@@ -460,6 +517,9 @@ impl WorkerPayload {
         let mut fds = vec![self.binary.file.as_fd(), self.config.as_fd()];
         if let Some(resources) = &self.resources {
             fds.extend(resources.artifacts.iter().map(|f| f.as_fd()));
+        }
+        if let Some(native) = &self.native_payload {
+            fds.extend(native.assets.iter().map(|a| a.file.as_fd()));
         }
         if let Some(output) = &output {
             fds.extend([output.stdout.as_fd(), output.stderr.as_fd()]);
@@ -535,17 +595,140 @@ impl WorkerPayload {
         Ok(WorkerAck { pid, status })
     }
 }
+struct NativeHeader<'a> {
+    header: Header,
+    session: ResourceSession,
+    descriptors: Vec<native_resources::NativeDescriptor>,
+    capsule: &'a [u8],
+    output: bool,
+}
+fn encode_native_header(
+    header: &Header,
+    mode: WorkerMode,
+    session: ResourceSession,
+    descriptors: &[native_resources::NativeDescriptor],
+    capsule: &[u8],
+    output: bool,
+) -> Result<Vec<u8>, WorkerError> {
+    let length = 112usize
+        .checked_add(
+            descriptors
+                .len()
+                .checked_mul(88)
+                .ok_or(WorkerError::Limit)?,
+        )
+        .and_then(|n| n.checked_add(capsule.len()))
+        .filter(|n| *n <= 65536)
+        .ok_or(WorkerError::Limit)?;
+    native_resources::preflight_native(descriptors.iter().copied())?;
+    let mut out = vec![0; 112];
+    out[..8].copy_from_slice(b"YNKNPY01");
+    out[8..12].copy_from_slice(&(length as u32).to_be_bytes());
+    out[12..80].copy_from_slice(&header.encode()[12..80]);
+    out[80] = if mode == WorkerMode::Run { 2 } else { 1 };
+    out[81] = descriptors.len() as u8;
+    out[82] = if output { 2 } else { 0 };
+    out[84..92].copy_from_slice(&session.session.to_be_bytes());
+    out[92..100].copy_from_slice(&session.generation.to_be_bytes());
+    out[100..104].copy_from_slice(&(capsule.len() as u32).to_be_bytes());
+    out.reserve_exact(length - 112);
+    for d in descriptors {
+        out.extend_from_slice(&d.encode()?);
+    }
+    out.extend_from_slice(capsule);
+    decode_native_header(&out)?;
+    Ok(out)
+}
+fn decode_native_header(bytes: &[u8]) -> Result<NativeHeader<'_>, WorkerError> {
+    if !(112..=65536).contains(&bytes.len())
+        || bytes[..8] != *b"YNKNPY01"
+        || u32::from_be_bytes(bytes[8..12].try_into().map_err(|_| WorkerError::Protocol)?) as usize
+            != bytes.len()
+        || bytes[83] != 0
+        || bytes[104..112] != [0; 8]
+    {
+        return Err(WorkerError::Protocol);
+    }
+    let count = bytes[81] as usize;
+    if count > 16
+        || ![0, 2].contains(&bytes[82])
+        || ![1, 2].contains(&bytes[80])
+        || bytes[82] == 2 && bytes[80] != 2
+    {
+        return Err(WorkerError::Protocol);
+    }
+    let capsule_length = u32::from_be_bytes(
+        bytes[100..104]
+            .try_into()
+            .map_err(|_| WorkerError::Protocol)?,
+    ) as usize;
+    let start = 112 + 88 * count;
+    if start.checked_add(capsule_length) != Some(bytes.len()) {
+        return Err(WorkerError::Protocol);
+    }
+    let mut old = [0; 80];
+    old[..8].copy_from_slice(b"YNKWRK\0\x01");
+    old[8] = bytes[80];
+    old[9] = 1;
+    old[12..80].copy_from_slice(&bytes[12..80]);
+    let header = Header::decode(&old)?;
+    let session = ResourceSession {
+        session: u64::from_be_bytes(
+            bytes[84..92]
+                .try_into()
+                .map_err(|_| WorkerError::Protocol)?,
+        ),
+        generation: u64::from_be_bytes(
+            bytes[92..100]
+                .try_into()
+                .map_err(|_| WorkerError::Protocol)?,
+        ),
+    };
+    if session.session == 0 || session.generation == 0 {
+        return Err(WorkerError::Protocol);
+    }
+    let capsule = &bytes[start..];
+    let decoded = crate::profile_channel::Capsule::decode(capsule, &header.config_hash)
+        .map_err(|_| WorkerError::Protocol)?;
+    if decoded.mode != crate::profile_channel::Mode::System {
+        return Err(WorkerError::Protocol);
+    }
+    let mut descriptors = [None; 16];
+    let mut refs = [(0, [0; 32], 0, [0; 32], 0); 16];
+    for (i, row) in bytes[112..start].chunks_exact(88).enumerate() {
+        let d = native_resources::NativeDescriptor::decode(row)?;
+        refs[i] = (d.kind as u8, d.digest, d.bytes, d.source, d.flags);
+        descriptors[i] = Some(d);
+    }
+    native_resources::preflight_native(descriptors[..count].iter().flatten().copied())?;
+    decoded
+        .validate_asset_refs(&refs[..count])
+        .map_err(|_| WorkerError::Protocol)?;
+    Ok(NativeHeader {
+        header,
+        session,
+        descriptors: descriptors[..count].iter().flatten().copied().collect(),
+        capsule,
+        output: bytes[82] == 2,
+    })
+}
 struct Received {
     binary: BinarySnapshot,
     config: File,
     resources: Vec<native_resources::OwnedResource>,
     resource_session: Option<ResourceSession>,
     output: Option<crate::output_transport::ValidatedWriters>,
+    native_assets: Vec<native_resources::NativeAsset>,
+    profile_capsule: Option<Vec<u8>>,
+    _metadata: ByteLease,
 }
 #[cfg(test)]
 fn receive(stream: &UnixStream, mode: WorkerMode) -> Result<(BinarySnapshot, File), WorkerError> {
     let received = receive_payload(stream, mode)?;
-    if !received.resources.is_empty() {
+    if !received.resources.is_empty()
+        || !received.native_assets.is_empty()
+        || received.profile_capsule.is_some()
+    {
         return Err(WorkerError::Protocol);
     }
     Ok((received.binary, received.config))
@@ -565,7 +748,10 @@ fn receive_payload(stream: &UnixStream, mode: WorkerMode) -> Result<Received, Wo
         .set_write_timeout(Some(TIMEOUT))
         .map_err(|_| WorkerError::Io)?;
     let start = Instant::now();
-    let mut bytes = Vec::with_capacity(HEADER_LEN);
+    let metadata = config_budget()
+        .reserve(2 * 65536)
+        .map_err(|_| WorkerError::Limit)?;
+    let mut bytes = Vec::with_capacity(65536);
     let mut fds = Vec::new();
     let mut shm_preflight = false;
     loop {
@@ -576,7 +762,7 @@ fn receive_payload(stream: &UnixStream, mode: WorkerMode) -> Result<Received, Wo
                     .ok_or(WorkerError::Timeout)?,
             ))
             .map_err(|_| WorkerError::Io)?;
-        let mut part = [0; 112 + 16 * 54 + 1];
+        let mut part = [0; 65537];
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(21))];
         let mut ancillary = RecvAncillaryBuffer::new(&mut space);
         let msg = recvmsg(
@@ -586,19 +772,25 @@ fn receive_payload(stream: &UnixStream, mode: WorkerMode) -> Result<Received, Wo
             RecvFlags::CMSG_CLOEXEC,
         )
         .map_err(|_| WorkerError::Io)?;
-        if msg
+        let mut malformed = msg
             .flags
-            .intersects(ReturnFlags::CTRUNC | ReturnFlags::TRUNC)
-        {
-            return Err(WorkerError::Protocol);
-        }
+            .intersects(ReturnFlags::CTRUNC | ReturnFlags::TRUNC);
         for message in ancillary.drain() {
             match message {
-                RecvAncillaryMessage::ScmRights(rights) => fds.extend(rights),
-                _ => return Err(WorkerError::Protocol),
+                RecvAncillaryMessage::ScmRights(rights) => {
+                    for fd in rights {
+                        if fds.len() < 20 && !malformed {
+                            fds.push(fd);
+                        } else {
+                            malformed = true;
+                            drop(fd);
+                        }
+                    }
+                }
+                _ => malformed = true,
             }
         }
-        if fds.len() > 20 || bytes.len() + msg.bytes > 112 + 16 * 54 {
+        if malformed || bytes.len() + msg.bytes > 65536 {
             return Err(WorkerError::Protocol);
         }
         if msg.bytes == 0 {
@@ -622,6 +814,12 @@ fn receive_payload(stream: &UnixStream, mode: WorkerMode) -> Result<Received, Wo
             shm_preflight = true;
             bytes.clear();
         }
+    }
+    if bytes.get(..8) == Some(b"YNKNPY01") {
+        if !shm_preflight {
+            return Err(WorkerError::Protocol);
+        }
+        return receive_native_payload(&bytes, fds, mode, start, metadata);
     }
     let output_v3 = bytes.get(..8) == Some(b"YNKWRK\0\x03");
     let legacy = if output_v3 {
@@ -704,11 +902,161 @@ fn receive_payload(stream: &UnixStream, mode: WorkerMode) -> Result<Received, Wo
         resources,
         resource_session,
         output,
+        native_assets: Vec::new(),
+        profile_capsule: None,
+        _metadata: metadata,
+    })
+}
+fn receive_native_payload(
+    bytes: &[u8],
+    fds: Vec<std::os::fd::OwnedFd>,
+    mode: WorkerMode,
+    start: Instant,
+    metadata: ByteLease,
+) -> Result<Received, WorkerError> {
+    let native = decode_native_header(bytes)?;
+    if native.header.mode != mode
+        || fds.len() != 2 + native.descriptors.len() + if native.output { 2 } else { 0 }
+    {
+        return Err(WorkerError::Protocol);
+    }
+    let total = native
+        .descriptors
+        .iter()
+        .try_fold(8192u64, |n, d| n.checked_add(d.bytes.checked_mul(2)?))
+        .ok_or(WorkerError::Limit)?;
+    let _reservation =
+        crate::resource_fd_receiver::Reservation::acquire(total).map_err(|_| WorkerError::Limit)?;
+    let mut fds = fds.into_iter();
+    let mut source = File::from(fds.next().ok_or(WorkerError::Protocol)?);
+    let config = File::from(fds.next().ok_or(WorkerError::Protocol)?);
+    let length = source.metadata().map_err(|_| WorkerError::Protocol)?.len();
+    if length > BinarySnapshot::MAX_SIZE
+        || !fcntl_get_seals(&source)
+            .map_err(|_| WorkerError::Protocol)?
+            .contains(SEALS | SealFlags::EXEC)
+    {
+        return Err(WorkerError::Protocol);
+    }
+    validate_file(&config, native.header.length, native.header.config_hash)?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| WorkerError::Io)?;
+    let lease = executable_budget()
+        .reserve(length as usize)
+        .map_err(|_| WorkerError::Limit)?;
+    let binary = BinarySnapshot::load_budgeted(
+        source,
+        Sha256(native.header.binary_hash),
+        Engine::Xray,
+        lease,
+    )
+    .map_err(|_| WorkerError::Protocol)?;
+    let mut assets = Vec::with_capacity(native.descriptors.len());
+    for descriptor in native.descriptors {
+        let source = File::from(fds.next().ok_or(WorkerError::Protocol)?);
+        assets.push(native_resources::copy_native(&source, descriptor, &|| {
+            start.elapsed() > TIMEOUT
+        })?);
+    }
+    let output = if native.output {
+        Some(
+            crate::output_transport::OutputWriters {
+                roles: fds.collect(),
+            }
+            .validate()
+            .map_err(|_| WorkerError::Protocol)?,
+        )
+    } else {
+        None
+    };
+    Ok(Received {
+        binary,
+        config,
+        resources: Vec::new(),
+        resource_session: Some(native.session),
+        output,
+        native_assets: assets,
+        profile_capsule: Some(native.capsule.to_vec()),
+        _metadata: metadata,
     })
 }
 struct WorkerConfig {
     file: File,
     _lease: Option<ByteLease>,
+}
+#[cfg(test)]
+mod profile_wire_tests {
+    use super::*;
+    fn bytes() -> Vec<u8> {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/system-chain-probe.json"
+        ))
+        .unwrap();
+        let capsule = f["capsule_hex"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        let reference = native_resources::NativeDescriptor {
+            kind: native_resources::NativeKind::Resolver,
+            digest: [9; 32],
+            bytes: 120,
+            records: 0,
+            source: [8; 32],
+            flags: 0,
+        };
+        encode_native_header(
+            &Header {
+                mode: WorkerMode::Run,
+                engine: Engine::Xray,
+                length: 64,
+                binary_hash: [1; 32],
+                config_hash: [3; 32],
+            },
+            WorkerMode::Run,
+            ResourceSession {
+                session: 5,
+                generation: 6,
+            },
+            &[reference],
+            &capsule,
+            true,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn native_payload_has_exact_refs_and_rejects_bounds_before_fd_materialization() {
+        let bytes = bytes();
+        let decoded = decode_native_header(&bytes).unwrap();
+        assert_eq!(decoded.descriptors.len(), 1);
+        assert!(decoded.output);
+        assert_eq!(decoded.session.session, 5);
+        for end in 0..bytes.len() {
+            assert!(decode_native_header(&bytes[..end]).is_err());
+        }
+        for (offset, value) in [
+            (80, 0),
+            (81, 17),
+            (82, 1),
+            (83, 1),
+            (104, 1),
+            (112, 4),
+            (116, 0),
+        ] {
+            let mut bad = bytes.clone();
+            bad[offset] = value;
+            assert!(decode_native_header(&bad).is_err(), "offset {offset}");
+        }
+        let mut wrong = bytes.clone();
+        wrong[48] ^= 1;
+        assert!(decode_native_header(&wrong).is_err());
+        let mut no_asset = bytes.clone();
+        no_asset[81] = 0;
+        assert!(decode_native_header(&no_asset).is_err());
+    }
 }
 fn worker_owned_config(
     source: &File,
@@ -868,6 +1216,9 @@ async fn serve_stream(mut stream: UnixStream, mode: WorkerMode) -> Result<(), Wo
         resources,
         resource_session,
         output,
+        native_assets,
+        profile_capsule,
+        _metadata,
     } = receive_payload(&stream, mode)?;
     // Исходный FD уже проверен receive: type/seals/declared size/SHA-256.
     // Helper удерживает отдельный global reserve до подтверждённого пустого cgroup.
@@ -879,7 +1230,13 @@ async fn serve_stream(mut stream: UnixStream, mode: WorkerMode) -> Result<(), Wo
             _lease: None,
         }
     };
-    let mut assets = if !resources.is_empty() && binary.engine == Engine::Xray {
+    let mut assets = if profile_capsule.is_some() {
+        Some(native_assets::Assets::create_profile(
+            &native_assets,
+            resource_session.ok_or(WorkerError::Protocol)?,
+            mode,
+        )?)
+    } else if !resources.is_empty() && binary.engine == Engine::Xray {
         Some(native_assets::Assets::create(
             &resources,
             resource_session.ok_or(WorkerError::Protocol)?,
@@ -925,11 +1282,19 @@ async fn serve_stream(mut stream: UnixStream, mode: WorkerMode) -> Result<(), Wo
             output.attach(&mut command);
         }
         if let Some(handoff) = handoff {
-            let result = handoff.exec(&mut command);
+            let result = handoff.exec(
+                &mut command,
+                profile_capsule.as_deref(),
+                &config.file,
+                assets.as_ref().map(native_assets::Assets::root_fd),
+            );
             if let Some(assets) = assets.as_mut() {
                 assets.cleanup_after_failed_exec()?;
             }
             return result;
+        }
+        if profile_capsule.is_some() {
+            return Err(WorkerError::Peer);
         }
         let _error = command.exec();
         // exec вернулся: новый child не создан, собственный ledger можно убрать.
