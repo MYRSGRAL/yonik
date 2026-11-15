@@ -1,0 +1,13 @@
+{
+  "engine": "xray",
+  "version": "26.10.31",
+  "source_commit": "a4a3dff5b20c2faae567b742c172c7b95e75c083",
+  "base_archive_sha256": "e5184047fd1380472f69114fb8173a0adfd8c50970560eceb9c87fcba0bb35e9",
+  "patch_sha256": "2832b4a81a130fd70f91316290555a6ad3e34188a1631f10067663d907a7f3f5",
+  "status": "partial-dns-context-only",
+  "runtime_hooks_connected": false,
+  "native_protocol": null,
+  "adapter_features": {},
+  "builder_apply_enabled": false,
+  "authority_issuer_connected": false
+}
