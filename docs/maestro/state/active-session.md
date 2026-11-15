@@ -46,7 +46,7 @@ p5_nss_fix: fa2699c418eabdd7360d36d65a73b8b3f6b9ff5c
 p5_native_narrow_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A2d0ea589-02ea-4d74-96cb-068cd20f9cf2
 completion_scope_head: e3e3f563428ca43c0087fe162faf748c016f843a
 completion_scope_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A84b976a3-2eb0-4fa6-ac80-814e41170e9b
-completion_scope_approval: pending_user
+completion_scope_approval: explicitly_approved_by_user
 completion_scope_review: three_medium_contract_clarifications_root_corrected
 p3_native_schema_fix: 0aace3297274851bf9ee9a2842d9e695c23196a2
 p5_test_gaps_head: bb425125644c2057c75e2563d6c45193db05ceea
@@ -376,6 +376,12 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   source-doc consistency/diff-check PASS. Новых implementation/tests/runtime
   запусков нет. Дополнение предложено пользователю на конкретное scope approval;
   scope пока НЕ расширен, все новые writer tasks остаются незапущенными.
+- Пользователь явно разрешил completion scope: десять дополнительных Go-точек
+  и перечисленные Rust-файлы. Контракт зафиксирован в трёх документах; дальнейшая
+  implementation не требует повторного permission на тот же scope. Сохраняются
+  запреты runtime/services/network/probes/dependencies/frozen ABI260 changes.
+  Следующий batch: два отдельных worktree из одной принятой root базы, Go writer
+  и Rust writer с общим документированным wire и непересекающимися файлами.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.

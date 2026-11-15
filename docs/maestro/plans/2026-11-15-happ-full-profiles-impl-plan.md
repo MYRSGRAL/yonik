@@ -178,6 +178,12 @@ fmt и clippy `--all-targets -- -D warnings`.
 
 ## P4. Native Xray: observatory и transport ownership
 
+Completion scope отдельно утверждён пользователем после source review:
+`docs/proposals/xray-full-profiles/completion-scope.md`, `capsule-mapping.md` и
+`resolver-snapshot-contract.md`. Десять дополнительных Go callsites, Rust
+issuer/channels/delivery и чистые compile/test проверки теперь разрешены.
+Ни runtime/services/network, ни frozen ABI260, ни новые dependencies не разрешены.
+
 Agent: coder. Parallel: да, с P5. Blocked by: P3. Blocks: P6.
 
 В repository создать versioned follow-up patch

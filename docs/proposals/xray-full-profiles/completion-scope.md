@@ -1,13 +1,13 @@
 ---
-status: proposed_for_user_approval
-implementation_approved: false
+status: approved
+implementation_approved: true
 session_id: 2026-11-15-happ-full-profiles
 ---
 
 # Дополнение scope для завершения P4/P5
 
-Это проект дополнительных изменений к принятому восьмифазному плану.
-Перечисленные здесь новые области implementation ещё не разрешены. Запуски
+Пользователь явно утвердил это дополнение к восьмифазному плану, включая десять
+дополнительных Go callsites и перечисленные Rust-файлы. Запуски
 ядра, helper/worker, Host/GUI, служб и сетевых probes по-прежнему закрыты.
 Принятый DATA/compiler результат не выдаёт runtime authority.
 
@@ -131,9 +131,9 @@ cache/cancel/family regressions. Catalog/data provisioning ещё не выпо�
 Source rechecks закрыли текущие NSS и pinned-native findings; runtime остаётся
 неподтверждённым. Pure tests не читают resolver/user state и не запускают sockets.
 
-Эти три документа представляют proposed source scope, не user approval и не
-обещание готовности. Доработка новых файлов начнётся только после явного
-согласования: Go вне прежнего перечня раньше не разрешался. После утверждения
+Эти три документа задают теперь разрешённый source scope, не обещание готовности.
+Ранее новый Go перечень не был разрешён; пользователь отдельно согласовал его.
+Это согласование не разрешает actual runtime или активацию служб. В реализации
 кодек уточняется только внутри описанных closed schemas/caps, без изменения
 старых ABI или расширения destinations/authority. Любое такое расширение
 требует нового конкретного решения, а не неявного fallback.
