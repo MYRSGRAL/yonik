@@ -49,6 +49,8 @@ completion_scope_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-9
 completion_scope_approval: explicitly_approved_by_user
 completion_implementation_base: 490915d710bfcd52d37351c2dfc8b878d8a24a15
 p4_completion_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A1b4702b1-fc41-4e3e-9f5d-24f4bcecbcac
+p4_completion_builder_head: ea2dcc7aeda27dc1bd85386938560692c73d12a0
+p4_completion_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A941052cd-6093-4e30-8ed7-94b163a86c83
 p5_completion_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A7f3da3dd-67bb-4d7e-ab13-163b3eb6bc21
 completion_scope_review: three_medium_contract_clarifications_root_corrected
 p3_native_schema_fix: 0aace3297274851bf9ee9a2842d9e695c23196a2
@@ -394,6 +396,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   workerPid/workerStart0; System record остаётся YNKEXT01 с verified identities.
   Host проверяет actual child после spawn; env locator сам не authority.
   Pure tests/compile-only разрешены, actual runtime/provisioning по-прежнему нет.
+- Go writer ea2dcc7 поставил только builder --compile-only: codec test binaries
+  компилируются -c, core version не исполняется; manifest явно COMPILE_ONLY.
+  Author19 mock tests normal/-O и Ruff PASS. Root проверил узкий diff и принял
+  prerequisite обычным merge; P4 gate НЕ закрыт и runtime hooks не готовы.
+  Тот же writer продолжает незавершённую фазу с конкретного milestone:
+  closed launch/admission/capsule/asset consumer + actual main hook до features,
+  затем transport/grants. Rust counterpart продолжает своё поручение.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
