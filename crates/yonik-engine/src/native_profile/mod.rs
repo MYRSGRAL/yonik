@@ -3,7 +3,10 @@ mod emit;
 mod graph;
 mod intent;
 mod validate;
-pub use intent::{MAX_INTENT_BYTES, ProfileIntent, WireSecurity, WireTransportKind};
+pub use intent::{
+    BranchProjection, MAX_INTENT_BYTES, ProfileIntent, WireAction, WireNetwork, WireSecurity,
+    WireTransportKind,
+};
 
 use crate::{CompiledConfig, SystemTun};
 pub use graph::{
