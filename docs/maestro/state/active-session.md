@@ -41,6 +41,9 @@ p5_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-979
 p5_partial_candidate: 13f89190331c36266e8eae973b5cc059893f2457
 p5_codec_candidate: dac3076644e11e3297fc835daa4b28bd38bba368
 p5_codec_review: scoped_clean
+p5_custody_review: nss_finding_corrected_pending_narrow_review
+p5_nss_fix: fa2699c0
+p3_native_schema_fix: 0aace3297274851bf9ee9a2842d9e695c23196a2
 p5_test_gaps_head: bb425125644c2057c75e2563d6c45193db05ceea
 p4_scope_trace_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A7a3bc077-48a6-4e70-bf8c-36ffcbcebc90
 p5_codec_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A43f6aab7-10a7-4710-b573-4521352eb303
@@ -327,6 +330,21 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
 - completion-scope.md подготовлен как draft: дополнительный Go/Rust diff,
   existing bounded direct firewall путь и ещё открытые catalog/resolver/mapping
   вопросы. Это не implementation approval и не финальный execution contract.
+- R5b 43de569d нашёл P2 NSS whitespace declaration bypass. Root fa2699c
+  учитывает database до двоеточия и обе duplicate/backend формы; положительный
+  spaced dns control сохранён. FD mutation и parser-depth test gaps остаются
+  отдельными от этого исправления, не объявлены production findings.
+- P4 protocol-scope source trace выявил три ранее пропущенных native расхождения:
+  pinned parser удалил proxySettings, XHTTP exact TLS ALPN[h3] имеет UDP carrier,
+  SS UDP обходит configured TCP transport selector. Root 0aace32 добавил checked
+  chain lowering в owned sockopt.dialerProxy и исправил physical requirements.
+  Local/System lowering и сохранение mark покрыты; provider sockopt не допускается.
+  P3 source gate требует narrow recheck этих новых исправлений.
+- RED NSS и три RED native regressions сохранены. GREEN55 targeted pure tests,
+  clippy all-targets двух packages -D warnings/fmt PASS; exact 3064 source
+  blobs/modes и retained ELF hashes сверены. Evidence:
+  local/orchestration/evidence/happ-p5-nss-allowlist-root. Own transient очищен
+  через cargo clean; сохранены оба RED/final, промежуточные source/ELF очищены.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
