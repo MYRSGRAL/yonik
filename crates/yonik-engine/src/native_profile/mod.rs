@@ -1,7 +1,9 @@
 //! Закрытая граница native graph. Результаты компиляции не дают сетевой authority.
 mod emit;
 mod graph;
+mod intent;
 mod validate;
+pub use intent::{MAX_INTENT_BYTES, ProfileIntent, WireSecurity, WireTransportKind};
 
 use crate::{CompiledConfig, SystemTun};
 pub use graph::{

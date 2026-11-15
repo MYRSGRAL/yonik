@@ -16,6 +16,118 @@ fn document(count: usize) -> serde_json::Value {
         .collect();
     json!({"outbounds":outbounds})
 }
+
+#[test]
+fn synthetic_dat_checks_category_kind_hash_count_and_nested_records() {
+    use yonik_engine::resource_bundle::{ExternalRef, ResourceKind};
+    let mut value = document(1);
+    value["routing"] =
+        json!({"rules":[{"type":"field","domain":["geosite:test@ads"],"outboundTag":"edge-0"}]});
+    let graph = validate_profile(&from_value(&value)).unwrap();
+    // GeoSiteList(entry: GeoSite(code=TEST, domain(type=Domain,value=example.invalid))).
+    let mut domain = vec![8, 2, 18, 15];
+    domain.extend(b"example.invalid");
+    let mut entry = vec![10, 4];
+    entry.extend(b"TEST");
+    entry.extend([18, domain.len() as u8]);
+    entry.extend(&domain);
+    let mut bytes = vec![10, entry.len() as u8];
+    bytes.extend(entry);
+    let mut reference = ExternalRef {
+        engine: yonik_engine::Engine::Xray,
+        digest: Sha256::digest(&bytes).into(),
+        bytes: bytes.len() as u64,
+        records: 1,
+        kind: ResourceKind::Domains,
+        format_version: 1,
+    };
+    let (_keep, cancel) = Cancellation::new();
+    verify_dat_content(&bytes, &reference, graph.resources(), &cancel).unwrap();
+    reference.kind = ResourceKind::Cidrs;
+    assert!(verify_dat_content(&bytes, &reference, graph.resources(), &cancel).is_err());
+    reference.kind = ResourceKind::Domains;
+    reference.records = 2;
+    assert!(verify_dat_content(&bytes, &reference, graph.resources(), &cancel).is_err());
+    reference.records = 1;
+    reference.digest = [0; 32];
+    assert!(verify_dat_content(&bytes, &reference, graph.resources(), &cancel).is_err());
+    reference.digest = Sha256::digest(&bytes).into();
+    let mut alias = bytes.clone();
+    alias[1] += 1;
+    alias[3] = 0x84;
+    alias.insert(4, 0);
+    let mut ambiguous = reference.clone();
+    ambiguous.bytes = alias.len() as u64;
+    ambiguous.digest = Sha256::digest(&alias).into();
+    assert!(verify_dat_content(&alias, &ambiguous, graph.resources(), &cancel).is_err());
+    for cut in 0..bytes.len() {
+        assert!(verify_dat_content(&bytes[..cut], &reference, graph.resources(), &cancel).is_err());
+    }
+    let mut bad = bytes.clone();
+    bad[2] = 18;
+    let mut changed = reference.clone();
+    changed.digest = Sha256::digest(&bad).into();
+    assert!(verify_dat_content(&bad, &changed, graph.resources(), &cancel).is_err());
+    let mut value = document(1);
+    value["routing"] =
+        json!({"rules":[{"type":"field","domain":["geosite:missing"],"outboundTag":"edge-0"}]});
+    let absent = validate_profile(&from_value(&value)).unwrap();
+    assert!(verify_dat_content(&bytes, &reference, absent.resources(), &cancel).is_err());
+}
+
+#[test]
+fn resolver_sources_are_exact_and_no_live_fallback_grammar_is_accepted() {
+    let bytes = b"nameserver 192.0.2.53\nnameserver 2001:db8::53\n";
+    let (servers, digest) = resolver_content(bytes, b"hosts: dns\n").unwrap();
+    assert_eq!(servers.len(), 2);
+    assert_ne!(
+        resolver_content(bytes, b"# changed\nhosts: dns\n")
+            .unwrap()
+            .1,
+        digest
+    );
+    assert_ne!(
+        resolver_content(b"nameserver 192.0.2.54\n", b"hosts: dns\n")
+            .unwrap()
+            .1,
+        digest
+    );
+    for nss in [
+        "hosts: files dns",
+        "hosts: resolve dns",
+        "hosts: dns [NOTFOUND=return]",
+        "hosts: dns\nhosts: dns",
+        "hosts: mdns",
+    ] {
+        assert!(resolver_content(bytes, nss.as_bytes()).is_err());
+    }
+    for resolv in [
+        "",
+        "nameserver 0.0.0.0",
+        "search example.invalid\nnameserver 192.0.2.53",
+        "options rotate\nnameserver 192.0.2.53",
+        "nameserver 192.0.2.53 extra",
+    ] {
+        assert!(resolver_content(resolv.as_bytes(), b"hosts: dns").is_err());
+    }
+}
+
+#[test]
+fn full_request_roundtrip_and_cancel_do_not_open_sources() {
+    use yonik_engine::native_profile::ProfileIntent;
+    let intent = ProfileIntent::from_profile(&profile(1)).unwrap();
+    let request = FullProfileRequest::new(intent, 7, [3; 32], true).unwrap();
+    let mut bytes = Vec::new();
+    request.write_sensitive(&mut bytes).unwrap();
+    let request = FullProfileRequest::decode(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    let (stop, cancel) = Cancellation::new();
+    request.preflight(&cancel).unwrap();
+    drop(stop);
+    assert_eq!(
+        request.preflight(&cancel),
+        Err(super::super::ServiceError::Cancelled)
+    );
+}
 fn from_value(value: &serde_json::Value) -> NativeProfile {
     let bytes = serde_json::to_vec(value).unwrap();
     match import_profiles(bytes).unwrap().entries.remove(0) {
