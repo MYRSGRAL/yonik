@@ -8,9 +8,9 @@ design_approved: true
 implementation_plan_approved: true
 execution_mode: parallel
 execution_backend: native
-current_phase: 3
+current_phase: 4
 total_phases: 8
-current_batch: import_and_compiler
+current_batch: native_and_system
 p1_task_id: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A4b1e8175-889a-4852-b8c6-a82144dfde88
 p1_thread_id: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A4b1e8175-889a-4852-b8c6-a82144dfde88
 p1_candidate: d6857b21e6992e3d4b7d448b4395a44f6f96d842
@@ -24,7 +24,8 @@ p2_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793
 p2_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A5dd29e5f-cb87-4ca3-8de1-045356518667
 p3_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A8ac093d3-885f-48c8-a51b-dd536829e681
 p3_candidate: d380fa0b5096679e4f0fbde1363262430e951f92
-p3_candidate_status: correction_tested_pending_narrow_review
+p3_candidate_status: source_compile_gate_accepted
+p3_review: scoped_clean
 p3_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A5434d2cc-828c-4b95-9bca-caa3d24f6c63
 p3_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3Ac73e19e2-1c96-4434-a0a5-2023682cf7b6
 localdns_go_scope: approved
@@ -65,7 +66,7 @@ phases:
       integration_points: ['P6 uses catalog tokens with kind namespace and matches ProfileEntry', 'ProfileStagedUpdate.report exposes entries, not legacy servers/native_json']
       assumptions: ['HTTP scenarios compile-only', 'Activation and production capability are P4/P5/P6']
       warnings: ['Numeric native/server IDs use separate namespaces', 'Ambiguous favorites remain unavailable for reselection', 'Global database antirollback outside this change']
-  - {id: 3, name: Xray compiler, agent: coder, status: in_progress, parallel: true, blocked_by: [1], retry_count: 1}
+  - {id: 3, name: Xray compiler, agent: coder, status: completed, parallel: true, blocked_by: [1], retry_count: 1}
   - {id: 4, name: Native transport, agent: coder, status: pending, parallel: true, blocked_by: [3]}
   - {id: 5, name: System helper, agent: coder, status: pending, parallel: true, blocked_by: [3]}
   - {id: 6, name: Desktop и Connect, agent: coder, status: pending, parallel: false, blocked_by: [2, 4, 5]}
@@ -223,6 +224,10 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   exact head; 8 retained ELF hashes проверены. Tests/ELF/source сохранены до
   исполнения. Cargo clean выполнен, собственный transient root удалён.
   Нужен новый narrow review двух findings; actual/DAT proof не повышается.
+- R3 narrow 5434d2cc — scoped CLEAN на d380fa0. F1/F2 и непосредственно
+  затронутые связи закрыты source-only. P3 SOURCE/COMPILE/PURE gate принят;
+  P4/P5 могут стартовать из единой интегрированной базы. Это не actual runtime,
+  DAT/category proof или подтверждение resolver socket ownership.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
