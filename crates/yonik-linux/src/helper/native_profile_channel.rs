@@ -19,6 +19,12 @@ use std::{
 };
 
 pub(crate) trait RouteAuthority: Send {
+    fn service(
+        &mut self,
+        scope: &RuntimeScopeStamp,
+        manifest: [u8; 32],
+        request: RouteRequest<'_>,
+    ) -> Result<Option<u64>, ServiceError>;
     fn check(
         &mut self,
         scope: &RuntimeScopeStamp,
@@ -29,6 +35,7 @@ pub(crate) trait RouteAuthority: Send {
     ) -> Result<Option<u64>, ServiceError>;
     fn release(&mut self, scope: &RuntimeScopeStamp, ticket: u64) -> Result<(), ServiceError>;
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteRequest<'a> {
     Static(wire::Destination<'a>),
     Chain,
@@ -69,6 +76,36 @@ struct Target {
     bytes: [u8; 253],
 }
 impl Target {
+    fn wire(&self) -> wire::Destination<'_> {
+        wire::Destination {
+            protocol: self.protocol,
+            family: self.family,
+            port: self.port,
+            bytes: &self.bytes[..self.length as usize],
+        }
+    }
+    fn host(host: &str, port: u16) -> Result<Self, ServiceError> {
+        match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => Self::copy(wire::Destination {
+                protocol: 6,
+                family: 4,
+                port,
+                bytes: &ip.octets(),
+            }),
+            Ok(std::net::IpAddr::V6(ip)) => Self::copy(wire::Destination {
+                protocol: 6,
+                family: 6,
+                port,
+                bytes: &ip.octets(),
+            }),
+            Err(_) => Self::copy(wire::Destination {
+                protocol: 6,
+                family: 3,
+                port,
+                bytes: host.as_bytes(),
+            }),
+        }
+    }
     fn copy(d: wire::Destination<'_>) -> Result<Self, ServiceError> {
         if d.bytes.len() > 253 {
             return Err(ServiceError::InvalidRequest);
@@ -115,6 +152,11 @@ impl Subject {
     }
 }
 trait Authority: Send {
+    fn service(
+        &mut self,
+        manifest: [u8; 32],
+        request: RouteRequest<'_>,
+    ) -> Result<Option<u64>, ServiceError>;
     type Proof: Send;
     type Ingress: Send;
     fn mode(&self) -> Mode;
@@ -181,9 +223,97 @@ struct Grant {
     query: Box<str>,
     expires: Instant,
     request: u64,
-    ticket: Option<u64>,
+    tickets: Box<[u64]>,
     next: Option<(u16, u8, u16)>,
     _query_credit: super::memory::ByteLease,
+}
+struct ServiceGrant {
+    selector: [u16; 4],
+    fingerprint: [u8; 32],
+    request: u64,
+    expires: Instant,
+    tickets: Box<[u64]>,
+    _credit: super::memory::ByteLease,
+}
+/// Fixed scratch до allocation/effects. Chain remote не становится exception.
+struct RoutePlan<'a> {
+    items: [Option<RouteRequest<'a>>; 128],
+    len: usize,
+}
+impl<'a> RoutePlan<'a> {
+    fn new() -> Self {
+        Self {
+            items: [None; 128],
+            len: 0,
+        }
+    }
+    fn push(&mut self, route: RouteRequest<'a>) -> Result<(), ServiceError> {
+        if self.items[..self.len].contains(&Some(route)) {
+            return Ok(());
+        }
+        let slot = self.items.get_mut(self.len).ok_or(ServiceError::Busy)?;
+        *slot = Some(route);
+        self.len += 1;
+        Ok(())
+    }
+    fn walk(
+        &mut self,
+        capsule: &'a wire::Capsule<'a>,
+        scope: u16,
+        mask: u8,
+        target: wire::Destination<'a>,
+        depth: u16,
+        remaining: &mut u16,
+    ) -> Result<(), ServiceError> {
+        if depth > 256 {
+            return Err(ServiceError::InvalidRequest);
+        }
+        for branch in 0..2 {
+            if mask & (1 << branch) == 0 {
+                continue;
+            }
+            *remaining = remaining.checked_sub(1).ok_or(ServiceError::Busy)?;
+            let dial = capsule.dial_scope(scope, branch).map_err(unavailable)?;
+            match dial.action {
+                1 => self.push(RouteRequest::Static(
+                    dial.endpoint.ok_or(ServiceError::InvalidRequest)?,
+                ))?,
+                2 => {
+                    let (next, mask) = dial.next.ok_or(ServiceError::InvalidRequest)?;
+                    self.walk(
+                        capsule,
+                        next,
+                        mask,
+                        dial.endpoint.ok_or(ServiceError::InvalidRequest)?,
+                        depth + 1,
+                        remaining,
+                    )?;
+                }
+                3 if target.family != 3 => self.push(RouteRequest::Direct(target))?,
+                4 => {}
+                _ => return Err(ServiceError::Unsupported),
+            }
+        }
+        Ok(())
+    }
+    fn resolver(
+        capsule: &'a wire::Capsule<'a>,
+        resolver: &wire::ResolverScope<'a>,
+    ) -> Result<Self, ServiceError> {
+        let mut plan = Self::new();
+        if resolver.peer.family == 3 {
+            return Err(ServiceError::Unsupported);
+        }
+        if let Some((scope, mask)) = resolver.scope {
+            plan.walk(capsule, scope, mask, resolver.peer, 0, &mut 4096)?;
+        } else {
+            plan.push(RouteRequest::Dns(resolver.peer))?;
+        }
+        if plan.len == 0 {
+            return Err(ServiceError::Unsupported);
+        }
+        Ok(plan)
+    }
 }
 struct Issuer<A: Authority> {
     authority: A,
@@ -191,6 +321,7 @@ struct Issuer<A: Authority> {
     record: LaunchRecord,
     flows: BTreeMap<u64, Box<SourceFlow<A::Ingress>>>,
     grants: BTreeMap<u64, Box<Grant>>,
+    services: BTreeMap<u64, Box<ServiceGrant>>,
     frontier: BTreeMap<(u64, u16, u8, u16), u16>,
     retired: VecDeque<(u64, Instant)>,
     next_flow: u64,
@@ -222,6 +353,7 @@ impl<A: Authority> Issuer<A> {
             record,
             flows: BTreeMap::new(),
             grants: BTreeMap::new(),
+            services: BTreeMap::new(),
             frontier: BTreeMap::new(),
             retired: VecDeque::new(),
             next_flow: 0,
@@ -297,7 +429,7 @@ impl<A: Authority> Issuer<A> {
         a: &wire::Authorize<'_>,
     ) -> Result<(u64, A::Proof), ServiceError> {
         self.fence()?;
-        if a.class != 1 {
+        if a.class != 1 && a.class != 3 {
             return Err(ServiceError::Unsupported);
         }
         let owned = Arc::clone(&self.capsule);
@@ -307,7 +439,7 @@ impl<A: Authority> Issuer<A> {
             .validate_request(&wire::Message::Authorize(*a))
             .map_err(unavailable)?;
         if refresh == 0
-            && (self.grants.len() >= capsule.limits()[0] as usize
+            && (self.grants.len() + self.services.len() >= capsule.limits()[0] as usize
                 || self.retired.len() >= capsule.limits()[7] as usize)
         {
             return Err(ServiceError::Busy);
@@ -372,16 +504,20 @@ impl<A: Authority> Issuer<A> {
         if self.authority.subject(&proof, a.source_flow, tuple)? != source_subject {
             return Err(ServiceError::Unavailable);
         }
-        let route = if let Some(dial) = &dial {
-            match dial.action {
+        let mut routes = RoutePlan::new();
+        if let Some(dial) = &dial {
+            routes.push(match dial.action {
                 1 => RouteRequest::Static(dial.endpoint.ok_or(ServiceError::InvalidRequest)?),
                 2 => RouteRequest::Chain,
                 3 => RouteRequest::Direct(a.effective),
                 _ => return Err(ServiceError::InvalidRequest),
-            }
+            })?;
         } else {
-            RouteRequest::Dns(capsule.resolver_peer(a.resolver).map_err(unavailable)?)
-        };
+            routes = RoutePlan::resolver(
+                &capsule,
+                &capsule.resolver_scope(a.resolver).map_err(unavailable)?,
+            )?;
+        }
         let grant = if refresh == 0 {
             Self::id(&mut self.next_grant)?
         } else {
@@ -390,14 +526,26 @@ impl<A: Authority> Issuer<A> {
         let query_credit = self
             .budget
             .dynamic
-            .reserve((a.query.len() + 15) & !15)
+            .reserve(((a.query.len() + 15) & !15) + routes.len * 24)
             .map_err(unavailable)?;
-        let old_ticket = if refresh == 0 {
+        let mut tickets = Vec::with_capacity(routes.len);
+        for route in routes.items[..routes.len].iter().flatten() {
+            match self.authority.route(*route, &proof, a.source_flow, tuple) {
+                Ok(Some(ticket)) => tickets.push(ticket),
+                Ok(None) => {}
+                Err(error) => {
+                    self.release_tickets(&tickets)?;
+                    return Err(error);
+                }
+            }
+        }
+        let old_tickets = if refresh == 0 {
             None
         } else {
-            self.grants.get(&grant).and_then(|g| g.ticket)
+            self.grants
+                .get_mut(&grant)
+                .map(|g| std::mem::take(&mut g.tickets))
         };
-        let ticket = self.authority.route(route, &proof, a.source_flow, tuple)?;
         let result = (|| {
             if self
                 .authority
@@ -434,7 +582,7 @@ impl<A: Authority> Issuer<A> {
                 query: a.query.into(),
                 expires,
                 request,
-                ticket,
+                tickets: tickets.clone().into_boxed_slice(),
                 next,
                 _query_credit: query_credit,
             };
@@ -463,37 +611,177 @@ impl<A: Authority> Issuer<A> {
         })();
         match result {
             Ok(value) => {
-                if let Some(old) = old_ticket {
-                    if self.authority.release(old).is_err() {
-                        self.unknown = true;
-                        self.authority.revoke();
-                        return Err(ServiceError::Unavailable);
-                    }
+                if let Some(old) = old_tickets {
+                    self.release_tickets(&old)?;
                 }
                 Ok(value)
             }
             Err(error) => {
-                if let Some(ticket) = ticket {
-                    if self.authority.release(ticket).is_err() {
-                        self.unknown = true;
-                        self.authority.revoke();
+                if let Some(old) = old_tickets {
+                    if let Some(grant) = self.grants.get_mut(&grant) {
+                        grant.tickets = old;
                     }
                 }
+                self.release_tickets(&tickets)?;
                 Err(error)
             }
         }
     }
+    fn release_tickets(&mut self, tickets: &[u64]) -> Result<(), ServiceError> {
+        for ticket in tickets {
+            if self.authority.release(*ticket).is_err() {
+                self.unknown = true;
+                self.authority.revoke();
+                return Err(ServiceError::Unavailable);
+            }
+        }
+        Ok(())
+    }
+    fn service(
+        &mut self,
+        request: u64,
+        refresh: u64,
+        message: &wire::Message<'_>,
+    ) -> Result<u64, ServiceError> {
+        self.fence()?;
+        let started = self.authority.now();
+        let wire::Message::Probe {
+            purpose,
+            index,
+            subject,
+            resolver,
+        } = *message
+        else {
+            return Err(ServiceError::InvalidRequest);
+        };
+        let selector = [purpose, index, subject, resolver];
+        let owned = Arc::clone(&self.capsule);
+        let capsule = wire::Capsule::decode(owned.bytes(), &self.record.binding.digest)
+            .map_err(unavailable)?;
+        capsule.validate_request(message).map_err(unavailable)?;
+        let target;
+        let mut routes = RoutePlan::new();
+        let mut hash = Sha256::new();
+        hash.update(b"YNK-SERVICE-v1\0");
+        hash.update(capsule.manifest);
+        for value in selector {
+            hash.update(value.to_be_bytes());
+        }
+        match purpose {
+            1 => {
+                let probe = capsule.probe_scope(index, subject).map_err(unavailable)?;
+                target = Target::host(probe.host, probe.port)?;
+                hash.update([probe.scheme, probe.branches]);
+                hash.update(probe.scope.to_be_bytes());
+                hash.update(probe.host.as_bytes());
+                hash.update([0]);
+                hash.update(probe.path.as_bytes());
+                routes.walk(
+                    &capsule,
+                    probe.scope,
+                    probe.branches,
+                    target.wire(),
+                    0,
+                    &mut 4096,
+                )?;
+            }
+            2 => {
+                let endpoint = capsule
+                    .bootstrap_query(index, subject, resolver)
+                    .map_err(unavailable)?;
+                let row = capsule.resolver_scope(resolver).map_err(unavailable)?;
+                // Exact Go c75a8e9: только system snapshot bootstrap, без
+                // заимствования internal/provider resolver по совпадению peer.
+                if row.source == [0; 32] || row.subject != u16::MAX {
+                    return Err(ServiceError::Unsupported);
+                }
+                hash.update(row.source);
+                hash.update(endpoint.bytes);
+                routes = RoutePlan::resolver(&capsule, &row)?;
+            }
+            _ => return Err(ServiceError::InvalidRequest),
+        }
+        if routes.len == 0 {
+            return Err(ServiceError::Unsupported);
+        }
+        let fingerprint = hash.finalize().into();
+        let id = if refresh == 0 {
+            if self.grants.len() + self.services.len() >= capsule.limits()[0] as usize
+                || self.retired.len() >= capsule.limits()[7] as usize
+            {
+                return Err(ServiceError::Busy);
+            }
+            Self::id(&mut self.next_grant)?
+        } else {
+            let old = self
+                .services
+                .get(&refresh)
+                .ok_or(ServiceError::Unavailable)?;
+            if old.selector != selector || old.fingerprint != fingerprint || started >= old.expires
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            refresh
+        };
+        let credit = self
+            .budget
+            .dynamic
+            .reserve(std::mem::size_of::<ServiceGrant>() + 80 + routes.len * 16)
+            .map_err(unavailable)?;
+        let mut tickets = Vec::with_capacity(routes.len);
+        for route in routes.items[..routes.len].iter().flatten() {
+            match self.authority.service(capsule.manifest, *route) {
+                Ok(Some(ticket)) => tickets.push(ticket),
+                Ok(None) => {}
+                Err(error) => {
+                    self.release_tickets(&tickets)?;
+                    return Err(error);
+                }
+            }
+        }
+        if let Err(error) = self.fence().and_then(|()| {
+            if self.authority.now() >= started + Duration::from_secs(1) {
+                Err(ServiceError::Unavailable)
+            } else {
+                Ok(())
+            }
+        }) {
+            self.release_tickets(&tickets)?;
+            return Err(error);
+        }
+        let old = self.services.insert(
+            id,
+            Box::new(ServiceGrant {
+                selector,
+                fingerprint,
+                request,
+                expires: started + Duration::from_secs(1),
+                tickets: tickets.into_boxed_slice(),
+                _credit: credit,
+            }),
+        );
+        if let Some(old) = old {
+            self.release_tickets(&old.tickets)?;
+        }
+        Ok(id)
+    }
     fn cancel_grant(&mut self, id: u64) -> Result<(), ServiceError> {
+        if self.unknown {
+            return Err(ServiceError::Unavailable);
+        }
+        if let Some(service) = self.services.remove(&id) {
+            if let Err(error) = self.release_tickets(&service.tickets) {
+                self.services.insert(id, service);
+                return Err(error);
+            }
+            return Ok(());
+        }
         let Some(grant) = self.grants.remove(&id) else {
             return Ok(());
         };
-        if let Some(ticket) = grant.ticket {
-            if self.authority.release(ticket).is_err() {
-                self.unknown = true;
-                self.authority.revoke();
-                self.grants.insert(id, grant);
-                return Err(ServiceError::Unavailable);
-            }
+        if let Err(error) = self.release_tickets(&grant.tickets) {
+            self.grants.insert(id, grant);
+            return Err(error);
         }
         if let Some((scope, mask, endpoint)) = grant.next {
             for branch in 0..2 {
@@ -528,6 +816,9 @@ impl<A: Authority> Issuer<A> {
         Ok(())
     }
     fn cancel_flow(&mut self, id: u64) -> Result<(), ServiceError> {
+        if self.unknown {
+            return Err(ServiceError::Unavailable);
+        }
         if id > self.next_flow {
             return Err(ServiceError::InvalidRequest);
         }
@@ -536,6 +827,13 @@ impl<A: Authority> Issuer<A> {
         self.authority.cancel_source(id)
     }
     fn cancel_request(&mut self, request: u64) -> Result<(), ServiceError> {
+        if self.unknown {
+            return Err(ServiceError::Unavailable);
+        }
+        if let Some((id, _)) = self.services.iter().find(|(_, g)| g.request == request) {
+            let id = *id;
+            return self.cancel_grant(id);
+        }
         if let Some((id, _)) = self.flows.iter().find(|(_, f)| f.request == request) {
             let id = *id;
             return self.cancel_flow(id);
@@ -565,6 +863,16 @@ struct SystemAuthority {
     routes: Box<dyn RouteAuthority>,
 }
 impl Authority for SystemAuthority {
+    fn service(
+        &mut self,
+        manifest: [u8; 32],
+        request: RouteRequest<'_>,
+    ) -> Result<Option<u64>, ServiceError> {
+        self.fence()?;
+        let result = self.routes.service(&self.scope, manifest, request)?;
+        self.fence()?;
+        Ok(result)
+    }
     type Proof = KnownOwnerProof;
     type Ingress = Option<Box<SocketHold>>;
     fn mode(&self) -> Mode {
@@ -701,6 +1009,22 @@ struct LocalAuthority {
     prepared: Arc<crate::host::local_profile_channel::Prepared>,
 }
 impl Authority for LocalAuthority {
+    fn service(
+        &mut self,
+        manifest: [u8; 32],
+        request: RouteRequest<'_>,
+    ) -> Result<Option<u64>, ServiceError> {
+        self.fence()?;
+        if self.prepared.capsule.bytes().get(..32) != Some(manifest.as_slice()) {
+            return Err(ServiceError::Unavailable);
+        }
+        if let RouteRequest::Dns(peer) = request {
+            // Local не получает kernel/route attribution System. Numeric peer
+            // остаётся bound к retained resolver row; loopback требует bind proof.
+            reject_unproved_stub(peer)?;
+        }
+        Ok(None)
+    }
     type Proof = ();
     type Ingress = Option<Box<SocketHold>>;
     fn mode(&self) -> Mode {
@@ -782,12 +1106,15 @@ impl Authority for LocalAuthority {
     }
     fn route(
         &mut self,
-        _: RouteRequest<'_>,
+        request: RouteRequest<'_>,
         _: &(),
         _: u64,
         _: Tuple,
     ) -> Result<Option<u64>, ServiceError> {
         self.fence()?;
+        if let RouteRequest::Dns(peer) = request {
+            reject_unproved_stub(peer)?;
+        }
         Ok(None)
     }
     fn release(&mut self, _: u64) -> Result<(), ServiceError> {
@@ -1822,6 +2149,17 @@ fn run_issuer<A: Authority>(
             return Err(ServiceError::Unavailable);
         }
         issuer.cancel_matching(|grant| now >= grant.expires)?;
+        let mut expired = [0; 4096];
+        let mut count = 0;
+        for (id, grant) in &issuer.services {
+            if now >= grant.expires {
+                *expired.get_mut(count).ok_or(ServiceError::Busy)? = *id;
+                count += 1;
+            }
+        }
+        for id in &expired[..count] {
+            issuer.cancel_grant(*id)?;
+        }
         let (n, sequenced) = if let Some(pending) = queued.pop_front() {
             bytes = pending.bytes;
             (pending.length, true)
@@ -1831,6 +2169,7 @@ fn run_issuer<A: Authority>(
                     .grants
                     .values()
                     .map(|g| g.expires)
+                    .chain(issuer.services.values().map(|g| g.expires))
                     .chain(awaiting.map(|a| a.2))
                     .fold(expires, Instant::min);
                 socket.pause_until(until);
@@ -2095,23 +2434,64 @@ fn run_issuer<A: Authority>(
                 )?;
             }
             wire::Message::Probe { .. } => {
-                issuer
-                    .capsule()?
-                    .validate_request(&frame.message)
-                    .map_err(unavailable)?;
-                send_message(
-                    issuer,
-                    socket,
-                    stop,
-                    outgoing,
-                    reply,
-                    0,
-                    &wire::Message::Deny {
-                        status: wire::Status::Deny,
-                        reason: 3,
-                    },
-                    expires.min(now + Duration::from_secs(1)),
-                )?;
+                let mut published = false;
+                let grant = issuer.service(reply, frame.header.object_id, &frame.message);
+                if let Ok(id) = grant {
+                    drain_before_publication(
+                        issuer,
+                        socket,
+                        pid,
+                        uid,
+                        &mut incoming,
+                        &mut queued,
+                        &mut acks,
+                    )?;
+                    if let Some(grant) = issuer.services.get(&id) {
+                        let until = grant.expires.min(expires);
+                        send_message(
+                            issuer,
+                            socket,
+                            stop,
+                            outgoing,
+                            reply,
+                            id,
+                            &wire::Message::Grant {
+                                status: wire::Status::Allow,
+                                class: if grant.selector[0] == 1 { 2 } else { 3 },
+                                required: false,
+                                grant: id,
+                                flow: 0,
+                                lease: until
+                                    .saturating_duration_since(Instant::now())
+                                    .as_millis()
+                                    .min(1000) as u32,
+                                revision: issuer.capsule()?.policy_revision,
+                                fresh: 0,
+                                receipt: wire::Receipt {
+                                    kind: wire::ReceiptKind::None,
+                                    id: 0,
+                                },
+                            },
+                            until,
+                        )?;
+                        published = true;
+                    }
+                }
+                if !published {
+                    send_message(
+                        issuer,
+                        socket,
+                        stop,
+                        outgoing,
+                        reply,
+                        0,
+                        &wire::Message::Deny {
+                            status: wire::Status::Deny,
+                            reason: 3,
+                        },
+                        expires.min(now + Duration::from_secs(1)),
+                    )?;
+                }
             }
             _ => return Err(ServiceError::InvalidRequest),
         }
@@ -2133,6 +2513,21 @@ fn run_issuer<A: Authority>(
             )?;
         }
     }
+}
+pub(super) fn reject_unproved_stub(peer: wire::Destination<'_>) -> Result<(), ServiceError> {
+    let address = match peer.family {
+        4 => std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+            <[u8; 4]>::try_from(peer.bytes).map_err(unavailable)?,
+        )),
+        6 => std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+            <[u8; 16]>::try_from(peer.bytes).map_err(unavailable)?,
+        )),
+        _ => return Err(ServiceError::Unsupported),
+    };
+    if address.is_loopback() || address.is_unspecified() || address.is_multicast() {
+        return Err(ServiceError::Unsupported);
+    }
+    Ok(())
 }
 
 /// Gate не имеет caller constructor или UI bool. Go a004e92 ещё не содержит

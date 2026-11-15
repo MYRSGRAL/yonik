@@ -224,8 +224,8 @@ driver. Driver проверяет exact ACK/hash/id, monotonic sequences, bounde
 queue и targeted CANCEL до публикации late результата. Refresh снова выполняет
 route fence. Grant TTL/freshness пересчитываются при каждой send attempt от
 original expiry. Unknown retirement сохраняет grant/ticket и отзывает context;
-обычная отмена одного flow сохраняет соседний. DNS class3 через user-flow и
-PROBE сейчас не создают service authority: до отдельного trusted service path
+обычная отмена одного flow сохраняет соседний. На b04c2c0 DNS class3 через user-flow и
+PROBE ещё не создавали service authority: до отдельного trusted service path
 они явно закрыты.
 
 `ProfileRoutes` получает Weak на тот же Backend и его runtime; новый backend,
@@ -432,3 +432,91 @@ ephemeral endpoint → actual UDP initiator proof, с cancel при закрыт
 Только переданного UDP FD недостаточно, чтобы доказать association provenance.
 Trusted Probe/DNS paths также не выведены из этого предложения. Все эти gates
 остаются закрытыми до отдельных producers/consumers и review.
+
+## Service issuer после R12: exact c75a8e9 counterpart
+
+Go source pin: c75a8e94be35c64c490706ce5c20ab256d9dbbb4, implementation API
+332–430. Byte-exact DATA vectors перенесены в
+`tests/fixtures/xray-profile-channel-v3/go-c75a8e9-service-grants.json`.
+Wire layout не расширяется: PROBE8, AUTHORIZE class3 prefix20, GRANT56,
+mappingVersion3/tableCount11, frozen ABI260 и four locators сохраняются.
+Разрешённое Go convention уточнение: PROBE objectId=0 initial, live service
+grantId для refresh; exact purpose/index/subject/resolver обязателен.
+
+`run_issuer` вызывает `Issuer::service` для PROBE, отдельно от user AUTHORIZE.
+Purpose1 выводит exact URL scheme/host/port/path, admitted subject и TCP root
+scope/actual branch mask из table8+typed scope rows. Никакого caller URL или
+arbitrary scope constructor. Purpose2 требует table2 physical hostname endpoint,
+его actual owning subject и table5 system snapshot resolver (subject=None,
+sourceDigest!=0). Probe URL из table8 этим endpoint index не подменяется.
+Scope/branch/carrier/chain routes обходятся до terminal physical leaves; chain
+remote не попадает в direct exceptions. Numeric Direct проходит тот же durable
+ProfileRoutes replacement/fence и bounded refcounts. Domain physical/result
+handoff остаётся Unsupported до independent authenticated RRset provenance.
+
+Service grants хранятся отдельно от user FlowGrant, но IDs, общий grant cap,
+dynamic byte credit, request cancellation и expiry общие. Service GRANT всегда
+sourceFlow=0,required=false,ownerFresh=0,receipt=None. Это не OS attribution и не
+снятие mandatory constraints: SystemAuthority проверяет retained runtime/image
+scope, а ProfileRoutes::service независимо сверяет exact retained manifest,
+active SessionArtifact, source/resolver guards и captured routes в serial backend.
+LocalAuthority проверяет exact child и retained Prepared sources. До ACK нет
+готового consumer; require_consumer и capability остаются false.
+
+User DNS AUTHORIZE class3 требует live private sourceFlow, immutable original,
+numeric exact resolver peer, canonical query, NONE subject/chain/stream/scope,
+branch0 и OwnerNone. В System новый serial Known observation остаётся ≤20ms;
+service grant ни на этом входе, ни при refresh не заменяет source flow.
+Provider DNS detour выводится из resolver row subject и checked chain matrix,
+без подмены system DNS. Retained resolver snapshot проверяется source fences;
+его digest в row не является самостоятельным peer proof. Loopback/unspecified/
+multicast DNS peer пока Unsupported: verified stub bind отсутствует. Existing
+resolved Varlink ResolverPeer из resolver/socket.rs — proof другого Unix endpoint,
+не proof UDP53, и не используется как замена. Numeric non-loopback DNS route
+проверяется against independently captured/revalidated SessionArtifact route;
+actual socket/RRset consumer guards обязательны и readiness этим не доказана.
+
+## UDP association: минимальный contract для root до изменения wire
+
+Текущие anchors: `Peer::socket` запрещает provenance3; `SocketRecord::encode`
+допускает только TCP; `Rendezvous` удерживает exact TCP request evidence;
+`SourceFlow` удерживает TCP SocketHold/cookie и original owner subject. SIOCGSKNS
+доказывает namespace actual UDP FD, но не приложение связи UDP↔TCP control.
+Передача child-created UDP FD с control ID была бы assertion, а не independent
+association proof. Такой constructor не добавлен, UDP остаётся Unsupported.
+
+Минимальный вариант независимого producer: issuer после fresh Known TCP control
+source создаёт и удерживает **собственный** loopback UDP socket/bound ephemeral
+endpoint в retained namespace и назначает association ID. По existing proof
+channel он доставляет Go owned duplicate; Go не выбирает cookie/namespace/port.
+Ledger связывает socket с retained TCP control source/cookie/subject, session,
+digest/generation, cancellation и KnownClosed custody. Нужен отдельный Local
+normal Host factory; привилегированный Local daemon не требуется.
+Factory независимо сравнивает actual socket namespace с retained stamp до
+доставки FD. Если текущий namespace issuer другой — Unsupported, без setns,
+CAP_SYS_ADMIN или иных новых capabilities.
+
+Предлагаемые **не реализованные и не принятые** private records, big endian:
+
+- `YNKUAQ01`160/rights0: prefix16(version1,length160,reserved0),binding80@16,
+  nonce32@96,runtimeRequestSequence8@128,controlSourceFlow8@136,
+  expectedControlCookie8@144,reserved8@152. Cookie сравнивается с retained actual
+  TCP proof, а не принимается за него.
+- `YNKUAC01`192/rights1 от issuer: prefix16,binding80@16,nonce32@96,
+  request8@128,controlSource8@136,associationId8@144,actualSocketCookie8@152,
+  family1@160,protocol17@161,reserved2@162,port2@164,reserved2@166,
+  address16@168,reserved8@184. Exactly1 issuer-created socket FD. Frozen runtime
+  frames/locators не меняются; это потребует отдельного versioned proof exchange.
+
+Для actual UDP flow одного association ACK недостаточно. Issuer должен получить
+kernel datagram peer на retained socket и независимо проверить SOCKS UDP header
+и immutable original destination до выдачи OPEN_INGRESS: bounded MSG_PEEK при
+одном outstanding packet/association, Go не consuming reader до issuer decision.
+Actual initiator UDP tuple получает **свой** fresh serial Known proof ≤20ms;
+TCP proof его не заменяет. Для первого узкого режима требуется совпадение
+retained principal PID/start/executable control и UDP owner. Datagram peer,
+destination/length/fingerprint и cookie должны совпасть у consuming Go read;
+packet IDs/credits monotonic, no wrap/replay, cancel control отзывает association
+и все её UDP flows. Payload не логируется. Shared-reader protocol и exact packet
+proof record ещё требуют root/Go согласования; добавлять по одному child-reported
+port или ACK без consuming match небезопасно. Никаких UDP grants до этой цепочки.

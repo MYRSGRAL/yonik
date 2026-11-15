@@ -585,28 +585,46 @@ impl ProfileRoutes {
         Ok(())
     }
 }
-impl crate::helper::native_profile_channel::RouteAuthority for ProfileRoutes {
-    fn check(
+enum ProfileRouteEvidence<'a> {
+    User(
+        &'a crate::attribution::native_session::KnownOwnerProof,
+        u64,
+        crate::attribution::broker::Flow,
+    ),
+    Service([u8; 32]),
+}
+impl ProfileRoutes {
+    fn check_route(
         &mut self,
         scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
         request: crate::helper::native_profile_channel::RouteRequest<'_>,
-        proof: &crate::attribution::native_session::KnownOwnerProof,
-        source: u64,
-        flow: crate::attribution::broker::Flow,
+        evidence: ProfileRouteEvidence<'_>,
     ) -> Result<Option<u64>, ServiceError> {
-        proof.checked(scope, source, flow).map_err(unavailable)?;
+        if let ProfileRouteEvidence::User(proof, source, flow) = evidence {
+            proof.checked(scope, source, flow).map_err(unavailable)?;
+        }
         let shared = self.backend.upgrade().ok_or(ServiceError::Unavailable)?;
         let mut backend = shared.try_lock().map_err(unavailable)?;
-        proof.checked(scope, source, flow).map_err(unavailable)?;
+        if let ProfileRouteEvidence::User(proof, source, flow) = evidence {
+            proof.checked(scope, source, flow).map_err(unavailable)?;
+        }
         let runtime = self.runtime.clone();
         let result = runtime.block_on(async {
             let (_keep, mut cancel) = fresh_cancel();
             let artifact = self.fence(&mut backend, scope, &mut cancel).await?;
+            if let ProfileRouteEvidence::Service(manifest)=evidence {
+                let profile=artifact.full_profile.as_ref().ok_or(ServiceError::Unsupported)?;
+                let capsule=crate::profile_channel::Capsule::decode(profile.capsule_bytes(),profile.retained().digest()).map_err(unavailable)?;
+                if capsule.manifest!=manifest {return Err(stale());}
+            }
             use crate::helper::native_profile_channel::RouteRequest;
             let (destination, dns, dynamic) = match request {
                 RouteRequest::Chain => return Ok(None),
                 RouteRequest::Static(d) => (d, false, false),
-                RouteRequest::Dns(d) => (d, true, false),
+                RouteRequest::Dns(d) => {
+                    crate::helper::native_profile_channel::reject_unproved_stub(d)?;
+                    (d, true, false)
+                },
                 RouteRequest::Direct(d) => (d, false, true),
             };
             let endpoint = match destination.family {
@@ -720,6 +738,30 @@ impl crate::helper::native_profile_channel::RouteAuthority for ProfileRoutes {
             backend.worker_uncertain = true;
         }
         result
+    }
+}
+impl crate::helper::native_profile_channel::RouteAuthority for ProfileRoutes {
+    fn check(
+        &mut self,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        request: crate::helper::native_profile_channel::RouteRequest<'_>,
+        proof: &crate::attribution::native_session::KnownOwnerProof,
+        source: u64,
+        flow: crate::attribution::broker::Flow,
+    ) -> Result<Option<u64>, ServiceError> {
+        self.check_route(
+            scope,
+            request,
+            ProfileRouteEvidence::User(proof, source, flow),
+        )
+    }
+    fn service(
+        &mut self,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        manifest: [u8; 32],
+        request: crate::helper::native_profile_channel::RouteRequest<'_>,
+    ) -> Result<Option<u64>, ServiceError> {
+        self.check_route(scope, request, ProfileRouteEvidence::Service(manifest))
     }
     fn release(
         &mut self,

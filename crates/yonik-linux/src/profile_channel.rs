@@ -1281,7 +1281,104 @@ pub(crate) struct DialScope<'a> {
     pub endpoint_index: u16,
     pub next: Option<(u16, u8)>,
 }
+/// Manifest DATA; служебную authority создаёт только trusted runtime issuer.
+pub(crate) struct ProbeScope<'a> {
+    pub scheme: u8,
+    pub port: u16,
+    pub host: &'a str,
+    pub path: &'a str,
+    pub scope: u16,
+    pub branches: u8,
+}
+pub(crate) struct ResolverScope<'a> {
+    pub subject: u16,
+    pub source: [u8; 32],
+    pub peer: Destination<'a>,
+    pub scope: Option<(u16, u8)>,
+}
 impl<'a> Capsule<'a> {
+    pub(crate) fn subject_scope(&self, index: u16, protocol: u8) -> Result<(u16, u8)> {
+        let subject = subject(self.tables[0].row(index)?)?;
+        let index = match protocol {
+            6 => subject.tcp,
+            17 => subject.udp,
+            _ => return Err(Error::Schema),
+        };
+        let scope = scope_from(&self.tables, index)?;
+        Ok((index, scope.mask))
+    }
+    pub(crate) fn probe_scope(&self, index: u16, subject: u16) -> Result<ProbeScope<'_>> {
+        self.validate_request(&Message::Probe {
+            purpose: 1,
+            index,
+            subject,
+            resolver: NONE,
+        })?;
+        let mut r = Reader::new(self.tables[7].row(index)?);
+        let scheme = r.u8()?;
+        r.zero(1)?;
+        let port = r.u16()?;
+        let host = r.string(253)?;
+        let path = r.string(2048)?;
+        let (scope, branches) = self.subject_scope(subject, 6)?;
+        Ok(ProbeScope {
+            scheme,
+            port,
+            host,
+            path,
+            scope,
+            branches,
+        })
+    }
+    pub(crate) fn resolver_scope(&self, index: u16) -> Result<ResolverScope<'_>> {
+        let mut r = Reader::new(self.tables[4].row(index)?);
+        r.u8()?;
+        let protocol = r.u8()?;
+        let subject = r.u16()?;
+        let source = r.array()?;
+        let peer = Destination::read(&mut r)?;
+        r.end()?;
+        let scope = if subject == NONE {
+            None
+        } else {
+            Some(self.subject_scope(subject, protocol)?)
+        };
+        Ok(ResolverScope {
+            subject,
+            source,
+            peer,
+            scope,
+        })
+    }
+    pub(crate) fn bootstrap_query(
+        &self,
+        index: u16,
+        subject: u16,
+        resolver: u16,
+    ) -> Result<Destination<'_>> {
+        self.validate_request(&Message::Probe {
+            purpose: 2,
+            index,
+            subject,
+            resolver,
+        })?;
+        // Row reference не разрешает hostname другого subject/chain frontier.
+        let mut owned = false;
+        for protocol in [6, 17] {
+            let (scope, mask) = self.subject_scope(subject, protocol)?;
+            for branch in 0..2 {
+                if mask & (1 << branch) != 0
+                    && self.dial_scope(scope, branch)?.endpoint_index == index
+                {
+                    owned = true;
+                }
+            }
+        }
+        if !owned {
+            return Err(Error::Reference);
+        }
+        self.endpoint(index)
+    }
     pub(crate) fn limits(&self) -> [u32; 8] {
         std::array::from_fn(|i| {
             let p = 88 + i * 4;
@@ -1704,9 +1801,19 @@ impl Capsule<'_> {
                         return Err(Error::Reference);
                     }
                 } else {
-                    let mut r = Reader::new(t[4].row(a.resolver)?);
-                    r.take(36)?;
-                    let destination = Destination::read(&mut r)?;
+                    if a.receipt.kind != ReceiptKind::None
+                        || a.receipt.id != 0
+                        || a.source_flow == 0
+                        || [a.subject, a.chain, a.transport, a.scope] != [NONE; 4]
+                        || a.branch != 0
+                    {
+                        return Err(Error::Reference);
+                    }
+                    hostname(a.query)?;
+                    if a.query.bytes().any(|b| b.is_ascii_uppercase()) {
+                        return Err(Error::Schema);
+                    }
+                    let destination = self.resolver_peer(a.resolver)?;
                     if destination != a.effective {
                         return Err(Error::Reference);
                     }
@@ -1719,6 +1826,9 @@ impl Capsule<'_> {
                 resolver,
             } => {
                 if *purpose == 1 {
+                    if *resolver != NONE {
+                        return Err(Error::Reference);
+                    }
                     let mut r = Reader::new(t[7].row(*index)?);
                     r.take(4)?;
                     r.string(253)?;
@@ -2567,6 +2677,7 @@ impl<'a> Message<'a> {
                     || lease > 1000
                     || status == Status::Allow && (grant == 0 || lease == 0 || revision == 0)
                     || status == Status::Allow && class == 1 && flow == 0
+                    || flow == 0 && (required || fresh != 0 || receipt.kind != ReceiptKind::None)
                     || status != Status::Allow && (grant != 0 || lease != 0)
                     || class == 2
                         && (flow != 0
@@ -2925,8 +3036,12 @@ impl<'a> Frame<'a> {
                     return Err(Error::Schema);
                 }
             }
+            Message::Probe { .. } => {
+                if header.reply_to != 0 {
+                    return Err(Error::Schema);
+                }
+            }
             Message::OpenIngress { .. }
-            | Message::Probe { .. }
             | Message::Renew { .. }
             | Message::Cancel { .. }
             | Message::Revoke { .. } => {
@@ -2964,6 +3079,59 @@ impl Sequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_c75a8e9_service_wire_vectors_and_live_probe_refresh() {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/go-c75a8e9-service-grants.json"
+        ))
+        .unwrap();
+        for (name, kind) in [
+            ("probeBodyHex", Kind::Probe),
+            ("bootstrapBodyHex", Kind::Probe),
+            ("dnsAuthorizeBodyHex", Kind::Authorize),
+            ("dnsGrantBodyHex", Kind::Grant),
+            ("probeGrantBodyHex", Kind::Grant),
+        ] {
+            let bytes = unhex(f[name].as_str().unwrap());
+            let message = Message::decode(kind, &bytes).unwrap();
+            let mut out = [0; 1153];
+            let length = Frame::encode(
+                Header {
+                    kind,
+                    sequence: 3,
+                    reply_to: if kind == Kind::Grant { 2 } else { 0 },
+                    binding: binding(),
+                    object_id: match &message {
+                        Message::Grant { grant, .. } => *grant,
+                        _ => 0,
+                    },
+                },
+                &message,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(&out[128..length], bytes);
+            Frame::decode(&out[..length], binding(), Mode::Local, kind == Kind::Grant).unwrap();
+            if name == "probeGrantBodyHex" {
+                let mut bad = bytes.clone();
+                bad[12..20].copy_from_slice(&1u64.to_be_bytes());
+                assert!(Message::decode(kind, &bad).is_err());
+            }
+            if name == "dnsGrantBodyHex" {
+                let mut bad = bytes.clone();
+                bad[12..20].fill(0);
+                bad[2] = 1;
+                bad[32..40].copy_from_slice(&1u64.to_be_bytes());
+                bad[40] = 2;
+                bad[48..56].copy_from_slice(&1u64.to_be_bytes());
+                assert!(Message::decode(kind, &bad).is_err());
+            }
+            if kind == Kind::Probe {
+                out[112..120].copy_from_slice(&17u64.to_be_bytes());
+                assert!(Frame::decode(&out[..length], binding(), Mode::System, false).is_ok());
+            }
+        }
+    }
     #[test]
     fn socket_record_constructor_rejects_invalid_tuple_and_ingress() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(

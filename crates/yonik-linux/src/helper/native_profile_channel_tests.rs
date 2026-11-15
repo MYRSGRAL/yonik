@@ -290,6 +290,7 @@ struct Proof {
     receipt: wire::Receipt,
 }
 struct Fake {
+    service_trusted: bool,
     mode: Mode,
     now: Instant,
     elapsed: Arc<std::sync::atomic::AtomicU64>,
@@ -297,15 +298,18 @@ struct Fake {
     revoked: AtomicBool,
     owner_count: u64,
     route_count: u64,
+    service_routes: Vec<Target>,
     released: Vec<u64>,
     live: BTreeSet<u64>,
     route_delay: Duration,
     unknown_release: bool,
+    release_attempts: usize,
     fail_after_route: bool,
 }
 impl Fake {
     fn new(mode: Mode) -> Self {
         Self {
+            service_trusted: false,
             mode,
             now: Instant::now(),
             elapsed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -313,15 +317,37 @@ impl Fake {
             revoked: AtomicBool::new(false),
             owner_count: 0,
             route_count: 0,
+            service_routes: Vec::new(),
             released: Vec::new(),
             live: BTreeSet::new(),
             route_delay: Duration::ZERO,
             unknown_release: false,
+            release_attempts: 0,
             fail_after_route: false,
         }
     }
 }
 impl Authority for Fake {
+    fn service(
+        &mut self,
+        _: [u8; 32],
+        route: RouteRequest<'_>,
+    ) -> Result<Option<u64>, ServiceError> {
+        self.fence()?;
+        if !self.service_trusted {
+            return Err(ServiceError::Unavailable);
+        }
+        match route {
+            RouteRequest::Static(d) | RouteRequest::Direct(d) | RouteRequest::Dns(d) => {
+                self.service_routes.push(Target::copy(d)?)
+            }
+            RouteRequest::Chain => panic!("service chain должен быть выведен до terminal leaf"),
+        }
+        self.route_count += 1;
+        self.live.insert(self.route_count);
+        self.now += self.route_delay;
+        Ok(Some(self.route_count))
+    }
     type Proof = Proof;
     type Ingress = ();
     fn mode(&self) -> Mode {
@@ -435,6 +461,7 @@ impl Authority for Fake {
         Ok(Some(self.route_count))
     }
     fn release(&mut self, ticket: u64) -> Result<(), ServiceError> {
+        self.release_attempts += 1;
         if self.unknown_release {
             return Err(ServiceError::Unavailable);
         }
@@ -447,11 +474,17 @@ impl Authority for Fake {
     }
 }
 fn issuer(mode: Mode) -> Issuer<Fake> {
+    issuer_profile(mode, false)
+}
+fn issuer_profile(mode: Mode, service: bool) -> Issuer<Fake> {
     use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent};
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+    let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../tests/fixtures/xray-profile-channel-v3/local-minimal.json"
     ))
     .unwrap();
+    if service {
+        fixture["profile"]["graph"]["observatory"] = serde_json::json!({"probeURL":"https://203.0.113.9/probe?token=fixture","subjectSelector":["direct"]});
+    }
     let intent = ProfileIntent::decode(&fixture["profile"].to_string()).unwrap();
     let mut plan =
         OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap()).unwrap();
@@ -539,6 +572,279 @@ fn authorize(source: u64) -> wire::Authorize<'static> {
             id: 0,
         },
     }
+}
+fn probe() -> wire::Message<'static> {
+    wire::Message::Probe {
+        purpose: 1,
+        index: 0,
+        subject: 0,
+        resolver: u16::MAX,
+    }
+}
+#[test]
+fn service_constructor_rejects_wrong_probe_resolver_even_without_wire_decoder() {
+    let mut issuer = issuer_profile(Mode::System, true);
+    issuer.authority.service_trusted = true;
+    assert!(
+        issuer
+            .service(
+                2,
+                0,
+                &wire::Message::Probe {
+                    purpose: 1,
+                    index: 0,
+                    subject: 0,
+                    resolver: 0
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(issuer.authority.route_count, 0);
+}
+#[test]
+fn trusted_service_probe_is_distinct_from_user_and_rejects_missing_authority() {
+    for mode in [Mode::Local, Mode::System] {
+        let mut issuer = issuer_profile(mode, true);
+        issuer.authority.known = false;
+        assert!(issuer.service(2, 0, &probe()).is_err());
+        assert_eq!(issuer.authority.route_count, 0);
+        issuer.authority.service_trusted = true;
+        let grant = issuer.service(3, 0, &probe()).unwrap();
+        assert!(issuer.flows.is_empty());
+        assert_eq!(issuer.authority.owner_count, 0);
+        assert!(issuer.authorize(4, 0, &authorize(grant)).is_err());
+        assert!(issuer.services.contains_key(&grant));
+        assert!(
+            issuer
+                .service(
+                    5,
+                    grant,
+                    &wire::Message::Probe {
+                        purpose: 1,
+                        index: 0,
+                        subject: 1,
+                        resolver: u16::MAX
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(issuer.service(6, grant, &probe()).unwrap(), grant);
+        issuer.cancel_request(6).unwrap();
+        assert!(issuer.services.is_empty());
+        assert!(issuer.service(7, grant, &probe()).is_err());
+        let next = issuer.service(8, 0, &probe()).unwrap();
+        assert!(next > grant);
+        issuer.authority.unknown_release = true;
+        assert!(issuer.cancel_grant(next).is_err());
+        assert!(issuer.services.contains_key(&next));
+        assert!(issuer.unknown);
+        assert!(issuer.service(9, 0, &probe()).is_err());
+    }
+}
+#[test]
+fn service_caps_precede_effects_and_route_latency_never_restarts_lease() {
+    let mut limited = issuer_profile(Mode::System, true);
+    limited.authority.service_trusted = true;
+    Arc::get_mut(&mut limited.budget).unwrap().dynamic = super::super::memory::ByteBudget::new(1);
+    assert!(limited.service(2, 0, &probe()).is_err());
+    assert_eq!(limited.authority.route_count, 0);
+    assert!(limited.services.is_empty());
+    let mut issuer = issuer_profile(Mode::System, true);
+    issuer.authority.service_trusted = true;
+    let started = issuer.authority.now();
+    issuer.authority.route_delay = Duration::from_millis(999);
+    let id = issuer.service(2, 0, &probe()).unwrap();
+    assert_eq!(
+        issuer.services[&id].expires,
+        started + Duration::from_secs(1)
+    );
+    issuer.authority.now = started + Duration::from_secs(1);
+    assert!(issuer.service(3, id, &probe()).is_err());
+    issuer.authority.route_delay = Duration::from_secs(1);
+    assert!(issuer.service(4, 0, &probe()).is_err());
+    assert_eq!(issuer.authority.live.len(), 1);
+}
+#[test]
+fn service_unknown_retirement_does_not_retry_cleanup_or_free_custody() {
+    let mut issuer = issuer_profile(Mode::System, true);
+    issuer.authority.service_trusted = true;
+    let id = issuer.service(2, 0, &probe()).unwrap();
+    issuer.authority.unknown_release = true;
+    assert!(issuer.cancel_grant(id).is_err());
+    assert_eq!(issuer.authority.release_attempts, 1);
+    assert!(issuer.cancel_grant(id).is_err());
+    assert_eq!(issuer.authority.release_attempts, 1);
+    assert!(issuer.services.contains_key(&id));
+    assert_eq!(issuer.authority.live.len(), 1);
+}
+#[test]
+fn user_dns_requires_private_flow_fresh_owner_exact_peer_query_and_class() {
+    let mut issuer = issuer(Mode::System);
+    let (flow, _) = issuer.open(2, &open(Mode::System, 32001)).unwrap();
+    let peer = Target::copy(issuer.capsule().unwrap().resolver_peer(0).unwrap()).unwrap();
+    let mut request = wire::Authorize {
+        source_flow: flow,
+        class: 3,
+        subject: u16::MAX,
+        chain: u16::MAX,
+        transport: u16::MAX,
+        scope: u16::MAX,
+        branch: 0,
+        original: original(),
+        effective: peer.wire(),
+        resolver: 0,
+        query: "query.invalid",
+        receipt: wire::Receipt {
+            kind: wire::ReceiptKind::None,
+            id: 0,
+        },
+    };
+    issuer.authority.known = false;
+    assert!(issuer.authorize(3, 0, &request).is_err());
+    assert_eq!(issuer.authority.route_count, 0);
+    issuer.authority.known = true;
+    let (grant, _) = issuer.authorize(4, 0, &request).unwrap();
+    assert!(issuer.services.is_empty());
+    request.query = "foreign.invalid";
+    assert!(issuer.authorize(5, grant, &request).is_err());
+    request.query = "query.invalid";
+    request.effective.port = 54;
+    assert!(issuer.authorize(6, 0, &request).is_err());
+    request.effective.port = 53;
+    request.subject = 0;
+    assert!(issuer.authorize(7, 0, &request).is_err());
+    request.subject = u16::MAX;
+    request.receipt = wire::Receipt {
+        kind: wire::ReceiptKind::SidebandOperation,
+        id: 1,
+    };
+    assert!(issuer.authorize(8, 0, &request).is_err());
+    assert!(issuer.service(9, grant, &probe()).is_err());
+    issuer.cancel_flow(flow).unwrap();
+    assert!(issuer.grants.is_empty());
+}
+#[test]
+fn unproved_dns_stub_is_not_approved_by_numeric_row_or_namespace_claim() {
+    for address in [[127, 0, 0, 53], [0, 0, 0, 0], [224, 0, 0, 1]] {
+        assert!(
+            reject_unproved_stub(wire::Destination {
+                protocol: 17,
+                family: 4,
+                port: 53,
+                bytes: &address
+            })
+            .is_err()
+        );
+    }
+}
+#[test]
+fn service_bootstrap_requires_owning_endpoint_and_exact_system_snapshot_row() {
+    use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent, VerifiedSystemResolver};
+    struct Snapshot;
+    impl VerifiedSystemResolver for Snapshot {
+        fn snapshot_digest(&self) -> [u8; 32] {
+            [8; 32]
+        }
+        fn servers(&self) -> Vec<std::net::SocketAddr> {
+            vec!["192.0.2.53:53".parse().unwrap()]
+        }
+    }
+    let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/xray-profile-channel-v3/system-chain-probe.json"
+    ))
+    .unwrap();
+    fixture["profile"]["graph"]
+        .as_object_mut()
+        .unwrap()
+        .remove("inbounds");
+    fixture["profile"]["graph"]["outbounds"][0]["settings"]["servers"][0]["address"] =
+        serde_json::json!("proxy.invalid");
+    fixture["profile"]["graph"]["dns"] = serde_json::json!({"servers":["localhost"]});
+    let intent = ProfileIntent::decode(&fixture["profile"].to_string()).unwrap();
+    let plan = OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap())
+        .unwrap()
+        .bind_system_resolver(&Snapshot)
+        .unwrap();
+    let capsule = Arc::new(
+        wire::OwnedCapsule::build(
+            &intent,
+            &plan,
+            Some(wire::SnapshotRef {
+                source: [8; 32],
+                asset: [9; 32],
+                bytes: 120,
+                flags: 0,
+            }),
+            [3; 32],
+            1,
+            1,
+        )
+        .unwrap(),
+    );
+    let decoded = wire::Capsule::decode(capsule.bytes(), &[3; 32]).unwrap();
+    let index = decoded.dial_scope(0, 0).unwrap().endpoint_index;
+    let record = LaunchRecord {
+        manifest: decoded.manifest,
+        ..issuer(Mode::Local).record
+    };
+    let mut issuer = Issuer::new(Fake::new(Mode::Local), capsule, record).unwrap();
+    issuer.authority.service_trusted = true;
+    let request = wire::Message::Probe {
+        purpose: 2,
+        index,
+        subject: 0,
+        resolver: 0,
+    };
+    let grant = issuer.service(2, 0, &request).unwrap();
+    assert_eq!(issuer.services[&grant].selector, [2, index, 0, 0]);
+    assert!(
+        issuer
+            .service(
+                3,
+                grant,
+                &wire::Message::Probe {
+                    purpose: 2,
+                    index,
+                    subject: 1,
+                    resolver: 0
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        issuer
+            .service(
+                4,
+                grant,
+                &wire::Message::Probe {
+                    purpose: 2,
+                    index,
+                    subject: 0,
+                    resolver: 1
+                }
+            )
+            .is_err()
+    );
+    assert!(issuer.services.contains_key(&grant));
+    assert!(issuer.flows.is_empty());
+    assert_eq!(issuer.authority.owner_count, 0);
+    let before = issuer.authority.service_routes.len();
+    issuer
+        .service(
+            5,
+            0,
+            &wire::Message::Probe {
+                purpose: 1,
+                index: 0,
+                subject: 0,
+                resolver: u16::MAX,
+            },
+        )
+        .unwrap();
+    let leaves = &issuer.authority.service_routes[before..];
+    assert_eq!(leaves.len(), 1);
+    assert_eq!((leaves[0].family, leaves[0].port), (4, 8443));
+    assert_eq!(&leaves[0].bytes[..4], &[192, 0, 2, 2]);
 }
 
 #[test]
@@ -658,6 +964,7 @@ struct FakeIo {
     record: LaunchRecord,
     state: std::cell::RefCell<IoState>,
     wrong_ack: bool,
+    service: bool,
 }
 #[derive(Default)]
 struct IoState {
@@ -730,6 +1037,22 @@ impl Channel for FakeIo {
                         status: wire::Status::Allow,
                     },
                 );
+                if self.service {
+                    self.push(&mut state, 3, 0, wire::Kind::Probe, probe());
+                    self.push(&mut state, 4, 0, wire::Kind::Probe, probe());
+                    self.push(
+                        &mut state,
+                        5,
+                        0,
+                        wire::Kind::Cancel,
+                        wire::Message::Cancel {
+                            target: 1,
+                            reason: 1,
+                            id: 3,
+                        },
+                    );
+                    return Ok(true);
+                }
                 self.push(
                     &mut state,
                     3,
@@ -770,6 +1093,30 @@ impl Channel for FakeIo {
                     },
                 );
             }
+            wire::Message::Grant {
+                flow: 0,
+                grant,
+                class: 2,
+                required: false,
+                fresh: 0,
+                receipt:
+                    wire::Receipt {
+                        kind: wire::ReceiptKind::None,
+                        id: 0,
+                    },
+                ..
+            } if self.service => self.push(
+                &mut state,
+                6,
+                0,
+                wire::Kind::Cancel,
+                wire::Message::Cancel {
+                    target: 3,
+                    reason: 1,
+                    id: grant,
+                },
+            ),
+            wire::Message::CloseAck { target: 3, .. } if self.service => state.finished = true,
             wire::Message::Grant { flow: 2, .. } => self.push(
                 &mut state,
                 8,
@@ -799,6 +1146,7 @@ fn actual_driver_commits_exact_ack_drains_cancel_and_preserves_neighbor() {
         record: issuer.record,
         state: Default::default(),
         wrong_ack: false,
+        service: false,
     };
     let ready = AtomicBool::new(false);
     assert!(run_issuer(&mut issuer, &io, 8, 997, &AtomicBool::new(false), &ready).is_err());
@@ -834,12 +1182,63 @@ fn wrong_manifest_ack_never_commits_or_mints() {
         record: issuer.record,
         state: Default::default(),
         wrong_ack: true,
+        service: false,
     };
     let ready = AtomicBool::new(false);
     assert!(run_issuer(&mut issuer, &io, 8, 997, &AtomicBool::new(false), &ready).is_err());
     assert!(!ready.load(Ordering::Acquire));
     assert!(issuer.flows.is_empty());
     assert_eq!(issuer.authority.owner_count, 0);
+}
+#[test]
+fn actual_driver_service_dispatch_drains_cancel_before_allow_and_retires_grant() {
+    let mut issuer = issuer_profile(Mode::System, true);
+    issuer.authority.service_trusted = true;
+    issuer.authority.known = false;
+    let io = FakeIo {
+        record: issuer.record,
+        state: Default::default(),
+        wrong_ack: false,
+        service: true,
+    };
+    assert!(
+        run_issuer(
+            &mut issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    assert!(issuer.services.is_empty());
+    assert!(issuer.flows.is_empty());
+    assert_eq!(issuer.authority.owner_count, 0);
+    let state = io.state.borrow();
+    let mut sequence = wire::Sequence::new();
+    let mut allowed = Vec::new();
+    for bytes in &state.sent {
+        let frame = wire::Frame::decode(bytes, issuer.record.binding, Mode::System, true).unwrap();
+        sequence.accept(frame.header.sequence).unwrap();
+        if let wire::Message::Grant {
+            flow: 0,
+            class: 2,
+            required: false,
+            fresh: 0,
+            receipt:
+                wire::Receipt {
+                    kind: wire::ReceiptKind::None,
+                    id: 0,
+                },
+            ..
+        } = frame.message
+        {
+            allowed.push(frame.header.reply_to);
+        }
+    }
+    assert_eq!(allowed, vec![4]);
+    assert_eq!(issuer.authority.released, vec![1, 2]);
 }
 struct Backpressure {
     elapsed: Arc<std::sync::atomic::AtomicU64>,
