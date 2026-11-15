@@ -70,6 +70,7 @@ class FullProfilePatchTests(unittest.TestCase):
                     "transport/internet/splithttp/client.go",
                     "transport/internet/splithttp/mux.go",
                     "transport/internet/splithttp/yonik_profile_transport_test.go",
+                    "transport/internet/splithttp/yonik_r9_test.go",
                 },
                 path,
             )

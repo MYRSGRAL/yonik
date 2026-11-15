@@ -1,3 +1,506 @@
+diff --git a/transport/internet/splithttp/yonik_r9_test.go b/transport/internet/splithttp/yonik_r9_test.go
+new file mode 100644
+--- /dev/null
++++ b/transport/internet/splithttp/yonik_r9_test.go
+@@ -0,0 +1,218 @@
++package splithttp
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net"
++	"net/http"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type r9H1Conn struct {
++	prefix                     *bytes.Reader
++	reply                      *bytes.Reader
++	entered, release           chan struct{}
++	readOnce                   sync.Once
++	writes, closes, deadlines  atomic.Int32
++	deadline                   time.Time
++	firstDeadline              time.Time
++	interruptRead              bool
++	writeEntered, writeRelease chan struct{}
++	unblockOnce                sync.Once
++	shortWrite                 bool
++}
++
++func (c *r9H1Conn) Read(b []byte) (int, error) {
++	if c.prefix != nil && c.prefix.Len() > 0 {
++		return c.prefix.Read(b)
++	}
++	if c.entered != nil {
++		c.readOnce.Do(func() { close(c.entered) })
++		<-c.release
++		if c.interruptRead {
++			return 0, io.ErrClosedPipe
++		}
++	}
++	return c.reply.Read(b)
++}
++func (c *r9H1Conn) Write(b []byte) (int, error) {
++	c.writes.Add(1)
++	if c.writeEntered != nil {
++		close(c.writeEntered)
++		<-c.writeRelease
++		return 0, io.ErrClosedPipe
++	}
++	if c.shortWrite {
++		return len(b) - 1, nil
++	}
++	return len(b), nil
++}
++func (c *r9H1Conn) Close() error {
++	c.closes.Add(1)
++	c.unblockOnce.Do(func() {
++		if c.interruptRead {
++			close(c.release)
++		}
++		if c.writeRelease != nil {
++			close(c.writeRelease)
++		}
++	})
++	return nil
++}
++func (c *r9H1Conn) LocalAddr() net.Addr  { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000} }
++func (c *r9H1Conn) RemoteAddr() net.Addr { return &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443} }
++func (c *r9H1Conn) SetDeadline(d time.Time) error {
++	if c.deadlines.Add(1) == 1 {
++		c.firstDeadline = d
++	}
++	c.deadline = d
++	return nil
++}
++func (c *r9H1Conn) SetReadDeadline(d time.Time) error  { return c.SetDeadline(d) }
++func (c *r9H1Conn) SetWriteDeadline(d time.Time) error { return c.SetDeadline(d) }
++
++func r9H1Request(t *testing.T) *http.Request {
++	t.Helper()
++	req, e := http.NewRequest("POST", "http://synthetic.invalid/", bytes.NewReader([]byte("new-payload")))
++	if e != nil {
++		t.Fatal(e)
++	}
++	return req
++}
++func r9H1Client(conn *r9H1Conn) (*DefaultDialerClient, *H1Conn) {
++	h1 := NewH1Conn(conn)
++	h1.UnreadedResponsesCount = 1
++	return &DefaultDialerClient{uploadRawPool: &sync.Pool{New: func() any { return h1 }}}, h1
++}
++
++func TestYonikR9H1BlockedResponseCancelNeverWrites(t *testing.T) {
++	for _, phase := range []string{"header", "body"} {
++		t.Run(phase, func(t *testing.T) {
++			raw := &r9H1Conn{reply: bytes.NewReader([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")), entered: make(chan struct{}), release: make(chan struct{})}
++			if phase == "body" {
++				raw.prefix = bytes.NewReader([]byte("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n"))
++				raw.reply = bytes.NewReader([]byte("body"))
++			}
++			client, _ := r9H1Client(raw)
++			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
++			defer cancel()
++			result := make(chan error, 1)
++			req := r9H1Request(t)
++			go func() {
++				result <- client.postH1Packet(ctx, req, true, func(ctx context.Context) error { return ctx.Err() })
++			}()
++			<-raw.entered
++			cancel()
++			close(raw.release)
++			err := <-result
++			if raw.writes.Load() != 0 || err == nil {
++				t.Fatalf("R9F1: payload после отмены: writes=%d err=%v", raw.writes.Load(), err)
++			}
++			if raw.closes.Load() != 1 || raw.deadlines.Load() == 0 {
++				t.Fatal("manual I/O не связано с cancel/deadline")
++			}
++			if client.closed.Load() {
++				t.Fatal("отмена consumer закрыла shared client")
++			}
++			client.uploadRawPool.New = nil
++			if client.uploadRawPool.Get() != nil {
++				t.Fatal("неподтверждённый H1 возвращён в pool")
++			}
++		})
++	}
++}
++
++func TestYonikR9H1ConfirmedReuseAndLegacyControl(t *testing.T) {
++	for _, owned := range []bool{false, true} {
++		raw := &r9H1Conn{reply: bytes.NewReader([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))}
++		client, h1 := r9H1Client(raw)
++		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
++		if e := client.postH1Packet(ctx, r9H1Request(t), owned, func(ctx context.Context) error { return ctx.Err() }); e != nil {
++			t.Fatal(e)
++		}
++		cancel()
++		if raw.writes.Load() != 1 || raw.closes.Load() != 0 {
++			t.Fatal("успешный H1 потерян")
++		}
++		if owned && (h1.UnreadedResponsesCount != 0 || raw.deadlines.Load() < 2 || !raw.deadline.IsZero()) {
++			t.Fatal("H1 переиспользован до ACK или не снят operation deadline")
++		}
++		if !owned && raw.deadlines.Load() != 0 {
++			t.Fatal("legacy I/O изменён")
++		}
++		deadline, _ := ctx.Deadline()
++		if owned && !raw.firstDeadline.Equal(deadline) {
++			t.Fatal("operation deadline отличается от logical request")
++		}
++	}
++}
++
++var _ net.Conn = (*r9H1Conn)(nil)
++
++func TestYonikR9H1CancellationInterruptsExclusiveManualIO(t *testing.T) {
++	for _, phase := range []string{"read", "write"} {
++		t.Run(phase, func(t *testing.T) {
++			raw := &r9H1Conn{reply: bytes.NewReader(nil)}
++			client, h1 := r9H1Client(raw)
++			var entered chan struct{}
++			if phase == "read" {
++				raw.entered = make(chan struct{})
++				raw.release = make(chan struct{})
++				raw.interruptRead = true
++				entered = raw.entered
++			} else {
++				h1.UnreadedResponsesCount = 0
++				raw.writeEntered = make(chan struct{})
++				raw.writeRelease = make(chan struct{})
++				entered = raw.writeEntered
++			}
++			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
++			defer cancel()
++			result := make(chan error, 1)
++			req := r9H1Request(t)
++			go func() {
++				result <- client.postH1Packet(ctx, req, true, func(ctx context.Context) error { return ctx.Err() })
++			}()
++			<-entered
++			cancel()
++			// Только operation Close может разблокировать fake I/O; test не присылает reply.
++			if e := <-result; e == nil {
++				t.Fatal("cancelled manual I/O подтвердилось")
++			}
++			if raw.closes.Load() != 1 || client.closed.Load() {
++				t.Fatal("отменён весь shared client или Close не единственный")
++			}
++			client.uploadRawPool.New = nil
++			if client.uploadRawPool.Get() != nil {
++				t.Fatal("прерванный H1 вернулся в pool")
++			}
++		})
++	}
++}
++
++func TestYonikR9H1PartialOrUnconfirmedIsNotReused(t *testing.T) {
++	for _, phase := range []string{"short-write", "missing-ack", "bad-status"} {
++		t.Run(phase, func(t *testing.T) {
++			raw := &r9H1Conn{reply: bytes.NewReader(nil), shortWrite: phase == "short-write"}
++			if phase == "bad-status" {
++				raw.reply = bytes.NewReader([]byte("HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n"))
++			}
++			client, h1 := r9H1Client(raw)
++			h1.UnreadedResponsesCount = 0
++			if e := client.postH1Packet(context.Background(), r9H1Request(t), true, func(context.Context) error { return nil }); e == nil {
++				t.Fatal("неподтверждённый write принят")
++			}
++			if raw.writes.Load() != 1 || raw.closes.Load() != 1 || client.closed.Load() {
++				t.Fatal("ambiguous write повторён или отменён shared client")
++			}
++			client.uploadRawPool.New = nil
++			if client.uploadRawPool.Get() != nil {
++				t.Fatal("partial/unconfirmed H1 вернулся в pool")
++			}
++		})
++	}
++}
+diff --git a/common/yonikbroker/profile_r9_linux_test.go b/common/yonikbroker/profile_r9_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_r9_linux_test.go
+@@ -0,0 +1,275 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"errors"
++	"sync/atomic"
++	"testing"
++)
++
++var r9CleanupError = errors.New("R9: cleanup Unknown")
++var r9FactoryError = errors.New("R9: factory failed")
++
++type r9Resource struct {
++	retire        func(error)
++	calls         atomic.Int32
++	fail          bool
++	reportSuccess bool
++}
++
++func (r *r9Resource) Close() error {
++	r.calls.Add(1)
++	var result error
++	if r.fail {
++		result = r9CleanupError
++	}
++	if r.retire != nil {
++		reported := result
++		if r.reportSuccess {
++			reported = nil
++		}
++		r.retire(reported)
++		r.retire(nil)
++	}
++	return result
++}
++
++type r9ShutdownBarrier struct{ entered, release chan struct{} }
++
++type r9KnownCleanupReturning struct {
++	retire       func(error)
++	ack, release chan struct{}
++	calls        atomic.Int32
++}
++
++func (r *r9KnownCleanupReturning) Close() error {
++	r.calls.Add(1)
++	r.retire(nil)
++	close(r.ack)
++	<-r.release
++	r.retire(nil)
++	return nil
++}
++
++func TestProfileR9ConcurrentCloseAndSlotReuseKeepsNewCustody(t *testing.T) {
++	f, pool := r9Pool(t)
++	f.c.manifest.caps[2] = 1
++	old := &r9KnownCleanupReturning{ack: make(chan struct{}), release: make(chan struct{})}
++	value, e := pool.NewResource(func(_ context.Context, retire func(error)) (ProfileCloser, error) {
++		old.retire = retire
++		return old, nil
++	})
++	if e != nil {
++		t.Fatal(e)
++	}
++	closed := make(chan error, 1)
++	go func() { closed <- value.Close() }()
++	<-old.ack
++	// Actual cleanup уже подтверждён, но предыдущий Close ещё не вернулся.
++	next := &profilePureClose{}
++	if _, e = pool.NewResource(func(context.Context, func(error)) (ProfileCloser, error) { return next, nil }); e != nil {
++		t.Fatal(e)
++	}
++	close(old.release)
++	if e = <-closed; e != nil {
++		t.Fatal(e)
++	}
++	if r9Retained(pool.state) != 1 {
++		t.Fatal("late callback очистил новую reservation")
++	}
++	f.p.cancel()
++	if e = f.p.closeTransports(); e != nil {
++		t.Fatal(e)
++	}
++	if next.count.Load() != 1 || old.calls.Load() != 1 {
++		t.Fatal("cleanup потерян или повторён после slot reuse")
++	}
++}
++
++func (r *r9ShutdownBarrier) Close() error { close(r.entered); <-r.release; return nil }
++func r9Pool(t *testing.T) (*flowFixture, *ProfilePool) {
++	t.Helper()
++	f := newFlowFixture(t, 1)
++	r := f.admittedReceipt(t, "r9.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileGrantKey{}, g)
++	pool, e := ProfileTransportPool(ctx, 1)
++	if e != nil {
++		t.Fatal(e)
++	}
++	return f, pool
++}
++func r9Retained(s *profileTransportState) int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	n := 0
++	for _, v := range s.objects {
++		if v != nil {
++			n++
++		}
++	}
++	return n
++}
++
++func TestProfileR9FactoryRevokeRetainsFailedCleanup(t *testing.T) {
++	f, pool := r9Pool(t)
++	barrier := &r9ShutdownBarrier{entered: make(chan struct{}), release: make(chan struct{})}
++	if _, e := pool.LoadOrCreate(0, func(context.Context) (ProfileCloser, error) { return barrier, nil }); e != nil {
++		t.Fatal(e)
++	}
++	entered, release := make(chan struct{}), make(chan struct{})
++	result := make(chan error, 1)
++	resource := &r9Resource{fail: true}
++	go func() {
++		value, e := pool.NewResource(func(_ context.Context, retire func(error)) (ProfileCloser, error) {
++			resource.retire = retire
++			close(entered)
++			<-release
++			return resource, nil
++		})
++		if value != nil {
++			result <- errors.New("late resource published")
++			return
++		}
++		result <- e
++	}()
++	<-entered
++	f.p.cancel()
++	<-barrier.entered
++	close(release)
++	e := <-result
++	close(barrier.release)
++	cleanup := f.p.closeTransports()
++	if e == nil || !errors.Is(cleanup, r9CleanupError) || r9Retained(pool.state) != 1 {
++		t.Fatalf("R9F2: custody потеряна: create=%v cleanup=%v retained=%d", e, cleanup, r9Retained(pool.state))
++	}
++	resource.fail = false
++	if !errors.Is(f.p.closeTransports(), r9CleanupError) || resource.calls.Load() != 1 {
++		t.Fatal("повторный Close стёр Unknown или повторил cleanup")
++	}
++}
++
++func TestProfileR9FactoryErrorRetainsNonNilResource(t *testing.T) {
++	f, pool := r9Pool(t)
++	resource := &r9Resource{fail: true, reportSuccess: true}
++	value, e := pool.NewResource(func(_ context.Context, retire func(error)) (ProfileCloser, error) {
++		resource.retire = retire
++		return resource, r9FactoryError
++	})
++	if value != nil || !errors.Is(e, r9FactoryError) {
++		t.Fatal("factory error потерян", value, e)
++	}
++	if r9Retained(pool.state) != 1 || !errors.Is(f.p.closeTransports(), r9CleanupError) {
++		t.Fatal("R9F2: factory error отбросил cleanup custody")
++	}
++	resource.fail = false
++	if !errors.Is(f.p.closeTransports(), r9CleanupError) || resource.calls.Load() != 1 {
++		t.Fatal("Unknown воскрес как KnownClosed")
++	}
++}
++
++func TestProfileR9ActiveRetirementResultIsSticky(t *testing.T) {
++	for _, fail := range []bool{false, true} {
++		f, pool := r9Pool(t)
++		resource := &r9Resource{fail: fail}
++		value, e := pool.NewResource(func(_ context.Context, retire func(error)) (ProfileCloser, error) {
++			resource.retire = retire
++			return resource, nil
++		})
++		if e != nil {
++			t.Fatal(e)
++		}
++		closeError := value.Close()
++		resource.retire(nil)
++		if fail {
++			if !errors.Is(closeError, r9CleanupError) || r9Retained(pool.state) != 1 {
++				t.Fatal("Unknown active retirement потерян")
++			}
++		} else if closeError != nil || r9Retained(pool.state) != 0 {
++			t.Fatal("KnownClosed active retirement не освободил slot")
++		}
++		f.p.cancel()
++		cleanup := f.p.closeTransports()
++		if fail && !errors.Is(cleanup, r9CleanupError) {
++			t.Fatal("Unknown сменился KnownClosed")
++		}
++		if !fail && cleanup != nil {
++			t.Fatal(cleanup)
++		}
++		if resource.calls.Load() != 1 {
++			t.Fatal("повторный raw Close после подтверждённого result")
++		}
++	}
++}
++
++func TestProfileR9PendingReservationAndEarlyRetireCannotPublish(t *testing.T) {
++	f, pool := r9Pool(t)
++	f.c.manifest.caps[2] = 1
++	entered, release := make(chan struct{}), make(chan struct{})
++	result := make(chan error, 1)
++	resource := &r9Resource{}
++	go func() {
++		value, e := pool.NewResource(func(_ context.Context, retire func(error)) (ProfileCloser, error) {
++			resource.retire = retire
++			retire(nil)
++			close(entered)
++			<-release
++			return resource, nil
++		})
++		if value != nil {
++			result <- errors.New("early retire published resource")
++			return
++		}
++		result <- e
++	}()
++	<-entered
++	if r9Retained(pool.state) != 1 {
++		t.Fatal("custody не зарезервирована до factory")
++	}
++	calls := 0
++	if _, e := pool.NewResource(func(context.Context, func(error)) (ProfileCloser, error) { calls++; return nil, nil }); e == nil || calls != 0 {
++		t.Fatal("pending reservation не входит в cap")
++	}
++	close(release)
++	if e := <-result; e == nil {
++		t.Fatal("early retire стал authority")
++	}
++	if resource.calls.Load() != 1 || r9Retained(pool.state) != 0 {
++		t.Fatal("подтверждённый cleanup не освободил slot")
++	}
++	pool.state.mu.Lock()
++	pending := pool.state.objectPending
++	pool.state.mu.Unlock()
++	if pending != 0 {
++		t.Fatal("pending reservation leaked")
++	}
++	f.p.cancel()
++	if e := f.p.closeTransports(); e != nil {
++		t.Fatal(e)
++	}
++}
++
++func TestProfileR9SuccessfulRejectedCleanupReleasesOnce(t *testing.T) {
++	f, pool := r9Pool(t)
++	f.c.manifest.caps[2] = 1
++	resource := &r9Resource{}
++	if _, e := pool.NewResource(func(_ context.Context, retire func(error)) (ProfileCloser, error) {
++		resource.retire = retire
++		return resource, r9FactoryError
++	}); !errors.Is(e, r9FactoryError) {
++		t.Fatal(e)
++	}
++	if r9Retained(pool.state) != 0 || resource.calls.Load() != 1 {
++		t.Fatal("успешный cleanup не освободил reservation ровно один раз")
++	}
++	calls := 0
++	if _, e := pool.NewResource(func(context.Context, func(error)) (ProfileCloser, error) { calls++; return &profilePureClose{}, nil }); e != nil || calls != 1 {
++		t.Fatal("reservation не переиспользуется", e, calls)
++	}
++	f.p.cancel()
++	if e := f.p.closeTransports(); e != nil {
++		t.Fatal(e)
++	}
++}
 diff --git a/transport/internet/yonik_profile_transport_test.go b/transport/internet/yonik_profile_transport_test.go
 new file mode 100644
 --- /dev/null
@@ -242,7 +745,7 @@ diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splitht
 +				config = *c
 +			}
 +			return NewXmuxManager(config, func() XmuxConn {
-+				value, e := pool.NewResource(func(physical context.Context, retire func()) (hooks.ProfileCloser, error) {
++				value, e := pool.NewResource(func(physical context.Context, retire func(error)) (hooks.ProfileCloser, error) {
 +					client := createOwnedHTTPClient(pool, dest, streamSettings)
 +					client.(*DefaultDialerClient).retire = retire
 +					return client.(*DefaultDialerClient), nil
@@ -404,7 +907,15 @@ diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splitht
 diff --git a/transport/internet/splithttp/client.go b/transport/internet/splithttp/client.go
 --- a/transport/internet/splithttp/client.go
 +++ b/transport/internet/splithttp/client.go
-@@ -16,6 +16,7 @@
+@@ -9,6 +9,7 @@
+ 	"net/http/httptrace"
+ 	"sync"
+ 	"sync/atomic"
++	"time"
+ 
+ 	"github.com/apernet/quic-go/http3"
+ 	"github.com/xtls/xray-core/common"
+@@ -16,6 +17,7 @@
  	"github.com/xtls/xray-core/common/errors"
  	"github.com/xtls/xray-core/common/net"
  	"github.com/xtls/xray-core/common/signal/done"
@@ -412,18 +923,18 @@ diff --git a/transport/internet/splithttp/client.go b/transport/internet/splitht
  )
  
  // interface to abstract between use of browser dialer, vs net/http
-@@ -31,6 +32,10 @@
+@@ -31,6 +33,10 @@
  
  // implements splithttp.DialerClient in terms of direct network connections
  type DefaultDialerClient struct {
 +	profile         *hooks.ProfilePool
-+	retire          func()
++	retire          func(error)
 +	closeOnce       sync.Once
 +	closeError      error
  	transportConfig *Config
  	client          *http.Client
  	closed          atomic.Bool
-@@ -45,6 +50,10 @@
+@@ -45,6 +51,10 @@
  }
  
  func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
@@ -434,7 +945,7 @@ diff --git a/transport/internet/splithttp/client.go b/transport/internet/splitht
  	// this is done when the TCP/UDP connection to the server was established,
  	// and we can unblock the Dial function and print correct net addresses in
  	// logs
-@@ -61,7 +70,7 @@
+@@ -61,7 +71,7 @@
  	if body != nil {
  		method = c.transportConfig.GetNormalizedUplinkHTTPMethod() // stream-up/one
  	}
@@ -443,7 +954,7 @@ diff --git a/transport/internet/splithttp/client.go b/transport/internet/splitht
  	if err != nil {
  		errors.LogInfoInner(ctx, err, "failed to create HTTP request for "+url)
  		return nil, nil, nil, err
-@@ -72,7 +81,7 @@
+@@ -72,7 +82,7 @@
  	go func() {
  		resp, err := c.client.Do(req)
  		if err != nil {
@@ -452,7 +963,7 @@ diff --git a/transport/internet/splithttp/client.go b/transport/internet/splitht
  				c.closed.Store(true)
  				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
  			}
-@@ -99,8 +108,13 @@
+@@ -99,8 +109,13 @@
  }
  
  func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessionId string, seqStr string, payload buf.MultiBuffer) error {
@@ -467,7 +978,7 @@ diff --git a/transport/internet/splithttp/client.go b/transport/internet/splitht
  	if err != nil {
  		return err
  	}
-@@ -109,7 +123,9 @@
+@@ -109,7 +124,9 @@
  	if c.httpVersion != "1.1" {
  		resp, err := c.client.Do(req)
  		if err != nil {
@@ -478,22 +989,68 @@ diff --git a/transport/internet/splithttp/client.go b/transport/internet/splitht
  			return err
  		}
  
-@@ -132,10 +148,13 @@
- 		var h1UploadConn *H1Conn
- 
- 		for {
-+			if e := c.profileGate(ctx); e != nil {
-+				return e
-+			}
- 			uploadConn = c.uploadRawPool.Get()
- 			newConnection := uploadConn == nil
- 			if newConnection {
+@@ -120,59 +137,7 @@
+ 			return errors.New("bad status code:", resp.Status)
+ 		}
+ 	} else {
+-		// stringify the entire HTTP/1.1 request so it can be
+-		// safely retried. if instead req.Write is called multiple
+-		// times, the body is already drained after the first
+-		// request
+-		requestBuff := new(bytes.Buffer)
+-		requestBuff.Grow(512 + int(req.ContentLength))
+-		common.Must(req.Write(requestBuff))
+-
+-		var uploadConn any
+-		var h1UploadConn *H1Conn
+-
+-		for {
+-			uploadConn = c.uploadRawPool.Get()
+-			newConnection := uploadConn == nil
+-			if newConnection {
 -				newConn, err := c.dialUploadConn(context.WithoutCancel(ctx))
-+				newConn, err := c.dialUploadConn(profileRequestContext(ctx))
- 				if err != nil {
- 					return err
- 				}
-@@ -180,11 +199,53 @@
+-				if err != nil {
+-					return err
+-				}
+-				h1UploadConn = NewH1Conn(newConn)
+-				uploadConn = h1UploadConn
+-			} else {
+-				h1UploadConn = uploadConn.(*H1Conn)
+-
+-				// TODO: Replace 0 here with a config value later
+-				// Or add some other condition for optimization purposes
+-				if h1UploadConn.UnreadedResponsesCount > 0 {
+-					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
+-					if err != nil {
+-						c.closed.Store(true)
+-						return fmt.Errorf("error while reading response: %s", err.Error())
+-					}
+-					io.Copy(io.Discard, resp.Body)
+-					defer resp.Body.Close()
+-					if resp.StatusCode != 200 {
+-						return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
+-					}
+-				}
+-			}
+-
+-			_, err := h1UploadConn.Write(requestBuff.Bytes())
+-			// if the write failed, we try another connection from
+-			// the pool, until the write on a new connection fails.
+-			// failed writes to a pooled connection are normal when
+-			// the connection has been closed in the meantime.
+-			if err == nil {
+-				break
+-			} else if newConnection {
+-				return err
+-			}
+-		}
+-
+-		c.uploadRawPool.Put(uploadConn)
++		return c.postH1Packet(ctx, req, c.profile != nil, c.profileGate)
+ 	}
+ 
+ 	return nil
+@@ -180,11 +145,53 @@
  
  // HTTP/1.1 and HTTP/2 will close itself, we only handle HTTP/3 here
  func (c *DefaultDialerClient) Close() error {
@@ -510,7 +1067,7 @@ diff --git a/transport/internet/splithttp/client.go b/transport/internet/splitht
 +			idle.CloseIdleConnections()
 +		}
 +		if c.retire != nil {
-+			c.retire()
++			c.retire(c.closeError)
 +		}
 +	})
 +	return c.closeError
@@ -550,6 +1107,194 @@ diff --git a/transport/internet/splithttp/client.go b/transport/internet/splitht
  }
  
  type WaitReadCloser struct {
+@@ -220,3 +227,187 @@
+ 	}
+ 	return nil
+ }
++
++// Отдельный private I/O участок позволяет pure fake контролировать grant gate;
++// production caller всегда передаёт c.profileGate из того же private client.
++func (c *DefaultDialerClient) postH1Packet(ctx context.Context, req *http.Request, owned bool, gate func(context.Context) error) error {
++	if owned {
++		return c.postProfileH1Packet(ctx, req, gate)
++	}
++	// stringify the entire HTTP/1.1 request so it can be
++	// safely retried. if instead req.Write is called multiple
++	// times, the body is already drained after the first
++	// request
++	requestBuff := new(bytes.Buffer)
++	requestBuff.Grow(512 + int(req.ContentLength))
++	common.Must(req.Write(requestBuff))
++
++	var uploadConn any
++	var h1UploadConn *H1Conn
++
++	for {
++		if e := gate(ctx); e != nil {
++			return e
++		}
++		uploadConn = c.uploadRawPool.Get()
++		newConnection := uploadConn == nil
++		if newConnection {
++			newConn, err := c.dialUploadConn(profileRequestContext(ctx))
++			if err != nil {
++				return err
++			}
++			h1UploadConn = NewH1Conn(newConn)
++			uploadConn = h1UploadConn
++		} else {
++			h1UploadConn = uploadConn.(*H1Conn)
++
++			// TODO: Replace 0 here with a config value later
++			// Or add some other condition for optimization purposes
++			if h1UploadConn.UnreadedResponsesCount > 0 {
++				resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
++				if err != nil {
++					c.closed.Store(true)
++					return fmt.Errorf("error while reading response: %s", err.Error())
++				}
++				io.Copy(io.Discard, resp.Body)
++				defer resp.Body.Close()
++				if resp.StatusCode != 200 {
++					return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
++				}
++			}
++		}
++
++		_, err := h1UploadConn.Write(requestBuff.Bytes())
++		// if the write failed, we try another connection from
++		// the pool, until the write on a new connection fails.
++		// failed writes to a pooled connection are normal when
++		// the connection has been closed in the meantime.
++		if err == nil {
++			break
++		} else if newConnection {
++			return err
++		}
++	}
++
++	c.uploadRawPool.Put(uploadConn)
++
++	return nil
++}
++
++// H1 checkout эксклюзивен: отмена закрывает только этот socket, не client/pool.
++// Stop и join callback завершаются до возврата socket следующему consumer.
++func (c *DefaultDialerClient) postProfileH1Packet(ctx context.Context, req *http.Request, gate func(context.Context) error) (err error) {
++	if err = gate(ctx); err != nil {
++		return err
++	}
++	var request bytes.Buffer
++	if err = req.Write(&request); err != nil {
++		return err
++	}
++	value := c.uploadRawPool.Get()
++	var conn *H1Conn
++	if value == nil {
++		var raw net.Conn
++		raw, err = c.dialUploadConn(ctx)
++		if err != nil {
++			return err
++		}
++		conn = NewH1Conn(raw)
++	} else {
++		conn = value.(*H1Conn)
++	}
++	var closeOnce sync.Once
++	var closeError error
++	closeConn := func() { closeOnce.Do(func() { closeError = conn.Close() }) }
++	cancelled := make(chan struct{})
++	stop := context.AfterFunc(ctx, func() { closeConn(); close(cancelled) })
++	reusable := false
++	defer func() {
++		stopped := stop()
++		if !stopped {
++			<-cancelled
++		}
++		if err == nil && (!stopped || ctx.Err() != nil) {
++			err = ctx.Err()
++			if err == nil {
++				err = errors.New("H1 logical operation cancelled")
++			}
++		}
++		if err == nil && reusable {
++			err = gate(ctx)
++		}
++		if err == nil && reusable {
++			err = conn.SetDeadline(time.Time{})
++		}
++		if err == nil && reusable && ctx.Err() == nil {
++			c.uploadRawPool.Put(conn)
++			return
++		}
++		closeConn()
++		if err == nil {
++			err = ctx.Err()
++			if err == nil {
++				err = errors.New("H1 operation unconfirmed")
++			}
++		}
++		if closeError != nil {
++			err = fmt.Errorf("%w; H1 cleanup: %v", err, closeError)
++		}
++	}()
++	deadline, _ := ctx.Deadline()
++	if err = conn.SetDeadline(deadline); err != nil {
++		return err
++	}
++	readResponse := func() error {
++		resp, e := http.ReadResponse(conn.RespBufReader, req)
++		if e != nil {
++			return e
++		}
++		if e = gate(ctx); e != nil {
++			closeConn()
++			resp.Body.Close()
++			return e
++		}
++		_, copyError := io.Copy(io.Discard, resp.Body)
++		closeBodyError := resp.Body.Close()
++		if copyError != nil {
++			return copyError
++		}
++		if closeBodyError != nil {
++			return closeBodyError
++		}
++		if resp.StatusCode != http.StatusOK {
++			return fmt.Errorf("H1 status %d", resp.StatusCode)
++		}
++		return gate(ctx)
++	}
++	if conn.UnreadedResponsesCount < 0 {
++		return errors.New("H1 response ledger invalid")
++	}
++	for conn.UnreadedResponsesCount > 0 {
++		if err = readResponse(); err != nil {
++			return err
++		}
++		conn.UnreadedResponsesCount--
++	}
++	// Повторный logical gate после любого blocked response и прямо перед payload.
++	if err = gate(ctx); err != nil {
++		return err
++	}
++	var written int
++	written, err = conn.Write(request.Bytes())
++	if err != nil {
++		return err
++	}
++	if written != request.Len() {
++		return io.ErrShortWrite
++	}
++	conn.UnreadedResponsesCount++
++	// Частичный/неподтверждённый request нельзя вернуть или повторить в другом H1.
++	if err = readResponse(); err != nil {
++		return err
++	}
++	conn.UnreadedResponsesCount--
++	reusable = true
++	return nil
++}
 diff --git a/transport/internet/memory_settings.go b/transport/internet/memory_settings.go
 --- a/transport/internet/memory_settings.go
 +++ b/transport/internet/memory_settings.go
@@ -1002,7 +1747,7 @@ new file mode 100644
 +func ProfilePacketCapability(net.Conn) (net.PacketConn, net.Addr, error)     { return nil, nil, errProfile }
 +func ProfileGuardConnection(_ context.Context, c net.Conn) (net.Conn, error) { return c, nil }
 +func ProfileAttachLogical(context.Context, io.Closer) error                  { return nil }
-+func (*ProfilePool) NewResource(func(context.Context, func()) (ProfileCloser, error)) (ProfileCloser, error) {
++func (*ProfilePool) NewResource(func(context.Context, func(error)) (ProfileCloser, error)) (ProfileCloser, error) {
 +	return nil, errProfile
 +}
 +func ProfileGuardPacketView(context.Context, net.Conn) (net.PacketConn, net.Addr, error) {
@@ -1232,11 +1977,11 @@ new file mode 100644
 +	}
 +	f.c.manifest.caps[2] = 1
 +	calls := 0
-+	if _, e = pool.NewResource(func(context.Context, func()) (ProfileCloser, error) { calls++; return &profilePureClose{}, nil }); e != nil {
++	if _, e = pool.NewResource(func(context.Context, func(error)) (ProfileCloser, error) { calls++; return &profilePureClose{}, nil }); e != nil {
 +		t.Fatal(e)
 +	}
 +	allocations := testing.AllocsPerRun(20, func() {
-+		if _, e = pool.NewResource(func(context.Context, func()) (ProfileCloser, error) { calls++; return nil, nil }); e == nil {
++		if _, e = pool.NewResource(func(context.Context, func(error)) (ProfileCloser, error) { calls++; return nil, nil }); e == nil {
 +			t.Fatal("object cap")
 +		}
 +	})
@@ -1322,7 +2067,7 @@ diff --git a/common/yonikbroker/profile_transport_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux.go
-@@ -0,0 +1,741 @@
+@@ -0,0 +1,796 @@
 +//go:build linux
 +
 +package nativehooks
@@ -1357,7 +2102,7 @@ new file mode 100644
 +	runtime       *ProfileRuntime
 +	pools         [128]*ProfilePool
 +	sockets       [128]*profilePhysicalConn
-+	objects       [128]io.Closer
++	objects       [128]*profileResourceCustody
 +	objectPending int
 +	pending       int
 +	closed        bool
@@ -1398,17 +2143,12 @@ new file mode 100644
 +			}
 +		}
 +	}
-+	for i, v := range objects {
-+		if v != nil {
-+			e := v.Close()
-+			closeError = errors.Join(closeError, e)
-+			if e != nil {
-+				s.mu.Lock()
-+				s.objects[i] = v
-+				s.mu.Unlock()
-+			}
++	for _, entry := range objects {
++		if entry != nil {
++			closeError = errors.Join(closeError, entry.Close())
 +		}
 +	}
++
 +	s.mu.Lock()
 +	s.closeError = errors.Join(s.closeError, closeError)
 +	s.mu.Unlock()
@@ -1439,72 +2179,132 @@ new file mode 100644
 +	return e
 +}
 +
-+// HTTP clients получают общий session cap до allocation, а не 128 на manager.
-+func (p *ProfilePool) NewResource(create func(context.Context, func()) (ProfileCloser, error)) (ProfileCloser, error) {
++// Reservation владеет custody до factory, включая concurrent shutdown.
++// Callback сообщает окончательный результат cleanup, не освобождает pending
++// или closing entry. Unknown остаётся terminal и не повторяет raw Close.
++type profileResourceCustody struct {
++	state                                       *profileTransportState
++	slot                                        int
++	ready                                       chan struct{}
++	once                                        sync.Once
++	value                                       io.Closer
++	pending, closing, terminal, retireRequested bool
++	retireError, result                         error
++}
++
++func (e *profileResourceCustody) completeLocked(err error) {
++	if e.terminal {
++		return
++	}
++	e.terminal = true
++	e.result = err
++	if err == nil {
++		if e.state.objects[e.slot] == e {
++			e.state.objects[e.slot] = nil
++		}
++	} else if e.state.closeError == nil {
++		e.state.closeError = err
++	}
++}
++func (e *profileResourceCustody) retire(err error) {
++	s := e.state
++	s.mu.Lock()
++	if e.terminal {
++		s.mu.Unlock()
++		return
++	}
++	e.retireRequested = true
++	if err != nil && e.retireError == nil {
++		e.retireError = err
++	}
++	if !e.pending && !e.closing {
++		e.completeLocked(e.retireError)
++	}
++	unknown := e.retireError != nil
++	if unknown && s.closeError == nil {
++		s.closeError = e.retireError
++	}
++	s.mu.Unlock()
++	if unknown {
++		s.runtime.cancel()
++	}
++}
++func (e *profileResourceCustody) Close() error {
++	<-e.ready
++	e.once.Do(func() {
++		s := e.state
++		s.mu.Lock()
++		if e.terminal {
++			s.mu.Unlock()
++			return
++		}
++		e.closing = true
++		value := e.value
++		s.mu.Unlock()
++		var err error
++		if value != nil {
++			err = value.Close()
++		}
++		s.mu.Lock()
++		err = errors.Join(err, e.retireError)
++		e.completeLocked(err)
++		s.mu.Unlock()
++		if err != nil {
++			s.runtime.cancel()
++		}
++	})
++	e.state.mu.Lock()
++	err := e.result
++	e.state.mu.Unlock()
++	return err
++}
++
++// HTTP clients и mux workers разделяют session cap. Reserved slot уже входит
++// в shutdown snapshot; pending factory не может создать невидимый ресурс.
++func (p *ProfilePool) NewResource(create func(context.Context, func(error)) (ProfileCloser, error)) (ProfileCloser, error) {
 +	if p == nil || p.state == nil || create == nil {
 +		return nil, errProfile
 +	}
 +	s := p.state
 +	s.mu.Lock()
-+	count := s.objectPending
-+	for _, v := range s.objects {
-+		if v != nil {
++	count, slot := 0, -1
++	for i, entry := range s.objects {
++		if entry != nil {
 +			count++
++		} else if slot < 0 && i < int(s.runtime.flow.manifest.caps[2]) {
++			slot = i
 +		}
 +	}
-+	if !p.registered() || !s.live() || count >= int(s.runtime.flow.manifest.caps[2]) {
++	if !p.registered() || !s.live() || slot < 0 || count >= int(s.runtime.flow.manifest.caps[2]) {
 +		s.mu.Unlock()
 +		return nil, errProfileFlowBusy
 +	}
++	entry := &profileResourceCustody{state: s, slot: slot, ready: make(chan struct{}), pending: true}
++	s.objects[slot] = entry
 +	s.objectPending++
 +	s.mu.Unlock()
-+	ctx, e := p.SessionContext()
-+	if e != nil {
-+		s.mu.Lock()
-+		s.objectPending--
-+		s.mu.Unlock()
-+		return nil, e
++	ctx, err := p.SessionContext()
++	var value ProfileCloser
++	if err == nil {
++		value, err = create(ctx, entry.retire)
 +	}
-+	slot := -1
-+	var once sync.Once
-+	retire := func() {
-+		once.Do(func() {
-+			s.mu.Lock()
-+			if slot >= 0 {
-+				s.objects[slot] = nil
-+			}
-+			s.mu.Unlock()
-+		})
-+	}
-+	value, e := create(ctx, retire)
 +	s.mu.Lock()
++	entry.value = value
++	entry.pending = false
 +	s.objectPending--
-+	if e != nil || value == nil {
-+		s.mu.Unlock()
-+		if value != nil {
-+			value.Close()
-+		}
-+		if e == nil {
-+			e = errProfile
-+		}
-+		return nil, e
-+	}
-+	if !s.live() {
-+		s.mu.Unlock()
-+		value.Close()
-+		return nil, errProfile
-+	}
-+	for i, v := range s.objects {
-+		if v == nil {
-+			slot = i
-+			s.objects[i] = value
-+			s.mu.Unlock()
-+			return value, nil
-+		}
-+	}
++	reject := err != nil || value == nil || !s.live() || entry.retireRequested
++	// Retire из Close rejected resource не может опередить actual Close result.
++	entry.closing = reject
++	close(entry.ready)
 +	s.mu.Unlock()
-+	value.Close()
-+	return nil, errProfileFlowBusy
++	if reject {
++		if err == nil {
++			err = errProfile
++		}
++		cleanup := entry.Close()
++		return nil, errors.Join(err, cleanup)
++	}
++	return value, nil
 +}
 +
 +func ProfileAttachLogical(ctx context.Context, c io.Closer) error {
@@ -2134,7 +2934,7 @@ new file mode 100644
 +	if target.Network != net.Network_TCP || target.Address != muxCoolAddress {
 +		t.Fatal("mux worker input changed")
 +	}
-+	worker := &ClientWorker{done: done.New(), profileRetire: func() { count++ }}
++	worker := &ClientWorker{done: done.New(), profileRetire: func(error) { count++ }}
 +	worker.Close()
 +	worker.Close()
 +	if count != 1 || !worker.Closed() {
@@ -2242,7 +3042,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
 +		if e != nil {
 +			return nil, e
 +		}
-+		value, e := pool.NewResource(func(_ context.Context, retire func()) (hooks.ProfileCloser, error) {
++		value, e := pool.NewResource(func(_ context.Context, retire func(error)) (hooks.ProfileCloser, error) {
 +			worker, e := f.create()
 +			if e != nil {
 +				return nil, e
@@ -2296,7 +3096,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
  }
  
  type ClientWorker struct {
-+	profileRetire  func()
++	profileRetire  func(error)
 +	profileOnce    sync.Once
  	sessionManager *SessionManager
  	link           transport.Link
@@ -2308,7 +3108,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
 -	return m.done.Close()
 +	e := m.done.Close()
 +	if m.profileRetire != nil {
-+		m.profileOnce.Do(m.profileRetire)
++		m.profileOnce.Do(func() { m.profileRetire(e) })
 +	}
 +	return e
  }

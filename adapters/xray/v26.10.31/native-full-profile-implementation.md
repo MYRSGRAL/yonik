@@ -227,6 +227,43 @@ carrier→next input; конечный pool разделяется по нако
 queries, DNS/Probe grants и resolver provenance hooks — следующий milestone;
 admission не создаёт service grants и live DefaultResolver fallback отсутствует.
 
+## R9: H1 operation lifetime и resource custody
+
+R9F1: `DefaultDialerClient.PostPacket` передаёт тот же private logical ctx и
+`c.profileGate` в H1 I/O участок. Owned checkout эксклюзивен: request deadline
+применяется к manual read/write, cancel закрывает только заимствованный H1.
+Callback остановлен и join-нут до возврата socket следующему consumer.
+После blocked response/body и непосредственно перед payload write повторяется
+logical gate. Все прежние ответы и ответ текущего request должны быть полностью
+прочитаны и подтверждены статусом200 до reuse. Short/failed/unconfirmed write
+не повторяется на другом H1 и не возвращается в pool. Неопределённый outcome
+не превращается в успешный request. Owned H1 теперь ждёт ответ текущего request;
+legacy H1 сохраняет прежнюю ветку. HTTP2/H3/shared client cancellation не меняется.
+
+R9F2: private Go signature теперь
+`ProfilePool.NewResource(func(context.Context,func(error))(ProfileCloser,error))`.
+Retirement callback сообщает окончательный результат actual cleanup, а не
+уведомление «Close начат»; XHTTP и mux передают возвращаемую ошибку. Wire,
+locator names и frozen ABI260 не меняются.
+
+До factory выделяется bounded `profileResourceCustody` slot: Pending→Active→
+Closing→KnownClosed/Unknown. Shutdown snapshot содержит reservation, даже когда
+factory ещё заблокирован, и ждёт его ready/result. Pending входит в общий cap,
+не учитывается дважды. Factory error с nonnil value и late return после revoke
+проходят один managed cleanup до возможного освобождения slot. Callback во
+время Pending/Closing не освобождает custody. Actual Close error сохраняет
+value, reservation и ошибку; поздний callback(nil) и повторный Close не очищают
+Unknown и не повторяют raw Close. Новые opens/reuse блокируются session fence.
+При KnownClosed slot освобождается ровно один раз с проверкой identity reservation.
+
+RED сохранён на985013a: broker source byte-exact; H1 body только механически
+выделен в private helper для injected pure gate без изменения I/O/auth semantics.
+Controls воспроизводят cancel→late response→payload write и потерю late resource
+при Close error. GREEN использует тот же production caller и отдельные controls
+для blocked read/write, partial/неподтверждённого H1, early retire, pending cap,
+late factory, factory error+value, sticky Unknown и successful cleanup.
+Это только correction двух findings; DNS/probe/pooled-chain readiness не меняется.
+
 ## Детерминированный R8 contract: tuple orientation
 
 Go `profile_flow_hooks_linux.go::ProfileAccept` кодирует original initiator в
