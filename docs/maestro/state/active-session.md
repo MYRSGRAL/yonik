@@ -47,6 +47,12 @@ p5_native_narrow_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-496
 completion_scope_head: e3e3f563428ca43c0087fe162faf748c016f843a
 completion_scope_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A84b976a3-2eb0-4fa6-ac80-814e41170e9b
 completion_scope_approval: explicitly_approved_by_user
+completion_implementation_base: 490915d710bfcd52d37351c2dfc8b878d8a24a15
+p4_completion_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A1b4702b1-fc41-4e3e-9f5d-24f4bcecbcac
+p4_completion_builder_head: ea2dcc7aeda27dc1bd85386938560692c73d12a0
+p4_completion_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A941052cd-6093-4e30-8ed7-94b163a86c83
+p5_completion_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A7f3da3dd-67bb-4d7e-ab13-163b3eb6bc21
+p5_completion_projection_head: 874d7d8da6d46082fc36ff8902ca4f0726e34eb8
 completion_scope_review: three_medium_contract_clarifications_root_corrected
 p3_native_schema_fix: 0aace3297274851bf9ee9a2842d9e695c23196a2
 p5_test_gaps_head: bb425125644c2057c75e2563d6c45193db05ceea
@@ -382,9 +388,43 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   запреты runtime/services/network/probes/dependencies/frozen ABI260 changes.
   Следующий batch: два отдельных worktree из одной принятой root базы, Go writer
   и Rust writer с общим документированным wire и непересекающимися файлами.
+- Два completion writer запущены из490915d: P4 Go patch/builder/hooks,
+  P5 Rust shared codec/projection/Local+System issuer/custody/payload/dispatch.
+  Оба получили override apply_patch вместо write_file/replace и подтверждение
+  нового разрешения, закрытые scopes и no nested delegation. Private locators:
+  YONIK_PROFILE_CONTROL_FD/LAUNCH_FD/PEER_PIDFD/ASSET_ROOT_FD. Для Local выбран
+  отдельный sealed YNKLOC01 record192 по YNKEXT01 layout, rights0 и pre-spawn
+  workerPid/workerStart0; System record остаётся YNKEXT01 с verified identities.
+  Host проверяет actual child после spawn; env locator сам не authority.
+  Pure tests/compile-only разрешены, actual runtime/provisioning по-прежнему нет.
+- Go writer ea2dcc7 поставил только builder --compile-only: codec test binaries
+  компилируются -c, core version не исполняется; manifest явно COMPILE_ONLY.
+  Author19 mock tests normal/-O и Ruff PASS. Root проверил узкий diff и принял
+  prerequisite обычным merge; P4 gate НЕ закрыт и runtime hooks не готовы.
+  Тот же writer продолжает незавершённую фазу с конкретного milestone:
+  closed launch/admission/capsule/asset consumer + actual main hook до features,
+  затем transport/grants. Rust counterpart продолжает своё поручение.
+- Rust writer874d7d8 реализовал только closed borrowed DATA P→D→C projection,
+  WireNetwork/WireAction и9 intent pure tests/clippy/fmt PASS по author evidence.
+  Root проверил узкий source diff и влит prerequisite; он не выдаёт authority,
+  actual mux decision не подтверждает и Unsupported не снимает. Тот же writer
+  продолжает shared codec/typed capsule11tables builder/decoder и parity vectors,
+  затем Local/System issuer/custody/dispatch. Go writer получил новые API facts;
+  оба P4/P5 completion gates остаются незавершёнными.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
+- Go milestone a004e92 добавил launch/admission consumer до config parser и
+  feature construction. Он влит как промежуточный SOURCE, builder gate закрыт.
+  R7 нашёл P2: named result p становился nil до deferred cleanup при отказе.
+  Root захватил исходный runtime аргументом defer и добавил чистый regression
+  invalid locator, не потребляющий FD и не выполняющий OS/network operations.
+  RED подтвердил panic (exit2); GREEN regression и все TestProfile pure tests
+  прошли. Source, compiler binding и ELF сохранены до исполнения; evidence
+  p4-root-defer-fix вне TTL. Strict patch dry-run, pins, gofmt, Python2tests,
+  Ruff и diff-check PASS; собственный Go cache/build root очищен и удалён.
+  FlowGrant/ingress/transport/DNS-query hooks всё ещё отсутствуют; полный P4
+  и runtime не PASS. Rust shared codec/capsule counterpart продолжает работу.
 
 ## Ограничения
 

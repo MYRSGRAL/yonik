@@ -196,6 +196,7 @@ def build(
     engine: str = "sing-box",
     *,
     native_codec: bool = False,
+    compile_only: bool = False,
 ) -> Path:
     """Собрать один раз; повторный запуск не сбрасывает частичные результаты."""
     if engine not in {"sing-box", "xray"}:
@@ -219,7 +220,14 @@ def build(
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_SH)
-        return build_locked(root, output, patch, engine, native_codec=native_codec)
+        return build_locked(
+            root,
+            output,
+            patch,
+            engine,
+            native_codec=native_codec,
+            compile_only=compile_only,
+        )
     finally:
         os.close(descriptor)
 
@@ -231,6 +239,7 @@ def build_locked(
     engine: str = "sing-box",
     *,
     native_codec: bool = False,
+    compile_only: bool = False,
 ) -> Path:
     source_url, source_tag, source_commit = (
         (XRAY_URL, XRAY_TAG, XRAY_COMMIT)
@@ -239,6 +248,8 @@ def build_locked(
     )
     source_version = source_tag.removeprefix("v")
     runner = Runner(root)
+    if compile_only:
+        runner.env.update(GOPROXY="off", GOSUMDB="off")
     source = root / f"build-source-{engine}"
     if source.is_symlink():
         raise BuildError(f"Исходник не должен быть symlink: {source}")
@@ -305,31 +316,21 @@ def build_locked(
         for name, expected in metadata.get("callsite_files_sha256", {}).items():
             if sha256(source / name) != expected:
                 raise BuildError(f"Callsite hash mismatch: {name}")
-        runner.run(
-            ["go", "test", "-p=1", "-mod=readonly", "./common/yonikbroker"], source
-        )
+
+        def check_package(package: str) -> None:
+            arguments = ["go", "test", "-p=1", "-mod=readonly"]
+            if compile_only:
+                test_binary = root / (
+                    package.removeprefix("./").replace("/", "-") + ".test"
+                )
+                arguments.extend(["-c", "-o", str(test_binary)])
+            runner.run([*arguments, package], source)
+
+        check_package("./common/yonikbroker")
         if metadata.get("routing_entry_guard_connected"):
-            runner.run(
-                [
-                    "go",
-                    "test",
-                    "-p=1",
-                    "-mod=readonly",
-                    "./app/dispatcher" if engine == "xray" else "./route",
-                ],
-                source,
-            )
+            check_package("./app/dispatcher" if engine == "xray" else "./route")
         if metadata.get("owned_tun_constructor_connected"):
-            runner.run(
-                [
-                    "go",
-                    "test",
-                    "-p=1",
-                    "-mod=readonly",
-                    "./proxy/tun" if engine == "xray" else "./protocol/tun",
-                ],
-                source,
-            )
+            check_package("./proxy/tun" if engine == "xray" else "./protocol/tun")
         if modules != {name: sha256(source / name) for name in modules}:
             raise BuildError("Codec изменил go.mod/go.sum")
         codec_record = {
@@ -379,6 +380,7 @@ def build_locked(
         },
         "native_protocol": None,
         "native_codec_component": codec_record,
+        "validation": "COMPILE_ONLY" if compile_only else "BUILD_AND_VERSION",
     }
     (runner.logs / "prebuild.json").write_text(
         json.dumps(prebuild, ensure_ascii=False, indent=2) + "\n"
@@ -395,14 +397,17 @@ def build_locked(
         raise BuildError("Патч изменился во время сборки")
     if not binary.is_file() or binary.is_symlink():
         raise BuildError("Go не создал ожидаемый бинарник")
-    version = runner.run([str(binary), "version"], source).splitlines()
-    if not version or (
-        version[0].strip() != f"sing-box version {source_version}"
-        if engine == "sing-box"
-        else not version[0].startswith(f"Xray {source_version} (")
-    ):
-        raise BuildError("Бинарник не подтверждает закреплённую версию ядра")
+    if not compile_only:
+        version = runner.run([str(binary), "version"], source).splitlines()
+        if not version or (
+            version[0].strip() != f"sing-box version {source_version}"
+            if engine == "sing-box"
+            else not version[0].startswith(f"Xray {source_version} (")
+        ):
+            raise BuildError("Бинарник не подтверждает закреплённую версию ядра")
     manifest = {
+        "validation": "COMPILE_ONLY" if compile_only else "BUILD_AND_VERSION",
+        "binary_version_executed": not compile_only,
         "prebuild_sha256": sha256(runner.logs / "prebuild.json"),
         "native_protocol": None,
         "native_codec_component": codec_record,
@@ -447,6 +452,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", choices=("sing-box", "xray"), default="sing-box")
     parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        help="Собрать и сохранить ELF без его исполнения",
+    )
+    parser.add_argument(
         "--native-codec",
         action="store_true",
         help="Проверить component codec без runtime featureack",
@@ -468,6 +478,7 @@ def main() -> int:
             options.patch,
             options.engine,
             native_codec=options.native_codec,
+            compile_only=options.compile_only,
         )
     except (BuildError, OSError, ValueError) as error:
         LOG.error("Сборка остановлена: %s", error)
