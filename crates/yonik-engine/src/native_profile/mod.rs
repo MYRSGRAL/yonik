@@ -5,8 +5,10 @@ mod validate;
 
 use crate::{CompiledConfig, SystemTun};
 pub use graph::{
-    EgressPlan, OwnedResourceRequirement, PhysicalEndpoint, ProbeRequirement, ProfileCompileError,
-    ResolverRequirement, TransportProtocol, ValidatedGraph, VerifiedNativeResources,
+    EgressPlan, IngressRequirement, OwnedResourceRequirement, PhysicalEndpoint, ProbeRequirement,
+    ProfileCompileError, ProviderIngressProtocol, ResolverRequirement, SystemResolverBinding,
+    SystemResolverRequirement, TransportProtocol, ValidatedGraph, VerifiedNativeResources,
+    VerifiedSystemResolver,
 };
 use std::{collections::BTreeMap, num::NonZeroU16};
 use yonik_import::NativeProfile;
@@ -17,6 +19,7 @@ pub struct OwnedRuntimePlan {
     pub(super) probe_port: NonZeroU16,
     pub(super) ingress: BTreeMap<String, OwnedIngress>,
     pub(super) tun: Option<SystemTun>,
+    pub(super) system_resolver: Option<SystemResolverBinding>,
     pub(super) resources: Vec<(
         OwnedResourceRequirement,
         crate::resource_bundle::ExternalRef,
@@ -37,12 +40,34 @@ impl OwnedRuntimePlan {
             probe_port,
             ingress: BTreeMap::new(),
             tun: None,
+            system_resolver: None,
             resources: Vec::new(),
         })
     }
     pub fn with_system(mut self, tun: SystemTun) -> Self {
         self.tun = Some(tun);
         self
+    }
+    pub fn bind_system_resolver(
+        mut self,
+        resolver: &impl VerifiedSystemResolver,
+    ) -> Result<Self, ProfileCompileError> {
+        let digest = resolver.snapshot_digest();
+        let servers = resolver.servers();
+        if digest == [0; 32]
+            || servers.is_empty()
+            || servers.len() > 16
+            || servers
+                .iter()
+                .any(|s| s.port() == 0 || s.ip().is_unspecified() || s.ip().is_multicast())
+        {
+            return Err(ProfileCompileError::ResourceRequired);
+        }
+        self.system_resolver = Some(SystemResolverBinding { digest, servers });
+        Ok(self)
+    }
+    pub fn system_resolver_binding(&self) -> Option<&SystemResolverBinding> {
+        self.system_resolver.as_ref()
     }
     pub fn bind_resources(
         mut self,
@@ -51,6 +76,7 @@ impl OwnedRuntimePlan {
     ) -> Result<Self, ProfileCompileError> {
         self.resources.clear();
         let mut bytes = 0u64;
+        let mut unique = std::collections::HashMap::new();
         for requirement in graph.resources() {
             let reference = catalog
                 .lookup(requirement)
@@ -58,9 +84,15 @@ impl OwnedRuntimePlan {
             reference
                 .validate()
                 .map_err(|_| ProfileCompileError::ResourceRequired)?;
-            bytes = bytes
-                .checked_add(reference.bytes)
-                .ok_or(ProfileCompileError::Budget)?;
+            if let Some(previous) = unique.insert(reference.digest, reference.clone()) {
+                if previous != reference {
+                    return Err(ProfileCompileError::ResourceRequired);
+                }
+            } else {
+                bytes = bytes
+                    .checked_add(reference.bytes)
+                    .ok_or(ProfileCompileError::Budget)?;
+            }
             if bytes > 512 * 1024 * 1024 {
                 return Err(ProfileCompileError::Budget);
             }

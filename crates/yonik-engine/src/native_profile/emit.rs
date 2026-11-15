@@ -11,6 +11,9 @@ pub(super) fn emit(
     if system != runtime.tun.is_some() {
         return Err(Error::Ownership);
     }
+    if !graph.egress.system_resolvers().is_empty() && runtime.system_resolver.is_none() {
+        return Err(Error::ResourceRequired);
+    }
     for endpoint in graph.egress.physical() {
         if (endpoint.host().eq_ignore_ascii_case("localhost")
             || endpoint
@@ -23,12 +26,40 @@ pub(super) fn emit(
         }
     }
     let mut mappings = HashMap::new();
-    let mut occupied = HashSet::new();
+    let mut occupied = HashMap::new();
+    let mut signatures: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, rule) in graph.value["routing"]["rules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for tag in rule["inboundTag"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let signature = signatures.entry(tag).or_default();
+            if signature.last() != Some(&index) {
+                signature.push(index);
+            }
+        }
+    }
     for i in graph.value["inbounds"].as_array().into_iter().flatten() {
         let tag = i["tag"].as_str().ok_or(Error::Ownership)?;
         let target = runtime.ingress.get(tag).ok_or(Error::Ownership)?;
-        if !occupied.insert(*target as u8) || (*target == OwnedIngress::System && !system) {
+        if *target == OwnedIngress::System && !system {
             return Err(Error::Ownership);
+        }
+        if let Some((previous, sniffing)) = occupied.insert(*target as u8, (tag, i.get("sniffing")))
+        {
+            if signatures.get(previous).map(Vec::as_slice).unwrap_or(&[])
+                != signatures.get(tag).map(Vec::as_slice).unwrap_or(&[])
+                || sniffing != i.get("sniffing")
+            {
+                return Err(Error::Ownership);
+            }
         }
         mappings.insert(
             tag.to_owned(),
@@ -100,6 +131,13 @@ pub(super) fn emit(
                         return Err(Error::Ownership);
                     }
                 }
+                // Aliases эквивалентны по membership каждого ordered rule.
+                // Удаляется только повтор имени, не rule или условие.
+                let mut seen = HashSet::new();
+                r["inboundTag"]
+                    .as_array_mut()
+                    .ok_or(Error::Reference)?
+                    .retain(|t| seen.insert(t.as_str().unwrap_or_default().to_owned()));
             }
         }
     }

@@ -365,6 +365,7 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
     let mut tags = Vec::new();
     let mut seen = HashSet::new();
     let mut endpoints = HashMap::new();
+    let mut packet_endpoints = HashMap::new();
     let mut chains = Vec::new();
     let mut direct = Vec::new();
     for o in outbounds {
@@ -489,6 +490,9 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
                     return Err(Error::Schema);
                 }
                 let method = text(s, "method")?;
+                if s.get("uot") == Some(&Value::Bool(true)) {
+                    return Err(Error::UnsupportedField);
+                }
                 if s.get("UoTVersion")
                     .and_then(Value::as_u64)
                     .is_some_and(|n| n > 2)
@@ -497,14 +501,27 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
                 }
                 if method.starts_with("2022-") {
                     use base64::Engine;
-                    let key = base64::engine::general_purpose::STANDARD
-                        .decode(text(s, "password")?)
-                        .map_err(|_| Error::Schema)?;
-                    if key.len() != if method.ends_with("128-gcm") { 16 } else { 32 } {
-                        return Err(Error::Schema);
+                    let password = text(s, "password")?;
+                    if password.split(':').count() > 32 {
+                        return Err(Error::Budget);
+                    }
+                    // Pinned ParsePSKList/ParseKey проверяет каждый PSK отдельно;
+                    // ошибка base64 допускает raw key нужной длины.
+                    for part in password.split(':') {
+                        let key = base64::engine::general_purpose::STANDARD
+                            .decode(part)
+                            .unwrap_or_else(|_| part.as_bytes().to_vec());
+                        if key.len() != if method.ends_with("128-gcm") { 16 } else { 32 } {
+                            return Err(Error::Schema);
+                        }
                     }
                 }
                 endpoints.insert(tag.to_owned(), endpoint(s, transport)?);
+                // SS/SS2022 native Process выбирает physical network по flow;
+                // raw TCP stream не превращает UDP payload в TCP transport.
+                if o["streamSettings"]["network"].as_str().unwrap_or("tcp") == "tcp" {
+                    packet_endpoints.insert(tag.to_owned(), endpoint(s, TransportProtocol::Udp)?);
+                }
             }
             "hysteria" => {
                 object(s, &[("address", 's'), ("port", 'n'), ("version", 'n')])?;
@@ -722,11 +739,16 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
     {
         return Err(Error::Reference);
     }
-    let resolvers = if let Some(dns) = value.get("dns") {
+    let (resolvers, system_resolvers) = if let Some(dns) = value.get("dns") {
         dns_validate(dns, &mut resources)?
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
+    let mut ingresses = Vec::new();
+    let mut ingress_tags = HashSet::new();
+    if array(&value, "inbounds")?.len() > 16 {
+        return Err(Error::Budget);
+    }
     for i in array(&value, "inbounds")? {
         object(
             i,
@@ -739,8 +761,24 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
                 ("sniffing", 'o'),
             ],
         )?;
-        choice(i, "protocol", &["socks", "http"])?;
-        text(i, "tag")?;
+        let protocol = match text(i, "protocol")? {
+            "socks" => ProviderIngressProtocol::Socks,
+            "http" => ProviderIngressProtocol::Http,
+            _ => return Err(Error::UnsupportedProtocol),
+        };
+        let tag = text(i, "tag")?;
+        if tag.is_empty()
+            || tag.len() > 128
+            || tag.starts_with("yonik-owned-")
+            || tag == "system-tun"
+            || !ingress_tags.insert(tag.to_owned())
+        {
+            return Err(Error::Reference);
+        }
+        ingresses.push(IngressRequirement {
+            tag: tag.to_owned(),
+            protocol,
+        });
         if let Some(s) = i.get("settings") {
             object(s, &[("udp", 'b'), ("auth", 's')])?;
             choice(s, "auth", &["noauth"])?;
@@ -761,9 +799,11 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
     let chained: HashSet<_> = chains.iter().map(|(s, _)| s.as_str()).collect();
     let subject_endpoints = tags
         .iter()
-        .filter_map(|tag| {
+        .flat_map(|tag| {
             endpoints
                 .get(tag)
+                .into_iter()
+                .chain(packet_endpoints.get(tag))
                 .map(|endpoint| (tag.clone(), endpoint.clone()))
         })
         .collect();
@@ -772,6 +812,11 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
     for tag in &tags {
         if !chained.contains(tag.as_str()) {
             if let Some(e) = endpoints.remove(tag) {
+                if unique.insert(e.clone()) {
+                    physical.push(e);
+                }
+            }
+            if let Some(e) = packet_endpoints.remove(tag) {
                 if unique.insert(e.clone()) {
                     physical.push(e);
                 }
@@ -794,18 +839,21 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
             direct,
             resolvers,
             subject_endpoints,
+            system_resolvers,
         },
         tags,
         selectors,
         resources,
         probe,
+        ingresses,
     })
 }
 fn dns_validate(
     dns: &Value,
     resources: &mut Vec<OwnedResourceRequirement>,
-) -> Result<Vec<ResolverRequirement>> {
+) -> Result<(Vec<ResolverRequirement>, Vec<SystemResolverRequirement>)> {
     let mut resolvers = Vec::new();
+    let mut system_resolvers = Vec::new();
     object(
         dns,
         &[
@@ -853,9 +901,19 @@ fn dns_validate(
             }
             text(server, "address")?
         };
+        if address.eq_ignore_ascii_case("localhost") {
+            system_resolvers.push(SystemResolverRequirement {
+                subject: server
+                    .get("tag")
+                    .or_else(|| dns.get("tag"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+            continue;
+        }
         let (host, port, protocol) = if address.parse::<std::net::IpAddr>().is_err() {
             let u = url::Url::parse(address).map_err(|_| Error::Schema)?;
-            if !["https", "tcp", "quic"].contains(&u.scheme())
+            if !["https", "tcp"].contains(&u.scheme())
                 || u.host_str().is_none()
                 || !u.username().is_empty()
                 || u.password().is_some()
@@ -899,5 +957,5 @@ fn dns_validate(
                 .map(str::to_owned),
         });
     }
-    Ok(resolvers)
+    Ok((resolvers, system_resolvers))
 }

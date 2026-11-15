@@ -60,7 +60,7 @@ fn ordered_rules_prefix_sets_and_physical_chains() {
     v["outbounds"][0]["proxySettings"] = json!({"tag":"edge-b","transportLayer":true});
     let g = validate_profile(&profile(&v)).unwrap();
     assert_eq!(g.selector_sets()[0].1, vec!["edge-a", "edge-b"]);
-    assert_eq!(g.egress().physical().len(), 1);
+    assert_eq!(g.egress().physical().len(), 2);
     assert_eq!(g.egress().physical()[0].host(), "192.0.2.2");
     assert_eq!(g.egress().subject_endpoints()[0].0, "edge-a");
     assert_eq!(g.egress().subject_endpoints()[0].1.host(), "192.0.2.1");
@@ -191,6 +191,7 @@ fn owned_resources_are_explicit_pinned_and_scoped_to_matchers() {
     let mut v = profiles().remove(0);
     v["routing"]["rules"][0]["domain"] = json!(["geosite:synthetic"]);
     v["outbounds"][0]["settings"]["servers"][0]["password"] = json!("geosite:credential-must-stay");
+    v["outbounds"][0]["settings"]["servers"][0]["method"] = json!("aes-128-gcm");
     let p = profile(&v);
     let graph = validate_profile(&p).unwrap();
     assert_eq!(graph.resources().len(), 1);
@@ -302,4 +303,263 @@ fn system_probe_follows_checked_system_ingress() {
         value["inbounds"][1]["sniffing"],
         value["inbounds"][2]["sniffing"]
     );
+}
+
+struct SyntheticBindings;
+impl VerifiedNativeResources for SyntheticBindings {
+    fn lookup(
+        &self,
+        r: &OwnedResourceRequirement,
+    ) -> Option<yonik_engine::resource_bundle::ExternalRef> {
+        Some(yonik_engine::resource_bundle::ExternalRef {
+            engine: yonik_engine::Engine::Xray,
+            digest: if r.kind() == yonik_engine::resource_bundle::ResourceKind::Domains {
+                [1; 32]
+            } else {
+                [2; 32]
+            },
+            bytes: 100,
+            records: 1,
+            kind: r.kind(),
+            format_version: 1,
+        })
+    }
+}
+impl VerifiedSystemResolver for SyntheticBindings {
+    fn snapshot_digest(&self) -> [u8; 32] {
+        [3; 32]
+    }
+    fn servers(&self) -> Vec<std::net::SocketAddr> {
+        vec![std::net::SocketAddr::from(([192, 0, 2, 53], 53))]
+    }
+}
+fn provider_shape(mut v: Value) -> Value {
+    let sniff = json!({"enabled":true,"routeOnly":true,"destOverride":["http","tls","quic"]});
+    v["inbounds"] = json!([
+        {"tag":"fixture-socks","protocol":"socks","listen":"0.0.0.0","port":1000,"settings":{"udp":true,"auth":"noauth"},"sniffing":sniff},
+        {"tag":"fixture-http","protocol":"http","listen":"0.0.0.0","port":1001,"sniffing":sniff}
+    ]);
+    let domains: Vec<_> = (0..11)
+        .map(|n| format!("geosite:fixture-category-{n}"))
+        .collect();
+    v["dns"] = json!({"hosts":{"dns.fixture.invalid":"192.0.2.53"},"queryStrategy":"UseIP","disableFallbackIfMatch":true,"servers":[
+        {"address":"localhost","domains":["domain:fixture.invalid"],"skipFallback":true},
+        {"tag":"fixture-dns-a","address":"https://dns.fixture.invalid/query","domains":domains[..6],"finalQuery":true},
+        {"tag":"fixture-dns-b","address":"https://backup.fixture.invalid/query","domains":domains[6..],"skipFallback":true}
+    ]});
+    let primary = v["outbounds"][0]["tag"].clone();
+    v["outbounds"].as_array_mut().unwrap().extend([
+        json!({"tag":"fixture-direct","protocol":"freedom","settings":{"domainStrategy":"UseIP"}}),
+        json!({"tag":"fixture-dns","protocol":"dns"}),
+        json!({"tag":"fixture-block","protocol":"blackhole"}),
+    ]);
+    if v.get("routing").is_none() {
+        v["routing"] = json!({"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","network":"tcp,udp","outboundTag":primary}]});
+    }
+    let mut rules = vec![
+        json!({"type":"field","inboundTag":["fixture-dns-a"],"outboundTag":"fixture-direct"}),
+        json!({"type":"field","inboundTag":["fixture-dns-b"],"outboundTag":primary}),
+        json!({"type":"field","inboundTag":["fixture-socks","fixture-http"],"port":"53","outboundTag":"fixture-dns"}),
+        json!({"type":"field","ip":["geoip:fixture-private"],"outboundTag":"fixture-direct"}),
+        json!({"type":"field","domain":["geosite:fixture-route"],"outboundTag":"fixture-block"}),
+    ];
+    rules.extend(v["routing"]["rules"].as_array().unwrap().iter().cloned());
+    v["routing"]["rules"] = json!(rules);
+    v["meta"] = json!({"display":"synthetic-only"});
+    v
+}
+fn bound_plan(graph: &ValidatedGraph, system: bool) -> OwnedRuntimePlan {
+    let mut p = plan()
+        .bind_resources(graph, &SyntheticBindings)
+        .unwrap()
+        .bind_system_resolver(&SyntheticBindings)
+        .unwrap();
+    if system {
+        p = p.with_system(
+            SystemTun::new(1, 1500, 42, vec!["198.18.0.1/30".parse().unwrap()]).unwrap(),
+        );
+    }
+    for i in graph.ingresses() {
+        p = p
+            .map_ingress(
+                i.tag(),
+                if system {
+                    OwnedIngress::System
+                } else {
+                    OwnedIngress::Local
+                },
+            )
+            .unwrap();
+    }
+    p
+}
+#[test]
+fn seven_full_provider_shapes_preserve_dns_routing_and_owned_aliases() {
+    // SYNTHETIC_BINDING_NO_DAT_PROOF: ни lookup, ни OS resolver не исполняются.
+    for v in profiles().into_iter().map(provider_shape) {
+        let p = profile(&v);
+        let graph = validate_profile(&p).unwrap();
+        assert_eq!(graph.resources().len(), 13);
+        assert_eq!(graph.ingresses().len(), 2);
+        assert_eq!(graph.egress().system_resolvers().len(), 1);
+        assert_eq!(graph.egress().resolvers().len(), 2);
+        assert_eq!(
+            graph.ingresses()[0].protocol(),
+            ProviderIngressProtocol::Socks
+        );
+        assert_eq!(
+            graph.ingresses()[1].protocol(),
+            ProviderIngressProtocol::Http
+        );
+        assert!(matches!(
+            compile_profile_local(&p, &plan()),
+            Err(ProfileCompileError::ResourceRequired)
+        ));
+        for system in [false, true] {
+            let runtime = bound_plan(&graph, system);
+            let value = if system {
+                emitted(compile_profile_system(&p, &runtime).unwrap().config())
+            } else {
+                emitted(&compile_profile_local(&p, &runtime).unwrap())
+            };
+            assert_eq!(value["observatory"], v["observatory"]);
+            assert_eq!(value["routing"]["balancers"], v["routing"]["balancers"]);
+            assert_eq!(value["dns"]["servers"][0], v["dns"]["servers"][0]);
+            assert_eq!(value["dns"]["disableFallbackIfMatch"], true);
+            assert_eq!(
+                value["routing"]["rules"].as_array().unwrap().len(),
+                v["routing"]["rules"].as_array().unwrap().len()
+            );
+            for (before, after) in v["routing"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(value["routing"]["rules"].as_array().unwrap())
+            {
+                assert_eq!(before["outboundTag"], after["outboundTag"]);
+                assert_eq!(before["balancerTag"], after["balancerTag"]);
+            }
+            assert_eq!(
+                value["routing"]["rules"][2]["inboundTag"],
+                json!([
+                    if system {
+                        "system-tun"
+                    } else {
+                        "yonik-owned-local"
+                    },
+                    "yonik-owned-probe"
+                ])
+            );
+            assert_eq!(value["inbounds"][0]["listen"], "127.0.0.1");
+            assert_eq!(
+                value["inbounds"][1]["sniffing"],
+                value["inbounds"][if system { 2 } else { 0 }]["sniffing"]
+            );
+        }
+    }
+}
+#[test]
+fn alias_conflicts_are_checked_per_rule_and_sniffing() {
+    let mut v = provider_shape(profiles().remove(3));
+    v["routing"]["rules"][2]["inboundTag"] = json!(["fixture-socks"]);
+    let p = profile(&v);
+    let g = validate_profile(&p).unwrap();
+    assert!(matches!(
+        compile_profile_local(&p, &bound_plan(&g, false)),
+        Err(ProfileCompileError::Ownership)
+    ));
+    v = provider_shape(profiles().remove(3));
+    v["inbounds"][1]["sniffing"]["routeOnly"] = json!(false);
+    let p = profile(&v);
+    let g = validate_profile(&p).unwrap();
+    assert!(matches!(
+        compile_profile_local(&p, &bound_plan(&g, false)),
+        Err(ProfileCompileError::Ownership)
+    ));
+}
+#[test]
+fn ss2022_checks_every_psk_without_flattening_identity_chain() {
+    let mut v = profiles().remove(3);
+    let p = profile(&v);
+    let g = validate_profile(&p).unwrap();
+    assert_eq!(g.egress().physical().len(), 2);
+    assert_eq!(g.egress().physical()[0].protocol(), TransportProtocol::Tcp);
+    assert_eq!(g.egress().physical()[1].protocol(), TransportProtocol::Udp);
+    let value = emitted(&compile_profile_local(&p, &plan()).unwrap());
+    assert_eq!(value["outbounds"], v["outbounds"]);
+    v["outbounds"][0]["settings"]["servers"][0]["password"] =
+        json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:invalid");
+    assert_eq!(
+        validate_profile(&profile(&v)).unwrap_err(),
+        ProfileCompileError::Schema
+    );
+}
+#[test]
+fn system_resolver_binding_is_required_without_replacing_provider_dns() {
+    let mut v = profiles().remove(3);
+    v["dns"] = json!({"servers":["localhost"]});
+    let p = profile(&v);
+    assert!(matches!(
+        compile_profile_local(&p, &plan()),
+        Err(ProfileCompileError::ResourceRequired)
+    ));
+    let rt = plan().bind_system_resolver(&SyntheticBindings).unwrap();
+    assert_eq!(
+        rt.system_resolver_binding().unwrap().snapshot_digest(),
+        &[3; 32]
+    );
+    assert_eq!(
+        emitted(&compile_profile_local(&p, &rt).unwrap())["dns"],
+        v["dns"]
+    );
+}
+#[test]
+fn resource_budget_counts_unique_dats_and_rejects_conflicting_descriptors() {
+    struct Catalog {
+        conflict: bool,
+    }
+    impl VerifiedNativeResources for Catalog {
+        fn lookup(
+            &self,
+            r: &OwnedResourceRequirement,
+        ) -> Option<yonik_engine::resource_bundle::ExternalRef> {
+            let mut reference = SyntheticBindings.lookup(r)?;
+            reference.bytes = 100 * 1024 * 1024;
+            if self.conflict {
+                reference.digest = [1; 32];
+            }
+            Some(reference)
+        }
+    }
+    let graph = validate_profile(&profile(&provider_shape(profiles().remove(3)))).unwrap();
+    assert!(
+        plan()
+            .bind_resources(&graph, &Catalog { conflict: false })
+            .is_ok()
+    );
+    assert!(matches!(
+        plan().bind_resources(&graph, &Catalog { conflict: true }),
+        Err(ProfileCompileError::ResourceRequired)
+    ));
+}
+#[test]
+fn system_resolver_binding_rejects_empty_or_unbounded_snapshots() {
+    struct Resolver {
+        count: usize,
+        digest: [u8; 32],
+    }
+    impl VerifiedSystemResolver for Resolver {
+        fn snapshot_digest(&self) -> [u8; 32] {
+            self.digest
+        }
+        fn servers(&self) -> Vec<std::net::SocketAddr> {
+            vec![std::net::SocketAddr::from(([192, 0, 2, 53], 53)); self.count]
+        }
+    }
+    for (count, digest) in [(0, [1; 32]), (17, [1; 32]), (1, [0; 32])] {
+        assert!(matches!(
+            plan().bind_system_resolver(&Resolver { count, digest }),
+            Err(ProfileCompileError::ResourceRequired)
+        ));
+    }
 }

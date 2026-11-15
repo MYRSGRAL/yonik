@@ -58,6 +58,33 @@ pub struct EgressPlan {
     pub(super) direct: Vec<String>,
     pub(super) resolvers: Vec<ResolverRequirement>,
     pub(super) subject_endpoints: Vec<(String, PhysicalEndpoint)>,
+    pub(super) system_resolvers: Vec<SystemResolverRequirement>,
+}
+/// Native localhost использует OS resolver вне provider dispatcher.
+pub struct SystemResolverRequirement {
+    pub(super) subject: Option<String>,
+}
+impl SystemResolverRequirement {
+    pub fn subject(&self) -> Option<&str> {
+        self.subject.as_deref()
+    }
+}
+/// Trusted host удерживает exact resolver/NSS snapshot и проверенные UDP/TCP routes.
+pub trait VerifiedSystemResolver {
+    fn snapshot_digest(&self) -> [u8; 32];
+    fn servers(&self) -> Vec<std::net::SocketAddr>;
+}
+pub struct SystemResolverBinding {
+    pub(super) digest: [u8; 32],
+    pub(super) servers: Vec<std::net::SocketAddr>,
+}
+impl SystemResolverBinding {
+    pub fn snapshot_digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+    pub fn servers(&self) -> &[std::net::SocketAddr] {
+        &self.servers
+    }
 }
 /// Требование resolver, а не разрешение прямого обхода provider DNS routing.
 pub struct ResolverRequirement {
@@ -84,6 +111,9 @@ impl EgressPlan {
     }
     pub fn resolvers(&self) -> &[ResolverRequirement] {
         &self.resolvers
+    }
+    pub fn system_resolvers(&self) -> &[SystemResolverRequirement] {
+        &self.system_resolvers
     }
     /// Remote destination каждого subject. Chained remote не physical exception.
     pub fn subject_endpoints(&self) -> &[(String, PhysicalEndpoint)] {
@@ -130,6 +160,24 @@ pub struct ValidatedGraph {
     pub(super) selectors: Vec<(String, Vec<String>)>,
     pub(super) resources: Vec<OwnedResourceRequirement>,
     pub(super) probe: Option<ProbeRequirement>,
+    pub(super) ingresses: Vec<IngressRequirement>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderIngressProtocol {
+    Socks,
+    Http,
+}
+pub struct IngressRequirement {
+    pub(super) tag: String,
+    pub(super) protocol: ProviderIngressProtocol,
+}
+impl IngressRequirement {
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+    pub fn protocol(&self) -> ProviderIngressProtocol {
+        self.protocol
+    }
 }
 impl ValidatedGraph {
     pub fn egress(&self) -> &EgressPlan {
@@ -146,6 +194,9 @@ impl ValidatedGraph {
     }
     pub fn probe(&self) -> Option<&ProbeRequirement> {
         self.probe.as_ref()
+    }
+    pub fn ingresses(&self) -> &[IngressRequirement] {
+        &self.ingresses
     }
 }
 impl fmt::Debug for ValidatedGraph {
