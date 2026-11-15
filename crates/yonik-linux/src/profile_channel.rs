@@ -2409,6 +2409,36 @@ impl Sequence {
 mod tests {
     use super::*;
     #[test]
+    fn exact_go_a004e92_launch_admission_golden_has_identical_layout() {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/go-a004e92-launch-admission.json"
+        ))
+        .unwrap();
+        let config = unhex(f["config_hex"].as_str().unwrap());
+        let record = unhex(f["local_record_hex"].as_str().unwrap());
+        let launch = LaunchRecord::decode(&record, Mode::Local).unwrap();
+        assert_eq!(launch.encode().unwrap().as_slice(), record);
+        assert_eq!(
+            launch.binding.digest,
+            <[u8; 32]>::from(Sha256::digest(&config))
+        );
+        let body = unhex(f["admit_body_hex"].as_str().unwrap());
+        let capsule = Capsule::decode(&body, &launch.binding.digest).unwrap();
+        assert_eq!(capsule.manifest, launch.manifest);
+        assert_eq!(
+            capsule.manifest.to_vec(),
+            unhex(f["manifest_sha256"].as_str().unwrap())
+        );
+        assert!(!capsule.mode.required());
+        // Golden проверяет wire grammar, не production construction или config proof.
+        assert!(
+            yonik_engine::native_profile::ProfileIntent::decode(
+                std::str::from_utf8(&config).unwrap()
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn ancillary_shapes_deny_mixed_rights_wrong_peer_and_truncation() {
         let peer = PeerIdentity {
             pid: 12,

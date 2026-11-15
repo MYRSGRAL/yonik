@@ -79,3 +79,25 @@ Go — inherited Host pidfd, sender peer и binding. Frozen records не мен�
 
 Нужны Local/System authenticated issuer и реальные callsites. Этот API не снимает
 существующий Unsupported и не объявляет native feature доступной.
+
+## Сверка Go a004e92
+
+Exact Go golden сохранён без изменений в
+`tests/fixtures/xray-profile-channel-v3/go-a004e92-launch-admission.json`.
+Он проверяет byte grammar, а не production builder: его config bytes `config`
+не являются валидным ProfileIntent, а transport hash синтетический.
+
+Две несовместимости требуют root integration, Rust authority не ослабляется:
+
+- Go `profileCapsule.validate` отвергает table9 payload byte3=0. Native default
+  UDP443 reject может дать закрытый mask0 scope (описан выше); этот вариант
+  отдельно закреплён Rust independent vector, никакой branch/edge он не разрешает.
+- Go `profileAssetPath`/`verifyAssets` ожидают `<digest>.dat`, тогда как принятый
+  P3 emitter `native_profile/emit.rs:238` создаёт `ext:r-<digest>.dat:<category>`
+  через `ExternalRef::tag`. Catalog source basename `<digest>.dat` не меняется;
+  runtime stage/consumer должны согласовать deterministic `r-<digest>.dat`.
+
+Go `main/run.go` читает bounded stdin до `PrepareProfileLaunch`, хотя parser и
+NewWithContext идут после admission. Local launcher обязан удостоверить image
+до передачи provider config; ожидание HELLO перед stdin с этим caller не работает.
+Go gate остаётся off; наличие golden/ACK не заменяет flow grants или deployment.
