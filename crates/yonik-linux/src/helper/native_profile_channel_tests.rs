@@ -1,5 +1,86 @@
 use super::*;
 use std::collections::BTreeSet;
+
+struct CancelProofIo {
+    inbox: std::cell::RefCell<Rendezvous<u8>>,
+    packets: std::cell::RefCell<VecDeque<Queued>>,
+}
+impl Channel for CancelProofIo {
+    fn discard_ingress(&self, request: u64) -> Result<(), ServiceError> {
+        self.inbox.borrow_mut().discard(request);
+        Ok(())
+    }
+    fn read(&self, _: u32, _: u32, out: &mut [u8; 1153]) -> Result<Option<usize>, ServiceError> {
+        Ok(self.packets.borrow_mut().pop_front().map(|packet| {
+            out[..packet.length].copy_from_slice(&packet.bytes[..packet.length]);
+            packet.length
+        }))
+    }
+    fn write(&self, _: &[u8]) -> Result<bool, ServiceError> {
+        panic!("drain не пишет ответы")
+    }
+}
+
+#[test]
+fn canceled_queued_open_discards_ready_proof_without_expiring_neighbor() {
+    let mut issuer = issuer(Mode::System);
+    let (neighbor, _) = issuer.open(1, &open(Mode::System, 32002)).unwrap();
+    let now = Instant::now();
+    let (packet, proof) = rendezvous_open(issuer.record, 2);
+    let mut inbox = Rendezvous::new().unwrap();
+    inbox.proof(proof, 42, now).unwrap();
+    inbox.runtime(packet, now).unwrap();
+    let packet = inbox.next(issuer.record, now).unwrap().unwrap();
+    let mut bytes = [0; 1153];
+    let length = wire::Frame::encode(
+        wire::Header {
+            kind: wire::Kind::Cancel,
+            sequence: 3,
+            reply_to: 0,
+            binding: issuer.record.binding,
+            object_id: 0,
+        },
+        &wire::Message::Cancel {
+            target: 1,
+            id: 2,
+            reason: 0,
+        },
+        &mut bytes,
+    )
+    .unwrap();
+    let io = CancelProofIo {
+        inbox: std::cell::RefCell::new(inbox),
+        packets: std::cell::RefCell::new(VecDeque::from([
+            packet,
+            Queued {
+                bytes,
+                length,
+                sequence: 3,
+            },
+        ])),
+    };
+    let mut incoming = wire::Sequence::new();
+    incoming.accept(1).unwrap();
+    let mut queued = VecDeque::new();
+    let mut acks = VecDeque::new();
+    drain_before_publication(
+        &mut issuer,
+        &io,
+        8,
+        997,
+        &mut incoming,
+        &mut queued,
+        &mut acks,
+    )
+    .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert!(issuer.retired.iter().any(|(id, _)| *id == 2));
+    let mut inbox = io.inbox.borrow_mut();
+    inbox.check(now + Duration::from_secs(2)).unwrap();
+    assert!(inbox.proof(proof, 43, now).is_err());
+    assert!(issuer.flows.contains_key(&neighbor));
+    issuer.fence().unwrap();
+}
 fn rendezvous_open(record: LaunchRecord, sequence: u64) -> (Queued, wire::SocketRecord) {
     let message = open(Mode::Local, 32001);
     let wire::Message::OpenIngress { tuple, ingress, .. } = message else {

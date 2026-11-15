@@ -1098,6 +1098,9 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn discard_ingress(&self, _request: u64) -> Result<(), ServiceError> {
+        Ok(())
+    }
     fn read(&self, pid: u32, uid: u32, out: &mut [u8; 1153])
     -> Result<Option<usize>, ServiceError>;
     fn write(&self, bytes: &[u8]) -> Result<bool, ServiceError>;
@@ -1258,6 +1261,11 @@ struct Rendezvous<T> {
     _credit: super::memory::ByteLease,
 }
 impl<T> Rendezvous<T> {
+    fn discard(&mut self, request: u64) {
+        // Sequence/proof watermarks сохраняются: cleanup не разрешает replay.
+        self.pending.remove(&request);
+        self.ready.remove(&request);
+    }
     fn new() -> Result<Self, ServiceError> {
         if std::mem::size_of::<Waiting<T>>() + 80 > 512 {
             return Err(ServiceError::Unsupported);
@@ -1594,6 +1602,16 @@ impl SystemChannel {
     }
 }
 impl Channel for SystemChannel {
+    fn discard_ingress(&self, request: u64) -> Result<(), ServiceError> {
+        self.peer
+            .proofs
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .lock()
+            .map_err(unavailable)?
+            .discard(request);
+        Ok(())
+    }
     fn read(
         &self,
         pid: u32,
@@ -1711,6 +1729,9 @@ fn drain_before_publication<A: Authority>(
             .accept(frame.header.sequence)
             .map_err(unavailable)?;
         if let wire::Message::Cancel { target, id, .. } = frame.message {
+            if target == 1 && id < frame.header.sequence {
+                socket.discard_ingress(id)?;
+            }
             let result = cancel(issuer, frame.header.sequence, target, id);
             acks.push_back(CancelReply {
                 request: frame.header.sequence,
@@ -1859,6 +1880,7 @@ fn run_issuer<A: Authority>(
             .ok_or(ServiceError::Unavailable)?;
         let reply = frame.header.sequence;
         if issuer.retired.iter().any(|(id, _)| *id == reply) {
+            socket.discard_ingress(reply)?;
             send_message(
                 issuer,
                 socket,
@@ -1900,70 +1922,75 @@ fn run_issuer<A: Authority>(
                 )?;
                 awaiting = Some((outgoing, admission, until, next_expiry));
             }
-            wire::Message::OpenIngress { .. } => match issuer.open(reply, &frame.message) {
-                Ok((flow, proof)) => {
-                    drain_before_publication(
+            wire::Message::OpenIngress { .. } => {
+                let result = issuer.open(reply, &frame.message);
+                socket.discard_ingress(reply)?;
+                match result {
+                    Ok((flow, proof)) => {
+                        drain_before_publication(
+                            issuer,
+                            socket,
+                            pid,
+                            uid,
+                            &mut incoming,
+                            &mut queued,
+                            &mut acks,
+                        )?;
+                        if !issuer.flows.contains_key(&flow) {
+                            send_message(
+                                issuer,
+                                socket,
+                                stop,
+                                outgoing,
+                                reply,
+                                0,
+                                &wire::Message::Deny {
+                                    status: wire::Status::Deny,
+                                    reason: 4,
+                                },
+                                expires.min(now + Duration::from_secs(1)),
+                            )?;
+                        } else {
+                            let source =
+                                issuer.flows.get(&flow).ok_or(ServiceError::Unavailable)?;
+                            issuer.authority.subject(&proof, flow, source.tuple)?;
+                            let until = issuer
+                                .authority
+                                .expiry(&proof)
+                                .unwrap_or(now + Duration::from_secs(1))
+                                .min(expires);
+                            send_message(
+                                issuer,
+                                socket,
+                                stop,
+                                outgoing,
+                                reply,
+                                0,
+                                &wire::Message::IngressReply {
+                                    status: wire::Status::Allow,
+                                    required: issuer.record.mode.required(),
+                                    flow,
+                                    revision: issuer.capsule()?.policy_revision,
+                                },
+                                until,
+                            )?;
+                        }
+                    }
+                    Err(_) => send_message(
                         issuer,
                         socket,
-                        pid,
-                        uid,
-                        &mut incoming,
-                        &mut queued,
-                        &mut acks,
-                    )?;
-                    if !issuer.flows.contains_key(&flow) {
-                        send_message(
-                            issuer,
-                            socket,
-                            stop,
-                            outgoing,
-                            reply,
-                            0,
-                            &wire::Message::Deny {
-                                status: wire::Status::Deny,
-                                reason: 4,
-                            },
-                            expires.min(now + Duration::from_secs(1)),
-                        )?;
-                    } else {
-                        let source = issuer.flows.get(&flow).ok_or(ServiceError::Unavailable)?;
-                        issuer.authority.subject(&proof, flow, source.tuple)?;
-                        let until = issuer
-                            .authority
-                            .expiry(&proof)
-                            .unwrap_or(now + Duration::from_secs(1))
-                            .min(expires);
-                        send_message(
-                            issuer,
-                            socket,
-                            stop,
-                            outgoing,
-                            reply,
-                            0,
-                            &wire::Message::IngressReply {
-                                status: wire::Status::Allow,
-                                required: issuer.record.mode.required(),
-                                flow,
-                                revision: issuer.capsule()?.policy_revision,
-                            },
-                            until,
-                        )?;
-                    }
+                        stop,
+                        outgoing,
+                        reply,
+                        0,
+                        &wire::Message::Deny {
+                            status: wire::Status::Unknown,
+                            reason: 1,
+                        },
+                        expires.min(now + Duration::from_secs(1)),
+                    )?,
                 }
-                Err(_) => send_message(
-                    issuer,
-                    socket,
-                    stop,
-                    outgoing,
-                    reply,
-                    0,
-                    &wire::Message::Deny {
-                        status: wire::Status::Unknown,
-                        reason: 1,
-                    },
-                    expires.min(now + Duration::from_secs(1)),
-                )?,
-            },
+            }
             wire::Message::Authorize(a) => {
                 match issuer.authorize(reply, frame.header.object_id, a) {
                     Ok((id, proof)) => {
@@ -2043,6 +2070,9 @@ fn run_issuer<A: Authority>(
                 }
             }
             wire::Message::Cancel { target, id, .. } => {
+                if *target == 1 && *id < reply {
+                    socket.discard_ingress(*id)?;
+                }
                 let result = cancel(issuer, reply, *target, *id);
                 let status = if result.is_ok() {
                     wire::CloseStatus::KnownClosed
