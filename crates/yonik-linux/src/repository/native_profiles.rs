@@ -236,7 +236,18 @@ fn open(key: &[u8; 32], db: &[u8; 32], row: &ProfileRow) -> Result<NativeSummary
     })
 }
 fn rows(connection: &Connection, source: i64) -> Result<Vec<ProfileRow>> {
-    let mut stmt = connection.prepare("SELECT id,source_id,fingerprint,generation,revision,ordinal,present,payload FROM native_profiles WHERE source_id=?1 ORDER BY id LIMIT 40001").map_err(storage)?;
+    projection_rows(connection, source, true)
+}
+fn projection_rows(connection: &Connection, source: i64, native: bool) -> Result<Vec<ProfileRow>> {
+    let table = if native {
+        "native_profiles"
+    } else {
+        "profiles"
+    };
+    let sql = format!(
+        "SELECT id,source_id,fingerprint,generation,revision,ordinal,present,payload FROM {table} WHERE source_id=?1 ORDER BY id LIMIT 40001"
+    );
+    let mut stmt = connection.prepare(&sql).map_err(storage)?;
     let result = stmt
         .query_map([source], |r| {
             Ok(ProfileRow {
@@ -338,9 +349,12 @@ pub(super) fn reconcile(
 }
 pub(super) fn is_current(
     tx: &Transaction<'_>,
+    key: &[u8; 32],
+    db: &[u8; 32],
     source: i64,
     generation: i64,
     revision: i64,
+    report: &mut Option<ProfileImportReport>,
 ) -> Result<bool> {
     let marker:Option<(i64,i64,i64,usize)>=tx.query_row("SELECT version,generation,revision,native_count FROM profile_projection WHERE source_id=?1",[source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(storage)?;
     match marker {
@@ -356,10 +370,104 @@ pub(super) fn is_current(
             if g == generation && r == revision && actual != n {
                 return Err(RepositoryError::Corrupt);
             }
+            if g == generation && r == revision {
+                *report = validate_composition(tx, key, db, source, g, r, &|| Ok(()))?;
+            }
             Ok(g == generation && r == revision)
         }
         _ => Err(RepositoryError::Corrupt),
     }
+}
+
+pub(super) fn original_report(
+    connection: &Connection,
+    key: &[u8; 32],
+    db: &[u8; 32],
+    source: i64,
+    generation: i64,
+    revision: i64,
+    check: &impl Fn() -> Result<()>,
+) -> Result<Option<ProfileImportReport>> {
+    check()?;
+    let encrypted: Vec<u8> = connection
+        .query_row(
+            "SELECT body FROM snapshots WHERE source_id=?1",
+            [source],
+            |r| bounded_blob(r, 0, BODY_LIMIT + 40),
+        )
+        .map_err(storage)?;
+    let body = decrypt(
+        key, db, 2, source, generation, revision, &encrypted, BODY_LIMIT,
+    )?;
+    let parsed = yonik_import::import_profiles(body.to_vec());
+    check()?;
+    match parsed {
+        Ok(report) => Ok(Some(report)),
+        Err(error) if error.kind() == yonik_import::FatalError::UnsupportedFormat => {
+            // Legacy native DATA остаются непрозрачными, без selectable endpoints.
+            let legacy = yonik_import::import_bytes_cancellable(body.to_vec(), || check().is_ok())
+                .map_err(|_| RepositoryError::Corrupt)?;
+            check()?;
+            if legacy.native_json.is_none() {
+                return Err(RepositoryError::Corrupt);
+            }
+            Ok(None)
+        }
+        Err(_) => Err(RepositoryError::Corrupt),
+    }
+}
+
+/// AEAD каждой строки не доказывает полноту набора. Original задаёт точный
+/// multiset вида/ordinal/identity; historical favourites проверяются отдельно.
+fn validate_composition(
+    connection: &Connection,
+    key: &[u8; 32],
+    db: &[u8; 32],
+    source: i64,
+    generation: i64,
+    revision: i64,
+    check: &impl Fn() -> Result<()>,
+) -> Result<Option<ProfileImportReport>> {
+    let report = original_report(connection, key, db, source, generation, revision, check)?;
+    let mut expected = HashMap::new();
+    let mut servers = std::collections::HashSet::new();
+    if let Some(report) = &report {
+        for (ordinal, entry) in report.entries.iter().enumerate() {
+            check()?;
+            match entry {
+                ProfileEntry::Xray(profile) => {
+                    expected.insert((true, ordinal), identity(key, db, source, profile)?);
+                }
+                ProfileEntry::Server(server) => {
+                    let fp = super::fingerprint(key, db, source, server)?;
+                    if servers.insert(fp.clone()) {
+                        expected.insert((false, ordinal), fp);
+                    }
+                }
+            }
+        }
+    }
+    for native in [false, true] {
+        for row in projection_rows(connection, source, native)? {
+            check()?;
+            super::validate_profile_snapshot(&row, generation, revision)?;
+            if native {
+                open(key, db, &row)?;
+            } else {
+                open_profile(key, db, &row)?;
+            }
+            if row.present
+                && expected.remove(&(native, row.ordinal)).as_ref() != Some(&row.fingerprint)
+            {
+                return Err(RepositoryError::Corrupt);
+            }
+        }
+    }
+    check()?;
+    if !expected.is_empty() {
+        return Err(RepositoryError::Corrupt);
+    }
+    Ok(report)
 }
 
 impl EncryptedSubscriptionRepository {
@@ -454,7 +562,9 @@ impl EncryptedSubscriptionRepository {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(storage)?;
-            let (g, r, _, _) = ensure_catalog(&tx, &db.key, &db.id, token.source)?;
+            let mut report = None;
+            let (g, r, _, _) =
+                super::ensure_catalog_report(&tx, &db.key, &db.id, token.source, &mut report)?;
             let sg: i64 = tx
                 .query_row(
                     "SELECT generation FROM sources WHERE id=?1",
@@ -485,25 +595,11 @@ impl EncryptedSubscriptionRepository {
             if row.fingerprint != token.fingerprint {
                 return Err(RepositoryError::Conflict);
             }
-            let encrypted: Vec<u8> = tx
-                .query_row(
-                    "SELECT body FROM snapshots WHERE source_id=?1",
-                    [token.source],
-                    |r| bounded_blob(r, 0, BODY_LIMIT + 40),
-                )
-                .map_err(storage)?;
-            let body = decrypt(
-                &db.key,
-                &db.id,
-                2,
-                token.source,
-                g,
-                r,
-                &encrypted,
-                BODY_LIMIT,
-            )?;
-            let report = yonik_import::import_profiles(body.to_vec())
-                .map_err(|_| RepositoryError::Corrupt)?;
+            let report = match report {
+                Some(report) => report,
+                None => original_report(&tx, &db.key, &db.id, token.source, g, r, &|| Ok(()))?
+                    .ok_or(RepositoryError::Corrupt)?,
+            };
             let entry = report
                 .entries
                 .into_iter()
@@ -712,7 +808,9 @@ pub(super) fn validate_backup(
         return Err(RepositoryError::Corrupt);
     }
     let mut stmt = connection
-        .prepare("SELECT DISTINCT source_id FROM native_profiles")
+        .prepare(
+            "SELECT source_id FROM profile_projection UNION SELECT source_id FROM native_profiles",
+        )
         .map_err(storage)?;
     let sources = stmt
         .query_map([], |r| r.get::<_, i64>(0))
@@ -727,11 +825,7 @@ pub(super) fn validate_backup(
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(|_| RepositoryError::Corrupt)?;
-        for row in rows(connection, source)? {
-            control.check()?;
-            super::validate_profile_snapshot(&row, g, r)?;
-            open(key, db, &row)?;
-        }
+        validate_composition(connection, key, db, source, g, r, &|| control.check())?;
     }
     Ok(())
 }

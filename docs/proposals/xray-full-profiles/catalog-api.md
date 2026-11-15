@@ -29,8 +29,9 @@ favorite, available, requires_reselection. У полного профиля не
 snapshot_generation, snapshot_revision }`. Token связывает source, вид,
 fingerprint и все поколения страницы. Устаревший token даёт Conflict,
 недоступное избранное — NotFound. Для повторного выбора получить новую страницу.
-Внутри одной транзакции snapshot расшифровывается и разбирается один раз;
-fingerprint выбранного ordinal проверяется до выдачи entry.
+В current-path одной транзакции original расшифровывается и разбирается один
+раз общим composition verifier; resolve использует тот же report.
+Fingerprint выбранного ordinal проверяется до выдачи entry.
 
 `set_catalog_favorite(selection, bool)` работает с обоими видами и проверяет
 CAS. Для недоступной historical записи false удаляет её; true не делает её
@@ -104,6 +105,24 @@ Backup/restore сохраняет старые schema/AEAD проверки и �
 точный DDL парной native-проекции, multiset-схему, counts, source/snapshot
 координаты, sequence и каждый native ciphertext, включая historical favorite.
 Неизвестные таблицы рядом с v2-проекцией отклоняются.
+
+Незашифрованные marker/count не доказывают полноту набора. Для current catalog,
+resolve и backup состав live-строк сверяется с authenticated original snapshot:
+точные вид, ordinal и keyed fingerprint, с сохранением multiplicity roots и
+прежнего URI dedup. Missing/extra/replaced строки, включая повтор ordinal у
+одинаковых roots, дают `RepositoryError::Corrupt`. Источники с одним marker и
+нулём оставшихся строк тоже проверяются. Historical favourites проходят AEAD
+и остаются недоступными; от них не требуется соответствие текущему original.
+Verifier разбирает original один раз на source, работает с bounded P1 report
+и hash maps, проверяет отмену между записями. Поиск по snapshot для каждой
+строки не выполняется. Отсутствующая старая проекция по-прежнему перестраивается
+атомарно; повреждённая current-проекция не принимается за полный каталог.
+
+Format4/5 admission сравнивает presence и все столбцы `native_profiles`
+(порядок id) и `profile_projection` (порядок source_id) между live и closed
+backup, в рамках общего byte budget. Изменение только ciphertext избранного
+после backup даёт Conflict с rollback версии/новой записи; нужен свежий backup.
+Существующие cancellation и cleanup/Unknown гарантии admission не меняются.
 
 ## Границы проверки
 

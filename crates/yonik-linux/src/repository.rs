@@ -2240,6 +2240,16 @@ fn ensure_catalog(
     db: &[u8; 32],
     source: i64,
 ) -> Result<(i64, i64, usize, usize)> {
+    ensure_catalog_report(tx, key, db, source, &mut None)
+}
+fn ensure_catalog_report(
+    tx: &rusqlite::Transaction<'_>,
+    key: &[u8; 32],
+    db: &[u8; 32],
+    source: i64,
+    report: &mut Option<yonik_import::ProfileImportReport>,
+) -> Result<(i64, i64, usize, usize)> {
+    *report = None;
     let snapshot: Option<(i64, i64)> = tx
         .query_row(
             "SELECT source_generation,revision FROM snapshots WHERE source_id=?1",
@@ -2262,7 +2272,7 @@ fn ensure_catalog(
         }
         if value.0 == generation
             && value.1 == revision
-            && native_profiles::is_current(tx, source, generation, revision)?
+            && native_profiles::is_current(tx, key, db, source, generation, revision, report)?
         {
             return Ok(value);
         }
@@ -2413,7 +2423,9 @@ impl EncryptedSubscriptionRepository {
                 .optional()
                 .map_err(storage)?
                 .ok_or(RepositoryError::NotFound)?;
-            let (generation, revision, _, _) = ensure_catalog(&tx, &db.key, &db.id, source)?;
+            let mut report = None;
+            let (generation, revision, _, _) =
+                ensure_catalog_report(&tx, &db.key, &db.id, source, &mut report)?;
             if revision != expected_snapshot_revision {
                 return Err(RepositoryError::Conflict);
             }
@@ -2426,23 +2438,28 @@ impl EncryptedSubscriptionRepository {
                 return Err(RepositoryError::NotFound);
             }
             validate_profile_snapshot(&r, generation, revision)?;
-            let body: Vec<u8> = tx
-                .query_row(
-                    "SELECT body FROM snapshots WHERE source_id=?1",
-                    [source],
-                    |r| bounded_blob(r, 0, BODY_LIMIT + 40),
-                )
-                .map_err(storage)?;
-            let body = decrypt(
-                &db.key, &db.id, 2, source, generation, revision, &body, BODY_LIMIT,
-            )?;
-            let report =
-                yonik_import::import_bytes(body.to_vec()).map_err(|_| RepositoryError::Corrupt)?;
-            let server = report
-                .servers
-                .get(p.ordinal)
-                .ok_or(RepositoryError::Corrupt)?;
-            if fingerprint(&db.key, &db.id, source, server)? != r.fingerprint {
+            let report = match report {
+                Some(report) => report,
+                None => native_profiles::original_report(
+                    &tx,
+                    &db.key,
+                    &db.id,
+                    source,
+                    generation,
+                    revision,
+                    &|| Ok(()),
+                )?
+                .ok_or(RepositoryError::Corrupt)?,
+            };
+            let yonik_import::ProfileEntry::Server(server) = report
+                .entries
+                .into_iter()
+                .nth(p.ordinal)
+                .ok_or(RepositoryError::Corrupt)?
+            else {
+                return Err(RepositoryError::Corrupt);
+            };
+            if fingerprint(&db.key, &db.id, source, &server)? != r.fingerprint {
                 return Err(RepositoryError::Corrupt);
             }
             let source_generation = tx
@@ -2452,11 +2469,6 @@ impl EncryptedSubscriptionRepository {
                     |r| r.get(0),
                 )
                 .map_err(storage)?;
-            let server = report
-                .servers
-                .into_iter()
-                .nth(p.ordinal)
-                .ok_or(RepositoryError::Corrupt)?;
             tx.commit().map_err(storage)?;
             Ok(ResolvedProfile {
                 profile: p,

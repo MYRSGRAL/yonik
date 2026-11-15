@@ -796,6 +796,8 @@ fn admit_format(
         ("snapshots", "source_id"),
         ("profile_catalog", "source_id"),
         ("profiles", "id"),
+        ("native_profiles", "id"),
+        ("profile_projection", "source_id"),
         ("source_sequence", "singleton"),
         ("sqlite_sequence", "name"),
         ("routing_draft", "singleton"),

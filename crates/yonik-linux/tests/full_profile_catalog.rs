@@ -549,3 +549,255 @@ async fn failed_refresh_preserves_native_snapshot_and_selection_without_transpor
     service.close().await.expect("service close");
     repo.close().await.expect("close");
 }
+
+async fn correction_missing_native_rows(all: bool, backup: bool) {
+    let dir = Directory::new();
+    let repo = dir.open().await;
+    let source = repo.create_source(vec![]).await.expect("source").id;
+    let body = include_str!("../../../tests/fixtures/xray-full-profile-seven.json");
+    save(&repo, source, 0, body).await;
+    let selection = page(&repo, source).await.profiles[0].1.clone();
+    repo.close().await.expect("close");
+    let connection = rusqlite::Connection::open(dir.database()).expect("fixture");
+    connection
+        .execute(
+            if all {
+                "DELETE FROM native_profiles WHERE source_id=?1"
+            } else {
+                "DELETE FROM native_profiles WHERE source_id=?1 AND ordinal=6"
+            },
+            [source],
+        )
+        .expect("delete fixture rows");
+    connection
+        .execute(
+            "UPDATE profile_projection SET native_count=?1 WHERE source_id=?2",
+            rusqlite::params![if all { 0 } else { 6 }, source],
+        )
+        .expect("coherent untrusted count");
+    drop(connection);
+    if backup {
+        let result = EncryptedSubscriptionRepository::backup_closed(
+            dir.database(),
+            dir.0.join("incomplete.sqlite"),
+            Zeroizing::new([84; 32]),
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err(RepositoryError::Corrupt),
+            "backup не должен принимать неполный состав original"
+        );
+        assert!(!dir.0.join("incomplete.sqlite").exists());
+    } else {
+        let repo = dir.open().await;
+        let catalog_error = repo.catalog(source, ProfileQuery::default()).await.err();
+        let resolve_error = repo.resolve_catalog(selection).await.err();
+        repo.close().await.expect("close");
+        assert_eq!(
+            catalog_error,
+            Some(RepositoryError::Corrupt),
+            "count не доказывает состав"
+        );
+        assert_eq!(
+            resolve_error,
+            Some(RepositoryError::Corrupt),
+            "resolve также проверяет весь состав"
+        );
+    }
+}
+#[tokio::test]
+async fn correction_missing_one_catalog() {
+    correction_missing_native_rows(false, false).await;
+}
+#[tokio::test]
+async fn correction_missing_all_catalog() {
+    correction_missing_native_rows(true, false).await;
+}
+#[tokio::test]
+async fn correction_missing_one_backup() {
+    correction_missing_native_rows(false, true).await;
+}
+#[tokio::test]
+async fn correction_missing_all_backup() {
+    correction_missing_native_rows(true, true).await;
+}
+
+async fn correction_admission_favorite(target: u8) {
+    let dir = Directory::new();
+    let repo = dir.open().await;
+    let source = repo.create_source(vec![]).await.expect("source").id;
+    save(
+        &repo,
+        source,
+        0,
+        include_str!("../../../tests/fixtures/xray-full-profile-seven.json"),
+    )
+    .await;
+    repo.routing_draft().await.expect("create routing table");
+    repo.close().await.expect("close");
+    let old = dir.0.join("old.sqlite");
+    EncryptedSubscriptionRepository::backup_closed(
+        dir.database(),
+        old.clone(),
+        Zeroizing::new([84; 32]),
+    )
+    .await
+    .expect("closed backup");
+    let repo = dir.open().await;
+    let selection = page(&repo, source).await.profiles[0].1.clone();
+    repo.set_catalog_favorite(selection, true)
+        .await
+        .expect("only live favorite changes");
+    let payload = format!("{{\"version\":{}}}", target - 2).into_bytes();
+    let result = if target == 4 {
+        repo.save_routing_draft_v2(0, payload.clone(), Some(old))
+            .await
+    } else {
+        repo.save_routing_draft_v3(0, payload.clone(), Some(old))
+            .await
+    };
+    let version: i64 = rusqlite::Connection::open(dir.database())
+        .expect("fixture")
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("version");
+    let favorite =
+        matches!(&page(&repo,source).await.profiles[0].0,CatalogProfile::Xray(p) if p.favorite);
+    repo.close().await.expect("close");
+    assert_eq!(
+        result,
+        Err(RepositoryError::Conflict),
+        "старый backup не содержит новое избранное"
+    );
+    assert_eq!(version, 3);
+    assert!(favorite);
+    assert!(repo_draft_absent(&dir).await);
+    let fresh = dir.0.join("fresh.sqlite");
+    EncryptedSubscriptionRepository::backup_closed(
+        dir.database(),
+        fresh.clone(),
+        Zeroizing::new([84; 32]),
+    )
+    .await
+    .expect("fresh backup");
+    let repo = dir.open().await;
+    let result = if target == 4 {
+        repo.save_routing_draft_v2(0, payload, Some(fresh)).await
+    } else {
+        repo.save_routing_draft_v3(0, payload, Some(fresh)).await
+    };
+    assert_eq!(result, Ok(1));
+    assert!(
+        matches!(&page(&repo,source).await.profiles[0].0,CatalogProfile::Xray(p) if p.favorite)
+    );
+    repo.close().await.expect("close");
+}
+#[tokio::test]
+async fn correction_admission_favorite_format4() {
+    correction_admission_favorite(4).await;
+}
+#[tokio::test]
+async fn correction_admission_favorite_format5() {
+    correction_admission_favorite(5).await;
+}
+
+async fn repo_draft_absent(dir: &Directory) -> bool {
+    let repo = dir.open().await;
+    let absent = repo.routing_draft().await.expect("routing state").is_none();
+    repo.close().await.expect("close");
+    absent
+}
+
+async fn correction_valid_aead_composition(mutation: &str) {
+    use chacha20poly1305::{
+        XChaCha20Poly1305, XNonce,
+        aead::{Aead, KeyInit, Payload},
+    };
+    let dir = Directory::new();
+    let repo = dir.open().await;
+    let source = repo.create_source(vec![]).await.expect("source").id;
+    // Совпадающие identity требуют проверки multiplicity и ordinal, а не set(fp).
+    let body = format!("[{},{}]", root("a", "1"), root("b", "1"));
+    save(&repo, source, 0, &body).await;
+    repo.close().await.expect("close");
+    let c = rusqlite::Connection::open(dir.database()).expect("fixture");
+    let (mut id, mut fp, mut ordinal): (i64, Vec<u8>, i64) = c
+        .query_row(
+            "SELECT id,fingerprint,ordinal FROM native_profiles WHERE source_id=?1 AND ordinal=1",
+            [source],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("last row");
+    match mutation {
+        "extra" => id += 1,
+        "replaced" => fp = vec![91; 32],
+        "ordinal" => ordinal = 0,
+        _ => panic!("unknown fixture mutation"),
+    }
+    let mut aad: Vec<u8> = c
+        .query_row("SELECT id FROM repository", [], |r| r.get(0))
+        .expect("database id");
+    aad.push(5);
+    for value in [id, 1, 1, source] {
+        aad.extend_from_slice(&value.to_le_bytes());
+    }
+    aad.extend_from_slice(&fp);
+    aad.extend_from_slice(&(ordinal as u64).to_le_bytes());
+    aad.push(1);
+    aad.extend_from_slice(b"\0native-xray-projection-v2");
+    let nonce = [41; 24];
+    let plain = serde_json::to_vec(&(2u8, "composition-fixture", false)).expect("payload");
+    let encrypted = XChaCha20Poly1305::new((&[84u8; 32]).into())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &plain,
+                aad: &aad,
+            },
+        )
+        .expect("valid fixture AEAD");
+    let mut payload = nonce.to_vec();
+    payload.extend(encrypted);
+    if mutation == "extra" {
+        c.execute("INSERT INTO native_profiles(id,source_id,fingerprint,generation,revision,ordinal,present,payload) VALUES (?1,?2,?3,1,1,?4,1,?5)",rusqlite::params![id,source,fp,ordinal,payload]).expect("extra valid ciphertext");
+        c.execute(
+            "UPDATE profile_projection SET native_count=3 WHERE source_id=?1",
+            [source],
+        )
+        .expect("coherent count");
+    } else {
+        c.execute(
+            "UPDATE native_profiles SET fingerprint=?1,ordinal=?2,payload=?3 WHERE id=?4",
+            rusqlite::params![fp, ordinal, payload, id],
+        )
+        .expect("replace valid ciphertext");
+    }
+    drop(c);
+    assert_eq!(
+        EncryptedSubscriptionRepository::backup_closed(
+            dir.database(),
+            dir.0.join("invalid-composition.sqlite"),
+            Zeroizing::new([84; 32])
+        )
+        .await,
+        Err(RepositoryError::Corrupt)
+    );
+    let repo = dir.open().await;
+    assert_eq!(
+        repo.catalog(source, ProfileQuery::default()).await.err(),
+        Some(RepositoryError::Corrupt)
+    );
+    repo.close().await.expect("close");
+}
+#[tokio::test]
+async fn correction_extra_live_entry_with_valid_aead() {
+    correction_valid_aead_composition("extra").await;
+}
+#[tokio::test]
+async fn correction_replaced_identity_with_valid_aead() {
+    correction_valid_aead_composition("replaced").await;
+}
+#[tokio::test]
+async fn correction_duplicate_ordinal_with_valid_aead() {
+    correction_valid_aead_composition("ordinal").await;
+}
