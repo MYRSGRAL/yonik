@@ -30,10 +30,12 @@ p4_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa92
 p4_partial_candidate: 6acfecb459a9d60c59a6cb794c89ea0b578965ff
 p4_issuer_proposal: 57f929683feb959ad87fd5e503acf3ee1932df0a
 p4_design_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A957fec20-7af1-463b-abd0-6e5975f32de5
+p4_design_correction_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A6cd9109e-9343-4dd0-b30d-20a1013cba79
 p4_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3Ac77cd132-0611-4814-b7e3-9bcb3da5f8b8
 p5_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A391a88b9-8afd-4ac6-ab7a-4e7c426ea289
 p45_base: 7d9ae80eb3977aa0c0b8766830b9de84346e5874
 p5_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A5e964ab1-96ea-4896-936e-19056eb05df7
+p5_partial_candidate: 13f89190331c36266e8eae973b5cc059893f2457
 p3_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A5434d2cc-828c-4b95-9bca-caa3d24f6c63
 p3_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3Ac73e19e2-1c96-4434-a0a5-2023682cf7b6
 localdns_go_scope: approved
@@ -264,6 +266,18 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   отличие owner proof от action grant, конкретные System Rust issuer callsites.
   Новых product/build/runtime изменений в этой подзадаче нет. P5 продолжает
   независимую scoped Rust работу; P4 candidate пока не интегрирован.
+- R4 feasibility: отдельный carrier возможен без frozen ABI260/dependencies,
+  но revision1 не implementation-ready. Local не требует новой privileged
+  boundary: existing normal Host + private child/config-bound channel,
+  без OS attribution и с trusted required=false. System сохраняет owner-required
+  invariant и один сериализованный backend. Нужны конкретные sideband custody,
+  typed body/state/replay/cancel/DNS contracts. Автор P4 исправляет дизайн;
+  дополнительный Go/Rust implementation scope пока не разрешён.
+- P5 13f8919 — partial numeric multi-egress/revalidation и exact compiler-result
+  retention; 27 pure tests/clippy/fmt по author evidence. Typed IPC, production
+  custody и SessionArtifact dispatch ещё отсутствуют. Та же P5 продолжена для
+  этих независимых scoped частей с native availability=false до carrier admission.
+  P4/P5 gates не закрыты; эти candidates не интегрированы.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
