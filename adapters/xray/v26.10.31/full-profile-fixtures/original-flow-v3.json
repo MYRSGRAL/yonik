@@ -1,0 +1,23 @@
+{
+  "contract": "R8 root: local=original initiator, remote=actual ingress; tuple40 big endian unchanged",
+  "rows": [
+    {
+      "name": "accepted-tcp",
+      "provenance": 2,
+      "ownedIngressPort": 1080,
+      "initiatorPort": 12000,
+      "actualIngressPort": 1080,
+      "tupleHex": "060400002ee00438c000020a0000000000000000000000007f000001000000000000000000000000",
+      "issuerRequirement": "exact owned TCP remote_port match"
+    },
+    {
+      "name": "associated-udp",
+      "provenance": 3,
+      "ownedIngressPort": 1080,
+      "initiatorPort": 12001,
+      "actualIngressPort": 49152,
+      "tupleHex": "110400002ee1c000c000020a0000000000000000000000007f000001000000000000000000000000",
+      "issuerRequirement": "retained actual UDP association binding; otherwise Unsupported; never TCP owner proof"
+    }
+  ]
+}
