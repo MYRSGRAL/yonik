@@ -5,6 +5,7 @@ mod identity;
 mod intent;
 mod json;
 mod model;
+mod native_profile;
 mod singbox;
 mod uri;
 mod xray;
@@ -14,6 +15,9 @@ pub use intent::{IntentError, ServerIntent};
 pub use model::{
     Credentials, Endpoint, FatalError, Field, ImportFailure, ImportReport, Issue, IssueCode,
     ParsedServer, Protocol, ReviewFlag, SecretText, Security, Transport,
+};
+pub use native_profile::{
+    NativeProfile, ProfileEngine, ProfileEntry, ProfileImportReport, import_profiles,
 };
 use std::io::Read;
 
