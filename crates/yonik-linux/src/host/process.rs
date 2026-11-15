@@ -80,7 +80,29 @@ pub(crate) async fn verify_version(
 }
 
 pub(crate) fn spawn(binary: &BinarySnapshot, checking: bool) -> Result<Child, HostError> {
+    spawn_profile(binary, checking, None, None)
+}
+pub(crate) fn spawn_profile(
+    binary: &BinarySnapshot,
+    checking: bool,
+    profile: Option<&super::local_profile_channel::Launch>,
+    assets: Option<&std::path::Path>,
+) -> Result<Child, HostError> {
     let mut command = binary.command();
+    if let Some(profile) = profile {
+        if checking {
+            return Err(HostError::ConfigRejected);
+        }
+        profile.configure(&mut command)?;
+    } else if let Some(assets) = assets {
+        if !checking {
+            return Err(HostError::ConfigRejected);
+        }
+        command
+            .env_clear()
+            .env("LANG", "C")
+            .env("XRAY_LOCATION_ASSET", assets);
+    }
     match binary.engine {
         Engine::Xray => {
             command.arg("run");
@@ -128,8 +150,16 @@ pub(crate) async fn config_check(
     bytes: &[u8],
     cancel: &mut Cancellation,
 ) -> Result<(), HostError> {
+    config_check_assets(binary, bytes, None, cancel).await
+}
+pub(crate) async fn config_check_assets(
+    binary: &BinarySnapshot,
+    bytes: &[u8],
+    assets: Option<&std::path::Path>,
+    cancel: &mut Cancellation,
+) -> Result<(), HostError> {
     cancel.check()?;
-    let mut child = spawn(binary, true)?;
+    let mut child = spawn_profile(binary, true, None, assets)?;
     let operation = async {
         #[cfg(feature = "test-support")]
         cancel.lifecycle_reach(super::LifecycleStage::Validate, child.id().ok_or(HostError::Process)?).await?;

@@ -1,7 +1,7 @@
 //! Системная сессия использует тот же backend и тот же durable journal, что и
 //! public protection. Accepted worker не доказывает готовность TCP/UDP/DNS.
 use super::{
-    ARPHRD_ETHER, Backend, GuardArtifact, IFF_LOOPBACK, IFF_UP, Journal, Ownership,
+    ARPHRD_ETHER, Backend, GuardArtifact, IFF_LOOPBACK, IFF_UP, IpPrefix, Journal, Ownership,
     PreparedContext, ProtectionState, PublicBlockPolicy, PublicPolicyRecovery, ServiceError,
     compile_protection, stale, unavailable,
 };
@@ -340,33 +340,123 @@ struct BundleCompile {
     native_pin: [u8; 32],
 }
 pub(super) struct SessionArtifact {
+    invalid: std::sync::atomic::AtomicBool,
+    installed: Option<crate::helper::native_profile::VerifiedStaticInstalledImage>,
+    full_profile: Option<Arc<crate::helper::profile_intent::PreparedFullProfile>>,
+    routes: Vec<ProfileRoute>,
+    owner: Ownership,
     pub(super) bundle: Option<crate::helper::service::BundleDigests>,
     pub(super) payload: Arc<WorkerPayload>,
     plan: SessionNetworkPlan,
     baseline: LinuxTopology,
     baseline_capture: TopologyCapture,
-    route: KernelRoute,
-    route_capture: RouteCapture,
     context: PreparedContext,
     uid: u32,
     worker_uid: u32,
     kill_switch: bool,
     attribution_required: bool,
     peer: Option<Arc<crate::attribution::PeerProcess>>,
+    memory: ByteLease,
+    native_owner_stamp: Option<native_owner::NativeArtifactStamp>,
+}
+#[derive(Clone)]
+struct ProfileRoute {
+    dns: bool,
     endpoint: IpAddr,
     port: u16,
     protocol: crate::TransportProtocol,
-    memory: ByteLease,
-    native_owner_stamp: Option<native_owner::NativeArtifactStamp>,
+    route: KernelRoute,
+    capture: RouteCapture,
 }
 impl SessionArtifact {
     pub(super) fn retained_bytes(&self) -> usize {
         self.payload.retained_bytes() + self.memory.bytes()
     }
-    fn query(&self) -> RouteQuery {
-        RouteQuery::new(self.endpoint, self.worker_uid)
+    fn query(&self, route: &ProfileRoute) -> RouteQuery {
+        RouteQuery::new(route.endpoint, self.worker_uid)
             .with_mark(self.plan.socket_mark())
-            .with_transport(self.protocol, None, Some(self.port))
+            .with_transport(route.protocol, None, Some(route.port))
+    }
+    async fn revalidate_routes(
+        &self,
+        cancel: &mut Cancellation,
+        own_index: Option<u32>,
+    ) -> Result<
+        (
+            Vec<crate::managed_network::firewall::BoundTransport>,
+            Vec<crate::managed_network::firewall::BoundTransport>,
+        ),
+        ServiceError,
+    > {
+        use std::sync::atomic::Ordering;
+        if self.invalid.load(Ordering::Acquire) {
+            return Err(stale());
+        }
+        let result = self.capture_routes(cancel, own_index).await;
+        if result.is_err() {
+            self.invalid.store(true, Ordering::Release);
+        }
+        result
+    }
+    async fn capture_routes(
+        &self,
+        cancel: &mut Cancellation,
+        own_index: Option<u32>,
+    ) -> Result<
+        (
+            Vec<crate::managed_network::firewall::BoundTransport>,
+            Vec<crate::managed_network::firewall::BoundTransport>,
+        ),
+        ServiceError,
+    > {
+        if let Some(installed) = &self.installed {
+            installed
+                .revalidate()
+                .map_err(|_| ServiceError::Unsupported)?;
+        }
+        if let Some(profile) = &self.full_profile {
+            profile.revalidate(cancel).map_err(unavailable)?;
+        }
+        let mut transports = Vec::with_capacity(self.routes.len());
+        let mut dns = Vec::new();
+        for captured in &self.routes {
+            let (route, stamp) = lookup_route_captured(self.query(captured), cancel, DEADLINE)
+                .await
+                .map_err(unavailable)?;
+            let index = checked_route(&route, self.owner, self.plan.routing_table())?;
+            if own_index == Some(index)
+                || !same_captured_kernel_route(
+                    &captured.route,
+                    &route,
+                    Some((captured.capture, stamp)),
+                )
+            {
+                return Err(stale());
+            }
+            let protocol = match captured.protocol {
+                crate::TransportProtocol::Tcp => {
+                    crate::managed_network::firewall::TransportProtocol::Tcp
+                }
+                crate::TransportProtocol::Udp => {
+                    crate::managed_network::firewall::TransportProtocol::Udp
+                }
+            };
+            let bound = crate::managed_network::firewall::BoundTransport::new(
+                captured.endpoint,
+                protocol,
+                captured.port,
+                index,
+                self.worker_uid,
+                self.plan.socket_mark(),
+            )
+            .map_err(unavailable)?;
+            if captured.dns {
+                dns.push(bound);
+            } else {
+                transports.push(bound);
+            }
+        }
+        Ok((transports, dns))
     }
 }
 pub(super) struct HelperTunCustody {
@@ -378,6 +468,294 @@ pub(super) struct ActiveSession {
     index: u32,
     link: LinuxLink,
     _exit_watch: SafetyTask,
+}
+
+/// Sideband использует тот же serial backend и durable journal. Отдельного
+/// executor/owner состояния рядом с SystemProtectionHost не создаётся.
+pub(super) struct ProfileRoutes {
+    backend: std::sync::Weak<Mutex<Backend>>,
+    runtime: tokio::runtime::Handle,
+    base: Option<PublicBlockPolicy>,
+    revision: Option<u64>,
+    dynamic: std::collections::BTreeMap<
+        crate::managed_network::firewall::BoundTransport,
+        (ProfileRoute, u16),
+    >,
+    tickets: std::collections::BTreeMap<u64, crate::managed_network::firewall::BoundTransport>,
+    next: u64,
+    unknown: bool,
+    _credit: ByteLease,
+}
+impl ProfileRoutes {
+    pub(super) fn new(
+        backend: std::sync::Weak<Mutex<Backend>>,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, ServiceError> {
+        Ok(Self {
+            backend,
+            runtime,
+            base: None,
+            revision: None,
+            dynamic: std::collections::BTreeMap::new(),
+            tickets: std::collections::BTreeMap::new(),
+            next: 0,
+            unknown: false,
+            _credit: config_budget().reserve(384 * 1024).map_err(unavailable)?,
+        })
+    }
+    fn stable(backend: &Backend) -> Result<(u64, PublicBlockPolicy), ServiceError> {
+        let record = backend
+            .journal
+            .as_ref()
+            .and_then(Journal::public_policy)
+            .ok_or(ServiceError::Unavailable)?;
+        let crate::managed_network::PublicPolicyPhase::Stable { policy } = record.phase() else {
+            return Err(ServiceError::Unavailable);
+        };
+        Ok((record.revision(), policy.clone()))
+    }
+    async fn fence(
+        &mut self,
+        backend: &mut Backend,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        cancel: &mut Cancellation,
+    ) -> Result<Arc<SessionArtifact>, ServiceError> {
+        if self.unknown {
+            return Err(ServiceError::Unavailable);
+        }
+        scope.validate().map_err(unavailable)?;
+        let active = backend.active.as_ref().ok_or(ServiceError::Unavailable)?;
+        let artifact = Arc::clone(&active.artifact);
+        let profile = artifact
+            .full_profile
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?;
+        if scope.context().5 != *profile.retained().digest() {
+            return Err(stale());
+        }
+        backend.verify_session(cancel).await?;
+        let (revision, policy) = Self::stable(backend)?;
+        if self.revision.is_some_and(|expected| expected != revision) {
+            return Err(stale());
+        }
+        if self.base.is_none() {
+            self.base = Some(policy);
+            self.revision = Some(revision);
+        }
+        for (captured, _) in self.dynamic.values() {
+            let (route, stamp) = lookup_route_captured(artifact.query(captured), cancel, DEADLINE)
+                .await
+                .map_err(unavailable)?;
+            if !same_captured_kernel_route(&captured.route, &route, Some((captured.capture, stamp)))
+            {
+                return Err(stale());
+            }
+        }
+        scope.validate().map_err(unavailable)?;
+        Ok(artifact)
+    }
+    async fn replace(
+        &mut self,
+        backend: &mut Backend,
+        artifact: &SessionArtifact,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        omit: Option<crate::managed_network::firewall::BoundTransport>,
+    ) -> Result<(), ServiceError> {
+        let transports = self
+            .dynamic
+            .keys()
+            .filter(|bound| Some(**bound) != omit)
+            .copied()
+            .collect::<Vec<_>>();
+        let policy = self
+            .base
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .with_additional_transport(&transports)
+            .map_err(unavailable)?;
+        // Candidate остаётся в map при Unknown; journal записывает desired до nft.
+        backend.worker_uncertain = true;
+        backend.policy(artifact.owner, policy).await?;
+        let (revision, _) = Self::stable(backend)?;
+        self.revision = Some(revision);
+        let (_keep, mut cancel) = fresh_cancel();
+        backend.verify_session(&mut cancel).await?;
+        scope.validate().map_err(unavailable)?;
+        backend.worker_uncertain = false;
+        Ok(())
+    }
+}
+impl crate::helper::native_profile_channel::RouteAuthority for ProfileRoutes {
+    fn check(
+        &mut self,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        request: crate::helper::native_profile_channel::RouteRequest<'_>,
+        proof: &crate::attribution::native_session::KnownOwnerProof,
+        source: u64,
+        flow: crate::attribution::broker::Flow,
+    ) -> Result<Option<u64>, ServiceError> {
+        proof.checked(scope, source, flow).map_err(unavailable)?;
+        let shared = self.backend.upgrade().ok_or(ServiceError::Unavailable)?;
+        let mut backend = shared.try_lock().map_err(unavailable)?;
+        proof.checked(scope, source, flow).map_err(unavailable)?;
+        let runtime = self.runtime.clone();
+        let result = runtime.block_on(async {
+            let (_keep, mut cancel) = fresh_cancel();
+            let artifact = self.fence(&mut backend, scope, &mut cancel).await?;
+            use crate::helper::native_profile_channel::RouteRequest;
+            let (destination, dns, dynamic) = match request {
+                RouteRequest::Chain => return Ok(None),
+                RouteRequest::Static(d) => (d, false, false),
+                RouteRequest::Dns(d) => (d, true, false),
+                RouteRequest::Direct(d) => (d, false, true),
+            };
+            let endpoint = match destination.family {
+                4 if destination.bytes.len() == 4 => IpAddr::V4(std::net::Ipv4Addr::from(
+                    <[u8; 4]>::try_from(destination.bytes).map_err(unavailable)?,
+                )),
+                6 if destination.bytes.len() == 16 => IpAddr::V6(std::net::Ipv6Addr::from(
+                    <[u8; 16]>::try_from(destination.bytes).map_err(unavailable)?,
+                )),
+                _ => return Err(ServiceError::Unsupported),
+            };
+            let protocol = match destination.protocol {
+                6 => crate::TransportProtocol::Tcp,
+                17 => crate::TransportProtocol::Udp,
+                _ => return Err(ServiceError::InvalidRequest),
+            };
+            if !dynamic {
+                if !artifact.routes.iter().any(|r| {
+                    r.endpoint == endpoint
+                        && r.port == destination.port
+                        && r.protocol == protocol
+                        && r.dns == dns
+                }) {
+                    return Err(ServiceError::Unavailable);
+                }
+                return Ok(None);
+            }
+            if self.tickets.len() >= 4096 {
+                return Err(ServiceError::Busy);
+            }
+            let query = RouteQuery::new(endpoint, artifact.worker_uid)
+                .with_mark(artifact.plan.socket_mark())
+                .with_transport(protocol, None, Some(destination.port));
+            let (route, capture) = lookup_route_captured(query, &mut cancel, DEADLINE)
+                .await
+                .map_err(unavailable)?;
+            let index = checked_route(&route, artifact.owner, artifact.plan.routing_table())?;
+                if endpoint.is_unspecified() || endpoint.is_loopback() || endpoint.is_multicast()
+                    || matches!(endpoint,IpAddr::V4(ip) if ip.is_link_local() || ip.is_broadcast())
+                    || matches!(endpoint,IpAddr::V6(ip) if ip.is_unicast_link_local() || ip.to_ipv4_mapped().is_some())
+                    || artifact.baseline.links.iter().any(|link|link.index==index && matches!(link.kind.as_deref(),Some(b"tun"|b"wireguard")))
+                {return Err(ServiceError::Unsupported);}
+                let base=self.base.as_ref().ok_or(ServiceError::Unavailable)?;
+                if artifact.baseline.routes.iter().any(|route|route.destination.length>0 && route.gateway.is_none() && route.output_interface==Some(index) && IpPrefix::new(route.destination.address,route.destination.length).is_ok_and(|prefix|prefix.contains(endpoint))) && !base.permits_lan_endpoint(endpoint,index) {return Err(ServiceError::Unsupported);}
+            if backend
+                .active
+                .as_ref()
+                .is_none_or(|active| active.index == index)
+            {
+                return Err(stale());
+            }
+            let bound = crate::managed_network::firewall::BoundTransport::new(
+                endpoint,
+                match protocol {
+                    crate::TransportProtocol::Tcp => {
+                        crate::managed_network::firewall::TransportProtocol::Tcp
+                    }
+                    crate::TransportProtocol::Udp => {
+                        crate::managed_network::firewall::TransportProtocol::Udp
+                    }
+                },
+                destination.port,
+                index,
+                artifact.worker_uid,
+                artifact.plan.socket_mark(),
+            )
+            .map_err(unavailable)?;
+            self.next = self.next.checked_add(1).ok_or(ServiceError::Unavailable)?;
+            let ticket = self.next;
+            if let Some((_, refs)) = self.dynamic.get_mut(&bound) {
+                *refs = refs
+                    .checked_add(1)
+                    .filter(|n| *n <= 4096)
+                    .ok_or(ServiceError::Busy)?;
+                self.tickets.insert(ticket, bound);
+                return Ok(Some(ticket));
+            }
+            if self.dynamic.len() >= 128 {
+                return Err(ServiceError::Busy);
+            }
+            // Проверка общего cap до вставки и до первого kernel effect.
+            let mut extra = self.dynamic.keys().copied().collect::<Vec<_>>();
+            extra.push(bound);
+            self.base
+                .as_ref()
+                .ok_or(ServiceError::Unavailable)?
+                .with_additional_transport(&extra)
+                .map_err(unavailable)?;
+            self.dynamic.insert(
+                bound,
+                (
+                    ProfileRoute {
+                        dns: false,
+                        endpoint,
+                        port: destination.port,
+                        protocol,
+                        route,
+                        capture,
+                    },
+                    1,
+                ),
+            );
+            self.tickets.insert(ticket, bound);
+            self.replace(&mut backend, &artifact, scope, None).await?;
+            Ok(Some(ticket))
+        });
+        if result.is_err() {
+            self.unknown = true;
+            scope.revoke();
+            backend.native_owner.revoke();
+            backend.worker_uncertain = true;
+        }
+        result
+    }
+    fn release(
+        &mut self,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        ticket: u64,
+    ) -> Result<(), ServiceError> {
+        let bound = *self.tickets.get(&ticket).ok_or(ServiceError::Unavailable)?;
+        let shared = self.backend.upgrade().ok_or(ServiceError::Unavailable)?;
+        let mut backend = shared.try_lock().map_err(unavailable)?;
+        let runtime = self.runtime.clone();
+        let result = runtime.block_on(async {
+            let (_keep, mut cancel) = fresh_cancel();
+            let artifact = self.fence(&mut backend, scope, &mut cancel).await?;
+            let (_, refs) = self
+                .dynamic
+                .get_mut(&bound)
+                .ok_or(ServiceError::Unavailable)?;
+            if *refs > 1 {
+                *refs -= 1;
+                self.tickets.remove(&ticket);
+                return Ok(());
+            }
+            self.replace(&mut backend, &artifact, scope, Some(bound))
+                .await?;
+            self.dynamic.remove(&bound);
+            self.tickets.remove(&ticket);
+            Ok(())
+        });
+        if result.is_err() {
+            self.unknown = true;
+            scope.revoke();
+            backend.native_owner.revoke();
+            backend.worker_uncertain = true;
+        }
+        result
+    }
 }
 
 /// Системный UID читается из фиксированного локального файла. NSS, shell и
@@ -501,6 +879,295 @@ fn fresh_cancel() -> (tokio::sync::watch::Sender<bool>, Cancellation) {
 }
 
 impl Backend {
+    pub(super) async fn prepare_full_profile(
+        &mut self,
+        uid: u32,
+        request: crate::helper::profile_intent::FullProfileRequest,
+        cancel: &mut Cancellation,
+    ) -> Result<GuardArtifact, ServiceError> {
+        use yonik_engine::native_profile::{
+            OwnedIngress, OwnedRuntimePlan, TransportProtocol as NativeProtocol,
+        };
+        request.preflight(cancel)?;
+        // Отсутствующий Go grants consumer закрывает вход до listen/check/worker.
+        let _consumer = crate::helper::native_profile_channel::require_consumer()?;
+        let installed = crate::helper::native_bootstrap::load_static_preflight(
+            std::time::Instant::now() + Duration::from_secs(3),
+        )
+        .map_err(|_| ServiceError::Unsupported)?;
+        if self.has_session() || self.worker_uncertain {
+            return Err(ServiceError::Busy);
+        }
+        let peer = Arc::clone(request.peer()?);
+        self.ensure_peer_attestation(Arc::clone(&peer), cancel)
+            .await?;
+        let worker_uid = worker_uid()?;
+        crate::attribution::preflight(true, Some(peer.as_ref()), worker_uid)
+            .await
+            .map_err(|_| ServiceError::Unsupported)?;
+        if worker_uid == uid {
+            return Err(ServiceError::Unsupported);
+        }
+        let graph = request
+            .intent()
+            .validate()
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        let physical = crate::helper::profile_intent::PhysicalRequirements::new(graph.egress())
+            .map_err(unavailable)?;
+        physical
+            .validate_numeric()
+            .map_err(|_| ServiceError::Unsupported)?;
+        let sources = request
+            .capture_sources(cancel)
+            .map_err(|_| ServiceError::Unsupported)?;
+        let owner = self.owner(uid)?;
+        let context = self.context(uid)?;
+        let stamp = self.snapshot()?.stamp;
+        let (baseline, baseline_capture) = read_topology_captured(cancel, DEADLINE)
+            .await
+            .map_err(unavailable)?;
+        let bytes = topology_bytes(&baseline);
+        if bytes > MAX_BASELINE_BYTES {
+            return Err(ServiceError::Unavailable);
+        }
+        let memory = config_budget()
+            .reserve(bytes * 2 + 128 * 1024)
+            .map_err(unavailable)?;
+        let plan =
+            SessionNetworkPlan::reserve_for_engine(owner, &baseline, yonik_engine::Engine::Xray)
+                .map_err(unavailable)?;
+        let local = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(unavailable)?;
+        let probe = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(unavailable)?;
+        let local_port = NonZeroU16::new(local.local_addr().map_err(unavailable)?.port())
+            .ok_or(ServiceError::Unavailable)?;
+        let probe_port = NonZeroU16::new(probe.local_addr().map_err(unavailable)?.port())
+            .ok_or(ServiceError::Unavailable)?;
+        let mut runtime = OwnedRuntimePlan::new(local_port, probe_port)
+            .map_err(unavailable)?
+            .with_system(plan.compiler_tun().map_err(unavailable)?);
+        for ingress in graph.ingresses() {
+            runtime = runtime
+                .map_ingress(ingress.tag(), OwnedIngress::System)
+                .map_err(|_| ServiceError::Unsupported)?;
+        }
+        let (generation, selection) = request.coordinates();
+        // Apply сначала проверяет exact PreparedContext, затем invalidate
+        // увеличивает server epoch ровно один раз. UI generation не policy authority.
+        let policy_revision = self.epoch.checked_add(1).ok_or(ServiceError::Unavailable)?;
+        let prepared = Arc::new(
+            request
+                .prepare_system_captured(runtime, policy_revision, 1, sources, cancel)
+                .map_err(|_| ServiceError::Unsupported)?,
+        );
+        if !prepared
+            .retained()
+            .matches(generation, selection, *prepared.retained().digest())
+        {
+            return Err(stale());
+        }
+        if self.registry.is_none() {
+            self.registry = Some(TrustedRegistry::system().map_err(unavailable)?);
+        }
+        let binary = self
+            .registry
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .snapshot(yonik_engine::Engine::Xray)
+            .map_err(unavailable)?;
+        let payload = Arc::new(
+            WorkerPayload::new_full_profile(binary, Arc::clone(&prepared), cancel)
+                .map_err(unavailable)?,
+        );
+        let mut routes = Vec::with_capacity(physical.endpoints().len());
+        for endpoint in physical.endpoints() {
+            let address: IpAddr = endpoint
+                .host()
+                .parse()
+                .map_err(|_| ServiceError::Unsupported)?;
+            let protocol = match endpoint.protocol() {
+                NativeProtocol::Tcp => crate::TransportProtocol::Tcp,
+                NativeProtocol::Udp => crate::TransportProtocol::Udp,
+            };
+            let query = RouteQuery::new(address, worker_uid)
+                .with_mark(plan.socket_mark())
+                .with_transport(protocol, None, Some(endpoint.port()));
+            let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
+                .await
+                .map_err(unavailable)?;
+            checked_route(&route, owner, plan.routing_table())?;
+            routes.push(ProfileRoute {
+                dns: false,
+                endpoint: address,
+                port: endpoint.port(),
+                protocol,
+                route,
+                capture,
+            });
+        }
+        let system_dns = graph
+            .egress()
+            .system_resolvers()
+            .iter()
+            .any(|r| r.subject().is_none());
+        let peer_count = graph
+            .egress()
+            .resolvers()
+            .iter()
+            .filter(|r| r.subject().is_none())
+            .count()
+            + if system_dns {
+                prepared
+                    .resolver()
+                    .ok_or(ServiceError::Unsupported)?
+                    .server_endpoints()
+                    .len()
+                    * 2
+            } else {
+                0
+            };
+        if routes.len().saturating_add(peer_count) > 128 {
+            return Err(ServiceError::Unsupported);
+        }
+        let mut peers = Vec::with_capacity(peer_count);
+        for resolver in graph
+            .egress()
+            .resolvers()
+            .iter()
+            .filter(|r| r.subject().is_none())
+        {
+            let endpoint = resolver.endpoint();
+            let address: IpAddr = endpoint
+                .host()
+                .parse()
+                .map_err(|_| ServiceError::Unsupported)?;
+            let protocol = match endpoint.protocol() {
+                NativeProtocol::Tcp => crate::TransportProtocol::Tcp,
+                NativeProtocol::Udp => crate::TransportProtocol::Udp,
+            };
+            peers.push((address, endpoint.port(), protocol));
+        }
+        if system_dns {
+            for server in prepared
+                .resolver()
+                .ok_or(ServiceError::Unsupported)?
+                .server_endpoints()
+            {
+                for protocol in [crate::TransportProtocol::Tcp, crate::TransportProtocol::Udp] {
+                    peers.push((server.ip(), server.port(), protocol));
+                }
+            }
+        }
+        if routes.len().saturating_add(peers.len()) > 128 {
+            return Err(ServiceError::Unsupported);
+        }
+        for (address, port, protocol) in peers {
+            let query = RouteQuery::new(address, worker_uid)
+                .with_mark(plan.socket_mark())
+                .with_transport(protocol, None, Some(port));
+            let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
+                .await
+                .map_err(unavailable)?;
+            checked_route(&route, owner, plan.routing_table())?;
+            routes.push(ProfileRoute {
+                dns: true,
+                endpoint: address,
+                port,
+                protocol,
+                route,
+                capture,
+            });
+        }
+        prepared.revalidate(cancel).map_err(unavailable)?;
+        let mut transports = Vec::with_capacity(routes.len());
+        for captured in &routes {
+            let index = checked_route(&captured.route, owner, plan.routing_table())?;
+            transports.push(
+                crate::managed_network::firewall::BoundTransport::new(
+                    captured.endpoint,
+                    match captured.protocol {
+                        crate::TransportProtocol::Tcp => {
+                            crate::managed_network::firewall::TransportProtocol::Tcp
+                        }
+                        crate::TransportProtocol::Udp => {
+                            crate::managed_network::firewall::TransportProtocol::Udp
+                        }
+                    },
+                    captured.port,
+                    index,
+                    worker_uid,
+                    plan.socket_mark(),
+                )
+                .map_err(unavailable)?,
+            );
+        }
+        let preflight = compile_protection(&baseline, false)?
+            .with_additional_transport(&transports)
+            .map_err(|_| ServiceError::Unsupported)?;
+        self.executor(owner)?
+            .check_public_policy(&preflight)
+            .await
+            .map_err(unavailable)?;
+        drop((local, probe));
+        self.worker_uncertain = true;
+        let checked = self
+            .supervisor()
+            .await?
+            .check(Arc::clone(&payload), cancel)
+            .await;
+        if checked.is_err() {
+            let (_keep, mut cleanup) = fresh_cancel();
+            if self.supervisor().await?.recover(&mut cleanup).await.is_ok() {
+                self.worker_uncertain = false;
+            }
+            return Err(if cancel.check().is_err() {
+                ServiceError::Cancelled
+            } else {
+                ServiceError::Unsupported
+            });
+        }
+        self.worker_uncertain = false;
+        let (current, capture) = read_topology_captured(cancel, DEADLINE)
+            .await
+            .map_err(unavailable)?;
+        if self.context(uid)? != context
+            || !self.snapshot()?.is_current(stamp)
+            || worker_uid != self::worker_uid()?
+            || !same_captured_topology(&baseline, baseline_capture, &current, capture)
+        {
+            return Err(stale());
+        }
+        peer.verify_identity()
+            .map_err(|_| ServiceError::Unsupported)?;
+        let artifact = SessionArtifact {
+            invalid: std::sync::atomic::AtomicBool::new(false),
+            installed: Some(installed),
+            full_profile: Some(prepared),
+            routes,
+            owner,
+            bundle: None,
+            payload,
+            plan,
+            baseline,
+            baseline_capture,
+            context,
+            uid,
+            worker_uid,
+            kill_switch: request.kill_switch(),
+            attribution_required: true,
+            peer: Some(peer),
+            memory,
+            native_owner_stamp: Some(self.native_owner.reserve()?),
+        };
+        artifact.revalidate_routes(cancel, None).await?;
+        let mut nonce = [0; 32];
+        getrandom::getrandom(&mut nonce).map_err(unavailable)?;
+        let bytes=serde_json::to_vec(&serde_json::json!({"version":3,"uid":uid,"stamp":stamp.to_string(),"generation":generation,"selection":selection,"nonce":nonce,"payload":artifact.payload.digest().as_bytes()})).map_err(unavailable)?;
+        Ok(GuardArtifact {
+            bytes,
+            stamp,
+            session: Some(Arc::new(artifact)),
+        })
+    }
     // Механический owner endpoint для согласуемого canonical handoff. Legacy
     // by-name сюда не входит; admission и Session factory остаются закрытыми.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -867,6 +1534,18 @@ impl Backend {
             None
         };
         let artifact = SessionArtifact {
+            invalid: std::sync::atomic::AtomicBool::new(false),
+            installed: None,
+            full_profile: None,
+            owner,
+            routes: vec![ProfileRoute {
+                dns: false,
+                endpoint,
+                port: server.endpoint().port(),
+                protocol,
+                route,
+                capture: route_capture,
+            }],
             native_owner_stamp: if attribution_required {
                 Some(self.native_owner.reserve()?)
             } else {
@@ -877,17 +1556,12 @@ impl Backend {
             plan,
             baseline,
             baseline_capture,
-            route,
-            route_capture,
             context,
             uid,
             worker_uid,
             kill_switch: request.kill_switch,
             attribution_required,
             peer: request.peer,
-            endpoint,
-            port: server.endpoint().port(),
-            protocol,
             memory,
         };
         Ok(GuardArtifact {
@@ -927,6 +1601,7 @@ impl Backend {
             .await
             .map_err(unavailable)?;
         if artifact.uid != uid
+            || artifact.owner != self.owner(uid)?
             || self.context(uid)? != artifact.context
             || !self.snapshot()?.is_current(stamp)
             || artifact.worker_uid != worker_uid()?
@@ -936,16 +1611,7 @@ impl Backend {
                 &current,
                 current_capture,
             )
-            || {
-                let (route, capture) = lookup_route_captured(artifact.query(), cancel, DEADLINE)
-                    .await
-                    .map_err(unavailable)?;
-                !same_captured_kernel_route(
-                    &artifact.route,
-                    &route,
-                    Some((artifact.route_capture, capture)),
-                )
-            }
+            || artifact.revalidate_routes(cancel, None).await.is_err()
         {
             return Err(stale());
         }
@@ -1011,18 +1677,7 @@ impl Backend {
             .await
             .map_err(unavailable)?;
         cancel.check().map_err(|_| ServiceError::Cancelled)?;
-        let (route, route_capture) = lookup_route_captured(artifact.query(), cancel, DEADLINE)
-            .await
-            .map_err(unavailable)?;
-        let egress = checked_route(&route, owner, artifact.plan.routing_table())?;
-        if !same_captured_kernel_route(
-            &artifact.route,
-            &route,
-            Some((artifact.route_capture, route_capture)),
-        ) || egress == index
-        {
-            return Err(stale());
-        }
+        let (transports, dns) = artifact.revalidate_routes(cancel, Some(index)).await?;
         let topology = read_topology(cancel, DEADLINE).await.map_err(unavailable)?;
         let link = topology
             .links
@@ -1037,23 +1692,6 @@ impl Backend {
             .find(|link| link.flags & IFF_LOOPBACK != 0)
             .ok_or(ServiceError::Unavailable)?
             .index;
-        let protocol = match artifact.protocol {
-            crate::TransportProtocol::Tcp => {
-                crate::managed_network::firewall::TransportProtocol::Tcp
-            }
-            crate::TransportProtocol::Udp => {
-                crate::managed_network::firewall::TransportProtocol::Udp
-            }
-        };
-        let transport = crate::managed_network::firewall::BoundTransport::new(
-            artifact.endpoint,
-            protocol,
-            artifact.port,
-            egress,
-            artifact.worker_uid,
-            artifact.plan.socket_mark(),
-        )
-        .map_err(unavailable)?;
         let controls = artifact
             .baseline
             .links
@@ -1066,16 +1704,9 @@ impl Backend {
             })
             .map(|link| link.index)
             .collect();
-        let policy = PublicBlockPolicy::new(
-            loopback,
-            Some(index),
-            vec![],
-            vec![],
-            vec![transport],
-            vec![],
-        )
-        .and_then(|policy| policy.with_link_control(controls))
-        .map_err(unavailable)?;
+        let policy = PublicBlockPolicy::new(loopback, Some(index), vec![], vec![], transports, dns)
+            .and_then(|policy| policy.with_link_control(controls))
+            .map_err(unavailable)?;
         self.policy(owner, policy).await?;
         artifact
             .plan
@@ -1186,16 +1817,7 @@ impl Backend {
             ),
         )
         .map_err(unavailable)?;
-        let (route, route_capture) = lookup_route_captured(artifact.query(), cancel, DEADLINE)
-            .await
-            .map_err(unavailable)?;
-        if !same_captured_kernel_route(
-            &artifact.route,
-            &route,
-            Some((artifact.route_capture, route_capture)),
-        ) {
-            return diagnostic_result("escape_route_contract", Err(stale()));
-        }
+        artifact.revalidate_routes(cancel, Some(index)).await?;
         let owner = self
             .journal
             .as_ref()
@@ -1400,7 +2022,13 @@ impl RecoveryHost for BackendRecovery<'_> {
             .map_err(unavailable)?;
         self.backend
             .policy(self.owner, compile_protection(&topology, false)?)
-            .await
+            .await?;
+        self.backend
+            .supervisor
+            .as_mut()
+            .ok_or(ServiceError::Unavailable)?
+            .confirm_profile_rules_retired()
+            .map_err(unavailable)
     }
     async fn cleanup_network(&mut self) -> Result<(), ServiceError> {
         if self.backend.worker_uncertain || self.backend.tun_custody.is_some() {

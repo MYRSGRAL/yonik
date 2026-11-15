@@ -1,4 +1,15 @@
 use super::*;
+#[test]
+fn native_delivery_total_includes_snapshot_and_rejects_overflow_before_staging() {
+    assert!(delivery_preflight([1; 16]).is_ok());
+    assert_eq!(delivery_preflight([1; 17]), Err(EgressError::Budget));
+    assert!(delivery_preflight([64 * 1024 * 1024 - 8192]).is_ok());
+    assert_eq!(
+        delivery_preflight([64 * 1024 * 1024 - 8192, 120]),
+        Err(EgressError::Budget)
+    );
+    assert_eq!(delivery_preflight([u64::MAX]), Err(EgressError::Budget));
+}
 use serde_json::json;
 use yonik_engine::native_profile::{TransportProtocol, validate_profile};
 use yonik_import::{NativeProfile, ProfileEntry, import_profiles};

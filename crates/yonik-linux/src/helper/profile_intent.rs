@@ -16,16 +16,58 @@ pub struct FullProfileRequest {
     generation: u64,
     selection: [u8; 32],
     kill_switch: bool,
+    peer: Option<std::sync::Arc<crate::attribution::PeerProcess>>,
     _memory: super::memory::ByteLease,
 }
 impl FullProfileRequest {
+    pub(crate) fn capture_sources(
+        &self,
+        cancel: &Cancellation,
+    ) -> Result<FullProfileSources, EgressError> {
+        FullProfileSources::capture(&self.intent, cancel)
+    }
+    pub(super) fn bind_peer(
+        &mut self,
+        peer: std::sync::Arc<crate::attribution::PeerProcess>,
+    ) -> Result<(), super::ServiceError> {
+        if self.peer.is_some() {
+            return Err(super::ServiceError::InvalidRequest);
+        }
+        self.peer = Some(peer);
+        Ok(())
+    }
+    pub(super) fn peer(
+        &self,
+    ) -> Result<&std::sync::Arc<crate::attribution::PeerProcess>, super::ServiceError> {
+        self.peer.as_ref().ok_or(super::ServiceError::Unsupported)
+    }
+    pub(super) fn coordinates(&self) -> (u64, [u8; 32]) {
+        (self.generation, self.selection)
+    }
+    pub(super) fn intent(&self) -> &yonik_engine::native_profile::ProfileIntent {
+        &self.intent
+    }
+    pub(super) fn kill_switch(&self) -> bool {
+        self.kill_switch
+    }
     /// Compile/source milestone внутри serialized backend. Не owner/image proof
     /// и не готовое разрешение Apply: все источники revalidate перед effects.
     pub fn prepare_system(
         &self,
+        plan: yonik_engine::native_profile::OwnedRuntimePlan,
+        policy_revision: u64,
+        admission_id: u64,
+        cancel: &Cancellation,
+    ) -> Result<PreparedFullProfile, EgressError> {
+        let sources = self.capture_sources(cancel)?;
+        self.prepare_system_captured(plan, policy_revision, admission_id, sources, cancel)
+    }
+    pub(crate) fn prepare_system_captured(
+        &self,
         mut plan: yonik_engine::native_profile::OwnedRuntimePlan,
         policy_revision: u64,
         admission_id: u64,
+        sources: FullProfileSources,
         cancel: &Cancellation,
     ) -> Result<PreparedFullProfile, EgressError> {
         if !plan.is_system() {
@@ -36,15 +78,15 @@ impl FullProfileRequest {
         self.intent
             .validate_ingress_mapping(&plan)
             .map_err(|_| EgressError::InvalidBinding)?;
-        let resources = NativeResourceSet::capture(&graph, cancel)?;
+        sources.revalidate(&self.intent, cancel)?;
+        let FullProfileSources {
+            resources,
+            resolver,
+            ..
+        } = sources;
         plan = plan
             .bind_resources(&graph, &resources)
             .map_err(|_| EgressError::Resource)?;
-        let resolver = if graph.egress().system_resolvers().is_empty() {
-            None
-        } else {
-            Some(PinnedResolverSnapshot::capture(cancel)?)
-        };
         if let Some(snapshot) = &resolver {
             plan = plan
                 .bind_system_resolver(snapshot)
@@ -68,7 +110,7 @@ impl FullProfileRequest {
             retained,
             resources,
             resolver,
-            capsule,
+            capsule: std::sync::Arc::new(capsule),
             kill_switch: self.kill_switch,
         };
         prepared.revalidate(cancel)?;
@@ -103,6 +145,7 @@ impl FullProfileRequest {
             generation,
             selection,
             kill_switch,
+            peer: None,
             _memory: memory,
         })
     }
@@ -180,16 +223,119 @@ impl FullProfileRequest {
         Ok(())
     }
 }
+pub(crate) struct FullProfileSources {
+    resources: NativeResourceSet,
+    resolver: Option<PinnedResolverSnapshot>,
+    intent_digest: [u8; 32],
+}
+impl FullProfileSources {
+    pub(crate) fn bind(
+        &self,
+        intent: &yonik_engine::native_profile::ProfileIntent,
+        mut plan: yonik_engine::native_profile::OwnedRuntimePlan,
+        cancel: &Cancellation,
+    ) -> Result<yonik_engine::native_profile::OwnedRuntimePlan, EgressError> {
+        self.revalidate(intent, cancel)?;
+        let graph = intent.validate().map_err(|_| EgressError::Encoding)?;
+        plan = plan
+            .bind_resources(&graph, &self.resources)
+            .map_err(|_| EgressError::Resource)?;
+        if let Some(snapshot) = &self.resolver {
+            plan = plan
+                .bind_system_resolver(snapshot)
+                .map_err(|_| EgressError::Resolver)?;
+        }
+        Ok(plan)
+    }
+    pub(crate) fn assets(
+        &self,
+    ) -> impl Iterator<Item = (&std::fs::File, &yonik_engine::resource_bundle::ExternalRef)> {
+        self.resources.source_files()
+    }
+    pub(crate) fn snapshot(&self) -> Option<&PinnedResolverSnapshot> {
+        self.resolver.as_ref()
+    }
+    fn digest(
+        intent: &yonik_engine::native_profile::ProfileIntent,
+    ) -> Result<[u8; 32], EgressError> {
+        let mut hash = DigestWriter {
+            digest: Sha256::new(),
+            bytes: 0,
+        };
+        intent
+            .write_sensitive(&mut hash)
+            .map_err(|_| EgressError::Encoding)?;
+        Ok(hash.digest.finalize().into())
+    }
+    pub(crate) fn capture(
+        intent: &yonik_engine::native_profile::ProfileIntent,
+        cancel: &Cancellation,
+    ) -> Result<Self, EgressError> {
+        check_cancel(cancel)?;
+        let graph = intent.validate().map_err(|_| EgressError::Encoding)?;
+        let resources = NativeResourceSet::capture(&graph, cancel)?;
+        let resolver = if graph.egress().system_resolvers().is_empty() {
+            None
+        } else {
+            Some(PinnedResolverSnapshot::capture(cancel)?)
+        };
+        delivery_preflight(
+            resources
+                .source_files()
+                .map(|(_, reference)| reference.bytes)
+                .chain(
+                    resolver
+                        .as_ref()
+                        .map(|snapshot| snapshot.asset_bytes().len() as u64),
+                ),
+        )?;
+        Ok(Self {
+            resources,
+            resolver,
+            intent_digest: Self::digest(intent)?,
+        })
+    }
+    pub(crate) fn revalidate(
+        &self,
+        intent: &yonik_engine::native_profile::ProfileIntent,
+        cancel: &Cancellation,
+    ) -> Result<(), EgressError> {
+        if Self::digest(intent)? != self.intent_digest {
+            return Err(EgressError::Stale);
+        }
+        self.resources.revalidate(cancel)?;
+        if let Some(snapshot) = &self.resolver {
+            snapshot.revalidate(cancel)?;
+        }
+        Ok(())
+    }
+}
+fn delivery_preflight(lengths: impl IntoIterator<Item = u64>) -> Result<(), EgressError> {
+    let mut bytes = 8192u64;
+    for (index, length) in lengths.into_iter().enumerate() {
+        if index >= 16 || length == 0 {
+            return Err(EgressError::Budget);
+        }
+        bytes = bytes
+            .checked_add(length)
+            .filter(|total| *total <= 64 * 1024 * 1024)
+            .ok_or(EgressError::Budget)?;
+    }
+    Ok(())
+}
 /// Один результат compile и actual source custody: provider credentials не
 /// реконструируются при seal/handoff; capsule builder получает тот же intent.
 pub struct PreparedFullProfile {
     retained: RetainedSystemProfile,
     resources: NativeResourceSet,
     resolver: Option<PinnedResolverSnapshot>,
-    capsule: crate::profile_channel::OwnedCapsule,
+    capsule: std::sync::Arc<crate::profile_channel::OwnedCapsule>,
     kill_switch: bool,
 }
 impl PreparedFullProfile {
+    pub(crate) fn capsule(&self) -> &std::sync::Arc<crate::profile_channel::OwnedCapsule> {
+        &self.capsule
+    }
     pub fn retained(&self) -> &RetainedSystemProfile {
         &self.retained
     }
@@ -800,6 +946,14 @@ pub struct NativeResourceSet {
     _memory: super::memory::ByteLease,
 }
 impl NativeResourceSet {
+    pub(crate) fn source_files(
+        &self,
+    ) -> impl Iterator<Item = (&std::fs::File, &yonik_engine::resource_bundle::ExternalRef)> {
+        self.files
+            .iter()
+            .filter(|file| !file.requirements.is_empty())
+            .map(|file| (&file.file, &file.reference))
+    }
     pub fn capture(
         graph: &yonik_engine::native_profile::ValidatedGraph,
         cancel: &Cancellation,
@@ -1182,6 +1336,9 @@ pub struct PinnedResolverSnapshot {
     _memory: super::memory::ByteLease,
 }
 impl PinnedResolverSnapshot {
+    pub(crate) fn server_endpoints(&self) -> &[SocketAddr] {
+        &self.servers
+    }
     pub fn capture(cancel: &Cancellation) -> Result<Self, EgressError> {
         check_cancel(cancel)?;
         let memory = super::memory::config_budget()
@@ -1665,6 +1822,12 @@ pub struct PhysicalRequirements<'a> {
     plan: &'a EgressPlan,
 }
 impl<'a> PhysicalRequirements<'a> {
+    pub(crate) fn validate_numeric(&self) -> Result<(), EgressError> {
+        for endpoint in self.endpoints() {
+            numeric(endpoint)?;
+        }
+        Ok(())
+    }
     pub fn new(plan: &'a EgressPlan) -> Result<Self, EgressError> {
         // Тот же верхний предел, что у firewall. DNS/LAN потребляют оставшийся
         // бюджет отдельно в PublicBlockPolicy::new, до dedup.

@@ -319,12 +319,13 @@ impl MemoryPreflight {
             (caps[3], 2 * 1024),
             (caps[3], 2048),
             (caps[7], 64),
-            (caps[6], 192),
-            (caps[0], 256),
+            (caps[6], 768),
+            (caps[0], 576),
             (caps[2], 1024),
             (caps[1], 512),
             (caps[0], 128),
-            (64, 128),
+            (1, 512 * 1024 + 64 * 1024 + 384 * 1024),
+            (caps[0] * 2, 64),
         ] {
             metadata = metadata
                 .checked_add((count as usize).checked_mul(width).ok_or(Error::Budget)?)
@@ -348,6 +349,7 @@ pub(crate) struct SnapshotRef {
     pub bytes: u32,
     pub flags: u32,
 }
+pub(crate) type AssetReference = (u8, [u8; 32], u64, [u8; 32], u32);
 pub(crate) struct ResolverHost {
     pub alias: String,
     pub addresses: Vec<std::net::IpAddr>,
@@ -1137,7 +1139,66 @@ pub(crate) struct Capsule<'a> {
     pub lease_ms: u32,
     pub policy_revision: u64,
 }
+pub(crate) struct DialScope<'a> {
+    pub input: u8,
+    pub action: u8,
+    pub endpoint: Option<Destination<'a>>,
+    pub endpoint_index: u16,
+    pub next: Option<(u16, u8)>,
+}
 impl<'a> Capsule<'a> {
+    pub(crate) fn limits(&self) -> [u32; 8] {
+        std::array::from_fn(|i| {
+            let p = 88 + i * 4;
+            u32::from_be_bytes([
+                self.body[p],
+                self.body[p + 1],
+                self.body[p + 2],
+                self.body[p + 3],
+            ])
+        })
+    }
+    pub(crate) fn buffer_credit(&self) -> Result<usize> {
+        Ok(MemoryPreflight::new(self.limits(), self.body.len())?.buffer_bytes)
+    }
+    pub(crate) fn dial_scope(&self, index: u16, branch: u8) -> Result<DialScope<'_>> {
+        if branch > 1 {
+            return Err(Error::Reference);
+        }
+        let scope = scope_from(&self.tables, index)?;
+        if scope.mask & (1 << branch) == 0 {
+            return Err(Error::Reference);
+        }
+        let b = scope.branches[branch as usize];
+        let endpoint = if b.endpoint == NONE {
+            None
+        } else {
+            Some(Destination::read(&mut Reader::new(
+                self.tables[1].row(b.endpoint)?,
+            ))?)
+        };
+        let next = if b.chain == NONE {
+            None
+        } else {
+            let c = chain(self.tables[2].row(b.chain)?)?;
+            Some((c.next, c.mask))
+        };
+        Ok(DialScope {
+            input: scope.input,
+            action: b.action,
+            endpoint,
+            endpoint_index: b.endpoint,
+            next,
+        })
+    }
+    pub(crate) fn endpoint(&self, index: u16) -> Result<Destination<'_>> {
+        Destination::read(&mut Reader::new(self.tables[1].row(index)?))
+    }
+    pub(crate) fn resolver_peer(&self, index: u16) -> Result<Destination<'_>> {
+        let mut r = Reader::new(self.tables[4].row(index)?);
+        r.take(36)?;
+        Destination::read(&mut r)
+    }
     pub(crate) fn decode(body: &'a [u8], digest: &[u8; 32]) -> Result<Self> {
         if body.len() < 128 || body.len() > FRAME_LIMIT - HEADER {
             return Err(Error::Bounds);
@@ -1388,15 +1449,80 @@ fn network(n: u8) -> Result<()> {
     Ok(())
 }
 impl Capsule<'_> {
+    /// Отдельная authority boundary: динамический UDP port принимается лишь
+    /// вместе с retained actual child socket proof; metadata assertion не proof.
+    pub(crate) fn validate_associated_request(
+        &self,
+        message: &Message<'_>,
+        proof: &crate::helper::native_profile_channel::SocketProof,
+    ) -> Result<()> {
+        let Message::OpenIngress {
+            ingress,
+            provenance,
+            tuple,
+            original,
+        } = message
+        else {
+            return Err(Error::Reference);
+        };
+        let row = self.tables[6].row(*ingress)?;
+        if row[0] != 2
+            || row[1] & 2 == 0
+            || *provenance != 3
+            || tuple.protocol != 17
+            || original.protocol != 17
+        {
+            return Err(Error::Reference);
+        }
+        proof
+            .validate_association(*tuple)
+            .map_err(|_| Error::Binding)
+    }
+    pub(crate) fn validate_asset_refs(&self, assets: &[AssetReference]) -> Result<()> {
+        if assets.len() > 16 {
+            return Err(Error::Budget);
+        }
+        let mut used = [false; 16];
+        for row in self.tables[5].rows() {
+            let mut r = Reader::new(row);
+            let kind = r.u8()?;
+            r.zero(1)?;
+            r.string(160)?;
+            let digest = r.array::<32>()?;
+            let bytes = r.u64()?;
+            let index = assets
+                .iter()
+                .position(|a| *a == (kind, digest, bytes, [0; 32], 0))
+                .ok_or(Error::Reference)?;
+            used[index] = true;
+        }
+        for row in self.tables[10].rows() {
+            let mut r = Reader::new(row);
+            let source = r.array::<32>()?;
+            let asset = r.array::<32>()?;
+            let bytes = u64::from(r.u32()?);
+            r.take(4)?;
+            let flags = r.u32()?;
+            let index = assets
+                .iter()
+                .position(|a| *a == (3, asset, bytes, source, flags))
+                .ok_or(Error::Reference)?;
+            used[index] = true;
+        }
+        if used[..assets.len()].iter().any(|used| !used) {
+            return Err(Error::Reference);
+        }
+        Ok(())
+    }
     /// Проверяет DATA scope запроса. Peer/ingress/owner authority выдаёт issuer.
-    fn validate_request(&self, message: &Message<'_>) -> Result<()> {
+    pub(crate) fn validate_request(&self, message: &Message<'_>) -> Result<()> {
         let t = &self.tables;
         match message {
             Message::OpenIngress {
                 ingress,
                 provenance,
                 tuple,
-                ..
+                original,
             } => {
                 let row = t[6].row(*ingress)?;
                 let kind = row[0];
@@ -1406,8 +1532,21 @@ impl Capsule<'_> {
                 if mask & bit == 0
                     || kind == 4
                     || (kind == 1) != (*provenance == 1)
-                    || kind != 1 && tuple.local_port != port
+                    || *provenance == 2 && tuple.remote_port != port
+                    || kind!=1 && (tuple.family!=4 || tuple.remote[..4]!=[127,0,0,1] || original.protocol!=tuple.protocol)
+                    // UDP association требует отдельного retained socket proof.
+                    // OPEN_INGRESS assertion и TCP attribution его не заменяют.
+                    || *provenance == 3
                     || kind == 3 && *provenance != 2
+                {
+                    return Err(Error::Reference);
+                }
+                if kind == 1
+                    && (original.protocol != tuple.protocol
+                        || original.port != tuple.remote_port
+                        || original.family != tuple.family
+                        || original.bytes
+                            != &tuple.remote[..if tuple.family == 4 { 4 } else { 16 }])
                 {
                     return Err(Error::Reference);
                 }
@@ -1738,11 +1877,11 @@ fn hostname(name: &str) -> Result<()> {
     Ok(())
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Destination<'a> {
-    protocol: u8,
-    port: u16,
-    family: u8,
-    bytes: &'a [u8],
+pub(crate) struct Destination<'a> {
+    pub protocol: u8,
+    pub port: u16,
+    pub family: u8,
+    pub bytes: &'a [u8],
 }
 impl<'a> Destination<'a> {
     fn read(r: &mut Reader<'a>) -> Result<Self> {
@@ -1967,9 +2106,9 @@ impl<'a> Reader<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct Receipt {
-    kind: ReceiptKind,
-    id: u64,
+pub(crate) struct Receipt {
+    pub kind: ReceiptKind,
+    pub id: u64,
 }
 impl Receipt {
     fn read(r: &mut Reader<'_>) -> Result<Self> {
@@ -1987,16 +2126,43 @@ impl Receipt {
         w.u64(self.id)
     }
 }
-#[derive(Clone, Copy)]
-struct Tuple {
-    protocol: u8,
-    family: u8,
-    local_port: u16,
-    remote_port: u16,
-    local: [u8; 16],
-    remote: [u8; 16],
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Tuple {
+    pub protocol: u8,
+    pub family: u8,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub local: [u8; 16],
+    pub remote: [u8; 16],
 }
 impl Tuple {
+    /// Wire уже initiator→ingress. Меняется только family namespace для broker;
+    /// перестановка endpoints атрибутировала бы accepted socket самого Xray.
+    pub(crate) fn owner_flow(self) -> Result<crate::attribution::broker::Flow> {
+        network(self.protocol)?;
+        let family = match self.family {
+            4 => 2,
+            6 => 10,
+            _ => return Err(Error::Schema),
+        };
+        if self.local_port == 0
+            || self.remote_port == 0
+            || self.family == 4
+                && (self.local[4..].iter().any(|b| *b != 0)
+                    || self.remote[4..].iter().any(|b| *b != 0))
+        {
+            return Err(Error::Schema);
+        }
+        Ok(crate::attribution::broker::Flow {
+            family,
+            protocol: self.protocol,
+            local_port: self.local_port,
+            remote_port: self.remote_port,
+            local: self.local,
+            remote: self.remote,
+            cookie: None,
+        })
+    }
     fn read(r: &mut Reader<'_>) -> Result<Self> {
         let protocol = r.u8()?;
         network(protocol)?;
@@ -2042,21 +2208,21 @@ impl Tuple {
     }
 }
 #[derive(Clone, Copy)]
-struct Authorize<'a> {
-    source_flow: u64,
-    class: u8,
-    subject: u16,
-    chain: u16,
-    transport: u16,
-    scope: u16,
-    branch: u8,
-    original: Destination<'a>,
-    effective: Destination<'a>,
-    resolver: u16,
-    query: &'a str,
-    receipt: Receipt,
+pub(crate) struct Authorize<'a> {
+    pub source_flow: u64,
+    pub class: u8,
+    pub subject: u16,
+    pub chain: u16,
+    pub transport: u16,
+    pub scope: u16,
+    pub branch: u8,
+    pub original: Destination<'a>,
+    pub effective: Destination<'a>,
+    pub resolver: u16,
+    pub query: &'a str,
+    pub receipt: Receipt,
 }
-enum Message<'a> {
+pub(crate) enum Message<'a> {
     Hello {
         nonce: [u8; 32],
         mode: Mode,
@@ -2544,12 +2710,12 @@ impl Writer<'_> {
     }
 }
 
-struct Frame<'a> {
-    header: Header,
-    message: Message<'a>,
+pub(crate) struct Frame<'a> {
+    pub header: Header,
+    pub message: Message<'a>,
 }
 impl<'a> Frame<'a> {
-    fn encode(header: Header, message: &Message<'_>, out: &mut [u8]) -> Result<usize> {
+    pub(crate) fn encode(header: Header, message: &Message<'_>, out: &mut [u8]) -> Result<usize> {
         if header.kind != message.kind() {
             return Err(Error::Schema);
         }
@@ -2560,7 +2726,12 @@ impl<'a> Frame<'a> {
         out[..HEADER].copy_from_slice(&wire);
         Ok(HEADER + n)
     }
-    fn decode(bytes: &'a [u8], binding: Binding, mode: Mode, from_host: bool) -> Result<Self> {
+    pub(crate) fn decode(
+        bytes: &'a [u8],
+        binding: Binding,
+        mode: Mode,
+        from_host: bool,
+    ) -> Result<Self> {
         let header = Header::decode(bytes.get(..HEADER).ok_or(Error::Bounds)?, bytes.len())?;
         if header.binding != binding {
             return Err(Error::Binding);
@@ -2634,18 +2805,18 @@ impl<'a> Frame<'a> {
 }
 
 /// Отдельно от object/request IDs. Ошибка навсегда закрывает decoder direction.
-struct Sequence {
+pub(crate) struct Sequence {
     next: u64,
     revoked: bool,
 }
 impl Sequence {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             next: 1,
             revoked: false,
         }
     }
-    fn accept(&mut self, sequence: u64) -> Result<()> {
+    pub(crate) fn accept(&mut self, sequence: u64) -> Result<()> {
         if self.revoked || sequence != self.next || sequence == u64::MAX {
             self.revoked = true;
             return Err(Error::Binding);
@@ -2658,6 +2829,39 @@ impl Sequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn initiator_tuple_r8_matches_independent_open_ingress_vectors() {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/initiator-ingress-r8.json"
+        ))
+        .unwrap();
+        let capsule = golden_build(false);
+        let capsule = Capsule::decode(capsule.bytes(), &binding().digest).unwrap();
+        for case in f["cases"].as_array().unwrap() {
+            let bytes = unhex(case["frame_hex"].as_str().unwrap());
+            let frame = Frame::decode(&bytes, binding(), Mode::Local, false).unwrap();
+            let Message::OpenIngress { tuple, .. } = &frame.message else {
+                panic!("OPEN_INGRESS expected")
+            };
+            let tuple_bytes = unhex(case["tuple_hex"].as_str().unwrap());
+            assert_eq!(&bytes[132..172], tuple_bytes);
+            assert_eq!(tuple.local_port, 32001);
+            assert_eq!(
+                tuple.remote_port,
+                case["expected_owner_remote_port"].as_u64().unwrap() as u16
+            );
+            let owner = tuple.owner_flow().unwrap();
+            assert_eq!(
+                owner.family,
+                case["expected_owner_family"].as_u64().unwrap() as u8
+            );
+            assert_eq!(owner.local_port, 32001);
+            assert_eq!(owner.remote_port, tuple.remote_port);
+            assert_eq!((owner.local, owner.remote), (tuple.local, tuple.remote));
+            let allowed = capsule.validate_request(&frame.message).is_ok();
+            assert_eq!(allowed, case["name"] == "tcp", "{}", case["name"]);
+        }
+    }
     #[test]
     fn exact_go_a004e92_launch_admission_golden_has_identical_layout() {
         let f: serde_json::Value = serde_json::from_str(include_str!(

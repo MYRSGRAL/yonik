@@ -59,7 +59,7 @@ impl IpPrefix {
         }
         Ok(Self { address, length })
     }
-    pub(super) fn contains(self, address: IpAddr) -> bool {
+    pub(crate) fn contains(self, address: IpAddr) -> bool {
         match (self.address, address) {
             (IpAddr::V4(prefix), IpAddr::V4(address)) => {
                 u32::from(prefix) == u32::from(address) & (u32::MAX << (32 - self.length))
@@ -204,6 +204,36 @@ pub struct PublicBlockPolicy {
     link_control: Vec<NonZeroU32>,
 }
 impl PublicBlockPolicy {
+    pub(crate) fn permits_lan_endpoint(&self, destination: IpAddr, ifindex: u32) -> bool {
+        self.lan
+            .iter()
+            .any(|entry| entry.ifindex.get() == ifindex && entry.prefix.contains(destination))
+    }
+    /// Замена сохраняет все прежние ограничения и общий предел исключений.
+    pub(crate) fn with_additional_transport(
+        &self,
+        extra: &[BoundTransport],
+    ) -> Result<Self, PolicyError> {
+        let used = self.private_routes.len()
+            + self.lan.len()
+            + self.transport.len()
+            + self.bootstrap_dns.len()
+            + self.link_control.len() * 3;
+        if extra.len() > MAX_EXCEPTIONS.saturating_sub(used) {
+            return Err(PolicyError::Limit);
+        }
+        let mut transport = self.transport.clone();
+        transport.extend_from_slice(extra);
+        Self::new(
+            self.loopback_ifindex.get(),
+            self.tun_ifindex.map(NonZeroU32::get),
+            self.private_routes.clone(),
+            self.lan.clone(),
+            transport,
+            self.bootstrap_dns.clone(),
+        )?
+        .with_link_control(self.link_control.iter().map(|i| i.get()).collect())
+    }
     pub fn new(
         loopback_ifindex: u32,
         tun_ifindex: Option<u32>,
@@ -830,5 +860,36 @@ mod tests {
             assert!([133, 135, 136].contains(&expr[2]["match"]["right"].as_u64().unwrap()));
             assert_eq!(expr[3]["match"]["right"], 0);
         }
+    }
+    #[test]
+    fn dynamic_replacement_preserves_private_lan_dns_controls_and_aggregate_cap() {
+        let base = PublicBlockPolicy::new(
+            1,
+            Some(8),
+            vec![PrivateRoute::new(prefix("10.0.0.0", 8), Some(7)).unwrap()],
+            vec![LanException::new(prefix("192.168.0.0", 16), 2).unwrap()],
+            vec![endpoint("192.0.2.1")],
+            vec![endpoint("192.0.2.53")],
+        )
+        .unwrap()
+        .with_link_control(vec![2])
+        .unwrap();
+        assert!(base.permits_lan_endpoint("192.168.1.2".parse().unwrap(), 2));
+        assert!(!base.permits_lan_endpoint("192.168.1.2".parse().unwrap(), 3));
+        let extra = endpoint("203.0.113.9");
+        let replaced = base.with_additional_transport(&[extra]).unwrap();
+        assert_eq!(replaced.private_routes, base.private_routes);
+        assert_eq!(replaced.lan, base.lan);
+        assert_eq!(replaced.bootstrap_dns, base.bootstrap_dns);
+        assert_eq!(replaced.link_control, base.link_control);
+        assert_eq!(
+            base.with_additional_transport(&vec![extra; 122]),
+            Err(PolicyError::Limit)
+        );
+        assert!(base.with_additional_transport(&vec![extra; 121]).is_ok());
+        assert_eq!(
+            base.with_additional_transport(&[endpoint("10.1.2.3")]),
+            Err(PolicyError::PrivateTransport)
+        );
     }
 }

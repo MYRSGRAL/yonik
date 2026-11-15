@@ -212,6 +212,39 @@ pub(crate) struct IssuedNativeRoles {
     pub(crate) run: RunRole,
 }
 impl RuntimeScopeStamp {
+    /// Sealed extension выводится только из consuming kernel/owner admission.
+    /// Caller не задаёт PID/start/context и не переводит Local record в System.
+    pub(crate) fn profile_launch_record(
+        &self,
+        capsule: &crate::profile_channel::OwnedCapsule,
+    ) -> Result<crate::profile_channel::LaunchRecord> {
+        self.validate_admission()?;
+        let e = &self.inner.expected;
+        let capsule = crate::profile_channel::Capsule::decode(capsule.bytes(), &e.digest)
+            .map_err(|_| Error::Untrusted)?;
+        if capsule.mode != crate::profile_channel::Mode::System {
+            return Err(Error::Untrusted);
+        }
+        let record = crate::profile_channel::LaunchRecord {
+            mode: crate::profile_channel::Mode::System,
+            nonce: e.nonce,
+            binding: crate::profile_channel::Binding {
+                session: e.session,
+                invocation: e.invocation,
+                digest: e.digest,
+                generation: e.generation,
+                epoch: e.epoch,
+            },
+            owner_pid: e.server_pid,
+            child_pid: e.task_pid,
+            owner_start: e.server_start,
+            child_start: e.task_start,
+            manifest: capsule.manifest,
+        };
+        record.encode().map_err(|_| Error::Untrusted)?;
+        self.validate_admission()?;
+        Ok(record)
+    }
     pub(crate) fn validate_admission(&self) -> Result<()> {
         self.inner
             .authorization
@@ -251,6 +284,10 @@ impl RuntimeScopeStamp {
     }
 }
 impl RunRole {
+    pub(crate) fn profile_scope(&self) -> Result<RuntimeScopeStamp> {
+        self.validate()?;
+        Ok(self.scope.fork_lookup())
+    }
     pub(crate) fn validate(&self) -> Result<()> {
         self.scope.validate()
     }

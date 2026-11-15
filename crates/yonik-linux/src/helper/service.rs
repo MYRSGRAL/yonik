@@ -130,6 +130,14 @@ pub struct BundleDigests {
 /// Единственный владелец привилегированных эффектов; dispatcher сериализует доступ.
 pub trait ProtectionHost: Send + 'static {
     type Artifact: PreparedArtifact;
+    fn prepare_full_profile(
+        &mut self,
+        _uid: u32,
+        _request: super::profile_intent::FullProfileRequest,
+        _cancel: Cancellation,
+    ) -> impl Future<Output = Result<(Self::Artifact, PreparedContext), ServiceError>> + Send {
+        async { Err(ServiceError::Unsupported) }
+    }
     fn native_prepare_eligibility(
         &mut self,
         cancel: Cancellation,
@@ -555,8 +563,31 @@ async fn dispatch<H: ProtectionHost>(
             result.map_err(|_| ServiceError::Unavailable)??,
     };
     let value = match request {
-        Request::PrepareFullProfile(request) => {
-            return deny_unadmitted_full_profile(&request, &cancel);
+        Request::PrepareFullProfile(mut request) => {
+            request.preflight(&cancel)?;
+            let handle = broker
+                .prepare(message, Prompt::Allow, cancel.clone(), || async {
+                    let mut host = host.try_lock().map_err(|_| PreparedError::Capacity)?;
+                    // System required неизменяем: trusted peer нужен и без optional ACL.
+                    let presence = peers.track(&sender, uid)?;
+                    let pid = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        broker.authorizer().peer_pid(&sender, uid),
+                    )
+                    .await
+                    .map_err(|_| PreparedError::Unsupported)??;
+                    request
+                        .bind_peer(Arc::new(crate::attribution::PeerProcess::pending(
+                            crate::attribution::CapturedBusPeer::capture(presence.bind(pid)?)
+                                .map_err(|_| PreparedError::Unsupported)?,
+                        )))
+                        .map_err(as_prepared)?;
+                    host.prepare_full_profile(uid, *request, cancel.clone())
+                        .await
+                        .map_err(as_prepared)
+                })
+                .await?;
+            serde_json::json!({"version":1,"handle":handle.as_bytes()})
         }
         Request::Introspect => return Ok(INTROSPECTION.to_owned()),
         Request::Capabilities => {
@@ -729,6 +760,7 @@ fn as_prepared(error: ServiceError) -> PreparedError {
         _ => PreparedError::Unavailable,
     }
 }
+#[cfg(test)]
 fn deny_unadmitted_full_profile(
     request: &super::profile_intent::FullProfileRequest,
     cancel: &Cancellation,

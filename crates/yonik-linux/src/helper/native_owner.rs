@@ -302,6 +302,11 @@ impl super::Backend {
         cancel: &mut crate::Cancellation,
     ) -> Result<crate::helper::systemd_worker::WorkerTicket, ServiceError> {
         self.supervisor().await?;
+        let routes = self
+            .profile_owner
+            .as_ref()
+            .map(|(backend, runtime)| super::ProfileRoutes::new(backend.clone(), runtime.clone()))
+            .transpose()?;
         let pending = self
             .native_owner
             .lease
@@ -328,6 +333,9 @@ impl super::Backend {
                 self.journal.as_ref().ok_or(ServiceError::Unavailable)?,
                 topology,
                 pending.network_epoch,
+                routes.map(|r| {
+                    Box::new(r) as Box<dyn crate::helper::native_profile_channel::RouteAuthority>
+                }),
                 output,
                 cancel,
             )
@@ -421,13 +429,23 @@ pub(super) async fn check_actual_boundaries_with_synthetic_inputs(
         .await
         .unwrap();
     let artifact = Arc::new(SessionArtifact {
+        invalid: std::sync::atomic::AtomicBool::new(false),
+        installed: None,
+        full_profile: None,
+        owner,
+        routes: vec![super::ProfileRoute {
+            dns: false,
+            endpoint,
+            port: 443,
+            protocol: crate::TransportProtocol::Tcp,
+            route,
+            capture: route_capture,
+        }],
         bundle: None,
         payload: crate::helper::systemd_worker::unit_owner_payload(),
         plan,
         baseline,
         baseline_capture,
-        route,
-        route_capture,
         context: backend.context(uid).unwrap(),
         uid,
         worker_uid: uid,
@@ -436,9 +454,6 @@ pub(super) async fn check_actual_boundaries_with_synthetic_inputs(
         peer: Some(Arc::new(
             crate::attribution::PeerProcess::capture(std::process::id(), uid).unwrap(),
         )),
-        endpoint,
-        port: 443,
-        protocol: crate::TransportProtocol::Tcp,
         memory: config_budget().reserve(1).unwrap(),
         native_owner_stamp: Some(backend.native_owner.reserve().unwrap()),
     });
@@ -549,6 +564,11 @@ pub(super) async fn check_actual_boundaries_with_synthetic_inputs(
 
     // Record потребляется целиком: commit не принимает независимый artifact B.
     let artifact_b = Arc::new(SessionArtifact {
+        invalid: std::sync::atomic::AtomicBool::new(false),
+        installed: None,
+        full_profile: None,
+        owner,
+        routes: artifact.routes.clone(),
         bundle: artifact.bundle,
         payload: Arc::clone(&artifact.payload),
         plan: crate::helper::SessionNetworkPlan::reserve_for_engine(
@@ -559,17 +579,12 @@ pub(super) async fn check_actual_boundaries_with_synthetic_inputs(
         .unwrap(),
         baseline: artifact.baseline.clone(),
         baseline_capture: artifact.baseline_capture,
-        route: artifact.route.clone(),
-        route_capture: artifact.route_capture,
         context: artifact.context,
         uid,
         worker_uid: uid,
         kill_switch: false,
         attribution_required: false,
         peer: artifact.peer.clone(),
-        endpoint,
-        port: 443,
-        protocol: artifact.protocol,
         memory: config_budget().reserve(1).unwrap(),
         native_owner_stamp: Some(NativeArtifactStamp {
             session: artifact.native_owner_stamp.as_ref().unwrap().session,

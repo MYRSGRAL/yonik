@@ -10,6 +10,348 @@ use std::{
 };
 use yonik_engine::resource_bundle::ExternalRef;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum NativeKind {
+    DatCidrs = 1,
+    DatDomains = 2,
+    Resolver = 3,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeDescriptor {
+    pub kind: NativeKind,
+    pub digest: [u8; 32],
+    pub bytes: u64,
+    pub records: u64,
+    pub source: [u8; 32],
+    pub flags: u32,
+}
+impl NativeDescriptor {
+    fn validate(self) -> Result<(), WorkerError> {
+        if self.digest == [0; 32] || self.bytes == 0 || self.bytes > 64 * 1024 * 1024 {
+            return Err(WorkerError::Limit);
+        }
+        match self.kind {
+            NativeKind::Resolver
+                if self.bytes > 2 * 1024 * 1024
+                    || self.records != 0
+                    || self.source == [0; 32]
+                    || self.flags & !1 != 0 =>
+            {
+                Err(WorkerError::Protocol)
+            }
+            NativeKind::DatCidrs | NativeKind::DatDomains
+                if self.source != [0; 32]
+                    || self.flags != 0
+                    || self.records == 0
+                    || self.records > 1_500_000 =>
+            {
+                Err(WorkerError::Protocol)
+            }
+            _ => Ok(()),
+        }
+    }
+    pub(crate) fn encode(self) -> Result<[u8; 88], WorkerError> {
+        self.validate()?;
+        let mut out = [0; 88];
+        out[0] = self.kind as u8;
+        out[1] = 1;
+        out[4..36].copy_from_slice(&self.digest);
+        out[36..44].copy_from_slice(&self.bytes.to_be_bytes());
+        out[44..52].copy_from_slice(&self.records.to_be_bytes());
+        out[52..84].copy_from_slice(&self.source);
+        out[84..88].copy_from_slice(&self.flags.to_be_bytes());
+        Ok(out)
+    }
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, WorkerError> {
+        if bytes.len() != 88 || bytes[1..4] != [1, 0, 0] {
+            return Err(WorkerError::Protocol);
+        }
+        let descriptor = Self {
+            kind: match bytes[0] {
+                1 => NativeKind::DatCidrs,
+                2 => NativeKind::DatDomains,
+                3 => NativeKind::Resolver,
+                _ => return Err(WorkerError::Protocol),
+            },
+            digest: bytes[4..36].try_into().map_err(|_| WorkerError::Protocol)?,
+            bytes: u64::from_be_bytes(
+                bytes[36..44]
+                    .try_into()
+                    .map_err(|_| WorkerError::Protocol)?,
+            ),
+            records: u64::from_be_bytes(
+                bytes[44..52]
+                    .try_into()
+                    .map_err(|_| WorkerError::Protocol)?,
+            ),
+            source: bytes[52..84]
+                .try_into()
+                .map_err(|_| WorkerError::Protocol)?,
+            flags: u32::from_be_bytes(
+                bytes[84..88]
+                    .try_into()
+                    .map_err(|_| WorkerError::Protocol)?,
+            ),
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+    pub(crate) fn name(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(72);
+        out.push_str(if self.kind == NativeKind::Resolver {
+            "dns-"
+        } else {
+            "r-"
+        });
+        for b in self.digest {
+            out.push(char::from(HEX[(b >> 4) as usize]));
+            out.push(char::from(HEX[(b & 15) as usize]));
+        }
+        out.push_str(if self.kind == NativeKind::Resolver {
+            ".bin"
+        } else {
+            ".dat"
+        });
+        out
+    }
+}
+pub(crate) struct NativeAsset {
+    pub file: File,
+    pub descriptor: NativeDescriptor,
+    _reservation: Option<Reservation>,
+}
+pub(crate) fn copy_native(
+    source: &File,
+    descriptor: NativeDescriptor,
+    cancel: &impl Fn() -> bool,
+) -> Result<NativeAsset, WorkerError> {
+    validate_native(source, descriptor)?;
+    let reservation = Reservation::acquire(
+        descriptor
+            .bytes
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(8192))
+            .ok_or(WorkerError::Limit)?,
+    )
+    .map_err(|_| WorkerError::Limit)?;
+    let mut target = File::from(
+        fs::memfd_create(
+            "yonik-worker-native",
+            fs::MemfdFlags::CLOEXEC | fs::MemfdFlags::ALLOW_SEALING,
+        )
+        .map_err(|_| WorkerError::Io)?,
+    );
+    fs::fchmod(&target, fs::Mode::RUSR | fs::Mode::WUSR).map_err(|_| WorkerError::Io)?;
+    let mut buffer = [0; 8192];
+    let mut offset = 0;
+    while offset < descriptor.bytes {
+        if cancel() {
+            return Err(WorkerError::Timeout);
+        }
+        let n = source
+            .read_at(
+                &mut buffer[..(descriptor.bytes - offset).min(8192) as usize],
+                offset,
+            )
+            .map_err(|_| WorkerError::Io)?;
+        if n == 0 {
+            return Err(WorkerError::Protocol);
+        }
+        target
+            .write_all(&buffer[..n])
+            .map_err(|_| WorkerError::Io)?;
+        offset += n as u64;
+    }
+    fs::fcntl_add_seals(
+        &target,
+        SealFlags::SEAL | SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK,
+    )
+    .map_err(|_| WorkerError::Io)?;
+    let file =
+        File::open(format!("/proc/self/fd/{}", target.as_raw_fd())).map_err(|_| WorkerError::Io)?;
+    validate_native(&file, descriptor)?;
+    if descriptor.kind == NativeKind::Resolver {
+        let _memory = crate::helper::memory::config_budget()
+            .reserve(descriptor.bytes as usize)
+            .map_err(|_| WorkerError::Limit)?;
+        let mut bytes = vec![0; descriptor.bytes as usize];
+        file.read_exact_at(&mut bytes, 0)
+            .map_err(|_| WorkerError::Io)?;
+        crate::profile_channel::verify_resolver_asset(
+            &bytes,
+            crate::profile_channel::SnapshotRef {
+                source: descriptor.source,
+                asset: descriptor.digest,
+                bytes: descriptor.bytes as u32,
+                flags: descriptor.flags,
+            },
+        )
+        .map_err(|_| WorkerError::Protocol)?;
+    }
+    Ok(NativeAsset {
+        file,
+        descriptor,
+        _reservation: Some(reservation),
+    })
+}
+pub(crate) struct TrustedNativePayload {
+    pub assets: Vec<NativeAsset>,
+    _reservation: Reservation,
+}
+impl TrustedNativePayload {
+    pub(crate) fn capture(
+        profile: &crate::helper::profile_intent::PreparedFullProfile,
+        cancel: &crate::Cancellation,
+    ) -> Result<Self, WorkerError> {
+        profile
+            .revalidate(cancel)
+            .map_err(|_| WorkerError::Protocol)?;
+        let count =
+            profile.resources().source_files().count() + usize::from(profile.resolver().is_some());
+        if count > 16 {
+            return Err(WorkerError::Limit);
+        }
+        let files = profile.resources().source_files();
+        let mut descriptors = Vec::with_capacity(count);
+        for (file, reference) in files {
+            let descriptor = NativeDescriptor {
+                kind: match reference.kind {
+                    yonik_engine::resource_bundle::ResourceKind::Cidrs => NativeKind::DatCidrs,
+                    yonik_engine::resource_bundle::ResourceKind::Domains => NativeKind::DatDomains,
+                },
+                digest: reference.digest,
+                bytes: reference.bytes,
+                records: reference.records,
+                source: [0; 32],
+                flags: 0,
+            };
+            descriptors.push((Some(file), descriptor));
+        }
+        if let Some(snapshot) = profile.resolver() {
+            let r = snapshot.reference();
+            descriptors.push((
+                None,
+                NativeDescriptor {
+                    kind: NativeKind::Resolver,
+                    digest: r.asset,
+                    bytes: u64::from(r.bytes),
+                    records: 0,
+                    source: r.source,
+                    flags: r.flags,
+                },
+            ));
+        }
+        preflight_native(descriptors.iter().map(|(_, d)| *d))?;
+        let bytes = descriptors
+            .iter()
+            .try_fold(8192u64, |n, (_, d)| n.checked_add(d.bytes))
+            .ok_or(WorkerError::Limit)?;
+        let reservation = Reservation::acquire(bytes).map_err(|_| WorkerError::Limit)?;
+        let mut assets = Vec::with_capacity(descriptors.len());
+        for (source, descriptor) in descriptors {
+            descriptor.validate()?;
+            if cancel.check().is_err() {
+                return Err(WorkerError::Timeout);
+            }
+            let mut file = File::from(
+                fs::memfd_create(
+                    "yonik-native-asset",
+                    fs::MemfdFlags::CLOEXEC | fs::MemfdFlags::ALLOW_SEALING,
+                )
+                .map_err(|_| WorkerError::Io)?,
+            );
+            fs::fchmod(&file, fs::Mode::RUSR | fs::Mode::WUSR).map_err(|_| WorkerError::Io)?;
+            let mut hash = Sha256::new();
+            if let Some(source) = source {
+                let mut buffer = [0; 8192];
+                let mut offset = 0;
+                while offset < descriptor.bytes {
+                    if cancel.check().is_err() {
+                        return Err(WorkerError::Timeout);
+                    }
+                    let n = source
+                        .read_at(
+                            &mut buffer[..(descriptor.bytes - offset).min(8192) as usize],
+                            offset,
+                        )
+                        .map_err(|_| WorkerError::Io)?;
+                    if n == 0 {
+                        return Err(WorkerError::Protocol);
+                    }
+                    file.write_all(&buffer[..n]).map_err(|_| WorkerError::Io)?;
+                    hash.update(&buffer[..n]);
+                    offset += n as u64;
+                }
+            } else {
+                let bytes = profile
+                    .resolver()
+                    .ok_or(WorkerError::Protocol)?
+                    .asset_bytes();
+                file.write_all(bytes).map_err(|_| WorkerError::Io)?;
+                hash.update(bytes);
+            }
+            if <[u8; 32]>::from(hash.finalize()) != descriptor.digest {
+                return Err(WorkerError::Protocol);
+            }
+            fs::fcntl_add_seals(
+                &file,
+                SealFlags::SEAL | SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK,
+            )
+            .map_err(|_| WorkerError::Io)?;
+            let file = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                .map_err(|_| WorkerError::Io)?;
+            validate_native(&file, descriptor)?;
+            assets.push(NativeAsset {
+                file,
+                descriptor,
+                _reservation: None,
+            });
+        }
+        profile
+            .revalidate(cancel)
+            .map_err(|_| WorkerError::Protocol)?;
+        Ok(Self {
+            assets,
+            _reservation: reservation,
+        })
+    }
+}
+pub(crate) fn preflight_native(
+    descriptors: impl IntoIterator<Item = NativeDescriptor>,
+) -> Result<(), WorkerError> {
+    let mut seen = [[0; 32]; 16];
+    let mut total = 8192u64;
+    for (count, d) in descriptors.into_iter().enumerate() {
+        d.validate()?;
+        if count == 16 || seen[..count].contains(&d.digest) {
+            return Err(WorkerError::Limit);
+        }
+        seen[count] = d.digest;
+        total = total
+            .checked_add(d.bytes)
+            .filter(|n| *n <= 64 * 1024 * 1024)
+            .ok_or(WorkerError::Limit)?;
+    }
+    Ok(())
+}
+pub(crate) fn validate_native(file: &File, d: NativeDescriptor) -> Result<(), WorkerError> {
+    d.validate()?;
+    let metadata = file.metadata().map_err(|_| WorkerError::Protocol)?;
+    if !metadata.is_file()
+        || metadata.len() != d.bytes
+        || fs::fcntl_getfl(file).map_err(|_| WorkerError::Protocol)? & OFlags::ACCMODE
+            != OFlags::RDONLY
+        || !fs::fcntl_get_seals(file)
+            .map_err(|_| WorkerError::Protocol)?
+            .contains(SealFlags::SEAL | SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK)
+    {
+        return Err(WorkerError::Protocol);
+    }
+    super::validate_file(file, d.bytes as usize, d.digest)
+}
+
 pub(super) struct OwnedResource {
     pub(super) file: File,
     pub(super) reference: ExternalRef,
@@ -127,6 +469,43 @@ impl OwnedResource {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profile_descriptor_layout_bounds_and_owned_names_are_exact() {
+        use super::{NativeDescriptor, NativeKind};
+        let descriptor = NativeDescriptor {
+            kind: NativeKind::DatDomains,
+            digest: [1; 32],
+            bytes: 64,
+            records: 1,
+            source: [0; 32],
+            flags: 0,
+        };
+        let bytes = descriptor.encode().unwrap();
+        assert_eq!(bytes.len(), 88);
+        assert_eq!(&bytes[..4], &[2, 1, 0, 0]);
+        assert_eq!(NativeDescriptor::decode(&bytes).unwrap(), descriptor);
+        assert_eq!(descriptor.name(), format!("r-{}.dat", "01".repeat(32)));
+        for end in 0..bytes.len() {
+            assert!(NativeDescriptor::decode(&bytes[..end]).is_err());
+        }
+        for index in [0, 1, 2, 3, 52, 87] {
+            let mut malformed = bytes;
+            malformed[index] ^= 128;
+            assert!(
+                NativeDescriptor::decode(&malformed).is_err(),
+                "byte {index}"
+            );
+        }
+        let mut snapshot = descriptor;
+        snapshot.kind = NativeKind::Resolver;
+        snapshot.source = [2; 32];
+        snapshot.records = 0;
+        snapshot.flags = 1;
+        assert_eq!(snapshot.name(), format!("dns-{}.bin", "01".repeat(32)));
+        assert!(NativeDescriptor::decode(&snapshot.encode().unwrap()).is_ok());
+        snapshot.bytes = 2 * 1024 * 1024 + 1;
+        assert!(snapshot.encode().is_err());
+    }
     use super::copy_owned;
     use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
     use sha2::{Digest, Sha256};

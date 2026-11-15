@@ -55,6 +55,7 @@ impl Write for ConfigBuffer {
 }
 
 pub struct CheckedConfig {
+    profile: Option<std::sync::Arc<super::local_profile_channel::Prepared>>,
     binary: BinarySnapshot,
     bytes: Vec<u8>,
     digest: ConfigDigest,
@@ -79,6 +80,35 @@ impl std::fmt::Debug for CheckedConfig {
     }
 }
 impl CheckedConfig {
+    pub async fn validate_full_profile(
+        binary: BinarySnapshot,
+        intent: yonik_engine::native_profile::ProfileIntent,
+        runtime: yonik_engine::native_profile::OwnedRuntimePlan,
+        cancel: &mut Cancellation,
+    ) -> Result<Self, HostError> {
+        if binary.engine != yonik_engine::Engine::Xray {
+            return Err(HostError::ConfigRejected);
+        }
+        let (profile, config) =
+            super::local_profile_channel::Prepared::prepare(intent, runtime, cancel)?;
+        let mut output = ConfigBuffer(Vec::new());
+        config
+            .write_sensitive(&mut output)
+            .map_err(|_| HostError::ConfigRejected)?;
+        process::verify_version(&binary, cancel).await?;
+        process::config_check_assets(&binary, &output.0, Some(profile.root_path()), cancel).await?;
+        profile.revalidate(cancel)?;
+        let digest = ConfigDigest::new(Sha256::digest(&output.0).into());
+        Ok(Self {
+            profile: Some(profile),
+            binary,
+            bytes: output.0,
+            digest,
+            port: config.listen_port(),
+            probe_port: config.probe_port(),
+            probe_access: config.into_probe_access(),
+        })
+    }
     pub async fn validate(
         binary: BinarySnapshot,
         config: CompiledConfig,
@@ -100,6 +130,7 @@ impl CheckedConfig {
         process::config_check(&binary, &bytes, cancel).await?;
         let digest = ConfigDigest::new(Sha256::digest(&bytes).into());
         Ok(Self {
+            profile: None,
             binary,
             bytes,
             digest,
@@ -113,6 +144,7 @@ impl CheckedConfig {
 /// Один владелец сериализует start/check/stop. На Drop — аварийный kill_on_drop;
 /// подтверждение cleanup выдаётся только после явного stop().await.
 pub struct LocalSession {
+    profile: Option<crate::helper::native_profile_channel::ProfileRuntime>,
     #[cfg(feature = "test-support")]
     cleanup_fault: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     event_log: Option<crate::event_log::EventLog>,
@@ -139,6 +171,7 @@ impl LocalSession {
             .map_err(|_| HostError::State)?;
         let id = NonZeroU64::new(id).ok_or(HostError::State)?;
         Ok(Self {
+            profile: None,
             #[cfg(feature = "test-support")]
             cleanup_fault: None,
             session: Session::new(id),
@@ -233,7 +266,11 @@ impl LocalSession {
         self.binary = Some(checked.binary);
         let result = async {
             let binary = self.binary.as_ref().ok_or(HostError::State)?;
-            self.child = Some(process::spawn(binary, false)?);
+            let launch=checked.profile.as_ref().map(|profile|profile.launch(*checked.digest.as_bytes(),cancel)).transpose()?;
+            self.child = Some(if let Some(launch)=&launch {process::spawn_profile(binary,false,Some(launch),None)?}else{process::spawn(binary,false)?});
+            // Image/actual child проверены до чувствительного stdin. HELLO
+            // ожидается issuer thread после stdin: Go сначала читает config.
+            if let Some(launch)=launch {self.profile=Some(launch.start(self.child.as_ref().ok_or(HostError::State)?,binary)?);}
             self.readers = Some(process::RuntimeReaders::attach(
                 self.child.as_mut().ok_or(HostError::State)?, binary.engine, self.event_log.clone(),
             )?);
@@ -245,7 +282,7 @@ impl LocalSession {
             let readiness = async {
                 loop {
                     if child.try_wait().map_err(|_| HostError::Process)?.is_some() { return Err(HostError::EngineExited); }
-                    if listeners_owned(child.id().ok_or(HostError::EngineExited)?, checked.port.get(), checked.probe_port.get())? { return Ok(()); }
+                    if self.profile.as_ref().is_none_or(crate::helper::native_profile_channel::ProfileRuntime::ready) && listeners_owned(child.id().ok_or(HostError::EngineExited)?, checked.port.get(), checked.probe_port.get())? { return Ok(()); }
                     sleep(Duration::from_millis(50)).await;
                 }
             };
@@ -329,6 +366,9 @@ impl LocalSession {
         self.release().await
     }
     async fn release(&mut self) -> Result<(), HostError> {
+        if let Some(profile) = &self.profile {
+            profile.revoke();
+        }
         if let Some(readers) = self.readers.take() {
             readers.stop().await;
         }
@@ -353,6 +393,9 @@ impl LocalSession {
         }
         self.log(crate::event_log::EventCode::CleanupConfirmed);
         self.child = None;
+        if let Some(mut profile) = self.profile.take() {
+            profile.confirmed_closed();
+        }
         self.binary = None;
         self.port = None;
         self.probe_port = None;

@@ -521,6 +521,12 @@ impl ProfileIntent {
     ) -> Result<CompiledProfileSystem, Error> {
         super::compile_profile_system(&self.profile()?, runtime)
     }
+    pub fn compile_local(
+        &self,
+        runtime: &OwnedRuntimePlan,
+    ) -> Result<crate::CompiledConfig, Error> {
+        super::compile_profile_local(&self.profile()?, runtime)
+    }
     fn outbound(&self, subject: &str) -> Result<&Outbound, Error> {
         self.wire
             .graph

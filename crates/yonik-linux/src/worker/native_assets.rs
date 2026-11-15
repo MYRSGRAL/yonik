@@ -104,7 +104,37 @@ pub(super) struct Assets {
     issued: bool,
     cleaned: bool,
 }
+struct AssetInput<'a> {
+    file: &'a File,
+    name: String,
+    bytes: u64,
+    digest: [u8; 32],
+}
 impl Assets {
+    pub(super) fn root_fd(&self) -> &File {
+        &self.root
+    }
+    pub(super) fn create_profile(
+        resources: &[super::native_resources::NativeAsset],
+        session: ResourceSession,
+        mode: WorkerMode,
+    ) -> Result<Self, WorkerError> {
+        super::native_resources::preflight_native(resources.iter().map(|a| a.descriptor))?;
+        for resource in resources {
+            super::native_resources::validate_native(&resource.file, resource.descriptor)?;
+        }
+        let proof = check_base(mode)?;
+        let inputs = resources
+            .iter()
+            .map(|a| AssetInput {
+                file: &a.file,
+                name: a.descriptor.name(),
+                bytes: a.descriptor.bytes,
+                digest: a.descriptor.digest,
+            })
+            .collect::<Vec<_>>();
+        Self::create_inputs(&inputs, session, mode, proof)
+    }
     pub(super) fn create(
         resources: &[OwnedResource],
         session: ResourceSession,
@@ -122,12 +152,37 @@ impl Assets {
         mode: WorkerMode,
         proof: ShmProof,
     ) -> Result<Self, WorkerError> {
-        let mut bytes = 8192u64;
         for resource in resources {
             super::native_resources::validate(&resource.file, &resource.reference)?;
+        }
+        let inputs = resources
+            .iter()
+            .map(|r| AssetInput {
+                file: &r.file,
+                name: format!("{}.dat", r.reference.tag()),
+                bytes: r.reference.bytes,
+                digest: r.reference.digest,
+            })
+            .collect::<Vec<_>>();
+        Self::create_inputs(&inputs, session, mode, proof)
+    }
+    fn create_inputs(
+        resources: &[AssetInput<'_>],
+        session: ResourceSession,
+        mode: WorkerMode,
+        proof: ShmProof,
+    ) -> Result<Self, WorkerError> {
+        if resources.len() > 16 {
+            return Err(WorkerError::Limit);
+        }
+        let mut bytes = 8192u64;
+        for resource in resources {
             bytes = bytes
-                .checked_add(resource.reference.bytes)
+                .checked_add(resource.bytes)
                 .ok_or(WorkerError::Limit)?;
+        }
+        if bytes > 64 * 1024 * 1024 {
+            return Err(WorkerError::Limit);
         }
         let reservation = Reservation::acquire(bytes).map_err(|_| WorkerError::Limit)?;
         let mut nonce = [0u8; 16];
@@ -187,7 +242,7 @@ impl Assets {
         };
         let started = std::time::Instant::now();
         for resource in resources {
-            let name = format!("{}.dat", resource.reference.tag());
+            let name = resource.name.clone();
             let mut file = File::from(
                 fs::openat(
                     &assets.root,
@@ -203,17 +258,17 @@ impl Assets {
                 name,
                 dev: metadata.dev(),
                 ino: metadata.ino(),
-                bytes: resource.reference.bytes,
-                digest: resource.reference.digest,
+                bytes: resource.bytes,
+                digest: resource.digest,
             });
             let mut buffer = [0u8; 8192];
             let mut offset = 0;
             let mut hash = Sha256::new();
-            while offset < resource.reference.bytes {
+            while offset < resource.bytes {
                 if started.elapsed() > super::TIMEOUT {
                     return Err(WorkerError::Timeout);
                 }
-                let length = (resource.reference.bytes - offset).min(buffer.len() as u64) as usize;
+                let length = (resource.bytes - offset).min(buffer.len() as u64) as usize;
                 let n = resource
                     .file
                     .read_at(&mut buffer[..length], offset)
@@ -225,19 +280,19 @@ impl Assets {
                 hash.update(&buffer[..n]);
                 offset += n as u64;
             }
-            if hash.finalize().as_slice() != resource.reference.digest
-                || file.metadata().map_err(io_error)?.len() != resource.reference.bytes
+            if hash.finalize().as_slice() != resource.digest
+                || file.metadata().map_err(io_error)?.len() != resource.bytes
             {
                 return Err(WorkerError::Protocol);
             }
             file.sync_all().map_err(io_error)?;
             let mut target = Sha256::new();
             offset = 0;
-            while offset < resource.reference.bytes {
+            while offset < resource.bytes {
                 if started.elapsed() > super::TIMEOUT {
                     return Err(WorkerError::Timeout);
                 }
-                let length = (resource.reference.bytes - offset).min(buffer.len() as u64) as usize;
+                let length = (resource.bytes - offset).min(buffer.len() as u64) as usize;
                 let n = file
                     .read_at(&mut buffer[..length], offset)
                     .map_err(io_error)?;
@@ -247,7 +302,7 @@ impl Assets {
                 target.update(&buffer[..n]);
                 offset += n as u64;
             }
-            if target.finalize().as_slice() != resource.reference.digest {
+            if target.finalize().as_slice() != resource.digest {
                 return Err(WorkerError::Protocol);
             }
             fs::fchmod(&file, Mode::RUSR).map_err(io_error)?;

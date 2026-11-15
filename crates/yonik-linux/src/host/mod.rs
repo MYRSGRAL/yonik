@@ -3,6 +3,7 @@ mod lifecycle_gate;
 #[cfg(feature = "test-support")]
 pub use lifecycle_gate::{LifecycleGate, LifecycleStage};
 mod binary;
+pub(crate) mod local_profile_channel;
 mod probe;
 mod process;
 mod session;
@@ -27,6 +28,7 @@ pub enum HostError {
     Version,
     Process,
     ConfigRejected,
+    Unsupported,
     Timeout,
     Cancelled,
     EngineExited,
@@ -46,6 +48,7 @@ impl fmt::Display for HostError {
             Self::Version => "Версия ядра не соответствует контракту",
             Self::Process => "Не удалось выполнить операцию процесса",
             Self::ConfigRejected => "Ядро отклонило конфигурацию",
+            Self::Unsupported => "Полный профиль недоступен для этого установленного ядра",
             Self::Timeout => "Превышено время операции",
             Self::Cancelled => "Операция отменена",
             Self::EngineExited => "Процесс ядра завершился",
