@@ -29,6 +29,7 @@ p3_review: scoped_clean
 p4_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A9d8c0a75-f89f-43f3-bf56-c9bac29fe61a
 p5_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A391a88b9-8afd-4ac6-ab7a-4e7c426ea289
 p45_base: 7d9ae80eb3977aa0c0b8766830b9de84346e5874
+p5_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A5e964ab1-96ea-4896-936e-19056eb05df7
 p3_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A5434d2cc-828c-4b95-9bca-caa3d24f6c63
 p3_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3Ac73e19e2-1c96-4434-a0a5-2023682cf7b6
 localdns_go_scope: approved
@@ -238,6 +239,12 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   и только module/export declarations mod.rs, без изменения P3 semantics.
   Shared writable files нет; frozen ABI260/старые receipts не изменять.
   Native/Host/services/network execution остаётся закрыто.
+- P5 preflight остановился без изменений: приложенный Agent Base Protocol
+  требовал недоступные write_file/replace, противореча scoped apply_patch.
+  Root явно отменил эти требования инструментов для P4/P5: source/docs через
+  apply_patch, read-only shell/Node и artifact/build операции разрешены.
+  Та же незавершённая P5 продолжена; работающий P4 получил это уточнение.
+  Scope/authority/runtime grants не расширялись, проверки ещё не выполнены.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
