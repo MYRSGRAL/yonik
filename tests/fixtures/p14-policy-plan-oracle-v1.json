@@ -1,0 +1,2031 @@
+{
+  "version": 1,
+  "classification": "SYNTHETIC_REFERENCE",
+  "profiles": {
+    "public": {
+      "yonik_policy": {
+        "version": 1,
+        "kind": "desired_data_only",
+        "bounds": {
+          "bytes": 262144,
+          "rows": 256,
+          "answers": 256,
+          "parallel_lookups": 2,
+          "lookup_deadline_ms": 10000
+        },
+        "desired": {
+          "version": 1,
+          "network_epoch": 1,
+          "engine_epoch": 2,
+          "resolver_epoch": 3,
+          "policy_transport": "udp",
+          "policy_route": "proxy",
+          "bootstrap_route": "direct",
+          "bootstrap": "9.9.9.9:53",
+          "bootstrap_transport": "tcp",
+          "vpns": [],
+          "fake_pools": [],
+          "reserved_constraints": []
+        },
+        "policy": {
+          "default_action": "block",
+          "user_rules": [
+            {
+              "id": 10,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "203.0.113.0/24"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            },
+            {
+              "id": 11,
+              "enabled": true,
+              "action": "proxy",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [],
+                "domains": [
+                  {
+                    "kind": "suffix",
+                    "name": "example.test"
+                  }
+                ]
+              },
+              "transport": {}
+            }
+          ],
+          "preset_rules": [
+            {
+              "id": 20,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "2001:db8::/32"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            }
+          ],
+          "lan": [
+            "192.168.0.0/16"
+          ],
+          "private_networks": [],
+          "private_domains": []
+        },
+        "dns": {
+          "mode": "real",
+          "upstream": "1.1.1.1:53",
+          "family_mask": 3,
+          "listen_port": 5353,
+          "fake_exclusions": [
+            {
+              "kind": "suffix",
+              "name": "internal.test"
+            }
+          ],
+          "require_mapping_lease": false
+        },
+        "requirements": {
+          "full_family": true,
+          "first_any_match": true,
+          "literal_only": true,
+          "private_ambiguity_terminal": true,
+          "no_public_private_fallback": true,
+          "no_local_reresolve": true,
+          "original_monotonic_deadline": true,
+          "positive_negative_cname_min_ttl": true,
+          "unknown_expired_fake_reject": true,
+          "fake_before_rules": true,
+          "epoch_nonreuse": true,
+          "fake_address_nonreuse": true,
+          "trusted_binding_before_every_dial": true,
+          "revoke_closes_sockets": true,
+          "service_paths_nonrecursive": true,
+          "established_tcp_ttl_close": false
+        }
+      }
+    },
+    "private": {
+      "yonik_policy": {
+        "version": 1,
+        "kind": "desired_data_only",
+        "bounds": {
+          "bytes": 262144,
+          "rows": 256,
+          "answers": 256,
+          "parallel_lookups": 2,
+          "lookup_deadline_ms": 10000
+        },
+        "desired": {
+          "version": 1,
+          "network_epoch": 1,
+          "engine_epoch": 2,
+          "resolver_epoch": 3,
+          "policy_transport": "udp",
+          "policy_route": "proxy",
+          "bootstrap_route": "direct",
+          "bootstrap": "9.9.9.9:53",
+          "bootstrap_transport": "tcp",
+          "vpns": [
+            {
+              "vpn": 7,
+              "ifname": "vpn7",
+              "table": 107,
+              "resolver": "10.0.0.53:53",
+              "transport": "tcp",
+              "excluded": false
+            }
+          ],
+          "fake_pools": [],
+          "reserved_constraints": []
+        },
+        "policy": {
+          "default_action": "block",
+          "user_rules": [
+            {
+              "id": 10,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "203.0.113.0/24"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            },
+            {
+              "id": 11,
+              "enabled": true,
+              "action": "proxy",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [],
+                "domains": [
+                  {
+                    "kind": "suffix",
+                    "name": "example.test"
+                  }
+                ]
+              },
+              "transport": {}
+            }
+          ],
+          "preset_rules": [
+            {
+              "id": 20,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "2001:db8::/32"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            }
+          ],
+          "lan": [
+            "192.168.0.0/16"
+          ],
+          "private_networks": [
+            {
+              "cidr": "10.0.0.0/8",
+              "vpn": 7,
+              "available": true
+            }
+          ],
+          "private_domains": []
+        },
+        "dns": {
+          "mode": "real",
+          "upstream": "1.1.1.1:53",
+          "family_mask": 3,
+          "listen_port": 5353,
+          "fake_exclusions": [
+            {
+              "kind": "suffix",
+              "name": "internal.test"
+            }
+          ],
+          "require_mapping_lease": false
+        },
+        "requirements": {
+          "full_family": true,
+          "first_any_match": true,
+          "literal_only": true,
+          "private_ambiguity_terminal": true,
+          "no_public_private_fallback": true,
+          "no_local_reresolve": true,
+          "original_monotonic_deadline": true,
+          "positive_negative_cname_min_ttl": true,
+          "unknown_expired_fake_reject": true,
+          "fake_before_rules": true,
+          "epoch_nonreuse": true,
+          "fake_address_nonreuse": true,
+          "trusted_binding_before_every_dial": true,
+          "revoke_closes_sockets": true,
+          "service_paths_nonrecursive": true,
+          "established_tcp_ttl_close": false
+        }
+      }
+    },
+    "unavailable": {
+      "yonik_policy": {
+        "version": 1,
+        "kind": "desired_data_only",
+        "bounds": {
+          "bytes": 262144,
+          "rows": 256,
+          "answers": 256,
+          "parallel_lookups": 2,
+          "lookup_deadline_ms": 10000
+        },
+        "desired": {
+          "version": 1,
+          "network_epoch": 1,
+          "engine_epoch": 2,
+          "resolver_epoch": 3,
+          "policy_transport": "udp",
+          "policy_route": "proxy",
+          "bootstrap_route": "direct",
+          "bootstrap": "9.9.9.9:53",
+          "bootstrap_transport": "tcp",
+          "vpns": [
+            {
+              "vpn": 7,
+              "ifname": "vpn7",
+              "table": 107,
+              "resolver": "10.0.0.53:53",
+              "transport": "tcp",
+              "excluded": false
+            }
+          ],
+          "fake_pools": [],
+          "reserved_constraints": []
+        },
+        "policy": {
+          "default_action": "block",
+          "user_rules": [
+            {
+              "id": 10,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "203.0.113.0/24"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            },
+            {
+              "id": 11,
+              "enabled": true,
+              "action": "proxy",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [],
+                "domains": [
+                  {
+                    "kind": "suffix",
+                    "name": "example.test"
+                  }
+                ]
+              },
+              "transport": {}
+            }
+          ],
+          "preset_rules": [
+            {
+              "id": 20,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "2001:db8::/32"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            }
+          ],
+          "lan": [
+            "192.168.0.0/16"
+          ],
+          "private_networks": [
+            {
+              "cidr": "10.0.0.0/8",
+              "vpn": 7,
+              "available": false
+            }
+          ],
+          "private_domains": []
+        },
+        "dns": {
+          "mode": "real",
+          "upstream": "1.1.1.1:53",
+          "family_mask": 3,
+          "listen_port": 5353,
+          "fake_exclusions": [
+            {
+              "kind": "suffix",
+              "name": "internal.test"
+            }
+          ],
+          "require_mapping_lease": false
+        },
+        "requirements": {
+          "full_family": true,
+          "first_any_match": true,
+          "literal_only": true,
+          "private_ambiguity_terminal": true,
+          "no_public_private_fallback": true,
+          "no_local_reresolve": true,
+          "original_monotonic_deadline": true,
+          "positive_negative_cname_min_ttl": true,
+          "unknown_expired_fake_reject": true,
+          "fake_before_rules": true,
+          "epoch_nonreuse": true,
+          "fake_address_nonreuse": true,
+          "trusted_binding_before_every_dial": true,
+          "revoke_closes_sockets": true,
+          "service_paths_nonrecursive": true,
+          "established_tcp_ttl_close": false
+        }
+      }
+    },
+    "zone": {
+      "yonik_policy": {
+        "version": 1,
+        "kind": "desired_data_only",
+        "bounds": {
+          "bytes": 262144,
+          "rows": 256,
+          "answers": 256,
+          "parallel_lookups": 2,
+          "lookup_deadline_ms": 10000
+        },
+        "desired": {
+          "version": 1,
+          "network_epoch": 1,
+          "engine_epoch": 2,
+          "resolver_epoch": 3,
+          "policy_transport": "udp",
+          "policy_route": "proxy",
+          "bootstrap_route": "direct",
+          "bootstrap": "9.9.9.9:53",
+          "bootstrap_transport": "tcp",
+          "vpns": [
+            {
+              "vpn": 7,
+              "ifname": "vpn7",
+              "table": 107,
+              "resolver": "10.0.0.53:53",
+              "transport": "tcp",
+              "excluded": false
+            }
+          ],
+          "fake_pools": [],
+          "reserved_constraints": []
+        },
+        "policy": {
+          "default_action": "block",
+          "user_rules": [
+            {
+              "id": 10,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "203.0.113.0/24"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            },
+            {
+              "id": 11,
+              "enabled": true,
+              "action": "proxy",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [],
+                "domains": [
+                  {
+                    "kind": "suffix",
+                    "name": "example.test"
+                  }
+                ]
+              },
+              "transport": {}
+            }
+          ],
+          "preset_rules": [
+            {
+              "id": 20,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "2001:db8::/32"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            }
+          ],
+          "lan": [
+            "192.168.0.0/16"
+          ],
+          "private_networks": [
+            {
+              "cidr": "10.0.0.0/8",
+              "vpn": 7,
+              "available": true
+            }
+          ],
+          "private_domains": [
+            {
+              "domain": {
+                "kind": "suffix",
+                "name": "internal.test"
+              },
+              "vpn": 7,
+              "available": true
+            }
+          ]
+        },
+        "dns": {
+          "mode": "real",
+          "upstream": "1.1.1.1:53",
+          "family_mask": 3,
+          "listen_port": 5353,
+          "fake_exclusions": [
+            {
+              "kind": "suffix",
+              "name": "internal.test"
+            }
+          ],
+          "require_mapping_lease": false
+        },
+        "requirements": {
+          "full_family": true,
+          "first_any_match": true,
+          "literal_only": true,
+          "private_ambiguity_terminal": true,
+          "no_public_private_fallback": true,
+          "no_local_reresolve": true,
+          "original_monotonic_deadline": true,
+          "positive_negative_cname_min_ttl": true,
+          "unknown_expired_fake_reject": true,
+          "fake_before_rules": true,
+          "epoch_nonreuse": true,
+          "fake_address_nonreuse": true,
+          "trusted_binding_before_every_dial": true,
+          "revoke_closes_sockets": true,
+          "service_paths_nonrecursive": true,
+          "established_tcp_ttl_close": false
+        }
+      }
+    },
+    "zone_down": {
+      "yonik_policy": {
+        "version": 1,
+        "kind": "desired_data_only",
+        "bounds": {
+          "bytes": 262144,
+          "rows": 256,
+          "answers": 256,
+          "parallel_lookups": 2,
+          "lookup_deadline_ms": 10000
+        },
+        "desired": {
+          "version": 1,
+          "network_epoch": 1,
+          "engine_epoch": 2,
+          "resolver_epoch": 3,
+          "policy_transport": "udp",
+          "policy_route": "proxy",
+          "bootstrap_route": "direct",
+          "bootstrap": "9.9.9.9:53",
+          "bootstrap_transport": "tcp",
+          "vpns": [
+            {
+              "vpn": 7,
+              "ifname": "vpn7",
+              "table": 107,
+              "resolver": "10.0.0.53:53",
+              "transport": "tcp",
+              "excluded": false
+            }
+          ],
+          "fake_pools": [],
+          "reserved_constraints": []
+        },
+        "policy": {
+          "default_action": "block",
+          "user_rules": [
+            {
+              "id": 10,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "203.0.113.0/24"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            },
+            {
+              "id": 11,
+              "enabled": true,
+              "action": "proxy",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [],
+                "domains": [
+                  {
+                    "kind": "suffix",
+                    "name": "example.test"
+                  }
+                ]
+              },
+              "transport": {}
+            }
+          ],
+          "preset_rules": [
+            {
+              "id": 20,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "2001:db8::/32"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            }
+          ],
+          "lan": [
+            "192.168.0.0/16"
+          ],
+          "private_networks": [
+            {
+              "cidr": "10.0.0.0/8",
+              "vpn": 7,
+              "available": true
+            }
+          ],
+          "private_domains": [
+            {
+              "domain": {
+                "kind": "suffix",
+                "name": "internal.test"
+              },
+              "vpn": 7,
+              "available": false
+            }
+          ]
+        },
+        "dns": {
+          "mode": "real",
+          "upstream": "1.1.1.1:53",
+          "family_mask": 3,
+          "listen_port": 5353,
+          "fake_exclusions": [
+            {
+              "kind": "suffix",
+              "name": "internal.test"
+            }
+          ],
+          "require_mapping_lease": false
+        },
+        "requirements": {
+          "full_family": true,
+          "first_any_match": true,
+          "literal_only": true,
+          "private_ambiguity_terminal": true,
+          "no_public_private_fallback": true,
+          "no_local_reresolve": true,
+          "original_monotonic_deadline": true,
+          "positive_negative_cname_min_ttl": true,
+          "unknown_expired_fake_reject": true,
+          "fake_before_rules": true,
+          "epoch_nonreuse": true,
+          "fake_address_nonreuse": true,
+          "trusted_binding_before_every_dial": true,
+          "revoke_closes_sockets": true,
+          "service_paths_nonrecursive": true,
+          "established_tcp_ttl_close": false
+        }
+      }
+    },
+    "fake": {
+      "yonik_policy": {
+        "version": 1,
+        "kind": "desired_data_only",
+        "bounds": {
+          "bytes": 262144,
+          "rows": 256,
+          "answers": 256,
+          "parallel_lookups": 2,
+          "lookup_deadline_ms": 10000
+        },
+        "desired": {
+          "version": 1,
+          "network_epoch": 1,
+          "engine_epoch": 2,
+          "resolver_epoch": 3,
+          "policy_transport": "udp",
+          "policy_route": "proxy",
+          "bootstrap_route": "direct",
+          "bootstrap": "9.9.9.9:53",
+          "bootstrap_transport": "tcp",
+          "vpns": [],
+          "fake_pools": [
+            "198.18.0.0/15"
+          ],
+          "reserved_constraints": []
+        },
+        "policy": {
+          "default_action": "block",
+          "user_rules": [
+            {
+              "id": 10,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "203.0.113.0/24"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            },
+            {
+              "id": 11,
+              "enabled": true,
+              "action": "proxy",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [],
+                "domains": [
+                  {
+                    "kind": "suffix",
+                    "name": "example.test"
+                  }
+                ]
+              },
+              "transport": {}
+            }
+          ],
+          "preset_rules": [
+            {
+              "id": 20,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "2001:db8::/32"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            }
+          ],
+          "lan": [
+            "192.168.0.0/16"
+          ],
+          "private_networks": [],
+          "private_domains": []
+        },
+        "dns": {
+          "mode": "fake_ip",
+          "upstream": "1.1.1.1:53",
+          "family_mask": 3,
+          "listen_port": 5353,
+          "fake_exclusions": [
+            {
+              "kind": "suffix",
+              "name": "internal.test"
+            }
+          ],
+          "require_mapping_lease": true
+        },
+        "requirements": {
+          "full_family": true,
+          "first_any_match": true,
+          "literal_only": true,
+          "private_ambiguity_terminal": true,
+          "no_public_private_fallback": true,
+          "no_local_reresolve": true,
+          "original_monotonic_deadline": true,
+          "positive_negative_cname_min_ttl": true,
+          "unknown_expired_fake_reject": true,
+          "fake_before_rules": true,
+          "epoch_nonreuse": true,
+          "fake_address_nonreuse": true,
+          "trusted_binding_before_every_dial": true,
+          "revoke_closes_sockets": true,
+          "service_paths_nonrecursive": true,
+          "established_tcp_ttl_close": false
+        }
+      }
+    },
+    "two_vpns": {
+      "yonik_policy": {
+        "version": 1,
+        "kind": "desired_data_only",
+        "bounds": {
+          "bytes": 262144,
+          "rows": 256,
+          "answers": 256,
+          "parallel_lookups": 2,
+          "lookup_deadline_ms": 10000
+        },
+        "desired": {
+          "version": 1,
+          "network_epoch": 1,
+          "engine_epoch": 2,
+          "resolver_epoch": 3,
+          "policy_transport": "udp",
+          "policy_route": "proxy",
+          "bootstrap_route": "direct",
+          "bootstrap": "9.9.9.9:53",
+          "bootstrap_transport": "tcp",
+          "vpns": [
+            {
+              "vpn": 7,
+              "ifname": "vpn7",
+              "table": 107,
+              "resolver": "10.0.0.53:53",
+              "transport": "tcp",
+              "excluded": false
+            },
+            {
+              "vpn": 8,
+              "ifname": "vpn8",
+              "table": 108,
+              "resolver": "172.16.0.53:53",
+              "transport": "tcp",
+              "excluded": false
+            }
+          ],
+          "fake_pools": [],
+          "reserved_constraints": []
+        },
+        "policy": {
+          "default_action": "block",
+          "user_rules": [
+            {
+              "id": 10,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "203.0.113.0/24"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            },
+            {
+              "id": 11,
+              "enabled": true,
+              "action": "proxy",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [],
+                "domains": [
+                  {
+                    "kind": "suffix",
+                    "name": "example.test"
+                  }
+                ]
+              },
+              "transport": {}
+            }
+          ],
+          "preset_rules": [
+            {
+              "id": 20,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "2001:db8::/32"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            }
+          ],
+          "lan": [
+            "192.168.0.0/16"
+          ],
+          "private_networks": [
+            {
+              "cidr": "10.0.0.0/8",
+              "vpn": 7,
+              "available": true
+            },
+            {
+              "cidr": "172.16.0.0/12",
+              "vpn": 8,
+              "available": true
+            }
+          ],
+          "private_domains": []
+        },
+        "dns": {
+          "mode": "real",
+          "upstream": "1.1.1.1:53",
+          "family_mask": 3,
+          "listen_port": 5353,
+          "fake_exclusions": [
+            {
+              "kind": "suffix",
+              "name": "internal.test"
+            }
+          ],
+          "require_mapping_lease": false
+        },
+        "requirements": {
+          "full_family": true,
+          "first_any_match": true,
+          "literal_only": true,
+          "private_ambiguity_terminal": true,
+          "no_public_private_fallback": true,
+          "no_local_reresolve": true,
+          "original_monotonic_deadline": true,
+          "positive_negative_cname_min_ttl": true,
+          "unknown_expired_fake_reject": true,
+          "fake_before_rules": true,
+          "epoch_nonreuse": true,
+          "fake_address_nonreuse": true,
+          "trusted_binding_before_every_dial": true,
+          "revoke_closes_sockets": true,
+          "service_paths_nonrecursive": true,
+          "established_tcp_ttl_close": false
+        }
+      }
+    },
+    "fake_private": {
+      "yonik_policy": {
+        "version": 1,
+        "kind": "desired_data_only",
+        "bounds": {
+          "bytes": 262144,
+          "rows": 256,
+          "answers": 256,
+          "parallel_lookups": 2,
+          "lookup_deadline_ms": 10000
+        },
+        "desired": {
+          "version": 1,
+          "network_epoch": 1,
+          "engine_epoch": 2,
+          "resolver_epoch": 3,
+          "policy_transport": "udp",
+          "policy_route": "proxy",
+          "bootstrap_route": "direct",
+          "bootstrap": "9.9.9.9:53",
+          "bootstrap_transport": "tcp",
+          "vpns": [
+            {
+              "vpn": 7,
+              "ifname": "vpn7",
+              "table": 107,
+              "resolver": "10.0.0.53:53",
+              "transport": "tcp",
+              "excluded": false
+            }
+          ],
+          "fake_pools": [
+            "198.18.0.0/15"
+          ],
+          "reserved_constraints": []
+        },
+        "policy": {
+          "default_action": "block",
+          "user_rules": [
+            {
+              "id": 10,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "203.0.113.0/24"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            },
+            {
+              "id": 11,
+              "enabled": true,
+              "action": "proxy",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [],
+                "domains": [
+                  {
+                    "kind": "suffix",
+                    "name": "example.test"
+                  }
+                ]
+              },
+              "transport": {}
+            }
+          ],
+          "preset_rules": [
+            {
+              "id": 20,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "2001:db8::/32"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            }
+          ],
+          "lan": [
+            "192.168.0.0/16"
+          ],
+          "private_networks": [
+            {
+              "cidr": "10.0.0.0/8",
+              "vpn": 7,
+              "available": true
+            }
+          ],
+          "private_domains": []
+        },
+        "dns": {
+          "mode": "fake_ip",
+          "upstream": "1.1.1.1:53",
+          "family_mask": 3,
+          "listen_port": 5353,
+          "fake_exclusions": [
+            {
+              "kind": "suffix",
+              "name": "internal.test"
+            }
+          ],
+          "require_mapping_lease": true
+        },
+        "requirements": {
+          "full_family": true,
+          "first_any_match": true,
+          "literal_only": true,
+          "private_ambiguity_terminal": true,
+          "no_public_private_fallback": true,
+          "no_local_reresolve": true,
+          "original_monotonic_deadline": true,
+          "positive_negative_cname_min_ttl": true,
+          "unknown_expired_fake_reject": true,
+          "fake_before_rules": true,
+          "epoch_nonreuse": true,
+          "fake_address_nonreuse": true,
+          "trusted_binding_before_every_dial": true,
+          "revoke_closes_sockets": true,
+          "service_paths_nonrecursive": true,
+          "established_tcp_ttl_close": false
+        }
+      }
+    },
+    "fake_unavailable": {
+      "yonik_policy": {
+        "version": 1,
+        "kind": "desired_data_only",
+        "bounds": {
+          "bytes": 262144,
+          "rows": 256,
+          "answers": 256,
+          "parallel_lookups": 2,
+          "lookup_deadline_ms": 10000
+        },
+        "desired": {
+          "version": 1,
+          "network_epoch": 1,
+          "engine_epoch": 2,
+          "resolver_epoch": 3,
+          "policy_transport": "udp",
+          "policy_route": "proxy",
+          "bootstrap_route": "direct",
+          "bootstrap": "9.9.9.9:53",
+          "bootstrap_transport": "tcp",
+          "vpns": [
+            {
+              "vpn": 7,
+              "ifname": "vpn7",
+              "table": 107,
+              "resolver": "10.0.0.53:53",
+              "transport": "tcp",
+              "excluded": false
+            }
+          ],
+          "fake_pools": [
+            "198.18.0.0/15"
+          ],
+          "reserved_constraints": []
+        },
+        "policy": {
+          "default_action": "block",
+          "user_rules": [
+            {
+              "id": 10,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "203.0.113.0/24"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            },
+            {
+              "id": 11,
+              "enabled": true,
+              "action": "proxy",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [],
+                "domains": [
+                  {
+                    "kind": "suffix",
+                    "name": "example.test"
+                  }
+                ]
+              },
+              "transport": {}
+            }
+          ],
+          "preset_rules": [
+            {
+              "id": 20,
+              "enabled": true,
+              "action": "direct",
+              "source": {
+                "executables": [],
+                "platform_sources": []
+              },
+              "destination": {
+                "cidrs": [
+                  "2001:db8::/32"
+                ],
+                "domains": []
+              },
+              "transport": {}
+            }
+          ],
+          "lan": [
+            "192.168.0.0/16"
+          ],
+          "private_networks": [
+            {
+              "cidr": "10.0.0.0/8",
+              "vpn": 7,
+              "available": false
+            }
+          ],
+          "private_domains": []
+        },
+        "dns": {
+          "mode": "fake_ip",
+          "upstream": "1.1.1.1:53",
+          "family_mask": 3,
+          "listen_port": 5353,
+          "fake_exclusions": [
+            {
+              "kind": "suffix",
+              "name": "internal.test"
+            }
+          ],
+          "require_mapping_lease": true
+        },
+        "requirements": {
+          "full_family": true,
+          "first_any_match": true,
+          "literal_only": true,
+          "private_ambiguity_terminal": true,
+          "no_public_private_fallback": true,
+          "no_local_reresolve": true,
+          "original_monotonic_deadline": true,
+          "positive_negative_cname_min_ttl": true,
+          "unknown_expired_fake_reject": true,
+          "fake_before_rules": true,
+          "epoch_nonreuse": true,
+          "fake_address_nonreuse": true,
+          "trusted_binding_before_every_dial": true,
+          "revoke_closes_sockets": true,
+          "service_paths_nonrecursive": true,
+          "established_tcp_ttl_close": false
+        }
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "D-01/private",
+      "profile": "private",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "10.1.2.3"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "private_vpn",
+        "origin": "private_network",
+        "vpn": 7
+      }
+    },
+    {
+      "id": "D-01/unavailable",
+      "profile": "unavailable",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "10.1.2.3"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "block",
+        "origin": "private_network",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-02/personal",
+      "profile": "public",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "2001:db8::1"
+        ],
+        "a": "nodata",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "proxy",
+        "origin": "user:11",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-03/rrset",
+      "profile": "public",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1",
+          "2001:db8::1"
+        ],
+        "a": "answer",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "direct",
+        "origin": "user:10",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-03/literal",
+      "profile": "public",
+      "observation": {
+        "kind": "literal",
+        "name": "example.test",
+        "addresses": [
+          "2001:db8::1"
+        ],
+        "a": "nodata",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "proxy",
+        "origin": "user:11",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-04/mixed",
+      "profile": "private",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "10.1.2.3",
+          "203.0.113.1"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "dns_policy_ambiguous"
+      }
+    },
+    {
+      "id": "D-05/timeout",
+      "profile": "private",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [],
+        "a": "timeout",
+        "aaaa": "timeout",
+        "resolution": "failed",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "dns_policy_unresolved"
+      }
+    },
+    {
+      "id": "D-05/servfail",
+      "profile": "private",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [],
+        "a": "servfail",
+        "aaaa": "servfail",
+        "resolution": "failed",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "dns_policy_unresolved"
+      }
+    },
+    {
+      "id": "D-05/partial",
+      "profile": "private",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1"
+        ],
+        "a": "answer",
+        "aaaa": "timeout",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "dns_policy_unresolved"
+      }
+    },
+    {
+      "id": "D-05/nodata",
+      "profile": "public",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "direct",
+        "origin": "user:10",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-05/all_nodata",
+      "profile": "private",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [],
+        "a": "nodata",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "dns_policy_unresolved"
+      }
+    },
+    {
+      "id": "D-06/down",
+      "profile": "zone_down",
+      "observation": {
+        "kind": "name",
+        "name": "host.internal.test",
+        "addresses": [],
+        "a": "unqueried",
+        "aaaa": "unqueried",
+        "resolution": "missing",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "block",
+        "origin": "private_domain",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-06/return",
+      "profile": "zone",
+      "observation": {
+        "kind": "name",
+        "name": "host.internal.test",
+        "addresses": [],
+        "a": "unqueried",
+        "aaaa": "unqueried",
+        "resolution": "missing",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "need_resolution",
+        "vpn": 7
+      }
+    },
+    {
+      "id": "D-06/private_answer",
+      "profile": "zone",
+      "observation": {
+        "kind": "name",
+        "name": "host.internal.test",
+        "addresses": [
+          "10.1.2.3"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 7,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "private_vpn",
+        "origin": "private_domain",
+        "vpn": 7
+      }
+    },
+    {
+      "id": "D-07/expiry",
+      "profile": "private",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1",
+          "2001:db8::1"
+        ],
+        "a": "answer",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 10,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "need_resolution",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-07/network",
+      "profile": "private",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1",
+          "2001:db8::1"
+        ],
+        "a": "answer",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          2,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "need_resolution",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-07/engine",
+      "profile": "private",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1",
+          "2001:db8::1"
+        ],
+        "a": "answer",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          3,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "need_resolution",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-07/resolver",
+      "profile": "private",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1",
+          "2001:db8::1"
+        ],
+        "a": "answer",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          4
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "need_resolution",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-07/fake_none",
+      "profile": "fake",
+      "observation": {
+        "kind": "fake",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1",
+          "2001:db8::1"
+        ],
+        "a": "answer",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "unknown_fake_mapping"
+      }
+    },
+    {
+      "id": "D-07/fake_expired",
+      "profile": "fake",
+      "observation": {
+        "kind": "fake",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1",
+          "2001:db8::1"
+        ],
+        "a": "answer",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "expired"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "unknown_fake_mapping"
+      }
+    },
+    {
+      "id": "D-07/fake_stale",
+      "profile": "fake",
+      "observation": {
+        "kind": "fake",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1",
+          "2001:db8::1"
+        ],
+        "a": "answer",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "stale"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "unknown_fake_mapping"
+      }
+    },
+    {
+      "id": "D-07/fake_valid",
+      "profile": "fake",
+      "observation": {
+        "kind": "fake",
+        "name": "example.test",
+        "addresses": [
+          "203.0.113.1",
+          "2001:db8::1"
+        ],
+        "a": "answer",
+        "aaaa": "answer",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "valid"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "direct",
+        "origin": "user:10",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-04/two_vpns",
+      "profile": "two_vpns",
+      "observation": {
+        "kind": "name",
+        "name": "example.test",
+        "addresses": [
+          "10.1.2.3",
+          "172.16.1.2"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "dns_policy_ambiguous"
+      }
+    },
+    {
+      "id": "D-01/fake_private_available",
+      "profile": "fake_private",
+      "observation": {
+        "kind": "fake",
+        "name": "example.test",
+        "addresses": [
+          "10.1.2.3"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "valid"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "private_vpn",
+        "origin": "private_network",
+        "vpn": 7
+      }
+    },
+    {
+      "id": "D-01/fake_private_unavailable",
+      "profile": "fake_unavailable",
+      "observation": {
+        "kind": "fake",
+        "name": "example.test",
+        "addresses": [
+          "10.1.2.3"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "valid"
+      },
+      "expected": {
+        "kind": "decided",
+        "route": "block",
+        "origin": "private_network",
+        "vpn": 0
+      }
+    },
+    {
+      "id": "D-07/fake_private_public_ambiguity",
+      "profile": "fake_private",
+      "observation": {
+        "kind": "fake",
+        "name": "example.test",
+        "addresses": [
+          "10.1.2.3",
+          "203.0.113.1"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "valid"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "dns_policy_ambiguous"
+      }
+    },
+    {
+      "id": "D-06/fresh_policy_wrong_resolver",
+      "profile": "zone",
+      "observation": {
+        "kind": "name",
+        "name": "host.internal.test",
+        "addresses": [
+          "10.1.2.3"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 0,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "wrong_resolver"
+      }
+    },
+    {
+      "id": "D-06/fresh_wrong_vpn_resolver",
+      "profile": "zone",
+      "observation": {
+        "kind": "name",
+        "name": "host.internal.test",
+        "addresses": [
+          "10.1.2.3"
+        ],
+        "a": "answer",
+        "aaaa": "nodata",
+        "resolution": "answer",
+        "now": 1,
+        "expires_at": 10,
+        "epoch": [
+          1,
+          2,
+          3
+        ],
+        "path": 8,
+        "mapping": "none"
+      },
+      "expected": {
+        "kind": "rejected",
+        "error": "wrong_resolver"
+      }
+    }
+  ],
+  "missing": [
+    {
+      "id": "D-05/family_error_classes",
+      "status": "NOT_IMPLEMENTED",
+      "seam": "AnswerSet.complete and Resolution::Failed collapse per-family errors; no DNS executor invoked"
+    },
+    {
+      "id": "D-07/nonreuse",
+      "status": "NOT_IMPLEMENTED",
+      "seam": "DnsEpoch/FakeMapping accept observations; no public allocator/restart persistence or socket revocation API"
+    }
+  ]
+}
