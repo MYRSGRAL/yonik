@@ -27,6 +27,8 @@ p3_candidate: d380fa0b5096679e4f0fbde1363262430e951f92
 p3_candidate_status: source_compile_gate_accepted
 p3_review: scoped_clean
 p4_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A9d8c0a75-f89f-43f3-bf56-c9bac29fe61a
+p4_partial_candidate: 6acfecb459a9d60c59a6cb794c89ea0b578965ff
+p4_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3Ac77cd132-0611-4814-b7e3-9bcb3da5f8b8
 p5_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A391a88b9-8afd-4ac6-ab7a-4e7c426ea289
 p45_base: 7d9ae80eb3977aa0c0b8766830b9de84346e5874
 p5_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A5e964ab1-96ea-4896-936e-19056eb05df7
@@ -245,6 +247,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   apply_patch, read-only shell/Node и artifact/build операции разрешены.
   Та же незавершённая P5 продолжена; работающий P4 получил это уточнение.
   Scope/authority/runtime grants не расширялись, проверки ещё не выполнены.
+- P4 6acfecb — partial DNS context patch, builder не подключён. Один чистый
+  cancel-query test и main compile-only PASS по evidence автора; RED отсутствует.
+  Grants/observatory/shared transports не реализованы, P4 gate не закрыт.
+  Автор продолжает SOURCE/design разбор точного production issuer и отдельного
+  carrier, без новых Go/build изменений. P5 уведомлён, сохраняет native gate.
+  Root подтвердил Rust привязки: RuntimeScopeStamp.context берёт фиксированный
+  digest/session/generation/invocation/epoch из VerifiedCoverage.expected;
+  YNKROLE1 и DATA4 связывают этот контекст, bind_run одноразовый. Это не
+  доказательство допустимости новой authority из session metadata.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
