@@ -29,6 +29,7 @@ p3_review: scoped_clean
 p4_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A9d8c0a75-f89f-43f3-bf56-c9bac29fe61a
 p4_partial_candidate: 6acfecb459a9d60c59a6cb794c89ea0b578965ff
 p4_issuer_proposal: 57f929683feb959ad87fd5e503acf3ee1932df0a
+p4_issuer_revision2: dccd92659ebca1818678ab1e734d39a0cf45767c
 p4_design_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A957fec20-7af1-463b-abd0-6e5975f32de5
 p4_design_correction_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A6cd9109e-9343-4dd0-b30d-20a1013cba79
 p4_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3Ac77cd132-0611-4814-b7e3-9bcb3da5f8b8
@@ -278,6 +279,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   custody и SessionArtifact dispatch ещё отсутствуют. Та же P5 продолжена для
   этих независимых scoped частей с native availability=false до carrier admission.
   P4/P5 gates не закрыты; эти candidates не интегрированы.
+- P4 revision2 dccd926 дополнил typed tables/state/caps/replay/cancel/DNS и
+  отдельный YNKEXT01 sideband без изменения frozen records. Local normal Host,
+  System required=true/единый owner backend сохранены. Root ещё не принимает
+  wire final: canonical stream-settings/P5 codec mapping и operational
+  direct-dynamic/resolver custody требуют согласования. P5 получил точные
+  вопросы; действующий firewall default-drop + exact BoundTransport сам по себе
+  не разрешает произвольный direct egress. Дополнительные files не изменять
+  до reviewable design/scope approval.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
