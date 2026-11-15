@@ -116,11 +116,11 @@ fn parse(original: &str) -> Result<Parsed, FatalError> {
     let decoded;
     let content = if envelope {
         decoded = crate::decode::base64_text(cleaned)?;
-        decoded.trim_start_matches('\u{feff}').trim()
+        decoded.trim_start_matches('\u{feff}')
     } else {
-        cleaned
+        original.trim_start_matches('\u{feff}')
     };
-    if !content.starts_with(['{', '[']) {
+    if !content.trim_start().starts_with(['{', '[']) {
         if !content.contains("://") {
             return Err(FatalError::UnsupportedFormat);
         }
@@ -136,6 +136,7 @@ fn parse(original: &str) -> Result<Parsed, FatalError> {
             envelope,
         ));
     }
+    let content = content.trim();
     crate::decode::json_depth(content)?;
     let checkpoint = crate::Checkpoint {
         proceed: &|| true,
@@ -177,7 +178,7 @@ fn parse(original: &str) -> Result<Parsed, FatalError> {
                 serde_json::from_str(node.get()).map_err(|_| FatalError::UnsupportedFormat)?;
             if fields.contains_key("type")
                 || !fields.get("protocol").is_some_and(|v| {
-                    serde_json::from_str::<&str>(v.get()).is_ok_and(|s| !s.is_empty())
+                    serde_json::from_str::<String>(v.get()).is_ok_and(|s| !s.is_empty())
                 })
             {
                 return Err(FatalError::UnsupportedFormat);

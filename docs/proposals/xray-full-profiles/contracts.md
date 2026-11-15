@@ -86,9 +86,27 @@ probe destination (scheme/host/port/path и политику redirects), allowed
 physical leaves, transport policy, expiry и caps. Binding проверяется на каждом
 open/reuse; DNS resolution/rebinding и redirect не расширяют destinations.
 
-`SessionHandle.OpenProbe(destination, subject)` выдаёт закрытый flow consumer
-только при точном binding; `OpenLogical(subject, destination, transport)`
-проверяет каждый logical stream даже при готовом pooled physical connection.
+Для пользовательского трафика требуется отдельный непрозрачный `FlowGrant`.
+Его выдаёт только trusted ingress issuer из аутентифицированного исходного
+flow и проверенного policy decision. Grant связывает source flow identity,
+исходную attribution и её provenance/required-флаг, исходное назначение,
+разрешённые destination/subject/chain, session identity, runtime digest,
+generation, expiry и cancellation. Ни session credential, ни provider graph,
+ни callback context сами по себе не заменяют исходный flow proof. Нельзя
+копировать attribution первого потока на остальные потоки общего transport.
+
+`SessionHandle.OpenLogical(flowGrant, subject, destination, transport)` проверяет
+этот grant и актуальный исходный flow proof при каждом logical open/reuse,
+даже при готовом pooled physical connection. Изменение resolved destination,
+chain или policy decision не расширяет grant; требуется новое проверенное
+решение issuer. Callback не может создать FlowGrant из SessionHandle.
+
+Observatory использует отдельный `ProbeGrant`, а не пользовательский FlowGrant.
+Trusted service issuer выдаёт его только из admitted runtime manifest при
+совпадении authenticated run, digest/generation, probe destination, subject,
+expiry и cancellation. Такой grant помечает служебный трафик и не приписывает
+ему process attribution пользовательского запроса.
+`SessionHandle.OpenProbe(probeGrant, destination, subject)` проверяет оба binding.
 Неверный digest/generation, unknown/expired/revoked session и missing consumer
 дают denial до dial. Provider tag — только проверяемое имя, никогда credential.
 Никакого fallback на root context. Выдача capability и revoke линеаризованы:
@@ -105,9 +123,13 @@ Caps обязательны на session/pool/physical/logical counts, pending o
 idle lifetime; checked counters резервируются до allocation/dial, возвращаются
 на error/cancel. Reconnect заново проверяет binding и egress authorization.
 
-gRPC callback получает trusted sealed session handoff от admitted transport
-factory, а не из произвольного callback context. Callback заново открывает
-проверенный logical consumer; missing handoff — denial. UDP PacketConn wrapper
+gRPC callback получает от admitted transport factory trusted handoff с session
+binding и соответствующим FlowGrant либо ProbeGrant, а не просто SessionHandle
+или произвольный callback context. При открытии/reuse logical stream callback
+повторно проверяет grant, исходный flow proof и cancellation; его отсутствие,
+чужое происхождение, устаревание или отзыв дают denial. Session-owned физический
+reconnect отдельно проверяет transport manifest и не создаёт logical grant.
+UDP PacketConn wrapper
 сохраняет необходимые Hysteria type-switch интерфейсы, но не отдаёт наружу
 незащищённый socket. Read/Write/ReadFrom/WriteTo/Close/deadlines проходят ownership
 и revoke guards; destination ограничен manifest. Close idempotent; release ровно
@@ -116,7 +138,10 @@ factory, а не из произвольного callback context. Callback за
 
 Обязательные P4 тесты — in-memory fake connections: denial без capability,
 wrong digest/generation/subject/destination, callback handoff, два logical streams
-с отменой одного, reconnect, caps и конкурентный revoke/dial/close. P5 отдельно
+с разными исходными flow grants и отменой одного, reconnect, caps и конкурентный
+revoke/dial/close. При действующей session отсутствующий, чужой или отменённый
+FlowGrant отвергается, включая callback и reused transport. Служебный ProbeGrant
+не принимается вместо пользовательского FlowGrant и наоборот. P5 отдельно
 проверяет все routes/provenance и stale prepare без allow-all worker UID.
 
 ## Существующие SOURCE invariants и недостающие доказательства

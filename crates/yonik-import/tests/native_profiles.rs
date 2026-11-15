@@ -50,6 +50,34 @@ fn uri_and_single_base64_keep_server_api() {
 }
 
 #[test]
+fn escaped_protocol_keeps_exact_root_bytes() {
+    let root = r#"{"outbounds":[{"protocol":"v\u006cess"}]}"#;
+    for text in [root.to_owned(), STANDARD.encode(root)] {
+        let report = import_profiles(text.as_bytes().to_vec()).unwrap();
+        let ProfileEntry::Xray(profile) = &report.entries[0] else {
+            panic!("Полный профиль превратился в сервер")
+        };
+        assert_eq!(profile.source().expose(), root);
+        assert_eq!(report.original().expose(), text);
+    }
+}
+
+#[test]
+fn uri_diagnostics_keep_original_line_numbers() {
+    let content =
+        "\u{feff}\nunsupported://node\ntrojan://synthetic-password@node.example.invalid:443#test\n";
+    for text in [content.to_owned(), STANDARD.encode(content)] {
+        let old = import_bytes(text.as_bytes().to_vec()).unwrap();
+        let new = import_profiles(text.as_bytes().to_vec()).unwrap();
+        assert_eq!(old.issues[0].line, 2);
+        assert_eq!(new.issues, old.issues);
+        assert_eq!(new.original().expose(), text);
+        assert_eq!(new.entries.len(), old.servers.len());
+        assert_eq!(new.base64_envelope, old.base64_envelope);
+    }
+}
+
+#[test]
 fn unrecognized_and_invalid_documents_never_become_profiles() {
     for text in [
         "",
