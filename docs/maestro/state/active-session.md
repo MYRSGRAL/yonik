@@ -52,6 +52,7 @@ p4_completion_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9
 p4_completion_builder_head: ea2dcc7aeda27dc1bd85386938560692c73d12a0
 p4_completion_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A941052cd-6093-4e30-8ed7-94b163a86c83
 p5_completion_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A7f3da3dd-67bb-4d7e-ab13-163b3eb6bc21
+p5_completion_projection_head: 874d7d8da6d46082fc36ff8902ca4f0726e34eb8
 completion_scope_review: three_medium_contract_clarifications_root_corrected
 p3_native_schema_fix: 0aace3297274851bf9ee9a2842d9e695c23196a2
 p5_test_gaps_head: bb425125644c2057c75e2563d6c45193db05ceea
@@ -403,6 +404,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   Тот же writer продолжает незавершённую фазу с конкретного milestone:
   closed launch/admission/capsule/asset consumer + actual main hook до features,
   затем transport/grants. Rust counterpart продолжает своё поручение.
+- Rust writer874d7d8 реализовал только closed borrowed DATA P→D→C projection,
+  WireNetwork/WireAction и9 intent pure tests/clippy/fmt PASS по author evidence.
+  Root проверил узкий source diff и влит prerequisite; он не выдаёт authority,
+  actual mux decision не подтверждает и Unsupported не снимает. Тот же writer
+  продолжает shared codec/typed capsule11tables builder/decoder и parity vectors,
+  затем Local/System issuer/custody/dispatch. Go writer получил новые API facts;
+  оба P4/P5 completion gates остаются незавершёнными.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
