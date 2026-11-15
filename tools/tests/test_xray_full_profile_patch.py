@@ -27,6 +27,12 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertFalse(metadata["builder_apply_enabled"])
         self.assertFalse(metadata["runtime_hooks_connected"])
         self.assertFalse(metadata["authority_issuer_connected"])
+        self.assertTrue(metadata["dns_service_consumer_connected"])
+        self.assertTrue(metadata["probe_service_consumer_connected"])
+        self.assertTrue(metadata["snapshot_query_engine_connected"])
+        self.assertTrue(metadata["observatory_probe_hook_connected"])
+        self.assertFalse(metadata["exact_dns_outer_caller_connected"])
+        self.assertFalse(metadata["physical_resolver_proof_connected"])
         self.assertIsNone(metadata["native_protocol"])
 
     def test_follow_up_preserves_frozen_wire_and_owned_source_scope(self) -> None:
@@ -43,6 +49,8 @@ class FullProfilePatchTests(unittest.TestCase):
                 or path
                 in {
                     "main/run.go",
+                    "app/observatory/observer.go",
+                    "app/observatory/yonik_profile_service_test.go",
                     "main/yonik_profile_test.go",
                     "app/dns/nameserver_local.go",
                     "features/dns/localdns/client.go",
@@ -123,6 +131,36 @@ class FullProfilePatchTests(unittest.TestCase):
             line[1:] for line in added.splitlines() if line.startswith("+")
         )
         self.assertEqual((embedded + "\n").encode(), fixture.read_bytes())
+
+    def test_service_vectors_are_embedded_without_claiming_authority(self) -> None:
+        fixture = ADAPTER / "full-profile-fixtures/service-grants-v3.json"
+        vectors = json.loads(fixture.read_text())
+        self.assertEqual((vectors["mappingVersion"], vectors["tableCount"]), (3, 11))
+        self.assertFalse(vectors["authority"])
+        self.assertEqual(
+            bytes.fromhex(vectors["probeBodyHex"]), struct.pack("!HHHH", 1, 0, 0, 65535)
+        )
+        self.assertEqual(
+            bytes.fromhex(vectors["bootstrapBodyHex"]), struct.pack("!HHHH", 2, 0, 0, 0)
+        )
+        for name, grant_class, flow in (
+            ("probeGrantBodyHex", 2, 0),
+            ("dnsGrantBodyHex", 3, 1),
+        ):
+            grant = bytes.fromhex(vectors[name])
+            self.assertEqual(len(grant), 56)
+            self.assertEqual(grant[:4], bytes((1, grant_class, 0, 0)))
+            self.assertEqual(struct.unpack_from("!Q", grant, 12)[0], flow)
+            self.assertEqual(grant[32:], bytes(24))
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        added = patch.split(
+            "+++ b/common/yonikbroker/profile-service-vectors.json\n", 1
+        )[1].split("diff --git ", 1)[0]
+        embedded = (
+            "\n".join(line[1:] for line in added.splitlines() if line.startswith("+"))
+            + "\n"
+        )
+        self.assertEqual(embedded.encode(), fixture.read_bytes())
 
 
 if __name__ == "__main__":
