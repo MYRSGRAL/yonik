@@ -279,6 +279,138 @@ impl fmt::Debug for ProfileIntent {
     }
 }
 impl ProfileIntent {
+    /// Проверка alias ownership без повторной компиляции/генерации credentials.
+    pub fn validate_ingress_mapping(&self, runtime: &OwnedRuntimePlan) -> Result<(), Error> {
+        let inputs = self
+            .wire
+            .graph
+            .inbounds
+            .as_ref()
+            .map(|i| i.0.as_slice())
+            .unwrap_or(&[]);
+        if inputs.len() != runtime.ingress_mappings().count() {
+            return Err(Error::Ownership);
+        }
+        let mut occupied: [Option<&Inbound>; 2] = [None, None];
+        if let Some(dns) = self.wire.graph.dns.as_ref() {
+            let reserved = |tag: Option<&str>| {
+                tag.is_some_and(|tag| tag.starts_with("yonik-owned-") || tag == "system-tun")
+            };
+            if reserved(dns.tag.as_deref())
+                || dns.servers.as_ref().is_some_and(|servers| {
+                    servers.0.iter().any(
+                    |server| matches!(server,DnsServer::Scoped(s) if reserved(s.tag.as_deref())),
+                )
+                })
+            {
+                return Err(Error::Ownership);
+            }
+        }
+        for input in inputs {
+            let tag = input.tag.as_deref().ok_or(Error::Ownership)?;
+            let owned = runtime
+                .ingress_mappings()
+                .find(|(name, _)| *name == tag)
+                .map(|(_, o)| o)
+                .ok_or(Error::Ownership)?;
+            if owned == super::OwnedIngress::System && !runtime.is_system() {
+                return Err(Error::Ownership);
+            }
+            let index = usize::from(owned == super::OwnedIngress::System);
+            if let Some(previous) = occupied[index] {
+                // Сравнение borrowed typed fields, без native JSON reconstruction.
+                let a = previous.sniffing.as_ref();
+                let b = input.sniffing.as_ref();
+                if a.map(|s| (s.enabled, s.route_only)) != b.map(|s| (s.enabled, s.route_only))
+                    || a.and_then(|s| s.dest_override.as_ref().map(|l| &l.0))
+                        != b.and_then(|s| s.dest_override.as_ref().map(|l| &l.0))
+                {
+                    return Err(Error::Ownership);
+                }
+                for rule in self
+                    .wire
+                    .graph
+                    .routing
+                    .as_ref()
+                    .and_then(|r| r.rules.as_ref())
+                    .map(|r| r.0.as_slice())
+                    .unwrap_or(&[])
+                {
+                    let tags = rule
+                        .inbound_tag
+                        .as_ref()
+                        .map(|t| t.0.as_slice())
+                        .unwrap_or(&[]);
+                    if tags
+                        .iter()
+                        .any(|t| Some(t.as_str()) == previous.tag.as_deref())
+                        != tags.iter().any(|t| t == tag)
+                    {
+                        return Err(Error::Ownership);
+                    }
+                }
+            }
+            occupied[index] = Some(input);
+            let collision = |name: Option<&str>| name == Some(tag);
+            if let Some(dns) = self.wire.graph.dns.as_ref() {
+                if collision(dns.tag.as_deref()) || dns.servers.as_ref().is_some_and(|servers|servers.0.iter().any(|server|matches!(server,DnsServer::Scoped(s) if collision(s.tag.as_deref())))) {return Err(Error::Ownership);}
+            }
+        }
+        Ok(())
+    }
+    /// Разрешённые native branches: bit0 normal, bit1 outbound mux.
+    /// None port означает объединение actual решений для port443 и остальных.
+    pub fn branch_mask(
+        &self,
+        subject: &str,
+        input: WireNetwork,
+        port: Option<u16>,
+    ) -> Result<u8, Error> {
+        let outbound = self.outbound(subject)?;
+        let Some(mux) = outbound.mux.as_ref().filter(|m| m.enabled == Some(true)) else {
+            return Ok(1);
+        };
+        let selected = if input == WireNetwork::Udp && mux.xudp_concurrency.unwrap_or(0) > 0
+            || mux.concurrency.unwrap_or(0) >= 0
+        {
+            2
+        } else {
+            1
+        };
+        if input != WireNetwork::Udp {
+            return Ok(selected);
+        }
+        let at443 = match mux.xudp_proxy_udp443.as_deref().unwrap_or("") {
+            "" | "reject" => 0,
+            "skip" => 1,
+            _ => selected,
+        };
+        Ok(match port {
+            Some(443) => at443,
+            Some(_) => selected,
+            None => selected | at443,
+        })
+    }
+    pub fn proxy_kind(&self, subject: &str) -> Result<u8, Error> {
+        let o = self.outbound(subject)?;
+        Ok(match o.protocol.as_ref().ok_or(Error::Schema)? {
+            Protocol::Vless => 1,
+            Protocol::Shadowsocks => {
+                let method = o
+                    .settings
+                    .as_ref()
+                    .and_then(|s| s.servers.as_ref())
+                    .and_then(|s| s.0.first())
+                    .and_then(|s| s.method.as_deref())
+                    .ok_or(Error::Schema)?;
+                if method.starts_with("2022-") { 3 } else { 2 }
+            }
+            Protocol::Hysteria => 4,
+            Protocol::Freedom => 5,
+            Protocol::Blackhole => 6,
+            Protocol::Dns => 7,
+        })
+    }
     /// Вычисляет P→D→C. При mux_worker вход proxy синтетический TCP;
     /// caller обязан отдельно доказать actual native mux decision.
     pub fn project_branch(
@@ -585,6 +717,63 @@ impl<'de> Visitor<'de> for Scan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_mux_decision_matches_disabled_xudp_and_port443_paths() {
+        for (mux, tcp, udp, at443) in [
+            (
+                serde_json::json!({"enabled":false,"concurrency":0,"xudpProxyUDP443":"reject"}),
+                1,
+                1,
+                1,
+            ),
+            (serde_json::json!({"enabled":true,"concurrency":0}), 2, 2, 0),
+            (
+                serde_json::json!({"enabled":true,"concurrency":-1}),
+                1,
+                1,
+                0,
+            ),
+            (
+                serde_json::json!({"enabled":true,"concurrency":-1,"xudpConcurrency":8}),
+                1,
+                2,
+                0,
+            ),
+            (
+                serde_json::json!({"enabled":true,"concurrency":0,"xudpProxyUDP443":"skip"}),
+                2,
+                3,
+                1,
+            ),
+            (
+                serde_json::json!({"enabled":true,"concurrency":0,"xudpProxyUDP443":"reject"}),
+                2,
+                2,
+                0,
+            ),
+        ] {
+            let wire = serde_json::json!({"version":1,"graph":{"outbounds":[{"tag":"x","protocol":"freedom","mux":mux}]}});
+            let intent = ProfileIntent::decode(&wire.to_string()).unwrap();
+            assert_eq!(
+                intent.branch_mask("x", WireNetwork::Tcp, None).unwrap(),
+                tcp
+            );
+            assert_eq!(
+                intent.branch_mask("x", WireNetwork::Udp, None).unwrap(),
+                udp
+            );
+            assert_eq!(
+                intent
+                    .branch_mask("x", WireNetwork::Udp, Some(443))
+                    .unwrap(),
+                at443
+            );
+            assert_eq!(
+                intent.branch_mask("x", WireNetwork::Udp, Some(80)).unwrap(),
+                if udp == 3 { 2 } else { udp }
+            );
+        }
+    }
     #[test]
     fn closed_carrier_projection_preserves_raw_udp_and_exact_h3() {
         let wire = serde_json::json!({"version":1,"graph":{"outbounds":[
