@@ -1,5 +1,205 @@
 use super::*;
 use std::collections::BTreeSet;
+fn rendezvous_open(record: LaunchRecord, sequence: u64) -> (Queued, wire::SocketRecord) {
+    let message = open(Mode::Local, 32001);
+    let wire::Message::OpenIngress { tuple, ingress, .. } = message else {
+        unreachable!()
+    };
+    let mut bytes = [0; 1153];
+    let length = wire::Frame::encode(
+        wire::Header {
+            kind: wire::Kind::OpenIngress,
+            sequence,
+            reply_to: 0,
+            binding: record.binding,
+            object_id: 0,
+        },
+        &message,
+        &mut bytes,
+    )
+    .unwrap();
+    (
+        Queued {
+            bytes,
+            length,
+            sequence,
+        },
+        wire::SocketRecord {
+            request: sequence,
+            proof: sequence,
+            ingress,
+            tuple,
+        },
+    )
+}
+#[test]
+fn socket_proof_rendezvous_accepts_both_channel_orders_without_early_authority() {
+    let record = issuer(Mode::System).record;
+    for proof_first in [false, true] {
+        let mut inbox = Rendezvous::<u8>::new().unwrap();
+        let now = Instant::now();
+        let (packet, proof) = rendezvous_open(record, 2);
+        if proof_first {
+            inbox.proof(proof, 42, now).unwrap();
+            assert!(inbox.next(record, now).unwrap().is_none());
+            assert!(inbox.take(2, proof.tuple, proof.ingress).is_err());
+            inbox.runtime(packet, now).unwrap();
+        } else {
+            inbox.runtime(packet, now).unwrap();
+            assert!(inbox.next(record, now).unwrap().is_none());
+            inbox.proof(proof, 42, now).unwrap();
+        }
+        assert_eq!(inbox.next(record, now).unwrap().unwrap().sequence, 2);
+        assert_eq!(inbox.take(2, proof.tuple, proof.ingress).unwrap(), 42);
+        assert!(inbox.take(2, proof.tuple, proof.ingress).is_err());
+        assert!(inbox.proof(proof, 43, now).is_err());
+    }
+}
+#[test]
+fn socket_proof_rendezvous_rejects_wrong_listener_duplicate_wrap_and_original_deadline() {
+    let record = issuer(Mode::System).record;
+    let now = Instant::now();
+    let (packet, proof) = rendezvous_open(record, 2);
+    let mut inbox = Rendezvous::<u8>::new().unwrap();
+    inbox.runtime(packet, now).unwrap();
+    inbox
+        .proof(
+            wire::SocketRecord {
+                tuple: Tuple {
+                    remote_port: 1081,
+                    ..proof.tuple
+                },
+                ..proof
+            },
+            1,
+            now,
+        )
+        .unwrap();
+    assert!(inbox.next(record, now).is_err());
+    let mut inbox = Rendezvous::<u8>::new().unwrap();
+    inbox.proof(proof, 1, now).unwrap();
+    assert!(
+        inbox
+            .proof(wire::SocketRecord { proof: 3, ..proof }, 2, now)
+            .is_err()
+    );
+    assert!(
+        inbox
+            .proof(
+                wire::SocketRecord {
+                    request: 3,
+                    proof: u64::MAX,
+                    ..proof
+                },
+                2,
+                now
+            )
+            .is_err()
+    );
+    assert!(
+        inbox
+            .proof(
+                wire::SocketRecord {
+                    request: u64::MAX,
+                    proof: 3,
+                    ..proof
+                },
+                2,
+                now
+            )
+            .is_err()
+    );
+    assert_eq!(
+        inbox.deadline(now + Duration::from_secs(5)),
+        now + Duration::from_secs(1)
+    );
+    assert!(inbox.check(now + Duration::from_secs(1)).is_err());
+}
+#[test]
+fn socket_proof_pending_cap_and_custody_close_every_owned_handle() {
+    use std::sync::atomic::AtomicUsize;
+    struct Handle(Arc<AtomicUsize>);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let record = issuer(Mode::System).record;
+    let (_, proof) = rendezvous_open(record, 2);
+    let now = Instant::now();
+    let mut inbox = Rendezvous::<Handle>::new().unwrap();
+    for id in 2..66 {
+        inbox
+            .proof(
+                wire::SocketRecord {
+                    request: id,
+                    proof: id,
+                    ..proof
+                },
+                Handle(Arc::clone(&drops)),
+                now,
+            )
+            .unwrap();
+    }
+    assert!(inbox.proof_capacity().is_err());
+    assert!(
+        inbox
+            .proof(
+                wire::SocketRecord {
+                    request: 66,
+                    proof: 66,
+                    ..proof
+                },
+                Handle(Arc::clone(&drops)),
+                now
+            )
+            .is_err()
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(inbox);
+    assert_eq!(drops.load(Ordering::SeqCst), 65);
+}
+#[test]
+fn socket_proof_missing_open_can_be_canceled_without_authority_or_resurrection() {
+    let record = issuer(Mode::System).record;
+    let (packet, proof) = rendezvous_open(record, 2);
+    let now = Instant::now();
+    let mut inbox = Rendezvous::<u8>::new().unwrap();
+    inbox.runtime(packet, now).unwrap();
+    assert!(inbox.next(record, now).unwrap().is_none());
+    let mut bytes = [0; 1153];
+    let length = wire::Frame::encode(
+        wire::Header {
+            kind: wire::Kind::Cancel,
+            sequence: 3,
+            reply_to: 0,
+            binding: record.binding,
+            object_id: 0,
+        },
+        &wire::Message::Cancel {
+            target: 1,
+            id: 2,
+            reason: 0,
+        },
+        &mut bytes,
+    )
+    .unwrap();
+    inbox
+        .runtime(
+            Queued {
+                bytes,
+                length,
+                sequence: 3,
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(inbox.next(record, now).unwrap().unwrap().sequence, 2);
+    assert!(inbox.take(2, proof.tuple, proof.ingress).is_err());
+    assert_eq!(inbox.next(record, now).unwrap().unwrap().sequence, 3);
+    assert!(inbox.proof(proof, 1, now).is_err());
+}
 #[derive(Clone)]
 struct Proof {
     source: u64,
@@ -61,6 +261,7 @@ impl Authority for Fake {
     }
     fn ingress(
         &mut self,
+        _request: u64,
         capsule: &wire::Capsule<'_>,
         message: &wire::Message<'_>,
         _: &Arc<ChannelBudget>,

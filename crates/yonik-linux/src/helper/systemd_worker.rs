@@ -932,21 +932,22 @@ impl SystemWorkerSupervisor {
         let mut session =
             crate::attribution::native_session::Session::from_verified(issued.session, remote)
                 .map_err(unavailable)?;
-        let (profile, extension) = if let Some(prepared) = payload.full_profile() {
+        let (profile, extension, delivery) = if let Some(prepared) = payload.full_profile() {
             let profile_scope = issued.run.profile_scope()?;
             let record = profile_scope.profile_launch_record(prepared.capsule())?;
             let endpoint = session.owner_endpoint().map_err(unavailable)?;
-            let (runtime, channel) = super::native_profile_channel::ProfileRuntime::start_system(
-                profile_scope,
-                endpoint,
-                Arc::clone(&payload),
-                uid,
-                routes.ok_or(WorkerSupervisorError::Untrusted)?,
-            )
-            .map_err(unavailable)?;
-            (Some(runtime), Some((record, channel)))
+            let (runtime, channel, delivery) =
+                super::native_profile_channel::ProfileRuntime::start_system(
+                    profile_scope,
+                    endpoint,
+                    Arc::clone(&payload),
+                    uid,
+                    routes.ok_or(WorkerSupervisorError::Untrusted)?,
+                )
+                .map_err(unavailable)?;
+            (Some(runtime), Some((record, channel)), Some(delivery))
         } else {
-            (None, None)
+            (None, None, None)
         };
         let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
@@ -975,6 +976,7 @@ impl SystemWorkerSupervisor {
         let permit = Arc::clone(&self.permit);
         self.native_transfer = Some(tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let exec_record = extension.as_ref().map(|(record, _)| *record);
             let retain = |stamp| {
                 *scope
                     .lock()
@@ -1005,9 +1007,26 @@ impl SystemWorkerSupervisor {
                 )
             }
             .map_err(unavailable)?;
-            payload
+            let ack = payload
                 .send_output_before(&stream, WorkerMode::Run, output, deadline.into_std())
-                .map_err(unavailable)
+                .map_err(unavailable)?;
+            if let (Some(record), Some(delivery)) = (exec_record, delivery) {
+                crate::worker::role_handoff::receive_exec_delivery(
+                    &handoff,
+                    record,
+                    &payload,
+                    pid,
+                    uid,
+                    deadline.into_std(),
+                    |proof| {
+                        delivery
+                            .try_send(proof)
+                            .map_err(|_| crate::worker::WorkerError::Peer)
+                    },
+                )
+                .map_err(unavailable)?;
+            }
+            Ok(ack)
         }));
         let ack = wait_owned(&mut self.native_transfer, cancel, deadline).await??;
         if ack.status != WorkerStatus::Accepted || ack.pid != pid {

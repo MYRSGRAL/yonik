@@ -13,7 +13,7 @@ use std::{
     fs::File,
     io::Read,
     net::SocketAddr,
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd},
     os::unix::fs::MetadataExt,
     sync::Arc,
 };
@@ -49,7 +49,7 @@ impl ChannelBudget {
         let decoded = wire::Capsule::decode(capsule.bytes(), digest).map_err(unavailable)?;
         let remaining = decoded.buffer_credit().map_err(unavailable)?;
         let bytes = 8usize * 1024 * 1024
-            - usize::from(system) * (512 + 384) * 1024
+            - usize::from(system) * (512 + 384 + 128) * 1024
             - 64 * 1024
             - capsule.bytes().len();
         Ok(Arc::new(Self {
@@ -125,6 +125,7 @@ trait Authority: Send {
     fn revoke(&self);
     fn ingress(
         &mut self,
+        request: u64,
         capsule: &wire::Capsule<'_>,
         message: &wire::Message<'_>,
         budget: &Arc<ChannelBudget>,
@@ -266,7 +267,9 @@ impl<A: Authority> Issuer<A> {
         {
             return Err(ServiceError::Busy);
         }
-        let socket = self.authority.ingress(&capsule, message, &self.budget)?;
+        let socket = self
+            .authority
+            .ingress(request, &capsule, message, &self.budget)?;
         let source = Self::id(&mut self.next_flow)?;
         let proof = self.authority.owner(source, *tuple, OwnerReference::NONE)?;
         let subject = self.authority.subject(&proof, source, *tuple)?;
@@ -576,12 +579,16 @@ impl Authority for SystemAuthority {
     }
     fn ingress(
         &mut self,
+        request: u64,
         capsule: &wire::Capsule<'_>,
         message: &wire::Message<'_>,
         budget: &Arc<ChannelBudget>,
     ) -> Result<Self::Ingress, ServiceError> {
         let wire::Message::OpenIngress {
-            tuple, provenance, ..
+            tuple,
+            provenance,
+            ingress,
+            ..
         } = message
         else {
             return Err(ServiceError::InvalidRequest);
@@ -594,7 +601,7 @@ impl Authority for SystemAuthority {
             .dynamic
             .reserve(std::mem::size_of::<SocketHold>() + 32)
             .map_err(unavailable)?;
-        let proof = self.peer.socket(*tuple, *provenance)?;
+        let proof = self.peer.socket(*tuple, *provenance, request, *ingress)?;
         if *provenance == 3 {
             capsule
                 .validate_associated_request(message, &proof)
@@ -712,12 +719,16 @@ impl Authority for LocalAuthority {
     }
     fn ingress(
         &mut self,
+        request: u64,
         capsule: &wire::Capsule<'_>,
         message: &wire::Message<'_>,
         budget: &Arc<ChannelBudget>,
     ) -> Result<Self::Ingress, ServiceError> {
         let wire::Message::OpenIngress {
-            tuple, provenance, ..
+            tuple,
+            provenance,
+            ingress,
+            ..
         } = message
         else {
             return Err(ServiceError::InvalidRequest);
@@ -729,7 +740,7 @@ impl Authority for LocalAuthority {
             .dynamic
             .reserve(std::mem::size_of::<SocketHold>() + 32)
             .map_err(unavailable)?;
-        let proof = self.peer.socket(*tuple, *provenance)?;
+        let proof = self.peer.socket(*tuple, *provenance, request, *ingress)?;
         if *provenance == 3 {
             capsule
                 .validate_associated_request(message, &proof)
@@ -788,6 +799,7 @@ impl Authority for LocalAuthority {
 }
 
 pub(crate) struct ProfileRuntime {
+    wake: Option<Arc<tokio::sync::Notify>>,
     stop: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     task: Option<std::thread::JoinHandle<Box<dyn Send>>>,
@@ -835,6 +847,7 @@ impl ProfileRuntime {
             })
             .map_err(unavailable)?;
         Ok(Self {
+            wake: None,
             stop,
             ready,
             task: Some(task),
@@ -847,11 +860,22 @@ impl ProfileRuntime {
         payload: Arc<crate::worker::WorkerPayload>,
         uid: u32,
         routes: Box<dyn RouteAuthority>,
-    ) -> Result<(Self, OwnedFd), ServiceError> {
+    ) -> Result<
+        (
+            Self,
+            OwnedFd,
+            std::sync::mpsc::SyncSender<crate::worker::role_handoff::VerifiedExecDelivery>,
+        ),
+        ServiceError,
+    > {
         let profile = payload.full_profile().ok_or(ServiceError::Unsupported)?;
         let capsule = Arc::clone(profile.capsule());
         let record = scope.profile_launch_record(&capsule).map_err(unavailable)?;
         let (host, worker) = channel_pair()?;
+        let (delivery_tx, delivery_rx) = std::sync::mpsc::sync_channel(1);
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let thread_wake = Arc::clone(&wake);
+        let handle = tokio::runtime::Handle::current();
         let stop = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -866,16 +890,67 @@ impl ProfileRuntime {
                     channel: host,
                     routes: Some(routes),
                     issuer: None,
+                    proof_channel: None,
+                    delivery: None,
+                    peer: None,
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    hello(
+                    resources.delivery = Some(
+                        delivery_rx
+                            .recv_timeout(
+                                resources
+                                    .scope
+                                    .admission_deadline()
+                                    .saturating_duration_since(Instant::now())
+                                    .min(Duration::from_secs(1)),
+                            )
+                            .map_err(unavailable)?,
+                    );
+                    let (_keep, cancel) = crate::Cancellation::new();
+                    resources
+                        .payload
+                        .full_profile()
+                        .ok_or(ServiceError::Unsupported)?
+                        .revalidate(&cancel)
+                        .map_err(unavailable)?;
+                    let peer = Peer::system(
+                        record,
+                        uid,
+                        resources.scope.fork_lookup(),
+                        resources
+                            .delivery
+                            .as_ref()
+                            .ok_or(ServiceError::Unavailable)?,
+                    )?;
+                    resources.peer = Some(Arc::clone(&peer));
+                    let (proof, go_proof) = channel_pair()?;
+                    crate::worker::role_handoff::send_proof_bootstrap(
                         &resources.channel,
                         record,
+                        &go_proof,
                         record.child_pid,
                         uid,
-                        &thread_stop,
-                    )?;
-                    let peer = Peer::system(record, uid, resources.payload.image_hash())?;
+                        resources
+                            .scope
+                            .admission_deadline()
+                            .min(Instant::now() + Duration::from_secs(1)),
+                    )
+                    .map_err(unavailable)?;
+                    drop(go_proof);
+                    resources.proof_channel = Some(SystemChannel::new(
+                        rustix::io::fcntl_dupfd_cloexec(&resources.channel, 3)
+                            .map_err(unavailable)?,
+                        proof,
+                        Arc::clone(&peer),
+                        record,
+                        handle,
+                        thread_wake,
+                    )?);
+                    resources
+                        .proof_channel
+                        .as_ref()
+                        .ok_or(ServiceError::Unavailable)?
+                        .hello(&thread_stop)?;
                     let authority = SystemAuthority {
                         scope: resources.scope.fork_lookup(),
                         owner: resources.owner.take().ok_or(ServiceError::Unavailable)?,
@@ -885,7 +960,10 @@ impl ProfileRuntime {
                     resources.issuer = Some(Issuer::new(authority, capsule, record)?);
                     run_issuer(
                         resources.issuer.as_mut().ok_or(ServiceError::Unavailable)?,
-                        &resources.channel,
+                        resources
+                            .proof_channel
+                            .as_ref()
+                            .ok_or(ServiceError::Unavailable)?,
                         record.child_pid,
                         uid,
                         &thread_stop,
@@ -896,6 +974,9 @@ impl ProfileRuntime {
                     resources.scope.revoke();
                 }
                 resources.scope.revoke();
+                if let Some(channel) = &resources.proof_channel {
+                    channel.shutdown();
+                }
                 let _shutdown =
                     rustix::net::shutdown(&resources.channel, rustix::net::Shutdown::Both);
                 Box::new(resources) as Box<dyn Send>
@@ -903,12 +984,14 @@ impl ProfileRuntime {
             .map_err(unavailable)?;
         Ok((
             Self {
+                wake: Some(wake),
                 stop,
                 ready,
                 task: Some(task),
                 known_closed: false,
             },
             worker,
+            delivery_tx,
         ))
     }
     pub(crate) fn ready(&self) -> bool {
@@ -916,6 +999,9 @@ impl ProfileRuntime {
     }
     pub(crate) fn revoke(&self) {
         self.stop.store(true, Ordering::Release);
+        if let Some(wake) = &self.wake {
+            wake.notify_one();
+        }
     }
     pub(crate) fn confirmed_closed(&mut self) {
         self.known_closed = true;
@@ -937,6 +1023,9 @@ impl Drop for ProfileRuntime {
     }
 }
 struct SystemResources {
+    delivery: Option<crate::worker::role_handoff::VerifiedExecDelivery>,
+    peer: Option<Arc<Peer>>,
+    proof_channel: Option<SystemChannel>,
     scope: RuntimeScopeStamp,
     owner: Option<OwnerEndpoint>,
     payload: Arc<crate::worker::WorkerPayload>,
@@ -959,7 +1048,7 @@ pub(crate) fn channel_pair() -> Result<(OwnedFd, OwnedFd), ServiceError> {
     Ok((a, b))
 }
 fn receive(
-    socket: &OwnedFd,
+    socket: &impl AsFd,
     pid: u32,
     uid: u32,
     out: &mut [u8; 1153],
@@ -1015,6 +1104,12 @@ trait Channel {
     fn pause(&self) {
         std::thread::sleep(Duration::from_millis(1));
     }
+    fn pause_until(&self, _until: Instant) {
+        self.pause();
+    }
+    fn writable_until(&self, until: Instant) {
+        self.pause_until(until);
+    }
 }
 impl Channel for OwnedFd {
     fn read(
@@ -1026,15 +1121,18 @@ impl Channel for OwnedFd {
         receive(self, pid, uid, out)
     }
     fn write(&self, bytes: &[u8]) -> Result<bool, ServiceError> {
-        match rustix::net::send(
-            self,
-            bytes,
-            rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL,
-        ) {
-            Ok(sent) if sent == bytes.len() => Ok(true),
-            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => Ok(false),
-            _ => Err(ServiceError::Unavailable),
-        }
+        send(self, bytes)
+    }
+}
+fn send(socket: &impl AsFd, bytes: &[u8]) -> Result<bool, ServiceError> {
+    match rustix::net::send(
+        socket,
+        bytes,
+        rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL,
+    ) {
+        Ok(sent) if sent == bytes.len() => Ok(true),
+        Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => Ok(false),
+        _ => Err(ServiceError::Unavailable),
     }
 }
 fn hello(
@@ -1133,7 +1231,443 @@ fn send_message<A: Authority>(
         if socket.write(&bytes[..n])? {
             return Ok(());
         }
-        socket.pause();
+        socket.writable_until(until);
+    }
+}
+struct SocketEvidence {
+    fd: OwnedFd,
+    namespace: OwnedFd,
+    facts: SocketFacts,
+}
+struct Waiting<T> {
+    record: wire::SocketRecord,
+    value: T,
+    expires: Instant,
+}
+struct WaitingFrame {
+    packet: Queued,
+    expires: Instant,
+}
+struct Rendezvous<T> {
+    pending: BTreeMap<u64, Waiting<T>>,
+    ready: BTreeMap<u64, Waiting<T>>,
+    frames: VecDeque<WaitingFrame>,
+    incoming: wire::Sequence,
+    last_delivered: u64,
+    last_proof: u64,
+    _credit: super::memory::ByteLease,
+}
+impl<T> Rendezvous<T> {
+    fn new() -> Result<Self, ServiceError> {
+        if std::mem::size_of::<Waiting<T>>() + 80 > 512 {
+            return Err(ServiceError::Unsupported);
+        }
+        let credit = super::memory::config_budget()
+            .reserve(128 * 1024)
+            .map_err(unavailable)?;
+        let mut incoming = wire::Sequence::new();
+        incoming.accept(1).map_err(unavailable)?;
+        Ok(Self {
+            pending: BTreeMap::new(),
+            ready: BTreeMap::new(),
+            frames: VecDeque::with_capacity(64),
+            incoming,
+            last_delivered: 1,
+            last_proof: 0,
+            _credit: credit,
+        })
+    }
+    fn check(&self, now: Instant) -> Result<(), ServiceError> {
+        if self
+            .pending
+            .values()
+            .chain(self.ready.values())
+            .any(|p| now >= p.expires)
+            || self.frames.iter().any(|p| now >= p.expires)
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
+    fn proof_capacity(&self) -> Result<(), ServiceError> {
+        if self.pending.len() + self.ready.len() >= 64 {
+            Err(ServiceError::Busy)
+        } else {
+            Ok(())
+        }
+    }
+    fn proof(
+        &mut self,
+        record: wire::SocketRecord,
+        value: T,
+        now: Instant,
+    ) -> Result<(), ServiceError> {
+        self.check(now)?;
+        self.proof_capacity()?;
+        if record.request <= self.last_delivered
+            || record.proof <= self.last_proof
+            || record.proof == u64::MAX
+            || record.request == u64::MAX
+            || self.pending.contains_key(&record.request)
+            || self.ready.contains_key(&record.request)
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.last_proof = record.proof;
+        self.pending.insert(
+            record.request,
+            Waiting {
+                record,
+                value,
+                expires: now + Duration::from_secs(1),
+            },
+        );
+        Ok(())
+    }
+    fn runtime(&mut self, packet: Queued, now: Instant) -> Result<(), ServiceError> {
+        self.check(now)?;
+        if self.frames.len() >= 64 {
+            return Err(ServiceError::Busy);
+        }
+        self.incoming.accept(packet.sequence).map_err(unavailable)?;
+        self.frames.push_back(WaitingFrame {
+            packet,
+            expires: now + Duration::from_secs(1),
+        });
+        Ok(())
+    }
+    fn next(&mut self, launch: LaunchRecord, now: Instant) -> Result<Option<Queued>, ServiceError> {
+        self.check(now)?;
+        let Some(front) = self.frames.front() else {
+            return Ok(None);
+        };
+        let frame = wire::Frame::decode(
+            &front.packet.bytes[..front.packet.length],
+            launch.binding,
+            launch.mode,
+            false,
+        )
+        .map_err(unavailable)?;
+        let request = frame.header.sequence;
+        if let wire::Message::OpenIngress {
+            ingress,
+            provenance: 2,
+            tuple,
+            ..
+        } = frame.message
+        {
+            if let Some(proof) = self.pending.get(&request) {
+                if proof.record.ingress != ingress || proof.record.tuple != tuple {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let proof = self
+                    .pending
+                    .remove(&request)
+                    .ok_or(ServiceError::Unavailable)?;
+                self.ready.insert(request, proof);
+            } else {
+                let canceled=self.frames.iter().any(|p|wire::Frame::decode(&p.packet.bytes[..p.packet.length],launch.binding,launch.mode,false).is_ok_and(|f|matches!(f.message,wire::Message::Cancel{target:1,id,..} if id==request)));
+                if !canceled {
+                    return Ok(None);
+                }
+            }
+        } else if self.pending.contains_key(&request) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.last_delivered = request;
+        Ok(self.frames.pop_front().map(|p| p.packet))
+    }
+    fn take(&mut self, request: u64, tuple: Tuple, ingress: u16) -> Result<T, ServiceError> {
+        self.check(Instant::now())?;
+        let proof = self
+            .ready
+            .remove(&request)
+            .ok_or(ServiceError::Unsupported)?;
+        if proof.record.tuple != tuple || proof.record.ingress != ingress {
+            return Err(ServiceError::InvalidRequest);
+        }
+        Ok(proof.value)
+    }
+    fn deadline(&self, until: Instant) -> Instant {
+        self.pending
+            .values()
+            .chain(self.ready.values())
+            .map(|p| p.expires)
+            .chain(self.frames.iter().map(|p| p.expires))
+            .fold(until, Instant::min)
+    }
+}
+type ProofInbox = Rendezvous<SocketEvidence>;
+struct SystemChannel {
+    runtime: tokio::net::UnixDatagram,
+    proof: tokio::net::UnixDatagram,
+    peer: Arc<Peer>,
+    launch: LaunchRecord,
+    handle: tokio::runtime::Handle,
+    wake: Arc<tokio::sync::Notify>,
+    failed: std::cell::Cell<bool>,
+}
+impl SystemChannel {
+    fn new(
+        runtime: OwnedFd,
+        proof: OwnedFd,
+        peer: Arc<Peer>,
+        launch: LaunchRecord,
+        handle: tokio::runtime::Handle,
+        wake: Arc<tokio::sync::Notify>,
+    ) -> Result<Self, ServiceError> {
+        for fd in [&runtime, &proof] {
+            let flags = rustix::fs::fcntl_getfl(fd).map_err(unavailable)?;
+            rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)
+                .map_err(unavailable)?;
+        }
+        let (runtime, proof) = {
+            let _enter = handle.enter();
+            (
+                tokio::net::UnixDatagram::from_std(std::os::unix::net::UnixDatagram::from(runtime))
+                    .map_err(unavailable)?,
+                tokio::net::UnixDatagram::from_std(std::os::unix::net::UnixDatagram::from(proof))
+                    .map_err(unavailable)?,
+            )
+        };
+        Ok(Self {
+            runtime,
+            proof,
+            peer,
+            launch,
+            handle,
+            wake,
+            failed: std::cell::Cell::new(false),
+        })
+    }
+    fn shutdown(&self) {
+        for fd in [&self.runtime, &self.proof] {
+            let _result = rustix::net::shutdown(fd, rustix::net::Shutdown::Both);
+        }
+    }
+    fn hello(&self, stop: &AtomicBool) -> Result<(), ServiceError> {
+        let until = Instant::now() + Duration::from_secs(1);
+        let mut bytes = [0; 1153];
+        loop {
+            if stop.load(Ordering::Acquire) || Instant::now() >= until {
+                return Err(ServiceError::Unavailable);
+            }
+            self.peer.validate()?;
+            if let Some(length) = Self::ready(&self.runtime, tokio::io::Interest::READABLE, || {
+                receive(&self.runtime, self.peer.pid, self.peer.uid, &mut bytes)
+            })? {
+                let frame = wire::Frame::decode(
+                    &bytes[..length],
+                    self.launch.binding,
+                    self.launch.mode,
+                    false,
+                )
+                .map_err(unavailable)?;
+                if frame.header.sequence != 1
+                    || !matches!(frame.message,wire::Message::Hello{nonce,mode} if nonce==self.launch.nonce&&mode==Mode::System)
+                {
+                    return Err(ServiceError::Unavailable);
+                }
+                return Ok(());
+            }
+            // До HELLO proof FD только удерживается. Его readable readiness не
+            // будит setup loop: отдельные каналы не гарантируют receive order.
+            self.handle.block_on(async{tokio::select!{biased;_=self.wake.notified()=>Ok(()),_=tokio::time::sleep_until(until.into())=>Ok(()),ready=self.runtime.readable()=>ready}}).map_err(unavailable)?;
+        }
+    }
+    fn receive_proof(&self, inbox: &mut ProofInbox) -> Result<bool, ServiceError> {
+        // Fixed credit включает один ingress scratch FD сверх 64 pending.
+        // Это позволяет прочитать EOF/overflow без allocation нового slot.
+        use rustix::net::{
+            self, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+        };
+        let mut bytes = [0; 193];
+        let mut control = [std::mem::MaybeUninit::uninit();
+            rustix::cmsg_space!(ScmRights(16), ScmCredentials(1))];
+        let mut ancillary = RecvAncillaryBuffer::new(&mut control);
+        let msg = match net::recvmsg(
+            &self.proof,
+            &mut [std::io::IoSliceMut::new(&mut bytes)],
+            &mut ancillary,
+            RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC,
+        ) {
+            Ok(msg) => msg,
+            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => return Ok(false),
+            Err(_) => return Err(ServiceError::Unavailable),
+        };
+        let mut credentials = None;
+        let mut socket = None;
+        let mut bad = false;
+        let mut rights_seen = false;
+        for part in ancillary.drain() {
+            match part {
+                RecvAncillaryMessage::ScmCredentials(c) if credentials.is_none() => {
+                    credentials = Some(c)
+                }
+                RecvAncillaryMessage::ScmRights(rights) => {
+                    if rights_seen {
+                        bad = true;
+                    }
+                    rights_seen = true;
+                    for fd in rights {
+                        if socket.is_none() && !bad {
+                            socket = Some(fd);
+                        } else {
+                            bad = true;
+                            drop(fd);
+                        }
+                    }
+                }
+                _ => bad = true,
+            }
+        }
+        let c = credentials.ok_or(ServiceError::Unavailable)?;
+        if bad
+            || msg.bytes != 192
+            || msg
+                .flags
+                .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
+            || c.pid.as_raw_pid() as u32 != self.peer.pid
+            || c.uid.as_raw() != self.peer.uid
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        let fd = socket.ok_or(ServiceError::Unavailable)?;
+        let record = wire::SocketRecord::decode(&bytes[..192], self.launch).map_err(unavailable)?;
+        inbox.proof_capacity()?;
+        let facts = SocketFacts::capture(&fd)?;
+        if !facts.matches(record.tuple, 2) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let namespace = yonik_nsfs::socket_namespace::socket_namespace(&fd)
+            .map_err(|_| ServiceError::Unsupported)?;
+        let stat = rustix::fs::fstat(&namespace).map_err(unavailable)?;
+        let scope = self
+            .peer
+            .system_scope
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?;
+        scope.validate().map_err(unavailable)?;
+        if (stat.st_dev, stat.st_ino) != scope.lookup_binding().2.namespace() {
+            return Err(ServiceError::Unsupported);
+        }
+        inbox.proof(
+            record,
+            SocketEvidence {
+                fd,
+                namespace,
+                facts,
+            },
+            Instant::now(),
+        )?;
+        Ok(true)
+    }
+    fn wait(&self, until: Instant, writable: bool) {
+        let until = self
+            .peer
+            .proofs
+            .as_ref()
+            .and_then(|p| p.lock().ok().map(|p| p.deadline(until)))
+            .unwrap_or(until);
+        let result=self.handle.block_on(async {
+            if writable {tokio::select!{biased; _=self.wake.notified()=>Ok(()),_=tokio::time::sleep_until(until.into())=>Ok(()),ready=self.runtime.writable()=>ready}}
+            else {tokio::select!{biased;_=self.wake.notified()=>Ok(()),_=tokio::time::sleep_until(until.into())=>Ok(()),ready=self.runtime.readable()=>ready,ready=self.proof.readable()=>ready}}
+        });
+        if result.is_err() {
+            self.failed.set(true);
+        }
+    }
+    fn ready<T>(
+        socket: &tokio::net::UnixDatagram,
+        interest: tokio::io::Interest,
+        operation: impl FnOnce() -> Result<Option<T>, ServiceError>,
+    ) -> Result<Option<T>, ServiceError> {
+        match socket.try_io(interest, || match operation() {
+            Ok(Some(value)) => Ok(Ok(value)),
+            Ok(None) => Err(std::io::ErrorKind::WouldBlock.into()),
+            Err(error) => Ok(Err(error)),
+        }) {
+            Ok(value) => value.map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(unavailable(error)),
+        }
+    }
+}
+impl Channel for SystemChannel {
+    fn read(
+        &self,
+        pid: u32,
+        uid: u32,
+        out: &mut [u8; 1153],
+    ) -> Result<Option<usize>, ServiceError> {
+        if self.failed.get() {
+            return Err(ServiceError::Unavailable);
+        }
+        self.peer.validate()?;
+        let mut inbox = self
+            .peer
+            .proofs
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?
+            .lock()
+            .map_err(unavailable)?;
+        for _ in 0..64 {
+            inbox.check(Instant::now())?;
+            let proof = Self::ready(&self.proof, tokio::io::Interest::READABLE, || {
+                self.receive_proof(&mut inbox)
+                    .map(|read| read.then_some(()))
+            })?
+            .is_some();
+            if let Some(packet) = inbox.next(self.launch, Instant::now())? {
+                out[..packet.length].copy_from_slice(&packet.bytes[..packet.length]);
+                return Ok(Some(packet.length));
+            }
+            if inbox.frames.len() >= 64 {
+                return Err(ServiceError::Busy);
+            }
+            let mut bytes = [0; 1153];
+            let frame = Self::ready(&self.runtime, tokio::io::Interest::READABLE, || {
+                receive(&self.runtime, pid, uid, &mut bytes)
+            })?;
+            if let Some(length) = frame {
+                let decoded = wire::Frame::decode(
+                    &bytes[..length],
+                    self.launch.binding,
+                    self.launch.mode,
+                    false,
+                )
+                .map_err(unavailable)?;
+                let sequence = decoded.header.sequence;
+                inbox.runtime(
+                    Queued {
+                        bytes,
+                        length,
+                        sequence,
+                    },
+                    Instant::now(),
+                )?;
+            }
+            if let Some(packet) = inbox.next(self.launch, Instant::now())? {
+                out[..packet.length].copy_from_slice(&packet.bytes[..packet.length]);
+                return Ok(Some(packet.length));
+            }
+            if !proof && frame.is_none() {
+                return Ok(None);
+            }
+        }
+        Err(ServiceError::Busy)
+    }
+    fn write(&self, bytes: &[u8]) -> Result<bool, ServiceError> {
+        Self::ready(&self.runtime, tokio::io::Interest::WRITABLE, || {
+            send(&self.runtime, bytes).map(|sent| sent.then_some(()))
+        })
+        .map(|sent| sent.is_some())
+    }
+    fn pause_until(&self, until: Instant) {
+        self.wait(until, false);
+    }
+    fn writable_until(&self, until: Instant) {
+        self.wait(until, true);
     }
 }
 struct Queued {
@@ -1272,7 +1806,13 @@ fn run_issuer<A: Authority>(
             (pending.length, true)
         } else {
             let Some(n) = socket.read(pid, uid, &mut bytes)? else {
-                socket.pause();
+                let until = issuer
+                    .grants
+                    .values()
+                    .map(|g| g.expires)
+                    .chain(awaiting.map(|a| a.2))
+                    .fold(expires, Instant::min);
+                socket.pause_until(until);
                 continue;
             };
             (n, false)
@@ -1605,6 +2145,9 @@ fn process_parent(pid: u32) -> Result<u32, ServiceError> {
         .ok_or(ServiceError::Unavailable)
 }
 pub(crate) struct Peer {
+    system_scope: Option<RuntimeScopeStamp>,
+    _config: Option<File>,
+    proofs: Option<Arc<std::sync::Mutex<ProofInbox>>>,
     pid: u32,
     start: u64,
     uid: u32,
@@ -1632,11 +2175,46 @@ impl Peer {
         }
         Self::capture(pid, process_start(pid)?, uid, binary.trusted_hash())
     }
-    fn system(record: LaunchRecord, uid: u32, image: [u8; 32]) -> Result<Arc<Self>, ServiceError> {
-        if record.mode != Mode::System || uid == 0 {
+    fn system(
+        record: LaunchRecord,
+        uid: u32,
+        scope: RuntimeScopeStamp,
+        delivery: &crate::worker::role_handoff::VerifiedExecDelivery,
+    ) -> Result<Arc<Self>, ServiceError> {
+        scope.validate().map_err(unavailable)?;
+        let (pid, worker_uid, _) = scope.lookup_binding();
+        if record.mode != Mode::System
+            || uid == 0
+            || uid != worker_uid
+            || pid != record.child_pid
+            || scope.context().5 != record.binding.digest
+        {
             return Err(ServiceError::Unsupported);
         }
-        Self::capture(record.child_pid, record.child_start, uid, image)
+        let memory = super::memory::config_budget()
+            .reserve(64 * 1024)
+            .map_err(unavailable)?;
+        let (image, config) = delivery.files(record).map_err(unavailable)?;
+        let m = image.metadata().map_err(unavailable)?;
+        let pidfd = rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(pid as i32).ok_or(ServiceError::Unsupported)?,
+            rustix::process::PidfdFlags::NONBLOCK,
+        )
+        .map_err(unavailable)?;
+        let peer = Arc::new(Self {
+            system_scope: Some(scope),
+            _config: Some(config),
+            proofs: Some(Arc::new(std::sync::Mutex::new(ProofInbox::new()?))),
+            pid,
+            start: record.child_start,
+            uid,
+            pidfd,
+            image,
+            identity: (m.dev(), m.ino()),
+            _memory: memory,
+        });
+        peer.validate()?;
+        Ok(peer)
     }
     fn capture(
         pid: u32,
@@ -1689,6 +2267,9 @@ impl Peer {
             return Err(ServiceError::Unsupported);
         }
         let peer = Arc::new(Self {
+            system_scope: None,
+            _config: None,
+            proofs: None,
             pid,
             start,
             uid,
@@ -1701,12 +2282,19 @@ impl Peer {
         Ok(peer)
     }
     pub(crate) fn validate(&self) -> Result<(), ServiceError> {
+        if let Some(scope) = &self.system_scope {
+            scope.validate().map_err(unavailable)?;
+        }
         let text = proc_text(format!("/proc/self/fdinfo/{}", self.pidfd.as_raw_fd()))?;
         let pid = text.lines().find_map(|l| {
             l.strip_prefix("Pid:")
                 .and_then(|s| s.trim().parse::<u32>().ok())
         });
-        let current = std::fs::metadata(format!("/proc/{}/exe", self.pid)).map_err(unavailable)?;
+        let current = if self.system_scope.is_some() {
+            self.image.metadata().map_err(unavailable)?
+        } else {
+            std::fs::metadata(format!("/proc/{}/exe", self.pid)).map_err(unavailable)?
+        };
         if pid != Some(self.pid)
             || process_start(self.pid)? != self.start
             || std::fs::metadata(format!("/proc/{}", self.pid))
@@ -1723,13 +2311,36 @@ impl Peer {
         }
         Ok(())
     }
-    fn socket(self: &Arc<Self>, tuple: Tuple, provenance: u8) -> Result<SocketProof, ServiceError> {
+    fn socket(
+        self: &Arc<Self>,
+        tuple: Tuple,
+        provenance: u8,
+        request: u64,
+        ingress: u16,
+    ) -> Result<SocketProof, ServiceError> {
         // Actual child socket FD ещё не связывает ephemeral UDP socket с
         // конкретным SOCKS control association. TCP proof этого не заменяет.
         if tuple.protocol == 17 || provenance == 3 {
             return Err(ServiceError::Unsupported);
         }
         self.validate()?;
+        if let Some(proofs) = &self.proofs {
+            let evidence = proofs
+                .lock()
+                .map_err(unavailable)?
+                .take(request, tuple, ingress)?;
+            let proof = SocketProof {
+                peer: Arc::clone(self),
+                fd: evidence.fd,
+                number: None,
+                namespace: Some(evidence.namespace),
+                facts: evidence.facts,
+                tuple,
+                provenance,
+            };
+            proof.validate()?;
+            return Ok(proof);
+        }
         let _flow = tuple.owner_flow().map_err(unavailable)?;
         let mut found = None;
         let mut count = 0;
@@ -1776,7 +2387,8 @@ impl Peer {
             found = Some(SocketProof {
                 peer: Arc::clone(self),
                 fd,
-                number,
+                number: Some(number),
+                namespace: None,
                 facts,
                 tuple,
                 provenance,
@@ -1863,7 +2475,8 @@ impl SocketFacts {
 pub(crate) struct SocketProof {
     peer: Arc<Peer>,
     fd: OwnedFd,
-    number: i32,
+    number: Option<i32>,
+    namespace: Option<OwnedFd>,
     facts: SocketFacts,
     tuple: Tuple,
     provenance: u8,
@@ -1881,9 +2494,26 @@ impl SocketProof {
     }
     fn validate(&self) -> Result<(), ServiceError> {
         self.peer.validate()?;
+        if let (Some(scope), Some(namespace)) = (&self.peer.system_scope, &self.namespace) {
+            let current = yonik_nsfs::socket_namespace::socket_namespace(&self.fd)
+                .map_err(|_| ServiceError::Unsupported)?;
+            let expected = scope.lookup_binding().2.namespace();
+            for fd in [&current, namespace] {
+                let s = rustix::fs::fstat(fd).map_err(unavailable)?;
+                if (s.st_dev, s.st_ino) != expected {
+                    return Err(ServiceError::Unsupported);
+                }
+            }
+            if SocketFacts::capture(&self.fd)? != self.facts
+                || !self.facts.matches(self.tuple, self.provenance)
+            {
+                return Err(ServiceError::Unavailable);
+            }
+            return self.peer.validate();
+        }
         let current = rustix::process::pidfd_getfd(
             &self.peer.pidfd,
-            self.number,
+            self.number.ok_or(ServiceError::Unsupported)?,
             rustix::process::PidfdGetfdFlags::empty(),
         )
         .map_err(|_| ServiceError::Unsupported)?;

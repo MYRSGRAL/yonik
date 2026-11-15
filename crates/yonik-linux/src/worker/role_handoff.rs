@@ -90,7 +90,7 @@ fn send_packet(
     bytes: &[u8],
     fds: &[std::os::fd::BorrowedFd<'_>],
 ) -> Result<(), WorkerError> {
-    if bytes.is_empty() || bytes.len() > FRAME || fds.len() > 2 {
+    if bytes.is_empty() || bytes.len() > 256 || fds.len() > 2 {
         return Err(WorkerError::Protocol);
     }
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
@@ -129,11 +129,11 @@ fn receive_packet(
     count: usize,
     deadline: Instant,
 ) -> Result<Vec<OwnedFd>, WorkerError> {
-    if expected.len() > FRAME || count > 2 {
+    if expected.len() > 256 || count > 2 {
         return Err(WorkerError::Protocol);
     }
     setup(socket, deadline)?;
-    let mut bytes = [0; FRAME + 1];
+    let mut bytes = [0; 257];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2), ScmCredentials(1))];
     let mut ancillary = RecvAncillaryBuffer::new(&mut space);
     let msg = net::recvmsg(
@@ -246,6 +246,114 @@ struct ProfileExtension {
     record: crate::profile_channel::LaunchRecord,
     launch: std::fs::File,
     channel: OwnedFd,
+    handoff: OwnedFd,
+}
+
+/// Consuming trusted exec delivery; не current-image и не owner/FlowGrant proof.
+pub(crate) struct VerifiedExecDelivery {
+    record: crate::profile_channel::ExecDelivery,
+    image: std::fs::File,
+    config: std::fs::File,
+    _credit: crate::helper::memory::ByteLease,
+}
+impl VerifiedExecDelivery {
+    pub(crate) fn files(
+        &self,
+        launch: crate::profile_channel::LaunchRecord,
+    ) -> Result<(std::fs::File, std::fs::File), WorkerError> {
+        crate::profile_channel::ExecDelivery::decode(
+            &self.record.encode().map_err(|_| WorkerError::Protocol)?,
+            launch,
+        )
+        .map_err(|_| WorkerError::Peer)?;
+        Ok((
+            self.image.try_clone().map_err(|_| WorkerError::Io)?,
+            self.config.try_clone().map_err(|_| WorkerError::Io)?,
+        ))
+    }
+}
+pub(crate) fn receive_exec_delivery(
+    socket: &OwnedFd,
+    launch: crate::profile_channel::LaunchRecord,
+    payload: &super::WorkerPayload,
+    pid: u32,
+    uid: u32,
+    deadline: Instant,
+    deliver: impl FnOnce(VerifiedExecDelivery) -> Result<(), WorkerError>,
+) -> Result<(), WorkerError> {
+    let expected = payload.exec_delivery(launch)?;
+    let credit = crate::helper::memory::executable_budget()
+        .reserve(expected.image_bytes as usize)
+        .map_err(|_| WorkerError::Protocol)?;
+    let fds = receive_packet(
+        socket,
+        &expected.encode().map_err(|_| WorkerError::Protocol)?,
+        pid,
+        uid,
+        2,
+        deadline,
+    )?;
+    let [image, config]: [OwnedFd; 2] = fds.try_into().map_err(|_| WorkerError::Protocol)?;
+    let image = std::fs::File::from(image);
+    let config = std::fs::File::from(config);
+    for (file, length, hash) in [
+        (&image, expected.image_bytes as usize, expected.image),
+        (
+            &config,
+            expected.config_bytes as usize,
+            launch.binding.digest,
+        ),
+    ] {
+        if rustix::fs::fcntl_getfl(file).map_err(|_| WorkerError::Peer)?
+            & rustix::fs::OFlags::ACCMODE
+            != rustix::fs::OFlags::RDONLY
+        {
+            return Err(WorkerError::Peer);
+        }
+        super::validate_file(file, length, hash)?;
+    }
+    if !rustix::fs::fcntl_get_seals(&image)
+        .map_err(|_| WorkerError::Peer)?
+        .contains(rustix::fs::SealFlags::EXEC)
+    {
+        return Err(WorkerError::Peer);
+    }
+    deliver(VerifiedExecDelivery {
+        record: expected,
+        image,
+        config,
+        _credit: credit,
+    })?;
+    setup(socket, deadline)?;
+    send_packet(
+        socket,
+        &expected.ack().map_err(|_| WorkerError::Protocol)?,
+        &[],
+    )
+}
+pub(crate) fn send_proof_bootstrap(
+    socket: &OwnedFd,
+    launch: crate::profile_channel::LaunchRecord,
+    proof: &OwnedFd,
+    pid: u32,
+    uid: u32,
+    deadline: Instant,
+) -> Result<(), WorkerError> {
+    setup(socket, deadline)?;
+    send_packet(
+        socket,
+        &crate::profile_channel::proof_bootstrap(launch).map_err(|_| WorkerError::Protocol)?,
+        &[proof.as_fd()],
+    )?;
+    receive_packet(
+        socket,
+        &crate::profile_channel::proof_bootstrap_ack(launch).map_err(|_| WorkerError::Protocol)?,
+        pid,
+        uid,
+        0,
+        deadline,
+    )?;
+    Ok(())
 }
 
 fn profile_binding(
@@ -287,6 +395,7 @@ impl RunHandoff {
         command: &mut std::process::Command,
         capsule: Option<&[u8]>,
         config: &std::fs::File,
+        image: &std::fs::File,
         assets: Option<&std::fs::File>,
     ) -> Result<(), WorkerError> {
         match (&self.transport.profile, capsule, assets) {
@@ -306,6 +415,67 @@ impl RunHandoff {
                     config,
                     usize::try_from(length).map_err(|_| WorkerError::Protocol)?,
                     extension.record.binding.digest,
+                )?;
+                use std::os::{fd::AsRawFd, unix::fs::FileExt};
+                if command.get_program()
+                    != std::ffi::OsStr::new(&format!("/proc/self/fd/{}", image.as_raw_fd()))
+                    || command
+                        .get_args()
+                        .ne(["run", "-c", "stdin:"].map(std::ffi::OsStr::new))
+                {
+                    return Err(WorkerError::Peer);
+                }
+                let mut input = config.try_clone().map_err(|_| WorkerError::Io)?;
+                use std::io::Seek;
+                input
+                    .seek(std::io::SeekFrom::Start(0))
+                    .map_err(|_| WorkerError::Io)?;
+                command.stdin(std::process::Stdio::from(input));
+                let mut hash = sha2::Sha256::new();
+                use sha2::Digest;
+                let mut offset = 0;
+                let mut buffer = [0; 16384];
+                let size = image.metadata().map_err(|_| WorkerError::Io)?.len();
+                if size == 0 || size > crate::BinarySnapshot::MAX_SIZE {
+                    return Err(WorkerError::Limit);
+                }
+                while offset < size {
+                    let n = image
+                        .read_at(&mut buffer[..(size - offset).min(16384) as usize], offset)
+                        .map_err(|_| WorkerError::Io)?;
+                    if n == 0 {
+                        return Err(WorkerError::Peer);
+                    }
+                    hash.update(&buffer[..n]);
+                    offset += n as u64;
+                }
+                let record = crate::profile_channel::ExecDelivery {
+                    launch: extension.record,
+                    image: hash.finalize().into(),
+                    image_bytes: size,
+                    config_bytes: u32::try_from(length).map_err(|_| WorkerError::Limit)?,
+                };
+                let readonly_image =
+                    std::fs::File::open(format!("/proc/self/fd/{}", image.as_raw_fd()))
+                        .map_err(|_| WorkerError::Io)?;
+                let readonly_config =
+                    std::fs::File::open(format!("/proc/self/fd/{}", config.as_raw_fd()))
+                        .map_err(|_| WorkerError::Io)?;
+                super::validate_file(&readonly_image, size as usize, record.image)?;
+                let deadline = Instant::now() + std::time::Duration::from_secs(1);
+                setup(&extension.handoff, deadline)?;
+                send_packet(
+                    &extension.handoff,
+                    &record.encode().map_err(|_| WorkerError::Protocol)?,
+                    &[readonly_image.as_fd(), readonly_config.as_fd()],
+                )?;
+                receive_packet(
+                    &extension.handoff,
+                    &record.ack().map_err(|_| WorkerError::Protocol)?,
+                    extension.record.owner_pid,
+                    0,
+                    0,
+                    deadline,
                 )?;
             }
             (None, None, _) => {}
@@ -443,6 +613,7 @@ fn receive_verified_transport(
             record: launch,
             launch: sealed,
             channel,
+            handoff: rustix::io::fcntl_dupfd_cloexec(socket, 3).map_err(|_| WorkerError::Io)?,
         })
     } else {
         None
