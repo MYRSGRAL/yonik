@@ -18,12 +18,13 @@ p1_review: scoped_clean
 p1_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A98dc36ca-eb0f-439b-86eb-879a1a7c6a13
 p2_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3Ab182df4b-487a-44c1-a50a-8300e04c0548
 p2_candidate: 7f915fec02a78cb8c2049ec816c2a580888cfcc3
+p2_integrated_head: 6fe50ed6961bace6f3fdbb3c580d49a222ac05cb
 p2_review: scoped_clean
 p2_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A59cadea6-d4a8-4b5e-8885-104af87bb83d
 p2_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A5dd29e5f-cb87-4ca3-8de1-045356518667
 p3_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A8ac093d3-885f-48c8-a51b-dd536829e681
-p3_candidate: 3572d533ec16db5e3be32574951e86268fc021f5
-p3_candidate_status: compile_scope_complete_review_in_progress
+p3_candidate: d380fa0b5096679e4f0fbde1363262430e951f92
+p3_candidate_status: correction_tested_pending_narrow_review
 p3_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3Ac73e19e2-1c96-4434-a0a5-2023682cf7b6
 localdns_go_scope: approved
 p1_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A2fdfb486-f16a-4156-b6f1-5b63eb67b2fc
@@ -206,6 +207,21 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
 - R2 narrow 59cadea6 — scoped CLEAN на 7f915fe, оба Major закрыты. P2 source
   gate принят, сохраняются author RED/GREEN46 и независимый archive binding.
   Интегрируется обычным local merge в task/happ-full-profiles, не в main.
+- P2 интегрирован в 6fe50ed; все software blobs/modes reviewed 7f915fe
+  сохранены. Отличаются только три root coordination/design docs. Receipt:
+  local/orchestration/evidence/happ-full-profiles-integration/p2-union.json.
+- R3 c73e19e2 нашёл два Major в P3 3572d53: неполная классификация DAT
+  aliases/inverted IP и неявный localdns при пустом DNS. Кандидат влит только
+  для root correction; P3 gate остаётся закрыт для запуска P4/P5.
+  Две новые регрессии воспроизвели ошибки (17 PASS / 2 expected failures).
+  Проверка pinned core также показала localdns fallback при отсутствии DNS app.
+  Новые tests используют explicit synthetic snapshot; unbound negative controls
+  сохранены. Evidence: local/orchestration/evidence/happ-p3-review-fix-root.
+- Root correction d380fa0: 55 pure tests, clippy all-targets -D warnings,
+  fmt и diff-check PASS. Полный frozen archive совпал с 3056 tracked blobs/modes
+  exact head; 8 retained ELF hashes проверены. Tests/ELF/source сохранены до
+  исполнения. Cargo clean выполнен, собственный transient root удалён.
+  Нужен новый narrow review двух findings; actual/DAT proof не повышается.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
