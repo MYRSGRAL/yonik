@@ -140,7 +140,10 @@ pub fn compile_system_bound_policy<C: crate::resource_bundle::VerifiedCatalog>(
     .map_err(PolicyCompileError::Server)
 }
 
-fn attach(mut config: CompiledConfig, tun: &SystemTun) -> Result<CompiledConfig, CompileError> {
+pub(crate) fn attach(
+    mut config: CompiledConfig,
+    tun: &SystemTun,
+) -> Result<CompiledConfig, CompileError> {
     let addresses: Vec<_> = tun
         .addresses
         .iter()

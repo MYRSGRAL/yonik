@@ -78,7 +78,7 @@ pub struct ProbeCredentials {
     password: String,
 }
 impl ProbeCredentials {
-    fn random() -> Result<Self, PolicyCompileError> {
+    pub(crate) fn random() -> Result<Self, PolicyCompileError> {
         let mut random = [0; 32];
         getrandom::getrandom(&mut random).map_err(|_| PolicyCompileError::Random)?;
         const HEX: &[u8] = b"0123456789abcdef";
@@ -111,6 +111,12 @@ pub struct ProbeAccess {
     domains: Vec<DomainPattern>,
 }
 impl ProbeAccess {
+    pub(crate) fn native(auth: ProbeCredentials) -> Self {
+        Self {
+            auth: Some(auth),
+            ..Self::default()
+        }
+    }
     pub fn auth(&self) -> Option<&ProbeCredentials> {
         self.auth.as_ref()
     }

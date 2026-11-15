@@ -1,6 +1,7 @@
 //! Строгий компилятор одного proxy outbound. Не запускает ядро и не меняет сеть.
 
 mod dns;
+pub mod native_profile;
 pub use dns::{DnsContract, DnsMode, compile_native_dns, compile_policy_with_dns};
 mod options;
 pub mod platform_source;
