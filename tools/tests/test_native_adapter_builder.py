@@ -118,7 +118,9 @@ class BuilderTests(unittest.TestCase):
             return original(runner, argv, cwd)
 
         with patch.object(builder.Runner, "run", autospec=True, side_effect=run):
-            result = builder.build(self.root, self.output, self.patch_file, "xray")
+            result = builder.build(
+                self.root, self.output, self.patch_file, "xray", compile_only=True
+            )
         manifest = json.loads(result.read_text())
         self.assertEqual(manifest["source_commit"], builder.XRAY_COMMIT)
         self.assertEqual(
@@ -132,8 +134,22 @@ class BuilderTests(unittest.TestCase):
         self.assertIn("-p=1", command)
         self.assertEqual(command[-1], "./main")
         self.assertFalse(any(argv[:2] == ["git", "apply"] for argv in self.commands))
+        self.assertFalse(
+            any(
+                argv and argv[0] == str(self.root / "build-native-adapter-xray")
+                for argv in self.commands
+            )
+        )
+        self.assertEqual(manifest["validation"], "COMPILE_ONLY")
+        self.assertFalse(manifest["binary_version_executed"])
 
     def test_codec_component_is_verified_without_feature_ack(self) -> None:
+        self.check_codec_component(compile_only=False)
+
+    def test_compile_only_codec_never_executes_tests_or_core(self) -> None:
+        self.check_codec_component(compile_only=True)
+
+    def check_codec_component(self, *, compile_only: bool) -> None:
         original = self.fake_run
 
         def run(runner: builder.Runner, argv: list[str], cwd: Path) -> str:
@@ -173,13 +189,29 @@ class BuilderTests(unittest.TestCase):
             patch.object(builder, "EXTRA_PATCHES", tuple(self.extra_patches)),
         ):
             result = builder.build(
-                self.root, self.output, self.patch_file, native_codec=True
+                self.root,
+                self.output,
+                self.patch_file,
+                native_codec=True,
+                compile_only=compile_only,
             )
         manifest = json.loads(result.read_text())
         self.assertFalse(manifest["native_codec_component"]["runtime_hooks_connected"])
         self.assertTrue(
             manifest["native_codec_component"]["routing_entry_guard_connected"]
         )
+        if compile_only:
+            tests = [argv for argv in self.commands if argv[:2] == ["go", "test"]]
+            self.assertEqual(len(tests), 3)
+            self.assertTrue(all("-c" in argv for argv in tests))
+            self.assertFalse(
+                any(
+                    argv and argv[0].startswith(str(self.root))
+                    for argv in self.commands
+                )
+            )
+            self.assertEqual(manifest["validation"], "COMPILE_ONLY")
+            return
         self.assertIn(["go", "test", "-p=1", "-mod=readonly", "./route"], self.commands)
         self.assertIn(
             ["go", "test", "-p=1", "-mod=readonly", "./protocol/tun"], self.commands
