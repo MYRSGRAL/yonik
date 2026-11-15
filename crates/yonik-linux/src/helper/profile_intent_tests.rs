@@ -128,6 +128,61 @@ fn full_request_roundtrip_and_cancel_do_not_open_sources() {
         Err(super::super::ServiceError::Cancelled)
     );
 }
+
+#[test]
+fn full_request_wrapper_budget_counts_partial_writes() {
+    use yonik_engine::native_profile::{MAX_INTENT_BYTES, ProfileIntent};
+    struct PartialSink {
+        accepted: usize,
+    }
+    impl std::io::Write for PartialSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let count = bytes.len().min(7);
+            self.accepted += count;
+            assert!(self.accepted <= super::super::MAX_REQUEST);
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let small = FullProfileRequest::new(
+        ProfileIntent::from_profile(&profile(1)).unwrap(),
+        7,
+        [3; 32],
+        true,
+    )
+    .unwrap();
+    let mut exact = Vec::new();
+    small.write_sensitive(&mut exact).unwrap();
+    let mut partial = PartialSink { accepted: 0 };
+    small.write_sensitive(&mut partial).unwrap();
+    assert_eq!(partial.accepted, exact.len());
+
+    let mut wire = json!({"version":1,"graph":{"outbounds":[{"tag":"x","protocol":"freedom","streamSettings":{"network":"grpc","grpcSettings":{"serviceName":""}}}]}});
+    let padding = MAX_INTENT_BYTES - 16 - wire.to_string().len();
+    wire["graph"]["outbounds"][0]["streamSettings"]["grpcSettings"]["serviceName"] =
+        json!("a".repeat(padding));
+    let intent = ProfileIntent::decode(&wire.to_string()).unwrap();
+    let mut intent_bytes = Vec::new();
+    intent.write_sensitive(&mut intent_bytes).unwrap();
+    assert_eq!(intent_bytes.len(), MAX_INTENT_BYTES - 16);
+    let request = FullProfileRequest::new(intent, 7, [3; 32], true).unwrap();
+    let mut partial = PartialSink { accepted: 0 };
+    assert_eq!(
+        request.write_sensitive(&mut partial),
+        Err(super::super::ServiceError::InvalidRequest)
+    );
+    assert!(partial.accepted < super::super::MAX_REQUEST);
+    let oversized =
+        json!({"version":1,"generation":7,"selection":vec![3u8;32],"kill_switch":true,"intent":wire})
+            .to_string();
+    assert!(oversized.len() > super::super::MAX_REQUEST);
+    assert!(matches!(
+        FullProfileRequest::decode(&oversized),
+        Err(super::super::ServiceError::InvalidRequest)
+    ));
+}
 fn from_value(value: &serde_json::Value) -> NativeProfile {
     let bytes = serde_json::to_vec(value).unwrap();
     match import_profiles(bytes).unwrap().entries.remove(0) {

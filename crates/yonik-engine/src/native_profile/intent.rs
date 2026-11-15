@@ -583,6 +583,56 @@ mod tests {
         }
     }
     #[test]
+    fn transport_exact_bytes_cover_utf8_signed_mux_and_nested_packets() {
+        // Golden выписаны из P5STRM01 layout, без вызова production encoder
+        // для ожидаемых значений. Length у строк считает UTF-8 bytes.
+        for (stream, mux, expected) in [
+            (
+                serde_json::json!({"network":"grpc","grpcSettings":{"serviceName":"я","mode":false}}),
+                Some(serde_json::json!({"concurrency":-1})),
+                "50355354524d30310200010100000004677270630000010100000002d18f000001000000000000010001ffffffffffffffff0000",
+            ),
+            (
+                serde_json::json!({"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[[{"type":"str","packet":"я"},{"type":"hex","packet":"ff"},{"rand":3}]],"servers":[]}}]}}),
+                None,
+                "50355354524d3031010001010000000374637000000000000000010100000001010000000d6865616465722d637573746f6d0101000000010000000301000000037374720100000002d18f0001000000036865780100000002666600000001000000000000000301000000000000",
+            ),
+        ] {
+            let mut outbound =
+                serde_json::json!({"tag":"x","protocol":"freedom","streamSettings":stream});
+            if let Some(mux) = mux {
+                outbound["mux"] = mux;
+            }
+            let wire = serde_json::json!({"version":1,"graph":{"outbounds":[outbound]}});
+            let intent = ProfileIntent::decode(&wire.to_string()).unwrap();
+            let mut actual = Vec::new();
+            intent.write_transport_sensitive("x", &mut actual).unwrap();
+            let expected: Vec<u8> = expected
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn explicit_empty_stream_has_a_distinct_exact_golden() {
+        let wire = r#"{"version":1,"graph":{"outbounds":[{"tag":"x","protocol":"freedom","streamSettings":{}}]}}"#;
+        let intent = ProfileIntent::decode(wire).unwrap();
+        let mut bytes = Vec::new();
+        intent.write_transport_sensitive("x", &mut bytes).unwrap();
+        // kind/security, Stream Some, девять None полей, Mux None.
+        assert_eq!(
+            bytes,
+            [
+                b"P5STRM01".as_slice(),
+                &[1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            ]
+            .concat()
+        );
+    }
+    #[test]
     fn outbound_count_is_bounded_in_typed_decode() {
         let outbounds: Vec<_> = (0..257)
             .map(|i| serde_json::json!({"tag":format!("s{i}"),"protocol":"freedom"}))
