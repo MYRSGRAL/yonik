@@ -1,3 +1,1192 @@
+diff --git a/common/yonikbroker/profile-system-proof-v1.json b/common/yonikbroker/profile-system-proof-v1.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-system-proof-v1.json
+@@ -0,0 +1,9 @@
++{
++  "provenance": "independent Python struct.pack big-endian; synthetic DATA only",
++  "launch_hex": "594e4b4558543031000100c0000100000606060606060606060606060606060606060606060606060606060606060606030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000500000007000000080000000000000009000000000000000a0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0000000000000000",
++  "exec_hex": "594e4b45584330310001010000020000060606060606060606060606060606060606060606060606060606060606060603030303030303030303030303030303030303030303030303030303030303030101010101010101010101010101010102020202020202020202020202020202000000000000000400000000000000050000000800000000000000000000000a0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c03030303030303030303030303030303030303030303030303030303030303030b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b00000000000010000000004000000000",
++  "exec_ack_hex": "594e4b45584130312fba0b79dd5b7133d213551c517f5f5eef816918aea91b3b85c8884c370c29de",
++  "bootstrap_hex": "594e4b5046303031000100800001000006060606060606060606060606060606060606060606060606060606060606060303030303030303030303030303030303030303030303030303030303030303010101010101010101010101010101010202020202020202020202020202020200000000000000040000000000000005",
++  "bootstrap_ack_hex": "594e4b5046413031a3df463f8028114a78f9a8f1e7fee1e5ad43b99d9ab199e38583388f9e42ccca",
++  "socket_hex": "594e4b5350463031000100c000010000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000003000000000000000100000200060400007d010438c00002010000000000000000000000007f00000100000000000000000000000000000000"
++}
+diff --git a/common/yonikbroker/profile_proof_os_linux.go b/common/yonikbroker/profile_proof_os_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_proof_os_linux.go
+@@ -0,0 +1,332 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"net/netip"
++	"os"
++	"syscall"
++	"time"
++
++	xnet "github.com/xtls/xray-core/common/net"
++	"golang.org/x/sys/unix"
++)
++
++// Разбор по одному cmsg сохраняет уже принятые rights при повреждённом suffix.
++func profileParseAncillary(body, oob []byte, flags int, adopt func(int) profileProofFD) profileProofPacket {
++	p := profileProofPacket{body: body, invalid: flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0}
++	for len(oob) > 0 {
++		h, data, rest, e := unix.ParseOneSocketControlMessage(oob)
++		if e != nil {
++			p.invalid = true
++			break
++		}
++		oob = rest
++		m := unix.SocketControlMessage{Header: h, Data: data}
++		if h.Level != unix.SOL_SOCKET {
++			p.invalid = true
++			continue
++		}
++		switch h.Type {
++		case unix.SCM_RIGHTS:
++			p.rightsMessages++
++			if len(m.Data)%4 != 0 {
++				p.invalid = true
++				m.Data = m.Data[:len(m.Data)&^3]
++			}
++			fds, e := unix.ParseUnixRights(&m)
++			if e != nil {
++				p.invalid = true
++				continue
++			}
++			if len(fds) == 0 || p.rightsMessages != 1 {
++				p.invalid = true
++			}
++			for _, fd := range fds {
++				if p.count >= len(p.rights) {
++					p.invalid = true
++					adopt(fd).Close()
++					continue
++				}
++				p.rights[p.count] = adopt(fd)
++				p.count++
++			}
++		case unix.SCM_CREDENTIALS:
++			p.credentials++
++			cred, e := unix.ParseUnixCredentials(&m)
++			if e != nil {
++				p.invalid = true
++			} else {
++				p.pid, p.uid = cred.Pid, cred.Uid
++			}
++		default:
++			p.invalid = true
++		}
++	}
++	return p
++}
++func profileAdoptFD(fd int) profileProofFD {
++	return &profileFileFD{file: os.NewFile(uintptr(fd), "profile-proof-owned")}
++}
++func (p *ProfileRuntime) proofPeerAlive() bool { return p.peerAlive() == nil }
++func (p *ProfileRuntime) receiveBootstrap(deadline time.Time) (profileProofPacket, error) {
++	for time.Now().Before(deadline) {
++		if p.peerAlive() != nil {
++			return profileProofPacket{}, errProfile
++		}
++		fds := []unix.PollFd{{Fd: int32(p.channel.Fd()), Events: unix.POLLIN}, {Fd: int32(p.peer.Fd()), Events: unix.POLLIN}}
++		wait := time.Until(deadline)
++		if wait > 20*time.Millisecond {
++			wait = 20 * time.Millisecond
++		}
++		n, e := unix.Poll(fds, int((wait+time.Millisecond-1)/time.Millisecond))
++		if e == unix.EINTR {
++			continue
++		}
++		if e != nil || fds[1].Revents != 0 {
++			return profileProofPacket{}, errProfile
++		}
++		if n == 0 {
++			continue
++		}
++		if fds[0].Revents&unix.POLLIN == 0 {
++			return profileProofPacket{}, errProfile
++		}
++		body := make([]byte, 128)
++		oob := make([]byte, unix.CmsgSpace(16*4)+unix.CmsgSpace(unix.SizeofUcred))
++		n, control, flags, _, e := unix.Recvmsg(int(p.channel.Fd()), body, oob, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
++		if n < 0 {
++			n = 0
++		}
++		if n > len(body) {
++			n = len(body)
++			flags |= unix.MSG_TRUNC
++		}
++		packet := profileParseAncillary(body[:n], oob[:control], flags, profileAdoptFD)
++		if e != nil || n == 0 {
++			packet.invalid = true
++			return packet, errProfile
++		}
++		return packet, nil
++	}
++	return profileProofPacket{}, errProfileTimeout
++}
++func (p *ProfileRuntime) validateProofFD(fd profileProofFD) error {
++	return fd.withFD(func(n int) error {
++		kind, e := unix.GetsockoptInt(n, unix.SOL_SOCKET, unix.SO_TYPE)
++		if e != nil || kind != unix.SOCK_SEQPACKET {
++			return errProfile
++		}
++		address, e := unix.Getsockname(n)
++		if e != nil {
++			return errProfile
++		}
++		if _, ok := address.(*unix.SockaddrUnix); !ok {
++			return errProfile
++		}
++		cred, e := unix.GetsockoptUcred(n, unix.SOL_SOCKET, unix.SO_PEERCRED)
++		if e != nil || !profileSenderValid(p.admission.launch, cred.Pid, cred.Uid, uint32(os.Geteuid())) {
++			return errProfile
++		}
++		var a, b unix.Stat_t
++		if unix.Fstat(n, &a) != nil || unix.Fstat(int(p.channel.Fd()), &b) != nil || a.Dev == b.Dev && a.Ino == b.Ino {
++			return errProfile
++		}
++		flags, e := unix.FcntlInt(uintptr(n), unix.F_GETFD, 0)
++		if e != nil || flags&unix.FD_CLOEXEC == 0 {
++			return errProfile
++		}
++		return unix.SetsockoptInt(n, unix.SOL_SOCKET, unix.SO_PASSCRED, 1)
++	})
++}
++func (p *ProfileRuntime) sendBootstrapAck(body []byte) error {
++	if len(body) != 40 || p.peerAlive() != nil {
++		return errProfile
++	}
++	n, e := unix.SendmsgN(int(p.channel.Fd()), body, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++	if e != nil || n != len(body) {
++		return errProfile
++	}
++	return nil
++}
++func (p *ProfileRuntime) proofHealth() error {
++	if p.proofs == nil || p.proofs.fd == nil {
++		return errProfile
++	}
++	return p.proofs.fd.withFD(func(n int) error {
++		fds := []unix.PollFd{{Fd: int32(n), Events: unix.POLLIN}}
++		count, e := unix.Poll(fds, 0)
++		if e != nil || count != 0 {
++			return errProfile
++		}
++		return nil
++	})
++}
++func (p *ProfileRuntime) sendSocketProof(body []byte, socket profileProofFD) error {
++	return p.proofs.fd.withFD(func(channel int) error {
++		return socket.withFD(func(fd int) error {
++			if p.peerAlive() != nil {
++				return errProfile
++			}
++			actual, e := profileSocketTuple(fd)
++			if e != nil || len(body) != 192 || string(actual[:]) != string(body[148:188]) {
++				return errProfile
++			}
++			n, e := unix.SendmsgN(channel, body, unix.UnixRights(fd), nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++			if e == unix.EAGAIN || e == unix.EWOULDBLOCK {
++				return errProfileProofBusy
++			}
++			if e != nil || n != len(body) {
++				return errProfile
++			}
++			return nil
++		})
++	})
++}
++func profileSockaddrValue(a unix.Sockaddr) (profileDestinationValue, error) {
++	v := profileDestinationValue{network: 6}
++	switch a := a.(type) {
++	case *unix.SockaddrInet4:
++		v.family = 4
++		v.port = uint16(a.Port)
++		v.address = netip.AddrFrom4(a.Addr).String()
++	case *unix.SockaddrInet6:
++		if a.ZoneId != 0 {
++			return v, errProfile
++		}
++		ip := netip.AddrFrom16(a.Addr).Unmap()
++		v.family = 6
++		if ip.Is4() {
++			v.family = 4
++		}
++		v.port = uint16(a.Port)
++		v.address = ip.String()
++	default:
++		return v, errProfile
++	}
++	if !v.valid() {
++		return v, errProfile
++	}
++	return v, nil
++}
++func profileSocketTuple(fd int) ([40]byte, error) {
++	var empty [40]byte
++	kind, e := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
++	if e != nil || kind != unix.SOCK_STREAM {
++		return empty, errProfile
++	}
++	protocol, e := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_PROTOCOL)
++	if e != nil || protocol != unix.IPPROTO_TCP {
++		return empty, errProfile
++	}
++	remote, e := unix.Getpeername(fd)
++	if e != nil {
++		return empty, errProfile
++	}
++	local, e := unix.Getsockname(fd)
++	if e != nil {
++		return empty, errProfile
++	}
++	r, e := profileSockaddrValue(remote)
++	if e != nil {
++		return empty, e
++	}
++	l, e := profileSockaddrValue(local)
++	if e != nil {
++		return empty, e
++	}
++	return profileTuple(xnet.TCPDestination(xnet.ParseAddress(r.address), xnet.Port(r.port)), xnet.TCPDestination(xnet.ParseAddress(l.address), xnet.Port(l.port)))
++}
++func profileDuplicateAccepted(conn xnet.Conn, tuple [40]byte) (profileProofFD, error) {
++	return profileDuplicateAcceptedWith(conn, tuple, func(fd uintptr) (profileProofFD, error) {
++		n, e := unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 3)
++		if e != nil {
++			return nil, e
++		}
++		return profileAdoptFD(n), nil
++	}, func(fd profileProofFD) (actual [40]byte, err error) {
++		err = fd.withFD(func(n int) error { var e error; actual, e = profileSocketTuple(n); return e })
++		return actual, err
++	})
++}
++func profileDuplicateAcceptedWith(conn xnet.Conn, tuple [40]byte, duplicate func(uintptr) (profileProofFD, error), inspect func(profileProofFD) ([40]byte, error)) (profileProofFD, error) {
++	source, ok := conn.(syscall.Conn)
++	if !ok {
++		return nil, ErrProfileUnsupported
++	}
++	raw, e := source.SyscallConn()
++	if e != nil {
++		return nil, e
++	}
++	var owned profileProofFD
++	var result error
++	e = raw.Control(func(fd uintptr) {
++		owned, result = duplicate(fd)
++		if result != nil {
++			return
++		}
++		if owned == nil {
++			result = errProfile
++			return
++		}
++		actual, e := inspect(owned)
++		if e != nil || actual != tuple {
++			result = errProfile
++		}
++	})
++	if e != nil {
++		result = e
++	}
++	if result != nil {
++		return owned, result
++	}
++	if owned == nil {
++		return nil, errProfile
++	}
++	return owned, nil
++}
++func (p *ProfileRuntime) proofPollFD() (int, error) {
++	if p.proofs == nil || p.proofs.fd == nil {
++		return -1, errProfile
++	}
++	fd := -1
++	e := p.proofs.fd.withFD(func(n int) error { fd = n; return nil })
++	return fd, e
++}
++func (p *ProfileRuntime) rejectRights(packet profileProofPacket) error {
++	var result error
++	for i, fd := range packet.rights {
++		if fd != nil {
++			if e := fd.Close(); e != nil {
++				p.proofRejected[i] = fd
++				result = e
++			}
++		}
++	}
++	if result != nil {
++		p.mu.Lock()
++		p.admission.state = profileUnknown
++		p.mu.Unlock()
++	}
++	return result
++}
++func (p *ProfileRuntime) rejectProofInput() {
++	if p.proofs == nil || p.proofs.fd == nil {
++		return
++	}
++	var packet profileProofPacket
++	_ = p.proofs.fd.withFD(func(fd int) error {
++		var body [128]byte
++		oob := make([]byte, unix.CmsgSpace(16*4)+unix.CmsgSpace(unix.SizeofUcred))
++		n, control, flags, _, _ := unix.Recvmsg(fd, body[:], oob, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
++		if n < 0 {
++			n = 0
++		}
++		if n > len(body) {
++			n = len(body)
++		}
++		packet = profileParseAncillary(body[:n], oob[:control], flags, profileAdoptFD)
++		return nil
++	})
++	_ = p.rejectRights(packet)
++}
+diff --git a/common/yonikbroker/profile_proof_linux.go b/common/yonikbroker/profile_proof_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_proof_linux.go
+@@ -0,0 +1,233 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"errors"
++	"os"
++	"sync"
++	"time"
++)
++
++var errProfileProofBusy = errors.New("profile proof channel backpressure")
++
++const profileAcceptedFDCredit = 256
++
++var errProfileProofCancelled = errors.New("profile proof request cancelled")
++
++// Kernel handle потребляется только через private scoped callback. Read/Write,
++// raw socket getters и произвольных integer FD constructors у API нет.
++type profileProofFD interface {
++	Close() error
++	withFD(func(int) error) error
++}
++type profileFileFD struct {
++	mu     sync.Mutex
++	file   *os.File
++	closed bool
++	result error
++}
++
++func (f *profileFileFD) Close() error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if !f.closed {
++		f.closed = true
++		f.result = f.file.Close()
++	}
++	return f.result
++}
++func (f *profileFileFD) withFD(fn func(int) error) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.closed || f.file == nil {
++		return errProfile
++	}
++	return fn(int(f.file.Fd()))
++}
++
++type profileProofPacket struct {
++	body               []byte
++	rights             [32]profileProofFD
++	count, credentials int
++	rightsMessages     int
++	pid                int32
++	uid                uint32
++	invalid            bool
++}
++type profileProofBootstrapIO interface {
++	receiveBootstrap(time.Time) (profileProofPacket, error)
++	validateProofFD(profileProofFD) error
++	sendBootstrapAck([]byte) error
++	proofPeerAlive() bool
++}
++type profileProofChannel struct {
++	mu          sync.Mutex
++	launch      profileLaunch
++	fd          profileProofFD
++	custody     [32]profileProofFD
++	lastProof   uint64
++	lastEmitted uint64
++	closed      bool
++	result      error
++	peer        func() bool
++	check       func() error
++	send        func([]byte, profileProofFD) error
++}
++
++func (c *profileProofChannel) Close() error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.closed {
++		c.closed = true
++		for i, fd := range c.custody {
++			if fd != nil {
++				e := fd.Close()
++				c.result = errors.Join(c.result, e)
++				if e == nil {
++					c.custody[i] = nil
++				}
++			}
++		}
++	}
++	return c.result
++}
++func (c *profileProofChannel) live() bool {
++	if c == nil {
++		return false
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return !c.closed && c.result == nil && c.fd != nil && (c.peer == nil || c.peer()) && (c.check == nil || c.check() == nil)
++}
++func (c *profileProofChannel) bootstrap(r profileLaunch, ch profileProofBootstrapIO, deadline time.Time, clock func() time.Time) error {
++	if r.mode != 2 || ch == nil || c.fd != nil || c.closed || !clock().Before(deadline) {
++		return errProfile
++	}
++	packet, e := ch.receiveBootstrap(deadline)
++	c.launch = r
++	c.custody = packet.rights
++	fail := func() error { return errors.Join(errProfile, c.Close()) }
++	expected, e2 := profileProofBootstrap(r)
++	if e != nil || e2 != nil || packet.invalid || packet.count != 1 || packet.rightsMessages != 1 || packet.credentials != 1 || !profileSenderValid(r, packet.pid, packet.uid, 0) || !bytes.Equal(packet.body, expected[:]) || !clock().Before(deadline) || !ch.proofPeerAlive() {
++		return fail()
++	}
++	c.fd = packet.rights[0]
++	if c.fd == nil || ch.validateProofFD(c.fd) != nil {
++		return fail()
++	}
++	ack := profileProofAck(expected)
++	if ch.sendBootstrapAck(ack[:]) != nil || !clock().Before(deadline) || !ch.proofPeerAlive() {
++		return fail()
++	}
++	return nil
++}
++func (c *profileProofChannel) prepare(op *profileOperation) error {
++	if op == nil || op.receipt == nil || op.receipt.association == nil {
++		return errProfile
++	}
++	a := op.receipt.association
++	if op.ctx.Err() != nil || a.ctx.Err() != nil {
++		return errProfileProofCancelled
++	}
++	if a.proof == nil || a.provenance != 2 || a.tuple != op.receipt.tuple || !c.live() {
++		return errProfile
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.closed || c.lastProof >= ^uint64(0)-1 {
++		return errProfile
++	}
++	if op.proof == 0 {
++		c.lastProof++
++		op.proof = c.lastProof
++	}
++	return nil
++}
++func (c *profileProofChannel) sendOpen(op *profileOperation) error {
++	if op.proofSent {
++		return errProfile
++	}
++	c.mu.Lock()
++	replay := op.proof <= c.lastEmitted
++	c.mu.Unlock()
++	if replay {
++		return errProfile
++	}
++	if op.ctx.Err() != nil || op.receipt.association.ctx.Err() != nil {
++		return errProfileProofCancelled
++	}
++	if !c.live() {
++		return errProfile
++	}
++	b, e := profileSocketRecord(c.launch, op.sequence, op.proof, op.receipt.index, op.receipt.tuple)
++	if e != nil {
++		return e
++	}
++	if c.send == nil {
++		return errProfile
++	}
++	if e = c.send(b[:], op.receipt.association.proof); e != nil {
++		return e
++	}
++	c.mu.Lock()
++	c.lastEmitted = op.proof
++	c.mu.Unlock()
++	op.proofSent = true
++	if op.ctx.Err() != nil {
++		return errProfileProofCancelled
++	}
++	return nil
++}
++
++func (c *profileFlowControl) closeAcceptedProofs() error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	var result error
++	for _, a := range c.accepted {
++		if a != nil {
++			result = errors.Join(result, a.closeProofLocked(c))
++		}
++	}
++	return result
++}
++func (a *profileAccepted) closeProofLocked(c *profileFlowControl) error {
++	if a.proof != nil {
++		if e := a.proof.Close(); e != nil {
++			return e
++		}
++		a.proof = nil
++	}
++	if a.proofCredit {
++		a.proofCredit = false
++		c.buffered -= profileAcceptedFDCredit
++	}
++	return nil
++}
++func (c *profileFlowControl) proofRequired(op *profileOperation) bool {
++	return c.mode == 2 && op.kind == 16 && op.receipt.provenance == 2
++}
++func (c *profileFlowControl) tryProof(op *profileOperation) error {
++	if !c.proofRequired(op) || op.proofSent {
++		return nil
++	}
++	// EAGAIN не разрешает более позднему proof обогнать ранний monotonic ID.
++	for _, other := range c.pending {
++		if other != nil && other != op && c.proofRequired(other) && !other.proofSent && !other.cancelled && other.ctx.Err() == nil && other.proof < op.proof {
++			return nil
++		}
++	}
++	if c.sendProof == nil {
++		return errProfile
++	}
++	e := c.sendProof(op)
++	if e == errProfileProofBusy {
++		return nil
++	}
++	if e == errProfileProofCancelled {
++		op.cancelled = true
++		return nil
++	}
++	return e
++}
+diff --git a/common/yonikbroker/profile_proof.go b/common/yonikbroker/profile_proof.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_proof.go
+@@ -0,0 +1,56 @@
++package nativehooks
++
++import "crypto/sha256"
++
++func profileProofBootstrap(r profileLaunch) (b [128]byte, err error) {
++	if r.mode != 2 {
++		return b, errProfile
++	}
++	copy(b[:], "YNKPF001")
++	be.PutUint16(b[8:], 1)
++	be.PutUint16(b[10:], 128)
++	be.PutUint16(b[12:], 1)
++	copy(b[16:], r.nonce[:])
++	copy(b[48:], r.digest[:])
++	copy(b[80:], r.session[:])
++	copy(b[96:], r.invocation[:])
++	be.PutUint64(b[112:], r.generation)
++	be.PutUint64(b[120:], r.epoch)
++	return b, nil
++}
++func profileProofAck(b [128]byte) (ack [40]byte) {
++	copy(ack[:], "YNKPFA01")
++	h := sha256.Sum256(b[:])
++	copy(ack[8:], h[:])
++	return ack
++}
++func profileSocketRecord(r profileLaunch, request, proof uint64, ingress uint16, tuple [40]byte) (b [192]byte, err error) {
++	if r.mode != 2 || request == 0 || request == ^uint64(0) || proof == 0 || proof == ^uint64(0) || ingress >= 4 || tuple[0] != 6 || !profileProofTuple(tuple) {
++		return b, errProfile
++	}
++	copy(b[:], "YNKSPF01")
++	be.PutUint16(b[8:], 1)
++	be.PutUint16(b[10:], 192)
++	be.PutUint16(b[12:], 1)
++	copy(b[16:], r.digest[:])
++	copy(b[48:], r.session[:])
++	copy(b[64:], r.invocation[:])
++	be.PutUint64(b[80:], r.generation)
++	be.PutUint64(b[88:], r.epoch)
++	copy(b[96:], r.nonce[:])
++	be.PutUint64(b[128:], request)
++	be.PutUint64(b[136:], proof)
++	be.PutUint16(b[144:], ingress)
++	b[146] = 2
++	copy(b[148:], tuple[:])
++	return b, nil
++}
++func profileProofTuple(t [40]byte) bool {
++	if t[0] != 6 || !zero(t[2:4]) || u16(t[:], 4) == 0 || u16(t[:], 6) == 0 {
++		return false
++	}
++	if t[1] == 4 {
++		return zero(t[12:24]) && zero(t[28:40]) && profileIP(t[8:12]) && profileIP(t[24:28])
++	}
++	return t[1] == 6 && profileIP(t[8:24]) && profileIP(t[24:40])
++}
+diff --git a/common/yonikbroker/profile_socket_proof_linux_test.go b/common/yonikbroker/profile_socket_proof_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_socket_proof_linux_test.go
+@@ -0,0 +1,534 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	_ "embed"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"golang.org/x/sys/unix"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++)
++
++//go:embed profile-system-proof-v1.json
++var systemProofVector []byte
++
++type proofFixture struct {
++	Launch    string `json:"launch_hex"`
++	Bootstrap string `json:"bootstrap_hex"`
++	Ack       string `json:"bootstrap_ack_hex"`
++	Socket    string `json:"socket_hex"`
++}
++
++func proofVector(t *testing.T) (profileLaunch, proofFixture) {
++	t.Helper()
++	var v proofFixture
++	if e := json.Unmarshal(systemProofVector, &v); e != nil {
++		t.Fatal(e)
++	}
++	b, e := hex.DecodeString(v.Launch)
++	if e != nil {
++		t.Fatal(e)
++	}
++	r, e := decodeProfileLaunch(b)
++	if e != nil {
++		t.Fatal(e)
++	}
++	return r, v
++}
++func proofBytes(t *testing.T, s string) []byte {
++	t.Helper()
++	b, e := hex.DecodeString(s)
++	if e != nil {
++		t.Fatal(e)
++	}
++	return b
++}
++
++type proofFakeFD struct {
++	mu     sync.Mutex
++	closed bool
++	calls  int
++	result error
++}
++
++func (f *proofFakeFD) Close() error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if !f.closed {
++		f.closed = true
++		f.calls++
++	}
++	return f.result
++}
++func (f *proofFakeFD) withFD(fn func(int) error) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.closed {
++		return errProfile
++	}
++	return fn(71)
++}
++
++type proofFakeBootstrap struct {
++	packet                             profileProofPacket
++	alive                              bool
++	clock                              *time.Time
++	advance                            time.Duration
++	readError, validateError, ackError error
++	reads, validates                   int
++	ack                                []byte
++}
++
++func (f *proofFakeBootstrap) receiveBootstrap(time.Time) (profileProofPacket, error) {
++	f.reads++
++	if f.clock != nil {
++		*f.clock = f.clock.Add(f.advance)
++	}
++	return f.packet, f.readError
++}
++func (f *proofFakeBootstrap) validateProofFD(profileProofFD) error {
++	f.validates++
++	return f.validateError
++}
++func (f *proofFakeBootstrap) sendBootstrapAck(b []byte) error {
++	f.ack = append([]byte(nil), b...)
++	return f.ackError
++}
++func (f *proofFakeBootstrap) proofPeerAlive() bool { return f.alive }
++
++func TestProfileProofExactRustWireAndTupleOrientation(t *testing.T) {
++	r, v := proofVector(t)
++	bootstrap, e := profileProofBootstrap(r)
++	if e != nil || !bytes.Equal(bootstrap[:], proofBytes(t, v.Bootstrap)) {
++		t.Fatal("YNKPF001 parity", e)
++	}
++	ack := profileProofAck(bootstrap)
++	if !bytes.Equal(ack[:], proofBytes(t, v.Ack)) {
++		t.Fatal("YNKPFA01 hash parity")
++	}
++	vector := proofBytes(t, v.Socket)
++	var tuple [40]byte
++	copy(tuple[:], vector[148:188])
++	record, e := profileSocketRecord(r, 3, 1, 0, tuple)
++	if e != nil || !bytes.Equal(record[:], vector) {
++		t.Fatal("YNKSPF01 parity", e)
++	}
++	if u16(tuple[:], 4) != 32001 || u16(tuple[:], 6) != 1080 {
++		t.Fatal("initiator/ingress flipped")
++	}
++	for _, request := range []uint64{0, ^uint64(0)} {
++		if _, e = profileSocketRecord(r, request, 1, 0, tuple); e == nil {
++			t.Fatal("invalid request ID")
++		}
++	}
++	for _, id := range []uint64{0, ^uint64(0)} {
++		if _, e = profileSocketRecord(r, 3, id, 0, tuple); e == nil {
++			t.Fatal("invalid proof ID")
++		}
++	}
++	r.mode = 1
++	if _, e = profileProofBootstrap(r); e == nil {
++		t.Fatal("Local minted System bootstrap")
++	}
++	if _, e = profileSocketRecord(r, 3, 1, 0, tuple); e == nil {
++		t.Fatal("Local minted System socket proof")
++	}
++}
++func TestProfileProofBootstrapRejectsMismatchAndClosesEveryRight(t *testing.T) {
++	for _, what := range []string{"valid", "binding", "credentials", "uid", "count", "truncated", "peer", "expired", "type", "ack", "read", "local", "duplicate"} {
++		t.Run(what, func(t *testing.T) {
++			r, v := proofVector(t)
++			now := time.Now()
++			fd, extra := &proofFakeFD{}, &proofFakeFD{}
++			io := &proofFakeBootstrap{packet: profileProofPacket{body: proofBytes(t, v.Bootstrap), count: 1, rightsMessages: 1, credentials: 1, pid: 7, uid: 0}, alive: true, clock: &now}
++			io.packet.rights[0] = fd
++			deadline := now.Add(time.Second)
++			switch what {
++			case "binding":
++				io.packet.body[16] ^= 1
++			case "credentials":
++				io.packet.credentials = 2
++			case "uid":
++				io.packet.uid = 1000
++			case "count":
++				io.packet.count = 2
++				io.packet.rights[1] = extra
++			case "truncated":
++				io.packet.invalid = true
++			case "peer":
++				io.alive = false
++			case "expired":
++				io.advance = time.Second
++			case "type":
++				io.validateError = errProfile
++			case "ack":
++				io.ackError = errProfile
++			case "read":
++				io.readError = errProfile
++			case "local":
++				r.mode = 1
++			}
++			channel := &profileProofChannel{}
++			e := channel.bootstrap(r, io, deadline, func() time.Time { return now })
++			if what == "valid" || what == "duplicate" {
++				if e != nil || !bytes.Equal(io.ack, proofBytes(t, v.Ack)) {
++					t.Fatal("valid bootstrap", e)
++				}
++				if what == "duplicate" && channel.bootstrap(r, io, deadline, func() time.Time { return now }) == nil {
++					t.Fatal("duplicate bootstrap")
++				}
++				channel.Close()
++				if fd.calls != 1 {
++					t.Fatal("bootstrap custody")
++				}
++				return
++			}
++			if e == nil || len(io.ack) != 0 && what != "ack" {
++				t.Fatal("invalid bootstrap accepted", what, e)
++			}
++			if what == "local" {
++				if io.reads != 0 {
++					t.Fatal("Local consumed System bootstrap")
++				}
++				return
++			}
++			if fd.calls != 1 || what == "count" && extra.calls != 1 {
++				t.Fatal("unexpected right leaked", fd.calls, extra.calls)
++			}
++		})
++	}
++}
++func TestProfileProofAncillarySuffixAndRuntimeRightsAreClosed(t *testing.T) {
++	fd := &proofFakeFD{}
++	adopt := func(n int) profileProofFD {
++		if n != 71 {
++			t.Fatal("wrong fake handle", n)
++		}
++		return fd
++	}
++	oob := append(unix.UnixRights(71), []byte{1, 2, 3}...)
++	packet := profileParseAncillary(nil, oob, 0, adopt)
++	if !packet.invalid || packet.count != 1 {
++		t.Fatal("malformed suffix lost prefix rights")
++	}
++	p := &ProfileRuntime{}
++	p.rejectRights(packet)
++	if fd.calls != 1 {
++		t.Fatal("runtime accepted/leaked SCM_RIGHTS")
++	}
++	for _, flags := range []int{unix.MSG_TRUNC, unix.MSG_CTRUNC} {
++		packet = profileParseAncillary(nil, unix.UnixRights(71), flags, adopt)
++		if !packet.invalid {
++			t.Fatal("truncated ancillary accepted")
++		}
++	}
++}
++func TestProfileProofUnknownCloseRetainsCustody(t *testing.T) {
++	r, v := proofVector(t)
++	failure := errors.New("synthetic close Unknown")
++	fd := &proofFakeFD{result: failure}
++	io := &proofFakeBootstrap{packet: profileProofPacket{body: proofBytes(t, v.Bootstrap), count: 1, credentials: 2, pid: 7}, alive: true}
++	io.packet.rights[0] = fd
++	c := &profileProofChannel{}
++	if e := c.bootstrap(r, io, time.Now().Add(time.Second), time.Now); !errors.Is(e, failure) {
++		t.Fatal("cleanup error lost", e)
++	}
++	if c.custody[0] != fd || !errors.Is(c.Close(), failure) || fd.calls != 1 || c.live() {
++		t.Fatal("Unknown became KnownClosed")
++	}
++}
++func TestProfileProofActualAcceptOpenSendAndReceiptLifetime(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	handle := &proofFakeFD{}
++	f.p.duplicateAccepted = func(xnet.Conn, [40]byte) (profileProofFD, error) { return handle, nil }
++	var records [][]byte
++	var objects []profileProofFD
++	f.p.proofs.send = func(b []byte, fd profileProofFD) error {
++		records = append(records, append([]byte(nil), b...))
++		objects = append(objects, fd)
++		return nil
++	}
++	ctx, cancel := context.WithCancel(context.WithValue(f.p.ctx, profileContextKey{}, f.p))
++	defer cancel()
++	accepted, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	a, _ := accepted.Value(profileAcceptedKey{}).(*profileAccepted)
++	r, op, e := f.c.open(accepted, a.index, 2, a.tuple, profileDestinationValue{family: 3, network: 6, port: 443, address: "original.invalid"}, a)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	if len(records) != 1 || objects[0] != handle || u64(records[0], 128) != op.sequence || u64(records[0], 136) != op.proof || !bytes.Equal(records[0][148:188], a.tuple[:]) || r.id != 0 {
++		t.Fatal("proof/OPEN binding or premature receipt")
++	}
++	if e = f.c.accept(f.ingressReply(op)); e != nil || r.id == 0 {
++		t.Fatal("matched ingress reply", e)
++	}
++	if e = f.p.proofs.sendOpen(op); e == nil {
++		t.Fatal("proof replay emitted")
++	}
++	f.c.mu.Lock()
++	f.c.closeReceipt(r)
++	f.c.mu.Unlock()
++	if handle.calls != 0 {
++		t.Fatal("one request closed shared accepted object")
++	}
++	cancel()
++	if e = f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if handle.calls != 1 {
++		t.Fatal("accepted lifetime did not retire FD")
++	}
++}
++func TestProfileProofBackpressureCancelAndOriginalDeadline(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	f.p.duplicateAccepted = func(xnet.Conn, [40]byte) (profileProofFD, error) { return &proofFakeFD{}, nil }
++	sends := 0
++	f.p.proofs.send = func([]byte, profileProofFD) error { sends++; return errProfileProofBusy }
++	ctx, cancel := context.WithCancel(context.WithValue(f.p.ctx, profileContextKey{}, f.p))
++	accepted, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	a := accepted.Value(profileAcceptedKey{}).(*profileAccepted)
++	r, op, e := f.c.open(accepted, 0, 2, a.tuple, profileDestinationValue{family: 3, network: 6, port: 443, address: "busy.invalid"}, a)
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(op)
++	deadline, id := op.deadline, op.proof
++	f.now = f.now.Add(100 * time.Millisecond)
++	f.c.tick()
++	if sends != 2 || op.proofSent || op.proof != id || op.deadline != deadline {
++		t.Fatal("EAGAIN changed identity/deadline")
++	}
++	cancel()
++	f.c.tick()
++	before := sends
++	if e = f.c.accept(f.ingressReply(op)); e != nil {
++		t.Fatal(e)
++	}
++	if r.id != 0 || f.c.receiptLive(r) || sends != before {
++		t.Fatal("late proof/reply resurrected cancelled OPEN")
++	}
++}
++func TestProfileProofEOFFenceBeforeIngressPublication(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	r, op := f.open(t, context.Background(), "fence.invalid")
++	f.p.proofs.check = func() error { return errProfile }
++	if e := f.c.accept(f.ingressReply(op)); e == nil || r.id != 0 {
++		t.Fatal("proof EOF admitted pending source")
++	}
++}
++
++func TestProfileSystemAcceptedTCPRequiresActualKernelHandle(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	f.p.proofs = nil
++	f.p.duplicateAccepted = nil
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	if _, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e == nil {
++		t.Fatal("System acceptedTCP получил receipt без actual kernel FD/proof channel")
++	}
++}
++
++type proofRawConn struct {
++	calls int
++	after error
++}
++
++func (r *proofRawConn) Control(fn func(uintptr)) error { r.calls++; fn(901); return r.after }
++func (*proofRawConn) Read(func(uintptr) bool) error    { panic("proof attempted payload read") }
++func (*proofRawConn) Write(func(uintptr) bool) error   { panic("proof attempted payload write") }
++
++type proofConn struct {
++	*flowFakeConn
++	raw *proofRawConn
++}
++
++func (c *proofConn) SyscallConn() (syscall.RawConn, error) { return c.raw, nil }
++func TestProfileProofActualExportUsesControlAndRetainsPartialFailure(t *testing.T) {
++	for _, what := range []string{"valid", "tuple", "control"} {
++		t.Run(what, func(t *testing.T) {
++			conn := &proofConn{flowFakeConn: fakeTCPFlowConn(), raw: &proofRawConn{}}
++			tuple, e := profileTuple(xnet.DestinationFromAddr(conn.RemoteAddr()), xnet.DestinationFromAddr(conn.LocalAddr()))
++			if e != nil {
++				t.Fatal(e)
++			}
++			handle := &proofFakeFD{}
++			if what == "control" {
++				conn.raw.after = errProfile
++			}
++			owned, e := profileDuplicateAcceptedWith(conn, tuple, func(fd uintptr) (profileProofFD, error) {
++				if fd != 901 {
++					t.Fatal("used locator instead of actual Control FD")
++				}
++				return handle, nil
++			}, func(fd profileProofFD) ([40]byte, error) {
++				if fd != handle {
++					t.Fatal("inspect did not use duplicate")
++				}
++				copy := tuple
++				if what == "tuple" {
++					copy[4] ^= 1
++				}
++				return copy, nil
++			})
++			if owned != handle || conn.raw.calls != 1 || (e == nil) != (what == "valid") {
++				t.Fatal("export/partial custody", owned, e)
++			}
++			owned.Close()
++			if handle.calls != 1 {
++				t.Fatal("partial descriptor leaked")
++			}
++		})
++	}
++}
++func TestProfileProofPendingFIFOAndWrapPreflight(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	accepted, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	a := accepted.Value(profileAcceptedKey{}).(*profileAccepted)
++	busy := true
++	var emitted []uint64
++	f.p.proofs.send = func(b []byte, _ profileProofFD) error {
++		if busy {
++			return errProfileProofBusy
++		}
++		emitted = append(emitted, u64(b, 136))
++		return nil
++	}
++	open := func(name string) *profileOperation {
++		_, op, e := f.c.open(accepted, 0, 2, a.tuple, profileDestinationValue{family: 3, network: 6, port: 443, address: name}, a)
++		if e != nil {
++			t.Fatal(e)
++		}
++		if e = f.c.dispatch(op); e != nil {
++			t.Fatal(e)
++		}
++		return op
++	}
++	one := open("one.invalid")
++	busy = false
++	two := open("two.invalid")
++	if len(emitted) != 0 {
++		t.Fatal("later proof overtook EAGAIN")
++	}
++	f.c.tick()
++	if !one.proofSent || !two.proofSent || len(emitted) != 2 || emitted[0] >= emitted[1] {
++		t.Fatal("proof FIFO", emitted)
++	}
++	f.p.proofs.lastProof = ^uint64(0) - 1
++	before := len(f.writes)
++	_, op, e := f.c.open(accepted, 0, 2, a.tuple, profileDestinationValue{family: 3, network: 6, port: 443, address: "wrap.invalid"}, a)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if f.c.dispatch(op) == nil || len(f.writes) != before {
++		t.Fatal("proof wrap emitted OPEN")
++	}
++}
++func TestProfileLocalAcceptedTCPDoesNotRequireSystemProof(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	if _, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e != nil {
++		t.Fatal("Local ошибочно требует System proof", e)
++	}
++}
++func TestProfileProofSystemUDPAndMissingRawHandleStayUnsupported(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	f.p.duplicateAccepted = nil
++	if _, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e == nil {
++		t.Fatal("valid channel replaced actual kernel handle")
++	}
++	if _, e := ProfileAssociateUDP(ctx, fakeTCPFlowConn()); e == nil {
++		t.Fatal("TCP proof promoted into UDP")
++	}
++}
++
++type proofDeadlineAdmission struct {
++	*fakeProfileAdmission
++	clock *time.Time
++}
++
++func (c *proofDeadlineAdmission) receive(deadline time.Time) ([]byte, error) {
++	*c.clock = c.clock.Add(150 * time.Millisecond)
++	return c.fakeProfileAdmission.receive(deadline)
++}
++func TestProfileProofBootstrapCannotExtendInitialHelloDeadline(t *testing.T) {
++	body, r := syntheticProfileCapsule()
++	r.mode = 2
++	body[76], body[77] = 2, 1
++	rehashProfileCapsule(body, &r)
++	start := time.Now()
++	now := start.Add(900 * time.Millisecond)
++	ch := &proofDeadlineAdmission{fakeProfileAdmission: &fakeProfileAdmission{r: r, body: body}, clock: &now}
++	if _, e := admitProfileUntil(r, []byte("config"), ch, func(*profileCapsule) error { return nil }, func() time.Time { return now }, start.Add(time.Second)); e == nil {
++		t.Fatal("bootstrap/HELLO restarted initial deadline")
++	}
++	for _, event := range ch.events {
++		if event == "ack" {
++			t.Fatal("late admission ACK")
++		}
++	}
++}
++func TestProfileProofAcceptedPreflightAndCancelledExportKeepCustody(t *testing.T) {
++	for _, what := range []string{"budget", "cancel", "unknown"} {
++		t.Run(what, func(t *testing.T) {
++			f := newFlowFixture(t, 2)
++			ctx, cancel := context.WithCancel(context.WithValue(f.p.ctx, profileContextKey{}, f.p))
++			defer cancel()
++			called := false
++			fd := &proofFakeFD{}
++			if what == "unknown" {
++				fd.result = errors.New("export cleanup Unknown")
++			}
++			f.p.duplicateAccepted = func(xnet.Conn, [40]byte) (profileProofFD, error) {
++				called = true
++				if what == "cancel" {
++					cancel()
++					return fd, nil
++				}
++				return fd, errProfile
++			}
++			if what == "budget" {
++				f.c.buffered = uint64(f.c.manifest.caps[4])
++			}
++			if _, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e == nil {
++				t.Fatal("invalid late export published")
++			}
++			if what == "budget" {
++				if called {
++					t.Fatal("overflow exported FD")
++				}
++				return
++			}
++			if fd.calls != 1 {
++				t.Fatal("export cleanup missing")
++			}
++			if what == "unknown" {
++				if f.c.accepted[0] == nil || f.c.accepted[0].proof != fd || f.p.ctx.Err() == nil {
++					t.Fatal("Unknown export lost custody")
++				}
++			} else if f.c.accepted[0] != nil {
++				t.Fatal("cancelled export retained known slot")
++			}
++		})
++	}
++}
 diff --git a/common/yonikbroker/profile_service_other.go b/common/yonikbroker/profile_service_other.go
 new file mode 100644
 --- /dev/null
@@ -36,7 +1225,7 @@ diff --git a/common/yonikbroker/profile_service_linux_test.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_service_linux_test.go
-@@ -0,0 +1,860 @@
+@@ -0,0 +1,1019 @@
 +//go:build linux
 +
 +package nativehooks
@@ -64,6 +1253,158 @@ new file mode 100644
 +//go:embed profile-service-vectors.json
 +var serviceVectors []byte
 +
++// Полный frame получен извлечёнными Header/Grant encoder Rust abf5c243.
++// Kind 2 = SidebandOperation; kind 1 = FrozenSent, это разные namespaces.
++func TestProfileServiceSystemUserDNSRustOwnerTail(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	r := profileReceiptFrom(ctx)
++	g, op, e := f.c.authorizeDNS(ctx, r, 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	var v struct {
++		Frame string `json:"systemUserDNSGrantFrameHex"`
++	}
++	if e = json.Unmarshal(serviceVectors, &v); e != nil {
++		t.Fatal(e)
++	}
++	wire, e := hex.DecodeString(v.Frame)
++	if e != nil {
++		t.Fatal(e)
++	}
++	packet, e := f.p.admission.launch.decodePacket(wire, 9)
++	if e != nil || packet.reply != op.sequence {
++		t.Fatal("Rust frame binding", e, packet.reply, op.sequence)
++	}
++	if r.id != 1 || r.revision != 1 {
++		t.Fatal("fixture source изменился", r.id, r.revision)
++	}
++	f.now = f.now.Add(3 * time.Millisecond)
++	if e = f.c.accept(packet); e != nil || op.err != nil || !f.c.grantLive(g) {
++		t.Fatal("System user DNS обязательный owner tail отвергнут", e, op.err)
++	}
++	if g.ownerID != 42 || g.ownerKind != 2 || g.ownerDeadline.Sub(f.now) != 17*time.Millisecond {
++		t.Fatal("freshness не вычла RTT", g.ownerDeadline.Sub(f.now))
++	}
++}
++
++func TestProfileServiceSystemOwnerTailRejectsForeignUnknownAndExpired(t *testing.T) {
++	// FrozenSent=1 разрешён отдельно от SidebandOperation=2, без нормализации id.
++	f, ctx := serviceFixture(t)
++	g, op, e := f.c.authorizeDNS(ctx, profileReceiptFrom(ctx), 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(op)
++	reply := serviceReply(f, op)
++	reply.body[40] = 1
++	if e = f.c.accept(reply); e != nil || op.err != nil || g.ownerKind != 1 {
++		t.Fatal("FrozenSent namespace", e, op.err)
++	}
++	for _, name := range []string{"required0", "unknown", "id0", "reserved", "fresh0", "freshOverflow", "expiredRTT", "foreignFlow", "revision", "foreignPrivate", "closedPrivate", "noPrivate", "probeClass", "localOwner"} {
++		t.Run(name, func(t *testing.T) {
++			f, ctx := serviceFixture(t)
++			r := profileReceiptFrom(ctx)
++			g, op, e := f.c.authorizeDNS(ctx, r, 0, "query.invalid")
++			if e != nil {
++				t.Fatal(e)
++			}
++			if e = f.c.dispatch(op); e != nil {
++				t.Fatal(e)
++			}
++			b, _ := hex.DecodeString("01030100000000000000000b0000000000000001000003e800000000000000010000000001312d000200000000000000000000000000002a")
++			switch name {
++			case "required0":
++				b[2] = 0
++			case "unknown":
++				b[40] = 3
++			case "id0":
++				clear(b[48:])
++			case "reserved":
++				b[41] = 1
++			case "fresh0":
++				clear(b[32:40])
++			case "freshOverflow":
++				be.PutUint64(b[32:], uint64(20*time.Millisecond+1))
++			case "expiredRTT":
++				f.now = f.now.Add(20 * time.Millisecond)
++			case "foreignFlow":
++				be.PutUint64(b[12:], r.id+1)
++			case "revision":
++				be.PutUint64(b[24:], r.revision+1)
++			case "foreignPrivate":
++				other := newFlowFixture(t, 2)
++				op.receipt = other.admittedReceipt(t, "foreign.invalid")
++			case "closedPrivate":
++				f.c.closeReceipt(r)
++			case "noPrivate":
++				g.receipt = nil
++			case "probeClass":
++				g.class, b[1] = 2, 2
++			case "localOwner":
++				f.c.mode = 1
++			}
++			if e = f.c.publishService(op, profilePacket{kind: 19, object: 11, body: b}); e == nil || g.id != 0 {
++				t.Fatal("чужой/Unknown/expired owner опубликован", name)
++			}
++		})
++	}
++	for _, class := range []byte{2, 3} {
++		f := newFlowFixture(t, 2)
++		ctx, cancel := context.WithCancel(f.p.ctx)
++		defer cancel()
++		g := &profileGrant{ctx: ctx, cancel: cancel, class: class, purpose: 1}
++		f.c.grants[0] = g
++		op := &profileOperation{kind: 20, grant: g, sent: f.now, sessionDeadline: f.now.Add(time.Second)}
++		b, _ := hex.DecodeString("01030100000000000000000b0000000000000001000003e800000000000000010000000001312d000200000000000000000000000000002a")
++		b[1] = class
++		clear(b[12:20])
++		if e := f.c.publishService(op, profilePacket{kind: 19, object: 11, body: b}); e == nil {
++			t.Fatal("service flow0 принял user attribution", class)
++		}
++	}
++}
++
++func TestProfileServiceSystemOwnerRefreshKeepsOriginalObservationExpiry(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	g, op, e := f.c.authorizeDNS(ctx, profileReceiptFrom(ctx), 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(op)
++	reply := serviceReply(f, op)
++	if e = f.c.accept(reply); e != nil || op.err != nil {
++		t.Fatal(e, op.err)
++	}
++	expires := g.ownerDeadline
++	f.now = f.now.Add(16 * time.Millisecond)
++	renew, e := f.c.refreshServiceLocked(g)
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(renew)
++	if renew.deadline.Sub(renew.sent) != 20*time.Millisecond {
++		t.Fatal("System DNS request потерял freshness deadline")
++	}
++	reply = serviceReply(f, renew)
++	if e = f.c.accept(reply); e != nil || renew.err != nil {
++		t.Fatal(e, renew.err)
++	}
++	if !g.ownerDeadline.Equal(expires) {
++		t.Fatal("тот же owner receipt продлил observation")
++	}
++	f.now = expires
++	// Даже пока lease жив, истёкший Known owner не разрешает DNS I/O.
++	g.refresh = &profileOperation{ctx: ctx, queued: true, done: make(chan struct{})}
++	close(g.refresh.done)
++	if e = profileEnsureService(ctx, g); e == nil {
++		t.Fatal("lease подменил свежий Known owner")
++	}
++}
++
 +func TestProfileServiceIndependentWireVectorsAndBootstrapScope(t *testing.T) {
 +	var vectors struct {
 +		Probe      string `json:"probeBodyHex"`
@@ -90,6 +1431,8 @@ new file mode 100644
 +	if !bytes.Equal(op.body, decode(vectors.DNS)) {
 +		t.Fatal("independent AUTHORIZE mismatch")
 +	}
++	// Старый независимый golden — Local, где mandatory owner отсутствует.
++	f.c.mode = 1
 +	f.c.dispatch(op)
 +	if e = f.c.accept(profilePacket{kind: 19, reply: op.sequence, object: 11, body: decode(vectors.DNSGrant)}); e != nil || op.err != nil || !f.c.grantLive(g) {
 +		t.Fatal("independent DNS GRANT", e, op.err)
@@ -196,6 +1539,11 @@ new file mode 100644
 +	if op.receipt != nil {
 +		be.PutUint64(b[12:], op.receipt.id)
 +		revision = op.receipt.revision
++		if f.c.mode == 2 {
++			b[2], b[40] = 1, 2
++			be.PutUint64(b[32:], uint64(20*time.Millisecond))
++			be.PutUint64(b[48:], 42)
++		}
 +	}
 +	be.PutUint64(b[24:], revision)
 +	return profilePacket{kind: 19, reply: op.sequence, object: id, body: b}
@@ -301,9 +1649,9 @@ new file mode 100644
 +			case "class":
 +				reply.body[1] = 1
 +			case "owner":
-+				reply.body[40] = 1
++				reply.body[40] = 0
 +			case "required":
-+				reply.body[2] = 1
++				reply.body[2] = 0
 +			case "flow":
 +				be.PutUint64(reply.body[12:], r.id+1)
 +			case "revision":
@@ -901,7 +2249,7 @@ diff --git a/common/yonikbroker/profile_service_linux.go b/common/yonikbroker/pr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_service_linux.go
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,412 @@
 +//go:build linux
 +
 +package nativehooks
@@ -1090,10 +2438,28 @@ new file mode 100644
 +func (c *profileFlowControl) publishService(op *profileOperation, f profilePacket) error {
 +	g, b := op.grant, f.body
 +	flow, revision := uint64(0), c.manifest.policy
++	// Только private original receipt связывает USER DNS с System attribution.
 +	if g.receipt != nil {
++		if g.class != 3 || g.purpose != 0 || op.kind != 18 || op.receipt != g.receipt || !c.receiptLive(g.receipt) || g.receipt.id == 0 {
++			return errProfile
++		}
 +		flow, revision = g.receipt.id, g.receipt.revision
++	} else if op.kind != 20 || op.receipt != nil || g.purpose == 0 {
++		return errProfile
 +	}
-+	if f.kind != 19 || len(b) != 56 || b[0] != 1 || b[1] != g.class || b[2] != 0 || b[3] != 0 || u64(b, 4) == 0 || f.object != u64(b, 4) || u64(b, 12) != flow || u32(b, 20) == 0 || u32(b, 20) > 1000 || u64(b, 24) != revision || !zero(b[32:]) {
++	required := byte(0)
++	if c.mode == 2 && g.receipt != nil {
++		required = 1
++	}
++	if f.kind != 19 || len(b) != 56 || b[0] != 1 || b[1] != g.class || b[2] != required || b[3] != 0 || u64(b, 4) == 0 || f.object != u64(b, 4) || u64(b, 12) != flow || u32(b, 20) == 0 || u32(b, 20) > 1000 || u64(b, 24) != revision || !zero(b[41:48]) {
++		return errProfile
++	}
++	ownerNS, ownerKind, ownerID := u64(b, 32), b[40], u64(b, 48)
++	if required == 0 {
++		if ownerNS != 0 || ownerKind != 0 || ownerID != 0 {
++			return errProfile
++		}
++	} else if ownerNS == 0 || ownerNS > uint64(20*time.Millisecond) || ownerKind < 1 || ownerKind > 2 || ownerID == 0 {
 +		return errProfile
 +	}
 +	id := u64(b, 4)
@@ -1108,10 +2474,15 @@ new file mode 100644
 +	if op.sessionDeadline.Before(deadline) {
 +		deadline = op.sessionDeadline
 +	}
-+	if !c.clock().Before(deadline) {
++	ownerDeadline := op.sent.Add(time.Duration(ownerNS))
++	if op.object != 0 && ownerKind == g.ownerKind && ownerID == g.ownerID && g.ownerDeadline.Before(ownerDeadline) {
++		ownerDeadline = g.ownerDeadline
++	}
++	if !c.clock().Before(deadline) || required == 1 && !c.clock().Before(ownerDeadline) {
 +		return errProfile
 +	}
 +	g.id, g.deadline, g.revision = id, deadline, revision
++	g.ownerDeadline, g.ownerKind, g.ownerID = ownerDeadline, ownerKind, ownerID
 +	if id > c.highestGrant {
 +		c.highestGrant = id
 +	}
@@ -1128,7 +2499,7 @@ new file mode 100644
 +		c.mu.Unlock()
 +		return errProfile
 +	}
-+	renew := g.deadline.Sub(c.clock()) <= 250*time.Millisecond
++	renew := g.deadline.Sub(c.clock()) <= 250*time.Millisecond || c.serviceOwnerRequired(g) && g.ownerDeadline.Sub(c.clock()) <= 5*time.Millisecond
 +	var op *profileOperation
 +	var e error
 +	if renew {
@@ -1145,10 +2516,13 @@ new file mode 100644
 +	}
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
-+	if !c.grantLive(g) {
++	if !c.grantLive(g) || c.serviceOwnerRequired(g) && !c.clock().Before(g.ownerDeadline) {
 +		return errProfile
 +	}
 +	return nil
++}
++func (c *profileFlowControl) serviceOwnerRequired(g *profileGrant) bool {
++	return c.mode == 2 && g.class == 3 && g.receipt != nil
 +}
 +func profileServiceGrant(ctx context.Context) *profileGrant {
 +	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
@@ -2282,7 +3656,7 @@ diff --git a/common/yonikbroker/profile-service-vectors.json b/common/yonikbroke
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile-service-vectors.json
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,12 @@
 +{
 +  "mappingVersion": 3,
 +  "tableCount": 11,
@@ -2291,7 +3665,9 @@ new file mode 100644
 +  "bootstrapBodyHex": "0002000000000000",
 +  "dnsAuthorizeBodyHex": "00000000000000010300ffffffffffffffff0000030601bb001000006f726967696e616c2e696e76616c696404110035000400007f0000350000000d71756572792e696e76616c696400000000000000000000000000000000",
 +  "dnsGrantBodyHex": "01030000000000000000000b0000000000000001000003e80000000000000001000000000000000000000000000000000000000000000000",
-+  "probeGrantBodyHex": "01020000000000000000000c0000000000000000000003e80000000000000001000000000000000000000000000000000000000000000000"
++  "probeGrantBodyHex": "01020000000000000000000c0000000000000000000003e80000000000000001000000000000000000000000000000000000000000000000",
++  "systemUserDNSRustHead": "abf5c2435dd71b272c8f064b155267c52fde9809",
++  "systemUserDNSGrantFrameHex": "594e4b434150303100010013000000b8000000000000000900000000000000040100000000000000000000000000000002000000000000000000000000000000b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e34391000000000000000010000000000000001000000000000000b000000000000000001030100000000000000000b0000000000000001000003e800000000000000010000000001312d000200000000000000000000000000002a"
 +}
 diff --git a/app/observatory/yonik_profile_service_test.go b/app/observatory/yonik_profile_service_test.go
 new file mode 100644
@@ -4769,7 +6145,7 @@ diff --git a/common/yonikbroker/profile_transport_linux_test.go b/common/yonikbr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux_test.go
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,306 @@
 +//go:build linux
 +
 +package nativehooks
@@ -4800,7 +6176,9 @@ new file mode 100644
 +	if e := json.Unmarshal(profileOriginalFlowV3, &v); e != nil {
 +		t.Fatal(e)
 +	}
-+	f := newFlowFixture(t, 2)
++	// Tuple vectors не являются System proof. UDP positive остаётся Local;
++	// System association Unsupported проверяется proof controls отдельно.
++	f := newFlowFixture(t, 1)
 +	rows := f.c.manifest.rows
 +	be.PutUint16(rows[6][0][2:], 1080)
 +	f.installManifest(t, rows)
@@ -6581,10 +7959,12 @@ diff --git a/app/proxyman/inbound/worker.go b/app/proxyman/inbound/worker.go
  	"github.com/xtls/xray-core/features/routing"
  	"github.com/xtls/xray-core/features/stats"
  	"github.com/xtls/xray-core/proxy"
-@@ -116,6 +117,13 @@
- 		Conn:    conn,
- 	})
- 
+@@ -100,6 +101,15 @@
+ 		}
+ 	}
+ 	ctx = session.ContextWithOutbounds(ctx, outbounds)
++	// Actual accepted object захватывается до CounterConnection: stats wrapper
++	// не получает raw FD API и не участвует в доказательстве kernel identity.
 +	var acceptErr error
 +	ctx, acceptErr = nativehooks.ProfileAccept(ctx, conn, w.tag)
 +	if acceptErr != nil {
@@ -6592,10 +7972,10 @@ diff --git a/app/proxyman/inbound/worker.go b/app/proxyman/inbound/worker.go
 +		conn.Close()
 +		return
 +	}
- 	content := new(session.Content)
- 	content.SniffingRequest = w.sniffingRequest
- 	ctx = session.ContextWithContent(ctx, content)
-@@ -355,6 +363,13 @@
+ 
+ 	if w.uplinkCounter != nil || w.downlinkCounter != nil {
+ 		conn = &stat.CounterConnection{
+@@ -355,6 +365,13 @@
  				Gateway: net.UDPDestination(w.address, w.port),
  				Tag:     w.tag,
  			})
@@ -7025,7 +8405,7 @@ diff --git a/common/yonikbroker/profile_capsule.go b/common/yonikbroker/profile_
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_capsule.go
-@@ -0,0 +1,511 @@
+@@ -0,0 +1,514 @@
 +package nativehooks
 +
 +import (
@@ -7245,6 +8625,9 @@ new file mode 100644
 +	// Одновременные frame/rows/strings, fixed decoder state, snapshot
 +	// и streaming DAT category index резервируются до materialization assets.
 +	credit := uint64(512*1024 + len(b)*3)
++	if r.mode == 2 {
++		credit += 128 * 1024
++	}
 +	dat := false
 +	dnsQueryCredit := uint64(0)
 +	for i := 0; i < m.assetCount; i++ {
@@ -7924,7 +9307,7 @@ diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_hooks_linux.go
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,661 @@
 +//go:build linux
 +
 +package nativehooks
@@ -7942,11 +9325,13 @@ new file mode 100644
 +)
 +
 +type profileAccepted struct {
-+	runtime    *ProfileRuntime
-+	ctx        context.Context
-+	tuple      [40]byte
-+	index      uint16
-+	provenance byte
++	proof       profileProofFD
++	proofCredit bool
++	runtime     *ProfileRuntime
++	ctx         context.Context
++	tuple       [40]byte
++	index       uint16
++	provenance  byte
 +}
 +type profileSelectedRoute struct {
 +	subject, scope uint16
@@ -8074,6 +9459,9 @@ new file mode 100644
 +	if !p.flowFresh() || conn == nil {
 +		return ctx, errProfile
 +	}
++	if p.admission.launch.mode == 2 && (!p.proofs.live() || conn.RemoteAddr() == nil || conn.RemoteAddr().Network() != "tcp") {
++		return ctx, ErrProfileUnsupported
++	}
 +	tuple, e := profileTuple(xnet.DestinationFromAddr(conn.RemoteAddr()), xnet.DestinationFromAddr(conn.LocalAddr()))
 +	if e != nil {
 +		return ctx, e
@@ -8102,8 +9490,37 @@ new file mode 100644
 +	}
 +	for i, a := range c.accepted {
 +		if a == nil && i < int(c.manifest.caps[6]) {
++			if p.admission.launch.mode == 2 && c.buffered+c.manifest.memoryCredit+profileAcceptedFDCredit > uint64(c.manifest.caps[4]) {
++				return ctx, errProfileFlowBusy
++			}
 +			a = &profileAccepted{runtime: p, ctx: ctx, index: uint16(index), provenance: provenance, tuple: tuple}
 +			c.accepted[i] = a
++			if p.admission.launch.mode == 2 {
++				c.buffered += profileAcceptedFDCredit
++				a.proofCredit = true
++				duplicate := p.duplicateAccepted
++				if duplicate == nil {
++					duplicate = profileDuplicateAccepted
++				}
++				fd, e := duplicate(conn, tuple)
++				a.proof = fd
++				if e != nil || fd == nil {
++					if closeErr := a.closeProofLocked(c); closeErr != nil {
++						p.cancel()
++						return ctx, closeErr
++					}
++					c.accepted[i] = nil
++					return ctx, ErrProfileUnsupported
++				}
++			}
++			if ctx.Err() != nil || !c.live() {
++				if e := a.closeProofLocked(c); e != nil {
++					p.cancel()
++					return ctx, e
++				}
++				c.accepted[i] = nil
++				return ctx, errProfile
++			}
 +			return context.WithValue(ctx, profileAcceptedKey{}, a), nil
 +		}
 +	}
@@ -8115,6 +9532,9 @@ new file mode 100644
 +	p := profileRuntime(ctx)
 +	if p == nil {
 +		return ctx, nil
++	}
++	if p.admission.launch.mode == 2 {
++		return ctx, ErrProfileUnsupported
 +	}
 +	parent, _ := ctx.Value(profileAcceptedKey{}).(*profileAccepted)
 +	if parent == nil || parent.runtime != p || parent.ctx.Err() != nil || conn == nil || !p.flowFresh() {
@@ -8553,7 +9973,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,849 @@
+@@ -0,0 +1,878 @@
 +//go:build linux
 +
 +package nativehooks
@@ -8659,6 +10079,8 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	proof                                   uint64
++	proofSent                               bool
 +	ctx                                     context.Context
 +	receipt                                 *profileReceipt
 +	grant                                   *profileGrant
@@ -8679,6 +10101,9 @@ new file mode 100644
 +	replied, cancelled                                       bool
 +}
 +type profileFlowControl struct {
++	proofAlive                                     func() bool
++	prepareProof                                   func(*profileOperation) error
++	sendProof                                      func(*profileOperation) error
 +	dnsQueries                                     [64]*profileDNSQuery
 +	mu                                             sync.Mutex
 +	manifest                                       profileCapsule
@@ -8703,10 +10128,10 @@ new file mode 100644
 +	return &profileFlowControl{manifest: m, mode: mode, clock: clock, write: write, alive: alive, sessionDeadline: clock().Add(time.Duration(m.lease) * time.Millisecond)}
 +}
 +func (c *profileFlowControl) live() bool {
-+	return !c.revoked && c.alive != nil && c.alive() && c.clock().Before(c.sessionDeadline)
++	return !c.revoked && c.alive != nil && c.alive() && c.clock().Before(c.sessionDeadline) && (c.mode != 2 || c.proofAlive != nil && c.proofAlive())
 +}
 +func (c *profileFlowControl) receiptLive(r *profileReceipt) bool {
-+	return c.live() && r != nil && r.control == c && !r.closed && r.ctx.Err() == nil && c.receipts[r.slot] == r
++	return c.live() && r != nil && r.control == c && !r.closed && r.ctx.Err() == nil && (r.association == nil || r.association.ctx.Err() == nil) && c.receipts[r.slot] == r
 +}
 +func (c *profileFlowControl) grantLive(g *profileGrant) bool {
 +	return g != nil && c.live() && (g.receipt == nil && g.purpose != 0 || c.receiptLive(g.receipt)) && !g.closed && g.ctx.Err() == nil && c.grants[g.slot] == g && c.clock().Before(g.deadline)
@@ -9007,10 +10432,23 @@ new file mode 100644
 +	if slot < 0 {
 +		return errProfile
 +	}
++	if c.proofRequired(op) {
++		if c.prepareProof == nil {
++			return errProfile
++		}
++		if e := c.prepareProof(op); e != nil {
++			if e == errProfileProofCancelled {
++				c.closeReceipt(op.receipt)
++				c.finish(op, e)
++				return nil
++			}
++			return e
++		}
++	}
 +	op.sent = c.clock()
 +	op.sessionDeadline = c.sessionDeadline
 +	op.deadline = op.sent.Add(time.Second)
-+	if op.kind == 18 && op.grant.class != 3 && c.mode == 2 {
++	if op.kind == 18 && op.receipt != nil && c.mode == 2 {
 +		op.deadline = op.sent.Add(20 * time.Millisecond)
 +	}
 +	if deadline, ok := op.ctx.Deadline(); ok && deadline.Before(op.deadline) {
@@ -9027,7 +10465,7 @@ new file mode 100644
 +	if seq > c.lastSent {
 +		c.lastSent = seq
 +	}
-+	return nil
++	return c.tryProof(op)
 +}
 +func (c *profileFlowControl) accept(f profilePacket) error {
 +	c.mu.Lock()
@@ -9205,6 +10643,9 @@ new file mode 100644
 +func (c *profileFlowControl) publish(op *profileOperation, f profilePacket) error {
 +	if op.kind == 16 {
 +		b := f.body
++		if c.proofRequired(op) && !op.proofSent {
++			return errProfile
++		}
 +		if f.kind != 17 || f.object != 0 || len(b) != 24 || b[0] != 1 || b[1] != c.mode-1 || !zero(b[2:4]) || u64(b, 4) == 0 || u64(b, 4) <= c.highestFlow || u32(b, 12) != 0 || u64(b, 16) == 0 {
 +			return errProfile
 +		}
@@ -9270,10 +10711,18 @@ new file mode 100644
 +	}
 +	for i, a := range c.accepted {
 +		if a != nil && a.ctx.Err() != nil {
++			if e := a.closeProofLocked(c); e != nil {
++				return e
++			}
 +			c.accepted[i] = nil
 +		}
 +	}
 +	for i, op := range c.pending {
++		if op != nil && !op.cancelled && op.ctx.Err() == nil && now.Before(op.deadline) {
++			if e := c.tryProof(op); e != nil {
++				return e
++			}
++		}
 +		if op != nil && (op.cancelled || op.ctx.Err() != nil || !c.operationLive(op) || !now.Before(op.deadline)) {
 +			if op.kind == 16 {
 +				c.closeReceipt(op.receipt)
@@ -9294,7 +10743,7 @@ new file mode 100644
 +		if g.ctx.Err() != nil || !g.deadline.IsZero() && !now.Before(g.deadline) {
 +			c.closeGrant(g)
 +		}
-+		if !g.closed && g.id != 0 && g.refresh == nil && (g.class == 2 || g.class == 3) && c.grantLive(g) && g.deadline.Sub(now) <= 250*time.Millisecond {
++		if !g.closed && g.id != 0 && g.refresh == nil && (g.class == 2 || g.class == 3) && c.grantLive(g) && (g.deadline.Sub(now) <= 250*time.Millisecond || c.serviceOwnerRequired(g) && g.ownerDeadline.Sub(now) <= 5*time.Millisecond) {
 +			if op, e := c.refreshServiceLocked(g); e == nil {
 +				op.queued = true
 +				if e = c.dispatchLocked(op); e != nil {
@@ -9407,7 +10856,7 @@ diff --git a/common/yonikbroker/profile_flow_linux_test.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux_test.go
-@@ -0,0 +1,887 @@
+@@ -0,0 +1,918 @@
 +//go:build linux
 +
 +package nativehooks
@@ -9534,7 +10983,38 @@ new file mode 100644
 +	}, live)
 +	p.flow = f.c
 +	p.flowFence = live
++	if mode == 2 {
++		// Остальные control tests моделируют уже проверенный kernel proof.
++		// Actual export/bootstrap/custody проверяются отдельными pure controls.
++		p.proofs = &profileProofChannel{launch: r, fd: &flowProofFD{}, peer: live, send: func([]byte, profileProofFD) error { return nil }}
++		f.c.proofAlive = p.proofs.live
++		p.duplicateAccepted = func(xnet.Conn, [40]byte) (profileProofFD, error) { return &flowProofFD{}, nil }
++		f.c.prepareProof = func(op *profileOperation) error {
++			if op.receipt.association == nil {
++				op.proof = 1
++				return nil
++			}
++			return p.proofs.prepare(op)
++		}
++		f.c.sendProof = func(op *profileOperation) error {
++			if op.receipt.association == nil {
++				op.proofSent = true
++				return nil
++			}
++			return p.proofs.sendOpen(op)
++		}
++	}
 +	return f
++}
++
++type flowProofFD struct{ closed bool }
++
++func (f *flowProofFD) Close() error { f.closed = true; return nil }
++func (f *flowProofFD) withFD(fn func(int) error) error {
++	if f.closed {
++		return errProfile
++	}
++	return fn(101)
 +}
 +func fakeFlowTuple(network byte) [40]byte {
 +	var b [40]byte
@@ -10343,7 +11823,7 @@ diff --git a/common/yonikbroker/profile_launch.go b/common/yonikbroker/profile_l
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch.go
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,238 @@
 +package nativehooks
 +
 +import (
@@ -10469,20 +11949,33 @@ new file mode 100644
 +}
 +
 +func admitProfile(r profileLaunch, config []byte, ch profileAdmissionChannel, verify func(*profileCapsule) error, now func() time.Time) (a profileAdmission, err error) {
++	return admitProfileUntil(r, config, ch, verify, now, time.Time{})
++}
++func admitProfileUntil(r profileLaunch, config []byte, ch profileAdmissionChannel, verify func(*profileCapsule) error, now func() time.Time, initial time.Time) (a profileAdmission, err error) {
 +	a.launch = r
 +	if sha256.Sum256(config) != r.digest || ch == nil || verify == nil || now == nil {
 +		return a, errProfile
 +	}
 +	a.state = profileAdmitting
 +	sent := now()
++	deadline := sent.Add(time.Second)
++	if !initial.IsZero() && initial.Before(deadline) {
++		deadline = initial
++	}
++	if !now().Before(deadline) {
++		return a, errProfile
++	}
 +	hello := make([]byte, 40)
 +	copy(hello, r.nonce[:])
 +	hello[32] = r.mode
 +	if ch.send(1, 0, hello) != nil {
 +		return a, errProfile
 +	}
-+	raw, e := ch.receive(sent.Add(time.Second))
++	raw, e := ch.receive(deadline)
 +	if e != nil {
++		return a, errProfile
++	}
++	if !now().Before(deadline) {
 +		return a, errProfile
 +	}
 +	frame, e := r.decodePacket(raw, 1)
@@ -10495,7 +11988,7 @@ new file mode 100644
 +	}
 +	a.capsule = capsule
 +	a.deadline = sent.Add(time.Duration(capsule.lease) * time.Millisecond)
-+	if verify(&a.capsule) != nil || !now().Before(sent.Add(time.Second)) || !now().Before(a.deadline) {
++	if verify(&a.capsule) != nil || !now().Before(deadline) || !now().Before(a.deadline) {
 +		return a, errProfile
 +	}
 +	ack := make([]byte, 48)
@@ -10573,7 +12066,7 @@ diff --git a/common/yonikbroker/profile_launch_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux.go
-@@ -0,0 +1,636 @@
+@@ -0,0 +1,685 @@
 +//go:build linux
 +
 +package nativehooks
@@ -10591,6 +12084,7 @@ new file mode 100644
 +	"sync"
 +	"time"
 +
++	xnet "github.com/xtls/xray-core/common/net"
 +	"github.com/xtls/xray-core/common/platform/filesystem"
 +	"golang.org/x/sys/unix"
 +)
@@ -10611,6 +12105,9 @@ new file mode 100644
 +// ProfileRuntime не содержит FlowGrant. Constructor доступен только через
 +// потребление sealed record и authenticated channel. Владение FD однократное.
 +type ProfileRuntime struct {
++	proofs                      *profileProofChannel
++	proofRejected               [32]profileProofFD
++	duplicateAccepted           func(xnet.Conn, [40]byte) (profileProofFD, error)
 +	transports                  *profileTransportState
 +	flow                        *profileFlowControl
 +	flowQueue                   chan *profileOperation
@@ -10655,6 +12152,13 @@ new file mode 100644
 +			return nil, errProfile
 +		}
 +		fds := []unix.PollFd{{Fd: int32(p.channel.Fd()), Events: unix.POLLIN}, {Fd: int32(p.peer.Fd()), Events: unix.POLLIN}}
++		if p.proofs != nil {
++			fd, e := p.proofPollFD()
++			if e != nil {
++				return nil, e
++			}
++			fds = append(fds, unix.PollFd{Fd: int32(fd), Events: unix.POLLIN})
++		}
 +		wait := time.Until(deadline)
 +		if wait > 20*time.Millisecond {
 +			wait = 20 * time.Millisecond
@@ -10669,6 +12173,12 @@ new file mode 100644
 +		if n == 0 {
 +			continue
 +		}
++		if len(fds) == 3 && fds[2].Revents != 0 {
++			if fds[2].Revents&unix.POLLIN != 0 {
++				p.rejectProofInput()
++			}
++			return nil, errProfile
++		}
 +		if fds[0].Revents&unix.POLLIN == 0 {
 +			return nil, errProfile
 +		}
@@ -10676,32 +12186,19 @@ new file mode 100644
 +		b := make([]byte, profileFrameLimit)
 +		oob := make([]byte, unix.CmsgSpace(16*4)+unix.CmsgSpace(unix.SizeofUcred))
 +		size, control, flags, _, err := unix.Recvmsg(int(p.channel.Fd()), b, oob, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
-+		valid := err == nil && size >= 128 && flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) == 0
-+		messages, e := unix.ParseSocketControlMessage(oob[:control])
-+		if e != nil {
-+			valid = false
++		if size < 0 {
++			size = 0
 +		}
-+		credentials := 0
-+		for _, m := range messages {
-+			if m.Header.Level == unix.SOL_SOCKET && m.Header.Type == unix.SCM_RIGHTS {
-+				rights, e := unix.ParseUnixRights(&m)
-+				if e == nil {
-+					for _, fd := range rights {
-+						_ = unix.Close(fd)
-+					}
-+				}
-+				valid = false
-+			} else if m.Header.Level == unix.SOL_SOCKET && m.Header.Type == unix.SCM_CREDENTIALS {
-+				credentials++
-+				cred, e := unix.ParseUnixCredentials(&m)
-+				if e != nil || !profileSenderValid(p.admission.launch, cred.Pid, cred.Uid, uint32(os.Geteuid())) {
-+					valid = false
-+				}
-+			} else {
-+				valid = false
-+			}
++		if size > len(b) {
++			size = len(b)
++			flags |= unix.MSG_TRUNC
 +		}
-+		if !valid || credentials != 1 || p.peerAlive() != nil {
++		packet := profileParseAncillary(b[:size], oob[:control], flags, profileAdoptFD)
++		if packet.count != 0 {
++			p.rejectRights(packet)
++			return nil, errProfile
++		}
++		if err != nil || size < 128 || packet.invalid || packet.credentials != 1 || !profileSenderValid(p.admission.launch, packet.pid, packet.uid, uint32(os.Geteuid())) || p.peerAlive() != nil {
 +			return nil, errProfile
 +		}
 +		return b[:size], nil
@@ -10712,7 +12209,7 @@ new file mode 100644
 +	return p.sendObject(kind, reply, 0, body)
 +}
 +func (p *ProfileRuntime) sendObject(kind uint16, reply, object uint64, body []byte) error {
-+	if p.tx == ^uint64(0) || p.peerAlive() != nil || kind == 3 && p.admission.state != profileAdmitted && !p.channelClear() {
++	if p.tx == ^uint64(0) || kind == 16 && p.admission.launch.mode == 2 && p.tx >= ^uint64(0)-1 || p.peerAlive() != nil || kind == 3 && p.admission.state != profileAdmitted && !p.channelClear() {
 +		return errProfile
 +	}
 +	p.tx++
@@ -10859,7 +12356,17 @@ new file mode 100644
 +	if unix.SetsockoptInt(int(p.channel.Fd()), unix.SOL_SOCKET, unix.SO_PASSCRED, 1) != nil {
 +		return nil, errProfile
 +	}
-+	a, e := admitProfile(r, config, p, func(m *profileCapsule) error { p.admission.capsule = *m; return p.verifyAssets() }, time.Now)
++	initialDeadline := time.Now().Add(time.Second)
++	if r.mode == 2 {
++		p.proofs = &profileProofChannel{}
++		if e = p.proofs.bootstrap(r, p, initialDeadline, time.Now); e != nil {
++			return nil, e
++		}
++		p.proofs.peer = p.proofPeerAlive
++		p.proofs.check = p.proofHealth
++		p.proofs.send = p.sendSocketProof
++	}
++	a, e := admitProfileUntil(r, config, p, func(m *profileCapsule) error { p.admission.capsule = *m; return p.verifyAssets() }, time.Now, initialDeadline)
 +	if e != nil {
 +		return nil, errProfile
 +	}
@@ -10875,6 +12382,11 @@ new file mode 100644
 +		return !p.closed && p.ctx.Err() == nil && p.admission.state == profileAdmitted && time.Now().Before(p.admission.deadline)
 +	})
 +	p.flow.reply = p.send
++	if p.proofs != nil {
++		p.flow.prepareProof = p.proofs.prepare
++		p.flow.sendProof = p.proofs.sendOpen
++		p.flow.proofAlive = p.proofs.live
++	}
 +	p.flow.sessionDeadline = a.deadline
 +	p.flowFence = p.fresh
 +	profileResolverClosed.Store(true)
@@ -10923,6 +12435,18 @@ new file mode 100644
 +		p.mu.Unlock()
 +		if p.flow != nil {
 +			p.flow.revoke()
++			if e := p.flow.closeAcceptedProofs(); e != nil {
++				p.mu.Lock()
++				p.admission.state = profileUnknown
++				p.mu.Unlock()
++			}
++			if p.proofs != nil {
++				if e := p.proofs.Close(); e != nil {
++					p.mu.Lock()
++					p.admission.state = profileUnknown
++					p.mu.Unlock()
++				}
++			}
 +			for {
 +				select {
 +				case op := <-p.flowQueue:
@@ -11063,6 +12587,21 @@ new file mode 100644
 +		p.cancel()
 +	}
 +	var first error
++	if p.proofs != nil {
++		first = p.proofs.Close()
++	}
++	if p.flow != nil {
++		if e := p.flow.closeAcceptedProofs(); e != nil && first == nil {
++			first = e
++		}
++	}
++	for _, fd := range p.proofRejected {
++		if fd != nil {
++			if e := fd.Close(); e != nil && first == nil {
++				first = e
++			}
++		}
++	}
 +	closeOne := func(f *os.File) {
 +		if f != nil {
 +			if e := f.Close(); e != nil && first == nil {
@@ -11164,6 +12703,9 @@ new file mode 100644
 +func (p *ProfileRuntime) Done() <-chan struct{} { return p.ctx.Done() }
 +func (p *ProfileRuntime) fresh() bool {
 +	if p.closed || p.ctx.Err() != nil || p.peerAlive() != nil || p.admission.state != profileAdmitted || !time.Now().Before(p.admission.deadline) {
++		return false
++	}
++	if p.admission.launch.mode == 2 && (p.proofs == nil || !p.proofs.live()) {
 +		return false
 +	}
 +	for i, f := range p.assets {

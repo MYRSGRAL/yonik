@@ -27,6 +27,8 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertFalse(metadata["builder_apply_enabled"])
         self.assertFalse(metadata["runtime_hooks_connected"])
         self.assertFalse(metadata["authority_issuer_connected"])
+        self.assertTrue(metadata["system_tcp_proof_consumer_connected"])
+        self.assertFalse(metadata["system_udp_association_proof_connected"])
         self.assertTrue(metadata["dns_service_consumer_connected"])
         self.assertTrue(metadata["probe_service_consumer_connected"])
         self.assertTrue(metadata["snapshot_query_engine_connected"])
@@ -107,6 +109,31 @@ class FullProfilePatchTests(unittest.TestCase):
                 (ADAPTER / "full-profile-fixtures" / name).read_bytes(),
             )
 
+    def test_system_proof_fixture_is_embedded_byte_exact(self) -> None:
+        fixture = ADAPTER / "full-profile-fixtures/system-proof-extension-v1.json"
+        vectors = json.loads(fixture.read_text())
+        bootstrap = bytes.fromhex(vectors["bootstrap_hex"])
+        ack = bytes.fromhex(vectors["bootstrap_ack_hex"])
+        socket = bytes.fromhex(vectors["socket_hex"])
+        self.assertEqual(len(bootstrap), 128)
+        self.assertEqual(bootstrap[:8], b"YNKPF001")
+        self.assertEqual(ack, b"YNKPFA01" + hashlib.sha256(bootstrap).digest())
+        self.assertEqual(len(socket), 192)
+        self.assertEqual(socket[:8], b"YNKSPF01")
+        self.assertEqual(struct.unpack_from("!HHH", socket, 8), (1, 192, 1))
+        self.assertEqual(socket[146:148], bytes((2, 0)))
+        local, remote = struct.unpack_from("!HH", socket, 152)
+        self.assertNotEqual(local, remote)
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        added = patch.split(
+            "+++ b/common/yonikbroker/profile-system-proof-v1.json\n", 1
+        )[1].split("diff --git ", 1)[0]
+        embedded = (
+            "\n".join(line[1:] for line in added.splitlines() if line.startswith("+"))
+            + "\n"
+        )
+        self.assertEqual(embedded.encode(), fixture.read_bytes())
+
     def test_original_flow_fixture_keeps_initiator_and_actual_udp_ports(self) -> None:
         fixture = ADAPTER / "full-profile-fixtures/original-flow-v3.json"
         rows = json.loads(fixture.read_text())["rows"]
@@ -152,6 +179,20 @@ class FullProfilePatchTests(unittest.TestCase):
             self.assertEqual(grant[:4], bytes((1, grant_class, 0, 0)))
             self.assertEqual(struct.unpack_from("!Q", grant, 12)[0], flow)
             self.assertEqual(grant[32:], bytes(24))
+        self.assertEqual(
+            vectors["systemUserDNSRustHead"],
+            "abf5c2435dd71b272c8f064b155267c52fde9809",
+        )
+        system = bytes.fromhex(vectors["systemUserDNSGrantFrameHex"])
+        self.assertEqual(len(system), 184)
+        self.assertEqual(system[:8], b"YNKCAP01")
+        self.assertEqual(struct.unpack_from("!HHIQQ", system, 8), (1, 19, 184, 9, 4))
+        self.assertEqual(struct.unpack_from("!Q", system, 112)[0], 11)
+        self.assertEqual(system[128:132], bytes((1, 3, 1, 0)))
+        self.assertEqual(struct.unpack_from("!QQIQ", system, 132), (11, 1, 1000, 1))
+        self.assertEqual(struct.unpack_from("!Q", system, 160)[0], 20_000_000)
+        self.assertEqual(system[168:176], bytes((2, 0, 0, 0, 0, 0, 0, 0)))
+        self.assertEqual(struct.unpack_from("!Q", system, 176)[0], 42)
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         added = patch.split(
             "+++ b/common/yonikbroker/profile-service-vectors.json\n", 1
