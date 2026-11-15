@@ -50,10 +50,16 @@ def _hash(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _document(raw: bytes, cap: int, fields: set[str], required: set[str]) -> dict:
+def _document(
+    raw: bytes,
+    cap: int,
+    fields: set[str],
+    required: set[str],
+    schemas: tuple[int, ...] = (1,),
+) -> dict:
     require(isinstance(raw, bytes) and len(raw) <= cap, "JSON byte cap/type")
     doc = object_fields(parse(raw), fields, required | {"schema"})
-    require(type(doc["schema"]) is int and doc["schema"] == 1, "Unknown schema")
+    require(type(doc["schema"]) is int and doc["schema"] in schemas, "Unknown schema")
     return doc
 
 
@@ -218,8 +224,9 @@ def _attribute(
     observed = _document(
         observed_raw,
         8 * MAX_METADATA,
-        OBSERVED_FIELDS,
+        OBSERVED_FIELDS | {"aliases"},
         {"records", "input_origins", "config"},
+        (1, 2),
     )
     candidate = _document(
         candidate_raw,
@@ -334,12 +341,27 @@ def _attribute(
         )
         return tuple(values)
 
+    from pathlib import Path
+
+    from _p25_final_profile import validate_observed_extensions
+
+    validate_observed_extensions(observed, record["files"])
     observed_units: dict[tuple, list[dict]] = defaultdict(list)
+
+    from _p25_final_profile import validate_purpose
+
     for row in sequence(observed["records"]):
+        require(isinstance(row, dict), "Observed record type")
         object_fields(
             row,
-            OBSERVED_RECORD_FIELDS,
-            {"argv", "compiler", "exit", "normalized_depfile"},
+            OBSERVED_RECORD_FIELDS
+            | (
+                {"purpose", "probe", "raw_depfile_sha256"}
+                if row.get("schema") == 2
+                else set()
+            ),
+            {"argv", "compiler", "exit"}
+            | ({"normalized_depfile"} if row.get("schema") != 2 else set()),
         )
         object_fields(row["compiler"], {"path", "sha256"}, {"path", "sha256"})
         _absolute(row["compiler"]["path"])
@@ -347,10 +369,9 @@ def _attribute(
         argv(row["argv"])
         require(type(row["exit"]) is int, "Invalid observed exit")
         if "schema" in row:
-            require(
-                type(row["schema"]) is int and row["schema"] == 1,
-                "Unknown observed schema",
-            )
+            validate_purpose(row, Path(observed["config"]["build"]))
+        else:
+            require(row["exit"] == 0, "Unsuccessful legacy observation")
         if "original_argv" in row:
             argv(row["original_argv"])
         if "compiler_id" in row:

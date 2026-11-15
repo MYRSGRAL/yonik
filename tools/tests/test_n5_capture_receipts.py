@@ -103,7 +103,7 @@ class CaptureReceiptTests(unittest.TestCase):
         return seam.produce(self.retained, self.pins, self.commit)
 
     def final_profile_fixture(
-        self, registry: bool = False, probe_only: bool = False
+        self, registry: bool = False, probe_only: bool = False, alias: bool = False
     ) -> None:
         """Форма enrich/retain: generated, source, staged SDK, normalized deps, observed."""
         from _p25_final_profile import PROFILE
@@ -229,7 +229,33 @@ class CaptureReceiptTests(unittest.TestCase):
             "header",
             b"// SPDX-License-Identifier: LGPL-3.0-only\n",
         )
-        dep = {"schema": 1, "unit": unit, "dependencies": [unit, source, header]}
+        alias_id = None
+        alias_map = {}
+        if alias:
+            forest = (
+                "release/build/cxx-qt-aaaaaaaaaaaaaaaa/out/cxxqtbuild/include/cxx-qt"
+            )
+            canonical = roots["build"] + "/" + forest + "/alias.h"
+            origin_dir = (
+                roots["build"]
+                + "/release/build/yonik-desktop-bbbbbbbbbbbbbbbb/out/cxxqtbuild/include/cxx-qt"
+            )
+            alias_id = add(
+                "build",
+                forest + "/alias.h",
+                "generated",
+                b"// synthetic retained header\n",
+            )
+            alias_map[origin_dir + "/alias.h"] = {
+                "canonical": canonical,
+                "links": [{"path": origin_dir, "target": str(Path(canonical).parent)}],
+                "sha256": record["files"][-1]["sha256"],
+            }
+        dep = {
+            "schema": 1,
+            "unit": unit,
+            "dependencies": [unit, source, header] + ([alias_id] if alias_id else []),
+        }
         dep_id = add(
             "build", "p25capture/0-normalized.json", "depfile", seam.retained_json(dep)
         )
@@ -311,6 +337,8 @@ class CaptureReceiptTests(unittest.TestCase):
                 "stderr_sha256": "e" * 64,
             },
         }
+        if alias:
+            observed.update(schema=2, aliases=alias_map)
         if registry:
             probe = {
                 key: value
@@ -347,6 +375,8 @@ class CaptureReceiptTests(unittest.TestCase):
             else f"generation-provenance:{unit}",
             f"source-offer-primary-join:{header}",
         ]
+        if alias_id:
+            missing.append(f"generation-provenance:{alias_id}")
         manifest.update(
             source=record["source"],
             missing=report["missing"],
@@ -445,6 +475,51 @@ class CaptureReceiptTests(unittest.TestCase):
             candidate["worker_sha256"], list(bytes.fromhex(self.digest("yonik-worker")))
         )
         self.assertEqual(consumer_report["admission"], "NOT_ADMISSION")
+
+    def test_schema2_probe_offline_without_host_sources(self) -> None:
+        self.final_profile_fixture()
+        observed = json.loads((self.retained / "build-cxx-observed.json").read_bytes())
+        observed.update(schema=2, aliases={})
+        original = observed["records"][0]
+        probe = {
+            key: value
+            for key, value in original.items()
+            if key not in {"raw_depfile_sha256", "normalized_depfile"}
+        }
+        probe.update(
+            schema=2,
+            purpose="family-query",
+            probe=None,
+            original_argv=["-?"],
+            argv=["/usr/bin/g++", "-?"],
+            exit=1,
+            unit=None,
+            depfile=None,
+        )
+        observed["records"].append(probe)
+        self.write("build-cxx-observed.json", observed)
+        self.pins["build-cxx-observed.json"] = self.digest("build-cxx-observed.json")
+        manifest = json.loads(
+            (self.retained / "build-capture-manifest.json").read_bytes()
+        )
+        manifest["positive_metadata"].update(
+            observed_invocations=2, observed_sha256=self.pins["build-cxx-observed.json"]
+        )
+        self.write("build-capture-manifest.json", manifest)
+        self.pins["build-capture-manifest.json"] = self.digest(
+            "build-capture-manifest.json"
+        )
+        marker = json.loads((self.retained / "rust-captured-only.json").read_bytes())
+        marker["build_capture"] = manifest
+        self.write("rust-captured-only.json", marker)
+        self.pins["rust-captured-only.json"] = self.digest("rust-captured-only.json")
+        _, report = self.produce()
+        self.assertEqual(report["admission"], "NOT_ADMISSION")
+
+    def test_schema2_alias_offline_retained_whitelist(self) -> None:
+        self.final_profile_fixture(alias=True)
+        _, report = self.produce()
+        self.assertEqual(report["admission"], "NOT_ADMISSION")
 
     def final_negative(self, name: str, mutate) -> None:
         self.final_profile_fixture()

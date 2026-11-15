@@ -113,7 +113,12 @@ def _inputs(
         key = (unit["file"], _argv(unit["argv"]))
         require(key not in units, "Duplicate unit")
         units.add(key)
-    observed = _document(observed_raw, 8 * MAX_METADATA, OBS_FIELDS, OBS_FIELDS)
+    observed = _document(
+        observed_raw, 8 * MAX_METADATA, OBS_FIELDS | {"aliases"}, OBS_FIELDS, (1, 2)
+    )
+    from _p25_final_profile import validate_observed_extensions
+
+    validate_observed_extensions(observed, record["files"])
     config = _object(observed["config"], "schema source build sdk")
     _schema(config)
     for key in ("source", "build", "sdk"):
@@ -144,11 +149,17 @@ def _inputs(
     used: set[str] = set()
     seen = set()
     count = 0
+    from _p25_final_profile import validate_purpose
+
     for row in sequence(observed["records"]):
-        object_fields(
-            row, ROW_FIELDS, ROW_FIELDS - {"normalized_depfile", "raw_depfile_sha256"}
+        require(isinstance(row, dict), "Observed record type")
+        fields = ROW_FIELDS | (
+            {"purpose", "probe"} if row.get("schema") == 2 else set()
         )
-        _schema(row)
+        object_fields(
+            row, fields, fields - {"normalized_depfile", "raw_depfile_sha256"}
+        )
+        validate_purpose(row, Path(config["build"]))
         _tool(row["compiler"])
         _argv(row["original_argv"])
         argv = _argv(row["argv"])
@@ -158,8 +169,7 @@ def _inputs(
             sha(row[key])
         require(
             row["config_sha256"] == observed["config_sha256"]
-            and type(row["exit"]) is int
-            and row["exit"] == 0,
+            and type(row["exit"]) is int,
             "Unsuccessful/unbound observation",
         )
         if row["unit"] is None:

@@ -41,6 +41,10 @@ PROFILE = {
     "registry_source_root": "/home/myrs/.cargo/registry/src",
     "registry_unpacked_byte_cap": 64 * 1024 * 1024,
     "dependency_flags": ["-MD", "-MF"],
+    "internal_observed_schema": 2,
+    "probe_source_cap": 4096,
+    "alias_count_cap": 128,
+    "alias_chain_cap": 4,
     "deadline_seconds": 300,
     "stream_cap": MAX_METADATA,
     "observed_metadata_cap": 8 * MAX_METADATA,
@@ -118,6 +122,318 @@ def compile_arguments(argv: list[str], depfile: Path) -> list[str]:
         "Конфликт dependency flags",
     )
     return [*argv, "-MD", "-MF", str(depfile)] if "-c" in argv else list(argv)
+
+
+PROBE_CAP = 4096
+FLAG_BODY = b"int main(void) { return 0; }"
+FAMILY_HASH = "97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f"
+FLAG_PREFIX = [
+    "-O0",
+    "-ffunction-sections",
+    "-fdata-sections",
+    "-fPIC",
+    "-m64",
+    "-march=x86-64",
+    "-Wall",
+    "-Wextra",
+]
+FLAG_OPTIONS = {"/Zc:__cplusplus", "/permissive-", "/bigobj", "-Wa,-mbig-obj"}
+
+
+def probe_shape(argv: list[str], build: Path) -> tuple[str, str | None]:
+    """Закрытый cc-1.11.1 contract, до запуска compiler."""
+    if argv == ["-?"]:
+        return "family-query", None
+    if len(argv) == 2 and argv[0] == "-E":
+        path = Path(argv[1])
+        if path.is_relative_to(build) and re.fullmatch(
+            r"release/build/(?:link-cplusplus|cxx|cxx-qt|cxx-qt-lib|yonik-desktop)-[0-9a-f]{16}/out/[0-9]{1,20}detect_compiler_family\.c",
+            path.relative_to(build).as_posix(),
+        ):
+            return "family-preprocess", str(path)
+    if (
+        len(argv) == 13
+        and argv[:8] == FLAG_PREFIX
+        and argv[8] in FLAG_OPTIONS
+        and argv[9] == "-o"
+        and argv[11] == "-c"
+    ):
+        path = Path(argv[12])
+        if (
+            path.is_relative_to(build)
+            and re.fullmatch(
+                r"release/build/(?:cxx-qt|cxx-qt-lib|yonik-desktop)-[0-9a-f]{16}/out/flag_check\.cpp",
+                path.relative_to(build).as_posix(),
+            )
+            and argv[10] == str(path.with_suffix(""))
+        ):
+            return "flag-support", str(path)
+    return "compile" if "-c" in argv else "other", None
+
+
+def validate_purpose(row: dict, build: Path) -> bool:
+    """Pure проверка declared proof; JSON не даёт файловой authority."""
+    require(
+        type(row["schema"]) is int and row["schema"] in (1, 2), "Unknown CXX schema"
+    )
+    require(type(row["exit"]) is int, "Invalid CXX exit")
+    if row["schema"] == 1:
+        require(
+            "purpose" not in row and "probe" not in row and row["exit"] == 0,
+            "Legacy unsuccessful/proof",
+        )
+        return False
+    require(isinstance(row["original_argv"], list), "CXX argv type")
+    compile_arguments(row["original_argv"], build / "unused.d")
+    purpose, source = probe_shape(row["original_argv"], build)
+    require(row["purpose"] == purpose, "Purpose binding mismatch")
+    proof = row["probe"]
+    if source is None:
+        require(proof is None, "Unexpected probe source")
+    else:
+        object_fields(
+            proof, {"source", "bytes_hex", "sha256"}, {"source", "bytes_hex", "sha256"}
+        )
+        require(
+            proof["source"] == source
+            and isinstance(proof["bytes_hex"], str)
+            and len(proof["bytes_hex"]) <= 2 * PROBE_CAP,
+            "Probe source/cap",
+        )
+        raw = bytes.fromhex(proof["bytes_hex"])
+        digest = hashlib.sha256(raw).hexdigest()
+        require(
+            digest == proof["sha256"]
+            and (
+                raw == FLAG_BODY if purpose == "flag-support" else digest == FAMILY_HASH
+            ),
+            "Probe source body/hash",
+        )
+    probe = purpose in {"family-query", "family-preprocess", "flag-support"}
+    require(
+        row["exit"]
+        in (
+            {1}
+            if purpose == "family-query"
+            else {0, 1}
+            if purpose == "flag-support"
+            else {0}
+        ),
+        "Unsuccessful CXX purpose",
+    )
+    if probe:
+        require(
+            row["argv"] == [PROFILE["compiler"], *row["original_argv"]],
+            "Probe argv binding",
+        )
+        require(
+            row["unit"] is None
+            and row["depfile"] is None
+            and "normalized_depfile" not in row
+            and "raw_depfile_sha256" not in row,
+            "Probe claims compiled unit",
+        )
+    elif purpose == "compile":
+        require(
+            isinstance(row["depfile"], str)
+            and re.fullmatch(r"p25capture/[0-9]+\.d", row["depfile"]),
+            "Compile depfile binding",
+        )
+        units = [
+            arg
+            for arg in row["original_argv"]
+            if arg.endswith((".cpp", ".cxx", ".cc", ".C", ".c++"))
+        ]
+        require(
+            len(units) == 1 and row["unit"] == str(Path(row["cwd"]) / units[0]),
+            "Compile unit binding",
+        )
+        require(
+            row["argv"]
+            == [
+                PROFILE["compiler"],
+                *compile_arguments(row["original_argv"], build / row["depfile"]),
+            ],
+            "Compile argv binding",
+        )
+    else:
+        require(
+            row["unit"] is None and row["depfile"] is None and proof is None,
+            "Other claims unit",
+        )
+    return probe
+
+
+ALIAS_CAP = 128
+ALIAS_LINK_CAP = 4
+
+
+def forest(path: Path, build: Path, header: bool = True) -> bool:
+    if not path.is_absolute() or ".." in path.parts or not path.is_relative_to(build):
+        return False
+    local = path.relative_to(build).as_posix()
+    return bool(
+        re.fullmatch(
+            r"release/build/(?:cxx-qt|cxx-qt-lib|yonik-desktop)-[0-9a-f]{16}/out/cxxqtbuild/include/(?:cxx-qt|cxx-qt-lib)(?:/[A-Za-z0-9_.-]+)*",
+            local,
+        )
+    ) and (not header or path.suffix in {".h", ".hpp", ".hxx"})
+
+
+def alias_target(path: Path, build: Path, stack: ExitStack) -> tuple[Path, list[dict]]:
+    """Только generated include forest; NOFOLLOW traversal и bounded links."""
+    require(forest(path, build), "Unknown alias forest/header")
+    current = path
+    links = []
+    stamps = []
+    seen = set()
+    while True:
+        require(current not in seen, "Alias cycle")
+        seen.add(current)
+        directory = _directory(build)
+        prefix = build
+        changed = False
+        try:
+            parts = current.relative_to(build).parts
+            for index, part in enumerate(parts):
+                info = os.stat(part, dir_fd=directory, follow_symlinks=False)
+                prefix /= part
+                identity = (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_mode,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_ctime_ns,
+                )
+                stamps.append((prefix, identity))
+                if stat.S_ISLNK(info.st_mode):
+                    require(len(links) < ALIAS_LINK_CAP, "Alias chain cap")
+                    target = os.readlink(part, dir_fd=directory)
+                    candidate = (
+                        Path(target)
+                        if Path(target).is_absolute()
+                        else prefix.parent / target
+                    )
+                    require(
+                        forest(prefix, build, False)
+                        and forest(candidate, build, False),
+                        "Alias target escape/forest",
+                    )
+                    links.append({"path": str(prefix), "target": target})
+                    current = candidate.joinpath(*parts[index + 1 :])
+                    require(forest(current, build), "Alias canonical header")
+                    changed = True
+                    break
+                if index < len(parts) - 1:
+                    nested = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=directory,
+                    )
+                    os.close(directory)
+                    directory = nested
+                else:
+                    require(stat.S_ISREG(info.st_mode), "Alias target not regular")
+        finally:
+            os.close(directory)
+        if not changed:
+            break
+
+    def verify() -> None:
+        for path, expected in stamps:
+            parent = _directory(path.parent)
+            try:
+                info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                actual = (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_mode,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_ctime_ns,
+                )
+                require(actual == expected, "Alias input changed")
+            finally:
+                os.close(parent)
+
+    # Проверяем каждый путь от root: pathname ancestors также остаются bound.
+    stack.callback(verify)
+    return current, links
+
+
+def validate_aliases(aliases: dict, build: Path) -> dict[str, str]:
+    require(
+        isinstance(aliases, dict) and len(aliases) <= ALIAS_CAP, "Alias map cap/type"
+    )
+    mapping = {}
+    for origin, value in aliases.items():
+        require(
+            isinstance(origin, str) and forest(Path(origin), build),
+            "Alias origin forest",
+        )
+        object_fields(
+            value, {"canonical", "links", "sha256"}, {"canonical", "links", "sha256"}
+        )
+        require(
+            isinstance(value["canonical"], str)
+            and forest(Path(value["canonical"]), build),
+            "Alias canonical forest",
+        )
+        links = value["links"]
+        require(
+            isinstance(links, list) and 0 < len(links) <= ALIAS_LINK_CAP,
+            "Alias links cap",
+        )
+        current = Path(origin)
+        visited = {current}
+        for link in links:
+            object_fields(link, {"path", "target"}, {"path", "target"})
+            require(
+                isinstance(link["path"], str) and isinstance(link["target"], str),
+                "Alias link type",
+            )
+            path, target = Path(link["path"]), Path(link["target"])
+            require(
+                forest(path, build, False) and current.is_relative_to(path),
+                "Alias link binding",
+            )
+            target = target if target.is_absolute() else path.parent / target
+            require(forest(target, build, False), "Alias target forest")
+            current = target / current.relative_to(path)
+            require(current not in visited, "Alias cycle")
+            visited.add(current)
+        require(
+            str(current) == value["canonical"]
+            and isinstance(value["sha256"], str)
+            and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None,
+            "Alias canonical/hash binding",
+        )
+        mapping[origin] = str(current)
+    return mapping
+
+
+def validate_observed_extensions(observed: dict, files: list[dict]) -> dict[str, str]:
+    require(
+        type(observed["schema"]) is int and observed["schema"] in (1, 2),
+        "Unknown observed schema",
+    )
+    require(
+        ("aliases" in observed) == (observed["schema"] == 2),
+        "Observed alias schema binding",
+    )
+    build = Path(observed["config"]["build"])
+    aliases = validate_aliases(observed.get("aliases", {}), build)
+    whitelist = {(row["root"], row["path"]): row for row in files}
+    for origin, canonical in aliases.items():
+        row = whitelist.get(("build", Path(canonical).relative_to(build).as_posix()))
+        require(
+            row is not None
+            and row["kind"] == "generated"
+            and row["sha256"] == observed["aliases"][origin]["sha256"],
+            "Alias outside retained whitelist",
+        )
+    return aliases
 
 
 @contextmanager
@@ -460,7 +776,11 @@ def compiler_capture(
     build = Path(config["build"])
     number = _reserve(build)
     dep = build / "p25capture" / f"{number}.d"
-    actual = compile_arguments(argv, dep)
+    purpose, probe_source = probe_shape(argv, build)
+    actual = (
+        compile_arguments(argv, dep) if purpose in {"compile", "other"} else list(argv)
+    )
+    proof = None
     with ExitStack() as stack:
         if not (
             cwd.is_relative_to(Path(config["source"])) or cwd.is_relative_to(build)
@@ -480,11 +800,54 @@ def compiler_capture(
                     ),
                     "Registry unit вне выбранного package/frozen roots",
                 )
+        if probe_source is not None:
+            with ExitStack() as source_stack:
+                source_reader = Reader(
+                    {
+                        "source": Path(config["source"]),
+                        "build": build,
+                        "sdk": Path(config["sdk"]),
+                    },
+                    source_stack,
+                )
+                stamps = {
+                    path: _identity(path)
+                    if path == Path(probe_source)
+                    else _identity(path)[:3]
+                    for path in (Path(probe_source), *Path(probe_source).parents)
+                    if path == build or path.is_relative_to(build)
+                }
+                raw = source_reader.read(
+                    "build", Path(probe_source).relative_to(build).as_posix(), PROBE_CAP
+                )
+            digest = hashlib.sha256(raw).hexdigest()
+            require(
+                raw == FLAG_BODY
+                if purpose == "flag-support"
+                else digest == FAMILY_HASH,
+                "Probe body mismatch",
+            )
+            proof = {"source": probe_source, "bytes_hex": raw.hex(), "sha256": digest}
         with trusted_tool(PROFILE["compiler"]) as (fd, compiler):
             command = [PROFILE["compiler"], *actual]
             code, out, err = runner(fd, command, cwd, env)
+        if probe_source is not None:
+            require(
+                all(
+                    (
+                        _identity(path)
+                        if path == Path(probe_source)
+                        else _identity(path)[:3]
+                    )
+                    == stamp
+                    for path, stamp in stamps.items()
+                ),
+                "Probe source changed during execution",
+            )
     row = {
-        "schema": 1,
+        "schema": 2,
+        "purpose": purpose,
+        "probe": proof,
         "config_sha256": env.get("YONIK_P25_CONFIG_SHA256"),
         "argv": command,
         "original_argv": argv,
@@ -496,7 +859,7 @@ def compiler_capture(
         "depfile": None,
         "unit": None,
     }
-    if "-c" in argv and code == 0:
+    if purpose == "compile" and code == 0:
         units = [
             arg for arg in argv if arg.endswith((".cpp", ".cxx", ".cc", ".C", ".c++"))
         ]
@@ -599,6 +962,7 @@ def enrich(roots: dict[str, Path], record: dict, retained: Path) -> dict:
     known = {(row["root"], row["path"]): row for row in rows}
     origins: dict[str, str] = {}
     compiled_units: set[str] = set()
+    aliases: dict[str, dict] = {}
     with ExitStack() as stack:
         reader = Reader(roots, stack)
         external_readers: dict[str, Reader] = {}
@@ -736,6 +1100,13 @@ def enrich(roots: dict[str, Path], record: dict, retained: Path) -> dict:
                         os.close(canonical)
                 finally:
                     os.close(directory)
+            alias_origin = None
+            alias_links = []
+            if forest(absolute, roots["build"]):
+                canonical, alias_links = alias_target(absolute, roots["build"], stack)
+                if alias_links:
+                    alias_origin = str(absolute)
+                    absolute = canonical
             matches = [
                 (name, root)
                 for name, root in roots.items()
@@ -754,6 +1125,16 @@ def enrich(roots: dict[str, Path], record: dict, retained: Path) -> dict:
             root, base = matches[0]
             local = relative(absolute.relative_to(base).as_posix())
             key = (root, local)
+            if alias_origin is not None:
+                _, checksum = reader._consume(root, local, MAX_GENERATED, False)
+                require(
+                    len(aliases) < ALIAS_CAP or alias_origin in aliases, "Alias map cap"
+                )
+                aliases[alias_origin] = {
+                    "canonical": str(absolute),
+                    "links": alias_links,
+                    "sha256": checksum,
+                }
             if key in known:
                 row = known[key]
                 if origin in compiled_units and row["kind"] == "header":
@@ -820,28 +1201,28 @@ def enrich(roots: dict[str, Path], record: dict, retained: Path) -> dict:
                 "stdout_sha256",
                 "stderr_sha256",
             }
+            if row.get("schema") == 2:
+                fields |= {"purpose", "probe"}
             object_fields(row, fields, fields)
             require(row["config_sha256"] == config_pin, "Observed config pin mismatch")
-            require(
-                type(row["schema"]) is int
-                and row["schema"] == 1
-                and type(row["exit"]) is int
-                and row["exit"] == 0,
-                "Неуспешный CXX record",
-            )
+            is_probe = validate_purpose(row, roots["build"])
             object_fields(row["compiler"], {"path", "sha256"}, {"path", "sha256"})
             require(
                 row["argv"]
                 == [
                     PROFILE["compiler"],
-                    *compile_arguments(
-                        row["original_argv"],
-                        roots["build"] / "p25capture" / f"{number}.d",
+                    *(
+                        row["original_argv"]
+                        if is_probe
+                        else compile_arguments(
+                            row["original_argv"],
+                            roots["build"] / "p25capture" / f"{number}.d",
+                        )
                     ),
                 ],
                 "Observed argv binding mismatch",
             )
-            if "-c" not in row["original_argv"]:
+            if is_probe or "-c" not in row["original_argv"]:
                 require(
                     row["unit"] is None and row["depfile"] is None,
                     "Probe не compile record",
@@ -931,7 +1312,8 @@ def enrich(roots: dict[str, Path], record: dict, retained: Path) -> dict:
     observed_hash = _write(
         retained / "build-cxx-observed.json",
         {
-            "schema": 1,
+            "schema": 2,
+            "aliases": aliases,
             "records": observed,
             "qt": qt,
             "input_origins": origins,

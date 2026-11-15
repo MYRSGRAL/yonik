@@ -841,3 +841,301 @@ class FinalProfileTests(unittest.TestCase):
                 self._check_executor_bounds_and_reaps_without_execution(
                     tmp_path, patches, failure
                 )
+
+
+class ClosedProbeAndAliasTests(unittest.TestCase):
+    """SYNTHETIC reconstruction; никогда не является capture03 receipt."""
+
+    evidence = Path(
+        "/home/myrs/projects/yonik/local/orchestration/evidence/n5-next-capture-preflight/capture-03-raw"
+    )
+
+    @unittest.skipUnless(
+        evidence.exists(), "Локальный diagnostic checkpoint отсутствует"
+    )
+    def test_all_337_retained_argv_with_injected_runner(self) -> None:
+        import hashlib
+        import json
+        import tarfile
+        from contextlib import contextmanager
+
+        checkpoint = json.loads((self.evidence / "checkpoint.json").read_bytes())
+        crate = (self.evidence / "cc-1.11.1.crate").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(crate).hexdigest(),
+            "4ff2a8126fff0f8c839080d619675a585e61720bb12d2baceae45769fd66f155",
+        )
+        with tarfile.open(self.evidence / "cc-1.11.1.crate") as archive:
+            family = archive.extractfile(
+                "cc-1.11.1/src/detect_compiler_family.c"
+            ).read()
+        root = Path(self.enterContext(TemporaryDirectory()))
+        build, source = root / "build", root / "source"
+        source.mkdir()
+        (build / "p25capture").mkdir(parents=True)
+
+        @contextmanager
+        def tool(alias: str):
+            yield 1, {"path": alias, "sha256": "a" * 64}
+
+        rows = []
+        for item in checkpoint["files"]:
+            if not item["origin"].endswith(".json"):
+                continue
+            raw = (self.evidence / item["file"]).read_bytes()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), item["sha256"])
+            value = json.loads(raw)
+            if "original_argv" in value:
+                rows.append(value)
+        self.assertEqual(len(rows), 337)
+        counts = {}
+        for index, original in enumerate(rows):
+            argv = [
+                arg.replace(checkpoint["original_build"], str(build))
+                for arg in original["original_argv"]
+            ]
+            purpose, path = p.probe_shape(argv, build)
+            if path:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_bytes(
+                    family if purpose == "family-preprocess" else p.FLAG_BODY
+                )
+            counts[purpose] = counts.get(purpose, 0) + 1
+
+            def runner(
+                fd: int, command: list[str], cwd: Path, env: dict[str, str]
+            ) -> tuple[int, bytes, bytes]:
+                if purpose in {"family-query", "family-preprocess", "flag-support"}:
+                    self.assertEqual(command[1:], argv)
+                return original["exit"], b"", b""
+
+            with patch.object(p, "trusted_tool", tool):
+                code, _, _ = p.compiler_capture(
+                    {"build": str(build), "source": str(source), "sdk": "/usr"},
+                    argv,
+                    source,
+                    {},
+                    runner,
+                )
+            row = json.loads((build / f"p25capture/{index}.json").read_bytes())
+            self.assertEqual(code, original["exit"])
+            probe = p.validate_purpose(row, build)
+            if probe:
+                self.assertIsNone(row["unit"])
+                self.assertIsNone(row["depfile"])
+            if path:
+                Path(path).unlink()
+                self.assertTrue(p.validate_purpose(row, build))
+        self.assertEqual(counts["family-query"], 9)
+        self.assertEqual(counts["family-preprocess"], 9)
+        self.assertEqual(counts["flag-support"], 28)
+
+    def test_closed_proof_negatives(self) -> None:
+        import copy
+        import hashlib
+
+        build = Path("/synthetic/build")
+        src = build / ("release/build/cxx-qt-" + "a" * 16) / "out/flag_check.cpp"
+        argv = [
+            *p.FLAG_PREFIX,
+            "/bigobj",
+            "-o",
+            str(src.with_suffix("")),
+            "-c",
+            str(src),
+        ]
+        row = {
+            "schema": 2,
+            "original_argv": argv,
+            "purpose": "flag-support",
+            "probe": {
+                "source": str(src),
+                "bytes_hex": p.FLAG_BODY.hex(),
+                "sha256": hashlib.sha256(p.FLAG_BODY).hexdigest(),
+            },
+            "exit": 1,
+            "unit": None,
+            "depfile": None,
+        }
+        row["argv"] = [p.PROFILE["compiler"], *argv]
+        self.assertTrue(p.validate_purpose(row, build))
+        self.assertTrue(p.validate_purpose(dict(row, exit=0), build))
+        for field, value in [
+            ("schema", 3),
+            ("schema", True),
+            ("exit", True),
+            ("exit", 2),
+            ("purpose", "compile"),
+            ("unit", str(src)),
+            ("depfile", "x"),
+        ]:
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                p.validate_purpose(dict(row, **{field: value}), build)
+        for extra in ["-include", "-fplugin=x", "-I/private"]:
+            bad = dict(row, original_argv=[*argv, extra])
+            with self.assertRaises(ValueError):
+                p.validate_purpose(bad, build)
+        bad = copy.deepcopy(row)
+        bad["probe"]["bytes_hex"] = b"production".hex()
+        with self.assertRaises(ValueError):
+            p.validate_purpose(bad, build)
+        bad = dict(row, schema=1)
+        with self.assertRaises(ValueError):
+            p.validate_purpose(bad, build)
+        with self.assertRaises(ValueError):
+            p.validate_purpose({"schema": 1, "exit": 1}, build)
+
+    @unittest.skipUnless(
+        evidence.exists(), "Локальный diagnostic checkpoint отсутствует"
+    )
+    def test_actual_11_alias_shapes_and_retained_only_mapping(self) -> None:
+        import hashlib
+        import json
+
+        root = Path(self.enterContext(TemporaryDirectory()))
+        build = root / "build"
+        build.mkdir()
+        checkpoint = json.loads((self.evidence / "checkpoint.json").read_bytes())
+        observations = json.loads(
+            (self.evidence / "alias-observation.json").read_bytes()
+        )["aliases"]
+        self.assertEqual(len(observations), 11)
+        expected = {}
+        for origin, item in observations.items():
+            canonical = Path(
+                item["canonical"].replace(checkpoint["original_build"], str(build))
+            )
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            raw = (self.evidence / item["retained_file"]).read_bytes()
+            canonical.write_bytes(raw)
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), item["sha256"])
+            for link in item["links"]:
+                path = Path(
+                    link["path"].replace(checkpoint["original_build"], str(build))
+                )
+                target = link["target"].replace(
+                    checkpoint["original_build"], str(build)
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not path.is_symlink():
+                    path.symlink_to(target)
+            expected[origin.replace(checkpoint["original_build"], str(build))] = str(
+                canonical
+            )
+        metadata = {}
+        with ExitStack() as stack:
+            for alias, expected_canonical in expected.items():
+                canonical, links = p.alias_target(Path(alias), build, stack)
+                self.assertEqual(str(canonical), expected_canonical)
+                metadata[alias] = {
+                    "canonical": str(canonical),
+                    "links": links,
+                    "sha256": hashlib.sha256(canonical.read_bytes()).hexdigest(),
+                }
+        # Pure replay не открывает никакие paths.
+        with patch("os.open", side_effect=AssertionError("offline I/O")):
+            self.assertEqual(p.validate_aliases(metadata, build), expected)
+        observed = {"schema": 2, "config": {"build": str(build)}, "aliases": metadata}
+        whitelist = [
+            {
+                "root": "build",
+                "path": Path(value["canonical"]).relative_to(build).as_posix(),
+                "kind": "generated",
+                "sha256": value["sha256"],
+            }
+            for value in metadata.values()
+        ]
+        with patch("os.open", side_effect=AssertionError("offline I/O")):
+            self.assertEqual(
+                p.validate_observed_extensions(observed, whitelist), expected
+            )
+            with self.assertRaises(ValueError):
+                p.validate_observed_extensions(observed, [])
+        for bad in [
+            build / "private.h",
+            build
+            / "release/build/unknown-aaaaaaaaaaaaaaaa/out/cxxqtbuild/include/cxx-qt/a.h",
+            build
+            / "release/build/cxx-qt-aaaaaaaaaaaaaaaa/out/cxxqtbuild/include/cxx-qt/a.cpp",
+        ]:
+            with ExitStack() as stack, self.assertRaises(ValueError):
+                p.alias_target(bad, build, stack)
+
+    def test_alias_escape_cycle_and_mutation(self) -> None:
+        root = Path(self.enterContext(TemporaryDirectory()))
+        build = root / "build"
+        include = build / "release/build/cxx-qt-aaaaaaaaaaaaaaaa/out/cxxqtbuild/include"
+        include.mkdir(parents=True)
+        alias = include / "cxx-qt"
+        alias.symlink_to("/private")
+        with ExitStack() as stack, self.assertRaises(ValueError):
+            p.alias_target(alias / "x.h", build, stack)
+        alias.unlink()
+        alias.symlink_to(alias)
+        with ExitStack() as stack, self.assertRaises(ValueError):
+            p.alias_target(alias / "x.h", build, stack)
+        alias.unlink()
+        alias.mkdir()
+        header = alias / "x.h"
+        header.write_bytes(b"header")
+        stack = ExitStack()
+        p.alias_target(header, build, stack)
+        header.write_bytes(b"mutation")
+        with self.assertRaises(ValueError):
+            stack.close()
+
+    def test_probe_source_mutation_during_runner_refused(self) -> None:
+        from contextlib import contextmanager
+
+        root = Path(self.enterContext(TemporaryDirectory()))
+        source, build = root / "source", root / "build"
+        source.mkdir()
+        (build / "p25capture").mkdir(parents=True)
+        path = build / "release/build/cxx-qt-aaaaaaaaaaaaaaaa/out/flag_check.cpp"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(p.FLAG_BODY)
+        argv = [
+            *p.FLAG_PREFIX,
+            "/bigobj",
+            "-o",
+            str(path.with_suffix("")),
+            "-c",
+            str(path),
+        ]
+
+        @contextmanager
+        def tool(alias: str):
+            yield 1, {"path": alias, "sha256": "a" * 64}
+
+        def runner(
+            fd: int, command: list[str], cwd: Path, env: dict[str, str]
+        ) -> tuple[int, bytes, bytes]:
+            path.write_bytes(b"replacement")
+            return 1, b"", b""
+
+        with patch.object(p, "trusted_tool", tool), self.assertRaises(ValueError):
+            p.compiler_capture(
+                {"build": str(build), "source": str(source), "sdk": "/usr"},
+                argv,
+                source,
+                {},
+                runner,
+            )
+
+    def test_alias_ancestor_replacement_refused(self) -> None:
+        root = Path(self.enterContext(TemporaryDirectory()))
+        build = root / "build"
+        path = (
+            build
+            / "release/build/cxx-qt-aaaaaaaaaaaaaaaa/out/cxxqtbuild/include/cxx-qt/x.h"
+        )
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"header")
+        stack = ExitStack()
+        p.alias_target(path, build, stack)
+        parent = path.parent
+        parent.rename(parent.with_name("old"))
+        parent.mkdir()
+        (parent / "x.h").write_bytes(b"header")
+        with self.assertRaises(ValueError):
+            stack.close()

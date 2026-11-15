@@ -143,7 +143,12 @@ def final_capture(
     registry_cwds: set[str] | None = None,
 ) -> dict:
     """Узкий offline join enriched evidence; никаких build-time методов enrich/prepare."""
-    from _p25_final_profile import PROFILE, compile_arguments
+    from _p25_final_profile import (
+        PROFILE,
+        compile_arguments,
+        validate_aliases,
+        validate_purpose,
+    )
 
     profile = exact(frozen["final_profile"], {"spec", "tooling_sha256", "sha256"})
     require(
@@ -186,12 +191,16 @@ def final_capture(
         digest == sha(observed_pin) == positive["observed_sha256"],
         "Observed independent pin mismatch",
     )
+    observed = parse(raw)
+    require(isinstance(observed, dict), "Observed object required")
     observed = exact(
-        parse(raw),
-        {"schema", "records", "qt", "input_origins", "config", "config_sha256"},
+        observed,
+        {"schema", "records", "qt", "input_origins", "config", "config_sha256"}
+        | ({"aliases"} if observed.get("schema") == 2 else set()),
     )
     require(
-        type(observed["schema"]) is int and observed["schema"] == 1, "Observed schema"
+        type(observed["schema"]) is int and observed["schema"] in (1, 2),
+        "Observed schema",
     )
     config = exact(observed["config"], {"schema", "source", "build", "sdk"})
     require(
@@ -259,6 +268,15 @@ def final_capture(
             and ("sdk", staged) in by_path,
             "Staged input binding mismatch",
         )
+    alias_map = validate_aliases(observed.get("aliases", {}), Path(roots["build"]))
+    for origin, canonical in alias_map.items():
+        key = ("build", Path(canonical).relative_to(Path(roots["build"])).as_posix())
+        require(
+            key in by_path
+            and by_path[key]["kind"] == "generated"
+            and by_path[key]["sha256"] == observed["aliases"][origin]["sha256"],
+            "Alias outside retained whitelist",
+        )
     used = {row["id"] for row in rows if row["kind"] == "elf"}
 
     def locate(path: str, cwd: str, kind: str | None = None) -> dict:
@@ -268,6 +286,7 @@ def final_capture(
                 path if Path(path).is_absolute() else str(Path(cwd) / path)
             )
         )
+        absolute = Path(alias_map.get(str(absolute), str(absolute)))
         matches = [
             (root, absolute.relative_to(Path(base)).as_posix())
             for root, base in roots.items()
@@ -312,18 +331,14 @@ def final_capture(
         }
         require(isinstance(row, dict), "Observed record должен быть object")
         compiling = row.get("unit") is not None
+        if row.get("schema") == 2:
+            fields |= {"purpose", "probe"}
         exact(
             row,
             fields
             | ({"raw_depfile_sha256", "normalized_depfile"} if compiling else set()),
         )
-        require(
-            type(row["schema"]) is int
-            and row["schema"] == 1
-            and type(row["exit"]) is int
-            and row["exit"] == 0,
-            "Observed unsuccessful/schema",
-        )
+        is_probe = validate_purpose(row, Path(roots["build"]))
         require(
             row["config_sha256"] == observed["config_sha256"],
             "Observed config binding mismatch",
@@ -346,9 +361,13 @@ def final_capture(
         )
         expected_argv = [
             PROFILE["compiler"],
-            *compile_arguments(
-                row["original_argv"],
-                Path(roots["build"]) / "p25capture" / f"{number}.d",
+            *(
+                row["original_argv"]
+                if is_probe
+                else compile_arguments(
+                    row["original_argv"],
+                    Path(roots["build"]) / "p25capture" / f"{number}.d",
+                )
             ),
         ]
         require(row["argv"] == expected_argv, "Observed argv binding mismatch")
@@ -359,7 +378,7 @@ def final_capture(
             and tool["sha256"] == sha(compiler["sha256"]),
             "Compiler input binding mismatch",
         )
-        if "-c" not in row["original_argv"]:
+        if is_probe or "-c" not in row["original_argv"]:
             require(
                 row["unit"] is None and row["depfile"] is None, "Probe binding mismatch"
             )

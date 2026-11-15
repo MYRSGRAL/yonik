@@ -101,8 +101,12 @@ def inputs(
         ),
         "Registry origins schema/cap",
     )
+    from _p25_final_profile import validate_observed_extensions, validate_purpose
+
+    validate_observed_extensions(observed, record["files"])
     for row in sequence(observed["records"]):
         require(isinstance(row, dict), "Registry observed record type")
+        validate_purpose(row, Path(observed["config"]["build"]))
         argv = sequence(row["original_argv"])
         require(
             all(isinstance(arg, str) and 0 < len(arg) <= 4096 for arg in argv),

@@ -61,3 +61,47 @@ PAX size override и ненулевой payload nonregular-записей отк
 с `TarFile`; `gzip_encoded=False` предназначен для pinned plain source TAR
 с общим `MAX_FILE` cap. Проверка package/path/type остаётся обязанностью consumer.
 Новый cap входит в полный profile hash; старые frozen records не изменяются.
+
+### Внутренний observed schema2: closed probes и generated aliases
+
+Изменение SOURCE/Python требует нового freeze полного final profile; selector
+остаётся `p25-final-cxx-v1`. Capture03 остаётся DIAGNOSTIC_ONLY: его failed
+schema1 records не переписываются и не становятся успешными задним числом.
+Acceptance, legal и production admission не повышаются.
+
+Producer классифицирует argv **до** compiler execution. Schema2 CXX record
+обязательно содержит `purpose` и `probe`. Закрытый cc-1.11.1 contract:
+
+- `family-query`: ровно `[-?]`, actual exit 1, source proof отсутствует;
+- `family-preprocess`: ровно `[-E, <OUT_DIR>/<digits>detect_compiler_family.c]`,
+  actual exit 0, snapshot фиксированного cc source с SHA256
+  `97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f`;
+- `flag-support`: фиксированный prefix `-O0 -ffunction-sections -fdata-sections
+  -fPIC -m64 -march=x86-64 -Wall -Wextra`, один из `/Zc:__cplusplus`,
+  `/permissive-`, `/bigobj`, `-Wa,-mbig-obj`, затем ровно
+  `-o <OUT_DIR>/flag_check -c <OUT_DIR>/flag_check.cpp`. Source bytes ровно
+  `int main(void) { return 0; }`; actual exit 0 или 1;
+- `compile` / `other`: обычная семантика; enrich/replay требуют actual exit 0.
+
+OUT_DIR ограничен `release/build/<known-crate>-<16hex>/out` под build root.
+Probe source читается NOFOLLOW с FD/type/stat checks, cap 4096 bytes;
+pre/post identities проверяются и вокруг runner. Proof содержит source path,
+bytes hex и SHA256. Probes не получают dependency flags, unit или depfile,
+не увеличивают compiled units; source snapshot доступен replay после удаления
+временного family source. Schema1 поддерживается только с actual exit0.
+
+Observed schema2 содержит обязательный `aliases` map (включая пустой).
+Обычный Reader остаётся NOFOLLOW. Специальный reader допускает только header
+`.h/.hpp/.hxx` внутри generated include forest
+`release/build/{cxx-qt,cxx-qt-lib,yonik-desktop}-<16hex>/out/cxxqtbuild/include/{cxx-qt,cxx-qt-lib}/...`.
+Максимум 4 symlink перехода, 128 alias entries; traversal `..`, cycles,
+unknown forest и targets вне build отвергаются. Link/parent/file identities
+проверяются до и после enrichment. Map связывает alias, actual link chain,
+canonical regular header и SHA256. Record и normalized deps используют canonical
+whitelist ID. Offline replay применяет только проверенный map к retained
+whitelist; JSON не разрешает открытие host paths. Legacy observed schema1
+не содержит aliases. Existing caps/pins и missing-closure требования сохраняются.
+
+Локальные tests с checkpoint capture03 явно SYNTHETIC: 337 original argv через
+injected runner и 11 alias shapes из retained evidence. Они не запускают
+compiler, Qt, Cargo или ELF и не создают receipts для failed capture03.
