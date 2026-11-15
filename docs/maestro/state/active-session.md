@@ -40,6 +40,9 @@ p45_base: 7d9ae80eb3977aa0c0b8766830b9de84346e5874
 p5_continuation_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A5e964ab1-96ea-4896-936e-19056eb05df7
 p5_partial_candidate: 13f89190331c36266e8eae973b5cc059893f2457
 p5_codec_candidate: dac3076644e11e3297fc835daa4b28bd38bba368
+p5_codec_review: scoped_clean
+p5_test_gaps_head: bb425125644c2057c75e2563d6c45193db05ceea
+p4_scope_trace_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A7a3bc077-48a6-4e70-bf8c-36ffcbcebc90
 p5_codec_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A43f6aab7-10a7-4710-b573-4521352eb303
 p5_custody_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A43de569d-169a-458d-9f68-816043169b0a
 p3_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A5434d2cc-828c-4b95-9bca-caa3d24f6c63
@@ -312,6 +315,18 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   дополнительный protection_host/native_owner/WorkerPayload integration scope.
   Запущены два независимых source review: R5a codec/bounds/canonical transport,
   R5b FD/DAT/resolver custody/helper fail-closed. Candidate пока не интегрирован.
+- R5a 43f6aab7 — scoped CLEAN нового codec; два test gaps root закрыл в
+  bb42512: независимые nonempty/UTF8/signed/nested canonical byte goldens и
+  near-limit request wrapper с partial-write sink. 23 targeted pure tests,
+  clippy двух packages all-targets -D warnings и fmt PASS. Frozen source совпал
+  с 3063 tracked blobs/modes, retained ELF hashes проверены до cleanup; own
+  transient удалён через cargo clean. Production codec bytes не менялись.
+  P5 candidate влит для integration/test corrections, gate остаётся false;
+  R5b custody review ещё ожидается. P4 продолжает конкретный chain protocol
+  scopes trace в artifact-only addendum, без новых product изменений.
+- completion-scope.md подготовлен как draft: дополнительный Go/Rust diff,
+  existing bounded direct firewall путь и ещё открытые catalog/resolver/mapping
+  вопросы. Это не implementation approval и не финальный execution contract.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
