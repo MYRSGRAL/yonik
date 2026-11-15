@@ -1,3 +1,2342 @@
+diff --git a/transport/internet/yonik_profile_transport_test.go b/transport/internet/yonik_profile_transport_test.go
+new file mode 100644
+--- /dev/null
++++ b/transport/internet/yonik_profile_transport_test.go
+@@ -0,0 +1,26 @@
++package internet
++
++import (
++	"context"
++	"io"
++	"net"
++	"testing"
++	"time"
++)
++
++type profileUnknownConn struct{ closed bool }
++
++func (c *profileUnknownConn) Read([]byte) (int, error)         { return 0, io.EOF }
++func (c *profileUnknownConn) Write(b []byte) (int, error)      { return len(b), nil }
++func (c *profileUnknownConn) Close() error                     { c.closed = true; return nil }
++func (c *profileUnknownConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
++func (c *profileUnknownConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
++func (c *profileUnknownConn) SetDeadline(time.Time) error      { return nil }
++func (c *profileUnknownConn) SetReadDeadline(time.Time) error  { return nil }
++func (c *profileUnknownConn) SetWriteDeadline(time.Time) error { return nil }
++func TestYonikTransportUnknownUDPTypeDeniedWithoutPanic(t *testing.T) {
++	c := &profileUnknownConn{}
++	if _, _, e := PacketConnForTransport(context.Background(), c); e == nil || !c.closed {
++		t.Fatal("unknown UDP connection accepted")
++	}
++}
+diff --git a/transport/internet/system_dialer.go b/transport/internet/system_dialer.go
+--- a/transport/internet/system_dialer.go
++++ b/transport/internet/system_dialer.go
+@@ -257,6 +257,14 @@
+ 
+ // guardedSystemDial закрывает все вызовы effective dialer, включая Happy Eyeballs.
+ func guardedSystemDial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
++	if hooks.ProfileSession(ctx) {
++		if _, ok := effectiveSystemDialer.(*DefaultSystemDialer); !ok {
++			return nil, errors.New("full-profile alternative dialer denied")
++		}
++		return hooks.ProfileDialPhysical(ctx, dest, func(physical context.Context) (net.Conn, error) {
++			return effectiveSystemDialer.Dial(physical, src, dest, sockopt)
++		})
++	}
+ 	if err := hooks.BeforeSocketDial(ctx); err != nil {
+ 		return nil, err
+ 	}
+@@ -268,13 +276,55 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return &ownedFlowConn{Conn: conn, release: release}, nil
++	return &ownedFlowConn{Conn: conn, release: release, ctx: ctx}, nil
+ }
+ 
+ // Close передаёт единственному session handle закрытие underlying connection.
+ type ownedFlowConn struct {
+ 	net.Conn
+ 	release func() error
++	ctx     context.Context
+ }
+ 
+ func (c *ownedFlowConn) Close() error { return c.release() }
++
++func (c *ownedFlowConn) ProfilePacketConn() (net.PacketConn, net.Addr, error) {
++	if c.ctx == nil || hooks.BeforeSocketDial(c.ctx) != nil {
++		return nil, nil, errors.New("UDP owner denied")
++	}
++	raw, ok := c.Conn.(*net.PacketConnWrapper)
++	if !ok {
++		return nil, nil, errors.New("UDP capability unavailable")
++	}
++	return &ownedFlowPacket{owner: c, packet: raw.PacketConn}, raw.RemoteAddr(), nil
++}
++
++type ownedFlowPacket struct {
++	owner  *ownedFlowConn
++	packet net.PacketConn
++}
++
++func (c *ownedFlowPacket) ReadFrom(b []byte) (int, net.Addr, error) {
++	if e := hooks.BeforeSocketDial(c.owner.ctx); e != nil {
++		return 0, nil, e
++	}
++	n, a, e := c.packet.ReadFrom(b)
++	if guard := hooks.BeforeSocketDial(c.owner.ctx); guard != nil {
++		return 0, nil, guard
++	}
++	return n, a, e
++}
++func (c *ownedFlowPacket) WriteTo(b []byte, a net.Addr) (int, error) {
++	if e := hooks.BeforeSocketDial(c.owner.ctx); e != nil {
++		return 0, e
++	}
++	if a == nil || a.String() != c.owner.RemoteAddr().String() {
++		return 0, errors.New("UDP peer mismatch")
++	}
++	return c.packet.WriteTo(b, a)
++}
++func (c *ownedFlowPacket) Close() error                       { return c.owner.Close() }
++func (c *ownedFlowPacket) LocalAddr() net.Addr                { return c.packet.LocalAddr() }
++func (c *ownedFlowPacket) SetDeadline(t time.Time) error      { return c.packet.SetDeadline(t) }
++func (c *ownedFlowPacket) SetReadDeadline(t time.Time) error  { return c.packet.SetReadDeadline(t) }
++func (c *ownedFlowPacket) SetWriteDeadline(t time.Time) error { return c.packet.SetWriteDeadline(t) }
+diff --git a/transport/internet/splithttp/yonik_profile_transport_test.go b/transport/internet/splithttp/yonik_profile_transport_test.go
+new file mode 100644
+--- /dev/null
++++ b/transport/internet/splithttp/yonik_profile_transport_test.go
+@@ -0,0 +1,24 @@
++package splithttp
++
++import (
++	"context"
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++	"testing"
++)
++
++func TestYonikXHTTPCancelBeforeClientAndRequest(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, e := Dial(ctx, net.Destination{}, nil); e == nil {
++		t.Fatal("cancelled grant reached transport factory")
++	}
++	client := &DefaultDialerClient{}
++	if _, _, _, e := client.OpenStream(ctx, "http://invalid", "", nil, false); e == nil {
++		t.Fatal("cancelled stream opened HTTP request")
++	}
++	payload := buf.New()
++	if e := client.PostPacket(ctx, "http://invalid", "", "", buf.MultiBuffer{payload}); e == nil {
++		t.Fatal("cancelled packet created HTTP request")
++	}
++}
+diff --git a/transport/internet/splithttp/mux.go b/transport/internet/splithttp/mux.go
+--- a/transport/internet/splithttp/mux.go
++++ b/transport/internet/splithttp/mux.go
+@@ -3,8 +3,10 @@
+ import (
+ 	"context"
+ 	"crypto/rand"
++	goerrors "errors"
+ 	"math"
+ 	"math/big"
++	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -42,6 +44,8 @@
+ }
+ 
+ type XmuxManager struct {
++	access      sync.Mutex
++	closed      bool
+ 	xmuxConfig  XmuxConfig
+ 	concurrency int32
+ 	connections int32
+@@ -60,8 +64,13 @@
+ }
+ 
+ func (m *XmuxManager) newXmuxClient() *XmuxClient {
++	connection := m.newConnFunc()
++	if connection.IsClosed() {
++		return &XmuxClient{XmuxConn: connection}
++	}
++
+ 	xmuxClient := &XmuxClient{
+-		XmuxConn:  m.newConnFunc(),
++		XmuxConn:  connection,
+ 		leftUsage: -1,
+ 	}
+ 	if x := m.xmuxConfig.GetNormalizedCMaxReuseTimes().rand(); x > 0 {
+@@ -87,6 +96,12 @@
+ }
+ 
+ func (m *XmuxManager) getXmuxClient(ctx context.Context, create bool) *XmuxClient {
++	m.access.Lock()
++	defer m.access.Unlock()
++	if m.closed {
++		return &XmuxClient{XmuxConn: &profileDeniedHTTPClient{err: goerrors.New("XHTTP session closed")}}
++	}
++
+ 	for i := 0; i < len(m.xmuxClients); {
+ 		xmuxClient := m.xmuxClients[i]
+ 		if xmuxClient.XmuxConn.IsClosed() ||
+@@ -145,3 +160,15 @@
+ 	}
+ 	return xmuxClient
+ }
++
++func (m *XmuxManager) Close() error {
++	m.access.Lock()
++	defer m.access.Unlock()
++	m.closed = true
++	var err error
++	for _, c := range m.xmuxClients {
++		err = goerrors.Join(err, common.Close(c.XmuxConn))
++	}
++	m.xmuxClients = nil
++	return err
++}
+diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splithttp/dialer.go
+--- a/transport/internet/splithttp/dialer.go
++++ b/transport/internet/splithttp/dialer.go
+@@ -8,7 +8,6 @@
+ 	"net/http"
+ 	"net/http/httptrace"
+ 	"net/url"
+-	"reflect"
+ 	"runtime"
+ 	"strconv"
+ 	"sync"
+@@ -21,8 +20,8 @@
+ 	"github.com/xtls/xray-core/common/buf"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/common/net/cnc"
+ 	"github.com/xtls/xray-core/common/signal/done"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/transport/internet"
+ 	"github.com/xtls/xray-core/transport/internet/browser_dialer"
+ 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
+@@ -45,6 +44,41 @@
+ )
+ 
+ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
++	pool, e := hooks.ProfileTransportPool(ctx, 3)
++	if e != nil {
++		return &profileDeniedHTTPClient{err: e}, nil
++	}
++	if pool != nil {
++		if browser_dialer.HasBrowserDialer() {
++			return &profileDeniedHTTPClient{err: errors.New("owned browser dialer denied")}, nil
++		}
++		if hooks.ProfileCheckDial(ctx, dest, true) != nil {
++			return &profileDeniedHTTPClient{err: errors.New("XHTTP carrier denied")}, nil
++		}
++		value, e := pool.LoadOrCreate(0, func(physical context.Context) (hooks.ProfileCloser, error) {
++			var config XmuxConfig
++			if c := streamSettings.ProtocolSettings.(*Config).Xmux; c != nil {
++				config = *c
++			}
++			return NewXmuxManager(config, func() XmuxConn {
++				value, e := pool.NewResource(func(physical context.Context, retire func()) (hooks.ProfileCloser, error) {
++					client := createOwnedHTTPClient(pool, dest, streamSettings)
++					client.(*DefaultDialerClient).retire = retire
++					return client.(*DefaultDialerClient), nil
++				})
++				if e != nil {
++					return &profileDeniedHTTPClient{err: e}
++				}
++				return value.(XmuxConn)
++			}), nil
++		})
++		if e != nil {
++			return &profileDeniedHTTPClient{err: e}, nil
++		}
++		client := value.(*XmuxManager).GetXmuxClient(ctx)
++		return client.XmuxConn.(DialerClient), client
++	}
++
+ 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+ 
+ 	if browser_dialer.HasBrowserDialer() && realityConfig == nil {
+@@ -99,6 +133,9 @@
+ }
+ 
+ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStreamConfig) DialerClient {
++	return createOwnedHTTPClient(nil, dest, streamSettings)
++}
++func createOwnedHTTPClient(pool *hooks.ProfilePool, dest net.Destination, streamSettings *internet.MemoryStreamConfig) DialerClient {
+ 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
+ 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+ 
+@@ -116,6 +153,11 @@
+ 	transportConfig := streamSettings.ProtocolSettings.(*Config)
+ 
+ 	dialContext := func(ctxInner context.Context) (net.Conn, error) {
++		var e error
++		ctxInner, e = pool.Context(ctxInner)
++		if e != nil {
++			return nil, e
++		}
+ 		var conn net.Conn
+ 		var err error
+ 		if streamSettings.FinalMask != nil {
+@@ -192,30 +234,24 @@
+ 			QUICConfig:      quicConfig,
+ 			TLSClientConfig: gotlsConfig,
+ 			Dial: func(ctx context.Context, addr string, tlsCfg *gotls.Config, cfg *quic.Config) (*quic.Conn, error) {
+-				var pktConn net.PacketConn
+-				var udpAddr net.Addr
++
++				var err error
++				ctx, err = pool.Context(ctx)
++				if err != nil {
++					return nil, err
++				}
++				var raw net.Conn
+ 				if streamSettings.FinalMask != nil {
+-					conn, err := streamSettings.FinalMask.DialUDP(ctx, dest)
+-					if err != nil {
+-						return nil, errors.New("failed to dial to dest").Base(err)
+-					}
+-					pktConn = conn.(*net.PacketConnWrapper).PacketConn
+-					udpAddr = conn.RemoteAddr()
++					raw, err = streamSettings.FinalMask.DialUDP(ctx, dest)
+ 				} else {
+-					conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+-					if err != nil {
+-						return nil, errors.New("failed to dial to dest").Base(err)
+-					}
+-					switch c := conn.(type) {
+-					case *net.PacketConnWrapper:
+-						pktConn = c.PacketConn
+-						udpAddr = c.RemoteAddr()
+-					case *cnc.Connection:
+-						pktConn = &internet.FakePacketConn{Conn: c}
+-						udpAddr = &net.UDPAddr{IP: []byte{0, 0, 0, 0}}
+-					default:
+-						panic(reflect.TypeOf(c))
+-					}
++					raw, err = internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
++				}
++				if err != nil {
++					return nil, err
++				}
++				pktConn, udpAddr, err := internet.PacketConnForTransport(ctx, raw)
++				if err != nil {
++					return nil, err
+ 				}
+ 
+ 				tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO}
+@@ -274,6 +310,7 @@
+ 	}
+ 
+ 	client := &DefaultDialerClient{
++		profile:         pool,
+ 		transportConfig: transportConfig,
+ 		client: &http.Client{
+ 			Transport: transport,
+@@ -291,6 +328,13 @@
+ }
+ 
+ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
++	if hooks.ProfileSession(ctx) && browser_dialer.HasBrowserDialer() {
++		return nil, errors.New("owned browser dialer denied")
++	}
++	if e := hooks.ProfileLogicalGate(ctx); e != nil {
++		return nil, e
++	}
++
+ 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
+ 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+ 
+@@ -328,6 +372,9 @@
+ 	requestURL.RawQuery = transportConfiguration.GetNormalizedQuery()
+ 
+ 	httpClient, xmuxClient := getHTTPClient(ctx, dest, streamSettings)
++	if denied, ok := httpClient.(*profileDeniedHTTPClient); ok {
++		return nil, denied.err
++	}
+ 
+ 	mode := transportConfiguration.Mode
+ 	if mode == "" || mode == "auto" {
+@@ -392,6 +439,9 @@
+ 		requestURL2.Path = config2.GetNormalizedPath()
+ 		requestURL2.RawQuery = config2.GetNormalizedQuery()
+ 		httpClient2, xmuxClient2 = getHTTPClient(ctx, dest2, memory2)
++		if denied, ok := httpClient2.(*profileDeniedHTTPClient); ok {
++			return nil, denied.err
++		}
+ 		errors.LogInfo(ctx, fmt.Sprintf("XHTTP is downloading from %s, mode %s, HTTP version %s, host %s", dest2, "stream-down", httpVersion2, requestURL2.Host))
+ 	}
+ 
+@@ -429,7 +479,7 @@
+ 		if err != nil { // browser dialer only
+ 			return nil, err
+ 		}
+-		return stat.Connection(&conn), nil
++		return hooks.ProfileGuardConnection(ctx, &conn)
+ 	} else { // stream-down
+ 		if xmuxClient2 != nil {
+ 			xmuxClient2.LeftRequests.Add(-1)
+@@ -447,7 +497,7 @@
+ 		if err != nil { // browser dialer only
+ 			return nil, err
+ 		}
+-		return stat.Connection(&conn), nil
++		return hooks.ProfileGuardConnection(ctx, &conn)
+ 	}
+ 
+ 	scMaxEachPostBytes := transportConfiguration.GetNormalizedScMaxEachPostBytes()
+@@ -537,7 +587,7 @@
+ 		}
+ 	}()
+ 
+-	return stat.Connection(&conn), nil
++	return hooks.ProfileGuardConnection(ctx, &conn)
+ }
+ 
+ // A wrapper around pipe that ensures the size limit is exactly honored.
+diff --git a/transport/internet/splithttp/client.go b/transport/internet/splithttp/client.go
+--- a/transport/internet/splithttp/client.go
++++ b/transport/internet/splithttp/client.go
+@@ -16,6 +16,7 @@
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/signal/done"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ )
+ 
+ // interface to abstract between use of browser dialer, vs net/http
+@@ -31,6 +32,10 @@
+ 
+ // implements splithttp.DialerClient in terms of direct network connections
+ type DefaultDialerClient struct {
++	profile         *hooks.ProfilePool
++	retire          func()
++	closeOnce       sync.Once
++	closeError      error
+ 	transportConfig *Config
+ 	client          *http.Client
+ 	closed          atomic.Bool
+@@ -45,6 +50,10 @@
+ }
+ 
+ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
++	if err = c.profileGate(ctx); err != nil {
++		return
++	}
++
+ 	// this is done when the TCP/UDP connection to the server was established,
+ 	// and we can unblock the Dial function and print correct net addresses in
+ 	// logs
+@@ -61,7 +70,7 @@
+ 	if body != nil {
+ 		method = c.transportConfig.GetNormalizedUplinkHTTPMethod() // stream-up/one
+ 	}
+-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
++	req, err := http.NewRequestWithContext(profileRequestContext(ctx), method, url, body)
+ 	if err != nil {
+ 		errors.LogInfoInner(ctx, err, "failed to create HTTP request for "+url)
+ 		return nil, nil, nil, err
+@@ -72,7 +81,7 @@
+ 	go func() {
+ 		resp, err := c.client.Do(req)
+ 		if err != nil {
+-			if !uploadOnly { // stream-down is enough
++			if !uploadOnly && ctx.Err() == nil { // stream-down is enough
+ 				c.closed.Store(true)
+ 				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
+ 			}
+@@ -99,8 +108,13 @@
+ }
+ 
+ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessionId string, seqStr string, payload buf.MultiBuffer) error {
++	if e := c.profileGate(ctx); e != nil {
++		buf.ReleaseMulti(payload)
++		return e
++	}
++
+ 	method := c.transportConfig.GetNormalizedUplinkHTTPMethod()
+-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, nil)
++	req, err := http.NewRequestWithContext(profileRequestContext(ctx), method, url, nil)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -109,7 +123,9 @@
+ 	if c.httpVersion != "1.1" {
+ 		resp, err := c.client.Do(req)
+ 		if err != nil {
+-			c.closed.Store(true)
++			if ctx.Err() == nil {
++				c.closed.Store(true)
++			}
+ 			return err
+ 		}
+ 
+@@ -132,10 +148,13 @@
+ 		var h1UploadConn *H1Conn
+ 
+ 		for {
++			if e := c.profileGate(ctx); e != nil {
++				return e
++			}
+ 			uploadConn = c.uploadRawPool.Get()
+ 			newConnection := uploadConn == nil
+ 			if newConnection {
+-				newConn, err := c.dialUploadConn(context.WithoutCancel(ctx))
++				newConn, err := c.dialUploadConn(profileRequestContext(ctx))
+ 				if err != nil {
+ 					return err
+ 				}
+@@ -180,11 +199,53 @@
+ 
+ // HTTP/1.1 and HTTP/2 will close itself, we only handle HTTP/3 here
+ func (c *DefaultDialerClient) Close() error {
+-	transport := c.client.Transport
+-	if h3Transport, ok := transport.(*http3.Transport); ok {
+-		h3Transport.Close()
++	c.closeOnce.Do(func() {
++		c.closed.Store(true)
++		transport := c.client.Transport
++		if h3, ok := transport.(*http3.Transport); ok {
++			c.closeError = h3.Close()
++		}
++		if idle, ok := transport.(interface{ CloseIdleConnections() }); ok {
++			idle.CloseIdleConnections()
++		}
++		if c.retire != nil {
++			c.retire()
++		}
++	})
++	return c.closeError
++}
++func (c *DefaultDialerClient) profileGate(ctx context.Context) error {
++	if e := hooks.ProfileLogicalGate(ctx); e != nil {
++		return e
++	}
++	if c.profile != nil {
++		pool, e := hooks.ProfileTransportPool(ctx, 3)
++		if e != nil {
++			return e
++		}
++		if pool != c.profile {
++			return errors.New("XHTTP pool identity mismatch")
++		}
+ 	}
+ 	return nil
++}
++func profileRequestContext(ctx context.Context) context.Context {
++	if hooks.ProfileSession(ctx) {
++		return ctx
++	}
++	return context.WithoutCancel(ctx)
++}
++
++type profileDeniedHTTPClient struct{ err error }
++
++func (c *profileDeniedHTTPClient) IsClosed() bool { return true }
++func (c *profileDeniedHTTPClient) Close() error   { return nil }
++func (c *profileDeniedHTTPClient) OpenStream(context.Context, string, string, io.Reader, bool) (io.ReadCloser, net.Addr, net.Addr, error) {
++	return nil, nil, nil, c.err
++}
++func (c *profileDeniedHTTPClient) PostPacket(_ context.Context, _ string, _ string, _ string, b buf.MultiBuffer) error {
++	buf.ReleaseMulti(b)
++	return c.err
+ }
+ 
+ type WaitReadCloser struct {
+diff --git a/transport/internet/memory_settings.go b/transport/internet/memory_settings.go
+--- a/transport/internet/memory_settings.go
++++ b/transport/internet/memory_settings.go
+@@ -2,11 +2,12 @@
+ 
+ import (
+ 	"context"
+-	"reflect"
+ 
+ 	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/net/cnc"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/transport/internet/finalmask"
+ )
+ 
+@@ -71,6 +72,9 @@
+ 			return DialSystem(ctx, dest, mss.SocketSettings)
+ 		}
+ 		listen := func(ctx context.Context, addr net.Addr) (net.Listener, error) {
++			if hooks.ProfileSession(ctx) {
++				return nil, hooks.ErrDenied
++			}
+ 			return ListenSystem(ctx, addr, mss.SocketSettings)
+ 		}
+ 		dialUDP := func(ctx context.Context, dest net.Destination) (net.PacketConn, net.Addr, error) {
+@@ -78,21 +82,12 @@
+ 			if err != nil {
+ 				return nil, nil, err
+ 			}
+-			var newConn net.PacketConn
+-			var udpAddr net.Addr
+-			switch c := conn.(type) {
+-			case *net.PacketConnWrapper:
+-				newConn = c.PacketConn
+-				udpAddr = conn.RemoteAddr()
+-			case *cnc.Connection:
+-				newConn = &FakePacketConn{Conn: c}
+-				udpAddr = &net.UDPAddr{IP: []byte{0, 0, 0, 0}, Port: 0}
+-			default:
+-				panic(reflect.TypeOf(c))
+-			}
+-			return newConn, udpAddr, nil
++			return PacketConnForTransport(ctx, conn)
+ 		}
+ 		listenPacket := func(ctx context.Context, addr net.Addr) (net.PacketConn, error) {
++			if hooks.ProfileSession(ctx) {
++				return nil, hooks.ErrDenied
++			}
+ 			return ListenSystemPacket(ctx, addr, mss.SocketSettings)
+ 		}
+ 		mss.FinalMask = finalmask.NewFinalMask(tcpMasks, udpMasks, dialTCP, listen, dialUDP, listenPacket)
+@@ -104,3 +99,28 @@
+ 
+ 	return mss, nil
+ }
++
++// Full-profile принимает только capability, сохраняющую guarded ownership.
++// Unknown connection не unwrap-ится и не вызывает panic.
++func PacketConnForTransport(ctx context.Context, conn net.Conn) (net.PacketConn, net.Addr, error) {
++	if pkt, addr, e := hooks.ProfilePacketCapability(conn); e == nil {
++		return pkt, addr, nil
++	}
++	if hooks.ProfileSession(ctx) {
++		if pkt, addr, e := hooks.ProfileGuardPacketView(ctx, conn); e == nil {
++			return pkt, addr, nil
++		}
++	}
++	if !hooks.ProfileSession(ctx) {
++		switch c := conn.(type) {
++		case *net.PacketConnWrapper:
++			return c.PacketConn, c.RemoteAddr(), nil
++		case *cnc.Connection:
++			return &FakePacketConn{Conn: c}, &net.UDPAddr{IP: []byte{0, 0, 0, 0}}, nil
++		}
++	}
++	if conn != nil {
++		conn.Close()
++	}
++	return nil, nil, errors.New("guarded UDP capability unavailable")
++}
+diff --git a/transport/internet/hysteria/yonik_profile_transport_test.go b/transport/internet/hysteria/yonik_profile_transport_test.go
+new file mode 100644
+--- /dev/null
++++ b/transport/internet/hysteria/yonik_profile_transport_test.go
+@@ -0,0 +1,15 @@
++package hysteria
++
++import (
++	"context"
++	"testing"
++)
++
++func TestYonikHysteriaCancelBeforeQUICFactory(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	c := &client{}
++	if e := c.dial(ctx); e == nil {
++		t.Fatal("cancelled grant reached QUIC factory")
++	}
++}
+diff --git a/transport/internet/hysteria/dialer.go b/transport/internet/hysteria/dialer.go
+--- a/transport/internet/hysteria/dialer.go
++++ b/transport/internet/hysteria/dialer.go
+@@ -5,7 +5,6 @@
+ 	gotls "crypto/tls"
+ 	"net/http"
+ 	"net/url"
+-	"reflect"
+ 	"runtime"
+ 	"strconv"
+ 	"sync"
+@@ -16,7 +15,7 @@
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/common/net/cnc"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/transport/internet"
+ 	"github.com/xtls/xray-core/transport/internet/finalmask"
+@@ -27,6 +26,7 @@
+ )
+ 
+ type client struct {
++	profile      *hooks.ProfilePool
+ 	lock         chan struct{}
+ 	instance     *core.Instance
+ 	forced       bool
+@@ -66,6 +66,16 @@
+ }
+ 
+ func (c *client) dial(ctx context.Context) error {
++	if e := hooks.ProfileLogicalGate(ctx); e != nil {
++		return e
++	}
++	if c.profile != nil {
++		var e error
++		ctx, e = c.profile.Context(ctx)
++		if e != nil {
++			return e
++		}
++	}
+ 	if c.forced {
+ 		return errors.New("client is closed")
+ 	}
+@@ -117,30 +127,19 @@
+ 	// 	quicConfig.KeepAlivePeriod = 10 * time.Second
+ 	// }
+ 
+-	var pktConn net.PacketConn
+-	var udpAddr net.Addr
++	var raw net.Conn
++	var err error
+ 	if c.finalMask != nil {
+-		conn, err := c.finalMask.DialUDP(ctx, c.dest)
+-		if err != nil {
+-			return errors.New("failed to dial to dest").Base(err)
+-		}
+-		pktConn = conn.(*net.PacketConnWrapper).PacketConn
+-		udpAddr = conn.RemoteAddr()
++		raw, err = c.finalMask.DialUDP(ctx, c.dest)
+ 	} else {
+-		conn, err := internet.DialSystem(ctx, c.dest, c.socketConfig)
+-		if err != nil {
+-			return errors.New("failed to dial to dest").Base(err)
+-		}
+-		switch c := conn.(type) {
+-		case *net.PacketConnWrapper:
+-			pktConn = c.PacketConn
+-			udpAddr = c.RemoteAddr()
+-		case *cnc.Connection:
+-			pktConn = &internet.FakePacketConn{Conn: c}
+-			udpAddr = &net.UDPAddr{IP: []byte{0, 0, 0, 0}}
+-		default:
+-			panic(reflect.TypeOf(c))
+-		}
++		raw, err = internet.DialSystem(ctx, c.dest, c.socketConfig)
++	}
++	if err != nil {
++		return err
++	}
++	pktConn, udpAddr, err := internet.PacketConnForTransport(ctx, raw)
++	if err != nil {
++		return err
+ 	}
+ 
+ 	tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO}
+@@ -241,7 +240,18 @@
+ 		defer c.unlock()
+ 	}
+ 
+-	err := c.dial(ctx)
++	physical := ctx
++	if c.profile != nil {
++		var e error
++		physical, e = c.profile.SessionContext()
++		if e != nil {
++			return nil, e
++		}
++	}
++	err := c.dial(physical)
++	if err == nil {
++		err = hooks.ProfileLogicalGate(ctx)
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -269,7 +279,18 @@
+ 		defer c.unlock()
+ 	}
+ 
+-	err := c.dial(ctx)
++	physical := ctx
++	if c.profile != nil {
++		var e error
++		physical, e = c.profile.SessionContext()
++		if e != nil {
++			return nil, e
++		}
++	}
++	err := c.dial(physical)
++	if err == nil {
++		err = hooks.ProfileLogicalGate(ctx)
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -332,6 +353,35 @@
+ 
+ 	datagram := DatagramFromContext(ctx)
+ 	dest.Network = net.Network_UDP
++	pool, e := hooks.ProfileTransportPool(ctx, 4)
++	if e != nil {
++		return nil, e
++	}
++	if pool != nil {
++		value, e := pool.LoadOrCreate(0, func(physical context.Context) (hooks.ProfileCloser, error) {
++			return &client{profile: pool, lock: make(chan struct{}, 1), dest: dest, config: streamSettings.ProtocolSettings.(*Config), tlsConfig: tlsConfig.GetTLSConfig(tls.WithDestination(dest)), socketConfig: streamSettings.SocketSettings, finalMask: streamSettings.FinalMask, quicParams: streamSettings.QuicParams}, nil
++		})
++		if e != nil {
++			return nil, e
++		}
++		owned := value.(*client)
++		if hooks.ProfileLogicalGate(ctx) != nil {
++			return nil, errors.New("logical grant denied")
++		}
++		var conn stat.Connection
++		if datagram {
++			conn, e = owned.udp(ctx)
++		} else {
++			conn, e = owned.tcp(ctx)
++		}
++		if e != nil {
++			return nil, e
++		}
++		if e = hooks.ProfileAttachLogical(ctx, conn); e != nil {
++			return nil, e
++		}
++		return conn, nil
++	}
+ 
+ 	initmanager.Do(func() {
+ 		manager = &clientManager{
+@@ -374,3 +424,5 @@
+ func init() {
+ 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
+ }
++
++func (c *client) Close() error { c.clean(true); return nil }
+diff --git a/transport/internet/grpc/yonik_profile_transport_test.go b/transport/internet/grpc/yonik_profile_transport_test.go
+new file mode 100644
+--- /dev/null
++++ b/transport/internet/grpc/yonik_profile_transport_test.go
+@@ -0,0 +1,15 @@
++package grpc
++
++import (
++	"context"
++	"github.com/xtls/xray-core/common/net"
++	"testing"
++)
++
++func TestYonikGRPCCancelBeforeClientFactory(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, e := Dial(ctx, net.Destination{}, nil); e == nil {
++		t.Fatal("cancelled callback reached client factory")
++	}
++}
+diff --git a/transport/internet/grpc/dial.go b/transport/internet/grpc/dial.go
+--- a/transport/internet/grpc/dial.go
++++ b/transport/internet/grpc/dial.go
+@@ -12,6 +12,7 @@
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/common/utils"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/transport/internet"
+ 	"github.com/xtls/xray-core/transport/internet/grpc/encoding"
+ 	"github.com/xtls/xray-core/transport/internet/reality"
+@@ -25,13 +26,20 @@
+ )
+ 
+ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
++	if e := hooks.ProfileLogicalGate(ctx); e != nil {
++		return nil, e
++	}
+ 	errors.LogInfo(ctx, "creating connection to ", dest)
+ 
+ 	conn, err := dialgRPC(ctx, dest, streamSettings)
+ 	if err != nil {
+ 		return nil, errors.New("failed to dial gRPC").Base(err)
+ 	}
+-	return stat.Connection(conn), nil
++	checked, e := hooks.ProfileGuardConnection(ctx, conn)
++	if e != nil {
++		return nil, e
++	}
++	return stat.Connection(checked), nil
+ }
+ 
+ func init() {
+@@ -56,38 +64,60 @@
+ 		return nil, errors.New("Cannot dial gRPC").Base(err)
+ 	}
+ 	client := encoding.NewGRPCServiceClient(conn)
++	ctx, cancel := context.WithCancel(ctx)
+ 	if grpcSettings.MultiMode {
+ 		errors.LogDebug(ctx, "using gRPC multi mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunMultiStreamName()+"`")
+ 		grpcService, err := client.(encoding.GRPCServiceClientX).TunMultiCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName())
+ 		if err != nil {
++			cancel()
+ 			return nil, errors.New("Cannot dial gRPC").Base(err)
+ 		}
+-		return encoding.NewMultiHunkConn(grpcService, nil, nil), nil
++		return encoding.NewMultiHunkConn(grpcService, cancel, nil), nil
+ 	}
+ 
+ 	errors.LogDebug(ctx, "using gRPC tun mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunStreamName()+"`")
+ 	grpcService, err := client.(encoding.GRPCServiceClientX).TunCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunStreamName())
+ 	if err != nil {
++		cancel()
+ 		return nil, errors.New("Cannot dial gRPC").Base(err)
+ 	}
+ 
+-	return encoding.NewHunkConn(grpcService, nil, nil), nil
+-}
+-
+-func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
++	return encoding.NewHunkConn(grpcService, cancel, nil), nil
++}
++
++func getGrpcClient(ctx context.Context, dest net.Destination, settings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
++	pool, e := hooks.ProfileTransportPool(ctx, 2)
++	if e != nil {
++		return nil, e
++	}
++	if pool != nil {
++		value, e := pool.LoadOrCreate(0, func(physical context.Context) (hooks.ProfileCloser, error) {
++			return newGrpcClient(physical, dest, settings)
++		})
++		if e != nil {
++			return nil, e
++		}
++		return value.(*grpc.ClientConn), nil
++	}
+ 	globalDialerAccess.Lock()
+ 	defer globalDialerAccess.Unlock()
+-
+ 	if globalDialerMap == nil {
+ 		globalDialerMap = make(map[dialerConf]*grpc.ClientConn)
+ 	}
++	key := dialerConf{dest, settings}
++	if client := globalDialerMap[key]; client != nil && client.GetState() != connectivity.Shutdown {
++		return client, nil
++	}
++	client, e := newGrpcClient(ctx, dest, settings)
++	if e == nil {
++		globalDialerMap[key] = client
++	}
++	return client, e
++}
++func newGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
+ 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
+ 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
+ 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
+-
+-	if client, found := globalDialerMap[dialerConf{dest, streamSettings}]; found && client.GetState() != connectivity.Shutdown {
+-		return client, nil
+-	}
+ 
+ 	dialOptions := []grpc.DialOption{
+ 		grpc.WithConnectParams(grpc.ConnectParams{
+@@ -119,6 +149,14 @@
+ 			}
+ 			address := net.ParseAddress(rawHost)
+ 
++			pool, e := hooks.ProfileTransportPool(ctx, 2)
++			if e != nil {
++				return nil, e
++			}
++			gctx, e = pool.Context(gctx)
++			if e != nil {
++				return nil, e
++			}
+ 			gctx = c.ContextWithID(gctx, c.IDFromContext(ctx))
+ 			gctx = session.ContextWithOutbounds(gctx, session.OutboundsFromContext(ctx))
+ 			gctx = session.ContextWithTimeoutOnly(gctx, true)
+@@ -197,7 +235,6 @@
+ 		setUserAgent(conn, userAgent)
+ 		conn.Connect()
+ 	}
+-	globalDialerMap[dialerConf{dest, streamSettings}] = conn
+ 	return conn, err
+ }
+ 
+diff --git a/common/yonikbroker/profile_transport_other.go b/common/yonikbroker/profile_transport_other.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_transport_other.go
+@@ -0,0 +1,36 @@
++//go:build !linux
++
++package nativehooks
++
++import (
++	"context"
++	xnet "github.com/xtls/xray-core/common/net"
++	"io"
++	"net"
++)
++
++type ProfileCloser = io.Closer
++type ProfilePool struct{}
++
++func ProfileTransportPool(context.Context, byte) (*ProfilePool, error)    { return nil, nil }
++func (*ProfilePool) Key() [32]byte                                        { return [32]byte{} }
++func (*ProfilePool) Context(ctx context.Context) (context.Context, error) { return ctx, nil }
++func (*ProfilePool) SessionContext() (context.Context, error)             { return nil, errProfile }
++func (*ProfilePool) LoadOrCreate(int, func(context.Context) (ProfileCloser, error)) (ProfileCloser, error) {
++	return nil, errProfile
++}
++func ProfileLogicalGate(context.Context) error  { return nil }
++func ProfilePhysicalGate(context.Context) error { return errProfile }
++func ProfileDialPhysical(context.Context, xnet.Destination, func(context.Context) (net.Conn, error)) (net.Conn, error) {
++	return nil, errProfile
++}
++func ProfilePacketCapability(net.Conn) (net.PacketConn, net.Addr, error)     { return nil, nil, errProfile }
++func ProfileGuardConnection(_ context.Context, c net.Conn) (net.Conn, error) { return c, nil }
++func ProfileAttachLogical(context.Context, io.Closer) error                  { return nil }
++func (*ProfilePool) NewResource(func(context.Context, func()) (ProfileCloser, error)) (ProfileCloser, error) {
++	return nil, errProfile
++}
++func ProfileGuardPacketView(context.Context, net.Conn) (net.PacketConn, net.Addr, error) {
++	return nil, nil, errProfile
++}
++func ProfileCheckTransport(context.Context, byte) error { return nil }
+diff --git a/common/yonikbroker/profile_transport_linux_test.go b/common/yonikbroker/profile_transport_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_transport_linux_test.go
+@@ -0,0 +1,304 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	_ "embed"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++//go:embed profile-original-flow-v3.json
++var profileOriginalFlowV3 []byte
++
++func TestProfileOriginalFlowCrossLanguageInitiatorOrientation(t *testing.T) {
++	var v struct {
++		Rows []struct {
++			Name  string `json:"name"`
++			Tuple string `json:"tupleHex"`
++		}
++	}
++	if e := json.Unmarshal(profileOriginalFlowV3, &v); e != nil {
++		t.Fatal(e)
++	}
++	f := newFlowFixture(t, 2)
++	rows := f.c.manifest.rows
++	be.PutUint16(rows[6][0][2:], 1080)
++	f.installManifest(t, rows)
++	defer f.serve(t)()
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	tcp := &flowFakeConn{local: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1080}, remote: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 12000}}
++	accepted, e := ProfileAccept(ctx, tcp, "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	first, release, e := ProfileOpenOriginal(accepted, xnet.TCPDestination(xnet.DomainAddress("one.invalid"), 443))
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	udp := &flowFakeConn{local: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 49152}, remote: &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 12001}}
++	association, e := ProfileAssociateUDP(accepted, udp)
++	if e != nil {
++		t.Fatal(e)
++	}
++	second, _, e := ProfileOpenOriginal(association, xnet.UDPDestination(xnet.DomainAddress("two.invalid"), 443))
++	if e != nil {
++		t.Fatal(e)
++	}
++	for i, flow := range []context.Context{first, second} {
++		r := profileReceiptFrom(flow)
++		if hex.EncodeToString(r.tuple[:]) != v.Rows[i].Tuple {
++			t.Fatal("tuple orientation mismatch", v.Rows[i].Name)
++		}
++	}
++	if profileReceiptFrom(first).tuple == profileReceiptFrom(second).tuple {
++		t.Fatal("TCP owner promoted to UDP")
++	}
++}
++
++type profilePureClose struct{ count atomic.Int32 }
++
++func (c *profilePureClose) Close() error { c.count.Add(1); return nil }
++
++func TestProfileTransportPoolIsolationAndSessionOwnership(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	r := f.admittedReceipt(t, "same.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileGrantKey{}, g)
++	pool, e := ProfileTransportPool(ctx, 0)
++	if e != nil {
++		t.Fatal(e)
++	}
++	resource := &profilePureClose{}
++	if _, e = pool.LoadOrCreate(0, func(context.Context) (ProfileCloser, error) { return resource, nil }); e != nil {
++		t.Fatal(e)
++	}
++	r2 := f.admittedReceipt(t, "same.invalid")
++	g2 := f.granted(t, r2)
++	ctx2 := context.WithValue(context.WithValue(g2.ctx, profileContextKey{}, f.p), profileGrantKey{}, g2)
++	other, e := ProfileTransportPool(ctx2, 0)
++	if e != nil || pool != other {
++		t.Fatal("identical live scope did not share", e)
++	}
++	f.c.mu.Lock()
++	f.c.closeReceipt(r)
++	f.c.mu.Unlock()
++	if _, e = pool.Context(context.Background()); e != nil || resource.count.Load() != 0 {
++		t.Fatal("one consumer killed shared transport", e)
++	}
++	if _, e = ProfileTransportPool(ctx, 0); e == nil {
++		t.Fatal("cancelled logical reused pool")
++	}
++	f.p.cancel()
++	if _, e = pool.Context(context.Background()); e == nil {
++		t.Fatal("session revoke reused pool")
++	}
++	pool.state.close()
++	if resource.count.Load() != 1 {
++		t.Fatal("physical ownership close", resource.count.Load())
++	}
++}
++
++type profilePurePacket struct {
++	writes, closes atomic.Int32
++	peer           net.Addr
++}
++
++func (c *profilePurePacket) ReadFrom(b []byte) (int, net.Addr, error) {
++	copy(b, "ok")
++	return 2, c.peer, nil
++}
++func (c *profilePurePacket) WriteTo(b []byte, _ net.Addr) (int, error) {
++	c.writes.Add(1)
++	return len(b), nil
++}
++func (c *profilePurePacket) Close() error { c.closes.Add(1); return nil }
++func (c *profilePurePacket) LocalAddr() net.Addr {
++	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
++}
++func (c *profilePurePacket) SetDeadline(time.Time) error      { return nil }
++func (c *profilePurePacket) SetReadDeadline(time.Time) error  { return nil }
++func (c *profilePurePacket) SetWriteDeadline(time.Time) error { return nil }
++
++func TestProfilePhysicalUDPCapabilityKeepsPeerAndSessionFence(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	rows := f.c.manifest.rows
++	rows[3][0][0] = 4
++	rows[8][0][5] = 17
++	f.installManifest(t, rows)
++	r := f.admittedReceipt(t, "udp.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileGrantKey{}, g)
++	peer := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 443}
++	raw := &profilePurePacket{peer: peer}
++	conn, e := ProfileDialPhysical(ctx, xnet.DestinationFromAddr(peer), func(context.Context) (net.Conn, error) {
++		return &xnet.PacketConnWrapper{PacketConn: raw, Dest: peer}, nil
++	})
++	if e != nil {
++		t.Fatal(e)
++	}
++	packet, actual, e := ProfilePacketCapability(conn)
++	if e != nil || packet == raw || actual.String() != peer.String() {
++		t.Fatal("UDP guard escaped", e)
++	}
++	if _, e = packet.WriteTo([]byte("ok"), peer); e != nil {
++		t.Fatal(e)
++	}
++	if _, e = packet.WriteTo([]byte("bad"), &net.UDPAddr{IP: net.IPv4(203, 0, 113, 10), Port: 443}); e == nil || raw.writes.Load() != 1 {
++		t.Fatal("arbitrary datagram escaped")
++	}
++	f.c.mu.Lock()
++	f.c.closeReceipt(r)
++	f.c.mu.Unlock()
++	if raw.closes.Load() != 0 {
++		t.Fatal("logical cancel closed shared socket")
++	}
++	f.p.cancel()
++	f.p.closeTransports()
++	if _, e = packet.WriteTo([]byte("late"), peer); e == nil || raw.writes.Load() != 1 || raw.closes.Load() != 1 {
++		t.Fatal("session revoke failed")
++	}
++}
++
++func TestProfileTransportPoolIdentityCapsAndCallbackDeadline(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	r := f.admittedReceipt(t, "one.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileGrantKey{}, g)
++	pool, e := ProfileTransportPool(ctx, 1)
++	if e != nil {
++		t.Fatal(e)
++	}
++	forged := &ProfilePool{}
++	if _, e = forged.Context(ctx); e == nil {
++		t.Fatal("zero pool became authority")
++	}
++	copyPool := *pool
++	if _, e = copyPool.Context(ctx); e == nil {
++		t.Fatal("copied pool became authority")
++	}
++	foreign := newFlowFixture(t, 1)
++	if _, e = pool.Context(context.WithValue(foreign.p.ctx, profileContextKey{}, foreign.p)); e == nil {
++		t.Fatal("foreign callback accepted")
++	}
++	if _, e = ProfileTransportPool(ctx, 4); e == nil {
++		t.Fatal("typed transport mismatch")
++	}
++	alternate := context.WithValue(ctx, profilePathKey{}, [32]byte{1})
++	g.ctx = alternate
++	other, e := ProfileTransportPool(alternate, 1)
++	if e != nil || pool.Key() == other.Key() {
++		t.Fatal("chain path omitted", e)
++	}
++	g.ctx = ctx
++	cb, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
++	defer cancel()
++	handoff, e := pool.Context(cb)
++	if e != nil {
++		t.Fatal(e)
++	}
++	a, _ := cb.Deadline()
++	b, _ := handoff.Deadline()
++	if a != b {
++		t.Fatal("callback deadline lost")
++	}
++	cancel()
++	if handoff.Err() == nil {
++		t.Fatal("callback cancellation lost")
++	}
++	f.c.manifest.caps[2] = 1
++	calls := 0
++	if _, e = pool.NewResource(func(context.Context, func()) (ProfileCloser, error) { calls++; return &profilePureClose{}, nil }); e != nil {
++		t.Fatal(e)
++	}
++	allocations := testing.AllocsPerRun(20, func() {
++		if _, e = pool.NewResource(func(context.Context, func()) (ProfileCloser, error) { calls++; return nil, nil }); e == nil {
++			t.Fatal("object cap")
++		}
++	})
++	if calls != 1 || allocations != 0 {
++		t.Fatal("overflow before allocation", calls, allocations)
++	}
++}
++
++type profileErrorConn struct {
++	flowFakeConn
++	count int
++}
++
++func (c *profileErrorConn) Close() error { c.count++; return errors.New("unknown socket cleanup") }
++func TestProfilePhysicalUnknownCleanupRetainsCustody(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	r := f.admittedReceipt(t, "one.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileGrantKey{}, g)
++	socket := &profileErrorConn{flowFakeConn: *fakeTCPFlowConn()}
++	dest := xnet.TCPDestination(xnet.IPAddress(net.IPv4(203, 0, 113, 9)), 443)
++	if _, e := ProfileDialPhysical(ctx, dest, func(context.Context) (net.Conn, error) {
++		f.c.mu.Lock()
++		f.c.closeReceipt(r)
++		f.c.mu.Unlock()
++		return socket, nil
++	}); e == nil {
++		t.Fatal("late socket published")
++	}
++	if e := f.p.closeTransports(); e == nil || socket.count != 1 {
++		t.Fatal("Unknown erased or close retried", e, socket.count)
++	}
++	state := f.p.transports
++	retained := false
++	for _, s := range state.sockets {
++		if s != nil {
++			retained = true
++		}
++	}
++	if !retained || f.p.ctx.Err() == nil {
++		t.Fatal("lost Unknown custody/fence")
++	}
++}
++
++func TestProfilePhysicalFactoryRejectsBeforeRunnerAndFencesPublication(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	r := f.admittedReceipt(t, "one.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileGrantKey{}, g)
++	target := xnet.TCPDestination(xnet.IPAddress(net.IPv4(203, 0, 113, 9)), 443)
++	calls := 0
++	runner := func(context.Context) (net.Conn, error) { calls++; return fakeTCPFlowConn(), nil }
++	if _, e := ProfileDialPhysical(ctx, xnet.TCPDestination(xnet.DomainAddress("pinned.invalid"), 443), runner); !errors.Is(e, ErrProfileUnsupported) || calls != 0 {
++		t.Fatal("live resolver fallback", e, calls)
++	}
++	if _, e := ProfileDialPhysical(context.WithValue(f.p.ctx, profileContextKey{}, f.p), target, runner); e == nil || calls != 0 {
++		t.Fatal("session credential opened socket")
++	}
++	socket := fakeTCPFlowConn()
++	runner = func(context.Context) (net.Conn, error) {
++		calls++
++		f.c.mu.Lock()
++		f.c.closeReceipt(r)
++		f.c.mu.Unlock()
++		return socket, nil
++	}
++	if _, e := ProfileDialPhysical(ctx, target, runner); e == nil || !socket.closed || calls != 1 {
++		t.Fatal("late cancelled socket publication")
++	}
++}
++
++func TestProfileTransportChainPoolRequiresEveryHopGrant(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "hysteria")
++	r := f.admittedReceipt(t, "one.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileGrantKey{}, g)
++	if _, e := ProfileTransportPool(ctx, 4); !errors.Is(e, ErrProfileUnsupported) {
++		t.Fatal("source grant became pooled chain authority", e)
++	}
++}
+diff --git a/common/yonikbroker/profile_transport_linux.go b/common/yonikbroker/profile_transport_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_transport_linux.go
+@@ -0,0 +1,741 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"crypto/sha256"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"io"
++	"net"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++type ProfileCloser = io.Closer
++type profilePoolContextKey struct{}
++type profilePathKey struct{}
++
++// Key не credential. Создать usable pool может только live private FlowGrant.
++type ProfilePool struct {
++	state    *profileTransportState
++	key      [32]byte
++	scope    uint16
++	branch   byte
++	endpoint profileDestinationValue
++	values   [2]io.Closer
++}
++type profileTransportState struct {
++	mu            sync.Mutex
++	runtime       *ProfileRuntime
++	pools         [128]*ProfilePool
++	sockets       [128]*profilePhysicalConn
++	objects       [128]io.Closer
++	objectPending int
++	pending       int
++	closed        bool
++	done          chan struct{}
++	closeError    error
++}
++
++func (s *profileTransportState) live() bool {
++	c := s.runtime.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return !s.closed && s.closeError == nil && s.runtime.ctx.Err() == nil && c.live()
++}
++func (s *profileTransportState) close() {
++	s.mu.Lock()
++	if s.closed {
++		s.mu.Unlock()
++		<-s.done
++		return
++	}
++	s.closed = true
++	sockets := s.sockets
++	pools := s.pools
++	objects := s.objects
++	s.mu.Unlock()
++	var closeError error
++	for _, c := range sockets {
++		if c != nil {
++			closeError = errors.Join(closeError, c.closeUnderlying())
++		}
++	}
++	for _, p := range pools {
++		if p != nil {
++			for _, v := range p.values {
++				if v != nil {
++					closeError = errors.Join(closeError, v.Close())
++				}
++			}
++		}
++	}
++	for i, v := range objects {
++		if v != nil {
++			e := v.Close()
++			closeError = errors.Join(closeError, e)
++			if e != nil {
++				s.mu.Lock()
++				s.objects[i] = v
++				s.mu.Unlock()
++			}
++		}
++	}
++	s.mu.Lock()
++	s.closeError = errors.Join(s.closeError, closeError)
++	s.mu.Unlock()
++	close(s.done)
++}
++func (p *ProfileRuntime) transportState() *profileTransportState {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if p.transports == nil {
++		p.transports = &profileTransportState{runtime: p, done: make(chan struct{})}
++		s := p.transports
++		context.AfterFunc(p.ctx, s.close)
++	}
++	return p.transports
++}
++
++func (p *ProfileRuntime) closeTransports() error {
++	p.mu.Lock()
++	s := p.transports
++	p.mu.Unlock()
++	if s == nil {
++		return nil
++	}
++	s.close()
++	s.mu.Lock()
++	e := s.closeError
++	s.mu.Unlock()
++	return e
++}
++
++// HTTP clients получают общий session cap до allocation, а не 128 на manager.
++func (p *ProfilePool) NewResource(create func(context.Context, func()) (ProfileCloser, error)) (ProfileCloser, error) {
++	if p == nil || p.state == nil || create == nil {
++		return nil, errProfile
++	}
++	s := p.state
++	s.mu.Lock()
++	count := s.objectPending
++	for _, v := range s.objects {
++		if v != nil {
++			count++
++		}
++	}
++	if !p.registered() || !s.live() || count >= int(s.runtime.flow.manifest.caps[2]) {
++		s.mu.Unlock()
++		return nil, errProfileFlowBusy
++	}
++	s.objectPending++
++	s.mu.Unlock()
++	ctx, e := p.SessionContext()
++	if e != nil {
++		s.mu.Lock()
++		s.objectPending--
++		s.mu.Unlock()
++		return nil, e
++	}
++	slot := -1
++	var once sync.Once
++	retire := func() {
++		once.Do(func() {
++			s.mu.Lock()
++			if slot >= 0 {
++				s.objects[slot] = nil
++			}
++			s.mu.Unlock()
++		})
++	}
++	value, e := create(ctx, retire)
++	s.mu.Lock()
++	s.objectPending--
++	if e != nil || value == nil {
++		s.mu.Unlock()
++		if value != nil {
++			value.Close()
++		}
++		if e == nil {
++			e = errProfile
++		}
++		return nil, e
++	}
++	if !s.live() {
++		s.mu.Unlock()
++		value.Close()
++		return nil, errProfile
++	}
++	for i, v := range s.objects {
++		if v == nil {
++			slot = i
++			s.objects[i] = value
++			s.mu.Unlock()
++			return value, nil
++		}
++	}
++	s.mu.Unlock()
++	value.Close()
++	return nil, errProfileFlowBusy
++}
++
++func ProfileAttachLogical(ctx context.Context, c io.Closer) error {
++	if c == nil {
++		return errProfile
++	}
++	if !ProfileSession(ctx) {
++		return nil
++	}
++	if ProfileLogicalGate(ctx) != nil {
++		c.Close()
++		return errProfile
++	}
++	context.AfterFunc(ctx, func() { c.Close() })
++	return nil
++}
++
++type profileLogicalConn struct {
++	conn net.Conn
++	ctx  context.Context
++	once sync.Once
++	stop func() bool
++	err  error
++}
++
++func ProfileGuardConnection(ctx context.Context, c net.Conn) (net.Conn, error) {
++	if !ProfileSession(ctx) {
++		return c, nil
++	}
++	if c == nil || ProfileLogicalGate(ctx) != nil {
++		if c != nil {
++			c.Close()
++		}
++		return nil, errProfile
++	}
++	if pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); pool != nil {
++		return c, nil
++	}
++	owned := &profileLogicalConn{conn: c, ctx: ctx}
++	owned.stop = context.AfterFunc(ctx, func() { owned.closeUnderlying() })
++	return owned, nil
++}
++func (c *profileLogicalConn) Read(b []byte) (int, error) {
++	if ProfileLogicalGate(c.ctx) != nil {
++		return 0, errProfile
++	}
++	n, e := c.conn.Read(b)
++	if ProfileLogicalGate(c.ctx) != nil {
++		return 0, errProfile
++	}
++	return n, e
++}
++func (c *profileLogicalConn) Write(b []byte) (int, error) {
++	if ProfileLogicalGate(c.ctx) != nil {
++		return 0, errProfile
++	}
++	n, e := c.conn.Write(b)
++	if ProfileLogicalGate(c.ctx) != nil {
++		return 0, errProfile
++	}
++	return n, e
++}
++func (c *profileLogicalConn) closeUnderlying() error {
++	c.once.Do(func() { c.err = c.conn.Close() })
++	return c.err
++}
++func (c *profileLogicalConn) Close() error                       { c.stop(); return c.closeUnderlying() }
++func (c *profileLogicalConn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
++func (c *profileLogicalConn) RemoteAddr() net.Addr               { return c.conn.RemoteAddr() }
++func (c *profileLogicalConn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t) }
++func (c *profileLogicalConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
++func (c *profileLogicalConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
++func profilePoolIdentity(p *ProfileRuntime, g *profileGrant) ([32]byte, profileDestinationValue, error) {
++	var key [32]byte
++	row := p.flow.manifest.rows[8][g.scope]
++	branch := int(g.branch)
++	endpoint := g.effective
++	if row[20+branch] == 2 {
++		return key, endpoint, ErrProfileUnsupported
++	} // Chain reuse требует grants каждого hop.
++	if row[20+branch] == 4 {
++		return key, endpoint, errProfile
++	}
++	if row[20+branch] == 1 {
++		c := profileCursor{b: p.flow.manifest.rows[1][u16(row, 8+branch*2)]}
++		h := c.take(8)
++		a := c.take(int(u16(h, 4)))
++		endpoint = profileDestinationValue{family: h[0], network: h[1], port: u16(h, 2), address: string(a)}
++		if h[0] != 3 {
++			ip := net.IP(a)
++			endpoint.address = ip.String()
++		}
++	}
++	endpoint.network = row[5+branch*2]
++	h := sha256.New()
++	h.Write([]byte("YNKCAP-POOL-v1\x00"))
++	r := p.admission.launch
++	h.Write(r.session[:])
++	h.Write(r.invocation[:])
++	h.Write(r.digest[:])
++	h.Write(r.manifest[:])
++	var b [16]byte
++	be.PutUint64(b[:], r.generation)
++	be.PutUint64(b[8:], r.epoch)
++	h.Write(b[:])
++	be.PutUint16(b[:], g.subject)
++	be.PutUint16(b[2:], g.scope)
++	be.PutUint16(b[4:], g.chain)
++	b[6] = g.branch
++	h.Write(b[:7])
++	if g.stream != 65535 {
++		h.Write(p.flow.manifest.rows[3][g.stream])
++	}
++	if path, ok := g.ctx.Value(profilePathKey{}).([32]byte); ok {
++		h.Write(path[:])
++	}
++	h.Write(g.effective.encode())
++	h.Write(endpoint.encode())
++	copy(key[:], h.Sum(nil))
++	return key, endpoint, nil
++}
++func ProfileTransportPool(ctx context.Context, kind byte) (*ProfilePool, error) {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return nil, nil
++	}
++	if existing, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); existing != nil {
++		if existing.state.runtime != p {
++			return nil, errProfile
++		}
++		g, e := existing.candidate()
++		if e != nil {
++			return nil, e
++		}
++		if kind != 0 && (g.stream == 65535 || p.flow.manifest.rows[3][g.stream][0] != kind) {
++			return nil, errProfile
++		}
++		if _, e := existing.Context(ctx); e != nil {
++			return nil, e
++		}
++		return existing, nil
++	}
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if profileEnsureGrant(ctx, g) != nil {
++		return nil, errProfile
++	}
++	if kind != 0 && (g.stream == 65535 || p.flow.manifest.rows[3][g.stream][0] != kind) {
++		return nil, errProfile
++	}
++	key, endpoint, e := profilePoolIdentity(p, g)
++	if e != nil {
++		return nil, e
++	}
++	s := p.transportState()
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if !s.live() {
++		return nil, errProfile
++	}
++	slot := -1
++	for i, pool := range s.pools {
++		if pool != nil && pool.key == key {
++			return pool, nil
++		}
++		if pool == nil && slot < 0 && i < int(p.flow.manifest.caps[2]) {
++			slot = i
++		}
++	}
++	if slot < 0 {
++		return nil, errProfileFlowBusy
++	}
++	pool := &ProfilePool{state: s, key: key, scope: g.scope, branch: g.branch, endpoint: endpoint}
++	s.pools[slot] = pool
++	return pool, nil
++}
++func (p *ProfilePool) Key() [32]byte {
++	if p == nil {
++		return [32]byte{}
++	}
++	return p.key
++}
++func (p *ProfilePool) candidate() (*profileGrant, error) {
++	if p == nil || p.state == nil || p.state.runtime == nil {
++		return nil, errProfile
++	}
++	c := p.state.runtime.flow
++	c.mu.Lock()
++	var chosen *profileGrant
++	for _, g := range c.grants {
++		if c.grantLive(g) && g.scope == p.scope && g.branch == p.branch {
++			k, _, e := profilePoolIdentity(p.state.runtime, g)
++			if e == nil && k == p.key {
++				chosen = g
++				break
++			}
++		}
++	}
++	c.mu.Unlock()
++	if chosen == nil || profileEnsureGrant(context.WithValue(chosen.ctx, profileContextKey{}, p.state.runtime), chosen) != nil {
++		return nil, errProfile
++	}
++	return chosen, nil
++}
++func (p *ProfilePool) Context(callback context.Context) (context.Context, error) {
++	if p == nil {
++		return callback, nil
++	}
++	if p.state == nil || p.state.runtime == nil {
++		return nil, errProfile
++	}
++	if other := profileRuntime(callback); other != nil && other != p.state.runtime {
++		return nil, errProfile
++	}
++	if callback != nil {
++		if g, _ := callback.Value(profileGrantKey{}).(*profileGrant); g != nil {
++			if g.receipt == nil || g.receipt.control != p.state.runtime.flow {
++				return nil, errProfile
++			}
++			key, _, e := profilePoolIdentity(p.state.runtime, g)
++			if e != nil || key != p.key {
++				return nil, errProfile
++			}
++		}
++	}
++	if callback == nil || callback.Err() != nil || !p.state.runtime.flowFresh() {
++		return nil, errProfile
++	}
++	p.state.mu.Lock()
++	live := p.registered() && p.state.live()
++	p.state.mu.Unlock()
++	if !live {
++		return nil, errProfile
++	}
++	if _, e := p.candidate(); e != nil {
++		return nil, e
++	}
++	// Callback cancellation/deadline сохраняются; authority берётся из private
++	// pool, а physical ownership не привязывается к первому logical caller.
++	ctx := context.WithValue(callback, profileContextKey{}, p.state.runtime)
++	return context.WithValue(ctx, profilePoolContextKey{}, p), nil
++}
++func (p *ProfilePool) SessionContext() (context.Context, error) {
++	if p == nil || p.state == nil || p.state.runtime == nil {
++		return nil, errProfile
++	}
++	return p.Context(p.state.runtime.ctx)
++}
++
++// Вызывается только под state.mu: копия opaque value не становится capability.
++func (p *ProfilePool) registered() bool {
++	for _, pool := range p.state.pools {
++		if pool == p {
++			return true
++		}
++	}
++	return false
++}
++func (p *ProfilePool) LoadOrCreate(slot int, create func(context.Context) (ProfileCloser, error)) (ProfileCloser, error) {
++	if p == nil || slot < 0 || slot >= len(p.values) {
++		return nil, errProfile
++	}
++	ctx, e := p.SessionContext()
++	if e != nil {
++		return nil, e
++	}
++	s := p.state
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if !s.live() {
++		return nil, errProfile
++	}
++	if p.values[slot] != nil {
++		return p.values[slot], nil
++	}
++	v, e := create(ctx)
++	if e != nil {
++		return nil, e
++	}
++	if v == nil {
++		return nil, errProfile
++	}
++	if !s.live() {
++		v.Close()
++		return nil, errProfile
++	}
++	p.values[slot] = v
++	return v, nil
++}
++func ProfileLogicalGate(ctx context.Context) error {
++	if ctx == nil || ctx.Err() != nil {
++		return errProfile
++	}
++	if !ProfileSession(ctx) {
++		return nil
++	}
++	if pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); pool != nil {
++		_, e := pool.Context(ctx)
++		return e
++	}
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	return profileEnsureGrant(ctx, g)
++}
++
++func ProfileCheckTransport(ctx context.Context, kind byte) error {
++	if !ProfileSession(ctx) {
++		return nil
++	}
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); pool != nil {
++		var e error
++		g, e = pool.candidate()
++		if e != nil {
++			return e
++		}
++	} else if profileEnsureGrant(ctx, g) != nil {
++		return errProfile
++	}
++	p := profileRuntime(ctx)
++	if g.stream == 65535 || p.flow.manifest.rows[3][g.stream][0] != kind {
++		return errProfile
++	}
++	return nil
++}
++func ProfilePhysicalGate(ctx context.Context) error {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return errProfile
++	}
++	pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool)
++	if pool == nil || pool.state.runtime != p || ctx.Err() != nil {
++		return errProfile
++	}
++	_, e := pool.Context(ctx)
++	return e
++}
++func ProfileDialPhysical(ctx context.Context, dest xnet.Destination, runner func(context.Context) (net.Conn, error)) (net.Conn, error) {
++	// До pinned snapshot query/peer proof integration domain нельзя передать
++	// net.Dialer: тот запустит live netgo resolver без service grant.
++	if dest.Address == nil {
++		return nil, errProfile
++	}
++	if dest.Address.Family().IsDomain() {
++		return nil, ErrProfileUnsupported
++	}
++	if ProfileCheckDial(ctx, dest, true) != nil {
++		return nil, errProfile
++	}
++	pool, e := ProfileTransportPool(ctx, 0)
++	if e != nil || pool == nil {
++		return nil, errProfile
++	}
++	s := pool.state
++	s.mu.Lock()
++	count := s.pending
++	for _, socket := range s.sockets {
++		if socket != nil {
++			count++
++		}
++	}
++	if !s.live() || count >= int(s.runtime.flow.manifest.caps[1]) {
++		s.mu.Unlock()
++		return nil, errProfileFlowBusy
++	}
++	s.pending++
++	s.mu.Unlock()
++	defer func() { s.mu.Lock(); s.pending--; s.mu.Unlock() }()
++	dialCtx, e := pool.Context(ctx)
++	if e != nil {
++		return nil, e
++	}
++	conn, e := runner(dialCtx)
++	if e != nil {
++		if conn != nil {
++			profileCloseRejected(pool, conn)
++		}
++		return nil, e
++	}
++	if conn == nil {
++		return nil, errProfile
++	}
++	if ProfileLogicalGate(ctx) != nil || ProfilePhysicalGate(dialCtx) != nil {
++		profileCloseRejected(pool, conn)
++		return nil, errProfile
++	}
++	s.mu.Lock()
++	if !s.live() {
++		s.mu.Unlock()
++		profileCloseRejected(pool, conn)
++		return nil, errProfile
++	}
++	for i, item := range s.sockets {
++		if item == nil {
++			owned := &profilePhysicalConn{Conn: conn, pool: pool, slot: i}
++			s.sockets[i] = owned
++			s.mu.Unlock()
++			return owned, nil
++		}
++	}
++	s.mu.Unlock()
++	profileCloseRejected(pool, conn)
++	return nil, errProfileFlowBusy
++}
++
++type profilePhysicalConn struct {
++	net.Conn
++	pool       *ProfilePool
++	slot       int
++	once       sync.Once
++	closeError error
++	closed     atomic.Bool
++}
++
++func (c *profilePhysicalConn) closeUnderlying() error {
++	c.closed.Store(true)
++	c.once.Do(func() { c.closeError = c.Conn.Close() })
++	return c.closeError
++}
++func (c *profilePhysicalConn) Close() error {
++	e := c.closeUnderlying()
++	s := c.pool.state
++	s.mu.Lock()
++	if e == nil && c.slot >= 0 && s.sockets[c.slot] == c {
++		s.sockets[c.slot] = nil
++	}
++	if e != nil && s.closeError == nil {
++		s.closeError = e
++	}
++	s.mu.Unlock()
++	if e != nil {
++		s.runtime.cancel()
++	}
++	return e
++}
++
++func profileCloseRejected(pool *ProfilePool, conn net.Conn) {
++	owned := &profilePhysicalConn{Conn: conn, pool: pool, slot: -1}
++	if e := owned.closeUnderlying(); e != nil {
++		s := pool.state
++		s.mu.Lock()
++		if s.closeError == nil {
++			s.closeError = e
++		}
++		for i, c := range s.sockets {
++			if c == nil {
++				owned.slot = i
++				s.sockets[i] = owned
++				break
++			}
++		}
++		s.mu.Unlock()
++		s.runtime.cancel()
++	}
++}
++func (c *profilePhysicalConn) gate() error {
++	s := c.pool.state
++	s.mu.Lock()
++	live := s.live()
++	s.mu.Unlock()
++	if !live {
++		return errProfile
++	}
++	if c.closed.Load() || c.pool.state.runtime.ctx.Err() != nil || !c.pool.state.runtime.flowFresh() {
++		return errProfile
++	}
++	return nil
++}
++func (c *profilePhysicalConn) Read(b []byte) (int, error) {
++	if e := c.gate(); e != nil {
++		return 0, e
++	}
++	n, e := c.Conn.Read(b)
++	if c.gate() != nil {
++		return 0, errProfile
++	}
++	return n, e
++}
++func (c *profilePhysicalConn) Write(b []byte) (int, error) {
++	if e := c.gate(); e != nil {
++		return 0, e
++	}
++	return c.Conn.Write(b)
++}
++
++// Только guarded capability; underlying socket никогда не возвращается.
++func (c *profilePhysicalConn) ProfilePacketConn() (net.PacketConn, net.Addr, error) {
++	raw, ok := c.Conn.(*xnet.PacketConnWrapper)
++	if !ok || c.gate() != nil {
++		return nil, nil, errProfile
++	}
++	return &profilePhysicalPacket{owner: c, packet: raw.PacketConn}, raw.RemoteAddr(), nil
++}
++
++type profilePhysicalPacket struct {
++	owner  *profilePhysicalConn
++	packet net.PacketConn
++}
++
++func (c *profilePhysicalPacket) ReadFrom(b []byte) (int, net.Addr, error) {
++	if e := c.owner.gate(); e != nil {
++		return 0, nil, e
++	}
++	n, a, e := c.packet.ReadFrom(b)
++	if c.owner.gate() != nil {
++		return 0, nil, errProfile
++	}
++	if n > 0 && !c.peer(a) {
++		return 0, nil, errProfile
++	}
++	return n, a, e
++}
++func (c *profilePhysicalPacket) peer(a net.Addr) bool {
++	if a == nil {
++		return false
++	}
++	v, e := profileValue(xnet.DestinationFromAddr(a))
++	return e == nil && v == c.owner.pool.endpoint
++}
++func (c *profilePhysicalPacket) WriteTo(b []byte, a net.Addr) (int, error) {
++	if c.owner.gate() != nil || !c.peer(a) {
++		return 0, errProfile
++	}
++	return c.packet.WriteTo(b, a)
++}
++func (c *profilePhysicalPacket) Close() error                  { return c.owner.Close() }
++func (c *profilePhysicalPacket) LocalAddr() net.Addr           { return c.packet.LocalAddr() }
++func (c *profilePhysicalPacket) SetDeadline(t time.Time) error { return c.packet.SetDeadline(t) }
++func (c *profilePhysicalPacket) SetReadDeadline(t time.Time) error {
++	return c.packet.SetReadDeadline(t)
++}
++func (c *profilePhysicalPacket) SetWriteDeadline(t time.Time) error {
++	return c.packet.SetWriteDeadline(t)
++}
++
++func ProfilePacketCapability(conn net.Conn) (net.PacketConn, net.Addr, error) {
++	if c, ok := conn.(interface {
++		ProfilePacketConn() (net.PacketConn, net.Addr, error)
++	}); ok {
++		return c.ProfilePacketConn()
++	}
++	return nil, nil, errProfile
++}
++
++// FinalMask возвращает собственный PacketConnWrapper над уже guarded socket.
++// Адаптер возвращает новый guarded view, никогда raw underlying packet socket.
++func ProfileGuardPacketView(ctx context.Context, conn net.Conn) (net.PacketConn, net.Addr, error) {
++	raw, ok := conn.(*xnet.PacketConnWrapper)
++	if !ok {
++		return nil, nil, errProfile
++	}
++	pool, e := ProfileTransportPool(ctx, 0)
++	if e != nil || pool == nil {
++		return nil, nil, errProfile
++	}
++	if e = ProfileCheckDial(ctx, xnet.DestinationFromAddr(raw.RemoteAddr()), true); e != nil {
++		return nil, nil, e
++	}
++	owned := &profilePhysicalConn{Conn: conn, pool: pool, slot: -1}
++	return &profilePhysicalPacket{owner: owned, packet: raw.PacketConn}, raw.RemoteAddr(), nil
++}
+diff --git a/common/yonikbroker/profile-original-flow-v3.json b/common/yonikbroker/profile-original-flow-v3.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-original-flow-v3.json
+@@ -0,0 +1,23 @@
++{
++  "contract": "R8 root: local=original initiator, remote=actual ingress; tuple40 big endian unchanged",
++  "rows": [
++    {
++      "name": "accepted-tcp",
++      "provenance": 2,
++      "ownedIngressPort": 1080,
++      "initiatorPort": 12000,
++      "actualIngressPort": 1080,
++      "tupleHex": "060400002ee00438c000020a0000000000000000000000007f000001000000000000000000000000",
++      "issuerRequirement": "exact owned TCP remote_port match"
++    },
++    {
++      "name": "associated-udp",
++      "provenance": 3,
++      "ownedIngressPort": 1080,
++      "initiatorPort": 12001,
++      "actualIngressPort": 49152,
++      "tupleHex": "110400002ee1c000c000020a0000000000000000000000007f000001000000000000000000000000",
++      "issuerRequirement": "retained actual UDP association binding; otherwise Unsupported; never TCP owner proof"
++    }
++  ]
++}
+diff --git a/common/mux/yonik_profile_transport_test.go b/common/mux/yonik_profile_transport_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/mux/yonik_profile_transport_test.go
+@@ -0,0 +1,44 @@
++package mux
++
++import (
++	"context"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/common/signal/done"
++	"testing"
++)
++
++func TestYonikMuxSessionCloseDoesNotCloseNeighbour(t *testing.T) {
++	manager := NewSessionManager()
++	a := manager.Allocate(&ClientStrategy{}, nil, nil)
++	b := manager.Allocate(&ClientStrategy{}, nil, nil)
++	if e := (profileMuxSession{a}).Close(); e != nil {
++		t.Fatal(e)
++	}
++	if !a.closed || b.closed || manager.Size() != 1 {
++		t.Fatal("mux neighbour cancelled")
++	}
++	b.Close(false)
++}
++func TestYonikMuxOwnedWorkerRetiresExactlyOnce(t *testing.T) {
++	count := 0
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	factory := &DialingWorkerFactory{profileContext: ctx}
++	workerCtx, stop := factory.workerContext()
++	defer stop()
++	cancel()
++	if workerCtx.Err() != context.Canceled {
++		t.Fatal("worker context detached")
++	}
++	target := session.OutboundsFromContext(workerCtx)[0].Target
++	if target.Network != net.Network_TCP || target.Address != muxCoolAddress {
++		t.Fatal("mux worker input changed")
++	}
++	worker := &ClientWorker{done: done.New(), profileRetire: func() { count++ }}
++	worker.Close()
++	worker.Close()
++	if count != 1 || !worker.Closed() {
++		t.Fatal("worker retirement")
++	}
++}
+diff --git a/common/mux/client.go b/common/mux/client.go
+--- a/common/mux/client.go
++++ b/common/mux/client.go
+@@ -16,6 +16,7 @@
+ 	"github.com/xtls/xray-core/common/signal/done"
+ 	"github.com/xtls/xray-core/common/task"
+ 	"github.com/xtls/xray-core/common/xudp"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/proxy"
+ 	"github.com/xtls/xray-core/transport"
+ 	"github.com/xtls/xray-core/transport/internet"
+@@ -28,8 +29,35 @@
+ }
+ 
+ func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) error {
++	picker := m.Picker
++	if hooks.ProfileSession(ctx) {
++		pool, e := hooks.ProfileTransportPool(ctx, 0)
++		if e != nil {
++			return e
++		}
++		base, ok := m.Picker.(*IncrementalWorkerPicker)
++		if !ok {
++			return errors.New("owned mux picker unavailable")
++		}
++		factory, ok := base.Factory.(*DialingWorkerFactory)
++		if !ok {
++			return errors.New("owned mux factory unavailable")
++		}
++		value, e := pool.LoadOrCreate(1, func(physical context.Context) (hooks.ProfileCloser, error) {
++			copyFactory := *factory
++			copyFactory.profileContext = physical
++			return &profileWorkers{picker: &IncrementalWorkerPicker{Factory: &copyFactory}}, nil
++		})
++		if e != nil {
++			return e
++		}
++		picker = value.(*profileWorkers).picker
++	}
+ 	for i := 0; i < 16; i++ {
+-		worker, err := m.Picker.PickAvailable()
++		if e := hooks.ProfileLogicalGate(ctx); e != nil {
++			return e
++		}
++		worker, err := picker.PickAvailable()
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -43,6 +71,24 @@
+ 
+ type WorkerPicker interface {
+ 	PickAvailable() (*ClientWorker, error)
++}
++
++type profileWorkers struct{ picker *IncrementalWorkerPicker }
++type profileMuxSession struct{ s *Session }
++
++func (c profileMuxSession) Close() error { return c.s.Close(false) }
++
++func (w *profileWorkers) Close() error {
++	w.picker.access.Lock()
++	defer w.picker.access.Unlock()
++	if w.picker.cleanupTask != nil {
++		w.picker.cleanupTask.Close()
++	}
++	for _, worker := range w.picker.workers {
++		worker.done.Close()
++	}
++	w.picker.workers = nil
++	return nil
+ }
+ 
+ type IncrementalWorkerPicker struct {
+@@ -70,6 +116,8 @@
+ 	for _, w := range p.workers {
+ 		if !w.Closed() {
+ 			activeWorkers = append(activeWorkers, w)
++		} else if w.profileRetire != nil {
++			w.Close()
+ 		}
+ 	}
+ 	p.workers = activeWorkers
+@@ -130,12 +178,35 @@
+ }
+ 
+ type DialingWorkerFactory struct {
+-	Proxy    proxy.Outbound
+-	Dialer   internet.Dialer
+-	Strategy ClientStrategy
++	profileContext context.Context
++	Proxy          proxy.Outbound
++	Dialer         internet.Dialer
++	Strategy       ClientStrategy
+ }
+ 
+ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
++	if f.profileContext != nil {
++		pool, e := hooks.ProfileTransportPool(f.profileContext, 0)
++		if e != nil {
++			return nil, e
++		}
++		value, e := pool.NewResource(func(_ context.Context, retire func()) (hooks.ProfileCloser, error) {
++			worker, e := f.create()
++			if e != nil {
++				return nil, e
++			}
++			worker.profileRetire = retire
++			return worker, nil
++		})
++		if e != nil {
++			return nil, e
++		}
++		return value.(*ClientWorker), nil
++	}
++	return f.create()
++}
++
++func (f *DialingWorkerFactory) create() (*ClientWorker, error) {
+ 	opts := []pipe.Option{pipe.WithSizeLimit(64 * 1024)}
+ 	uplinkReader, upLinkWriter := pipe.New(opts...)
+ 	downlinkReader, downlinkWriter := pipe.New(opts...)
+@@ -149,11 +220,10 @@
+ 	}
+ 
+ 	go func(p proxy.Outbound, d internet.Dialer, c common.Closable) {
+-		outbounds := []*session.Outbound{{
+-			Target: net.TCPDestination(muxCoolAddress, muxCoolPort),
+-		}}
+-		ctx := session.ContextWithOutbounds(context.Background(), outbounds)
+-		ctx, cancel := context.WithCancel(ctx)
++		ctx, cancel := f.workerContext()
++		defer cancel()
++		stop := context.AfterFunc(ctx, func() { c.Close() })
++		defer stop()
+ 
+ 		if errP := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); errP != nil {
+ 			errC := errors.Cause(errP)
+@@ -168,12 +238,22 @@
+ 	return c, nil
+ }
+ 
++func (f *DialingWorkerFactory) workerContext() (context.Context, context.CancelFunc) {
++	parent := context.Background()
++	if f.profileContext != nil {
++		parent = f.profileContext
++	}
++	return context.WithCancel(session.ContextWithOutbounds(parent, []*session.Outbound{{Target: net.TCPDestination(muxCoolAddress, muxCoolPort)}}))
++}
++
+ type ClientStrategy struct {
+ 	MaxConcurrency uint32
+ 	MaxConnection  uint32
+ }
+ 
+ type ClientWorker struct {
++	profileRetire  func()
++	profileOnce    sync.Once
+ 	sessionManager *SessionManager
+ 	link           transport.Link
+ 	done           *done.Instance
+@@ -220,7 +300,11 @@
+ }
+ 
+ func (m *ClientWorker) Close() error {
+-	return m.done.Close()
++	e := m.done.Close()
++	if m.profileRetire != nil {
++		m.profileOnce.Do(m.profileRetire)
++	}
++	return e
+ }
+ 
+ func (m *ClientWorker) monitor() {
+@@ -309,6 +393,9 @@
+ }
+ 
+ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool {
++	if hooks.ProfileLogicalGate(ctx) != nil {
++		return false
++	}
+ 	if m.IsFull() {
+ 		return false
+ 	}
+@@ -317,6 +404,12 @@
+ 	s := sm.Allocate(&m.strategy, link.Reader, link.Writer)
+ 	if s == nil {
+ 		return false
++	}
++	if hooks.ProfileSession(ctx) {
++		if hooks.ProfileAttachLogical(ctx, profileMuxSession{s}) != nil {
++			s.Close(false)
++			return false
++		}
+ 	}
+ 	go fetchInput(ctx, s, m.link.Writer)
+ 	if _, ok := link.Reader.(*pipe.Reader); !ok {
 diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
 --- a/app/dispatcher/default.go
 +++ b/app/dispatcher/default.go
@@ -1399,13 +3738,14 @@ diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_hooks_linux.go
-@@ -0,0 +1,560 @@
+@@ -0,0 +1,587 @@
 +//go:build linux
 +
 +package nativehooks
 +
 +import (
 +	"context"
++	"crypto/sha256"
 +	"net/netip"
 +	"time"
 +
@@ -1844,6 +4184,17 @@ new file mode 100644
 +	if p == nil {
 +		return nil
 +	}
++	if pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); pool != nil {
++		if ctx.Err() != nil || pool.state.runtime != p {
++			return errProfile
++		}
++		g, e := pool.candidate()
++		if e != nil {
++			return e
++		}
++		logical := context.WithValue(context.WithValue(g.ctx, profileContextKey{}, p), profileGrantKey{}, g)
++		return ProfileCheckDial(context.WithValue(logical, profilePoolContextKey{}, (*ProfilePool)(nil)), target, carrier)
++	}
 +	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
 +	if profileEnsureGrant(ctx, g) != nil {
 +		return errProfile
@@ -1907,6 +4258,21 @@ new file mode 100644
 +		return ctx, errProfile
 +	}
 +	ctx = context.WithValue(ctx, profileGrantKey{}, (*profileGrant)(nil))
++	h := sha256.New()
++	h.Write([]byte("YNKCAP-CHAIN-PATH-v1\x00"))
++	if path, ok := ctx.Value(profilePathKey{}).([32]byte); ok {
++		h.Write(path[:])
++	}
++	var step [9]byte
++	be.PutUint16(step[:], g.subject)
++	be.PutUint16(step[2:], g.scope)
++	be.PutUint16(step[4:], g.chain)
++	be.PutUint16(step[6:], nextScope)
++	step[8] = g.branch
++	h.Write(step[:])
++	var path [32]byte
++	copy(path[:], h.Sum(nil))
++	ctx = context.WithValue(ctx, profilePathKey{}, path)
 +	return context.WithValue(ctx, profileRouteKey{}, profileSelectedRoute{subject: subject, scope: nextScope, branches: edge[5], effective: v, chained: true}), nil
 +}
 +
@@ -3711,7 +6077,7 @@ diff --git a/common/yonikbroker/profile_launch.go b/common/yonikbroker/profile_l
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch.go
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,225 @@
 +package nativehooks
 +
 +import (
@@ -3725,6 +6091,7 @@ new file mode 100644
 +const profileFlowFixedCredit = 5 * 1024 * 1024
 +
 +var errProfile = errors.New("full-profile admission denied")
++var ErrProfileUnsupported = errors.New("full-profile operation unsupported")
 +
 +// Эти типы закрыты: JSON, tag и context не могут создать admission.
 +type profileLaunch struct {
@@ -3940,7 +6307,7 @@ diff --git a/common/yonikbroker/profile_launch_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux.go
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,632 @@
 +//go:build linux
 +
 +package nativehooks
@@ -3977,6 +6344,7 @@ new file mode 100644
 +// ProfileRuntime не содержит FlowGrant. Constructor доступен только через
 +// потребление sealed record и authenticated channel. Владение FD однократное.
 +type ProfileRuntime struct {
++	transports                  *profileTransportState
 +	flow                        *profileFlowControl
 +	flowQueue                   chan *profileOperation
 +	flowFence                   func() bool
@@ -4460,6 +6828,12 @@ new file mode 100644
 +	_ = unix.Shutdown(int(p.channel.Fd()), unix.SHUT_RDWR)
 +	p.mu.Unlock()
 +	<-p.done
++	if err := p.closeTransports(); err != nil {
++		p.mu.Lock()
++		p.admission.state = profileUnknown
++		p.mu.Unlock()
++		return err
++	}
 +	err := p.closeFiles()
 +	if err != nil {
 +		p.mu.Lock()
@@ -4491,6 +6865,11 @@ new file mode 100644
 +	_ = unix.Shutdown(int(p.channel.Fd()), unix.SHUT_RDWR)
 +	p.mu.Unlock()
 +	<-p.done
++	if p.closeTransports() != nil {
++		p.mu.Lock()
++		p.admission.state = profileUnknown
++		p.mu.Unlock()
++	}
 +}
 +
 +// Start повторяет fence непосредственно перед feature Start, сохраняя закрытый
@@ -5308,13 +7687,16 @@ new file mode 100644
 diff --git a/common/yonikbroker/routing.go b/common/yonikbroker/routing.go
 --- a/common/yonikbroker/routing.go
 +++ b/common/yonikbroker/routing.go
-@@ -63,6 +63,14 @@
+@@ -63,6 +63,17 @@
  }
  
  func guardEntry(ctx context.Context, stage Stage) error {
 +	if ProfileSession(ctx) {
 +		if stage == BeforeRouting {
 +			return ProfileOriginalValid(ctx)
++		}
++		if stage == BeforeDial {
++			return ProfilePhysicalGate(ctx)
 +		}
 +		// Physical ownership и DNS service grants подключаются следующим
 +		// transport milestone; owner-only legacy consumer не даёт fallback.
@@ -5677,7 +8059,61 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	if dest.Network == net.Network_TCP {
  		if streamSettings == nil {
  			s, err := ToMemoryStreamConfig(nil)
-@@ -108,7 +112,12 @@
+@@ -56,11 +60,36 @@
+ 		}
+ 
+ 		protocol := streamSettings.ProtocolName
++		if nativehooks.ProfileSession(ctx) {
++			var kind byte
++			switch protocol {
++			case "tcp":
++				kind = 1
++			case "grpc":
++				kind = 2
++			case "splithttp":
++				kind = 3
++			case "hysteria":
++				kind = 4
++			default:
++				return nil, nativehooks.ErrDenied
++			}
++			if e := nativehooks.ProfileCheckTransport(ctx, kind); e != nil {
++				return nil, e
++			}
++		}
+ 		dialer := transportDialerCache[protocol]
+ 		if dialer == nil {
+ 			return nil, errors.New(protocol, " dialer not registered")
+ 		}
+-		return dialer(ctx, dest, streamSettings)
++		conn, e := dialer(ctx, dest, streamSettings)
++		if e != nil {
++			return nil, e
++		}
++		if nativehooks.ProfileSession(ctx) && protocol == "tcp" {
++			return nativehooks.ProfileGuardConnection(ctx, conn)
++		}
++		return conn, nil
+ 	}
+ 
+ 	if dest.Network == net.Network_UDP {
+@@ -68,7 +97,14 @@
+ 		if udpDialer == nil {
+ 			return nil, errors.New("UDP dialer not registered")
+ 		}
+-		return udpDialer(ctx, dest, streamSettings)
++		conn, e := udpDialer(ctx, dest, streamSettings)
++		if e != nil {
++			return nil, e
++		}
++		if nativehooks.ProfileSession(ctx) {
++			return nativehooks.ProfileGuardConnection(ctx, conn)
++		}
++		return conn, nil
+ 	}
+ 
+ 	return nil, errors.New("unknown network ", dest.Network)
+@@ -108,7 +144,12 @@
  	return ips, err
  }
  
@@ -5691,7 +8127,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	errors.LogInfo(ctx, "redirecting request "+dst.String()+" to "+obt)
  	outbounds := session.OutboundsFromContext(ctx)
  	ctx = session.ContextWithOutbounds(ctx, append(outbounds, &session.Outbound{
-@@ -120,7 +129,11 @@
+@@ -120,7 +161,11 @@
  	ur, uw := pipe.New(pipe.OptionsFromContext(ctx)...)
  	dr, dw := pipe.New(pipe.OptionsFromContext(ctx)...)
  
@@ -5704,7 +8140,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	var readerOpt cnc.ConnectionOption
  	if dst.Network == net.Network_TCP {
  		readerOpt = cnc.ConnectionOutputMulti(dr)
-@@ -132,7 +145,7 @@
+@@ -132,7 +177,7 @@
  		readerOpt,
  		cnc.ConnectionOnClose(common.ChainedClosable{uw, dw}),
  	)
@@ -5713,7 +8149,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  }
  
  func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (*net.Destination, error) {
-@@ -224,6 +237,9 @@
+@@ -224,6 +269,9 @@
  
  // DialSystem calls system dialer to create a network connection.
  func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
@@ -5723,7 +8159,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	var src net.Address
  	outbounds := session.OutboundsFromContext(ctx)
  	var outboundName string
-@@ -242,6 +258,9 @@
+@@ -242,6 +290,9 @@
  	if sockopt == nil {
  		return guardedSystemDial(ctx, src, dest, sockopt)
  	}
@@ -5733,7 +8169,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  
  	if newDest, err := checkAddressPortStrategy(ctx, dest, sockopt); err == nil && newDest != nil {
  		errors.LogInfo(ctx, "replace destination with "+newDest.String())
-@@ -275,7 +294,7 @@
+@@ -275,7 +326,7 @@
  		if h == nil {
  			return nil, errors.New("there is no outbound handler for dialerProxy")
  		}

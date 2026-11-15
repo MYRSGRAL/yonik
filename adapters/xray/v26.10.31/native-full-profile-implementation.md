@@ -1,4 +1,4 @@
-# P4: launch/admission и original-flow/grant consumer
+# P4: admission, original-flow/grants и transport ownership
 
 Это SOURCE/COMPILE/PURE milestone, не завершение P4 и не runtime acceptance.
 Follow-up применяется после existing native-broker-codec к pinned Xray26.10.31.
@@ -158,21 +158,92 @@ pending hole. EOF/revoke/peer death отменяют весь ledger. Unknown CL
 `ProfileChain` проверяет source scope/branch/action/edge, exact endpoint, next
 subject/input/branch mask до pipe allocation и direct nextHandler.Dispatch.
 Next input=C, original network остаётся immutable. UDP logical link cache
-разделяется по private receipt. Physical session ownership/pools и DNS grants
-ещё не подключены: existing physical guard и contextless DNS fail closed.
+разделяется по private receipt. Physical ownership и transport pools подключены
+отдельной веткой ниже; contextless DNS/service grants остаются fail closed.
 
-## Открытый вопрос counterpart: tuple orientation
+## Session-owned physical factory и transport pools
+
+`ProfileTransportPool(ctx,kind)` принимает только private live logical grant;
+actual kind Tcp1/Grpc2/Xhttp3/Hysteria4 сравнивается с active table4 stream.
+Raw UDP не использует configured stream. `internet.Dial` проверяет actual
+protocol selector; другие transports и alternative system dialer отвергаются.
+XHTTP browser dialer не получает owned authority; final-mask outbound listen
+callbacks также запрещены. Это не изменение frozen bootstrap/env/ABI260.
+
+Key=SHA256(domain+NUL,session,invocation,digest,manifestHash,generation,epoch,
+subject,scope,branch,chain,pathDigest,exact table4 kind/security/fingerprint,
+effective logical destination,physical endpoint). Config bytes уже связаны с
+issuer intent digest до parser; actual handler/factory берёт stream settings из
+того же parsed config. Provider tag и stream-settings pointer не key/authority.
+`ProfileChain` накапливает отдельный path digest по actual checked transitions.
+
+Private pool registry≤128 и physical sockets≤128 принадлежат runtime, а не
+первому flow. Global native caches используются только legacy веткой. gRPC,
+Hysteria и XHTTP получают session-owned clients из private registry. Отдельный
+общий resource cap≤128 резервируется ДО constructor HTTP client/mux worker;
+это не128 на каждый XmuxManager. Все bounds могут только уменьшаться capsule
+caps. Metadata этих fixed arrays включены в существующий5MiB credit; decoded
+capsule/snapshot/flow strings не получают второй8MiB budget. Runtime protocol
+buffer/load acceptance этим SOURCE/COMPILE/PURE milestone не доказывается.
+
+`ProfilePool.Context(callback)` сохраняет actual callback deadline/cancel,
+проверяет registration, foreign runtime и immutable pool identity и заново
+выбирает live grant этого scope/key. Ни копия opaque value, ни нулевой pool,
+ни session credential не создают authority. Первый owner receipt не переносится
+на следующего consumer. `SessionContext` задаёт physical lifetime runtime;
+проверки user stream/request/send остаются у его собственного logical grant.
+
+`guardedSystemDial` выбирает отдельный `ProfileDialPhysical` до socket runner:
+reserved physical slot, D/C/endpoint/current grant, runner, повторный fence до
+publication. Session revoke/EOF/peer death/lease прекращают open/reuse/I/O.
+Отмена одного logical receipt не закрывает shared physical sockets/clients.
+Failed close делает session закрытой для новых effects; socket reference и
+Unknown custody сохраняются, `ProfileRuntime.Close` не освобождает asset/FD
+custody после ошибки transport cleanup.
+
+Guarded UDP capability `ProfilePacketConn`/`PacketConnForTransport` используется
+в system factory, memory/final-mask factory, Hysteria и XHTTP H3. Она проверяет
+actual peer на ReadFrom/WriteTo, возвращает guarded PacketConn, не raw socket.
+Неизвестный connection type даёт typed denial вместо panic. FinalMask view
+сохраняет внутренний guard; old TCP-chain FakePacketConn не становится profile
+UDP escape. Legacy branch остаётся отдельной.
+
+Native mux actual picker/factory создаёт session-bound worker вместо Background,
+с synthetic TCP v1.mux.cool как прежде. На каждый logical Dispatch проверяется
+свой grant; cancel закрывает только mux Session. Worker close/cleanup освобождает
+свой bounded resource slot. gRPC callback получает private pool handoff;
+отдельный RPC cancel/Close не закрывает ClientConn соседей. Hysteria проверяет
+grant до каждого tcp/udp open/reuse, сохраняет required InterConn concrete API
+и привязывает close logical stream к его ctx. XHTTP H1/H2/H3/xmux и upload retry
+проверяют pool/logical identity; owned requests не используют WithoutCancel.
+Cancel одного HTTP request не помечает shared client как transport failure.
+TCP/raw UDP/gRPC/XHTTP logical connections повторяют checks на read/write.
+
+Оставшиеся закрытые пути явно возвращают `ErrProfileUnsupported`: domain
+physical dial до pinned snapshot query/peer proof, pooled source с action=Chain
+до per-logical grants каждого hop при reuse. Обычный redirect продолжает проверять
+carrier→next input; конечный pool разделяется по накопленному chain path.
+Нельзя выдать source FlowGrant за полномочия всех последующих scopes. Snapshot
+queries, DNS/Probe grants и resolver provenance hooks — следующий milestone;
+admission не создаёт service grants и live DefaultResolver fallback отсутствует.
+
+## Детерминированный R8 contract: tuple orientation
 
 Go `profile_flow_hooks_linux.go::ProfileAccept` кодирует original initiator в
 local[8]/localPort[4], ingress в remote[24]/remotePort[6], по owner-flow смыслу.
-`ProfileAssociateUDP` сохраняет actual ephemeral association port. Независимый
-Rust9b1bba9 `profile_channel.rs::Capsule::validate_request` требует для non-TUN
-`tuple.local_port == ownedPort`; его messages vector использует socket-local
-orientation. Нужен root ответ: какой orientation нормативен для acceptedTCP и
-associatedUDP и как issuer нормализует его для owner lookup. Fixed tuple40
-не менялся; consumer и fake producer не выдают реальную authority. До согласования
-этот pairing не объявляется совместимым. TUN source→destination проверяется
-отдельно. Ослаблять peer/endpoint/owner проверки ради parity нельзя.
+`ProfileAssociateUDP` сохраняет actual ephemeral association port. Root/R8
+подтвердил эту initiator orientation по frozen kernel owner lookup/cold fixture.
+Для acceptedTCP issuer отдельно проверяет remote_port==ownedPort. Проверка
+Rust9b1bba9 local_port==ownedPort ошибочна и исправляется Rust writer в active
+issuer WIP; Go tuple не переворачивается. Fixed tuple40/ABI260 не меняются.
+Для associatedUDP issuer обязан удерживать проверяемый binding actual UDP
+association endpoint к owning ingress/session/sourceFlow и его lifetime.
+Нет такого binding — explicitly Unsupported. TCP tuple/owner не подменяет UDP
+tuple/owner; port1080 нельзя подставить вместо actual ephemeral49152.
+Cross-language `full-profile-fixtures/original-flow-v3.json` фиксирует unequal
+ports: TCP12000→1080 и UDP12001→49152, initiator192.0.2.10→ingress127.0.0.1.
+Это grammar/source fixture без authority; TUN source→destination проверяется
+отдельно. Peer/endpoint/owner mandatory checks не ослабляются ради parity.
 
 ## Golden и counterpart
 
@@ -194,6 +265,6 @@ direct policy и original-flow receipts принадлежат назначен�
 system-chain-probe/resolver-snapshot-v1 сохранены byte-exact под own fixtures и
 в patch. Capsule DATA tests не являются source/asset ACK proof для synthetic
 System snapshot ref. Следующие части P4: authenticated issuer/durable direct
-policy, session physical ownership/pools, mux worker context, Hysteria/gRPC/
-XHTTP guards, UDP/probe/DNS service grants и pinned snapshot query engine.
+policy, per-logical pooled chain hop grants, UDP issuer association binding,
+probe/DNS service grants и pinned snapshot query engine.
 Gate остаётся false; full runtime acceptance не выполнялся.

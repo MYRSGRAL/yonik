@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 import unittest
 from pathlib import Path
 
@@ -19,7 +20,10 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertTrue(metadata["original_flow_receipts_connected"])
         self.assertTrue(metadata["authorize_grant_consumer_connected"])
         self.assertTrue(metadata["dispatcher_chain_guards_connected"])
-        self.assertFalse(metadata["physical_session_ownership_connected"])
+        self.assertTrue(metadata["physical_session_ownership_connected"])
+        self.assertTrue(metadata["transport_guards_connected"])
+        self.assertFalse(metadata["pooled_chain_reuse_connected"])
+        self.assertFalse(metadata["probe_grants_connected"])
         self.assertFalse(metadata["builder_apply_enabled"])
         self.assertFalse(metadata["runtime_hooks_connected"])
         self.assertFalse(metadata["authority_issuer_connected"])
@@ -53,6 +57,19 @@ class FullProfilePatchTests(unittest.TestCase):
                     "app/proxyman/outbound/yonik_profile_test.go",
                     "transport/internet/dialer.go",
                     "transport/internet/udp/dispatcher.go",
+                    "common/mux/client.go",
+                    "common/mux/yonik_profile_transport_test.go",
+                    "transport/internet/system_dialer.go",
+                    "transport/internet/memory_settings.go",
+                    "transport/internet/yonik_profile_transport_test.go",
+                    "transport/internet/grpc/dial.go",
+                    "transport/internet/grpc/yonik_profile_transport_test.go",
+                    "transport/internet/hysteria/dialer.go",
+                    "transport/internet/hysteria/yonik_profile_transport_test.go",
+                    "transport/internet/splithttp/dialer.go",
+                    "transport/internet/splithttp/client.go",
+                    "transport/internet/splithttp/mux.go",
+                    "transport/internet/splithttp/yonik_profile_transport_test.go",
                 },
                 path,
             )
@@ -79,6 +96,31 @@ class FullProfilePatchTests(unittest.TestCase):
                 embedded.encode(),
                 (ADAPTER / "full-profile-fixtures" / name).read_bytes(),
             )
+
+    def test_original_flow_fixture_keeps_initiator_and_actual_udp_ports(self) -> None:
+        fixture = ADAPTER / "full-profile-fixtures/original-flow-v3.json"
+        rows = json.loads(fixture.read_text())["rows"]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            wire = bytes.fromhex(row["tupleHex"])
+            self.assertEqual(len(wire), 40)
+            network, family, reserved, local, remote = struct.unpack("!BBHHH", wire[:8])
+            self.assertIn(network, (6, 17))
+            self.assertEqual((family, reserved), (4, 0))
+            self.assertEqual(local, row["initiatorPort"])
+            self.assertEqual(remote, row["actualIngressPort"])
+            self.assertNotEqual(local, remote)
+        self.assertEqual(rows[0]["actualIngressPort"], rows[0]["ownedIngressPort"])
+        self.assertNotEqual(rows[1]["actualIngressPort"], rows[1]["ownedIngressPort"])
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        added = patch.split(
+            "+++ b/common/yonikbroker/profile-original-flow-v3.json\n", 1
+        )[1]
+        added = added.split("diff --git ", 1)[0]
+        embedded = "\n".join(
+            line[1:] for line in added.splitlines() if line.startswith("+")
+        )
+        self.assertEqual((embedded + "\n").encode(), fixture.read_bytes())
 
 
 if __name__ == "__main__":
