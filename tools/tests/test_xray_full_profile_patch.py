@@ -27,6 +27,8 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertFalse(metadata["builder_apply_enabled"])
         self.assertFalse(metadata["runtime_hooks_connected"])
         self.assertFalse(metadata["authority_issuer_connected"])
+        self.assertTrue(metadata["system_tcp_proof_consumer_connected"])
+        self.assertFalse(metadata["system_udp_association_proof_connected"])
         self.assertTrue(metadata["dns_service_consumer_connected"])
         self.assertTrue(metadata["probe_service_consumer_connected"])
         self.assertTrue(metadata["snapshot_query_engine_connected"])
@@ -106,6 +108,31 @@ class FullProfilePatchTests(unittest.TestCase):
                 embedded.encode(),
                 (ADAPTER / "full-profile-fixtures" / name).read_bytes(),
             )
+
+    def test_system_proof_fixture_is_embedded_byte_exact(self) -> None:
+        fixture = ADAPTER / "full-profile-fixtures/system-proof-extension-v1.json"
+        vectors = json.loads(fixture.read_text())
+        bootstrap = bytes.fromhex(vectors["bootstrap_hex"])
+        ack = bytes.fromhex(vectors["bootstrap_ack_hex"])
+        socket = bytes.fromhex(vectors["socket_hex"])
+        self.assertEqual(len(bootstrap), 128)
+        self.assertEqual(bootstrap[:8], b"YNKPF001")
+        self.assertEqual(ack, b"YNKPFA01" + hashlib.sha256(bootstrap).digest())
+        self.assertEqual(len(socket), 192)
+        self.assertEqual(socket[:8], b"YNKSPF01")
+        self.assertEqual(struct.unpack_from("!HHH", socket, 8), (1, 192, 1))
+        self.assertEqual(socket[146:148], bytes((2, 0)))
+        local, remote = struct.unpack_from("!HH", socket, 152)
+        self.assertNotEqual(local, remote)
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        added = patch.split(
+            "+++ b/common/yonikbroker/profile-system-proof-v1.json\n", 1
+        )[1].split("diff --git ", 1)[0]
+        embedded = (
+            "\n".join(line[1:] for line in added.splitlines() if line.startswith("+"))
+            + "\n"
+        )
+        self.assertEqual(embedded.encode(), fixture.read_bytes())
 
     def test_original_flow_fixture_keeps_initiator_and_actual_udp_ports(self) -> None:
         fixture = ADAPTER / "full-profile-fixtures/original-flow-v3.json"

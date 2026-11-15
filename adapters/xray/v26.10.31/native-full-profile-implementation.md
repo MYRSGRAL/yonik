@@ -434,8 +434,72 @@ fixture `tests/fixtures/xray-profile-channel-v3/system-proof-extension-v1.json`
 Один pre-HELLO YNKPF001/128bytes/rights1
 с отдельным proof FD и ACK YNKPFA01+SHA256 record. Затем runtime rights-free;
 YNKSPF01/192bytes actual acceptedTCP FD связывается с pending OPEN/request seq,
-proofId и tuple. В этом commit bootstrap/proof channel не менялись. UDP association
+proofId и tuple. Go consumer этой extension описан ниже. UDP association
 по-прежнему Unsupported без independent association proof; TCP proof не UDP proof.
+
+## System acceptedTCP proof consumer
+
+Counterpart — exact Rusta049da5fddbde79f43e8f621c7a77c65bc63535c и Root614dfa4
+(cancel correction без wire change). Independent fixture скопирована byte-exact
+в `full-profile-fixtures/system-proof-extension-v1.json` и embedded
+`common/yonikbroker/profile-system-proof-v1.json`; DATA не являются authority.
+
+`openProfileRuntime` после sealed launch/config/peer validation, до HELLO и
+features, в System mode принимает ровно один YNKPF001128/rights1. Credentials,
+pidfd/liveness, nonce/digest/session/invocation/generation/epoch обязательны.
+Proof endpoint проверяется как отдельный connected AF_UNIX/SOCK_SEQPACKET с
+expected SO_PEERCRED, CLOEXEC и SO_PASSCRED; duplicate runtime socket отвергается.
+ACK ровно40 bytes YNKPFA01+SHA256 record, rights0. Initial deadline сохраняется
+в `admitProfileUntil`: bootstrap/HELLO/ADMIT не начинают новый timeout. Local
+не потребляет bootstrap и не получает System proof. После bootstrap runtime
+receiver остаётся rights-free. Cmsg parser идёт по одному header и сохраняет
+rights prefix для cleanup при повреждённом suffix; лишние/unknown/truncated
+ancillary отвергаются. Proof channel не имеет входящих штатных сообщений:
+любые bytes/rights/EOF/HUP вызывают fence/revoke и cleanup.
+
+`app/proxyman/inbound/worker.go::tcpWorker.callback` вызывает `ProfileAccept`
+до stats wrapper. Broker получает actual connection через `syscall.Conn` /
+`RawConn.Control`, выполняет F_DUPFD_CLOEXEC и проверяет duplicate TCP tuple через
+getsockname/getpeername/SO_PROTOCOL/SO_TYPE. Сравнение с Go tuple повторяется
+при proof send. Нет env-number, TCPConn.File, unwrap/stat API расширения,
+pidfd_getfd, proc/exe fallback или child-supplied namespace FD.
+Duplicate — inspect/SCM-only private interface без Read/Write/raw getter.
+F_DUPFD сохраняет kernel access flags socket; O_RDONLY socket capability здесь
+не заявляется. Никаких payload operations через duplicate нет.
+
+Accepted slot и256 bytes FD metadata credit резервируются до duplicate. Actual
+kernel object удерживается до закрытия connection context, а не одного HTTP
+request. Каждый OPEN получает новый proofId и exact request sequence. После
+runtime OPEN existing single actor отправляет YNKSPF01 body192 и ровно1 FD:
+binding80=digest32/session16/invocation16/generation8/epoch8@16, nonce32@96,
+request8@128,proof8@136,ingress2@144,provenance2@146,reserved0@147,
+initiator tuple40@148,reserved4@188. Local=initiator, remote=ingress.
+Proof не создаёт Known owner и не заменяет FlowGrant.
+
+Pending requests≤64 и tombstone reservation прежние; System preflight добавляет
+128KiB proof metadata credit. EAGAIN оставляет pending operation с исходными
+proofId/sequence/deadline. Более поздний proof не обгоняет ранний ID; cancel
+разрешает пропустить неотправленный ID, но никогда не отправить его позднее.
+Zero/MAX/wrap/replay отвергаются. Разные каналы могут быть прочитаны Rust в любом
+порядке: sender не требует нового acknowledgement или polling owner actor.
+INGRESS_REPLY Allow не публикуется до proof send и после caller cancellation.
+Proof health входит в System publication/live fences. FD cleanup сериализован
+с отправкой, не допускает close/reuse numeric FD race; Close error sticky,
+handle/credit остаются в custody и session отзывается. Повторный Close не
+превращает Unknown в KnownClosed.
+
+Pure controls используют fake SCM bytes, RawConn.Control и FD operations, без
+actual sockets/ioctl/netpipe/proc/core execution. Они проверяют wire/hash parity,
+bootstrap mismatch/credential/count/deadline, Local separation, malformed cmsg
+cleanup, FIFO/EAGAIN/cancel, original deadline, EOF publication fence, partial
+export, same-object retention, Unknown и wrap preflight. Existing control
+fixtures явно моделируют уже проверенный System proof; это не production bypass.
+System UDP association возвращает Unsupported; tuple vectors остаются data,
+UDP positive control использует отдельный Local mode без OS attribution.
+
+Gate остаётся false. DNS outer files pending permission не изменены;
+provider-cache/internal DNS, resolver-peer/RRset handoff и pooled chain-hop grants
+не завершены. Actual System end-to-end/runtime acceptance не выполнялся.
 
 ## Детерминированный R8 contract: tuple orientation
 
