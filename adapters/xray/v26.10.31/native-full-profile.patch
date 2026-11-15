@@ -1,3 +1,41 @@
+diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
+--- a/app/dispatcher/default.go
++++ b/app/dispatcher/default.go
+@@ -266,6 +266,9 @@
+ 
+ // Dispatch implements routing.Dispatcher.
+ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*transport.Link, error) {
++	if e := nativehooks.ProfileDispatchEntry(ctx, destination); e != nil {
++		return nil, e
++	}
+ 	if err := nativehooks.RoutingEntry(ctx); err != nil {
+ 		return nil, err
+ 	}
+@@ -326,6 +329,9 @@
+ 
+ // DispatchLink implements routing.Dispatcher.
+ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link) error {
++	if e := nativehooks.ProfileDispatchEntry(ctx, destination); e != nil {
++		return e
++	}
+ 	if err := nativehooks.RoutingEntry(ctx); err != nil {
+ 		return err
+ 	}
+@@ -499,6 +505,13 @@
+ 	}
+ 
+ 	ob.Tag = handler.Tag()
++	var grantErr error
++	ctx, grantErr = nativehooks.ProfileSelectRoute(ctx, handler.Tag(), ob.Target)
++	if grantErr != nil {
++		common.Close(link.Writer)
++		common.Interrupt(link.Reader)
++		return grantErr
++	}
+ 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
+ 		if tag := handler.Tag(); tag != "" {
+ 			if inTag == "" {
+diff --git a/app/dns/nameserver_local.go b/app/dns/nameserver_local.go
 --- a/app/dns/nameserver_local.go
 +++ b/app/dns/nameserver_local.go
 @@ -19,7 +19,7 @@
@@ -9,6 +47,237 @@
  
  	if len(ips) > 0 {
  		errors.LogInfo(ctx, "Localhost got answer: ", domain, " -> ", ips)
+diff --git a/app/proxyman/inbound/worker.go b/app/proxyman/inbound/worker.go
+--- a/app/proxyman/inbound/worker.go
++++ b/app/proxyman/inbound/worker.go
+@@ -15,6 +15,7 @@
+ 	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/common/signal/done"
+ 	"github.com/xtls/xray-core/common/task"
++	nativehooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/features/routing"
+ 	"github.com/xtls/xray-core/features/stats"
+ 	"github.com/xtls/xray-core/proxy"
+@@ -116,6 +117,13 @@
+ 		Conn:    conn,
+ 	})
+ 
++	var acceptErr error
++	ctx, acceptErr = nativehooks.ProfileAccept(ctx, conn, w.tag)
++	if acceptErr != nil {
++		cancel()
++		conn.Close()
++		return
++	}
+ 	content := new(session.Content)
+ 	content.SniffingRequest = w.sniffingRequest
+ 	ctx = session.ContextWithContent(ctx, content)
+@@ -355,6 +363,13 @@
+ 				Gateway: net.UDPDestination(w.address, w.port),
+ 				Tag:     w.tag,
+ 			})
++			var acceptErr error
++			ctx, acceptErr = nativehooks.ProfileAccept(ctx, conn, w.tag)
++			if acceptErr != nil {
++				cancel()
++				conn.Close()
++				return
++			}
+ 			content := new(session.Content)
+ 			content.SniffingRequest = w.sniffingRequest
+ 			ctx = session.ContextWithContent(ctx, content)
+diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
+--- a/app/proxyman/outbound/handler.go
++++ b/app/proxyman/outbound/handler.go
+@@ -17,6 +17,7 @@
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/serial"
+ 	"github.com/xtls/xray-core/common/session"
++	nativehooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/outbound"
+ 	"github.com/xtls/xray-core/features/policy"
+@@ -175,11 +176,64 @@
+ }
+ 
+ // Dispatch implements proxy.Outbound.Dispatch.
++type profileMuxChoice byte
++
++const (
++	profileMuxNormal profileMuxChoice = iota
++	profileMuxTCP
++	profileMuxUDP
++	profileMuxReject
++)
++
++// Единственная actual native branch decision; capsule boolean её не заменяет.
++func (h *Handler) profileMuxDecision(target net.Destination) profileMuxChoice {
++	if h.mux == nil {
++		return profileMuxNormal
++	}
++	if target.Network == net.Network_UDP && target.Port == 443 {
++		switch h.udp443 {
++		case "reject":
++			return profileMuxReject
++		case "skip":
++			return profileMuxNormal
++		}
++	}
++	if h.xudp != nil && target.Network == net.Network_UDP {
++		if h.xudp.Enabled {
++			return profileMuxUDP
++		}
++		return profileMuxNormal
++	}
++	if h.mux.Enabled {
++		return profileMuxTCP
++	}
++	return profileMuxNormal
++}
+ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
+ 	outbounds := session.OutboundsFromContext(ctx)
+ 	ob := outbounds[len(outbounds)-1]
++	if nativehooks.ProfileHandlerEntry(ctx, h.tag, ob.Target) != nil {
++		common.Interrupt(link.Reader)
++		common.Interrupt(link.Writer)
++		return
++	}
++	authorizeProfile := func(mux bool) (func(), error) {
++		next, release, e := nativehooks.ProfileAuthorizeHandler(ctx, h.tag, ob.Target, mux)
++		if e == nil {
++			ctx = next
++			nativehooks.ProfileGuardLink(ctx, link)
++		}
++		return release, e
++	}
+ 	content := session.ContentFromContext(ctx)
+ 	if h.senderSettings != nil && h.senderSettings.TargetStrategy.HasStrategy() && ob.Target.Address.Family().IsDomain() && (content == nil || !content.SkipDNSResolve) {
++		// Snapshot/service DNS grants ещё не подключены; background resolver
++		// не должен терять original receipt и создавать скрытый fallback.
++		if nativehooks.ProfileSession(ctx) {
++			common.Interrupt(link.Reader)
++			common.Interrupt(link.Writer)
++			return
++		}
+ 		strategy := h.senderSettings.TargetStrategy
+ 		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
+ 			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
+@@ -204,38 +258,41 @@
+ 		link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
+ 		link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
+ 	}
+-	if h.mux != nil {
++	decision := h.profileMuxDecision(ob.Target)
++	if decision != profileMuxNormal {
+ 		test := func(err error) {
+ 			if err != nil {
+-				err := errors.New("failed to process mux outbound traffic").Base(err)
++				err = errors.New("failed to process mux outbound traffic").Base(err)
+ 				session.SubmitOutboundErrorToOriginator(ctx, err)
+ 				errors.LogInfo(ctx, err.Error())
+ 				common.Interrupt(link.Writer)
+ 				common.Interrupt(link.Reader)
+ 			}
+ 		}
+-		if ob.Target.Network == net.Network_UDP && ob.Target.Port == 443 {
+-			switch h.udp443 {
+-			case "reject":
+-				test(errors.New("XUDP rejected UDP/443 traffic"))
+-				return
+-			case "skip":
+-				goto out
+-			}
+-		}
+-		if h.xudp != nil && ob.Target.Network == net.Network_UDP {
+-			if !h.xudp.Enabled {
+-				goto out
+-			}
++		if decision == profileMuxReject {
++			test(errors.New("XUDP rejected UDP/443 traffic"))
++			return
++		}
++		release, e := authorizeProfile(true)
++		if e != nil {
++			test(e)
++			return
++		}
++		defer release()
++		if decision == profileMuxUDP {
+ 			test(h.xudp.Dispatch(ctx, link))
+-			return
+-		}
+-		if h.mux.Enabled {
++		} else {
+ 			test(h.mux.Dispatch(ctx, link))
+-			return
+-		}
+-	}
+-out:
++		}
++		return
++	}
++	releaseProfile, profileErr := authorizeProfile(false)
++	if profileErr != nil {
++		common.Interrupt(link.Reader)
++		common.Interrupt(link.Writer)
++		return
++	}
++	defer releaseProfile()
+ 	err := h.proxy.Process(ctx, link, h)
+ 	var errC error
+ 	if err != nil {
+@@ -266,6 +323,9 @@
+ 
+ // Dial implements internet.Dialer.
+ func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
++	if e := nativehooks.ProfileCheckDial(ctx, dest, false); e != nil {
++		return nil, e
++	}
+ 	if h.senderSettings != nil && h.senderSettings.Via != nil {
+ 		outbounds := session.OutboundsFromContext(ctx)
+ 		ob := outbounds[len(outbounds)-1]
+diff --git a/app/proxyman/outbound/yonik_profile_test.go b/app/proxyman/outbound/yonik_profile_test.go
+new file mode 100644
+--- /dev/null
++++ b/app/proxyman/outbound/yonik_profile_test.go
+@@ -0,0 +1,35 @@
++package outbound
++
++import (
++	"github.com/xtls/xray-core/common/mux"
++	"github.com/xtls/xray-core/common/net"
++	"testing"
++)
++
++func TestYonikProfileActualNativeMuxDecision(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		network    net.Network
++		port       net.Port
++		main, xudp *mux.ClientManager
++		policy     string
++		want       profileMuxChoice
++	}{
++		{"no manager", net.Network_UDP, 53, nil, nil, "", profileMuxNormal},
++		{"disabled", net.Network_TCP, 443, &mux.ClientManager{}, nil, "", profileMuxNormal},
++		{"tcp mux", net.Network_TCP, 443, &mux.ClientManager{Enabled: true}, nil, "", profileMuxTCP},
++		{"udp xudp", net.Network_UDP, 53, &mux.ClientManager{Enabled: true}, &mux.ClientManager{Enabled: true}, "", profileMuxUDP},
++		{"udp disabled xudp", net.Network_UDP, 53, &mux.ClientManager{Enabled: true}, &mux.ClientManager{}, "", profileMuxNormal},
++		{"udp main mux", net.Network_UDP, 53, &mux.ClientManager{Enabled: true}, nil, "", profileMuxTCP},
++		{"udp443 reject", net.Network_UDP, 443, &mux.ClientManager{Enabled: true}, &mux.ClientManager{Enabled: true}, "reject", profileMuxReject},
++		{"udp443 skip", net.Network_UDP, 443, &mux.ClientManager{Enabled: true}, &mux.ClientManager{Enabled: true}, "skip", profileMuxNormal},
++		{"udp443 allow", net.Network_UDP, 443, &mux.ClientManager{Enabled: true}, &mux.ClientManager{Enabled: true}, "allow", profileMuxUDP},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			h := &Handler{mux: tc.main, xudp: tc.xudp, udp443: tc.policy}
++			if got := h.profileMuxDecision(net.Destination{Network: tc.network, Port: tc.port}); got != tc.want {
++				t.Fatal(got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/common/yonikbroker/profile-launch-vectors.json b/common/yonikbroker/profile-launch-vectors.json
+new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile-launch-vectors.json
 @@ -0,0 +1,8 @@
@@ -20,9 +289,220 @@
 +  "admit_body_hex": "534d918fd76e5171c6c4bae8a4f31eb96941a80d3346cad6dc5d9e80f6f5277a000000000000000000000000000000000000000000000000000000000000000000000000000000010000ea600100000300000000000000010000100000000080000000800000004000800000000075300000100000000100000b000000000000000100010000000f000b000000016105000000000000010002000000000000000300000000000000040001000000280024000001000000010000000000000000000000000000000000000000000000000000000000000000050000000000000006000000000000000700010000000b000700000203123400016900080000000000000009000200000038001800000000060106060000ffffffff0000ffffffffffff03000000001800000000110111110000ffffffffffffffffffffffff03000000000a000000000000000b000000000000",
 +  "manifest_sha256": "534d918fd76e5171c6c4bae8a4f31eb96941a80d3346cad6dc5d9e80f6f5277a"
 +}
+diff --git a/common/yonikbroker/profile-rust-local-minimal.json b/common/yonikbroker/profile-rust-local-minimal.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-rust-local-minimal.json
+@@ -0,0 +1,25 @@
++{
++  "provenance": "independent struct.pack reference from mappingVersion3; synthetic DATA, no source/owner proof",
++  "profile": {
++    "version": 1,
++    "graph": {
++      "outbounds": [
++        {
++          "tag": "direct",
++          "protocol": "freedom"
++        }
++      ],
++      "dns": {
++        "servers": [
++          "192.0.2.53"
++        ]
++      }
++    }
++  },
++  "capsule_hex": "42380ff945bb086700c6aab465647b6b17cdf9f8869949d86238fce2bf72c917000000000000000000000000000000000000000000000000000000000000000000000000000000010000ea600100000300000000000000010000100000000080000000800000004000800000000075300000100000000100000b0000000000000001000100000014001000000006646972656374050000000000000100020000000000000003000000000000000400010000002800240000010000006eef7fffac9bb760fff69a2c41df43aaad73104657c75088f69e2168e967053a0005000100000034003000000111ffff00000000000000000000000000000000000000000000000000000000000000000411003500040000c00002350006000000000000000700020000003600170000020304380011796f6e696b2d6f776e65642d6c6f63616c00170000040104390011796f6e696b2d6f776e65642d70726f626500080000000000000009000200000038001800000000060106060000ffffffff0000ffffffffffff03000000001800000000110111110000ffffffffffffffffffffffff03000000000a000000000000000b000000000000",
++  "manifest_sha256": "42380ff945bb086700c6aab465647b6b17cdf9f8869949d86238fce2bf72c917",
++  "admit_frame_hex": "594e4b434150303100010002000002360000000000000001000000000000000101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303000000000000000400000000000000050000000000000000000000000000000042380ff945bb086700c6aab465647b6b17cdf9f8869949d86238fce2bf72c917000000000000000000000000000000000000000000000000000000000000000000000000000000010000ea600100000300000000000000010000100000000080000000800000004000800000000075300000100000000100000b0000000000000001000100000014001000000006646972656374050000000000000100020000000000000003000000000000000400010000002800240000010000006eef7fffac9bb760fff69a2c41df43aaad73104657c75088f69e2168e967053a0005000100000034003000000111ffff00000000000000000000000000000000000000000000000000000000000000000411003500040000c00002350006000000000000000700020000003600170000020304380011796f6e696b2d6f776e65642d6c6f63616c00170000040104390011796f6e696b2d6f776e65642d70726f626500080000000000000009000200000038001800000000060106060000ffffffff0000ffffffffffff03000000001800000000110111110000ffffffffffffffffffffffff03000000000a000000000000000b000000000000",
++  "transport_preimages_hex": [
++    "50355354524d303101000000"
++  ]
++}
+diff --git a/common/yonikbroker/profile-rust-resolver-snapshot-v1.json b/common/yonikbroker/profile-rust-resolver-snapshot-v1.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-rust-resolver-snapshot-v1.json
+@@ -0,0 +1,9 @@
++{
++  "nss": "hosts: files dns\n",
++  "resolv": "nameserver 127.0.0.53\nsearch example.invalid\noptions ndots:2\n",
++  "hosts": "127.0.0.1 localhost\n",
++  "hostname": "host.example.invalid",
++  "sourceSha256": "6892fe06cdec42441a09304d9aa99cdcd08a4f57e3fc20ca948a4cba055fd2bd",
++  "assetSha256": "e866b0d5a637a6a3b90e9906198a32d0a3f39655b93ae2cf78834a87c0dba62c",
++  "wireHex": "594e4b444e53303100010078000000ea6892fe06cdec42441a09304d9aa99cdcd08a4f57e3fc20ca948a4cba055fd2bd2ad90a00ddc40e2931e9da1b7c943a5d40d15039436ea2e20442d47c0916959e081ef9d5367595d16e30b4b4549d9f43537320508b4ce0788963e10e4f808857000000000000000070ea17ed14bd902667e91c9495ddef68b51e8f84dacad0e1dda7c1121cc8a6b9030202000000138800100014686f73742e6578616d706c652e696e76616c6964000100106578616d706c652e696e76616c69642e0001040000357f000035000100096c6f63616c686f73740001047f000001"
++}
+diff --git a/common/yonikbroker/profile-rust-system-chain-default-reject.json b/common/yonikbroker/profile-rust-system-chain-default-reject.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-rust-system-chain-default-reject.json
+@@ -0,0 +1,77 @@
++{
++  "provenance": "independent mappingVersion3 vector: native MuxConfig.Build default UDP443 reject; inactive source scope mask0, no rejected edge",
++  "profile": {
++    "version": 1,
++    "graph": {
++      "inbounds": [
++        {
++          "tag": "provider",
++          "protocol": "socks",
++          "port": 1080
++        }
++      ],
++      "outbounds": [
++        {
++          "tag": "a",
++          "protocol": "shadowsocks",
++          "settings": {
++            "servers": [
++              {
++                "address": "192.0.2.1",
++                "port": 443,
++                "method": "aes-128-gcm",
++                "password": "fixture"
++              }
++            ]
++          },
++          "proxySettings": {
++            "tag": "b",
++            "transportLayer": true
++          }
++        },
++        {
++          "tag": "b",
++          "protocol": "vless",
++          "settings": {
++            "vnext": [
++              {
++                "address": "192.0.2.2",
++                "port": 8443,
++                "users": [
++                  {
++                    "id": "00000000-0000-0000-0000-000000000001",
++                    "encryption": "none"
++                  }
++                ]
++              }
++            ]
++          },
++          "streamSettings": {
++            "network": "grpc",
++            "grpcSettings": {
++              "serviceName": "svc"
++            }
++          },
++          "mux": {
++            "enabled": true,
++            "concurrency": 0
++          }
++        }
++      ],
++      "observatory": {
++        "probeURL": "http://example.test/probe",
++        "subjectSelector": [
++          "a",
++          "b"
++        ]
++      }
++    }
++  },
++  "capsule_hex": "67882a57429825e6ab7bf7faca0289a03d36facf8041705d11b62209f13bc601000000000000000000000000000000000000000000000000000000000000000000000000000000010000ea600201000300000000000000010000100000000080000000800000004000800000000075300000100000000100000b000000000000000100020000001e000b00000001610200000000000001000b00000001620100000100020003000200020000002800100000040601bb00040000c00002010000000000100000040620fb00040000c000020200000000000300010000000c000800000000000200020000000400020000005000240000010000006eef7fffac9bb760fff69a2c41df43aaad73104657c75088f69e2168e967053a0024000002000000978b394a06ec54a8c503f1f034f22f2693da71a655c6ac59a0e06ac2053627600005000200000068003000000206ffff080808080808080808080808080808080808080808080808080808080808080804060035000400007f000035003000000211ffff080808080808080808080808080808080808080808080808080808080808080804110035000400007f0000350006000000000000000700030000004a00170000020304380011796f6e696b2d6f776e65642d6c6f63616c00170000040104390011796f6e696b2d6f776e65642d70726f62650010000001030000000a73797374656d2d74756e00080001000000240020000001000050000c6578616d706c652e7465737400062f70726f626500020000000100090004000000700018000000000601060600000000ffff0000ffff0000ffff02000000001800000000110000000000ffffffffffffffffffffffff00000000001800000001060200000606ffff0001ffff0001ffffffff00010000001800000001110200000606ffff0001ffff0001ffffffff00010000000a000100000012000e0000000870726f766964657200020100000b000100000050004c000008080808080808080808080808080808080808080808080808080808080808080909090909090909090909090909090909090909090909090909090909090909000000780001000000000000",
++  "manifest_sha256": "67882a57429825e6ab7bf7faca0289a03d36facf8041705d11b62209f13bc601",
++  "admit_frame_hex": "594e4b434150303100010002000003a20000000000000001000000000000000101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303000000000000000400000000000000050000000000000000000000000000000067882a57429825e6ab7bf7faca0289a03d36facf8041705d11b62209f13bc601000000000000000000000000000000000000000000000000000000000000000000000000000000010000ea600201000300000000000000010000100000000080000000800000004000800000000075300000100000000100000b000000000000000100020000001e000b00000001610200000000000001000b00000001620100000100020003000200020000002800100000040601bb00040000c00002010000000000100000040620fb00040000c000020200000000000300010000000c000800000000000200020000000400020000005000240000010000006eef7fffac9bb760fff69a2c41df43aaad73104657c75088f69e2168e967053a0024000002000000978b394a06ec54a8c503f1f034f22f2693da71a655c6ac59a0e06ac2053627600005000200000068003000000206ffff080808080808080808080808080808080808080808080808080808080808080804060035000400007f000035003000000211ffff080808080808080808080808080808080808080808080808080808080808080804110035000400007f0000350006000000000000000700030000004a00170000020304380011796f6e696b2d6f776e65642d6c6f63616c00170000040104390011796f6e696b2d6f776e65642d70726f62650010000001030000000a73797374656d2d74756e00080001000000240020000001000050000c6578616d706c652e7465737400062f70726f626500020000000100090004000000700018000000000601060600000000ffff0000ffff0000ffff02000000001800000000110000000000ffffffffffffffffffffffff00000000001800000001060200000606ffff0001ffff0001ffffffff00010000001800000001110200000606ffff0001ffff0001ffffffff00010000000a000100000012000e0000000870726f766964657200020100000b000100000050004c000008080808080808080808080808080808080808080808080808080808080808080909090909090909090909090909090909090909090909090909090909090909000000780001000000000000",
++  "transport_preimages_hex": [
++    "50355354524d303101000000",
++    "50355354524d3031020001010000000467727063000001010000000373766300000000000000000101010100000000000000000000"
++  ]
++}
+diff --git a/common/yonikbroker/profile-rust-system-chain-probe.json b/common/yonikbroker/profile-rust-system-chain-probe.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-rust-system-chain-probe.json
+@@ -0,0 +1,78 @@
++{
++  "provenance": "independent struct.pack reference from mappingVersion3; synthetic DATA, no source/owner proof",
++  "profile": {
++    "version": 1,
++    "graph": {
++      "inbounds": [
++        {
++          "tag": "provider",
++          "protocol": "socks",
++          "port": 1080
++        }
++      ],
++      "outbounds": [
++        {
++          "tag": "a",
++          "protocol": "shadowsocks",
++          "settings": {
++            "servers": [
++              {
++                "address": "192.0.2.1",
++                "port": 443,
++                "method": "aes-128-gcm",
++                "password": "fixture"
++              }
++            ]
++          },
++          "proxySettings": {
++            "tag": "b",
++            "transportLayer": true
++          }
++        },
++        {
++          "tag": "b",
++          "protocol": "vless",
++          "settings": {
++            "vnext": [
++              {
++                "address": "192.0.2.2",
++                "port": 8443,
++                "users": [
++                  {
++                    "id": "00000000-0000-0000-0000-000000000001",
++                    "encryption": "none"
++                  }
++                ]
++              }
++            ]
++          },
++          "streamSettings": {
++            "network": "grpc",
++            "grpcSettings": {
++              "serviceName": "svc"
++            }
++          },
++          "mux": {
++            "enabled": true,
++            "concurrency": 0,
++            "xudpProxyUDP443": "skip"
++          }
++        }
++      ],
++      "observatory": {
++        "probeURL": "http://example.test/probe",
++        "subjectSelector": [
++          "a",
++          "b"
++        ]
++      }
++    }
++  },
++  "capsule_hex": "497037f2e9bcc9dc301dc75d58e1e63b2b611ee070d62b4d0b7faedbd18e8152000000000000000000000000000000000000000000000000000000000000000000000000000000010000ea600201000300000000000000010000100000000080000000800000004000800000000075300000100000000100000b000000000000000100020000001e000b00000001610200000000000001000b00000001620100000100020003000200030000003c00100000040601bb00040000c00002010000000000100000041101bb00040000c00002010000000000100000040620fb00040000c0000202000000000003000200000018000800000000000200020000000800000001000300010000000400020000005000240000010000006eef7fffac9bb760fff69a2c41df43aaad73104657c75088f69e2168e967053a0024000002000000c34dce17f9829a958941be54898e8770295945c20a6c0d164bce62861b1b9cf90005000200000068003000000206ffff080808080808080808080808080808080808080808080808080808080808080804060035000400007f000035003000000211ffff080808080808080808080808080808080808080808080808080808080808080804110035000400007f0000350006000000000000000700030000004a00170000020304380011796f6e696b2d6f776e65642d6c6f63616c00170000040104390011796f6e696b2d6f776e65642d70726f62650010000001030000000a73797374656d2d74756e00080001000000240020000001000050000c6578616d706c652e7465737400062f70726f626500020000000100090004000000700018000000000601060600000000ffff0000ffff0000ffff020000000018000000001101111100000001ffffffffffff0001ffff02000000001800000001060200000606ffff0002ffff0001ffffffff000100000018000000011103060606060002000200010001ffffffff01010000000a000100000012000e0000000870726f766964657200020100000b000100000050004c000008080808080808080808080808080808080808080808080808080808080808080909090909090909090909090909090909090909090909090909090909090909000000780001000000000000",
++  "manifest_sha256": "497037f2e9bcc9dc301dc75d58e1e63b2b611ee070d62b4d0b7faedbd18e8152",
++  "admit_frame_hex": "594e4b434150303100010002000003c200000000000000010000000000000001010101010101010101010101010101010202020202020202020202020202020203030303030303030303030303030303030303030303030303030303030303030000000000000004000000000000000500000000000000000000000000000000497037f2e9bcc9dc301dc75d58e1e63b2b611ee070d62b4d0b7faedbd18e8152000000000000000000000000000000000000000000000000000000000000000000000000000000010000ea600201000300000000000000010000100000000080000000800000004000800000000075300000100000000100000b000000000000000100020000001e000b00000001610200000000000001000b00000001620100000100020003000200030000003c00100000040601bb00040000c00002010000000000100000041101bb00040000c00002010000000000100000040620fb00040000c0000202000000000003000200000018000800000000000200020000000800000001000300010000000400020000005000240000010000006eef7fffac9bb760fff69a2c41df43aaad73104657c75088f69e2168e967053a0024000002000000c34dce17f9829a958941be54898e8770295945c20a6c0d164bce62861b1b9cf90005000200000068003000000206ffff080808080808080808080808080808080808080808080808080808080808080804060035000400007f000035003000000211ffff080808080808080808080808080808080808080808080808080808080808080804110035000400007f0000350006000000000000000700030000004a00170000020304380011796f6e696b2d6f776e65642d6c6f63616c00170000040104390011796f6e696b2d6f776e65642d70726f62650010000001030000000a73797374656d2d74756e00080001000000240020000001000050000c6578616d706c652e7465737400062f70726f626500020000000100090004000000700018000000000601060600000000ffff0000ffff0000ffff020000000018000000001101111100000001ffffffffffff0001ffff02000000001800000001060200000606ffff0002ffff0001ffffffff000100000018000000011103060606060002000200010001ffffffff01010000000a000100000012000e0000000870726f766964657200020100000b000100000050004c000008080808080808080808080808080808080808080808080808080808080808080909090909090909090909090909090909090909090909090909090909090909000000780001000000000000",
++  "transport_preimages_hex": [
++    "50355354524d303101000000",
++    "50355354524d303102000101000000046772706300000101000000037376630000000000000000010101010000000000000000000100000004736b6970"
++  ]
++}
+diff --git a/common/yonikbroker/profile_capsule.go b/common/yonikbroker/profile_capsule.go
+new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_capsule.go
-@@ -0,0 +1,501 @@
+@@ -0,0 +1,509 @@
 +package nativehooks
 +
 +import (
@@ -135,7 +615,7 @@
 +func profileAssetPath(path, root string, m *profileCapsule) int {
 +	for i := 0; i < m.assetCount; i++ {
 +		a := m.assets[i]
-+		name := hex.EncodeToString(a.digest[:]) + ".dat"
++		name := "r-" + hex.EncodeToString(a.digest[:]) + ".dat"
 +		if a.dns {
 +			name = "dns-" + hex.EncodeToString(a.digest[:]) + ".bin"
 +		}
@@ -147,14 +627,15 @@
 +}
 +
 +type profileCapsule struct {
-+	hash       [32]byte
-+	admission  uint64
-+	lease      uint32
-+	policy     uint64
-+	caps       [8]uint32
-+	rows       [11][][]byte
-+	assets     [16]profileAsset
-+	assetCount int
++	memoryCredit uint64
++	hash         [32]byte
++	admission    uint64
++	lease        uint32
++	policy       uint64
++	caps         [8]uint32
++	rows         [11][][]byte
++	assets       [16]profileAsset
++	assetCount   int
 +}
 +
 +var profileRowCaps = [11]int{256, 512, 1024, 256, 64, 16, 4, 1, 512, 16, 1}
@@ -250,10 +731,14 @@
 +			dat = true
 +		}
 +	}
-+	if dat {
-+		credit += 2*1024*1024 + 32768
++	// DAT parsing завершается до создания flow ledger; эти reservations
++	// переиспользуются, а не складываются как одновременно живущие buffers.
++	stageCredit := uint64(profileFlowFixedCredit)
++	if dat && stageCredit < 2*1024*1024+32768 {
++		stageCredit = 2*1024*1024 + 32768
 +	}
-+	if credit > uint64(m.caps[4]) {
++	m.memoryCredit = credit + uint64(profileFlowFixedCredit)
++	if credit+stageCredit > uint64(m.caps[4]) {
 +		return profileCapsule{}, errProfile
 +	}
 +	return m, nil
@@ -305,7 +790,7 @@
 +	var physical [512]bool
 +	physicalCount := uint32(0)
 +	for i, b := range m.rows[8] {
-+		if len(b) != 24 || int(u16(b, 0)) >= counts(1) || (b[2] != 6 && b[2] != 17) || b[3] == 0 || b[3]&^byte(3) != 0 || !zero(b[22:]) {
++		if len(b) != 24 || int(u16(b, 0)) >= counts(1) || (b[2] != 6 && b[2] != 17) || b[3]&^byte(3) != 0 || !zero(b[22:]) {
 +			return false
 +		}
 +		for branch := 0; branch < 2; branch++ {
@@ -432,7 +917,10 @@
 +		if !c.done() || p == nil || !profileName(tag, 128) || !profileIndex(u16(p, 0), counts(7), false) || (p[2] != 1 && p[2] != 2) || p[3] != 0 {
 +			return false
 +		}
-+		if m.rows[6][u16(p, 0)][0] != p[2]+1 {
++		kind := m.rows[6][u16(p, 0)][0]
++		// Provider protocol и owned ingress — разные namespaces; System
++		// проецирует provider SOCKS/HTTP на authenticated TUN ingress.
++		if kind < 1 || kind > 3 {
 +			return false
 +		}
 +		aliases[i] = string(tag)
@@ -524,6 +1012,144 @@
 +	m.assetCount++
 +	return true
 +}
+diff --git a/common/yonikbroker/profile_compat_test.go b/common/yonikbroker/profile_compat_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_compat_test.go
+@@ -0,0 +1,131 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"crypto/sha256"
++	_ "embed"
++	"encoding/hex"
++	"encoding/json"
++	"testing"
++)
++
++//go:embed profile-rust-local-minimal.json
++var rustLocal []byte
++
++//go:embed profile-rust-system-chain-default-reject.json
++var rustClosed []byte
++
++//go:embed profile-rust-system-chain-probe.json
++var rustProbe []byte
++
++//go:embed profile-rust-resolver-snapshot-v1.json
++var rustSnapshot []byte
++
++func TestProfileRustIndependentCapsulesAndClosedScope(t *testing.T) {
++	for _, fixture := range [][]byte{rustLocal, rustClosed, rustProbe} {
++		var v struct {
++			Capsule string `json:"capsule_hex"`
++		}
++		if e := json.Unmarshal(fixture, &v); e != nil {
++			t.Fatal(e)
++		}
++		b, e := hex.DecodeString(v.Capsule)
++		if e != nil {
++			t.Fatal(e)
++		}
++		r := profileLaunch{mode: b[76]}
++		copy(r.manifest[:], b[:32])
++		for i := range r.digest {
++			r.digest[i] = 3
++		}
++		m, e := decodeProfileCapsule(b, r)
++		if e != nil {
++			t.Fatalf("independent mode%d capsule: %v", r.mode, e)
++		}
++		for scope, row := range m.rows[8] {
++			if row[3] != 0 {
++				continue
++			}
++			// Закрытый scope — DATA, но ни одна branch не создаёт AUTHORIZE.
++			f := newFlowFixture(t, r.mode)
++			receipt := f.admittedReceipt(t, "closed.invalid")
++			f.c.manifest = m
++			for branch := byte(0); branch < 2; branch++ {
++				if _, _, e = f.c.authorize(receipt.ctx, receipt, uint16(scope), branch, receipt.original, nil); e == nil {
++					t.Fatal("closed branch authorized")
++				}
++			}
++			row[4] = 6
++			if m.validate(r.mode) {
++				t.Fatal("closed scope retained dial authority")
++			}
++			row[4] = 0
++		}
++	}
++}
++
++func snapshotAsset(b []byte) profileAsset {
++	a := profileAsset{dns: true, size: uint64(len(b)), digest: sha256.Sum256(b)}
++	copy(a.source[:], b[16:48])
++	return a
++}
++
++func TestProfileSnapshotNetgoCaseAndHostsAreData(t *testing.T) {
++	var v struct {
++		Wire string `json:"wireHex"`
++		Hash string `json:"assetSha256"`
++	}
++	if e := json.Unmarshal(rustSnapshot, &v); e != nil {
++		t.Fatal(e)
++	}
++	b, e := hex.DecodeString(v.Wire)
++	if e != nil {
++		t.Fatal(e)
++	}
++	a := snapshotAsset(b)
++	if hex.EncodeToString(a.digest[:]) != v.Hash {
++		t.Fatal("independent digest")
++	}
++	if _, e = decodeProfileSnapshot(b, snapshotAsset(b)); e != nil {
++		t.Fatal("independent snapshot", e)
++	}
++	for _, old := range []string{"host.example.invalid", "example.invalid."} {
++		i := bytes.Index(b, []byte(old))
++		if i < 0 {
++			t.Fatal(old)
++		}
++		b[i] -= 32
++	}
++	// Последний literal hosts становится unspecified; resolver peer неизменен.
++	copy(b[len(b)-4:], []byte{0, 0, 0, 0})
++	if _, e = decodeProfileSnapshot(b, snapshotAsset(b)); e != nil {
++		t.Fatal("netgo case/hosts literal rejected", e)
++	}
++	peer := bytes.Index(b, []byte{4, 0, 0, 53, 127, 0, 0, 53})
++	if peer < 0 {
++		t.Fatal("peer")
++	}
++	bad := append([]byte(nil), b...)
++	copy(bad[peer+4:peer+8], []byte{0, 0, 0, 0})
++	if _, e = decodeProfileSnapshot(bad, snapshotAsset(bad)); e == nil {
++		t.Fatal("unspecified resolver peer accepted")
++	}
++	if profileIP([]byte{0, 0, 0, 0}) || (profileDestinationValue{family: 4, network: 6, port: 443, address: "0.0.0.0"}).valid() {
++		t.Fatal("hosts literal became physical authority")
++	}
++	bad = append([]byte(nil), b...)
++	bad[bytes.Index(b, []byte("Host.example.invalid"))] = '/'
++	if _, e = decodeProfileSnapshot(bad, snapshotAsset(bad)); e == nil {
++		t.Fatal("unsafe hostname accepted")
++	}
++	bad = append([]byte(nil), b...)
++	bad[bytes.Index(b, []byte("localhost"))] = 'L'
++	if _, e = decodeProfileSnapshot(bad, snapshotAsset(bad)); e == nil {
++		t.Fatal("noncanonical hosts key accepted")
++	}
++	if profileHostsLiteral([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 0, 0, 1}) {
++		t.Fatal("mapped hosts literal accepted")
++	}
++}
+diff --git a/common/yonikbroker/profile_dat.go b/common/yonikbroker/profile_dat.go
+new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dat.go
 @@ -0,0 +1,242 @@
@@ -769,9 +1395,2323 @@
 +	}
 +	return nil
 +}
+diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker/profile_flow_hooks_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_flow_hooks_linux.go
+@@ -0,0 +1,560 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"net/netip"
++	"time"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/buf"
++	xnet "github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/transport"
++)
++
++type profileAccepted struct {
++	runtime    *ProfileRuntime
++	ctx        context.Context
++	tuple      [40]byte
++	index      uint16
++	provenance byte
++}
++type profileSelectedRoute struct {
++	subject, scope uint16
++	branches       byte
++	effective      profileDestinationValue
++	chained        bool
++}
++
++func profileRuntime(ctx context.Context) *ProfileRuntime {
++	if ctx == nil {
++		return nil
++	}
++	p, _ := ctx.Value(profileContextKey{}).(*ProfileRuntime)
++	return p
++}
++func ProfileSession(ctx context.Context) bool { return profileRuntime(ctx) != nil }
++func CarryProfileSession(source, target context.Context) context.Context {
++	if p := profileRuntime(source); p != nil {
++		return context.WithValue(target, profileContextKey{}, p)
++	}
++	return target
++}
++func profileValue(d xnet.Destination) (profileDestinationValue, error) {
++	if !d.IsValid() {
++		return profileDestinationValue{}, errProfile
++	}
++	v := profileDestinationValue{port: uint16(d.Port)}
++	switch d.Network {
++	case xnet.Network_TCP:
++		v.network = 6
++	case xnet.Network_UDP:
++		v.network = 17
++	default:
++		return v, errProfile
++	}
++	if d.Address.Family().IsDomain() {
++		v.family = 3
++		v.address = d.Address.Domain()
++	} else {
++		a, ok := netip.AddrFromSlice(d.Address.IP())
++		if !ok {
++			return v, errProfile
++		}
++		a = a.Unmap()
++		v.address = a.String()
++		v.family = 6
++		if a.Is4() {
++			v.family = 4
++		}
++	}
++	if !v.valid() {
++		return v, errProfile
++	}
++	return v, nil
++}
++func profileTuple(local, remote xnet.Destination) (t [40]byte, e error) {
++	a, e := profileValue(local)
++	if e != nil {
++		return t, e
++	}
++	b, e := profileValue(remote)
++	if e != nil || a.family == 3 || b.family == 3 || a.family != b.family || a.network != b.network {
++		return t, errProfile
++	}
++	t[0] = a.network
++	t[1] = a.family
++	be.PutUint16(t[4:], a.port)
++	be.PutUint16(t[6:], b.port)
++	la, _ := netip.ParseAddr(a.address)
++	ra, _ := netip.ParseAddr(b.address)
++	copy(t[8:24], la.AsSlice())
++	copy(t[24:40], ra.AsSlice())
++	return t, nil
++}
++func (p *ProfileRuntime) flowFresh() bool {
++	if p == nil || p.ctx == nil || p.flow == nil {
++		return false
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return p.flowFence != nil && p.flowFence()
++}
++func (p *ProfileRuntime) flowRPC(op *profileOperation) error {
++	if op == nil {
++		return nil
++	}
++	p.flow.mu.Lock()
++	enqueue := !op.queued
++	op.queued = true
++	p.flow.mu.Unlock()
++	if enqueue {
++		select {
++		case p.flowQueue <- op:
++		case <-op.ctx.Done():
++			p.flow.mu.Lock()
++			p.flow.finish(op, errProfile)
++			p.flow.mu.Unlock()
++			return errProfile
++		case <-p.ctx.Done():
++			p.flow.mu.Lock()
++			p.flow.finish(op, errProfile)
++			p.flow.mu.Unlock()
++			return errProfile
++		}
++	}
++	select {
++	case <-op.done:
++		return op.err
++	case <-op.ctx.Done():
++		p.flow.abort(op)
++		return errProfile
++	case <-p.ctx.Done():
++		p.flow.abort(op)
++		return errProfile
++	}
++}
++
++// ProfileAccept вызывается только owning accepted worker с actual socket tuple.
++// Tag выбирает manifest row, но без private runtime не создаёт authority.
++func ProfileAccept(ctx context.Context, conn xnet.Conn, tag string) (context.Context, error) {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return ctx, nil
++	}
++	if !p.flowFresh() || conn == nil {
++		return ctx, errProfile
++	}
++	tuple, e := profileTuple(xnet.DestinationFromAddr(conn.RemoteAddr()), xnet.DestinationFromAddr(conn.LocalAddr()))
++	if e != nil {
++		return ctx, e
++	}
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.live() {
++		return ctx, errProfile
++	}
++	index := -1
++	for i, row := range c.manifest.rows[6] {
++		cur := profileCursor{b: row[4:]}
++		alias := cur.str(160)
++		if string(alias) == tag && (row[0] == 2 || row[0] == 3) && u16(row, 2) == u16(tuple[:], 6) {
++			index = i
++			break
++		}
++	}
++	if index < 0 {
++		return ctx, errProfile
++	}
++	provenance := byte(2)
++	if tuple[0] == 17 {
++		provenance = 3
++	}
++	for i, a := range c.accepted {
++		if a == nil && i < int(c.manifest.caps[6]) {
++			a = &profileAccepted{runtime: p, ctx: ctx, index: uint16(index), provenance: provenance, tuple: tuple}
++			c.accepted[i] = a
++			return context.WithValue(ctx, profileAcceptedKey{}, a), nil
++		}
++	}
++	return ctx, errProfile
++}
++
++// Actual UDP association port — ephemeral; TCP tuple/owner не переносится.
++func ProfileAssociateUDP(ctx context.Context, conn xnet.Conn) (context.Context, error) {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return ctx, nil
++	}
++	parent, _ := ctx.Value(profileAcceptedKey{}).(*profileAccepted)
++	if parent == nil || parent.runtime != p || parent.ctx.Err() != nil || conn == nil || !p.flowFresh() {
++		return ctx, errProfile
++	}
++	tuple, e := profileTuple(xnet.DestinationFromAddr(conn.RemoteAddr()), xnet.DestinationFromAddr(conn.LocalAddr()))
++	if e != nil || tuple[0] != 17 {
++		return ctx, errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.live() || c.manifest.rows[6][parent.index][0] != 2 {
++		return ctx, errProfile
++	}
++	for i, a := range c.accepted {
++		if a == nil && i < int(c.manifest.caps[6]) {
++			a = &profileAccepted{runtime: p, ctx: ctx, index: parent.index, provenance: 3, tuple: tuple}
++			c.accepted[i] = a
++			return context.WithValue(ctx, profileAcceptedKey{}, a), nil
++		}
++	}
++	return ctx, errProfile
++}
++func ProfileOpenOriginal(ctx context.Context, destination xnet.Destination) (context.Context, func(), error) {
++	p := profileRuntime(ctx)
++	noop := func() {}
++	if p == nil {
++		return ctx, noop, nil
++	}
++	accepted, _ := ctx.Value(profileAcceptedKey{}).(*profileAccepted)
++	if accepted == nil || accepted.runtime != p || accepted.ctx.Err() != nil || !p.flowFresh() {
++		return ctx, noop, errProfile
++	}
++	original, e := profileValue(destination)
++	if e != nil {
++		return ctx, noop, e
++	}
++	r, op, e := p.flow.open(ctx, accepted.index, accepted.provenance, accepted.tuple, original, accepted)
++	if e != nil {
++		return ctx, noop, e
++	}
++	if e = p.flowRPC(op); e != nil {
++		return ctx, noop, e
++	}
++	ctx = context.WithValue(r.ctx, profileReceiptKey{}, r)
++	release := func() { p.flow.mu.Lock(); p.flow.closeReceipt(r); p.flow.mu.Unlock() }
++	if accepted.provenance == 3 {
++		release = noop
++	}
++	return ctx, release, nil
++}
++func ProfileOpenTUN(ctx context.Context, conn xnet.Conn, destination xnet.Destination) (context.Context, func(), error) {
++	p := profileRuntime(ctx)
++	noop := func() {}
++	if p == nil {
++		return ctx, noop, nil
++	}
++	if !p.flowFresh() || p.admission.launch.mode != 2 || conn == nil {
++		return ctx, noop, errProfile
++	}
++	original, e := profileValue(destination)
++	if e != nil {
++		return ctx, noop, e
++	}
++	source := xnet.DestinationFromAddr(conn.RemoteAddr())
++	source.Network = destination.Network
++	// TUN local endpoint — immutable original destination, не TUN gateway.
++	tuple, e := profileTuple(source, destination)
++	if e != nil {
++		return ctx, noop, e
++	}
++	index := -1
++	for i, row := range p.flow.manifest.rows[6] {
++		if row[0] == 1 {
++			index = i
++			break
++		}
++	}
++	if index < 0 {
++		return ctx, noop, errProfile
++	}
++	r, op, e := p.flow.open(ctx, uint16(index), 1, tuple, original, nil)
++	if e != nil {
++		return ctx, noop, e
++	}
++	if e = p.flowRPC(op); e != nil {
++		return ctx, noop, e
++	}
++	return context.WithValue(r.ctx, profileReceiptKey{}, r), func() { p.flow.mu.Lock(); p.flow.closeReceipt(r); p.flow.mu.Unlock() }, nil
++}
++func profileReceiptFrom(ctx context.Context) *profileReceipt {
++	r, _ := ctx.Value(profileReceiptKey{}).(*profileReceipt)
++	return r
++}
++func ProfileOriginalValid(ctx context.Context) error {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return nil
++	}
++	r := profileReceiptFrom(ctx)
++	if r == nil || !p.flowFresh() {
++		return errProfile
++	}
++	p.flow.mu.Lock()
++	defer p.flow.mu.Unlock()
++	if !p.flow.receiptLive(r) || r.id == 0 {
++		return errProfile
++	}
++	return nil
++}
++func ProfileDispatchEntry(ctx context.Context, destination xnet.Destination) error {
++	if !ProfileSession(ctx) {
++		return nil
++	}
++	if ProfileOriginalValid(ctx) != nil {
++		return errProfile
++	}
++	v, e := profileValue(destination)
++	r := profileReceiptFrom(ctx)
++	if e != nil || v != r.original || v.address == "v1.mux.cool" {
++		return errProfile
++	}
++	return nil
++}
++func ProfileSameOriginal(a, b context.Context) bool {
++	if !ProfileSession(a) && !ProfileSession(b) {
++		return true
++	}
++	return profileRuntime(a) == profileRuntime(b) && profileReceiptFrom(a) != nil && profileReceiptFrom(a) == profileReceiptFrom(b)
++}
++func profileSubject(m *profileCapsule, tag string) (uint16, bool) {
++	for i, row := range m.rows[0] {
++		cur := profileCursor{b: row}
++		name := cur.str(160)
++		if string(name) == tag {
++			return uint16(i), true
++		}
++	}
++	return 0, false
++}
++func ProfileSelectRoute(ctx context.Context, tag string, effective xnet.Destination) (context.Context, error) {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return ctx, nil
++	}
++	if ProfileOriginalValid(ctx) != nil {
++		return ctx, errProfile
++	}
++	subject, ok := profileSubject(&p.flow.manifest, tag)
++	if !ok {
++		return ctx, errProfile
++	}
++	v, e := profileValue(effective)
++	if e != nil {
++		return ctx, e
++	}
++	if v.network != profileReceiptFrom(ctx).original.network {
++		return ctx, errProfile
++	}
++	return context.WithValue(ctx, profileRouteKey{}, profileSelectedRoute{subject: subject, branches: 3, effective: v}), nil
++}
++func ProfileHandlerEntry(ctx context.Context, tag string, target xnet.Destination) error {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return nil
++	}
++	if ProfileOriginalValid(ctx) != nil {
++		return errProfile
++	}
++	route, ok := ctx.Value(profileRouteKey{}).(profileSelectedRoute)
++	subject, found := profileSubject(&p.flow.manifest, tag)
++	if !ok || !found || subject != route.subject {
++		return errProfile
++	}
++	v, e := profileValue(target)
++	if e != nil || v != route.effective {
++		return errProfile
++	}
++	return nil
++}
++func ProfileAuthorizeHandler(ctx context.Context, tag string, target xnet.Destination, mux bool) (context.Context, func(), error) {
++	p := profileRuntime(ctx)
++	noop := func() {}
++	if p == nil {
++		return ctx, noop, nil
++	}
++	if ProfileHandlerEntry(ctx, tag, target) != nil {
++		return ctx, noop, errProfile
++	}
++	route := ctx.Value(profileRouteKey{}).(profileSelectedRoute)
++	v, e := profileValue(target)
++	if e != nil {
++		return ctx, noop, e
++	}
++	branch := byte(0)
++	if mux {
++		branch = 1
++	}
++	if route.branches&(1<<branch) == 0 {
++		return ctx, noop, errProfile
++	}
++	row := p.flow.manifest.rows[0][route.subject]
++	offset := len(row) - 4
++	if v.network == 17 {
++		offset += 2
++	}
++	scope := u16(row, offset)
++	if route.chained && scope != route.scope {
++		return ctx, noop, errProfile
++	}
++	g, op, e := p.flow.authorize(ctx, profileReceiptFrom(ctx), scope, branch, v, nil)
++	if e != nil {
++		return ctx, noop, e
++	}
++	if e = p.flowRPC(op); e != nil {
++		return ctx, noop, e
++	}
++	return context.WithValue(g.ctx, profileGrantKey{}, g), func() { p.flow.mu.Lock(); p.flow.closeGrant(g); p.flow.mu.Unlock() }, nil
++}
++func profileEnsureGrant(ctx context.Context, g *profileGrant) error {
++	p := profileRuntime(ctx)
++	if p == nil || g == nil || g.receipt.control != p.flow || !p.flowFresh() {
++		return errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	if !c.grantLive(g) {
++		c.mu.Unlock()
++		return errProfile
++	}
++	now := c.clock()
++	renew := g.deadline.Sub(now) <= 250*time.Millisecond || c.mode == 2 && g.ownerDeadline.Sub(now) <= 5*time.Millisecond
++	c.mu.Unlock()
++	if renew {
++		_, op, e := c.authorize(g.ctx, g.receipt, g.scope, g.branch, g.effective, g)
++		if e != nil {
++			return e
++		}
++		if e = p.flowRPC(op); e != nil {
++			return e
++		}
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.grantLive(g) || c.mode == 2 && !c.clock().Before(g.ownerDeadline) {
++		return errProfile
++	}
++	return nil
++}
++func ProfileCheckDial(ctx context.Context, target xnet.Destination, carrier bool) error {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return nil
++	}
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if profileEnsureGrant(ctx, g) != nil {
++		return errProfile
++	}
++	v, e := profileValue(target)
++	if e != nil {
++		return e
++	}
++	s := p.flow.manifest.rows[8][g.scope]
++	b := int(g.branch)
++	expected := s[4+b*2]
++	if carrier {
++		expected = s[5+b*2]
++	}
++	if v.network != expected {
++		return errProfile
++	}
++	action := s[20+b]
++	if action == 4 {
++		return errProfile
++	}
++	if action == 3 {
++		if v.address != g.effective.address || v.port != g.effective.port {
++			return errProfile
++		}
++		return nil
++	}
++	ep := p.flow.manifest.rows[1][u16(s, 8+b*2)]
++	encoded := v.encode()
++	if carrier {
++		if len(ep) != len(encoded)+4 || string(ep[:len(encoded)]) != string(encoded) {
++			return errProfile
++		}
++	} else {
++		encoded[1] = s[5+b*2]
++		if len(ep) != len(encoded)+4 || string(ep[:len(encoded)]) != string(encoded) {
++			return errProfile
++		}
++	}
++	return nil
++}
++func ProfileChain(ctx context.Context, target xnet.Destination, nextTag string) (context.Context, error) {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return ctx, nil
++	}
++	if ProfileCheckDial(ctx, target, true) != nil {
++		return ctx, errProfile
++	}
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	s := p.flow.manifest.rows[8][g.scope]
++	if s[20+int(g.branch)] != 2 || g.chain == 65535 {
++		return ctx, errProfile
++	}
++	edge := p.flow.manifest.rows[2][g.chain]
++	nextScope := u16(edge, 2)
++	next := p.flow.manifest.rows[8][nextScope]
++	subject, ok := profileSubject(&p.flow.manifest, nextTag)
++	v, e := profileValue(target)
++	if !ok || e != nil || u16(next, 0) != subject || next[2] != v.network || u16(edge, 0) != g.scope || edge[4] != g.branch {
++		return ctx, errProfile
++	}
++	ctx = context.WithValue(ctx, profileGrantKey{}, (*profileGrant)(nil))
++	return context.WithValue(ctx, profileRouteKey{}, profileSelectedRoute{subject: subject, scope: nextScope, branches: edge[5], effective: v, chained: true}), nil
++}
++
++type profileFlowReader struct {
++	ctx    context.Context
++	grant  *profileGrant
++	reader buf.Reader
++}
++
++func (r *profileFlowReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
++	if profileEnsureGrant(r.ctx, r.grant) != nil {
++		return nil, errProfile
++	}
++	mb, e := r.reader.ReadMultiBuffer()
++	if profileEnsureGrant(r.ctx, r.grant) != nil {
++		buf.ReleaseMulti(mb)
++		return nil, errProfile
++	}
++	for _, b := range mb {
++		if b.UDP != nil {
++			v, e := profileValue(*b.UDP)
++			if e != nil || v != r.grant.effective {
++				buf.ReleaseMulti(mb)
++				return nil, errProfile
++			}
++		}
++	}
++	return mb, e
++}
++func (r *profileFlowReader) Close() error { return common.Interrupt(r.reader) }
++
++type profileFlowWriter struct {
++	ctx    context.Context
++	grant  *profileGrant
++	writer buf.Writer
++}
++
++func (w *profileFlowWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	if profileEnsureGrant(w.ctx, w.grant) != nil {
++		buf.ReleaseMulti(mb)
++		return errProfile
++	}
++	return w.writer.WriteMultiBuffer(mb)
++}
++func (w *profileFlowWriter) Close() error { return common.Close(w.writer) }
++func ProfileGuardLink(ctx context.Context, link *transport.Link) {
++	if !ProfileSession(ctx) {
++		return
++	}
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	link.Reader = &profileFlowReader{ctx, g, link.Reader}
++	link.Writer = &profileFlowWriter{ctx, g, link.Writer}
++}
+diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profile_flow_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_flow_linux.go
+@@ -0,0 +1,806 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"errors"
++	"net/netip"
++	"sync"
++	"time"
++)
++
++var errProfileFlowBusy = errors.New("full-profile control budget exhausted")
++
++type profileDestinationValue struct {
++	address         string
++	port            uint16
++	family, network byte
++}
++
++func (d profileDestinationValue) valid() bool {
++	if d.port == 0 || d.network != 6 && d.network != 17 {
++		return false
++	}
++	if d.family == 3 {
++		return profileDomain([]byte(d.address))
++	}
++	a, e := netip.ParseAddr(d.address)
++	return e == nil && a.Zone() == "" && !a.Is4In6() && !a.IsUnspecified() && !a.IsMulticast() && (d.family == 4 && a.Is4() || d.family == 6 && a.Is6())
++}
++func (d profileDestinationValue) encode() []byte {
++	if !d.valid() {
++		return nil
++	}
++	var address []byte
++	if d.family == 3 {
++		address = []byte(d.address)
++	} else {
++		a, e := netip.ParseAddr(d.address)
++		if e != nil {
++			return nil
++		}
++		address = a.AsSlice()
++	}
++	b := make([]byte, 8+len(address))
++	b[0] = d.family
++	b[1] = d.network
++	be.PutUint16(b[2:], d.port)
++	be.PutUint16(b[4:], uint16(len(address)))
++	copy(b[8:], address)
++	c := profileCursor{b: b}
++	profileDestination(&c)
++	if !c.done() {
++		return nil
++	}
++	return b
++}
++
++type profileReceiptKey struct{}
++type profileGrantKey struct{}
++type profileRouteKey struct{}
++type profileAcceptedKey struct{}
++
++func profileTupleValid(t [40]byte) bool {
++	if t[0] != 6 && t[0] != 17 || !zero(t[2:4]) || u16(t[:], 4) == 0 || u16(t[:], 6) == 0 {
++		return false
++	}
++	if t[1] == 4 {
++		return zero(t[12:24]) && zero(t[28:40]) && profileIP(t[8:12]) && profileIP(t[24:28])
++	}
++	return t[1] == 6 && profileIP(t[8:24]) && profileIP(t[24:40])
++}
++
++type profileReceipt struct {
++	control             *profileFlowControl
++	ctx                 context.Context
++	cancel              context.CancelFunc
++	association         *profileAccepted
++	original            profileDestinationValue
++	tuple               [40]byte
++	id, revision        uint64
++	slot, index         uint16
++	provenance          byte
++	closed, cancelSent  bool
++	pending, grantCount int
++	openOperation       *profileOperation
++}
++type profileGrant struct {
++	receipt                             *profileReceipt
++	ctx                                 context.Context
++	cancel                              context.CancelFunc
++	effective                           profileDestinationValue
++	deadline, ownerDeadline             time.Time
++	id, revision, ownerID               uint64
++	subject, scope, stream, chain, slot uint16
++	branch, ownerKind                   byte
++	closed, cancelSent                  bool
++	pending                             int
++	refresh                             *profileOperation
++}
++type profileOperation struct {
++	ctx                                     context.Context
++	receipt                                 *profileReceipt
++	grant                                   *profileGrant
++	done                                    chan struct{}
++	err                                     error
++	body                                    []byte
++	sent, deadline                          time.Time
++	sessionDeadline                         time.Time
++	sequence, object                        uint64
++	kind                                    uint16
++	cancelled, completed, submitted, queued bool
++}
++type profileTombstone struct {
++	sequence, cancelSequence, objectCancelSequence, objectID uint64
++	deadline                                                 time.Time
++	kind                                                     uint16
++	targetKind                                               byte
++	replied, cancelled                                       bool
++}
++type profileFlowControl struct {
++	mu                                             sync.Mutex
++	manifest                                       profileCapsule
++	mode                                           byte
++	clock                                          func() time.Time
++	write                                          func(uint16, uint64, []byte) (uint64, error)
++	reply                                          func(uint16, uint64, []byte) error
++	alive                                          func() bool
++	receipts                                       [4096]*profileReceipt
++	accepted                                       [4096]*profileAccepted
++	grants                                         [4096]*profileGrant
++	pending                                        [64]*profileOperation
++	tombs                                          [256]profileTombstone
++	watermark, lastSent, highestFlow, highestGrant uint64
++	buffered                                       uint64
++	operations                                     int
++	revoked                                        bool
++	sessionDeadline                                time.Time
++}
++
++func newProfileFlowControl(m profileCapsule, mode byte, clock func() time.Time, write func(uint16, uint64, []byte) (uint64, error), alive func() bool) *profileFlowControl {
++	return &profileFlowControl{manifest: m, mode: mode, clock: clock, write: write, alive: alive, sessionDeadline: clock().Add(time.Duration(m.lease) * time.Millisecond)}
++}
++func (c *profileFlowControl) live() bool {
++	return !c.revoked && c.alive != nil && c.alive() && c.clock().Before(c.sessionDeadline)
++}
++func (c *profileFlowControl) receiptLive(r *profileReceipt) bool {
++	return c.live() && r != nil && r.control == c && !r.closed && r.ctx.Err() == nil && c.receipts[r.slot] == r
++}
++func (c *profileFlowControl) grantLive(g *profileGrant) bool {
++	return g != nil && c.receiptLive(g.receipt) && !g.closed && g.ctx.Err() == nil && c.grants[g.slot] == g && c.clock().Before(g.deadline)
++}
++func (c *profileFlowControl) operation(ctx context.Context, r *profileReceipt, g *profileGrant, kind uint16, object uint64, body []byte) (*profileOperation, error) {
++	if ctx == nil || ctx.Err() != nil || len(body) > 1024 || !c.live() || !c.operationAvailable() {
++		return nil, errProfile
++	}
++	c.operations++
++	r.pending++
++	if g != nil {
++		g.pending++
++	}
++	return &profileOperation{ctx: ctx, receipt: r, grant: g, kind: kind, object: object, body: body, done: make(chan struct{})}, nil
++}
++func (c *profileFlowControl) operationAvailable() bool {
++	if c.operations >= int(c.manifest.caps[3]) || c.operations >= 64 {
++		return false
++	}
++	// Pending и будущий tombstone резервируются одновременно, до enqueue.
++	reserved := c.operations
++	for _, t := range c.tombs {
++		if t.sequence != 0 {
++			reserved++
++		}
++	}
++	if reserved >= int(c.manifest.caps[7]) || reserved >= 256 {
++		return false
++	}
++	return true
++}
++func (c *profileFlowControl) open(ctx context.Context, index uint16, provenance byte, tuple [40]byte, original profileDestinationValue, association *profileAccepted) (*profileReceipt, *profileOperation, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.live() || ctx == nil || ctx.Err() != nil || int(index) >= len(c.manifest.rows[6]) || original.address == "v1.mux.cool" || original.network != tuple[0] || !original.valid() || !profileTupleValid(tuple) {
++		return nil, nil, errProfile
++	}
++	row := c.manifest.rows[6][index]
++	mask := byte(1)
++	if tuple[0] == 17 {
++		mask = 2
++	} else if tuple[0] != 6 {
++		return nil, nil, errProfile
++	}
++	if row[1]&mask == 0 || provenance == 1 && (c.mode != 2 || row[0] != 1) || provenance == 2 && (tuple[0] != 6 || row[0] != 2 && row[0] != 3) || provenance == 3 && (tuple[0] != 17 || row[0] != 2) || provenance < 1 || provenance > 3 {
++		return nil, nil, errProfile
++	}
++	if provenance == 3 && association == nil {
++		return nil, nil, errProfile
++	}
++	var slot = -1
++	for i, r := range c.receipts {
++		if r == nil && slot < 0 && i < int(c.manifest.caps[6]) {
++			slot = i
++		}
++		if provenance == 3 && r != nil && r.association == association && r.original == original && r.tuple == tuple {
++			if !c.receiptLive(r) {
++				return nil, nil, errProfile
++			}
++			if r.id != 0 {
++				return r, nil, nil
++			}
++			if r.openOperation != nil {
++				return r, r.openOperation, nil
++			}
++			return nil, nil, errProfile
++		}
++	}
++	if slot < 0 || !c.operationAvailable() {
++		return nil, nil, errProfile
++	}
++	// Immutable strings/buffer capacity включены в общий session budget.
++	extra := uint64((len(original.address) + 15) &^ 15)
++	if c.buffered+extra+c.manifest.memoryCredit > uint64(c.manifest.caps[4]) {
++		return nil, nil, errProfile
++	}
++	child, cancel := context.WithCancel(ctx)
++	r := &profileReceipt{control: c, ctx: child, cancel: cancel, association: association, original: original, tuple: tuple, index: index, provenance: provenance, slot: uint16(slot)}
++	body := make([]byte, 44)
++	be.PutUint16(body, index)
++	body[2] = provenance
++	copy(body[4:], tuple[:])
++	body = append(body, original.encode()...)
++	op, e := c.operation(child, r, nil, 16, 0, body)
++	if e != nil {
++		cancel()
++		return nil, nil, e
++	}
++	c.receipts[slot] = r
++	r.openOperation = op
++	c.buffered += extra
++	return r, op, nil
++}
++func (c *profileFlowControl) authorize(ctx context.Context, r *profileReceipt, scope uint16, branch byte, effective profileDestinationValue, refresh *profileGrant) (*profileGrant, *profileOperation, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.authorizeLocked(ctx, r, scope, branch, effective, refresh)
++}
++func (c *profileFlowControl) authorizeLocked(ctx context.Context, r *profileReceipt, scope uint16, branch byte, effective profileDestinationValue, refresh *profileGrant) (*profileGrant, *profileOperation, error) {
++	if ctx == nil || ctx.Err() != nil {
++		return nil, nil, errProfile
++	}
++	if !c.receiptLive(r) || r.id == 0 || !c.operationAvailable() || int(scope) >= len(c.manifest.rows[8]) || branch > 1 || !effective.valid() {
++		return nil, nil, errProfile
++	}
++	s := c.manifest.rows[8][scope]
++	if s[3]&(1<<branch) == 0 || s[2] != effective.network {
++		return nil, nil, errProfile
++	}
++	if s[20+int(branch)] == 3 && effective.family == 3 {
++		return nil, nil, errProfile
++	}
++	subject, stream, chain := u16(s, 0), u16(s, 12+int(branch)*2), u16(s, 16+int(branch)*2)
++	var g *profileGrant
++	var object uint64
++	if refresh != nil {
++		if !c.grantLive(refresh) || refresh.receipt != r || refresh.scope != scope || refresh.branch != branch || refresh.effective != effective {
++			return nil, nil, errProfile
++		}
++		if refresh.refresh != nil {
++			return refresh, refresh.refresh, nil
++		}
++		g = refresh
++		object = g.id
++	} else {
++		slot := -1
++		for i, item := range c.grants {
++			if item == nil && i < int(c.manifest.caps[0]) {
++				slot = i
++				break
++			}
++		}
++		extra := uint64((len(effective.address) + 15) &^ 15)
++		if slot < 0 || c.buffered+extra+c.manifest.memoryCredit > uint64(c.manifest.caps[4]) {
++			return nil, nil, errProfile
++		}
++		child, cancel := context.WithCancel(ctx)
++		g = &profileGrant{receipt: r, ctx: child, cancel: cancel, effective: effective, slot: uint16(slot), subject: subject, scope: scope, stream: stream, chain: chain, branch: branch}
++		c.grants[slot] = g
++		r.grantCount++
++		c.buffered += extra
++	}
++	b := make([]byte, 20)
++	be.PutUint64(b, r.id)
++	b[8] = 1
++	be.PutUint16(b[10:], subject)
++	be.PutUint16(b[12:], chain)
++	be.PutUint16(b[14:], stream)
++	be.PutUint16(b[16:], scope)
++	b[18] = branch
++	b = append(b, r.original.encode()...)
++	b = append(b, effective.encode()...)
++	// resolverIndex=None, empty queryName, OwnerReceiptKind=None/id=0:
++	// issuer выполняет fresh lookup; credential/session не подставляются как proof.
++	b = append(b, 255, 255, 0, 0)
++	b = append(b, make([]byte, 16)...)
++	op, e := c.operation(ctx, r, g, 18, object, b)
++	if e != nil && refresh == nil {
++		c.closeGrant(g)
++	}
++	if e == nil && refresh != nil {
++		g.refresh = op
++	}
++	return g, op, e
++}
++func (c *profileFlowControl) closeGrant(g *profileGrant) {
++	if g != nil && !g.closed {
++		g.closed = true
++		g.cancel()
++	}
++}
++func (c *profileFlowControl) closeReceipt(r *profileReceipt) {
++	if r != nil && !r.closed {
++		r.closed = true
++		r.cancel()
++	}
++}
++func (c *profileFlowControl) finish(op *profileOperation, e error) {
++	if op.completed {
++		return
++	}
++	op.completed = true
++	if op.receipt.openOperation == op {
++		op.receipt.openOperation = nil
++	}
++	c.operations--
++	op.receipt.pending--
++	if op.grant != nil {
++		op.grant.pending--
++		if op.grant.refresh == op {
++			op.grant.refresh = nil
++		}
++	}
++	op.err = e
++	close(op.done)
++}
++func (c *profileFlowControl) abort(op *profileOperation) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	op.cancelled = true
++	if op.kind == 16 {
++		c.closeReceipt(op.receipt)
++	} else {
++		c.closeGrant(op.grant)
++	}
++}
++func (c *profileFlowControl) cancelWire(kind byte, id uint64) (uint64, error) {
++	body := make([]byte, 12)
++	body[0] = kind
++	be.PutUint64(body[4:], id)
++	seq, e := c.write(32, 0, body)
++	if seq > c.lastSent {
++		c.lastSent = seq
++	}
++	return seq, e
++}
++func (c *profileFlowControl) cancel(kind byte, id uint64) (uint64, error) {
++	if kind == 1 {
++		return c.cancelWire(kind, id)
++	}
++	reserved := c.operations
++	for _, t := range c.tombs {
++		if t.sequence != 0 {
++			reserved++
++		}
++	}
++	if reserved >= int(c.manifest.caps[7]) || reserved >= 256 {
++		return 0, errProfileFlowBusy
++	}
++	for i, t := range c.tombs {
++		if t.sequence == 0 {
++			seq, e := c.cancelWire(kind, id)
++			if e != nil {
++				return seq, e
++			}
++			c.tombs[i] = profileTombstone{sequence: seq, kind: 32, targetKind: kind, objectID: id, deadline: c.clock().Add(time.Second)}
++			return seq, nil
++		}
++	}
++	return 0, errProfileFlowBusy
++}
++func (c *profileFlowControl) tomb(op *profileOperation, cancelled bool) error {
++	for i, t := range c.tombs {
++		if t.sequence == 0 {
++			entry := profileTombstone{sequence: op.sequence, deadline: op.deadline.Add(time.Second), kind: op.kind, replied: !cancelled, cancelled: cancelled}
++			if cancelled {
++				seq, e := c.cancel(1, op.sequence)
++				if e != nil {
++					return e
++				}
++				entry.cancelSequence = seq
++			}
++			c.tombs[i] = entry
++			return nil
++		}
++	}
++	return errProfile
++}
++func (c *profileFlowControl) dispatch(op *profileOperation) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.dispatchLocked(op)
++}
++func (c *profileFlowControl) dispatchLocked(op *profileOperation) error {
++	if op.completed {
++		return nil
++	}
++	if op.submitted {
++		return nil
++	}
++	if !c.live() || op.cancelled || op.ctx.Err() != nil || !c.receiptLive(op.receipt) {
++		if op.kind == 16 {
++			c.closeReceipt(op.receipt)
++		} else {
++			c.closeGrant(op.grant)
++		}
++		c.finish(op, errProfile)
++		return nil
++	}
++	slot := -1
++	for i, p := range c.pending {
++		if p == nil {
++			slot = i
++			break
++		}
++	}
++	if slot < 0 {
++		return errProfile
++	}
++	op.sent = c.clock()
++	op.sessionDeadline = c.sessionDeadline
++	op.deadline = op.sent.Add(time.Second)
++	if op.kind == 18 && c.mode == 2 {
++		op.deadline = op.sent.Add(20 * time.Millisecond)
++	}
++	if deadline, ok := op.ctx.Deadline(); ok && deadline.Before(op.deadline) {
++		op.deadline = deadline
++	}
++	seq, e := c.write(op.kind, op.object, op.body)
++	if e != nil {
++		c.finish(op, e)
++		return e
++	}
++	op.sequence = seq
++	op.submitted = true
++	c.pending[slot] = op
++	if seq > c.lastSent {
++		c.lastSent = seq
++	}
++	return nil
++}
++func (c *profileFlowControl) accept(f profilePacket) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.live() {
++		return errProfile
++	}
++	if f.kind == 32 {
++		b := f.body
++		if f.reply != 0 || f.object != 0 || len(b) != 12 || !zero(b[2:4]) || b[0] < 2 || b[0] > 4 || u64(b, 4) == 0 && b[0] != 4 || b[0] == 4 && u64(b, 4) != 0 {
++			return errProfile
++		}
++		id := u64(b, 4)
++		if b[0] == 2 {
++			for _, r := range c.receipts {
++				if r != nil && r.id == id {
++					c.closeReceipt(r)
++				}
++			}
++		} else if b[0] == 3 {
++			for _, g := range c.grants {
++				if g != nil && g.id == id {
++					c.closeGrant(g)
++				}
++			}
++		} else {
++			c.revoked = true
++			for _, r := range c.receipts {
++				c.closeReceipt(r)
++			}
++		}
++		ack := make([]byte, 12)
++		ack[0] = b[0]
++		ack[1] = 3
++		be.PutUint64(ack[4:], id)
++		if c.reply == nil || c.reply(34, f.sequence, ack) != nil {
++			return errProfile
++		}
++		if b[0] == 4 {
++			return errProfile
++		}
++		return nil
++	}
++	for i, op := range c.pending {
++		if op == nil || op.sequence != f.reply {
++			continue
++		}
++		expected := uint16(19)
++		if op.kind == 16 {
++			expected = 17
++		}
++		if f.kind != expected {
++			return errProfile
++		}
++		c.pending[i] = nil
++		cancelled := op.cancelled || op.ctx.Err() != nil || !c.receiptLive(op.receipt) || !c.clock().Before(op.deadline)
++		if cancelled {
++			if op.kind == 16 {
++				c.closeReceipt(op.receipt)
++			} else {
++				c.closeGrant(op.grant)
++			}
++			if e := c.tomb(op, true); e != nil {
++				return e
++			}
++			c.finish(op, errProfile)
++			return c.discardLate(f, op.kind)
++		}
++		e := c.publish(op, f)
++		if e != nil {
++			if op.kind == 16 {
++				c.closeReceipt(op.receipt)
++			} else {
++				c.closeGrant(op.grant)
++			}
++		}
++		if te := c.tomb(op, false); te != nil {
++			return te
++		}
++		c.finish(op, e)
++		return nil
++	}
++	for i, t := range c.tombs {
++		if t.sequence == f.reply {
++			if t.kind == 32 {
++				if t.replied {
++					return errProfile
++				}
++				if !profileCloseACK(f, t.targetKind, t.objectID) {
++					return errProfile
++				}
++				c.tombs[i].replied = true
++				return nil
++			}
++			if !t.cancelled || t.replied {
++				return errProfile
++			}
++			if e := c.discardLate(f, t.kind); e != nil {
++				return e
++			}
++			c.tombs[i].replied = true
++			return nil
++		}
++		if t.cancelSequence != 0 && t.cancelSequence == f.reply {
++			if !profileCloseACK(f, 1, t.sequence) {
++				return errProfile
++			}
++			c.tombs[i].cancelSequence = 0
++			return nil
++		}
++		if t.objectCancelSequence != 0 && t.objectCancelSequence == f.reply {
++			if !profileCloseACK(f, t.targetKind, t.objectID) {
++				return errProfile
++			}
++			c.tombs[i].objectCancelSequence = 0
++			return nil
++		}
++	}
++	if f.reply != 0 && f.reply <= c.watermark {
++		return nil
++	}
++	return errProfile
++}
++func (c *profileFlowControl) discardLate(f profilePacket, kind uint16) error {
++	var target byte
++	if kind == 18 {
++		if f.kind != 19 || len(f.body) != 56 {
++			return errProfile
++		}
++		target = 3
++		if f.body[0] == 1 && (u64(f.body, 4) == 0 || f.object != u64(f.body, 4)) {
++			return errProfile
++		}
++	}
++	if kind == 16 {
++		if f.kind != 17 || len(f.body) != 24 || f.object != 0 {
++			return errProfile
++		}
++		target = 2
++		if f.body[0] == 1 && u64(f.body, 4) == 0 {
++			return errProfile
++		}
++	}
++	if target != 0 {
++		if f.body[0] == 2 || f.body[0] == 3 {
++			return nil
++		}
++		if f.body[0] != 1 {
++			return errProfile
++		}
++		id := u64(f.body, 4)
++		seq, e := c.cancelWire(target, id)
++		if e != nil {
++			return e
++		}
++		for i, t := range c.tombs {
++			if t.sequence == f.reply {
++				c.tombs[i].objectCancelSequence = seq
++				c.tombs[i].targetKind = target
++				c.tombs[i].objectID = id
++				c.tombs[i].replied = true
++				return nil
++			}
++		}
++		return errProfile
++	}
++	return errProfile
++}
++func profileCloseACK(f profilePacket, kind byte, id uint64) bool {
++	return f.kind == 34 && f.object == 0 && len(f.body) == 12 && f.body[0] == kind && (f.body[1] == 1 || f.body[1] == 3) && zero(f.body[2:4]) && u64(f.body, 4) == id
++}
++func (c *profileFlowControl) publish(op *profileOperation, f profilePacket) error {
++	if op.kind == 16 {
++		b := f.body
++		if f.kind != 17 || f.object != 0 || len(b) != 24 || b[0] != 1 || b[1] != c.mode-1 || !zero(b[2:4]) || u64(b, 4) == 0 || u64(b, 4) <= c.highestFlow || u32(b, 12) != 0 || u64(b, 16) == 0 {
++			return errProfile
++		}
++		op.receipt.id = u64(b, 4)
++		op.receipt.revision = u64(b, 16)
++		c.highestFlow = op.receipt.id
++		return nil
++	}
++	b := f.body
++	g := op.grant
++	if f.kind != 19 || len(b) != 56 || b[0] != 1 || b[1] != 1 || b[2] != c.mode-1 || b[3] != 0 || u64(b, 4) == 0 || f.object != u64(b, 4) || u64(b, 12) != op.receipt.id || u32(b, 20) == 0 || u32(b, 20) > 1000 || u64(b, 24) != op.receipt.revision || !zero(b[41:48]) {
++		return errProfile
++	}
++	id := u64(b, 4)
++	if op.object == 0 {
++		if id <= c.highestGrant {
++			return errProfile
++		}
++	} else if id != op.object || g.id != id || !c.grantLive(g) {
++		return errProfile
++	}
++	ownerNS, ownerKind, ownerID := u64(b, 32), b[40], u64(b, 48)
++	if c.mode == 1 {
++		if ownerNS != 0 || ownerKind != 0 || ownerID != 0 {
++			return errProfile
++		}
++	} else if ownerNS == 0 || ownerNS > uint64(20*time.Millisecond) || ownerKind < 1 || ownerKind > 2 || ownerID == 0 {
++		return errProfile
++	}
++	deadline := op.sent.Add(time.Duration(u32(b, 20)) * time.Millisecond)
++	if op.sessionDeadline.Before(deadline) {
++		deadline = op.sessionDeadline
++	}
++	ownerDeadline := op.sent.Add(time.Duration(ownerNS))
++	if op.object != 0 && ownerKind == g.ownerKind && ownerID == g.ownerID && g.ownerDeadline.Before(ownerDeadline) {
++		ownerDeadline = g.ownerDeadline
++	}
++	if !c.clock().Before(deadline) || c.mode == 2 && !c.clock().Before(ownerDeadline) {
++		return errProfile
++	}
++	g.id = id
++	g.deadline = deadline
++	g.ownerDeadline = ownerDeadline
++	g.ownerKind = ownerKind
++	g.ownerID = ownerID
++	g.revision = u64(b, 24)
++	if id > c.highestGrant {
++		c.highestGrant = id
++	}
++	return nil
++}
++func (c *profileFlowControl) tick() error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	now := c.clock()
++	for i, t := range c.tombs {
++		if t.sequence != 0 && !now.Before(t.deadline) {
++			c.tombs[i] = profileTombstone{}
++		}
++	}
++	for i, a := range c.accepted {
++		if a != nil && a.ctx.Err() != nil {
++			c.accepted[i] = nil
++		}
++	}
++	for i, op := range c.pending {
++		if op != nil && (op.cancelled || op.ctx.Err() != nil || !c.receiptLive(op.receipt) || !now.Before(op.deadline)) {
++			if op.kind == 16 {
++				c.closeReceipt(op.receipt)
++			} else {
++				c.closeGrant(op.grant)
++			}
++			if e := c.tomb(op, true); e != nil {
++				return e
++			}
++			c.pending[i] = nil
++			c.finish(op, errProfile)
++		}
++	}
++	for i, g := range c.grants {
++		if g == nil {
++			continue
++		}
++		if g.ctx.Err() != nil || !g.deadline.IsZero() && !now.Before(g.deadline) {
++			c.closeGrant(g)
++		}
++		if !g.closed && g.id != 0 && g.refresh == nil && c.receiptLive(g.receipt) && g.deadline.Sub(now) <= 250*time.Millisecond {
++			_, op, e := c.authorizeLocked(g.ctx, g.receipt, g.scope, g.branch, g.effective, g)
++			if e == nil {
++				op.queued = true
++				if e = c.dispatchLocked(op); e != nil {
++					return e
++				}
++			}
++		}
++		if g.closed {
++			if g.id != 0 && !g.cancelSent {
++				if _, e := c.cancel(3, g.id); e != nil {
++					if e == errProfileFlowBusy {
++						break
++					}
++					return e
++				}
++				g.cancelSent = true
++			}
++			if g.pending == 0 {
++				c.buffered -= uint64((len(g.effective.address) + 15) &^ 15)
++				g.receipt.grantCount--
++				c.grants[i] = nil
++			}
++		}
++	}
++	for i, r := range c.receipts {
++		if r == nil {
++			continue
++		}
++		if r.ctx.Err() != nil {
++			c.closeReceipt(r)
++		}
++		if r.closed {
++			if r.id != 0 && !r.cancelSent {
++				if _, e := c.cancel(2, r.id); e != nil {
++					if e == errProfileFlowBusy {
++						break
++					}
++					return e
++				}
++				r.cancelSent = true
++			}
++			if r.pending == 0 && r.grantCount == 0 && (r.provenance != 3 || r.association == nil || r.association.ctx.Err() != nil) {
++				c.buffered -= uint64((len(r.original.address) + 15) &^ 15)
++				c.receipts[i] = nil
++			}
++		}
++	}
++	floor := c.lastSent + 1
++	for _, op := range c.pending {
++		if op != nil && op.sequence < floor {
++			floor = op.sequence
++		}
++	}
++	for _, t := range c.tombs {
++		if t.sequence == 0 {
++			continue
++		}
++		ready := (t.replied || t.cancelled && t.cancelSequence == 0) && t.cancelSequence == 0 && t.objectCancelSequence == 0
++		if !ready && t.sequence < floor {
++			floor = t.sequence
++		}
++	}
++	if floor > 0 && floor-1 > c.watermark {
++		c.watermark = floor - 1
++	}
++	for i, t := range c.tombs {
++		if t.sequence != 0 && t.sequence <= c.watermark {
++			c.tombs[i] = profileTombstone{}
++		}
++	}
++	return nil
++}
++func (c *profileFlowControl) revoke() {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.revoked = true
++	for _, r := range c.receipts {
++		c.closeReceipt(r)
++	}
++	for i, op := range c.pending {
++		if op != nil {
++			c.finish(op, errProfile)
++			c.pending[i] = nil
++		}
++	}
++}
+diff --git a/common/yonikbroker/profile_flow_linux_test.go b/common/yonikbroker/profile_flow_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_flow_linux_test.go
+@@ -0,0 +1,887 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net"
++	"sync"
++	"testing"
++	"time"
++	"unsafe"
++
++	"github.com/xtls/xray-core/common/buf"
++	xnet "github.com/xtls/xray-core/common/net"
++)
++
++func TestProfileFlowGrantRequiresOriginalReceipt(t *testing.T) {
++	body, r := syntheticProfileCapsule()
++	m, e := decodeProfileCapsule(body, r)
++	if e != nil {
++		t.Fatal(e)
++	}
++	now := time.Now()
++	c := newProfileFlowControl(m, 1, func() time.Time { return now }, func(uint16, uint64, []byte) (uint64, error) { return 3, nil }, func() bool { return true })
++	if _, _, e := c.authorize(context.Background(), nil, 0, 0, profileDestinationValue{network: 6, port: 443, address: "203.0.113.1", family: 4}, nil); e == nil {
++		t.Fatal("session credential стал FlowGrant")
++	}
++}
++
++type profilePureReader struct {
++	read func() (buf.MultiBuffer, error)
++}
++
++func (r profilePureReader) ReadMultiBuffer() (buf.MultiBuffer, error) { return r.read() }
++
++type profilePureWriter struct{ writes int }
++
++func (w *profilePureWriter) WriteMultiBuffer(b buf.MultiBuffer) error {
++	w.writes++
++	buf.ReleaseMulti(b)
++	return nil
++}
++
++func TestProfileFlowLogicalIORechecksCancelAndPayload(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	r := f.admittedReceipt(t, "logical.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileGrantKey{}, g)
++	// Underlying reader может вернуть payload вместе с EOF. Cancel между
++	// before/after проверками не должен публиковать даже такой payload.
++	reader := profileFlowReader{ctx: ctx, grant: g, reader: profilePureReader{read: func() (buf.MultiBuffer, error) {
++		b := buf.New()
++		b.Write([]byte("secret"))
++		f.c.mu.Lock()
++		f.c.closeReceipt(r)
++		f.c.mu.Unlock()
++		return buf.MultiBuffer{b}, io.EOF
++	}}}
++	if mb, e := reader.ReadMultiBuffer(); e == nil || len(mb) != 0 {
++		t.Fatal("cancelled EOF payload published")
++	}
++	w := &profilePureWriter{}
++	writer := profileFlowWriter{ctx: ctx, grant: g, writer: w}
++	b := buf.New()
++	b.Write([]byte("secret"))
++	if e := writer.WriteMultiBuffer(buf.MultiBuffer{b}); e == nil || w.writes != 0 {
++		t.Fatal("cancelled logical write")
++	}
++	f = newFlowFixture(t, 1)
++	r = f.admittedReceipt(t, "payload.invalid")
++	g = f.granted(t, r)
++	ctx = context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileGrantKey{}, g)
++	wrong := xnet.UDPDestination(xnet.IPAddress(net.IPv4(203, 0, 113, 10)), 443)
++	reader = profileFlowReader{ctx: ctx, grant: g, reader: profilePureReader{read: func() (buf.MultiBuffer, error) { b := buf.New(); b.UDP = &wrong; return buf.MultiBuffer{b}, io.EOF }}}
++	if mb, e := reader.ReadMultiBuffer(); e == nil || len(mb) != 0 {
++		t.Fatal("foreign per-payload destination published")
++	}
++	reader.reader = profilePureReader{read: func() (buf.MultiBuffer, error) {
++		b := buf.New()
++		b.Write([]byte("ok"))
++		return buf.MultiBuffer{b}, io.EOF
++	}}
++	mb, e := reader.ReadMultiBuffer()
++	if e != io.EOF || len(mb) != 1 {
++		t.Fatal("valid logical payload lost", e)
++	}
++	buf.ReleaseMulti(mb)
++}
++
++type flowFixture struct {
++	c                         *profileFlowControl
++	p                         *ProfileRuntime
++	now                       time.Time
++	sequence, flowID, grantID uint64
++	ownerSequence             uint64
++	writes                    []profilePacket
++}
++
++func newFlowFixture(t *testing.T, mode byte) *flowFixture {
++	t.Helper()
++	body, r := syntheticProfileCapsule()
++	if mode == 2 {
++		r.mode = 2
++		body[76] = 2
++		body[77] = 1
++		rehashProfileCapsule(body, &r)
++	}
++	m, e := decodeProfileCapsule(body, r)
++	if e != nil {
++		t.Fatal(e)
++	}
++	f := &flowFixture{now: time.Now(), sequence: 2}
++	ctx, cancel := context.WithCancel(context.Background())
++	t.Cleanup(cancel)
++	p := &ProfileRuntime{ctx: ctx, cancel: cancel, admission: profileAdmission{launch: r, capsule: m, state: profileAdmitted, deadline: f.now.Add(time.Minute)}, flowQueue: make(chan *profileOperation, 64)}
++	f.p = p
++	live := func() bool { return ctx.Err() == nil && f.now.Before(p.admission.deadline) }
++	f.c = newProfileFlowControl(m, mode, func() time.Time { return f.now }, func(kind uint16, object uint64, b []byte) (uint64, error) {
++		f.sequence++
++		f.writes = append(f.writes, profilePacket{kind: kind, sequence: f.sequence, object: object, body: append([]byte(nil), b...)})
++		return f.sequence, nil
++	}, live)
++	p.flow = f.c
++	p.flowFence = live
++	return f
++}
++func fakeFlowTuple(network byte) [40]byte {
++	var b [40]byte
++	b[0] = network
++	b[1] = 4
++	be.PutUint16(b[4:], 31000)
++	be.PutUint16(b[6:], 0x1234)
++	copy(b[8:], []byte{192, 0, 2, 1})
++	copy(b[24:], []byte{127, 0, 0, 1})
++	return b
++}
++func (f *flowFixture) ingressReply(op *profileOperation) profilePacket {
++	f.flowID++
++	b := make([]byte, 24)
++	b[0] = 1
++	b[1] = f.c.mode - 1
++	be.PutUint64(b[4:], f.flowID)
++	be.PutUint64(b[16:], 1)
++	return profilePacket{kind: 17, reply: op.sequence, body: b}
++}
++func (f *flowFixture) grantReply(op *profileOperation, ownerKind byte) profilePacket {
++	id := op.object
++	if id == 0 {
++		f.grantID++
++		id = f.grantID
++	}
++	b := make([]byte, 56)
++	b[0] = 1
++	b[1] = 1
++	b[2] = f.c.mode - 1
++	be.PutUint64(b[4:], id)
++	be.PutUint64(b[12:], op.receipt.id)
++	be.PutUint32(b[20:], 1000)
++	be.PutUint64(b[24:], 1)
++	if f.c.mode == 2 {
++		be.PutUint64(b[32:], uint64(20*time.Millisecond))
++		b[40] = ownerKind
++		be.PutUint64(b[48:], 77+f.ownerSequence)
++		f.ownerSequence++
++	}
++	return profilePacket{kind: 19, reply: op.sequence, object: id, body: b}
++}
++func (f *flowFixture) open(t *testing.T, ctx context.Context, address string) (*profileReceipt, *profileOperation) {
++	t.Helper()
++	r, op, e := f.c.open(ctx, 0, 2, fakeFlowTuple(6), profileDestinationValue{network: 6, family: 3, address: address, port: 443}, nil)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	return r, op
++}
++func (f *flowFixture) admittedReceipt(t *testing.T, address string) *profileReceipt {
++	r, op := f.open(t, context.Background(), address)
++	if e := f.c.accept(f.ingressReply(op)); e != nil {
++		t.Fatal(e)
++	}
++	<-op.done
++	if op.err != nil {
++		t.Fatal(op.err)
++	}
++	return r
++}
++func (f *flowFixture) pendingGrant(t *testing.T, r *profileReceipt) (*profileGrant, *profileOperation) {
++	t.Helper()
++	effective := profileDestinationValue{network: 6, family: 4, address: "203.0.113.9", port: 443}
++	g, op, e := f.c.authorize(r.ctx, r, 0, 0, effective, nil)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	return g, op
++}
++func (f *flowFixture) granted(t *testing.T, r *profileReceipt) *profileGrant {
++	g, op := f.pendingGrant(t, r)
++	if e := f.c.accept(f.grantReply(op, 2)); e != nil {
++		t.Fatal(e)
++	}
++	<-op.done
++	if op.err != nil {
++		t.Fatal(op.err)
++	}
++	return g
++}
++
++func TestProfileFlowReceiptLifetimeAndNoResurrection(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	r := f.admittedReceipt(t, "one.invalid")
++	g := f.granted(t, r)
++	if g.ownerKind != 0 || g.ownerID != 0 {
++		t.Fatal("Local OS proof")
++	}
++	f.now = f.now.Add(2 * time.Second)
++	if e := f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if !f.c.receiptLive(r) || f.c.grantLive(g) {
++		t.Fatal("receipt получил grant TTL")
++	}
++	if _, _, e := f.c.authorize(r.ctx, r, 0, 0, g.effective, g); e == nil {
++		t.Fatal("expired grant resurrected")
++	}
++	f.c.mu.Lock()
++	f.c.closeReceipt(r)
++	f.c.mu.Unlock()
++	if _, _, e := f.c.authorize(r.ctx, r, 0, 0, g.effective, nil); e == nil {
++		t.Fatal("closed receipt resurrected")
++	}
++}
++func TestProfileFlowOwnerFreshnessAndNamespaces(t *testing.T) {
++	for _, kind := range []byte{1, 2} {
++		t.Run(string(rune('0'+kind)), func(t *testing.T) {
++			f := newFlowFixture(t, 2)
++			r := f.admittedReceipt(t, "one.invalid")
++			g, op := f.pendingGrant(t, r)
++			reply := f.grantReply(op, kind)
++			f.now = f.now.Add(3 * time.Millisecond)
++			if e := f.c.accept(reply); e != nil || op.err != nil {
++				t.Fatal(e, op.err)
++			}
++			if g.ownerKind != kind || g.ownerID != 77 || g.ownerDeadline != op.sent.Add(20*time.Millisecond) {
++				t.Fatal("owner namespace/queue extended TTL")
++			}
++			if !zero(op.body[len(op.body)-16:]) {
++				t.Fatal("synthetic FrozenSent request")
++			}
++		})
++	}
++	f := newFlowFixture(t, 2)
++	r := f.admittedReceipt(t, "stale.invalid")
++	g, op := f.pendingGrant(t, r)
++	reply := f.grantReply(op, 2)
++	f.now = f.now.Add(21 * time.Millisecond)
++	if e := f.c.accept(reply); e != nil {
++		t.Fatal(e)
++	}
++	if op.err == nil || g.id != 0 || !g.closed {
++		t.Fatal("stale owner grant published")
++	}
++	local := newFlowFixture(t, 1)
++	rr := local.admittedReceipt(t, "local.invalid")
++	gg, oo := local.pendingGrant(t, rr)
++	bad := local.grantReply(oo, 0)
++	bad.body[40] = 1
++	be.PutUint64(bad.body[48:], 77)
++	if local.c.accept(bad) != nil || oo.err == nil || gg.id != 0 {
++		t.Fatal("Local accepted owner proof")
++	}
++}
++func TestProfileFlowCancelLateReplyAndNeighbourIsolation(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	a := f.admittedReceipt(t, "a.invalid")
++	b := f.admittedReceipt(t, "b.invalid")
++	ga, opa := f.pendingGrant(t, a)
++	late := f.grantReply(opa, 0)
++	gb, opb := f.pendingGrant(t, b)
++	good := f.grantReply(opb, 0)
++	f.c.abort(opa)
++	if e := f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if e := f.c.accept(good); e != nil || opb.err != nil {
++		t.Fatal(e, opb.err)
++	}
++	if e := f.c.accept(late); e != nil {
++		t.Fatal(e)
++	}
++	if ga.id != 0 || !ga.closed || !f.c.grantLive(gb) || !f.c.receiptLive(b) {
++		t.Fatal("late grant/соседний flow")
++	}
++	last := f.writes[len(f.writes)-1]
++	if last.kind != 32 || last.body[0] != 3 || u64(last.body, 4) != late.object {
++		t.Fatal("late GRANT не отменён")
++	}
++	f.c.revoke()
++	if f.c.grantLive(gb) || b.ctx.Err() == nil {
++		t.Fatal("global revoke")
++	}
++}
++func TestProfileFlowRefreshKeepsOldDeadlineUntilReply(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	r := f.admittedReceipt(t, "one.invalid")
++	g := f.granted(t, r)
++	old := g.deadline
++	f.now = f.now.Add(800 * time.Millisecond)
++	_, op, e := f.c.authorize(g.ctx, r, g.scope, g.branch, g.effective, g)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if f.c.dispatch(op) != nil {
++		t.Fatal("dispatch")
++	}
++	if g.deadline != old || op.object != g.id {
++		t.Fatal("eager lease extension")
++	}
++	_, same, e := f.c.authorize(g.ctx, r, g.scope, g.branch, g.effective, g)
++	if e != nil || same != op {
++		t.Fatal("duplicate refresh")
++	}
++	if e = f.c.accept(f.grantReply(op, 0)); e != nil || op.err != nil || !g.deadline.After(old) {
++		t.Fatal("refresh", e, op.err)
++	}
++	f.c.mu.Lock()
++	f.c.closeReceipt(r)
++	f.c.mu.Unlock()
++	if _, _, e = f.c.authorize(g.ctx, r, g.scope, g.branch, g.effective, g); e == nil {
++		t.Fatal("closed during refresh")
++	}
++}
++func TestProfileFlowBudgetPreflightNoAllocation(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.c.manifest.caps[3] = 1
++	_, op := f.open(t, context.Background(), "one.invalid")
++	dest := profileDestinationValue{network: 6, family: 3, address: "other.invalid", port: 443}
++	tuple := fakeFlowTuple(6)
++	allocations := testing.AllocsPerRun(100, func() {
++		if _, _, e := f.c.open(context.Background(), 0, 2, tuple, dest, nil); e == nil {
++			t.Fatal("pending overflow")
++		}
++	})
++	if allocations != 0 {
++		t.Fatal("overflow allocated", allocations)
++	}
++	f.c.abort(op)
++	if e := f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	f.c.manifest.caps[7] = 1
++	allocations = testing.AllocsPerRun(100, func() {
++		if _, _, e := f.c.open(context.Background(), 0, 2, tuple, dest, nil); e == nil {
++			t.Fatal("tombstone overflow")
++		}
++	})
++	if allocations != 0 {
++		t.Fatal("tombstone overflow allocated", allocations)
++	}
++	if unsafe.Sizeof(profileReceipt{}) > 256 || unsafe.Sizeof(profileGrant{}) > 256 || unsafe.Sizeof(profileTombstone{}) > 64 || unsafe.Sizeof(profileOperation{})+1024 > 2048 {
++		t.Fatal("ledger sizing changed")
++	}
++}
++
++type flowFakeConn struct {
++	local, remote net.Addr
++	closed        bool
++}
++
++func (c *flowFakeConn) LocalAddr() net.Addr            { return c.local }
++func (c *flowFakeConn) RemoteAddr() net.Addr           { return c.remote }
++func (c *flowFakeConn) Close() error                   { c.closed = true; return nil }
++func (*flowFakeConn) Read([]byte) (int, error)         { return 0, io.EOF }
++func (*flowFakeConn) Write(b []byte) (int, error)      { return len(b), nil }
++func (*flowFakeConn) SetDeadline(time.Time) error      { return nil }
++func (*flowFakeConn) SetReadDeadline(time.Time) error  { return nil }
++func (*flowFakeConn) SetWriteDeadline(time.Time) error { return nil }
++func fakeTCPFlowConn() *flowFakeConn {
++	return &flowFakeConn{local: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0x1234}, remote: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 31000}}
++}
++func (f *flowFixture) serve(t *testing.T) func() {
++	stop := make(chan struct{})
++	var wg sync.WaitGroup
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for {
++			select {
++			case <-stop:
++				return
++			case op := <-f.p.flowQueue:
++				if e := f.c.dispatch(op); e != nil {
++					f.c.mu.Lock()
++					f.c.finish(op, e)
++					f.c.mu.Unlock()
++					continue
++				}
++				var reply profilePacket
++				if op.kind == 16 {
++					reply = f.ingressReply(op)
++				} else {
++					reply = f.grantReply(op, 2)
++				}
++				if e := f.c.accept(reply); e != nil {
++					f.c.mu.Lock()
++					f.c.finish(op, e)
++					f.c.mu.Unlock()
++				}
++			}
++		}
++	}()
++	return func() { close(stop); wg.Wait() }
++}
++func TestProfileFlowActualHooksKeepOriginalAndHTTPRequestsDistinct(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	defer f.serve(t)()
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	// Fake admitted VLESS/TCP graph: user target может быть domain, physical
++	// endpoint строго static и не зависит от mutable request destination.
++	f.c.manifest.rows[0][0][3] = 1
++	proxyDest := profileDestinationValue{network: 6, family: 4, address: "198.51.100.10", port: 443}
++	f.c.manifest.rows[1] = [][]byte{append(proxyDest.encode(), 0, 0, 0, 0)}
++	for _, s := range f.c.manifest.rows[8] {
++		s[4] = 6
++		s[5] = 6
++		be.PutUint16(s[8:], 0)
++		be.PutUint16(s[12:], 0)
++		s[20] = 1
++	}
++	ctx, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	dest := xnet.TCPDestination(xnet.DomainAddress("one.invalid"), 443)
++	first, closeFirst, e := ProfileOpenOriginal(ctx, dest)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = ProfileDispatchEntry(first, dest); e != nil {
++		t.Fatal(e)
++	}
++	if e = ProfileDispatchEntry(first, xnet.TCPDestination(xnet.DomainAddress("changed.invalid"), 443)); e == nil {
++		t.Fatal("original was rewritten")
++	}
++	selected, e := ProfileSelectRoute(first, "a", dest)
++	if e != nil {
++		t.Fatal(e)
++	}
++	granted, release, e := ProfileAuthorizeHandler(selected, "a", dest, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	g := granted.Value(profileGrantKey{}).(*profileGrant)
++	if g.receipt.original.address != "one.invalid" || ProfileCheckDial(granted, xnet.TCPDestination(xnet.IPAddress(net.IPv4(198, 51, 100, 10)), 443), false) != nil {
++		t.Fatal("grant binding")
++	}
++	if ProfileCheckDial(granted, xnet.UDPDestination(dest.Address, 443), false) == nil {
++		t.Fatal("wrong proxy dial network")
++	}
++	release()
++	closeFirst()
++	second, closeSecond, e := ProfileOpenOriginal(ctx, dest)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer closeSecond()
++	if profileReceiptFrom(first).id == profileReceiptFrom(second).id || ProfileOriginalValid(first) == nil || !ProfileSameOriginal(second, second) {
++		t.Fatal("HTTP keep-alive reused old receipt")
++	}
++	if !bytes.Equal(profileReceiptFrom(second).tuple[8:12], []byte{192, 0, 2, 1}) {
++		t.Fatal("tuple initiator orientation")
++	}
++	bad := fakeTCPFlowConn()
++	bad.local = &net.TCPAddr{IP: net.IPv4zero, Port: 0x1234}
++	if _, e = ProfileAccept(ctx, bad, "i"); e == nil {
++		t.Fatal("wildcard accepted")
++	}
++}
++
++func (f *flowFixture) installManifest(t *testing.T, rows [11][][]byte) {
++	t.Helper()
++	m := f.c.manifest
++	b := make([]byte, 128)
++	be.PutUint64(b[64:], 1)
++	be.PutUint32(b[72:], m.lease)
++	b[76] = f.c.mode
++	b[77] = f.c.mode - 1
++	be.PutUint16(b[78:], 3)
++	be.PutUint64(b[80:], m.policy)
++	for i, v := range m.caps {
++		be.PutUint32(b[88+i*4:], v)
++	}
++	be.PutUint16(b[120:], 11)
++	for i, table := range rows {
++		var encoded []byte
++		for _, row := range table {
++			prefix := make([]byte, 4)
++			be.PutUint16(prefix, uint16(len(row)))
++			encoded = append(encoded, prefix...)
++			encoded = append(encoded, row...)
++		}
++		p := make([]byte, 8)
++		be.PutUint16(p, uint16(i+1))
++		be.PutUint16(p[2:], uint16(len(table)))
++		be.PutUint32(p[4:], uint32(len(encoded)))
++		b = append(b, p...)
++		b = append(b, encoded...)
++	}
++	r := f.p.admission.launch
++	rehashProfileCapsule(b, &r)
++	next, e := decodeProfileCapsule(b, r)
++	if e != nil {
++		t.Fatal("fake producer manifest", e)
++	}
++	f.c.manifest = next
++	f.p.admission.launch = r
++	f.p.admission.capsule = next
++}
++func flowSubject(name string, kind byte, stream, tcp, udp uint16) []byte {
++	b := []byte{0, byte(len(name))}
++	b = append(b, []byte(name)...)
++	b = append(b, kind, 0)
++	for _, v := range []uint16{stream, tcp, udp} {
++		p := make([]byte, 2)
++		be.PutUint16(p, v)
++		b = append(b, p...)
++	}
++	return b
++}
++func flowScope(subject uint16, input, dial, carrier, action byte, endpoint, stream, chain uint16) []byte {
++	b := make([]byte, 24)
++	be.PutUint16(b, subject)
++	b[2] = input
++	b[3] = 1
++	b[4] = dial
++	b[5] = carrier
++	for i := 8; i < 20; i++ {
++		b[i] = 255
++	}
++	be.PutUint16(b[8:], endpoint)
++	be.PutUint16(b[12:], stream)
++	be.PutUint16(b[16:], chain)
++	b[20] = action
++	return b
++}
++func flowEndpoint(network byte, address string, port uint16) []byte {
++	return append((profileDestinationValue{network: network, address: address, port: port, family: 4}).encode(), 0, 0, 0, 0)
++}
++func flowEdge(source, next uint16) []byte {
++	b := make([]byte, 8)
++	be.PutUint16(b, source)
++	be.PutUint16(b[2:], next)
++	b[5] = 1
++	return b
++}
++func (f *flowFixture) chainGraph(t *testing.T, variant string) {
++	rows := f.c.manifest.rows
++	firstKind, transport, security := byte(1), byte(3), byte(1)
++	if variant == "hysteria" {
++		firstKind = 4
++		transport = 4
++		security = 0
++	}
++	streamA := make([]byte, 36)
++	streamA[0] = transport
++	streamA[1] = security
++	streamA[4] = 1
++	streamB := make([]byte, 36)
++	streamB[0] = 2
++	streamB[4] = 2
++	rows[3] = [][]byte{streamA, streamB}
++	if variant == "grpc-udp-to-tcp" {
++		rows[0] = [][]byte{flowSubject("a", 1, 0, 0, 1), flowSubject("b", 2, 1, 2, 3)}
++		streamA[0] = 2
++		streamA[1] = 0
++		rows[1] = [][]byte{flowEndpoint(6, "198.51.100.1", 443), flowEndpoint(6, "198.51.100.2", 8388), flowEndpoint(17, "198.51.100.2", 8388)}
++		rows[8] = [][]byte{flowScope(0, 6, 6, 6, 2, 0, 0, 0), flowScope(0, 17, 6, 6, 2, 0, 0, 1), flowScope(1, 6, 6, 6, 1, 1, 1, 65535), flowScope(1, 17, 17, 17, 1, 2, 65535, 65535)}
++		rows[2] = [][]byte{flowEdge(0, 2), flowEdge(1, 2)}
++	} else if variant == "ss-raw-udp" {
++		rows[0] = [][]byte{flowSubject("a", 2, 0, 0, 1), flowSubject("b", 1, 1, 2, 3)}
++		streamA[0] = 2
++		streamA[1] = 0
++		rows[1] = [][]byte{flowEndpoint(6, "198.51.100.1", 443), flowEndpoint(17, "198.51.100.1", 443), flowEndpoint(6, "198.51.100.2", 8388)}
++		rows[8] = [][]byte{flowScope(0, 6, 6, 6, 2, 0, 0, 0), flowScope(0, 17, 17, 17, 2, 1, 65535, 1), flowScope(1, 6, 6, 6, 1, 2, 1, 65535), flowScope(1, 17, 6, 6, 1, 2, 1, 65535)}
++		rows[2] = [][]byte{flowEdge(0, 2), flowEdge(1, 3)}
++	} else {
++		rows[0] = [][]byte{flowSubject("a", firstKind, 0, 0, 1), flowSubject("b", 2, 1, 2, 3)}
++		rows[1] = [][]byte{flowEndpoint(17, "198.51.100.1", 443), flowEndpoint(6, "198.51.100.2", 8388), flowEndpoint(17, "198.51.100.2", 8388)}
++		rows[8] = [][]byte{flowScope(0, 6, 6, 17, 2, 0, 0, 0), flowScope(0, 17, 6, 17, 2, 0, 0, 1), flowScope(1, 6, 6, 6, 1, 1, 1, 65535), flowScope(1, 17, 17, 17, 1, 2, 65535, 65535)}
++		rows[2] = [][]byte{flowEdge(0, 3), flowEdge(1, 3)}
++		// TCP mux disabled, XUDP enabled, UDP/443 skip: B TCP normal;
++		// B UDP имеет обе branches, но source endpoint:443 выбирает normal.
++		s := rows[8][3]
++		s[3] = 3
++		s[6] = 6
++		s[7] = 6
++		be.PutUint16(s[10:], 1)
++		be.PutUint16(s[14:], 1)
++		s[21] = 1
++	}
++	f.installManifest(t, rows)
++}
++func TestProfileFlowChainCarrierBecomesNextInput(t *testing.T) {
++	for _, variant := range []string{"xhttp-h3", "hysteria", "ss-raw-udp", "grpc-udp-to-tcp"} {
++		t.Run(variant, func(t *testing.T) {
++			f := newFlowFixture(t, 1)
++			f.chainGraph(t, variant)
++			stop := f.serve(t)
++			defer stop()
++			ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++			ctx, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
++			if e != nil {
++				t.Fatal(e)
++			}
++			destination := xnet.TCPDestination(xnet.DomainAddress("original.invalid"), 443)
++			if variant == "ss-raw-udp" || variant == "grpc-udp-to-tcp" {
++				conn := &flowFakeConn{local: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 49152}, remote: &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 32001}}
++				ctx, e = ProfileAssociateUDP(ctx, conn)
++				if e != nil {
++					t.Fatal(e)
++				}
++				destination = xnet.UDPDestination(destination.Address, 443)
++			}
++			original, closeOriginal, e := ProfileOpenOriginal(ctx, destination)
++			if e != nil {
++				t.Fatal(e)
++			}
++			defer closeOriginal()
++			selected, e := ProfileSelectRoute(original, "a", destination)
++			if e != nil {
++				t.Fatal(e)
++			}
++			first, release, e := ProfileAuthorizeHandler(selected, "a", destination, false)
++			if e != nil {
++				t.Fatal(e)
++			}
++			defer release()
++			aTCP := xnet.TCPDestination(xnet.IPAddress(net.IPv4(198, 51, 100, 1)), 443)
++			aUDP := xnet.UDPDestination(aTCP.Address, 443)
++			dial := aTCP
++			if variant == "ss-raw-udp" {
++				dial = aUDP
++			}
++			carrier, wrong := aUDP, aTCP
++			nextScope := uint16(3)
++			if variant == "grpc-udp-to-tcp" {
++				carrier, wrong = aTCP, aUDP
++				nextScope = 2
++			}
++			if ProfileCheckDial(first, dial, false) != nil || ProfileCheckDial(first, carrier, true) != nil {
++				t.Fatal("source D/C")
++			}
++			if _, e = ProfileChain(first, wrong, "b"); e == nil {
++				t.Fatal("original/default protocol вместо carrier")
++			}
++			chained, e := ProfileChain(first, carrier, "b")
++			if e != nil {
++				t.Fatal(e)
++			}
++			if variant == "xhttp-h3" || variant == "hysteria" {
++				if _, _, e = ProfileAuthorizeHandler(chained, "b", carrier, true); e == nil {
++					t.Fatal("mux bool обошёл exact nextBranchMask")
++				}
++			}
++			if _, _, e = ProfileAuthorizeHandler(chained, "b", wrong, false); e == nil {
++				t.Fatal("next input вместо C")
++			}
++			second, releaseSecond, e := ProfileAuthorizeHandler(chained, "b", carrier, false)
++			if e != nil {
++				t.Fatal(e)
++			}
++			defer releaseSecond()
++			g := second.Value(profileGrantKey{}).(*profileGrant)
++			if g.scope != nextScope || g.receipt.original.network != profileReceiptFrom(original).original.network || g.receipt.id != profileReceiptFrom(original).id {
++				t.Fatal("original/provenance changed")
++			}
++			bNetwork := xnet.Network_UDP
++			expectedStream := uint16(65535)
++			if variant == "ss-raw-udp" || variant == "grpc-udp-to-tcp" {
++				bNetwork = xnet.Network_TCP
++				expectedStream = 1
++			}
++			bDial := xnet.Destination{Network: bNetwork, Address: xnet.IPAddress(net.IPv4(198, 51, 100, 2)), Port: 8388}
++			if g.stream != expectedStream || ProfileCheckDial(second, bDial, false) != nil {
++				t.Fatal("raw UDP/configured stream")
++			}
++		})
++	}
++}
++func TestProfileFlowSessionRenewalCannotExtendOldGrant(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.c.sessionDeadline = f.now.Add(50 * time.Millisecond)
++	r := f.admittedReceipt(t, "one.invalid")
++	g := f.granted(t, r)
++	if g.deadline != f.now.Add(50*time.Millisecond) {
++		t.Fatal("grant escaped session deadline")
++	}
++	f.c.sessionDeadline = f.now.Add(time.Minute)
++	f.now = f.now.Add(51 * time.Millisecond)
++	if f.c.grantLive(g) || !f.c.receiptLive(r) {
++		t.Fatal("renew extended old grant/lifetime")
++	}
++}
++func TestProfileFlowAssociationUsesActualUDPTupleAndDestinations(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	defer f.serve(t)()
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	ctx, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	udp := &flowFakeConn{local: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 49152}, remote: &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 32001}}
++	ctx, e = ProfileAssociateUDP(ctx, udp)
++	if e != nil {
++		t.Fatal(e)
++	}
++	one := xnet.UDPDestination(xnet.IPAddress(net.IPv4(203, 0, 113, 1)), 53)
++	two := xnet.UDPDestination(xnet.IPAddress(net.IPv4(203, 0, 113, 2)), 53)
++	first, _, e := ProfileOpenOriginal(ctx, one)
++	if e != nil {
++		t.Fatal(e)
++	}
++	same, _, e := ProfileOpenOriginal(ctx, one)
++	if e != nil {
++		t.Fatal(e)
++	}
++	second, _, e := ProfileOpenOriginal(ctx, two)
++	if e != nil {
++		t.Fatal(e)
++	}
++	a, b := profileReceiptFrom(first), profileReceiptFrom(second)
++	if a != profileReceiptFrom(same) || a.id == b.id || a.tuple[0] != 17 || u16(a.tuple[:], 4) != 32001 || u16(a.tuple[:], 6) != 49152 || ProfileSameOriginal(first, second) {
++		t.Fatal("UDP reused TCP/other destination proof")
++	}
++	f.c.mu.Lock()
++	f.c.closeReceipt(a)
++	f.c.mu.Unlock()
++	if _, _, e = ProfileOpenOriginal(ctx, one); e == nil {
++		t.Fatal("closed UDP receipt resurrected")
++	}
++	if ProfileOriginalValid(second) != nil {
++		t.Fatal("UDP neighbour cancelled")
++	}
++}
++
++func TestProfileFlowSameOwnerReceiptCannotExtendFreshness(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	r := f.admittedReceipt(t, "one.invalid")
++	g := f.granted(t, r)
++	deadline := g.ownerDeadline
++	kind, id := g.ownerKind, g.ownerID
++	f.now = f.now.Add(10 * time.Millisecond)
++	_, op, e := f.c.authorize(g.ctx, r, g.scope, g.branch, g.effective, g)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	reply := f.grantReply(op, kind)
++	be.PutUint64(reply.body[48:], id)
++	if e = f.c.accept(reply); e != nil || op.err != nil || g.ownerDeadline != deadline {
++		t.Fatal("same owner receipt retimed", e, op.err)
++	}
++	f.now = f.now.Add(11 * time.Millisecond)
++	_, op, e = f.c.authorize(g.ctx, r, g.scope, g.branch, g.effective, g)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	reply = f.grantReply(op, kind)
++	be.PutUint64(reply.body[48:], id)
++	if e = f.c.accept(reply); e != nil {
++		t.Fatal(e)
++	}
++	if op.err == nil || !g.closed {
++		t.Fatal("stale owner receipt resurrected by new lease")
++	}
++}
++func TestProfileFlowRetiredLateReplyDoesNotResetNeighbour(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	a := f.admittedReceipt(t, "a.invalid")
++	b := f.admittedReceipt(t, "b.invalid")
++	ga, oa := f.pendingGrant(t, a)
++	late := f.grantReply(oa, 0)
++	gb, ob := f.pendingGrant(t, b)
++	good := f.grantReply(ob, 0)
++	f.c.abort(oa)
++	if e := f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	cancel := f.writes[len(f.writes)-1]
++	ack := make([]byte, 12)
++	ack[0] = 1
++	ack[1] = 3
++	be.PutUint64(ack[4:], oa.sequence)
++	if e := f.c.accept(profilePacket{kind: 34, reply: cancel.sequence, body: ack}); e != nil {
++		t.Fatal(e)
++	}
++	if e := f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if f.c.watermark < oa.sequence || f.c.watermark >= ob.sequence {
++		t.Fatal("watermark crossed live hole")
++	}
++	if e := f.c.accept(late); e != nil || ga.id != 0 {
++		t.Fatal("retired late publication", e)
++	}
++	if e := f.c.accept(good); e != nil || ob.err != nil || !f.c.grantLive(gb) {
++		t.Fatal("neighbour lost", e, ob.err)
++	}
++	if e := f.c.accept(profilePacket{kind: 19, reply: 999, object: 99, body: make([]byte, 56)}); e == nil {
++		t.Fatal("future reply accepted")
++	}
++}
++func TestProfileFlowTUNProofIsSystemAndTupleBound(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	rows := f.c.manifest.rows
++	rows[6] = append(rows[6], []byte{1, 3, 0, 0, 0, 1, 't'})
++	f.installManifest(t, rows)
++	defer f.serve(t)()
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	conn := fakeTCPFlowConn()
++	dest := xnet.TCPDestination(xnet.IPAddress(net.IPv4(203, 0, 113, 50)), 443)
++	flow, release, e := ProfileOpenTUN(ctx, conn, dest)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	r := profileReceiptFrom(flow)
++	if r.provenance != 1 || r.index != 1 || r.original.family != 4 || !bytes.Equal(r.tuple[8:12], []byte{192, 0, 2, 1}) || !bytes.Equal(r.tuple[24:28], []byte{203, 0, 113, 50}) {
++		t.Fatal("TUN original tuple")
++	}
++	local := newFlowFixture(t, 1)
++	localCtx := context.WithValue(local.p.ctx, profileContextKey{}, local.p)
++	if _, _, e = ProfileOpenTUN(localCtx, conn, dest); e == nil {
++		t.Fatal("Local minted System receipt")
++	}
++}
++func TestProfileFlowIdleCONNECTRefreshesWithoutResurrection(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	r := f.admittedReceipt(t, "connect.invalid")
++	g := f.granted(t, r)
++	id := g.id
++	start := f.now
++	for i := 0; i < 4; i++ {
++		f.now = f.now.Add(800 * time.Millisecond)
++		old := g.deadline
++		if e := f.c.tick(); e != nil {
++			t.Fatal(e)
++		}
++		op := g.refresh
++		if op == nil || op.object != id || !op.submitted || g.deadline != old {
++			t.Fatal("idle CONNECT missing/eager refresh")
++		}
++		if e := f.c.accept(f.grantReply(op, 0)); e != nil || op.err != nil {
++			t.Fatal(e, op.err)
++		}
++	}
++	if !f.c.grantLive(g) || g.receipt.id != r.id || f.now.Sub(start) <= time.Second {
++		t.Fatal("CONNECT did not survive >1s")
++	}
++	f.now = f.now.Add(800 * time.Millisecond)
++	if e := f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	op := g.refresh
++	reply := f.grantReply(op, 0)
++	f.c.mu.Lock()
++	f.c.closeReceipt(r)
++	f.c.mu.Unlock()
++	if e := f.c.accept(reply); e != nil {
++		t.Fatal(e)
++	}
++	if op.err == nil || !g.closed || f.c.grantLive(g) {
++		t.Fatal("refresh resurrected closed CONNECT")
++	}
++}
+diff --git a/common/yonikbroker/profile_flow_other.go b/common/yonikbroker/profile_flow_other.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_flow_other.go
+@@ -0,0 +1,39 @@
++//go:build !linux
++
++package nativehooks
++
++import (
++	"context"
++	xnet "github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/transport"
++)
++
++// На этих платформах PrepareProfileLaunch отказывает до создания runtime.
++// Legacy callers сохраняют поведение и не получают profile authority.
++func ProfileSession(context.Context) bool                                           { return false }
++func CarryProfileSession(_ context.Context, target context.Context) context.Context { return target }
++func ProfileAccept(ctx context.Context, _ xnet.Conn, _ string) (context.Context, error) {
++	return ctx, nil
++}
++func ProfileAssociateUDP(ctx context.Context, _ xnet.Conn) (context.Context, error) { return ctx, nil }
++func ProfileOpenOriginal(ctx context.Context, _ xnet.Destination) (context.Context, func(), error) {
++	return ctx, func() {}, nil
++}
++func ProfileOpenTUN(ctx context.Context, _ xnet.Conn, _ xnet.Destination) (context.Context, func(), error) {
++	return ctx, func() {}, nil
++}
++func ProfileOriginalValid(context.Context) error                   { return nil }
++func ProfileDispatchEntry(context.Context, xnet.Destination) error { return nil }
++func ProfileSameOriginal(context.Context, context.Context) bool    { return true }
++func ProfileSelectRoute(ctx context.Context, _ string, _ xnet.Destination) (context.Context, error) {
++	return ctx, nil
++}
++func ProfileHandlerEntry(context.Context, string, xnet.Destination) error { return nil }
++func ProfileAuthorizeHandler(ctx context.Context, _ string, _ xnet.Destination, _ bool) (context.Context, func(), error) {
++	return ctx, func() {}, nil
++}
++func ProfileCheckDial(context.Context, xnet.Destination, bool) error { return nil }
++func ProfileChain(ctx context.Context, _ xnet.Destination, _ string) (context.Context, error) {
++	return ctx, nil
++}
++func ProfileGuardLink(context.Context, *transport.Link) {}
+diff --git a/common/yonikbroker/profile_launch.go b/common/yonikbroker/profile_launch.go
+new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch.go
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,224 @@
 +package nativehooks
 +
 +import (
@@ -782,6 +3722,7 @@
 +)
 +
 +const profileFrameLimit = 65536
++const profileFlowFixedCredit = 5 * 1024 * 1024
 +
 +var errProfile = errors.New("full-profile admission denied")
 +
@@ -995,9 +3936,11 @@
 +// ProfileLaunchRequested — только выбор закрытого launch path, не proof.
 +// Даже один повреждённый locator запрещает fallback к legacy.
 +func ProfileLaunchRequested() bool { return profileLocatorsPresent() }
+diff --git a/common/yonikbroker/profile_launch_linux.go b/common/yonikbroker/profile_launch_linux.go
+new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux.go
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,620 @@
 +//go:build linux
 +
 +package nativehooks
@@ -1034,6 +3977,9 @@
 +// ProfileRuntime не содержит FlowGrant. Constructor доступен только через
 +// потребление sealed record и authenticated channel. Владение FD однократное.
 +type ProfileRuntime struct {
++	flow                        *profileFlowControl
++	flowQueue                   chan *profileOperation
++	flowFence                   func() bool
 +	mu                          sync.Mutex
 +	admission                   profileAdmission
 +	channel, peer, root, record *os.File
@@ -1126,11 +4072,15 @@
 +	return nil, errProfileTimeout
 +}
 +func (p *ProfileRuntime) send(kind uint16, reply uint64, body []byte) error {
-+	if p.tx == ^uint64(0) || p.peerAlive() != nil || kind == 3 && !p.channelClear() {
++	return p.sendObject(kind, reply, 0, body)
++}
++func (p *ProfileRuntime) sendObject(kind uint16, reply, object uint64, body []byte) error {
++	if p.tx == ^uint64(0) || p.peerAlive() != nil || kind == 3 && p.admission.state != profileAdmitted && !p.channelClear() {
 +		return errProfile
 +	}
 +	p.tx++
 +	b := p.admission.launch.packet(kind, p.tx, reply, body)
++	be.PutUint64(b[112:], object)
 +	n, err := unix.SendmsgN(int(p.channel.Fd()), b, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
 +	if err != nil || n != len(b) {
 +		return errProfile
@@ -1145,7 +4095,7 @@
 +			return errProfile
 +		}
 +		a := m.assets[i]
-+		name := hex.EncodeToString(a.digest[:]) + ".dat"
++		name := "r-" + hex.EncodeToString(a.digest[:]) + ".dat"
 +		if a.dns {
 +			name = "dns-" + hex.EncodeToString(a.digest[:]) + ".bin"
 +		}
@@ -1278,6 +4228,18 @@
 +	}
 +	p.rx = 1
 +	p.admission = a
++	p.flowQueue = make(chan *profileOperation, 64)
++	p.flow = newProfileFlowControl(a.capsule, a.launch.mode, time.Now, func(kind uint16, object uint64, body []byte) (uint64, error) {
++		e := p.sendObject(kind, 0, object, body)
++		return p.tx, e
++	}, func() bool {
++		p.mu.Lock()
++		defer p.mu.Unlock()
++		return !p.closed && p.ctx.Err() == nil && p.admission.state == profileAdmitted && time.Now().Before(p.admission.deadline)
++	})
++	p.flow.reply = p.send
++	p.flow.sessionDeadline = a.deadline
++	p.flowFence = p.fresh
 +	// Existing native DAT loader получает только retained controlled root.
 +	// Никакой provider path или унаследованный XRAY_LOCATION_ASSET не принимается.
 +	if os.Setenv("XRAY_LOCATION_ASSET", "/proc/self/fd/"+strconv.Itoa(int(p.root.Fd()))) != nil {
@@ -1321,59 +4283,141 @@
 +		}
 +		p.cancel()
 +		p.mu.Unlock()
++		if p.flow != nil {
++			p.flow.revoke()
++			for {
++				select {
++				case op := <-p.flowQueue:
++					p.flow.mu.Lock()
++					p.flow.finish(op, errProfile)
++					p.flow.mu.Unlock()
++				default:
++					return
++				}
++			}
++		}
 +	}()
-+	// Единственный reader/writer после initial ACK. Отсутствующие consumer
-+	// сообщения не превращаются в grants; unknown/replay/EOF немедленно fence.
++	var renewRequest uint64
++	var renewSent, renewDeadline time.Time
 +	for {
++		if p.flow != nil {
++			for n := 0; n < 64; n++ {
++				select {
++				case op := <-p.flowQueue:
++					if p.flow.dispatch(op) != nil {
++						return
++					}
++				default:
++					n = 64
++				}
++			}
++			if p.flow.tick() != nil {
++				return
++			}
++		}
 +		p.mu.Lock()
 +		a := p.admission
 +		closed := p.closed
 +		p.mu.Unlock()
-+		if closed {
++		now := time.Now()
++		if closed || p.ctx.Err() != nil || !now.Before(a.deadline) {
 +			return
 +		}
 +		lead := time.Duration(a.capsule.lease) * time.Millisecond / 2
 +		if lead > 20*time.Second {
 +			lead = 20 * time.Second
 +		}
-+		renewAt := a.deadline.Add(-lead)
-+		if renewAt.Before(time.Now()) {
-+			renewAt = time.Now()
-+		}
-+		packet, err := p.receive(renewAt)
-+		if err == errProfileTimeout {
-+			next, e := renewProfile(a, p, p.tx+1, p.rx+1, time.Now)
-+			if e != nil {
++		if renewRequest == 0 && !now.Before(a.deadline.Add(-lead)) {
++			body := make([]byte, 40)
++			be.PutUint64(body, a.capsule.admission)
++			copy(body[8:], a.capsule.hash[:])
++			renewSent = now
++			renewDeadline = now.Add(time.Second)
++			if a.deadline.Before(renewDeadline) {
++				renewDeadline = a.deadline
++			}
++			if p.send(21, 0, body) != nil {
 +				return
 +			}
-+			p.mu.Lock()
-+			if p.closed {
-+				p.mu.Unlock()
-+				return
-+			}
-+			p.admission = next
-+			p.rx++
-+			p.mu.Unlock()
-+			continue
++			renewRequest = p.tx
 +		}
-+		if err != nil {
++		if renewRequest != 0 && !now.Before(renewDeadline) {
 +			return
 +		}
-+		frame, e := a.launch.decodePacket(packet, p.rx+1)
-+		if e == nil && frame.kind == 33 && frame.reply == 0 && frame.object == 0 && len(frame.body) == 8 && zero(frame.body[2:]) {
++		wait := now.Add(10 * time.Millisecond)
++		if a.deadline.Before(wait) {
++			wait = a.deadline
++		}
++		if renewRequest != 0 && renewDeadline.Before(wait) {
++			wait = renewDeadline
++		}
++		raw, e := p.receive(wait)
++		if e == errProfileTimeout {
++			continue
++		}
++		if e != nil {
++			return
++		}
++		frame, e := a.launch.decodePacket(raw, p.rx+1)
++		if e != nil {
++			return
++		}
++		p.rx++
++		if frame.kind == 33 {
++			if frame.reply != 0 || frame.object != 0 || len(frame.body) != 8 || !zero(frame.body[2:]) {
++				return
++			}
++			p.flow.revoke()
 +			p.mu.Lock()
 +			if !p.closed && p.admission.state != profileUnknown {
 +				p.admission.state = profileRevoked
 +			}
 +			p.cancel()
 +			p.mu.Unlock()
-+			// Core/transport cleanup ещё не подтверждён: KnownClosed здесь ложен.
 +			ack := make([]byte, 12)
 +			ack[0] = 4
 +			ack[1] = 3
 +			_ = p.send(34, frame.sequence, ack)
++			return
 +		}
-+		return
++		if frame.kind == 2 {
++			if renewRequest == 0 || frame.reply != renewRequest || frame.object != 0 {
++				return
++			}
++			next, e := decodeProfileCapsulePrevious(frame.body, a.launch, a.capsule.hash)
++			now = time.Now()
++			if e != nil || next.admission <= a.capsule.admission || !now.Before(renewDeadline) {
++				return
++			}
++			nextDeadline := renewSent.Add(time.Duration(next.lease) * time.Millisecond)
++			if !now.Before(nextDeadline) {
++				return
++			}
++			ack := make([]byte, 48)
++			copy(ack, next.hash[:])
++			be.PutUint64(ack[32:], next.admission)
++			ack[40] = 1
++			if p.send(3, frame.sequence, ack) != nil || !time.Now().Before(renewDeadline) {
++				return
++			}
++			p.mu.Lock()
++			if p.closed || p.ctx.Err() != nil {
++				p.mu.Unlock()
++				return
++			}
++			p.admission.capsule.admission = next.admission
++			p.admission.capsule.lease = next.lease
++			p.admission.deadline = nextDeadline
++			p.mu.Unlock()
++			renewRequest = 0
++			p.flow.mu.Lock()
++			p.flow.sessionDeadline = nextDeadline
++			p.flow.mu.Unlock()
++			continue
++		}
++		if p.flow == nil || p.flow.accept(frame) != nil {
++			return
++		}
 +	}
 +}
 +func (p *ProfileRuntime) closeFiles() error {
@@ -1517,6 +4561,8 @@
 +	}
 +	return p, nil
 +}
+diff --git a/common/yonikbroker/profile_launch_linux_test.go b/common/yonikbroker/profile_launch_linux_test.go
+new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux_test.go
 @@ -0,0 +1,27 @@
@@ -1547,6 +4593,8 @@
 +		}
 +	}
 +}
+diff --git a/common/yonikbroker/profile_launch_other.go b/common/yonikbroker/profile_launch_other.go
+new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_other.go
 @@ -0,0 +1,29 @@
@@ -1579,6 +4627,8 @@
 +func (*ProfileRuntime) Start(func() error) error { return errProfile }
 +func (*ProfileRuntime) Close() error             { return nil }
 +func (*ProfileRuntime) Done() <-chan struct{}    { return nil }
+diff --git a/common/yonikbroker/profile_launch_test.go b/common/yonikbroker/profile_launch_test.go
+new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_test.go
 @@ -0,0 +1,474 @@
@@ -2023,12 +5073,12 @@
 +	a.digest[0] = 1
 +	m := profileCapsule{assetCount: 1}
 +	m.assets[0] = a
-+	name := hex.EncodeToString(a.digest[:]) + ".dat"
++	name := "r-" + hex.EncodeToString(a.digest[:]) + ".dat"
 +	root := "/proc/self/fd/9"
 +	if profileAssetPath(root+"/"+name, root, &m) != 0 {
 +		t.Fatal("owned path")
 +	}
-+	for _, path := range []string{"/usr/share/xray/" + name, root + "/../" + name, root + "//" + name, root + "/geoip.dat", root + "/dns-" + name} {
++	for _, path := range []string{"/usr/share/xray/" + name, root + "/../" + name, root + "//" + name, root + "/geoip.dat", root + "/dns-" + name, root + "/" + name[2:]} {
 +		if profileAssetPath(path, root, &m) != -1 {
 +			t.Fatal(path)
 +		}
@@ -2056,14 +5106,17 @@
 +		t.Fatal("factory при digest mismatch")
 +	}
 +}
+diff --git a/common/yonikbroker/profile_snapshot.go b/common/yonikbroker/profile_snapshot.go
+new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_snapshot.go
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,194 @@
 +package nativehooks
 +
 +import (
 +	"bytes"
 +	"crypto/sha256"
++	"net/netip"
 +)
 +
 +// Snapshot пока удерживает exact verified encoding. DNS consumer следующего
@@ -2076,11 +5129,6 @@
 +}
 +
 +func profileDNSName(b []byte, root bool) bool {
-+	for _, v := range b {
-+		if v >= 'A' && v <= 'Z' {
-+			return false
-+		}
-+	}
 +	if root && (len(b) == 0 || bytes.Equal(b, []byte("."))) {
 +		return true
 +	}
@@ -2089,7 +5137,22 @@
 +	}
 +	// Pinned netgo isDomainName допускает SRV-like underscore labels.
 +	// Dynamic flow Destination использует отдельную, более строгую LDH grammar.
-+	return profileLabels(b, true, false)
++	return profileLabels(b, true, true)
++}
++
++func profileHostsAlias(b []byte) bool {
++	for _, v := range b {
++		if v >= 'A' && v <= 'Z' {
++			return false
++		}
++	}
++	return profileDNSName(b, false) && (bytes.IndexByte(b, '.') < 0 || b[len(b)-1] == '.')
++}
++
++func profileHostsLiteral(b []byte) bool {
++	ip, ok := netip.AddrFromSlice(b)
++	// Hosts data не являются разрешением physical endpoint или resolver peer.
++	return ok && !ip.Is4In6()
 +}
 +
 +func decodeProfileSnapshot(b []byte, a profileAsset) (*profileSnapshot, error) {
@@ -2147,7 +5210,7 @@
 +	var aliases [4096][]byte
 +	for i := 0; i < hosts; i++ {
 +		alias := c.str(253)
-+		if !profileDNSName(alias, false) || bytes.IndexByte(alias, '.') >= 0 && alias[len(alias)-1] != '.' {
++		if !profileHostsAlias(alias) {
 +			return nil, errProfile
 +		}
 +		aliases[i] = alias
@@ -2166,7 +5229,7 @@
 +			} else if family[0] != 4 {
 +				return nil, errProfile
 +			}
-+			if !profileIP(c.take(size)) {
++			if !profileHostsLiteral(c.take(size)) {
 +				return nil, errProfile
 +			}
 +		}
@@ -2242,6 +5305,25 @@
 +	}
 +	return true
 +}
+diff --git a/common/yonikbroker/routing.go b/common/yonikbroker/routing.go
+--- a/common/yonikbroker/routing.go
++++ b/common/yonikbroker/routing.go
+@@ -63,6 +63,14 @@
+ }
+ 
+ func guardEntry(ctx context.Context, stage Stage) error {
++	if ProfileSession(ctx) {
++		if stage == BeforeRouting {
++			return ProfileOriginalValid(ctx)
++		}
++		// Physical ownership и DNS service grants подключаются следующим
++		// transport milestone; owner-only legacy consumer не даёт fallback.
++		return ErrDenied
++	}
+ 	c, ok := ctx.Value(routingKey{}).(*routingConsumer)
+ 	if !ok || c == nil {
+ 		return ErrDenied
+diff --git a/features/dns/localdns/client.go b/features/dns/localdns/client.go
 --- a/features/dns/localdns/client.go
 +++ b/features/dns/localdns/client.go
 @@ -31,12 +31,20 @@
@@ -2267,6 +5349,8 @@
  	}
  	if err != nil {
  		return nil, 0, err
+diff --git a/features/dns/localdns/yonik_context_test.go b/features/dns/localdns/yonik_context_test.go
+new file mode 100644
 --- /dev/null
 +++ b/features/dns/localdns/yonik_context_test.go
 @@ -0,0 +1,20 @@
@@ -2290,6 +5374,7 @@
 +		t.Fatalf("отменённый запрос: ips=%d ttl=%d err=%v", len(ips), ttl, err)
 +	}
 +}
+diff --git a/main/run.go b/main/run.go
 --- a/main/run.go
 +++ b/main/run.go
 @@ -1,7 +1,10 @@
@@ -2395,6 +5480,8 @@
 +	})
 +	return s.closeErr
 +}
+diff --git a/main/yonik_profile_test.go b/main/yonik_profile_test.go
+new file mode 100644
 --- /dev/null
 +++ b/main/yonik_profile_test.go
 @@ -0,0 +1,32 @@
@@ -2430,3 +5517,266 @@
 +		})
 +	}
 +}
+diff --git a/proxy/http/server.go b/proxy/http/server.go
+--- a/proxy/http/server.go
++++ b/proxy/http/server.go
+@@ -5,6 +5,7 @@
+ 	"bytes"
+ 	"context"
+ 	"encoding/base64"
++	nativehooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"io"
+ 	"net/http"
+ 	"strings"
+@@ -153,12 +154,22 @@
+ 	})
+ 
+ 	if strings.EqualFold(request.Method, "CONNECT") {
+-		return s.handleConnect(ctx, request, reader, conn, dest, dispatcher, inbound)
++		requestCtx, release, err := nativehooks.ProfileOpenOriginal(ctx, dest)
++		if err != nil {
++			return err
++		}
++		defer release()
++		return s.handleConnect(requestCtx, request, reader, conn, dest, dispatcher, inbound)
+ 	}
+ 
+ 	keepAlive := (strings.TrimSpace(strings.ToLower(request.Header.Get("Proxy-Connection"))) == "keep-alive")
+ 
+-	err = s.handlePlainHTTP(ctx, request, conn, dest, dispatcher)
++	requestCtx, release, receiptErr := nativehooks.ProfileOpenOriginal(ctx, dest)
++	if receiptErr != nil {
++		return receiptErr
++	}
++	err = s.handlePlainHTTP(requestCtx, request, conn, dest, dispatcher)
++	release()
+ 	if err == errWaitAnother {
+ 		if keepAlive {
+ 			goto Start
+diff --git a/proxy/socks/server.go b/proxy/socks/server.go
+--- a/proxy/socks/server.go
++++ b/proxy/socks/server.go
+@@ -15,6 +15,7 @@
+ 	"github.com/xtls/xray-core/common/protocol"
+ 	udp_proto "github.com/xtls/xray-core/common/protocol/udp"
+ 	"github.com/xtls/xray-core/common/session"
++	nativehooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/policy"
+ 	"github.com/xtls/xray-core/features/routing"
+@@ -142,6 +143,11 @@
+ 
+ 	if request.Command == protocol.RequestCommandTCP {
+ 		dest := request.Destination()
++		flowCtx, release, err := nativehooks.ProfileOpenOriginal(ctx, dest)
++		if err != nil {
++			return err
++		}
++		defer release()
+ 		errors.LogInfo(ctx, "TCP Connect request to ", dest)
+ 		if inbound.Source.IsValid() {
+ 			ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+@@ -155,7 +161,7 @@
+ 			inbound.CanSpliceCopy = 1
+ 		}
+ 		if err := dispatcher.DispatchLink(
+-			ctx, dest, &transport.Link{
++			flowCtx, dest, &transport.Link{
+ 				Reader: reader,
+ 				Writer: buf.NewWriter(conn),
+ 			},
+@@ -230,6 +236,7 @@
+ 
+ 	reader := buf.NewPacketReader(conn)
+ 	var changeRemote sync.Once
++	var associationErr error
+ 	for {
+ 		mpayload, err := reader.ReadMultiBuffer()
+ 		if err != nil {
+@@ -245,7 +252,12 @@
+ 				ctx = session.ContextWithInbound(ctx, inbound)
+ 				errors.LogInfo(ctx, "client UDP connection from ", inbound.Source)
+ 			}
++			ctx, associationErr = nativehooks.ProfileAssociateUDP(ctx, conn)
+ 		})
++		if associationErr != nil {
++			buf.ReleaseMulti(mpayload)
++			return associationErr
++		}
+ 
+ 		for _, payload := range mpayload {
+ 			request, err := DecodeUDPPacket(payload)
+@@ -262,10 +274,14 @@
+ 
+ 			destination := request.Destination()
+ 
+-			currentPacketCtx := ctx
++			currentPacketCtx, _, receiptErr := nativehooks.ProfileOpenOriginal(ctx, destination)
++			if receiptErr != nil {
++				payload.Release()
++				continue
++			}
+ 			errors.LogDebug(ctx, "send packet to ", destination, " with ", payload.Len(), " bytes")
+ 			if inbound != nil && inbound.Source.IsValid() {
+-				currentPacketCtx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
++				currentPacketCtx = log.ContextWithAccessMessage(currentPacketCtx, &log.AccessMessage{
+ 					From:   inbound.Source,
+ 					To:     destination,
+ 					Status: log.AccessAccepted,
+@@ -275,7 +291,7 @@
+ 
+ 			payload.UDP = &destination
+ 
+-			if !s.cone || dest == nil {
++			if nativehooks.ProfileSession(ctx) || !s.cone || dest == nil {
+ 				dest = &destination
+ 			}
+ 
+diff --git a/proxy/tun/handler.go b/proxy/tun/handler.go
+--- a/proxy/tun/handler.go
++++ b/proxy/tun/handler.go
+@@ -97,7 +97,7 @@
+ 		t.sniffingRequest = content.SniffingRequest
+ 	}
+ 
+-	t.ctx = nativehooks.CarryClosedSession(ctx, core.ToBackgroundDetachedContext(ctx))
++	t.ctx = nativehooks.CarryProfileSession(ctx, nativehooks.CarryClosedSession(ctx, core.ToBackgroundDetachedContext(ctx)))
+ 	t.policyManager = pm
+ 	t.dispatcher = dispatcher
+ 
+@@ -218,6 +218,11 @@
+ 
+ 	ctx, cancel := context.WithCancel(t.ctx)
+ 	defer cancel()
++	ctx, release, receiptErr := nativehooks.ProfileOpenTUN(ctx, conn, destination)
++	if receiptErr != nil {
++		return
++	}
++	defer release()
+ 	ctx = c.ContextWithID(ctx, session.NewID())
+ 
+ 	source := net.DestinationFromAddr(conn.RemoteAddr())
+diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
+--- a/transport/internet/dialer.go
++++ b/transport/internet/dialer.go
+@@ -11,6 +11,7 @@
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/net/cnc"
+ 	"github.com/xtls/xray-core/common/session"
++	nativehooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/features/dns"
+ 	"github.com/xtls/xray-core/features/outbound"
+ 	"github.com/xtls/xray-core/transport"
+@@ -46,6 +47,9 @@
+ 
+ // Dial dials a internet connection towards the given destination.
+ func Dial(ctx context.Context, dest net.Destination, streamSettings *MemoryStreamConfig) (stat.Connection, error) {
++	if e := nativehooks.ProfileCheckDial(ctx, dest, false); e != nil {
++		return nil, e
++	}
+ 	if dest.Network == net.Network_TCP {
+ 		if streamSettings == nil {
+ 			s, err := ToMemoryStreamConfig(nil)
+@@ -108,7 +112,12 @@
+ 	return ips, err
+ }
+ 
+-func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.Handler) net.Conn {
++func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.Handler) (net.Conn, error) {
++	var e error
++	ctx, e = nativehooks.ProfileChain(ctx, dst, obt)
++	if e != nil {
++		return nil, e
++	}
+ 	errors.LogInfo(ctx, "redirecting request "+dst.String()+" to "+obt)
+ 	outbounds := session.OutboundsFromContext(ctx)
+ 	ctx = session.ContextWithOutbounds(ctx, append(outbounds, &session.Outbound{
+@@ -120,7 +129,11 @@
+ 	ur, uw := pipe.New(pipe.OptionsFromContext(ctx)...)
+ 	dr, dw := pipe.New(pipe.OptionsFromContext(ctx)...)
+ 
+-	go h.Dispatch(context.WithoutCancel(ctx), &transport.Link{Reader: ur, Writer: dw})
++	dispatchCtx := context.WithoutCancel(ctx)
++	if nativehooks.ProfileSession(ctx) {
++		dispatchCtx = ctx
++	}
++	go h.Dispatch(dispatchCtx, &transport.Link{Reader: ur, Writer: dw})
+ 	var readerOpt cnc.ConnectionOption
+ 	if dst.Network == net.Network_TCP {
+ 		readerOpt = cnc.ConnectionOutputMulti(dr)
+@@ -132,7 +145,7 @@
+ 		readerOpt,
+ 		cnc.ConnectionOnClose(common.ChainedClosable{uw, dw}),
+ 	)
+-	return nc
++	return nc, nil
+ }
+ 
+ func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (*net.Destination, error) {
+@@ -224,6 +237,9 @@
+ 
+ // DialSystem calls system dialer to create a network connection.
+ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
++	if e := nativehooks.ProfileCheckDial(ctx, dest, true); e != nil {
++		return nil, e
++	}
+ 	var src net.Address
+ 	outbounds := session.OutboundsFromContext(ctx)
+ 	var outboundName string
+@@ -242,6 +258,9 @@
+ 	if sockopt == nil {
+ 		return guardedSystemDial(ctx, src, dest, sockopt)
+ 	}
++	if nativehooks.ProfileSession(ctx) && dest.Address.Family().IsDomain() && (sockopt.AddressPortStrategy != AddressPortStrategy_None || sockopt.DomainStrategy.HasStrategy()) {
++		return nil, nativehooks.ErrDenied
++	}
+ 
+ 	if newDest, err := checkAddressPortStrategy(ctx, dest, sockopt); err == nil && newDest != nil {
+ 		errors.LogInfo(ctx, "replace destination with "+newDest.String())
+@@ -275,7 +294,7 @@
+ 		if h == nil {
+ 			return nil, errors.New("there is no outbound handler for dialerProxy")
+ 		}
+-		return redirect(ctx, dest, sockopt.DialerProxy, h), nil
++		return redirect(ctx, dest, sockopt.DialerProxy, h)
+ 	}
+ 
+ 	return guardedSystemDial(ctx, src, dest, sockopt)
+diff --git a/transport/internet/udp/dispatcher.go b/transport/internet/udp/dispatcher.go
+--- a/transport/internet/udp/dispatcher.go
++++ b/transport/internet/udp/dispatcher.go
+@@ -14,6 +14,7 @@
+ 	"github.com/xtls/xray-core/common/protocol/udp"
+ 	"github.com/xtls/xray-core/common/signal"
+ 	"github.com/xtls/xray-core/common/signal/done"
++	nativehooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/features/routing"
+ 	"github.com/xtls/xray-core/transport"
+ )
+@@ -21,6 +22,7 @@
+ type ResponseCallback func(ctx context.Context, packet *udp.Packet)
+ 
+ type connEntry struct {
++	ctx    context.Context
+ 	link   *transport.Link
+ 	timer  *signal.ActivityTimer
+ 	cancel context.CancelFunc
+@@ -75,6 +77,10 @@
+ 	if v.closed {
+ 		return nil, errors.New("dispatcher is closed")
+ 	}
++	if v.conn != nil && !nativehooks.ProfileSameOriginal(ctx, v.conn.ctx) {
++		v.conn.Close()
++		v.conn = nil
++	}
+ 
+ 	if v.conn != nil {
+ 		if v.conn.closed {
+@@ -95,6 +101,7 @@
+ 	}
+ 
+ 	entry := &connEntry{
++		ctx:    ctx,
+ 		link:   link,
+ 		cancel: cancel,
+ 	}
