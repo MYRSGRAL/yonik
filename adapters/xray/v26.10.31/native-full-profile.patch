@@ -9,6 +9,2230 @@
  
  	if len(ips) > 0 {
  		errors.LogInfo(ctx, "Localhost got answer: ", domain, " -> ", ips)
+--- /dev/null
++++ b/common/yonikbroker/profile-launch-vectors.json
+@@ -0,0 +1,8 @@
++{
++  "classification": "SYNTHETIC_NO_AUTHORITY",
++  "mapping_version": 3,
++  "config_hex": "636f6e666967",
++  "local_record_hex": "594e4b4c4f433031000100c0000000000100000000000000000000000000000000000000000000000000000000000000b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e3439100100000000000000000000000000000002000000000000000000000000000000000000000000000100000000000000010000002a0000000000000000000000070000000000000000534d918fd76e5171c6c4bae8a4f31eb96941a80d3346cad6dc5d9e80f6f5277a0000000000000000",
++  "admit_body_hex": "534d918fd76e5171c6c4bae8a4f31eb96941a80d3346cad6dc5d9e80f6f5277a000000000000000000000000000000000000000000000000000000000000000000000000000000010000ea600100000300000000000000010000100000000080000000800000004000800000000075300000100000000100000b000000000000000100010000000f000b000000016105000000000000010002000000000000000300000000000000040001000000280024000001000000010000000000000000000000000000000000000000000000000000000000000000050000000000000006000000000000000700010000000b000700000203123400016900080000000000000009000200000038001800000000060106060000ffffffff0000ffffffffffff03000000001800000000110111110000ffffffffffffffffffffffff03000000000a000000000000000b000000000000",
++  "manifest_sha256": "534d918fd76e5171c6c4bae8a4f31eb96941a80d3346cad6dc5d9e80f6f5277a"
++}
+--- /dev/null
++++ b/common/yonikbroker/profile_capsule.go
+@@ -0,0 +1,501 @@
++package nativehooks
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"net/netip"
++	"unicode/utf8"
++)
++
++type profileCursor struct {
++	b   []byte
++	bad bool
++}
++
++func (c *profileCursor) take(n int) []byte {
++	if n < 0 || n > len(c.b) {
++		c.bad = true
++		return nil
++	}
++	b := c.b[:n]
++	c.b = c.b[n:]
++	return b
++}
++func (c *profileCursor) n16() uint16 {
++	b := c.take(2)
++	if b == nil {
++		return 0
++	}
++	return u16(b, 0)
++}
++func (c *profileCursor) str(max int) []byte {
++	n := int(c.n16())
++	if n > max {
++		c.bad = true
++		return nil
++	}
++	return c.take(n)
++}
++func (c *profileCursor) done() bool { return !c.bad && len(c.b) == 0 }
++func profileName(b []byte, max int) bool {
++	if len(b) == 0 || len(b) > max || !utf8.Valid(b) {
++		return false
++	}
++	for _, r := range string(b) {
++		if r < 32 || r == 127 {
++			return false
++		}
++	}
++	return true
++}
++func profileDomain(b []byte) bool {
++	return profileLabels(b, false, true)
++}
++func profileLabels(b []byte, underscore, uppercase bool) bool {
++	if len(b) == 0 || len(b) > 253 {
++		return false
++	}
++	start := 0
++	for i, v := range b {
++		if v == '.' {
++			if i == start || i-start > 63 || b[start] == '-' || b[i-1] == '-' {
++				return false
++			}
++			start = i + 1
++			continue
++		}
++		if !(v >= 'a' && v <= 'z' || uppercase && v >= 'A' && v <= 'Z' || v >= '0' && v <= '9' || v == '-' || underscore && v == '_') {
++			return false
++		}
++	}
++	return start < len(b) && len(b)-start <= 63 && b[start] != '-' && b[len(b)-1] != '-'
++}
++func profileIP(b []byte) bool {
++	a, ok := netip.AddrFromSlice(b)
++	return ok && !a.Is4In6() && !a.IsUnspecified() && !a.IsMulticast()
++}
++func profileHost(b []byte) bool {
++	if profileDomain(b) {
++		return true
++	}
++	a, e := netip.ParseAddr(string(b))
++	return e == nil && a.Zone() == "" && !a.Is4In6() && !a.IsUnspecified() && !a.IsMulticast()
++}
++func profileDestination(c *profileCursor) byte {
++	h := c.take(8)
++	if h == nil {
++		return 0
++	}
++	n := int(u16(h, 4))
++	a := c.take(n)
++	if c.bad || (h[1] != 6 && h[1] != 17) || u16(h, 2) == 0 || !zero(h[6:]) {
++		c.bad = true
++		return 0
++	}
++	if !(h[0] == 3 && profileDomain(a) || h[0] == 4 && n == 4 && profileIP(a) || h[0] == 6 && n == 16 && profileIP(a)) {
++		c.bad = true
++	}
++	return h[1]
++}
++
++type profileAsset struct {
++	digest [32]byte
++	size   uint64
++	dns    bool
++	source [32]byte
++	flags  uint32
++}
++
++func profileAssetPath(path, root string, m *profileCapsule) int {
++	for i := 0; i < m.assetCount; i++ {
++		a := m.assets[i]
++		name := hex.EncodeToString(a.digest[:]) + ".dat"
++		if a.dns {
++			name = "dns-" + hex.EncodeToString(a.digest[:]) + ".bin"
++		}
++		if path == root+"/"+name {
++			return i
++		}
++	}
++	return -1
++}
++
++type profileCapsule struct {
++	hash       [32]byte
++	admission  uint64
++	lease      uint32
++	policy     uint64
++	caps       [8]uint32
++	rows       [11][][]byte
++	assets     [16]profileAsset
++	assetCount int
++}
++
++var profileRowCaps = [11]int{256, 512, 1024, 256, 64, 16, 4, 1, 512, 16, 1}
++var profileMaxCaps = [8]uint32{4096, 128, 128, 64, 8388608, 30000, 4096, 256}
++
++func profileIndex(i uint16, n int, optional bool) bool { return int(i) < n || optional && i == 65535 }
++
++func decodeProfileCapsule(b []byte, r profileLaunch) (m profileCapsule, err error) {
++	return decodeProfileCapsulePrevious(b, r, [32]byte{})
++}
++func decodeProfileCapsulePrevious(b []byte, r profileLaunch, previous [32]byte) (m profileCapsule, err error) {
++	if len(b) < 128 || len(b) > profileFrameLimit-128 || !bytes.Equal(b[:32], r.manifest[:]) || !bytes.Equal(b[32:64], previous[:]) || u64(b, 64) == 0 || u32(b, 72) == 0 || u32(b, 72) > 60000 || b[76] != r.mode || b[77] != r.mode-1 || u16(b, 78) != 3 || u64(b, 80) == 0 || u16(b, 120) != 11 || !zero(b[122:128]) {
++		return m, errProfile
++	}
++	copy(m.hash[:], b[:32])
++	m.admission = u64(b, 64)
++	m.lease = u32(b, 72)
++	m.policy = u64(b, 80)
++	for i, limit := range profileMaxCaps {
++		v := u32(b, 88+i*4)
++		if v == 0 || v > limit {
++			return profileCapsule{}, errProfile
++		}
++		m.caps[i] = v
++	}
++	if uint64(m.caps[4]) < uint64(512*1024+len(b)*3) {
++		return profileCapsule{}, errProfile
++	}
++	h := sha256.New()
++	h.Write([]byte("YNKCAP-MANIFEST-v1\x00"))
++	h.Write(r.digest[:])
++	h.Write(b[76:78])
++	h.Write(b[80:120])
++	h.Write(b[128:])
++	if !bytes.Equal(h.Sum(nil), m.hash[:]) {
++		return profileCapsule{}, errProfile
++	}
++	// Первый проход не материализует rows. Все counts и lengths до make.
++	c := profileCursor{b: b[128:]}
++	for i, limit := range profileRowCaps {
++		p := c.take(8)
++		if p == nil || int(u16(p, 0)) != i+1 {
++			return profileCapsule{}, errProfile
++		}
++		n := int(u16(p, 2))
++		size := int(u32(p, 4))
++		if n > limit || size < n*4 {
++			return profileCapsule{}, errProfile
++		}
++		rows := profileCursor{b: c.take(size)}
++		if c.bad {
++			return profileCapsule{}, errProfile
++		}
++		for j := 0; j < n; j++ {
++			length := int(rows.n16())
++			reserved := rows.n16()
++			rows.take(length)
++			if reserved != 0 || rows.bad {
++				return profileCapsule{}, errProfile
++			}
++		}
++		if !rows.done() {
++			return profileCapsule{}, errProfile
++		}
++	}
++	if !c.done() {
++		return profileCapsule{}, errProfile
++	}
++	c = profileCursor{b: b[128:]}
++	for i := range m.rows {
++		p := c.take(8)
++		n := int(u16(p, 2))
++		rows := profileCursor{b: c.take(int(u32(p, 4)))}
++		m.rows[i] = make([][]byte, n)
++		for j := range m.rows[i] {
++			length := int(rows.n16())
++			rows.n16()
++			m.rows[i][j] = rows.take(length)
++		}
++	}
++	if !m.validate(r.mode) {
++		return profileCapsule{}, errProfile
++	}
++	// Одновременные frame/rows/strings, fixed decoder state, snapshot
++	// и streaming DAT category index резервируются до materialization assets.
++	credit := uint64(512*1024 + len(b)*3)
++	dat := false
++	for i := 0; i < m.assetCount; i++ {
++		a := m.assets[i]
++		if a.dns {
++			credit += a.size
++		} else {
++			dat = true
++		}
++	}
++	if dat {
++		credit += 2*1024*1024 + 32768
++	}
++	if credit > uint64(m.caps[4]) {
++		return profileCapsule{}, errProfile
++	}
++	return m, nil
++}
++
++func (m *profileCapsule) validate(mode byte) bool {
++	counts := func(table int) int { return len(m.rows[table-1]) }
++	if counts(1) == 0 || counts(7) == 0 {
++		return false
++	}
++	var names [256]string
++	for i, b := range m.rows[0] {
++		c := profileCursor{b: b}
++		name := c.str(160)
++		p := c.take(8)
++		if !c.done() || p == nil || !profileName(name, 160) || p[0] < 1 || p[0] > 7 || p[1] != 0 || !profileIndex(u16(p, 2), counts(4), false) || !profileIndex(u16(p, 4), counts(9), false) || !profileIndex(u16(p, 6), counts(9), false) {
++			return false
++		}
++		names[i] = string(name)
++		for j := 0; j < i; j++ {
++			if names[j] == names[i] {
++				return false
++			}
++		}
++		for j, proto := range []byte{6, 17} {
++			idx := int(u16(p, 4+j*2))
++			s := m.rows[8][idx]
++			if len(s) != 24 || int(u16(s, 0)) != i || s[2] != proto || idx != i*2+j {
++				return false
++			}
++		}
++	}
++	if counts(9) != counts(1)*2 {
++		return false
++	}
++	for _, b := range m.rows[1] {
++		c := profileCursor{b: b}
++		profileDestination(&c)
++		p := c.take(4)
++		if !c.done() || !zero(p) {
++			return false
++		}
++	}
++	for _, b := range m.rows[3] {
++		if len(b) != 36 || b[0] < 1 || b[0] > 4 || b[1] > 2 || !zero(b[2:4]) || zero(b[4:]) {
++			return false
++		}
++	}
++	var physical [512]bool
++	physicalCount := uint32(0)
++	for i, b := range m.rows[8] {
++		if len(b) != 24 || int(u16(b, 0)) >= counts(1) || (b[2] != 6 && b[2] != 17) || b[3] == 0 || b[3]&^byte(3) != 0 || !zero(b[22:]) {
++			return false
++		}
++		for branch := 0; branch < 2; branch++ {
++			dial, carrier, action := b[4+branch*2], b[5+branch*2], b[20+branch]
++			ep, stream, chain := u16(b, 8+branch*2), u16(b, 12+branch*2), u16(b, 16+branch*2)
++			if b[3]&(1<<branch) == 0 {
++				if dial != 0 || carrier != 0 || action != 0 || ep != 65535 || stream != 65535 || chain != 65535 {
++					return false
++				}
++				continue
++			}
++			if action == 4 {
++				subject := m.rows[0][u16(b, 0)]
++				if subject[len(subject)-8] < 6 {
++					return false
++				}
++				if dial != 0 || carrier != 0 || ep != 65535 || stream != 65535 || chain != 65535 {
++					return false
++				}
++				continue
++			}
++			subject := m.rows[0][u16(b, 0)]
++			if subject[len(subject)-8] >= 6 {
++				return false
++			}
++			if (dial != 6 && dial != 17) || (carrier != 6 && carrier != 17) || !profileIndex(stream, counts(4), true) {
++				return false
++			}
++			if dial == 17 && stream != 65535 {
++				return false
++			}
++			switch action {
++			case 1, 2:
++				if !profileIndex(ep, counts(2), false) || m.rows[1][ep][1] != carrier {
++					return false
++				}
++				if action == 1 {
++					if chain != 65535 {
++						return false
++					}
++					if !physical[ep] {
++						physical[ep] = true
++						physicalCount++
++						if physicalCount > 128 || physicalCount > m.caps[1] {
++							return false
++						}
++					}
++				} else {
++					if !profileIndex(chain, counts(3), false) {
++						return false
++					}
++					edge := m.rows[2][chain]
++					if len(edge) != 8 || int(u16(edge, 0)) != i || int(edge[4]) != branch {
++						return false
++					}
++				}
++			case 3:
++				if ep != 65535 || chain != 65535 {
++					return false
++				}
++			default:
++				return false
++			}
++		}
++	}
++	for i, b := range m.rows[2] {
++		if len(b) != 8 || !profileIndex(u16(b, 0), counts(9), false) || !profileIndex(u16(b, 2), counts(9), false) || b[4] > 1 || b[5] == 0 || b[5]&^byte(3) != 0 || !zero(b[6:]) {
++			return false
++		}
++		src, dst := m.rows[8][u16(b, 0)], m.rows[8][u16(b, 2)]
++		branch := int(b[4])
++		if src[20+branch] != 2 || int(u16(src, 16+2*branch)) != i || dst[2] != src[5+2*branch] || b[5]&^dst[3] != 0 {
++			return false
++		}
++	}
++	// Проверка DAG bounded DFS по scope edges, без рекурсии/аллокации на path.
++	var color [512]byte
++	var visit func(int, int) bool
++	visit = func(i, depth int) bool {
++		if depth > 256 || color[i] == 1 {
++			return false
++		}
++		if color[i] == 2 {
++			return true
++		}
++		color[i] = 1
++		s := m.rows[8][i]
++		for branch := 0; branch < 2; branch++ {
++			if s[20+branch] == 2 {
++				edge := m.rows[2][u16(s, 16+branch*2)]
++				if !visit(int(u16(edge, 2)), depth+1) {
++					return false
++				}
++			}
++		}
++		color[i] = 2
++		return true
++	}
++	for i := range m.rows[8] {
++		if !visit(i, 0) {
++			return false
++		}
++	}
++	for _, b := range m.rows[6] {
++		c := profileCursor{b: b}
++		p := c.take(4)
++		alias := c.str(160)
++		if !c.done() || p == nil || p[0] < 1 || p[0] > 4 || p[1] == 0 || p[1]&^byte(3) != 0 || !profileName(alias, 160) {
++			return false
++		}
++		if p[0] == 1 {
++			if mode != 2 || u16(p, 2) != 0 || p[1] != 3 {
++				return false
++			}
++		} else if u16(p, 2) == 0 {
++			return false
++		}
++	}
++	var aliases [16]string
++	for i, b := range m.rows[9] {
++		c := profileCursor{b: b}
++		tag := c.str(128)
++		p := c.take(4)
++		if !c.done() || p == nil || !profileName(tag, 128) || !profileIndex(u16(p, 0), counts(7), false) || (p[2] != 1 && p[2] != 2) || p[3] != 0 {
++			return false
++		}
++		if m.rows[6][u16(p, 0)][0] != p[2]+1 {
++			return false
++		}
++		aliases[i] = string(tag)
++		for j := 0; j < i; j++ {
++			if aliases[i] == aliases[j] {
++				return false
++			}
++		}
++	}
++	if counts(11) == 1 {
++		b := m.rows[10][0]
++		if len(b) != 76 || u16(b, 68) != 1 || !zero(b[70:72]) || u32(b, 72) > 1 || u32(b, 64) < 120 || u32(b, 64) > 2*1024*1024 || zero(b[:32]) || zero(b[32:64]) {
++			return false
++		}
++		a := profileAsset{size: uint64(u32(b, 64)), dns: true, flags: u32(b, 72)}
++		copy(a.source[:], b[:32])
++		copy(a.digest[:], b[32:64])
++		if !m.addAsset(a) {
++			return false
++		}
++	}
++	for _, b := range m.rows[4] {
++		c := profileCursor{b: b}
++		p := c.take(36)
++		proto := profileDestination(&c)
++		if !c.done() || p == nil || (p[0] != 1 && p[0] != 2) || (p[1] != 6 && p[1] != 17) || p[1] != proto || !profileIndex(u16(p, 2), counts(1), true) {
++			return false
++		}
++		if p[0] == 2 {
++			if counts(11) != 1 || !bytes.Equal(p[4:], m.rows[10][0][:32]) {
++				return false
++			}
++		}
++	}
++	for _, b := range m.rows[5] {
++		c := profileCursor{b: b}
++		p := c.take(2)
++		category := c.str(160)
++		hash := c.take(32)
++		size := c.take(8)
++		if !c.done() || p == nil || hash == nil || size == nil || (p[0] != 1 && p[0] != 2) || p[1] != 0 || !profileName(category, 160) || zero(hash) {
++			return false
++		}
++		a := profileAsset{size: u64(size, 0)}
++		copy(a.digest[:], hash)
++		if !m.addAsset(a) {
++			return false
++		}
++	}
++	for _, b := range m.rows[7] {
++		c := profileCursor{b: b}
++		p := c.take(4)
++		host := c.str(253)
++		path := c.str(2048)
++		n := int(c.n16())
++		if p == nil || p[0] < 1 || p[0] > 2 || p[1] != 0 || u16(p, 2) == 0 || !profileHost(host) || len(path) == 0 || path[0] != '/' || n == 0 || n > counts(1) {
++			return false
++		}
++		var seen [256]bool
++		for j := 0; j < n; j++ {
++			idx := c.n16()
++			if !profileIndex(idx, counts(1), false) || seen[idx] {
++				return false
++			}
++			seen[idx] = true
++		}
++		if !c.done() {
++			return false
++		}
++	}
++	return true
++}
++func (m *profileCapsule) addAsset(a profileAsset) bool {
++	if a.size == 0 || a.size > 64*1024*1024 {
++		return false
++	}
++	var total uint64
++	for i := 0; i < m.assetCount; i++ {
++		old := m.assets[i]
++		if old.digest == a.digest {
++			return old == a
++		}
++		total += old.size
++	}
++	if total+a.size > 64*1024*1024 || m.assetCount == 16 {
++		return false
++	}
++	m.assets[m.assetCount] = a
++	m.assetCount++
++	return true
++}
+--- /dev/null
++++ b/common/yonikbroker/profile_dat.go
+@@ -0,0 +1,242 @@
++package nativehooks
++
++import (
++	"bufio"
++	"bytes"
++	"crypto/sha256"
++	"io"
++	"os"
++	"sort"
++	"strings"
++	"unicode/utf8"
++)
++
++// Streaming protobuf verifier: не вызывает proto.Unmarshal с attacker counts.
++// Суммарный input ограничен asset budget; depth ровно четыре уровня schema.
++type profileDATReader struct {
++	br         *bufio.Reader
++	pos, end   uint64
++	categories [][32]byte
++	wanted     [16]string
++	found      [16]bool
++	kind       byte
++}
++
++func (r *profileDATReader) byte() (byte, error) {
++	if r.pos >= r.end {
++		return 0, io.ErrUnexpectedEOF
++	}
++	b, e := r.br.ReadByte()
++	if e == nil {
++		r.pos++
++	}
++	return b, e
++}
++func (r *profileDATReader) varint() (uint64, error) {
++	var v uint64
++	for i := 0; i < 10; i++ {
++		b, e := r.byte()
++		if e != nil || i == 9 && b > 1 {
++			return 0, errProfile
++		}
++		v |= uint64(b&127) << uint(7*i)
++		if b < 128 {
++			if i > 0 && b == 0 {
++				return 0, errProfile
++			}
++			return v, nil
++		}
++	}
++	return 0, errProfile
++}
++func (r *profileDATReader) text(n uint64, keep bool) (string, error) {
++	if n == 0 || n > r.end-r.pos || keep && n > 160 {
++		return "", errProfile
++	}
++	var held [160]byte
++	var runeBytes [4]byte
++	used := 0
++	for i := uint64(0); i < n; i++ {
++		b, e := r.byte()
++		if e != nil {
++			return "", errProfile
++		}
++		if keep {
++			held[i] = b
++		}
++		runeBytes[used] = b
++		used++
++		if utf8.FullRune(runeBytes[:used]) {
++			_, size := utf8.DecodeRune(runeBytes[:used])
++			if size == 1 && runeBytes[0] >= 128 {
++				return "", errProfile
++			}
++			used = 0
++		} else if used == 4 {
++			return "", errProfile
++		}
++	}
++	if used != 0 {
++		return "", errProfile
++	}
++	if keep {
++		return string(held[:n]), nil
++	}
++	return "", nil
++}
++
++// level: list0, entry1, record2, attribute3. Known fields/type only.
++func (r *profileDATReader) message(end uint64, level int) error {
++	if end > r.end || level > 3 {
++		return errProfile
++	}
++	var seen uint8
++	var code string
++	var ipLength uint64
++	var prefix uint64
++	for r.pos < end {
++		tag, e := r.varint()
++		if e != nil {
++			return e
++		}
++		field, wire := tag>>3, tag&7
++		if field == 0 || field > 3 {
++			return errProfile
++		}
++		repeated := level == 0 && field == 1 || level == 1 && field == 2 || level == 2 && r.kind == 2 && field == 3
++		bit := uint8(1 << field)
++		if !repeated && seen&bit != 0 {
++			return errProfile
++		}
++		seen |= bit
++		scalar := level == 1 && r.kind == 1 && field == 3 || level == 2 && r.kind == 1 && field == 2 || level == 2 && r.kind == 2 && field == 1 || level == 3 && (field == 2 || field == 3)
++		if scalar {
++			if wire != 0 {
++				return errProfile
++			}
++			v, e := r.varint()
++			if e != nil {
++				return e
++			}
++			if level == 1 && v > 1 || level == 2 && r.kind == 2 && v > 3 || level == 3 && field == 2 && v > 1 {
++				return errProfile
++			}
++			if level == 2 && r.kind == 1 {
++				prefix = v
++			}
++			continue
++		}
++		if wire != 2 {
++			return errProfile
++		}
++		n, e := r.varint()
++		if e != nil || n > end-r.pos {
++			return errProfile
++		}
++		childEnd := r.pos + n
++		switch {
++		case level == 0 && field == 1, level == 1 && field == 2, level == 2 && r.kind == 2 && field == 3:
++			if e = r.message(childEnd, level+1); e != nil {
++				return e
++			}
++		case level == 1 && field == 1:
++			code, e = r.text(n, true)
++			if e != nil || !profileName([]byte(code), 160) {
++				return errProfile
++			}
++		case level == 2 && r.kind == 1 && field == 1:
++			if n != 4 && n != 16 {
++				return errProfile
++			}
++			ipLength = n
++			var address [16]byte
++			for i := uint64(0); i < n; i++ {
++				v, e := r.byte()
++				if e != nil {
++					return e
++				}
++				address[i] = v
++			}
++			// CIDR unspecified/multicast networks допустимы в DAT; это matcher, не peer.
++		case level == 2 && r.kind == 2 && field == 2, level == 3 && field == 1:
++			if _, e = r.text(n, false); e != nil {
++				return e
++			}
++		default:
++			return errProfile
++		}
++		if r.pos != childEnd {
++			return errProfile
++		}
++	}
++	if r.pos != end {
++		return errProfile
++	}
++	switch level {
++	case 1:
++		if code == "" {
++			return errProfile
++		}
++		canonical := strings.ToUpper(code)
++		hash := sha256.Sum256([]byte(canonical))
++		if len(r.categories) == cap(r.categories) {
++			return errProfile
++		}
++		r.categories = append(r.categories, hash)
++		for i, wanted := range r.wanted {
++			// Native seek сравнивает exact DAT code с upper-case request code;
++			// нормализация самого DAT не должна создавать отсутствующую category.
++			if wanted != "" && wanted == code {
++				r.found[i] = true
++			}
++		}
++	case 2:
++		if r.kind == 1 {
++			if ipLength == 0 || prefix > ipLength*8 {
++				return errProfile
++			}
++		} else if seen&(1<<2) == 0 {
++			return errProfile
++		}
++	case 3:
++		if seen&(1<<1) == 0 || seen&(1<<2) != 0 && seen&(1<<3) != 0 {
++			return errProfile
++		}
++	}
++	return nil
++}
++func verifyProfileDAT(f *os.File, a profileAsset, m *profileCapsule) error {
++	return verifyProfileDATReader(io.NewSectionReader(f, 0, int64(a.size)), a, m)
++}
++func verifyProfileDATReader(input io.Reader, a profileAsset, m *profileCapsule) error {
++	// 65536 category hashes = 2MiB, зарезервированы до parsing, не по wire count.
++	r := profileDATReader{br: bufio.NewReaderSize(input, 32768), end: a.size, categories: make([][32]byte, 0, 65536)}
++	for i, row := range m.rows[5] {
++		c := profileCursor{b: row}
++		kind := c.take(2)
++		category := c.str(160)
++		digest := c.take(32)
++		if bytes.Equal(digest, a.digest[:]) {
++			if r.kind != 0 && r.kind != kind[0] {
++				return errProfile
++			}
++			r.kind = kind[0]
++			r.wanted[i] = strings.ToUpper(strings.SplitN(string(category), "@", 2)[0])
++		}
++	}
++	if r.kind == 0 || r.message(r.end, 0) != nil {
++		return errProfile
++	}
++	sort.Slice(r.categories, func(i, j int) bool { return bytes.Compare(r.categories[i][:], r.categories[j][:]) < 0 })
++	for i := 1; i < len(r.categories); i++ {
++		if r.categories[i] == r.categories[i-1] {
++			return errProfile
++		}
++	}
++	for i, w := range r.wanted {
++		if w != "" && !r.found[i] {
++			return errProfile
++		}
++	}
++	return nil
++}
+--- /dev/null
++++ b/common/yonikbroker/profile_launch.go
+@@ -0,0 +1,223 @@
++package nativehooks
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"errors"
++	"time"
++)
++
++const profileFrameLimit = 65536
++
++var errProfile = errors.New("full-profile admission denied")
++
++// Эти типы закрыты: JSON, tag и context не могут создать admission.
++type profileLaunch struct {
++	mode                    byte
++	nonce, digest, manifest [32]byte
++	session, invocation     [16]byte
++	generation, epoch       uint64
++	hostPID, workerPID      uint32
++	hostStart, workerStart  uint64
++}
++
++func profileSenderValid(r profileLaunch, pid int32, uid, localUID uint32) bool {
++	if r.mode != 1 && r.mode != 2 {
++		return false
++	}
++	expected := localUID
++	if r.mode == 2 {
++		expected = 0
++	}
++	return pid > 0 && uint32(pid) == r.hostPID && uid == expected
++}
++
++func decodeProfileLaunch(b []byte) (r profileLaunch, err error) {
++	if len(b) != 192 || u16(b, 8) != 1 || u16(b, 10) != 192 || !zero(b[14:16]) || !zero(b[184:]) {
++		return r, errProfile
++	}
++	switch string(b[:8]) {
++	case "YNKLOC01":
++		r.mode = 1
++		if u16(b, 12) != 0 || u32(b, 132) != 0 || u64(b, 144) != 0 {
++			return r, errProfile
++		}
++	case "YNKEXT01":
++		r.mode = 2
++		if u16(b, 12) != 1 || u32(b, 132) == 0 || u64(b, 144) == 0 {
++			return r, errProfile
++		}
++	default:
++		return r, errProfile
++	}
++	copy(r.nonce[:], b[16:48])
++	copy(r.digest[:], b[48:80])
++	copy(r.session[:], b[80:96])
++	copy(r.invocation[:], b[96:112])
++	copy(r.manifest[:], b[152:184])
++	r.generation = u64(b, 112)
++	r.epoch = u64(b, 120)
++	r.hostPID = u32(b, 128)
++	r.workerPID = u32(b, 132)
++	r.hostStart = u64(b, 136)
++	r.workerStart = u64(b, 144)
++	if zero(r.nonce[:]) || zero(r.digest[:]) || zero(r.session[:]) || zero(r.invocation[:]) || zero(r.manifest[:]) || r.generation == 0 || r.epoch == 0 || r.hostPID == 0 || r.hostStart == 0 {
++		return profileLaunch{}, errProfile
++	}
++	return r, nil
++}
++
++type profilePacket struct {
++	kind                    uint16
++	sequence, reply, object uint64
++	body                    []byte
++}
++
++func (r profileLaunch) decodePacket(b []byte, expected uint64) (p profilePacket, err error) {
++	if expected == 0 || len(b) < 128 || len(b) > profileFrameLimit || string(b[:8]) != "YNKCAP01" || u16(b, 8) != 1 || int(u32(b, 12)) != len(b) || u64(b, 16) != expected || !bytes.Equal(b[32:48], r.session[:]) || !bytes.Equal(b[48:64], r.invocation[:]) || !bytes.Equal(b[64:96], r.digest[:]) || u64(b, 96) != r.generation || u64(b, 104) != r.epoch || !zero(b[120:128]) {
++		return p, errProfile
++	}
++	p = profilePacket{u16(b, 10), expected, u64(b, 24), u64(b, 112), b[128:]}
++	return p, nil
++}
++func (r profileLaunch) packet(kind uint16, seq, reply uint64, body []byte) []byte {
++	b := make([]byte, 128+len(body))
++	copy(b, "YNKCAP01")
++	be.PutUint16(b[8:], 1)
++	be.PutUint16(b[10:], kind)
++	be.PutUint32(b[12:], uint32(len(b)))
++	be.PutUint64(b[16:], seq)
++	be.PutUint64(b[24:], reply)
++	copy(b[32:], r.session[:])
++	copy(b[48:], r.invocation[:])
++	copy(b[64:], r.digest[:])
++	be.PutUint64(b[96:], r.generation)
++	be.PutUint64(b[104:], r.epoch)
++	copy(b[128:], body)
++	return b
++}
++
++type profileState byte
++
++const (
++	profileAwait profileState = iota
++	profileAdmitting
++	profileAdmitted
++	profileRevoked
++	profileClosed
++	profileUnknown
++)
++
++type profileAdmission struct {
++	launch   profileLaunch
++	capsule  profileCapsule
++	state    profileState
++	deadline time.Time
++}
++
++type profileAdmissionChannel interface {
++	send(uint16, uint64, []byte) error
++	receive(time.Time) ([]byte, error)
++}
++
++func admitProfile(r profileLaunch, config []byte, ch profileAdmissionChannel, verify func(*profileCapsule) error, now func() time.Time) (a profileAdmission, err error) {
++	a.launch = r
++	if sha256.Sum256(config) != r.digest || ch == nil || verify == nil || now == nil {
++		return a, errProfile
++	}
++	a.state = profileAdmitting
++	sent := now()
++	hello := make([]byte, 40)
++	copy(hello, r.nonce[:])
++	hello[32] = r.mode
++	if ch.send(1, 0, hello) != nil {
++		return a, errProfile
++	}
++	raw, e := ch.receive(sent.Add(time.Second))
++	if e != nil {
++		return a, errProfile
++	}
++	frame, e := r.decodePacket(raw, 1)
++	if e != nil || frame.kind != 2 || frame.reply != 1 || frame.object != 0 {
++		return a, errProfile
++	}
++	capsule, e := decodeProfileCapsule(frame.body, r)
++	if e != nil {
++		return a, errProfile
++	}
++	a.capsule = capsule
++	a.deadline = sent.Add(time.Duration(capsule.lease) * time.Millisecond)
++	if verify(&a.capsule) != nil || !now().Before(sent.Add(time.Second)) || !now().Before(a.deadline) {
++		return a, errProfile
++	}
++	ack := make([]byte, 48)
++	copy(ack, capsule.hash[:])
++	be.PutUint64(ack[32:], capsule.admission)
++	ack[40] = 1
++	if ch.send(3, 1, ack) != nil || !now().Before(a.deadline) {
++		return a, errProfile
++	}
++	a.state = profileAdmitted
++	return a, nil
++}
++
++// profileBoot — общий gate production main и pure boot-order tests.
++// Callback не вызывается ни при отсутствии proof, ни при несовпадении exact bytes.
++func profileBoot(r profileLaunch, config []byte, a *profileAdmission, create func(*profileAdmission) error) error {
++	if sha256.Sum256(config) != r.digest || a == nil || a.launch != r || a.state != profileAdmitted || !time.Now().Before(a.deadline) {
++		return errProfile
++	}
++	return create(a)
++}
++
++type profileContextKey struct{}
++
++func renewProfile(a profileAdmission, ch profileAdmissionChannel, request, expected uint64, now func() time.Time) (profileAdmission, error) {
++	if a.state != profileAdmitted || !now().Before(a.deadline) {
++		return a, errProfile
++	}
++	sent := now()
++	body := make([]byte, 40)
++	be.PutUint64(body, a.capsule.admission)
++	copy(body[8:], a.capsule.hash[:])
++	if ch.send(21, 0, body) != nil {
++		return a, errProfile
++	}
++	deadline := sent.Add(time.Second)
++	if a.deadline.Before(deadline) {
++		deadline = a.deadline
++	}
++	raw, e := ch.receive(deadline)
++	if e != nil {
++		return a, errProfile
++	}
++	frame, e := a.launch.decodePacket(raw, expected)
++	if e != nil || frame.kind != 2 || frame.reply != request || frame.object != 0 {
++		return a, errProfile
++	}
++	next, e := decodeProfileCapsulePrevious(frame.body, a.launch, a.capsule.hash)
++	if e != nil || next.admission <= a.capsule.admission || !now().Before(deadline) {
++		return a, errProfile
++	}
++	newDeadline := sent.Add(time.Duration(next.lease) * time.Millisecond)
++	if !now().Before(newDeadline) {
++		return a, errProfile
++	}
++	ack := make([]byte, 48)
++	copy(ack, next.hash[:])
++	be.PutUint64(ack[32:], next.admission)
++	ack[40] = 1
++	if ch.send(3, expected, ack) != nil || !now().Before(deadline) || !now().Before(newDeadline) {
++		return a, errProfile
++	}
++	// Immutable manifest/rows остаются теми же; renewal не удерживает новые
++	// backing buffers через будущие logical grants.
++	a.capsule.admission = next.admission
++	a.capsule.lease = next.lease
++	a.deadline = newDeadline
++	return a, nil
++}
++
++// ProfileLaunchRequested — только выбор закрытого launch path, не proof.
++// Даже один повреждённый locator запрещает fallback к legacy.
++func ProfileLaunchRequested() bool { return profileLocatorsPresent() }
+--- /dev/null
++++ b/common/yonikbroker/profile_launch_linux.go
+@@ -0,0 +1,519 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"io"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/xtls/xray-core/common/platform/filesystem"
++	"golang.org/x/sys/unix"
++)
++
++var profileLocatorNames = [4]string{"YONIK_PROFILE_CONTROL_FD", "YONIK_PROFILE_LAUNCH_FD", "YONIK_PROFILE_PEER_PIDFD", "YONIK_PROFILE_ASSET_ROOT_FD"}
++
++var errProfileTimeout = errors.New("full-profile channel deadline")
++
++func profileLocatorsPresent() bool {
++	for _, name := range profileLocatorNames {
++		if _, ok := os.LookupEnv(name); ok {
++			return true
++		}
++	}
++	return false
++}
++
++// ProfileRuntime не содержит FlowGrant. Constructor доступен только через
++// потребление sealed record и authenticated channel. Владение FD однократное.
++type ProfileRuntime struct {
++	mu                          sync.Mutex
++	admission                   profileAdmission
++	channel, peer, root, record *os.File
++	assets                      [16]*os.File
++	assetStamps                 [16]unix.Stat_t
++	snapshot                    *profileSnapshot
++	ctx                         context.Context
++	cancel                      context.CancelFunc
++	rx, tx                      uint64
++	closed                      bool
++	done                        chan struct{}
++}
++
++func (p *ProfileRuntime) peerAlive() error {
++	b := Bootstrap{ServerPID: p.admission.launch.hostPID, ServerStarttime: p.admission.launch.hostStart}
++	return b.CheckServer(p.peer)
++}
++
++func profileOwnedFile(f *os.File, directory bool) bool {
++	var s unix.Stat_t
++	if unix.Fstat(int(f.Fd()), &s) != nil || s.Mode&0022 != 0 || s.Uid != 0 && s.Uid != uint32(os.Geteuid()) {
++		return false
++	}
++	if directory {
++		return s.Mode&unix.S_IFMT == unix.S_IFDIR
++	}
++	return s.Mode&unix.S_IFMT == unix.S_IFREG && s.Nlink == 1
++}
++func profileSameStamp(a, b unix.Stat_t) bool { a.Atim = b.Atim; return a == b }
++
++// authenticate/receive — единственная OS boundary. Pure tests используют
++// decodePacket/decodeProfileCapsule, не вызывая proc, recvmsg или socketpair.
++func (p *ProfileRuntime) receive(deadline time.Time) ([]byte, error) {
++	for time.Now().Before(deadline) {
++		if p.peerAlive() != nil {
++			return nil, errProfile
++		}
++		fds := []unix.PollFd{{Fd: int32(p.channel.Fd()), Events: unix.POLLIN}, {Fd: int32(p.peer.Fd()), Events: unix.POLLIN}}
++		wait := time.Until(deadline)
++		if wait > 20*time.Millisecond {
++			wait = 20 * time.Millisecond
++		}
++		n, err := unix.Poll(fds, int((wait+time.Millisecond-1)/time.Millisecond))
++		if err == unix.EINTR {
++			continue
++		}
++		if err != nil || fds[1].Revents != 0 {
++			return nil, errProfile
++		}
++		if n == 0 {
++			continue
++		}
++		if fds[0].Revents&unix.POLLIN == 0 {
++			return nil, errProfile
++		}
++		// Fixed bounded RX/ancillary allocation; received rights никогда не принимаются.
++		b := make([]byte, profileFrameLimit)
++		oob := make([]byte, unix.CmsgSpace(16*4)+unix.CmsgSpace(unix.SizeofUcred))
++		size, control, flags, _, err := unix.Recvmsg(int(p.channel.Fd()), b, oob, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
++		valid := err == nil && size >= 128 && flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) == 0
++		messages, e := unix.ParseSocketControlMessage(oob[:control])
++		if e != nil {
++			valid = false
++		}
++		credentials := 0
++		for _, m := range messages {
++			if m.Header.Level == unix.SOL_SOCKET && m.Header.Type == unix.SCM_RIGHTS {
++				rights, e := unix.ParseUnixRights(&m)
++				if e == nil {
++					for _, fd := range rights {
++						_ = unix.Close(fd)
++					}
++				}
++				valid = false
++			} else if m.Header.Level == unix.SOL_SOCKET && m.Header.Type == unix.SCM_CREDENTIALS {
++				credentials++
++				cred, e := unix.ParseUnixCredentials(&m)
++				if e != nil || !profileSenderValid(p.admission.launch, cred.Pid, cred.Uid, uint32(os.Geteuid())) {
++					valid = false
++				}
++			} else {
++				valid = false
++			}
++		}
++		if !valid || credentials != 1 || p.peerAlive() != nil {
++			return nil, errProfile
++		}
++		return b[:size], nil
++	}
++	return nil, errProfileTimeout
++}
++func (p *ProfileRuntime) send(kind uint16, reply uint64, body []byte) error {
++	if p.tx == ^uint64(0) || p.peerAlive() != nil || kind == 3 && !p.channelClear() {
++		return errProfile
++	}
++	p.tx++
++	b := p.admission.launch.packet(kind, p.tx, reply, body)
++	n, err := unix.SendmsgN(int(p.channel.Fd()), b, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++	if err != nil || n != len(b) {
++		return errProfile
++	}
++	return nil
++}
++
++func (p *ProfileRuntime) verifyAssets() error {
++	m := &p.admission.capsule
++	for i := 0; i < m.assetCount; i++ {
++		if p.peerAlive() != nil || !p.channelClear() {
++			return errProfile
++		}
++		a := m.assets[i]
++		name := hex.EncodeToString(a.digest[:]) + ".dat"
++		if a.dns {
++			name = "dns-" + hex.EncodeToString(a.digest[:]) + ".bin"
++		}
++		fd, err := unix.Openat(int(p.root.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
++		if err != nil {
++			return errProfile
++		}
++		f := os.NewFile(uintptr(fd), "profile-asset")
++		p.assets[i] = f
++		var before, after unix.Stat_t
++		if !profileOwnedFile(f, false) || unix.Fstat(fd, &before) != nil || before.Size < 0 || uint64(before.Size) != a.size {
++			return errProfile
++		}
++		h := sha256.New()
++		if a.dns {
++			// Только snapshot <=2MiB materializes; DAT хешируется bounded streaming.
++			data, err := io.ReadAll(io.LimitReader(f, int64(a.size)+1))
++			if err != nil || uint64(len(data)) != a.size {
++				return errProfile
++			}
++			h.Write(data)
++			if p.snapshot, err = decodeProfileSnapshot(data, a); err != nil {
++				return errProfile
++			}
++		} else {
++			n, err := io.CopyBuffer(h, io.LimitReader(f, int64(a.size)+1), make([]byte, 32768))
++			if err != nil || uint64(n) != a.size {
++				return errProfile
++			}
++			if verifyProfileDAT(f, a, m) != nil {
++				return errProfile
++			}
++		}
++		var actual [32]byte
++		copy(actual[:], h.Sum(nil))
++		if actual != a.digest || unix.Fstat(fd, &after) != nil || !profileSameStamp(before, after) {
++			return errProfile
++		}
++		p.assetStamps[i] = after
++	}
++	if p.snapshot != nil && !p.snapshot.validatesResolvers(m) {
++		return errProfile
++	}
++	return nil
++}
++
++func openProfileRuntime(config []byte) (p *ProfileRuntime, err error) {
++	p = &ProfileRuntime{done: make(chan struct{})}
++	p.ctx, p.cancel = context.WithCancel(context.Background())
++	success := false
++	defer func() {
++		if !success {
++			_ = p.closeFiles()
++		}
++	}()
++	var files [4]*os.File
++	var numbers [4]int
++	for i, name := range profileLocatorNames {
++		raw, ok := os.LookupEnv(name)
++		n, e := strconv.ParseUint(raw, 10, 31)
++		if !ok || e != nil || n < 3 || strconv.FormatUint(n, 10) != raw {
++			return nil, errProfile
++		}
++		numbers[i] = int(n)
++		for j := 0; j < i; j++ {
++			if numbers[j] == numbers[i] {
++				return nil, errProfile
++			}
++		}
++	}
++	// При ошибке после этой точки runtime закрывает все потреблённые FD.
++	for i, n := range numbers {
++		unix.CloseOnExec(n)
++		files[i] = os.NewFile(uintptr(n), "profile-owned")
++	}
++	p.channel, p.record, p.peer, p.root = files[0], files[1], files[2], files[3]
++	for _, entry := range os.Environ() {
++		name, value, _ := strings.Cut(entry, "=")
++		allowed := name == "LANG" && value == "C"
++		for _, locator := range profileLocatorNames {
++			allowed = allowed || name == locator
++		}
++		if !allowed {
++			return nil, errProfile
++		}
++	}
++	seals, e := unix.FcntlInt(p.record.Fd(), unix.F_GET_SEALS, 0)
++	mandatory := unix.F_SEAL_SEAL | unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_WRITE
++	var s unix.Stat_t
++	if e != nil || seals&mandatory != mandatory || unix.Fstat(int(p.record.Fd()), &s) != nil || s.Mode&unix.S_IFMT != unix.S_IFREG || s.Size != 192 {
++		return nil, errProfile
++	}
++	record := make([]byte, 192)
++	if _, e = p.record.ReadAt(record, 0); e != nil {
++		return nil, errProfile
++	}
++	r, e := decodeProfileLaunch(record)
++	if e != nil || sha256.Sum256(config) != r.digest {
++		return nil, errProfile
++	}
++	p.admission.launch = r
++	if r.mode == 2 {
++		self := Bootstrap{ServerPID: r.workerPID, ServerStarttime: r.workerStart}
++		// pidfd на самого child создаётся только для локальной проверки record binding.
++		// Никакого вызова в pure tests.
++		if uint32(os.Getpid()) != self.ServerPID {
++			return nil, errProfile
++		}
++		fd, e := unix.PidfdOpen(os.Getpid(), 0)
++		if e != nil {
++			return nil, errProfile
++		}
++		f := os.NewFile(uintptr(fd), "profile-self")
++		e = self.CheckServer(f)
++		_ = f.Close()
++		if e != nil {
++			return nil, errProfile
++		}
++	}
++	kind, e := unix.GetsockoptInt(int(p.channel.Fd()), unix.SOL_SOCKET, unix.SO_TYPE)
++	if e != nil || kind != unix.SOCK_SEQPACKET || p.peerAlive() != nil || !profileOwnedFile(p.root, true) {
++		return nil, errProfile
++	}
++	if unix.SetsockoptInt(int(p.channel.Fd()), unix.SOL_SOCKET, unix.SO_PASSCRED, 1) != nil {
++		return nil, errProfile
++	}
++	a, e := admitProfile(r, config, p, func(m *profileCapsule) error { p.admission.capsule = *m; return p.verifyAssets() }, time.Now)
++	if e != nil {
++		return nil, errProfile
++	}
++	p.rx = 1
++	p.admission = a
++	// Existing native DAT loader получает только retained controlled root.
++	// Никакой provider path или унаследованный XRAY_LOCATION_ASSET не принимается.
++	if os.Setenv("XRAY_LOCATION_ASSET", "/proc/self/fd/"+strconv.Itoa(int(p.root.Fd()))) != nil {
++		return nil, errProfile
++	}
++	rootName := "/proc/self/fd/" + strconv.Itoa(int(p.root.Fd()))
++	manifest := p.admission.capsule
++	filesystem.NewFileReader = func(path string) (io.ReadCloser, error) {
++		index := profileAssetPath(path, rootName, &manifest)
++		if index < 0 || p.ctx.Err() != nil {
++			return nil, errProfile
++		}
++		a := manifest.assets[index]
++		return &profileAssetReader{runtime: p, reader: io.NewSectionReader(p.assets[index], 0, int64(a.size))}, nil
++	}
++	success = true
++	go p.monitor()
++	return p, nil
++}
++
++type profileAssetReader struct {
++	runtime *ProfileRuntime
++	reader  *io.SectionReader
++	closed  bool
++}
++
++func (r *profileAssetReader) Read(b []byte) (int, error) {
++	if r.closed || r.runtime.ctx.Err() != nil {
++		return 0, errProfile
++	}
++	return r.reader.Read(b)
++}
++func (r *profileAssetReader) Close() error { r.closed = true; return nil }
++
++func (p *ProfileRuntime) monitor() {
++	defer close(p.done)
++	defer func() {
++		p.mu.Lock()
++		if !p.closed && p.admission.state != profileUnknown {
++			p.admission.state = profileRevoked
++		}
++		p.cancel()
++		p.mu.Unlock()
++	}()
++	// Единственный reader/writer после initial ACK. Отсутствующие consumer
++	// сообщения не превращаются в grants; unknown/replay/EOF немедленно fence.
++	for {
++		p.mu.Lock()
++		a := p.admission
++		closed := p.closed
++		p.mu.Unlock()
++		if closed {
++			return
++		}
++		lead := time.Duration(a.capsule.lease) * time.Millisecond / 2
++		if lead > 20*time.Second {
++			lead = 20 * time.Second
++		}
++		renewAt := a.deadline.Add(-lead)
++		if renewAt.Before(time.Now()) {
++			renewAt = time.Now()
++		}
++		packet, err := p.receive(renewAt)
++		if err == errProfileTimeout {
++			next, e := renewProfile(a, p, p.tx+1, p.rx+1, time.Now)
++			if e != nil {
++				return
++			}
++			p.mu.Lock()
++			if p.closed {
++				p.mu.Unlock()
++				return
++			}
++			p.admission = next
++			p.rx++
++			p.mu.Unlock()
++			continue
++		}
++		if err != nil {
++			return
++		}
++		frame, e := a.launch.decodePacket(packet, p.rx+1)
++		if e == nil && frame.kind == 33 && frame.reply == 0 && frame.object == 0 && len(frame.body) == 8 && zero(frame.body[2:]) {
++			p.mu.Lock()
++			if !p.closed && p.admission.state != profileUnknown {
++				p.admission.state = profileRevoked
++			}
++			p.cancel()
++			p.mu.Unlock()
++			// Core/transport cleanup ещё не подтверждён: KnownClosed здесь ложен.
++			ack := make([]byte, 12)
++			ack[0] = 4
++			ack[1] = 3
++			_ = p.send(34, frame.sequence, ack)
++		}
++		return
++	}
++}
++func (p *ProfileRuntime) closeFiles() error {
++	if p.cancel != nil {
++		p.cancel()
++	}
++	var first error
++	closeOne := func(f *os.File) {
++		if f != nil {
++			if e := f.Close(); e != nil && first == nil {
++				first = e
++			}
++		}
++	}
++	for _, f := range p.assets {
++		closeOne(f)
++	}
++	closeOne(p.channel)
++	closeOne(p.peer)
++	closeOne(p.root)
++	closeOne(p.record)
++	return first
++}
++func (p *ProfileRuntime) Close() error {
++	if p == nil || p.ctx == nil {
++		return nil
++	}
++	p.mu.Lock()
++	if p.admission.state == profileUnknown {
++		p.mu.Unlock()
++		return errProfile
++	}
++	if p.closed {
++		p.mu.Unlock()
++		return nil
++	}
++	p.closed = true
++	p.admission.state = profileClosed
++	p.cancel()
++	_ = unix.Shutdown(int(p.channel.Fd()), unix.SHUT_RDWR)
++	p.mu.Unlock()
++	<-p.done
++	err := p.closeFiles()
++	if err != nil {
++		p.mu.Lock()
++		p.admission.state = profileUnknown
++		p.mu.Unlock()
++	}
++	return err
++}
++
++// RevokeUnknown удерживает asset/root/pidfd custody при неподтверждённом
++// feature cleanup. Parent освобождает run только после actual child reap.
++func (p *ProfileRuntime) Revoke()        { p.revoke(false) }
++func (p *ProfileRuntime) RevokeUnknown() { p.revoke(true) }
++func (p *ProfileRuntime) revoke(unknown bool) {
++	if p == nil || p.ctx == nil {
++		return
++	}
++	p.mu.Lock()
++	if p.closed {
++		p.mu.Unlock()
++		return
++	}
++	if unknown {
++		p.admission.state = profileUnknown
++	} else if p.admission.state != profileUnknown {
++		p.admission.state = profileRevoked
++	}
++	p.cancel()
++	_ = unix.Shutdown(int(p.channel.Fd()), unix.SHUT_RDWR)
++	p.mu.Unlock()
++	<-p.done
++}
++
++// Start повторяет fence непосредственно перед feature Start, сохраняя закрытый
++// runtime до Close. Этот вызов не даёт transport/socket authority.
++func (p *ProfileRuntime) Start(start func() error) error {
++	if p == nil || p.ctx == nil || start == nil {
++		return errProfile
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if !p.fresh() {
++		return errProfile
++	}
++	err := start()
++	if err != nil {
++		p.admission.state = profileUnknown
++		p.cancel()
++		_ = unix.Shutdown(int(p.channel.Fd()), unix.SHUT_RDWR)
++	}
++	return err
++}
++func (p *ProfileRuntime) Done() <-chan struct{} { return p.ctx.Done() }
++func (p *ProfileRuntime) fresh() bool {
++	if p.closed || p.ctx.Err() != nil || p.peerAlive() != nil || p.admission.state != profileAdmitted || !time.Now().Before(p.admission.deadline) {
++		return false
++	}
++	for i, f := range p.assets {
++		if f != nil {
++			var stamp unix.Stat_t
++			if unix.Fstat(int(f.Fd()), &stamp) != nil || !profileSameStamp(stamp, p.assetStamps[i]) {
++				return false
++			}
++		}
++	}
++	return p.channelClear()
++}
++func (p *ProfileRuntime) channelClear() bool {
++	fds := []unix.PollFd{{Fd: int32(p.channel.Fd()), Events: unix.POLLIN}}
++	n, e := unix.Poll(fds, 0)
++	return e == nil && n == 0
++}
++
++// PrepareProfileLaunch вызывается main ДО core.NewWithContext. Check-only
++// категорически не потребляет Run admission и не вызывает factory.
++func PrepareProfileLaunch(config []byte, checkOnly bool, create func(context.Context) error) (*ProfileRuntime, error) {
++	if checkOnly || len(config) == 0 || len(config) > 65536 {
++		return nil, errProfile
++	}
++	p, err := openProfileRuntime(config)
++	if err != nil {
++		return nil, err
++	}
++	p.mu.Lock()
++	if !p.fresh() {
++		err = errProfile
++	} else {
++		err = profileBoot(p.admission.launch, config, &p.admission, func(*profileAdmission) error { return create(context.WithValue(p.ctx, profileContextKey{}, p)) })
++		if err == nil && !p.fresh() {
++			err = errProfile
++		}
++	}
++	p.mu.Unlock()
++	if err != nil {
++		// Constructor мог частично создать features. Их cleanup здесь не доказан;
++		// custody остаётся у child до stop/reap, никаких новых grants нет.
++		p.RevokeUnknown()
++		return p, err
++	}
++	return p, nil
++}
+--- /dev/null
++++ b/common/yonikbroker/profile_launch_linux_test.go
+@@ -0,0 +1,18 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"testing"
++)
++
++func TestProfileUnknownCleanupRetainsCustody(t *testing.T) {
++	p := &ProfileRuntime{ctx: context.Background(), admission: profileAdmission{state: profileUnknown}}
++	// Никаких OS FD: отказ обязан произойти до Close/Shutdown/file operations.
++	for i := 0; i < 2; i++ {
++		if p.Close() == nil || p.closed || p.admission.state != profileUnknown {
++			t.Fatal("Unknown стал KnownClosed")
++		}
++	}
++}
+--- /dev/null
++++ b/common/yonikbroker/profile_launch_other.go
+@@ -0,0 +1,29 @@
++//go:build !linux
++
++package nativehooks
++
++import (
++	"context"
++	"os"
++)
++
++func profileLocatorsPresent() bool {
++	for _, name := range []string{"YONIK_PROFILE_CONTROL_FD", "YONIK_PROFILE_LAUNCH_FD", "YONIK_PROFILE_PEER_PIDFD", "YONIK_PROFILE_ASSET_ROOT_FD"} {
++		if _, ok := os.LookupEnv(name); ok {
++			return true
++		}
++	}
++	return false
++}
++
++type ProfileRuntime struct{}
++
++func (*ProfileRuntime) RevokeUnknown() {}
++func (*ProfileRuntime) Revoke()        {}
++
++func PrepareProfileLaunch([]byte, bool, func(context.Context) error) (*ProfileRuntime, error) {
++	return nil, errProfile
++}
++func (*ProfileRuntime) Start(func() error) error { return errProfile }
++func (*ProfileRuntime) Close() error             { return nil }
++func (*ProfileRuntime) Done() <-chan struct{}    { return nil }
+--- /dev/null
++++ b/common/yonikbroker/profile_launch_test.go
+@@ -0,0 +1,474 @@
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	_ "embed"
++	"encoding/hex"
++	"encoding/json"
++	"io"
++	"testing"
++	"time"
++)
++
++//go:embed profile-launch-vectors.json
++var profileGolden []byte
++
++func TestProfileIndependentGoldenV3(t *testing.T) {
++	var v struct {
++		Local string `json:"local_record_hex"`
++		Body  string `json:"admit_body_hex"`
++		Hash  string `json:"manifest_sha256"`
++	}
++	if e := json.Unmarshal(profileGolden, &v); e != nil {
++		t.Fatal(e)
++	}
++	record, e := hex.DecodeString(v.Local)
++	if e != nil {
++		t.Fatal(e)
++	}
++	r, e := decodeProfileLaunch(record)
++	if e != nil {
++		t.Fatal(e)
++	}
++	body, e := hex.DecodeString(v.Body)
++	if e != nil {
++		t.Fatal(e)
++	}
++	m, e := decodeProfileCapsule(body, r)
++	if e != nil {
++		t.Fatal(e)
++	}
++	generated, binding := syntheticProfileCapsule()
++	if !bytes.Equal(generated, body) || binding.manifest != m.hash || hex.EncodeToString(m.hash[:]) != v.Hash {
++		t.Fatal("independent golden mismatch")
++	}
++}
++
++func TestProfileLaunchRecordModes(t *testing.T) {
++	b := make([]byte, 192)
++	copy(b, "YNKLOC01")
++	be.PutUint16(b[8:], 1)
++	be.PutUint16(b[10:], 192)
++	for _, i := range []int{16, 48, 80, 96, 152} {
++		b[i] = 1
++	}
++	be.PutUint64(b[112:], 1)
++	be.PutUint64(b[120:], 1)
++	be.PutUint32(b[128:], 42)
++	be.PutUint64(b[136:], 7)
++	if _, err := decodeProfileLaunch(b); err != nil {
++		t.Fatal(err)
++	}
++	b[132] = 1
++	if _, err := decodeProfileLaunch(b); err == nil {
++		t.Fatal("Local принял System worker")
++	}
++	b[132] = 0
++	copy(b, "YNKEXT01")
++	be.PutUint16(b[12:], 1)
++	if _, err := decodeProfileLaunch(b); err == nil {
++		t.Fatal("System без worker")
++	}
++	be.PutUint32(b[132:], 43)
++	be.PutUint64(b[144:], 8)
++	r, err := decodeProfileLaunch(b)
++	if err != nil || r.mode != 2 {
++		t.Fatal("valid System", err)
++	}
++	if !profileSenderValid(r, 42, 0, 1000) || profileSenderValid(r, 42, 1000, 1000) || profileSenderValid(r, 43, 0, 1000) {
++		t.Fatal("System peer")
++	}
++	r.mode = 1
++	if !profileSenderValid(r, 42, 1000, 1000) || profileSenderValid(r, 42, 0, 1000) {
++		t.Fatal("Local peer")
++	}
++}
++
++func syntheticProfileCapsule() ([]byte, profileLaunch) {
++	r := profileLaunch{mode: 1, generation: 1, epoch: 1}
++	r.digest = sha256.Sum256([]byte("config"))
++	r.nonce[0] = 1
++	r.session[0] = 1
++	r.invocation[0] = 2
++	var rows [11][][]byte
++	subject := []byte{0, 1, 'a', 5, 0, 0, 0, 0, 0, 0, 1}
++	rows[0] = [][]byte{subject}
++	stream := make([]byte, 36)
++	stream[0] = 1
++	stream[4] = 1
++	rows[3] = [][]byte{stream}
++	ingress := []byte{2, 3, 0x12, 0x34, 0, 1, 'i'}
++	rows[6] = [][]byte{ingress}
++	for i, network := range []byte{6, 17} {
++		s := make([]byte, 24)
++		s[2] = network
++		s[3] = 1
++		s[4] = network
++		s[5] = network
++		for j := 8; j < 20; j++ {
++			s[j] = 255
++		}
++		if i == 0 {
++			be.PutUint16(s[12:], 0)
++		}
++		s[20] = 3
++		rows[8] = append(rows[8], s)
++	}
++	b := make([]byte, 128)
++	be.PutUint64(b[64:], 1)
++	be.PutUint32(b[72:], 60000)
++	b[76] = 1
++	be.PutUint16(b[78:], 3)
++	be.PutUint64(b[80:], 1)
++	for i, v := range profileMaxCaps {
++		be.PutUint32(b[88+i*4:], v)
++	}
++	be.PutUint16(b[120:], 11)
++	for i, table := range rows {
++		var encoded []byte
++		for _, row := range table {
++			p := make([]byte, 4)
++			be.PutUint16(p, uint16(len(row)))
++			encoded = append(encoded, p...)
++			encoded = append(encoded, row...)
++		}
++		prefix := make([]byte, 8)
++		be.PutUint16(prefix, uint16(i+1))
++		be.PutUint16(prefix[2:], uint16(len(table)))
++		be.PutUint32(prefix[4:], uint32(len(encoded)))
++		b = append(b, prefix...)
++		b = append(b, encoded...)
++	}
++	rehashProfileCapsule(b, &r)
++	return b, r
++}
++func rehashProfileCapsule(b []byte, r *profileLaunch) {
++	h := sha256.New()
++	h.Write([]byte("YNKCAP-MANIFEST-v1\x00"))
++	h.Write(r.digest[:])
++	h.Write(b[76:78])
++	h.Write(b[80:120])
++	h.Write(b[128:])
++	copy(r.manifest[:], h.Sum(nil))
++	copy(b, r.manifest[:])
++}
++
++type fakeProfileAdmission struct {
++	r        profileLaunch
++	body     []byte
++	events   []string
++	failACK  bool
++	failRead bool
++}
++
++func (f *fakeProfileAdmission) send(kind uint16, reply uint64, b []byte) error {
++	if kind == 1 {
++		if reply != 0 || len(b) != 40 || !bytes.Equal(b[:32], f.r.nonce[:]) || b[32] != f.r.mode {
++			return errProfile
++		}
++		f.events = append(f.events, "HELLO")
++		return nil
++	}
++	if kind != 3 || reply != 1 || len(b) != 48 || !bytes.Equal(b[:32], f.r.manifest[:]) || u64(b, 32) != 1 || b[40] != 1 || !zero(b[41:]) {
++		return errProfile
++	}
++	f.events = append(f.events, "ACK")
++	if f.failACK {
++		return io.ErrClosedPipe
++	}
++	return nil
++}
++func (f *fakeProfileAdmission) receive(time.Time) ([]byte, error) {
++	f.events = append(f.events, "ADMIT")
++	if f.failRead {
++		return nil, io.EOF
++	}
++	return f.r.packet(2, 1, 1, f.body), nil
++}
++
++func TestProfileAdmissionBootOrderAndFences(t *testing.T) {
++	for _, fault := range []string{"", "assets", "EOF", "ACK", "expired", "digest"} {
++		t.Run(fault, func(t *testing.T) {
++			body, r := syntheticProfileCapsule()
++			f := &fakeProfileAdmission{r: r, body: body, failRead: fault == "EOF", failACK: fault == "ACK"}
++			now := time.Now()
++			clock := func() time.Time { return now }
++			raw := []byte("config")
++			if fault == "digest" {
++				raw = []byte("changed")
++			}
++			a, err := admitProfile(r, raw, f, func(*profileCapsule) error {
++				f.events = append(f.events, "ASSETS")
++				if fault == "assets" {
++					return errProfile
++				}
++				if fault == "expired" {
++					now = now.Add(time.Minute)
++				}
++				return nil
++			}, clock)
++			if fault != "" {
++				if err == nil {
++					t.Fatal("принят fault", fault)
++				}
++				for _, event := range f.events {
++					if event == "ACK" && (fault == "assets" || fault == "expired") {
++						t.Fatal("ACK до proofs")
++					}
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err = profileBoot(r, raw, &a, func(*profileAdmission) error { f.events = append(f.events, "NEW", "START"); return nil }); err != nil {
++				t.Fatal(err)
++			}
++			if got := stringsJoin(f.events); got != "HELLO ADMIT ASSETS ACK NEW START" {
++				t.Fatal(got)
++			}
++			a.state = profileRevoked
++			if profileBoot(r, raw, &a, func(*profileAdmission) error { t.Fatal("factory после revoke"); return nil }) == nil {
++				t.Fatal("revoke")
++			}
++		})
++	}
++}
++func stringsJoin(v []string) string {
++	var b bytes.Buffer
++	for i, s := range v {
++		if i > 0 {
++			b.WriteByte(' ')
++		}
++		b.WriteString(s)
++	}
++	return b.String()
++}
++
++func TestProfileCapsuleTruncationAndRehashedMalformed(t *testing.T) {
++	body, r := syntheticProfileCapsule()
++	if _, err := decodeProfileCapsule(body, r); err != nil {
++		t.Fatal(err)
++	}
++	for i := 0; i < len(body); i++ {
++		if _, err := decodeProfileCapsule(body[:i], r); err == nil {
++			t.Fatalf("truncation %d", i)
++		}
++	}
++	for _, offset := range []int{77, 78, 120, 128, 130, 134, 138} {
++		bad := append([]byte(nil), body...)
++		bad[offset] ^= 255
++		rehashProfileCapsule(bad, &r)
++		if _, err := decodeProfileCapsule(bad, r); err == nil {
++			t.Fatalf("accepted malformed %d", offset)
++		}
++	}
++}
++func TestProfileFrameRejectsReplayBindingAndOverflow(t *testing.T) {
++	_, r := syntheticProfileCapsule()
++	b := r.packet(2, 1, 1, nil)
++	if _, e := r.decodePacket(b, 1); e != nil {
++		t.Fatal(e)
++	}
++	if _, e := r.decodePacket(b, 2); e == nil {
++		t.Fatal("replay")
++	}
++	for _, offset := range []int{0, 8, 12, 16, 32, 48, 64, 96, 104, 120} {
++		bad := append([]byte(nil), b...)
++		bad[offset] ^= 1
++		if _, e := r.decodePacket(bad, 1); e == nil {
++			t.Fatal(offset)
++		}
++	}
++	if _, e := r.decodePacket(make([]byte, 65537), 1); e == nil {
++		t.Fatal("overflow")
++	}
++}
++
++func syntheticProfileSnapshot() ([]byte, profileAsset) {
++	b := make([]byte, 120+32+8+2)
++	copy(b, "YNKDNS01")
++	be.PutUint16(b[8:], 1)
++	be.PutUint16(b[10:], 120)
++	b[16] = 1
++	b[152] = 3
++	b[153] = 1
++	b[154] = 2
++	be.PutUint32(b[156:], 5000)
++	be.PutUint16(b[160:], 16)
++	// hostname empty, search empty, один localhost stub, hosts empty.
++	b = append(b, 0, 0, 0, 0, 0, 1, 4, 0, 0, 53, 127, 0, 0, 1, 0, 0)
++	be.PutUint32(b[12:], uint32(len(b)))
++	a := profileAsset{dns: true, size: uint64(len(b)), digest: sha256.Sum256(b)}
++	copy(a.source[:], b[16:48])
++	return b, a
++}
++func TestProfileSnapshotExactHashLayoutAndBounds(t *testing.T) {
++	b, a := syntheticProfileSnapshot()
++	if _, e := decodeProfileSnapshot(b, a); e != nil {
++		t.Fatal(e)
++	}
++	for i := 0; i < len(b); i++ {
++		if _, e := decodeProfileSnapshot(b[:i], a); e == nil {
++			t.Fatal("truncated", i)
++		}
++	}
++	for _, offset := range []int{8, 10, 12, 16, 112, 152, 153, 154, 155, 156, 160, 166, 168, 170} {
++		bad := append([]byte(nil), b...)
++		bad[offset] ^= 255
++		aa := a
++		aa.digest = sha256.Sum256(bad)
++		if _, e := decodeProfileSnapshot(bad, aa); e == nil {
++			t.Fatal("malformed", offset)
++		}
++	}
++	a.digest[0] ^= 1
++	if _, e := decodeProfileSnapshot(b, a); e == nil {
++		t.Fatal("wrong asset hash")
++	}
++}
++
++func TestProfileDATStreamingGrammarAndCategory(t *testing.T) {
++	data := []byte{10, 14, 10, 2, 'Z', 'Z', 18, 8, 10, 4, 1, 2, 3, 0, 16, 24}
++	hash := sha256.Sum256(data)
++	row := []byte{1, 0, 0, 2, 'z', 'z'}
++	row = append(row, hash[:]...)
++	size := make([]byte, 8)
++	be.PutUint64(size, uint64(len(data)))
++	row = append(row, size...)
++	m := profileCapsule{}
++	m.rows[5] = [][]byte{row}
++	a := profileAsset{digest: hash, size: uint64(len(data))}
++	if e := verifyProfileDATReader(bytes.NewReader(data), a, &m); e != nil {
++		t.Fatal(e)
++	}
++	lower := append([]byte(nil), data...)
++	lower[4] = 'z'
++	lower[5] = 'z'
++	if verifyProfileDATReader(bytes.NewReader(lower), a, &m) == nil {
++		t.Fatal("native exact code mismatch")
++	}
++	for _, offset := range []int{0, 1, 2, 3, 6, 7, 8, 9, 15} {
++		bad := append([]byte(nil), data...)
++		bad[offset] ^= 255
++		if verifyProfileDATReader(bytes.NewReader(bad), a, &m) == nil {
++			t.Fatal("accepted DAT mutation", offset)
++		}
++	}
++	m.rows[5][0][4] = 'a'
++	if verifyProfileDATReader(bytes.NewReader(data), a, &m) == nil {
++		t.Fatal("missing category")
++	}
++}
++
++type fakeProfileRenew struct {
++	r        profileLaunch
++	body     []byte
++	request  uint64
++	sequence uint64
++	ack      bool
++	fail     bool
++}
++
++func (f *fakeProfileRenew) send(kind uint16, reply uint64, b []byte) error {
++	if kind == 21 {
++		if reply != 0 || len(b) != 40 || u64(b, 0) != 1 || !bytes.Equal(b[8:], f.r.manifest[:]) {
++			return errProfile
++		}
++		return nil
++	}
++	if kind != 3 || reply != f.sequence || len(b) != 48 || u64(b, 32) != 2 {
++		return errProfile
++	}
++	f.ack = true
++	if f.fail {
++		return io.ErrClosedPipe
++	}
++	return nil
++}
++func (f *fakeProfileRenew) receive(time.Time) ([]byte, error) {
++	return f.r.packet(2, f.sequence, f.request, f.body), nil
++}
++func TestProfileRenewalDoesNotResurrectOrExtendOnStaleACK(t *testing.T) {
++	body, r := syntheticProfileCapsule()
++	m, e := decodeProfileCapsule(body, r)
++	if e != nil {
++		t.Fatal(e)
++	}
++	now := time.Now()
++	old := profileAdmission{launch: r, capsule: m, state: profileAdmitted, deadline: now.Add(time.Second)}
++	next := append([]byte(nil), body...)
++	copy(next[32:], r.manifest[:])
++	be.PutUint64(next[64:], 2)
++	f := &fakeProfileRenew{r: r, body: next, request: 3, sequence: 2}
++	renewed, e := renewProfile(old, f, 3, 2, func() time.Time { return now })
++	if e != nil || !f.ack || !renewed.deadline.After(old.deadline) {
++		t.Fatal("renew", e)
++	}
++	for _, fault := range []string{"expired", "revoked", "ACK", "reply", "replay", "manifest"} {
++		t.Run(fault, func(t *testing.T) {
++			a := old
++			ff := *f
++			ff.body = append([]byte(nil), next...)
++			switch fault {
++			case "expired":
++				a.deadline = now
++			case "revoked":
++				a.state = profileRevoked
++			case "ACK":
++				ff.fail = true
++			case "reply":
++				ff.request = 999
++			case "replay":
++				ff.sequence = 1
++			case "manifest":
++				ff.body[32] ^= 1
++			}
++			got, e := renewProfile(a, &ff, 3, 2, func() time.Time { return now })
++			if e == nil || got.deadline != a.deadline {
++				t.Fatal("renewed after", fault)
++			}
++		})
++	}
++}
++
++func TestProfileAssetPathRejectsGlobalAndTraversal(t *testing.T) {
++	a := profileAsset{size: 1}
++	a.digest[0] = 1
++	m := profileCapsule{assetCount: 1}
++	m.assets[0] = a
++	name := hex.EncodeToString(a.digest[:]) + ".dat"
++	root := "/proc/self/fd/9"
++	if profileAssetPath(root+"/"+name, root, &m) != 0 {
++		t.Fatal("owned path")
++	}
++	for _, path := range []string{"/usr/share/xray/" + name, root + "/../" + name, root + "//" + name, root + "/geoip.dat", root + "/dns-" + name} {
++		if profileAssetPath(path, root, &m) != -1 {
++			t.Fatal(path)
++		}
++	}
++}
++func TestProfileCheckOnlyNeverConsumesRun(t *testing.T) {
++	if _, e := PrepareProfileLaunch([]byte("config"), true, func(context.Context) error { t.Fatal("check-only factory"); return nil }); e == nil {
++		t.Fatal("check-only Run accepted")
++	}
++	p := &ProfileRuntime{}
++	if p.Start(func() error { t.Fatal("zero runtime Start"); return nil }) == nil {
++		t.Fatal("zero runtime")
++	}
++}
++
++func TestProfileAdmissionRejectsBeforeFactory(t *testing.T) {
++	raw := []byte("synthetic config")
++	r := profileLaunch{digest: sha256.Sum256(raw), mode: 1}
++	called := false
++	if err := profileBoot(r, raw, nil, func(*profileAdmission) error { called = true; return nil }); err == nil || called {
++		t.Fatal("factory до admission")
++	}
++	r.digest[0] ^= 1
++	if err := profileBoot(r, raw, nil, func(*profileAdmission) error { called = true; return nil }); err == nil || called {
++		t.Fatal("factory при digest mismatch")
++	}
++}
+--- /dev/null
++++ b/common/yonikbroker/profile_snapshot.go
+@@ -0,0 +1,183 @@
++package nativehooks
++
++import (
++	"bytes"
++	"crypto/sha256"
++)
++
++// Snapshot пока удерживает exact verified encoding. DNS consumer следующего
++// milestone получает только этот тип, а не произвольный filename/hash.
++type profileSnapshot struct {
++	encoded  []byte
++	peers    [3][]byte
++	families [3]byte
++	count    int
++}
++
++func profileDNSName(b []byte, root bool) bool {
++	for _, v := range b {
++		if v >= 'A' && v <= 'Z' {
++			return false
++		}
++	}
++	if root && (len(b) == 0 || bytes.Equal(b, []byte("."))) {
++		return true
++	}
++	if len(b) > 0 && b[len(b)-1] == '.' {
++		b = b[:len(b)-1]
++	}
++	// Pinned netgo isDomainName допускает SRV-like underscore labels.
++	// Dynamic flow Destination использует отдельную, более строгую LDH grammar.
++	return profileLabels(b, true, false)
++}
++
++func decodeProfileSnapshot(b []byte, a profileAsset) (*profileSnapshot, error) {
++	if !a.dns || sha256.Sum256(b) != a.digest || uint64(len(b)) != a.size || len(b) < 120 || len(b) > 2*1024*1024 || string(b[:8]) != "YNKDNS01" || u16(b, 8) != 1 || u16(b, 10) != 120 || int(u32(b, 12)) != len(b) || !bytes.Equal(b[16:48], a.source[:]) || !zero(b[112:120]) {
++		return nil, errProfile
++	}
++	c := profileCursor{b: b[120:]}
++	hash := c.take(32)
++	p := c.take(8)
++	flags := c.n16()
++	if hash == nil || p == nil || p[0] < 1 || p[0] > 4 || p[1] > 15 || p[2] < 1 || p[2] > 5 || p[3] != 0 || u32(p, 4) == 0 || u32(p, 4) > 30000 || flags&^uint16(31) != 0 {
++		return nil, errProfile
++	}
++	if !profileDNSName(c.str(253), true) {
++		return nil, errProfile
++	}
++	search := int(c.n16())
++	if search > 6 {
++		return nil, errProfile
++	}
++	for i := 0; i < search; i++ {
++		if !profileDNSName(c.str(253), true) {
++			return nil, errProfile
++		}
++	}
++	peers := int(c.n16())
++	snapshot := &profileSnapshot{encoded: b, count: peers}
++	// Pinned netgo использует первые три valid nameserver, включая duplicates.
++	if peers == 0 || peers > 3 {
++		return nil, errProfile
++	}
++	for i := 0; i < peers; i++ {
++		h := c.take(4)
++		if h == nil || h[1] != 0 || u16(h, 2) != 53 {
++			return nil, errProfile
++		}
++		n := 4
++		if h[0] == 6 {
++			n = 16
++		} else if h[0] != 4 {
++			return nil, errProfile
++		}
++		address := c.take(n)
++		if !profileIP(address) {
++			return nil, errProfile
++		}
++		snapshot.peers[i] = address
++		snapshot.families[i] = h[0]
++	}
++	hosts := int(c.n16())
++	if hosts > 4096 || a.flags&1 != 0 && hosts != 0 {
++		return nil, errProfile
++	}
++	// O(n log n) duplicate check с fixed stack storage, без map capacity.
++	var aliases [4096][]byte
++	for i := 0; i < hosts; i++ {
++		alias := c.str(253)
++		if !profileDNSName(alias, false) || bytes.IndexByte(alias, '.') >= 0 && alias[len(alias)-1] != '.' {
++			return nil, errProfile
++		}
++		aliases[i] = alias
++		n := int(c.n16())
++		if n < 1 || n > 16 {
++			return nil, errProfile
++		}
++		for j := 0; j < n; j++ {
++			family := c.take(1)
++			if family == nil {
++				return nil, errProfile
++			}
++			size := 4
++			if family[0] == 6 {
++				size = 16
++			} else if family[0] != 4 {
++				return nil, errProfile
++			}
++			if !profileIP(c.take(size)) {
++				return nil, errProfile
++			}
++		}
++	}
++	if !c.done() {
++		return nil, errProfile
++	}
++	// Heapsort избегает allocations и квадратичного поведения на hosts cap.
++	less := func(i, j int) bool { return bytes.Compare(aliases[i], aliases[j]) < 0 }
++	var down func(int, int)
++	down = func(i, n int) {
++		for {
++			child := i*2 + 1
++			if child >= n {
++				return
++			}
++			if child+1 < n && less(child, child+1) {
++				child++
++			}
++			if !less(i, child) {
++				return
++			}
++			aliases[i], aliases[child] = aliases[child], aliases[i]
++			i = child
++		}
++	}
++	for i := hosts/2 - 1; i >= 0; i-- {
++		down(i, hosts)
++	}
++	for i := hosts - 1; i > 0; i-- {
++		aliases[0], aliases[i] = aliases[i], aliases[0]
++		down(0, i)
++	}
++	for i := 1; i < hosts; i++ {
++		if bytes.Equal(aliases[i-1], aliases[i]) {
++			return nil, errProfile
++		}
++	}
++	return snapshot, nil
++}
++
++func (s *profileSnapshot) validatesResolvers(m *profileCapsule) bool {
++	var coverage [3]byte
++	for _, row := range m.rows[4] {
++		if row[0] != 2 {
++			continue
++		}
++		c := profileCursor{b: row[36:]}
++		h := c.take(8)
++		if h == nil || u16(h, 2) != 53 {
++			return false
++		}
++		ip := c.take(int(u16(h, 4)))
++		found := false
++		for i := 0; i < s.count; i++ {
++			if h[0] == s.families[i] && bytes.Equal(ip, s.peers[i]) {
++				found = true
++				if h[1] == 6 {
++					coverage[i] |= 1
++				} else {
++					coverage[i] |= 2
++				}
++			}
++		}
++		if !found {
++			return false
++		}
++	}
++	for i := 0; i < s.count; i++ {
++		if coverage[i] != 3 {
++			return false
++		}
++	}
++	return true
++}
 --- a/features/dns/localdns/client.go
 +++ b/features/dns/localdns/client.go
 @@ -31,12 +31,20 @@
@@ -55,5 +2279,145 @@
 +	ips, ttl, err := c.LookupIPWithContext(ctx, "synthetic.invalid", dns.IPOption{IPv4Enable: true})
 +	if !errors.Is(err, context.Canceled) || len(ips) != 0 || ttl != 0 {
 +		t.Fatalf("отменённый запрос: ips=%d ttl=%d err=%v", len(ips), ttl, err)
++	}
++}
+--- a/main/run.go
++++ b/main/run.go
+@@ -1,7 +1,10 @@
+ package main
+ 
+ import (
++	"bytes"
++	"context"
+ 	"fmt"
++	"io"
+ 	"log"
+ 	"os"
+ 	"os/signal"
+@@ -11,6 +14,7 @@
+ 	"runtime"
+ 	"runtime/debug"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 	"time"
+ 
+@@ -18,6 +22,7 @@
+ 	"github.com/xtls/xray-core/common/errors"
+ 	clog "github.com/xtls/xray-core/common/log"
+ 	"github.com/xtls/xray-core/common/platform"
++	nativehooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/main/commands/base"
+ )
+@@ -215,6 +220,28 @@
+ }
+ 
+ func startXray() (core.Server, error) {
++	if nativehooks.ProfileLaunchRequested() {
++		if *test || *dump || configDir != "" || len(configFiles) > 1 || len(configFiles) == 1 && configFiles[0] != "stdin:" || (*format != "auto" && *format != "json") {
++			return nil, errors.New("full-profile требует отдельный run со stdin JSON")
++		}
++		data, err := io.ReadAll(io.LimitReader(os.Stdin, 65537))
++		if err != nil || len(data) > 65536 {
++			return nil, errors.New("full-profile config превышает лимит")
++		}
++		server, launch, err := prepareProfileServer(data, nativehooks.PrepareProfileLaunch, func(ctx context.Context, data []byte) (core.Server, error) {
++			c, err := core.LoadConfig("json", bytes.NewReader(data))
++			if err != nil {
++				return nil, err
++			}
++			return core.NewWithContext(ctx, c)
++		})
++		if err != nil {
++			return nil, err
++		}
++		owned := &profileServer{Server: server, launch: launch}
++		go func() { <-launch.Done(); _ = owned.Close() }()
++		return owned, nil
++	}
+ 	// TODO: Restore public key initialization when Lua privileged signature authorization is re-enabled.
+ 	// if err := lua.SetPrivilegedPublicKey(*luaPrivilegedPublicKey); err != nil {
+ 	// 	return nil, errors.New("failed to configure Lua privileged authorization").Base(err)
+@@ -234,3 +261,46 @@
+ 
+ 	return server, nil
+ }
++
++type profilePrepare func([]byte, bool, func(context.Context) error) (*nativehooks.ProfileRuntime, error)
++
++func prepareProfileServer(data []byte, prepare profilePrepare, factory func(context.Context, []byte) (core.Server, error)) (core.Server, *nativehooks.ProfileRuntime, error) {
++	var server core.Server
++	launch, err := prepare(data, false, func(ctx context.Context) error { var e error; server, e = factory(ctx, data); return e })
++	if err != nil {
++		if server != nil {
++			_ = server.Close()
++		}
++		if launch != nil {
++			launch.RevokeUnknown()
++		}
++		return nil, nil, err
++	}
++	return server, launch, nil
++}
++
++type profileServer struct {
++	core.Server
++	launch   *nativehooks.ProfileRuntime
++	once     sync.Once
++	closeErr error
++}
++
++func (s *profileServer) Start() error { return s.launch.Start(s.Server.Start) }
++func (s *profileServer) Close() error {
++	s.once.Do(func() {
++		s.launch.Revoke()
++		b := s.Server.Close()
++		if b != nil {
++			s.launch.RevokeUnknown()
++			s.closeErr = b
++			return
++		}
++		a := s.launch.Close()
++		s.closeErr = a
++		if s.closeErr == nil {
++			s.closeErr = b
++		}
++	})
++	return s.closeErr
++}
+--- /dev/null
++++ b/main/yonik_profile_test.go
+@@ -0,0 +1,32 @@
++package main
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"testing"
++
++	nativehooks "github.com/xtls/xray-core/common/yonikbroker"
++	"github.com/xtls/xray-core/core"
++)
++
++// Ни core.New, ни feature Start не выполняются: только production caller
++// с in-memory admission/factory boundaries.
++func TestYonikProfileMainNoConstructionBeforeAdmission(t *testing.T) {
++	for _, reason := range []string{"absent", "wrong-peer", "digest", "expired", "assets", "revoked"} {
++		t.Run(reason, func(t *testing.T) {
++			data := []byte("synthetic exact config")
++			constructed := false
++			prepare := func(actual []byte, check bool, _ func(context.Context) error) (*nativehooks.ProfileRuntime, error) {
++				if check || !bytes.Equal(actual, data) {
++					t.Fatal("изменены exact bytes/mode")
++				}
++				return nil, errors.New(reason)
++			}
++			s, p, e := prepareProfileServer(data, prepare, func(context.Context, []byte) (core.Server, error) { constructed = true; return nil, nil })
++			if e == nil || s != nil || p != nil || constructed {
++				t.Fatal("main обошёл admission")
++			}
++		})
 +	}
 +}
