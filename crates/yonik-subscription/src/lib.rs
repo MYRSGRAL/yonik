@@ -5,6 +5,38 @@ pub mod scheduler;
 use std::{fmt, num::NonZeroU64};
 use yonik_import::{FatalError, ImportReport};
 
+/// Профильный staging сохраняет DATA roots без извлечения outbound endpoints.
+#[derive(Debug)]
+pub struct ProfileStagedUpdate {
+    ticket: Ticket,
+    report: yonik_import::ProfileImportReport,
+    summary: Summary,
+}
+#[derive(Debug)]
+pub struct ProfileApprovedUpdate(ProfileStagedUpdate);
+impl ProfileStagedUpdate {
+    pub fn report(&self) -> &yonik_import::ProfileImportReport {
+        &self.report
+    }
+    pub fn summary(&self) -> Summary {
+        self.summary
+    }
+    pub fn accept_clean(self) -> Result<ProfileApprovedUpdate, Error> {
+        if self.summary.needs_review() {
+            return Err(Error::ReviewRequired);
+        }
+        Ok(ProfileApprovedUpdate(self))
+    }
+    pub fn approve_after_review(self) -> ProfileApprovedUpdate {
+        ProfileApprovedUpdate(self)
+    }
+}
+impl ProfileApprovedUpdate {
+    pub fn report(&self) -> &yonik_import::ProfileImportReport {
+        &self.0.report
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Stale,
@@ -134,9 +166,80 @@ pub struct Subscription {
     request: u64,
     active: Option<Ticket>,
     snapshot: Option<ImportReport>,
+    profile_snapshot: Option<yonik_import::ProfileImportReport>,
 }
 
 impl Subscription {
+    /// Переход server-only staging к v2 с тем же correlation ticket.
+    /// Повторная DATA-проверка не выдаёт runtime capability.
+    pub fn upgrade_staged(&self, staged: StagedUpdate) -> Result<ProfileStagedUpdate, Error> {
+        self.stage_profiles_cancellable(
+            staged.ticket,
+            staged.report.original().expose().as_bytes().to_vec(),
+            || true,
+        )
+        .map_err(|error| match error {
+            CancellableStageError::Cancelled => Error::Stale,
+            CancellableStageError::Stage(error) => error,
+        })
+    }
+
+    pub fn stage_profiles_cancellable(
+        &self,
+        ticket: Ticket,
+        body: Vec<u8>,
+        proceed: impl Fn() -> bool,
+    ) -> Result<ProfileStagedUpdate, CancellableStageError> {
+        self.check(ticket).map_err(CancellableStageError::Stage)?;
+        if !proceed() {
+            return Err(CancellableStageError::Cancelled);
+        }
+        let report = yonik_import::import_profiles(body);
+        if !proceed() {
+            return Err(CancellableStageError::Cancelled);
+        }
+        let report = report
+            .map_err(|error| CancellableStageError::Stage(Error::InvalidImport(error.kind())))?;
+        if report.entries.is_empty() {
+            return Err(CancellableStageError::Stage(Error::NoUsableRecords));
+        }
+        let mut flagged = 0;
+        let mut native = false;
+        for entry in &report.entries {
+            if !proceed() {
+                return Err(CancellableStageError::Cancelled);
+            }
+            match entry {
+                yonik_import::ProfileEntry::Server(server) => {
+                    flagged += usize::from(!server.review_flags().is_empty())
+                }
+                yonik_import::ProfileEntry::Xray(_) => native = true,
+            }
+        }
+        let summary = Summary {
+            accepted: report.entries.len(),
+            rejected: report.issues.len(),
+            flagged,
+            native_json: native,
+        };
+        Ok(ProfileStagedUpdate {
+            ticket,
+            report,
+            summary,
+        })
+    }
+
+    /// Repository уже выполнил CAS; публикация не затрагивает активную сессию.
+    pub fn commit_profiles(&mut self, approved: ProfileApprovedUpdate) -> Result<(), Error> {
+        self.check(approved.0.ticket)?;
+        self.revision = self.revision.checked_add(1).ok_or(Error::Exhausted)?;
+        self.snapshot_source_generation = Some(approved.0.ticket.source_generation);
+        self.profile_snapshot = Some(approved.0.report);
+        self.snapshot = None;
+        self.active = None;
+        Ok(())
+    }
+
     pub fn new(controller: NonZeroU64) -> Self {
         Self {
             controller,
@@ -146,6 +249,7 @@ impl Subscription {
             request: 0,
             active: None,
             snapshot: None,
+            profile_snapshot: None,
         }
     }
 
@@ -163,6 +267,10 @@ impl Subscription {
 
     pub fn snapshot(&self) -> Option<&ImportReport> {
         self.snapshot.as_ref()
+    }
+
+    pub fn profile_snapshot(&self) -> Option<&yonik_import::ProfileImportReport> {
+        self.profile_snapshot.as_ref()
     }
 
     pub fn begin(&mut self) -> Result<Ticket, Error> {
@@ -250,6 +358,7 @@ impl Subscription {
         self.check(ticket)?;
         let revision = self.revision.checked_add(1).ok_or(Error::Exhausted)?;
         self.snapshot = Some(report);
+        self.profile_snapshot = None;
         self.snapshot_source_generation = Some(ticket.source_generation);
         self.revision = revision;
         self.active = None;

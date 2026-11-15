@@ -173,6 +173,7 @@ fn validate_controlled(
             decrypt(key, &id, 8, 0, 0, revision, &raw, 262144)?;
         }
     }
+    native_profiles::validate_backup(connection, key, &id, control)?;
     Ok(())
 }
 
@@ -795,6 +796,8 @@ fn admit_format(
         ("snapshots", "source_id"),
         ("profile_catalog", "source_id"),
         ("profiles", "id"),
+        ("native_profiles", "id"),
+        ("profile_projection", "source_id"),
         ("source_sequence", "singleton"),
         ("sqlite_sequence", "name"),
         ("routing_draft", "singleton"),
