@@ -92,6 +92,26 @@ pub(super) fn emit(
         return Err(Error::Ownership);
     }
     let mut value = graph.value.clone();
+    // В pinned Xray proxySettings удалён. Только уже проверенные true-chain
+    // edges переводятся в owned sockopt; provider sockopt по-прежнему запрещён.
+    for outbound in value["outbounds"].as_array_mut().ok_or(Error::Schema)? {
+        if let Some(chain) = outbound
+            .as_object_mut()
+            .ok_or(Error::Schema)?
+            .remove("proxySettings")
+        {
+            let next = chain["tag"].as_str().ok_or(Error::Reference)?;
+            let stream = outbound
+                .as_object_mut()
+                .ok_or(Error::Schema)?
+                .entry("streamSettings")
+                .or_insert_with(|| json!({}));
+            stream
+                .as_object_mut()
+                .ok_or(Error::Schema)?
+                .insert("sockopt".into(), json!({"dialerProxy":next}));
+        }
+    }
     if let Some(rules) = value
         .get_mut("routing")
         .and_then(|r| r.get_mut("rules"))

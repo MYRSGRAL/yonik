@@ -338,7 +338,12 @@ fn stream(v: &Value) -> Result<TransportProtocol> {
     if let Some(m) = v.get("finalmask") {
         mask(m)?;
     }
-    Ok(if network == "hysteria" {
+    let xhttp_h3 = network == "xhttp"
+        && v["security"] == "tls"
+        && v["tlsSettings"]["alpn"]
+            .as_array()
+            .is_some_and(|alpn| alpn.len() == 1 && alpn[0] == "h3");
+    Ok(if network == "hysteria" || xhttp_h3 {
         TransportProtocol::Udp
     } else {
         TransportProtocol::Tcp
@@ -527,9 +532,9 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
                     }
                 }
                 endpoints.insert(tag.to_owned(), endpoint(s, transport)?);
-                // SS/SS2022 native Process выбирает physical network по flow;
-                // raw TCP stream не превращает UDP payload в TCP transport.
-                if o["streamSettings"]["network"].as_str().unwrap_or("tcp") == "tcp" {
+                // UDP target обходит configured TCP transport selector. При
+                // UDP carrier обе ветки имеют один physical endpoint.
+                if transport != TransportProtocol::Udp {
                     packet_endpoints.insert(tag.to_owned(), endpoint(s, TransportProtocol::Udp)?);
                 }
             }

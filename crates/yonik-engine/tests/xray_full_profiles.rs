@@ -77,6 +77,79 @@ fn ordered_rules_prefix_sets_and_physical_chains() {
         ProfileCompileError::Cycle
     );
 }
+
+#[test]
+fn pinned_chain_emits_dialer_proxy_without_removed_proxy_settings() {
+    for existing_stream in [false, true] {
+        let mut value = profiles().remove(0);
+        value["outbounds"][0]["proxySettings"] = json!({"tag":"edge-b","transportLayer":true});
+        if !existing_stream {
+            value["outbounds"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("streamSettings");
+        }
+        let p = profile(&value);
+        let compiled = compile_profile_local(&p, &plan()).unwrap();
+        let config = emitted(&compiled);
+        assert!(config["outbounds"][0].get("proxySettings").is_none());
+        assert_eq!(
+            config["outbounds"][0]["streamSettings"]["sockopt"]["dialerProxy"],
+            "edge-b"
+        );
+        let tun = SystemTun::new(1, 1500, 42, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        let system = compile_profile_system(&p, &plan().with_system(tun)).unwrap();
+        let system = emitted(system.config());
+        assert!(system["outbounds"][0].get("proxySettings").is_none());
+        assert_eq!(
+            system["outbounds"][0]["streamSettings"]["sockopt"]["dialerProxy"],
+            "edge-b"
+        );
+        assert_eq!(
+            system["outbounds"][0]["streamSettings"]["sockopt"]["mark"],
+            42
+        );
+        assert_eq!(
+            validate_profile(&p).unwrap().egress().chains(),
+            &[("edge-a".into(), "edge-b".into())]
+        );
+    }
+}
+
+#[test]
+fn pinned_xhttp_h3_has_udp_physical_transport() {
+    let mut value = profiles().remove(4);
+    value["outbounds"][0]["streamSettings"]["tlsSettings"]["alpn"] = json!(["h3"]);
+    let graph = validate_profile(&profile(&value)).unwrap();
+    assert_eq!(
+        graph.egress().physical()[0].protocol(),
+        TransportProtocol::Udp
+    );
+    value["outbounds"][0]["streamSettings"]["tlsSettings"]["alpn"] = json!(["h3", "h2"]);
+    let graph = validate_profile(&profile(&value)).unwrap();
+    assert_eq!(
+        graph.egress().physical()[0].protocol(),
+        TransportProtocol::Tcp
+    );
+}
+
+#[test]
+fn pinned_shadowsocks_udp_bypasses_configured_grpc_transport() {
+    let value = json!({"outbounds":[{"tag":"edge","protocol":"shadowsocks","settings":{"servers":[{"address":"192.0.2.3","port":443,"method":"aes-128-gcm","password":"synthetic"}]},"streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"fixture"}}}]});
+    let graph = validate_profile(&profile(&value)).unwrap();
+    let endpoints = graph.egress().physical();
+    assert_eq!(endpoints.len(), 2);
+    assert!(
+        endpoints
+            .iter()
+            .any(|endpoint| endpoint.protocol() == TransportProtocol::Tcp)
+    );
+    assert!(
+        endpoints
+            .iter()
+            .any(|endpoint| endpoint.protocol() == TransportProtocol::Udp)
+    );
+}
 #[test]
 fn protocol_and_security_effects_are_closed() {
     let base = profiles().remove(5);

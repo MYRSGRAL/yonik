@@ -181,3 +181,21 @@ IP inversion prefixes отвергаются. Инвертированный `ge
 system resolver binding: native DNS app и core fallback включают localdns.
 Provider DNS при этом не подменяется. Это полнота requirement manifest, а не
 доказательство actual resolver snapshot или полномочий его сокетов.
+
+### Уточнение pinned outbound schema и physical carriers
+
+Pinned `infra/conf/xray.go` отвергает старый `proxySettings`. Checked
+`transportLayer=true` edge остаётся в DATA/typed graph, а emitter удаляет старое
+поле и создаёт owned `streamSettings.sockopt.dialerProxy` с проверенным next tag.
+Произвольный provider sockopt по-прежнему не допускается. Local и System
+используют один lowering; System mark сохраняется рядом с dialerProxy.
+
+Physical carrier XHTTP с TLS и ровно ALPN `[h3]` — UDP. Смешанный ALPN
+или другие security/version ветки не объявляются HTTP3 по одному наличию h3.
+SS/SS2022 UDP target использует raw UDP, обходя configured TCP transport selector;
+UDP requirement учитывается также при gRPC/XHTTP. Совпадающие UDP carriers
+сохраняют один physical endpoint, не дублируют firewall exception.
+
+Это source-derived compiler corrections. Per-logical protocol scopes, actual
+chain transitions и mux/redirect guards относятся к незавершённому P4 carrier;
+одних tag edges и physical endpoints для выдачи runtime grant недостаточно.
