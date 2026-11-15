@@ -347,12 +347,20 @@ vectors; это DATA без authority.
   reserved0@19. Далее immutable original Destination, exact numeric resolver
   Destination, resolverIndex u16, queryName(u16+canonical ASCII≤253), затем
   OwnerReceiptKind=None/reserved7/id0. Source flow — live private receipt.
-- `GRANT=19` body56 прежний. Для service class2/3 required=0, ownerFreshNs=0,
-  OwnerReceiptKind=None/id0; class/sourceFlowId/revision сверяются с pending.
-  required=0 не снимает trusted mandatory/active-ACL constraints issuer;
-  это отсутствие пользовательской attribution у service socket, не Allow.
-  Probe/bootstrap sourceFlowId=0 и revision=manifest.policy; user DNS сохраняет
-  свой sourceFlowId/revision. Session credential не принимается как grant.
+- `GRANT=19` body56 прежний; class/sourceFlowId/revision сверяются с pending.
+  Probe/bootstrap sourceFlowId=0, required=0, ownerFreshNs=0,
+  OwnerReceiptKind=None/id0, revision=manifest.policy. Local USER DNS тоже
+  required0/fresh0/None. Это не снимает manifest/mandatory/active-ACL constraints.
+  System USER DNS AUTHORIZE class3 требует live private original receipt,
+  совпадение pending receipt/flow/revision и required=1; freshKnown 1..20ms
+  от исходного send time минус RTT. FrozenSent=1 и SidebandOperation=2 —
+  разные typed owner namespaces, id ненулевой; reserved7=0. Unknown/expired/
+  чужой owner не публикуется. Повтор того же kind/id не продлевает observation;
+  перед DNS I/O freshness проверяется, при остатке ≤5ms нужен refresh.
+  Session credential и DNSGrant не дают user transport authority.
+  Exact encoder Rust abf5c2435dd71b272c8f064b155267c52fde9809, полный
+  System YNKCAP01 GRANT с owner tail включён в service-grants-v3.json;
+  producer не должен обнулять mandatory attribution ради decoder.
 - ObjectId=0 при initial request; refresh использует тот же kind/body с
   ObjectId=live grantId. Это private consumer convention для counterpart:
   Rust должен принять refresh PROBE20 exact purpose/index/subject/resolver,

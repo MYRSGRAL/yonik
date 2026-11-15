@@ -36,7 +36,7 @@ diff --git a/common/yonikbroker/profile_service_linux_test.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_service_linux_test.go
-@@ -0,0 +1,860 @@
+@@ -0,0 +1,1019 @@
 +//go:build linux
 +
 +package nativehooks
@@ -64,6 +64,158 @@ new file mode 100644
 +//go:embed profile-service-vectors.json
 +var serviceVectors []byte
 +
++// Полный frame получен извлечёнными Header/Grant encoder Rust abf5c243.
++// Kind 2 = SidebandOperation; kind 1 = FrozenSent, это разные namespaces.
++func TestProfileServiceSystemUserDNSRustOwnerTail(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	r := profileReceiptFrom(ctx)
++	g, op, e := f.c.authorizeDNS(ctx, r, 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	var v struct {
++		Frame string `json:"systemUserDNSGrantFrameHex"`
++	}
++	if e = json.Unmarshal(serviceVectors, &v); e != nil {
++		t.Fatal(e)
++	}
++	wire, e := hex.DecodeString(v.Frame)
++	if e != nil {
++		t.Fatal(e)
++	}
++	packet, e := f.p.admission.launch.decodePacket(wire, 9)
++	if e != nil || packet.reply != op.sequence {
++		t.Fatal("Rust frame binding", e, packet.reply, op.sequence)
++	}
++	if r.id != 1 || r.revision != 1 {
++		t.Fatal("fixture source изменился", r.id, r.revision)
++	}
++	f.now = f.now.Add(3 * time.Millisecond)
++	if e = f.c.accept(packet); e != nil || op.err != nil || !f.c.grantLive(g) {
++		t.Fatal("System user DNS обязательный owner tail отвергнут", e, op.err)
++	}
++	if g.ownerID != 42 || g.ownerKind != 2 || g.ownerDeadline.Sub(f.now) != 17*time.Millisecond {
++		t.Fatal("freshness не вычла RTT", g.ownerDeadline.Sub(f.now))
++	}
++}
++
++func TestProfileServiceSystemOwnerTailRejectsForeignUnknownAndExpired(t *testing.T) {
++	// FrozenSent=1 разрешён отдельно от SidebandOperation=2, без нормализации id.
++	f, ctx := serviceFixture(t)
++	g, op, e := f.c.authorizeDNS(ctx, profileReceiptFrom(ctx), 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(op)
++	reply := serviceReply(f, op)
++	reply.body[40] = 1
++	if e = f.c.accept(reply); e != nil || op.err != nil || g.ownerKind != 1 {
++		t.Fatal("FrozenSent namespace", e, op.err)
++	}
++	for _, name := range []string{"required0", "unknown", "id0", "reserved", "fresh0", "freshOverflow", "expiredRTT", "foreignFlow", "revision", "foreignPrivate", "closedPrivate", "noPrivate", "probeClass", "localOwner"} {
++		t.Run(name, func(t *testing.T) {
++			f, ctx := serviceFixture(t)
++			r := profileReceiptFrom(ctx)
++			g, op, e := f.c.authorizeDNS(ctx, r, 0, "query.invalid")
++			if e != nil {
++				t.Fatal(e)
++			}
++			if e = f.c.dispatch(op); e != nil {
++				t.Fatal(e)
++			}
++			b, _ := hex.DecodeString("01030100000000000000000b0000000000000001000003e800000000000000010000000001312d000200000000000000000000000000002a")
++			switch name {
++			case "required0":
++				b[2] = 0
++			case "unknown":
++				b[40] = 3
++			case "id0":
++				clear(b[48:])
++			case "reserved":
++				b[41] = 1
++			case "fresh0":
++				clear(b[32:40])
++			case "freshOverflow":
++				be.PutUint64(b[32:], uint64(20*time.Millisecond+1))
++			case "expiredRTT":
++				f.now = f.now.Add(20 * time.Millisecond)
++			case "foreignFlow":
++				be.PutUint64(b[12:], r.id+1)
++			case "revision":
++				be.PutUint64(b[24:], r.revision+1)
++			case "foreignPrivate":
++				other := newFlowFixture(t, 2)
++				op.receipt = other.admittedReceipt(t, "foreign.invalid")
++			case "closedPrivate":
++				f.c.closeReceipt(r)
++			case "noPrivate":
++				g.receipt = nil
++			case "probeClass":
++				g.class, b[1] = 2, 2
++			case "localOwner":
++				f.c.mode = 1
++			}
++			if e = f.c.publishService(op, profilePacket{kind: 19, object: 11, body: b}); e == nil || g.id != 0 {
++				t.Fatal("чужой/Unknown/expired owner опубликован", name)
++			}
++		})
++	}
++	for _, class := range []byte{2, 3} {
++		f := newFlowFixture(t, 2)
++		ctx, cancel := context.WithCancel(f.p.ctx)
++		defer cancel()
++		g := &profileGrant{ctx: ctx, cancel: cancel, class: class, purpose: 1}
++		f.c.grants[0] = g
++		op := &profileOperation{kind: 20, grant: g, sent: f.now, sessionDeadline: f.now.Add(time.Second)}
++		b, _ := hex.DecodeString("01030100000000000000000b0000000000000001000003e800000000000000010000000001312d000200000000000000000000000000002a")
++		b[1] = class
++		clear(b[12:20])
++		if e := f.c.publishService(op, profilePacket{kind: 19, object: 11, body: b}); e == nil {
++			t.Fatal("service flow0 принял user attribution", class)
++		}
++	}
++}
++
++func TestProfileServiceSystemOwnerRefreshKeepsOriginalObservationExpiry(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	g, op, e := f.c.authorizeDNS(ctx, profileReceiptFrom(ctx), 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(op)
++	reply := serviceReply(f, op)
++	if e = f.c.accept(reply); e != nil || op.err != nil {
++		t.Fatal(e, op.err)
++	}
++	expires := g.ownerDeadline
++	f.now = f.now.Add(16 * time.Millisecond)
++	renew, e := f.c.refreshServiceLocked(g)
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(renew)
++	if renew.deadline.Sub(renew.sent) != 20*time.Millisecond {
++		t.Fatal("System DNS request потерял freshness deadline")
++	}
++	reply = serviceReply(f, renew)
++	if e = f.c.accept(reply); e != nil || renew.err != nil {
++		t.Fatal(e, renew.err)
++	}
++	if !g.ownerDeadline.Equal(expires) {
++		t.Fatal("тот же owner receipt продлил observation")
++	}
++	f.now = expires
++	// Даже пока lease жив, истёкший Known owner не разрешает DNS I/O.
++	g.refresh = &profileOperation{ctx: ctx, queued: true, done: make(chan struct{})}
++	close(g.refresh.done)
++	if e = profileEnsureService(ctx, g); e == nil {
++		t.Fatal("lease подменил свежий Known owner")
++	}
++}
++
 +func TestProfileServiceIndependentWireVectorsAndBootstrapScope(t *testing.T) {
 +	var vectors struct {
 +		Probe      string `json:"probeBodyHex"`
@@ -90,6 +242,8 @@ new file mode 100644
 +	if !bytes.Equal(op.body, decode(vectors.DNS)) {
 +		t.Fatal("independent AUTHORIZE mismatch")
 +	}
++	// Старый независимый golden — Local, где mandatory owner отсутствует.
++	f.c.mode = 1
 +	f.c.dispatch(op)
 +	if e = f.c.accept(profilePacket{kind: 19, reply: op.sequence, object: 11, body: decode(vectors.DNSGrant)}); e != nil || op.err != nil || !f.c.grantLive(g) {
 +		t.Fatal("independent DNS GRANT", e, op.err)
@@ -196,6 +350,11 @@ new file mode 100644
 +	if op.receipt != nil {
 +		be.PutUint64(b[12:], op.receipt.id)
 +		revision = op.receipt.revision
++		if f.c.mode == 2 {
++			b[2], b[40] = 1, 2
++			be.PutUint64(b[32:], uint64(20*time.Millisecond))
++			be.PutUint64(b[48:], 42)
++		}
 +	}
 +	be.PutUint64(b[24:], revision)
 +	return profilePacket{kind: 19, reply: op.sequence, object: id, body: b}
@@ -301,9 +460,9 @@ new file mode 100644
 +			case "class":
 +				reply.body[1] = 1
 +			case "owner":
-+				reply.body[40] = 1
++				reply.body[40] = 0
 +			case "required":
-+				reply.body[2] = 1
++				reply.body[2] = 0
 +			case "flow":
 +				be.PutUint64(reply.body[12:], r.id+1)
 +			case "revision":
@@ -901,7 +1060,7 @@ diff --git a/common/yonikbroker/profile_service_linux.go b/common/yonikbroker/pr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_service_linux.go
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,412 @@
 +//go:build linux
 +
 +package nativehooks
@@ -1090,10 +1249,28 @@ new file mode 100644
 +func (c *profileFlowControl) publishService(op *profileOperation, f profilePacket) error {
 +	g, b := op.grant, f.body
 +	flow, revision := uint64(0), c.manifest.policy
++	// Только private original receipt связывает USER DNS с System attribution.
 +	if g.receipt != nil {
++		if g.class != 3 || g.purpose != 0 || op.kind != 18 || op.receipt != g.receipt || !c.receiptLive(g.receipt) || g.receipt.id == 0 {
++			return errProfile
++		}
 +		flow, revision = g.receipt.id, g.receipt.revision
++	} else if op.kind != 20 || op.receipt != nil || g.purpose == 0 {
++		return errProfile
 +	}
-+	if f.kind != 19 || len(b) != 56 || b[0] != 1 || b[1] != g.class || b[2] != 0 || b[3] != 0 || u64(b, 4) == 0 || f.object != u64(b, 4) || u64(b, 12) != flow || u32(b, 20) == 0 || u32(b, 20) > 1000 || u64(b, 24) != revision || !zero(b[32:]) {
++	required := byte(0)
++	if c.mode == 2 && g.receipt != nil {
++		required = 1
++	}
++	if f.kind != 19 || len(b) != 56 || b[0] != 1 || b[1] != g.class || b[2] != required || b[3] != 0 || u64(b, 4) == 0 || f.object != u64(b, 4) || u64(b, 12) != flow || u32(b, 20) == 0 || u32(b, 20) > 1000 || u64(b, 24) != revision || !zero(b[41:48]) {
++		return errProfile
++	}
++	ownerNS, ownerKind, ownerID := u64(b, 32), b[40], u64(b, 48)
++	if required == 0 {
++		if ownerNS != 0 || ownerKind != 0 || ownerID != 0 {
++			return errProfile
++		}
++	} else if ownerNS == 0 || ownerNS > uint64(20*time.Millisecond) || ownerKind < 1 || ownerKind > 2 || ownerID == 0 {
 +		return errProfile
 +	}
 +	id := u64(b, 4)
@@ -1108,10 +1285,15 @@ new file mode 100644
 +	if op.sessionDeadline.Before(deadline) {
 +		deadline = op.sessionDeadline
 +	}
-+	if !c.clock().Before(deadline) {
++	ownerDeadline := op.sent.Add(time.Duration(ownerNS))
++	if op.object != 0 && ownerKind == g.ownerKind && ownerID == g.ownerID && g.ownerDeadline.Before(ownerDeadline) {
++		ownerDeadline = g.ownerDeadline
++	}
++	if !c.clock().Before(deadline) || required == 1 && !c.clock().Before(ownerDeadline) {
 +		return errProfile
 +	}
 +	g.id, g.deadline, g.revision = id, deadline, revision
++	g.ownerDeadline, g.ownerKind, g.ownerID = ownerDeadline, ownerKind, ownerID
 +	if id > c.highestGrant {
 +		c.highestGrant = id
 +	}
@@ -1128,7 +1310,7 @@ new file mode 100644
 +		c.mu.Unlock()
 +		return errProfile
 +	}
-+	renew := g.deadline.Sub(c.clock()) <= 250*time.Millisecond
++	renew := g.deadline.Sub(c.clock()) <= 250*time.Millisecond || c.serviceOwnerRequired(g) && g.ownerDeadline.Sub(c.clock()) <= 5*time.Millisecond
 +	var op *profileOperation
 +	var e error
 +	if renew {
@@ -1145,10 +1327,13 @@ new file mode 100644
 +	}
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
-+	if !c.grantLive(g) {
++	if !c.grantLive(g) || c.serviceOwnerRequired(g) && !c.clock().Before(g.ownerDeadline) {
 +		return errProfile
 +	}
 +	return nil
++}
++func (c *profileFlowControl) serviceOwnerRequired(g *profileGrant) bool {
++	return c.mode == 2 && g.class == 3 && g.receipt != nil
 +}
 +func profileServiceGrant(ctx context.Context) *profileGrant {
 +	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
@@ -2282,7 +2467,7 @@ diff --git a/common/yonikbroker/profile-service-vectors.json b/common/yonikbroke
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile-service-vectors.json
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,12 @@
 +{
 +  "mappingVersion": 3,
 +  "tableCount": 11,
@@ -2291,7 +2476,9 @@ new file mode 100644
 +  "bootstrapBodyHex": "0002000000000000",
 +  "dnsAuthorizeBodyHex": "00000000000000010300ffffffffffffffff0000030601bb001000006f726967696e616c2e696e76616c696404110035000400007f0000350000000d71756572792e696e76616c696400000000000000000000000000000000",
 +  "dnsGrantBodyHex": "01030000000000000000000b0000000000000001000003e80000000000000001000000000000000000000000000000000000000000000000",
-+  "probeGrantBodyHex": "01020000000000000000000c0000000000000000000003e80000000000000001000000000000000000000000000000000000000000000000"
++  "probeGrantBodyHex": "01020000000000000000000c0000000000000000000003e80000000000000001000000000000000000000000000000000000000000000000",
++  "systemUserDNSRustHead": "abf5c2435dd71b272c8f064b155267c52fde9809",
++  "systemUserDNSGrantFrameHex": "594e4b434150303100010013000000b8000000000000000900000000000000040100000000000000000000000000000002000000000000000000000000000000b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e34391000000000000000010000000000000001000000000000000b000000000000000001030100000000000000000b0000000000000001000003e800000000000000010000000001312d000200000000000000000000000000002a"
 +}
 diff --git a/app/observatory/yonik_profile_service_test.go b/app/observatory/yonik_profile_service_test.go
 new file mode 100644
@@ -9010,7 +9197,7 @@ new file mode 100644
 +	op.sent = c.clock()
 +	op.sessionDeadline = c.sessionDeadline
 +	op.deadline = op.sent.Add(time.Second)
-+	if op.kind == 18 && op.grant.class != 3 && c.mode == 2 {
++	if op.kind == 18 && op.receipt != nil && c.mode == 2 {
 +		op.deadline = op.sent.Add(20 * time.Millisecond)
 +	}
 +	if deadline, ok := op.ctx.Deadline(); ok && deadline.Before(op.deadline) {
@@ -9294,7 +9481,7 @@ new file mode 100644
 +		if g.ctx.Err() != nil || !g.deadline.IsZero() && !now.Before(g.deadline) {
 +			c.closeGrant(g)
 +		}
-+		if !g.closed && g.id != 0 && g.refresh == nil && (g.class == 2 || g.class == 3) && c.grantLive(g) && g.deadline.Sub(now) <= 250*time.Millisecond {
++		if !g.closed && g.id != 0 && g.refresh == nil && (g.class == 2 || g.class == 3) && c.grantLive(g) && (g.deadline.Sub(now) <= 250*time.Millisecond || c.serviceOwnerRequired(g) && g.ownerDeadline.Sub(now) <= 5*time.Millisecond) {
 +			if op, e := c.refreshServiceLocked(g); e == nil {
 +				op.queued = true
 +				if e = c.dispatchLocked(op); e != nil {

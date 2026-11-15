@@ -152,6 +152,20 @@ class FullProfilePatchTests(unittest.TestCase):
             self.assertEqual(grant[:4], bytes((1, grant_class, 0, 0)))
             self.assertEqual(struct.unpack_from("!Q", grant, 12)[0], flow)
             self.assertEqual(grant[32:], bytes(24))
+        self.assertEqual(
+            vectors["systemUserDNSRustHead"],
+            "abf5c2435dd71b272c8f064b155267c52fde9809",
+        )
+        system = bytes.fromhex(vectors["systemUserDNSGrantFrameHex"])
+        self.assertEqual(len(system), 184)
+        self.assertEqual(system[:8], b"YNKCAP01")
+        self.assertEqual(struct.unpack_from("!HHIQQ", system, 8), (1, 19, 184, 9, 4))
+        self.assertEqual(struct.unpack_from("!Q", system, 112)[0], 11)
+        self.assertEqual(system[128:132], bytes((1, 3, 1, 0)))
+        self.assertEqual(struct.unpack_from("!QQIQ", system, 132), (11, 1, 1000, 1))
+        self.assertEqual(struct.unpack_from("!Q", system, 160)[0], 20_000_000)
+        self.assertEqual(system[168:176], bytes((2, 0, 0, 0, 0, 0, 0, 0)))
+        self.assertEqual(struct.unpack_from("!Q", system, 176)[0], 42)
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         added = patch.split(
             "+++ b/common/yonikbroker/profile-service-vectors.json\n", 1
