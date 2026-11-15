@@ -1,7 +1,9 @@
 # P4: незавершённый native full-profile follow-up
 
-Статус: частичный DNS prerequisite; full-profile authority и transport ownership
-не реализованы. Builder намеренно не подключает этот patch и не объявляет feature.
+Статус: production launch/admission consumer и DNS context prerequisite;
+per-flow authority и transport ownership ещё не реализованы. Builder намеренно
+не подключает этот patch и не объявляет feature. Текущее implementation API,
+golden и ограничения: [native-full-profile-implementation.md](native-full-profile-implementation.md).
 Замороженные descriptors, ABI260 и upstream pin не изменяются.
 
 Пользователь отдельно утвердил source completion scope. Актуальный перечень
