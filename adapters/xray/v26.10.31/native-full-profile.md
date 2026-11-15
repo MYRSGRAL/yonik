@@ -65,7 +65,7 @@ Evidence вне TTL:
 Full runtime PASS, strict fresh-base patch-chain verification, transport guards,
 grant/race/caps tests и builder apply/pins этой поставкой не заявляются.
 
-## SOURCE proposal revision 2: YNKCAP01 (для согласования root)
+## SOURCE proposal revision 2.1: YNKCAP01 (для согласования root)
 
 Revision2 заменяет revision1 целиком. Это reviewable proposal, НЕ final contract
 и НЕ разрешение implementation дополнительных файлов. Общая P4 не завершена;
@@ -105,10 +105,11 @@ transport/resolver scope и mandatory constraints. App ACL проверяетс�
 
 System owner freshness остаётся ≤20ms исходного observation, RTT/очередь его
 не продлевают. Общий сериализованный owner backend возвращает один result для
-одной операции: frozen lookup и sideband grant связываются через internal receipt
-от actual sent Reply, а не делают обязательные два lookup. Ни новый wire PID/path,
-ни Known assertion не нужны. Для операции без свежего receipt backend выполняет
-один lookup; старый receipt не переиспользуется по истечении freshness.
+одной операции: frozen-derived receipt создаётся только после actual sent Reply,
+а sideband lookup получает отдельный private operation receipt. Между этими
+namespace нет неявного преобразования или обязательных двух lookup. Ни новый
+wire PID/path, ни Known assertion не нужны. Для операции без свежего receipt
+backend выполняет один lookup; старый receipt не продлевает freshness.
 
 ### Go source facts и точки mint
 
@@ -294,9 +295,9 @@ correlation не становится sourceFlowId. ZERO только session/in
 | ADMIT=2 H→G | capsule выше; replyTo=HELLO seq для initial |
 | ADMIT_ACK=3 G→H | manifestHash[32],admissionId u64,status u8,reserved[7]; replyTo=ADMIT seq |
 | OPEN_INGRESS=16 G→H | ingressIndex u16,provenance u8(TUN=1/acceptedTCP=2/associatedUDP=3),reserved u8, tuple[40], original Destination; objectId=0 |
-| INGRESS_REPLY=17 H→G | status u8,required u8,reserved u16,sourceFlowId u64,leaseMs u32,decisionRevision u64; replyTo=request |
-| AUTHORIZE=18 G→H | sourceFlowId u64,grantClass u8(flow=1/DNS=3),reserved u8,subjectIndex u16,chainIndex u16,transportIndex u16,original Destination,effective Destination,resolverIndex u16,queryName string(u16 length+0..253 bytes),ownerRequestId u64; objectId=0 |
-| GRANT=19 H→G | status u8,class u8,required u8,reserved u8,grantId u64,sourceFlowId u64,leaseMs u32,decisionRevision u64,ownerFreshNs u64,ownerRequestId u64; exact scope берётся из outstanding request; objectId=grantId при Allow, иначе 0 |
+| INGRESS_REPLY=17 H→G | status u8,required u8,reserved u16,sourceFlowId u64,lifetime u32=0 (owned-ingress, не TTL),decisionRevision u64; replyTo=request |
+| AUTHORIZE=18 G→H | sourceFlowId u64,grantClass u8(flow=1/DNS=3),reserved u8,subjectIndex u16,chainIndex u16,transportIndex u16,original Destination,effective Destination,resolverIndex u16,queryName string(u16 length+0..253 bytes),ownerReceiptKind u8, reserved[7],ownerReceiptId u64; objectId=0 для нового grant, live grantId для refresh |
+| GRANT=19 H→G | status u8,class u8,required u8,reserved u8,grantId u64,sourceFlowId u64,leaseMs u32,decisionRevision u64,ownerFreshNs u64,ownerReceiptKind u8,reserved[7],ownerReceiptId u64; exact scope берётся из outstanding request; objectId=grantId при Allow, иначе 0 |
 | PROBE=20 G→H | purpose u16(probe=1/bootstrapDNS=2),index u16(probe/endpoint row),subjectIndex u16,resolverIndex u16(0xffff вне DNS); sourceFlowId=0,required=0; scope только из exact manifest |
 | RENEW=21 G→H | admissionId u64,manifestHash[32]; objectId=0; host отвечает ADMIT или DENY=22 (status u8,reason u8,reserved[6]) |
 | CANCEL=32 either→peer | targetKind u8(request=1/flow=2/grant=3/session=4),reason u8,reserved u16,targetId u64; objectId=0; request cancel ссылается на sequence отправителя request; session targetId=0 |
@@ -304,11 +305,25 @@ correlation не становится sourceFlowId. ZERO только session/in
 | CLOSE_ACK=34 reply | targetKind u8,closeStatus u8(KnownClosed=1/Unknown=3),reserved u16,targetId u64; replyTo=CANCEL/REVOKE seq |
 
 Status Allow=1/Deny=2/Unknown=3; Unknown всегда deny, не fallback.
-ownerRequestId=0 и ownerFreshNs=0 в Local/probe. System ownerRequestId ссылается
-на реально отправленный ABI260 reply с тем же tuple/binding в общем backend ledger;
-неизвестный номер не proof и вызывает один backend lookup, не доверие caller.
-Existing Go check может отдать этот private receipt в AUTHORIZE; grant не отменяет
-следующие frozen guards, но свежая операция использует тот же result без double lookup.
+Owner receipt имеет отдельный tagged namespace: None=0, FrozenSent=1,
+SidebandOperation=2; прочие значения отвергаются. Local/probe передают только
+None/id=0/ownerFreshNs=0. System request с None/id=0 требует свежего lookup,
+а не разрешает действие без owner. FrozenSent/id — request ID реально
+отправленного ABI260 Reply; SidebandOperation/id — монотонный ID внутреннего
+actor ledger, не request ID frozen wire. Ненулевой kind с id=0 или None с
+ненулевым id — protocol error. Эти числа не authority без retained ledger.
+
+Общий actor проверяет binding, immutable tuple и привязку receipt к операции
+живого sourceFlowId. Только FrozenSent требует actual-sent Reply. При отсутствии,
+вытеснении или истечении корректно оформленной ссылки actor делает один lookup
+для этой операции и создаёт SidebandOperation receipt с исходным owner expiry;
+искусственный frozen Lookup/Reply не создаётся. Unknown/ошибка остаётся deny.
+GRANT сообщает фактически использованные kind/id. Два namespace не смешиваются,
+caller не может перенести receipt на другой flow. Actor хранит оба вида в общем
+bounded ring≤64; eviction приводит к свежему lookup, не к доверию присланному ID.
+Existing Go check может передать private FrozenSent receipt в AUTHORIZE;
+grant не отменяет следующие frozen guards. Общий actor может использовать свежий
+результат одной операции без обязательного второго lookup и без сдвига expiry.
 System ownerFreshNs=min(remaining snapshot lifetime,20ms) после send queue;
 Go вычитает RTT, stale→Unknown. Не переносить receipt между source flows.
 
@@ -321,9 +336,25 @@ mode/caps, новый admissionId+lease; old grants не продлеваютс�
 generation требует stop+cleanup+новая invocation; замены scope под old grants нет.
 ADMIT.replyTo=RENEW seq; ACK.replyTo=новый ADMIT seq; успешный ACK атомарно обновляет
 session deadline. При ошибке/stale ACK старый deadline не продлевается.
-Flow/grant lease≤1s, physical lease≤session deadline; Local не owner lease.
+Ingress receipt не имеет секундной lease: он живёт до закрытия owning TCP
+connection/request, UDP association, TUN flow либо session и занимает один из
+4096 ingress slots. Go issuer фиксирует этот lifetime до OPEN_INGRESS; закрытие
+отменяет pending запрос и посылает CANCEL(flow). Host не восстанавливает закрытый
+sourceFlowId повторным AUTHORIZE. Потеря канала/session закрывает все receipts.
+Renewal session не создаёт новый ingress и не продлевает owner freshness.
+
+Grant lease≤1s, physical lease≤session deadline; Local не owner lease.
+Долгоживущий logical stream обновляет grant через AUTHORIZE с objectId=его
+live grantId при remaining≤250ms. Требуются тот же sourceFlowId, exact scope,
+class, decision revision и binding плюс свежая обязательная owner-проверка.
+Host возвращает тот же grantId с новым bounded expiry; новый ресурс/ingress
+не создаётся. Закрытый, отменённый или expired grant не возрождается refresh.
+Смена scope требует нового grant и отдельного проверенного перехода, не refresh.
+До получения и проверки GRANT Go сохраняет прежний deadline; timeout/отказ
+или expiry закрывает только этот logical stream. Refresh не продлевает исходную
+System owner observation: actor применяет её оставшийся срок либо новый lookup.
 Lease deadline на receiver считается от monotonic send time соответствующего
-HELLO/RENEW/OPEN_INGRESS/AUTHORIZE/PROBE, вычитая весь RTT; sender не может
+HELLO/RENEW/AUTHORIZE/PROBE, вычитая весь RTT; sender не может
 заново начать lease при delayed reply. Для ADMIT_ACK host удерживает deadline
 исходного ADMIT, ACK не добавляет времени. Нулевой remaining lifetime — отказ.
 REVOKE CLOSE_ACK имеет targetKind=session,targetId=0. CANCEL любого namespace
@@ -360,7 +391,7 @@ immutable capsule≤64KiB; decoder RX/TX 2*64KiB; control queues 64*1024=64KiB
 каждая сторона RX/TX (128KiB total); pending 64*2048=128KiB; tombstones 256*64=16KiB;
 ingress 4096*192=768KiB; grants 4096*256=1MiB; pools 128*1024=128KiB;
 physical metadata 128*512=64KiB; logical metadata 4096*128=512KiB.
-Owner sent-reply receipt ring≤64*128=8KiB включён в тот же бюджет; grants всех
+Owner receipt ring обоих kind суммарно≤64*128=8KiB включён в тот же бюджет; grants всех
 трёх классов суммарно≤4096, не отдельные 4096 на класс.
 Остаток (около 5MiB при этих caps) — data buffers; общий checked reservation включает
 и их, и container capacity/allocator rounding. Ограничения rows и byte budget
@@ -449,6 +480,10 @@ shared owner one lookup per operation/remaining TTL, cancellation-before/after
 GRANT publish, late replies preserve neighbours, bounded watermark/tombstones,
 renewal old-grants expiry, per-table truncation/count/index/hash/fingerprint,
 full budget preflight before fake allocation, Unknown cleanup retaining custody.
+Дополнительно: CONNECT дольше секунды с живым ingress и grant refresh, закрытие
+ingress во время refresh без resurrection, grant expiry без успешного refresh,
+unknown/evicted FrozenSent → fresh SidebandOperation без synthetic Reply,
+cross-kind ID collision и original owner expiry после очереди/повторного use.
 Только in-memory/fake state machine и source-level frozen vectors; реальные
 socketpair/exec/proc/systemd/runtime tests в этой фазе запрещены.
 
