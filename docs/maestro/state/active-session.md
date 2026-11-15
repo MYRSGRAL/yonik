@@ -25,6 +25,7 @@ p2_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-
 p3_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A8ac093d3-885f-48c8-a51b-dd536829e681
 p3_candidate: d380fa0b5096679e4f0fbde1363262430e951f92
 p3_candidate_status: correction_tested_pending_narrow_review
+p3_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A5434d2cc-828c-4b95-9bca-caa3d24f6c63
 p3_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3Ac73e19e2-1c96-4434-a0a5-2023682cf7b6
 localdns_go_scope: approved
 p1_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A2fdfb486-f16a-4156-b6f1-5b63eb67b2fc
