@@ -2,7 +2,8 @@
 
 Это SOURCE/PURE codec milestone, не завершение P5 и не runtime acceptance.
 Production issuer, delivery/custody, versioned backend dispatch, native DAT
-delivery, новый resolver snapshot и dynamic firewall lifecycle — следующие части.
+delivery и dynamic firewall lifecycle — следующие части. Source producer DAT и
+новый resolver snapshot реализованы отдельно от runtime admission.
 
 ## Shared codec
 
@@ -101,3 +102,50 @@ Go `main/run.go` читает bounded stdin до `PrepareProfileLaunch`, хот�
 NewWithContext идут после admission. Local launcher обязан удостоверить image
 до передачи provider config; ожидание HELLO перед stdin с этим caller не работает.
 Go gate остаётся off; наличие golden/ACK не заменяет flow grants или deployment.
+
+## Trusted source producer
+
+`helper/profile_intent.rs::NativeResourceSet::capture(graph,cancel)` открывает
+только fixed root-owned catalog и digest basenames. Категории связываются с
+compiler requirements после actual bounded DAT parsing. Удерживаются каталог,
+все parent FDs и DATA FDs; revalidate сравнивает identities/bytes/hash отдельно.
+Это native DAT proof, не `canonicalRebuiltBatch`; payload/stage ещё не подключены.
+Ошибочный revalidate делает source set/snapshot sticky stale; повторный вызов
+не открывает источники и не выдаёт новый proof. Custody остаётся у объекта.
+
+`PinnedResolverSnapshot::capture` теперь охватывает nsswitch, resolv, hosts и
+actual kernel hostname (`/proc/sys/kernel/hostname`, bounded read без libc/NSS).
+Прямые и symlink parents удерживаются через O_PATH|NOFOLLOW; resolv chain≤4,
+каждый link/root-owned parent и final source проверяется before/after. Missing
+hosts — отдельное retained parent observation. Остальные missing sources дают
+отказ. Revalidate повторяет fixed capture и проверяет retained handles; unit tests
+не вызывают capture и не читают `/etc`/`proc`.
+
+`resolver_snapshot_data` реализует pinned netgo files/DNS ordering (включая
+resolve при отсутствии explicit dns), defaultNS, первые три valid nameservers
+с duplicates, search/domain, options и coalesced hosts aliases. Неизвестная или
+непредставимая grammar даёт typed Resolver error. Canonical YNKDNS01 asset и
+sourceDigest v2 различаются. `profile_channel::verify_resolver_asset(bytes,ref)`
+сначала проверяет exact size/hash, затем zero-allocation bounded readback.
+Independent vector `resolver-snapshot-v1.json` предназначен для Go parity.
+
+`FullProfileRequest::prepare_system(plan,policy_revision,admission_id,cancel)`
+связывает same intent → source capture → resource/resolver bindings → один
+CompiledProfileSystem → RetainedSystemProfile digest → capsule. Возвращённый
+`PreparedFullProfile` удерживает exact compiler result и source proofs, но не
+подтверждает selection/installed image/owner и не выдаёт Apply/Run/grants.
+Serialized backend должен проверить эти authority proofs отдельно, перенести
+тот же retained result в SessionArtifact и revalidate перед каждой стадией.
+Numeric/provider-DNS synthetic fixture этого producer не вызывает OS capture.
+
+Дополнительные exact Go a004e92 несовместимости для root review:
+
+- `profileDNSName` в snapshot decoder запрещает uppercase, но pinned netgo
+  `ensureRooted` не меняет регистр search/domain/hostname. Rust сохраняет эти
+  bytes; pure fixture `search Example.INVALID` не подгоняется под decoder.
+- `decodeProfileSnapshot` применяет `profileIP` к hosts addresses, запрещая
+  unspecified/multicast. Pinned netgo hosts parser принимает valid literals
+  (например `0.0.0.0 blocked.invalid`). Сами hosts rows не разрешают physical
+  dial: mandatory destination checks остаются отдельными. Resolver peers в Rust
+  проходят более строгие mandatory checks, неподдержанный selected peer не
+  заменяется следующим nameserver.

@@ -348,6 +348,256 @@ pub(crate) struct SnapshotRef {
     pub bytes: u32,
     pub flags: u32,
 }
+pub(crate) struct ResolverHost {
+    pub alias: String,
+    pub addresses: Vec<std::net::IpAddr>,
+}
+/// Только canonical DATA. Source FDs и env/image proofs удерживает producer.
+pub(crate) struct ResolverData {
+    pub source: [u8; 32],
+    pub source_flags: u32,
+    pub nss_hash: [u8; 32],
+    pub hosts_hash: [u8; 32],
+    pub resolv_hash: [u8; 32],
+    pub order: u8,
+    pub ndots: u8,
+    pub attempts: u8,
+    pub timeout_ms: u32,
+    pub flags: u16,
+    pub hostname: String,
+    pub search: Vec<String>,
+    pub peers: Vec<std::net::SocketAddr>,
+    pub hosts: Vec<ResolverHost>,
+    pub _memory: crate::helper::memory::ByteLease,
+}
+impl ResolverData {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        if self.search.len() > 6
+            || !(1..=3).contains(&self.peers.len())
+            || self.hosts.len() > 4096
+            || self.source_flags & !1 != 0
+            || self.source_flags == 1 && !self.hosts.is_empty()
+        {
+            return Err(Error::Budget);
+        }
+        resolver_name(&self.hostname, false, false)?;
+        for search in &self.search {
+            resolver_name(search, true, false)?;
+        }
+        for host in &self.hosts {
+            resolver_name(&host.alias, host.alias.contains('.'), true)?;
+            if !(1..=16).contains(&host.addresses.len()) {
+                return Err(Error::Budget);
+            }
+        }
+        // Worst-case encoded size bounded до reserve: не realloc после overflow.
+        let mut size = 170 + self.hostname.len();
+        for search in &self.search {
+            size = size.checked_add(2 + search.len()).ok_or(Error::Budget)?;
+        }
+        for peer in &self.peers {
+            size = size
+                .checked_add(if peer.is_ipv4() { 8 } else { 20 })
+                .ok_or(Error::Budget)?;
+        }
+        for host in &self.hosts {
+            size = size
+                .checked_add(4 + host.alias.len())
+                .ok_or(Error::Budget)?;
+            for ip in &host.addresses {
+                size = size
+                    .checked_add(if ip.is_ipv4() { 5 } else { 17 })
+                    .ok_or(Error::Budget)?;
+            }
+        }
+        if size > 2 * 1024 * 1024 {
+            return Err(Error::Budget);
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(b"YNKDNS01");
+        out.extend_from_slice(&[0, 1, 0, 120]);
+        out.extend_from_slice(&(size as u32).to_be_bytes());
+        out.extend_from_slice(&self.source);
+        out.extend_from_slice(&self.nss_hash);
+        out.extend_from_slice(&self.hosts_hash);
+        out.extend_from_slice(&[0; 8]);
+        out.extend_from_slice(&self.resolv_hash);
+        out.extend_from_slice(&[self.order, self.ndots, self.attempts, 0]);
+        out.extend_from_slice(&self.timeout_ms.to_be_bytes());
+        out.extend_from_slice(&self.flags.to_be_bytes());
+        string(&mut out, &self.hostname, 253)?;
+        out.extend_from_slice(&(self.search.len() as u16).to_be_bytes());
+        for search in &self.search {
+            string(&mut out, search, 253)?;
+        }
+        out.extend_from_slice(&(self.peers.len() as u16).to_be_bytes());
+        for peer in &self.peers {
+            out.extend_from_slice(&[if peer.is_ipv4() { 4 } else { 6 }, 0]);
+            out.extend_from_slice(&peer.port().to_be_bytes());
+            resolver_ip_write(&mut out, peer.ip());
+        }
+        out.extend_from_slice(&(self.hosts.len() as u16).to_be_bytes());
+        for host in &self.hosts {
+            string(&mut out, &host.alias, 253)?;
+            out.extend_from_slice(&(host.addresses.len() as u16).to_be_bytes());
+            for ip in &host.addresses {
+                out.push(if ip.is_ipv4() { 4 } else { 6 });
+                resolver_ip_write(&mut out, *ip);
+            }
+        }
+        if out.len() != size {
+            return Err(Error::Bounds);
+        }
+        validate_resolver_asset(&out, self.source, self.source_flags)?;
+        Ok(out)
+    }
+}
+fn resolver_ip_write(out: &mut Vec<u8>, ip: std::net::IpAddr) {
+    match ip {
+        std::net::IpAddr::V4(ip) => out.extend_from_slice(&ip.octets()),
+        std::net::IpAddr::V6(ip) => out.extend_from_slice(&ip.octets()),
+    }
+}
+fn resolver_ip_read(r: &mut Reader<'_>, family: u8) -> Result<std::net::IpAddr> {
+    match family {
+        4 => Ok(std::net::Ipv4Addr::from(r.array::<4>()?).into()),
+        6 => {
+            let ip = std::net::Ipv6Addr::from(r.array::<16>()?);
+            if ip.to_ipv4_mapped().is_some() {
+                return Err(Error::Schema);
+            }
+            Ok(ip.into())
+        }
+        _ => Err(Error::Schema),
+    }
+}
+pub(crate) fn resolver_name(name: &str, rooted: bool, lowercase: bool) -> Result<()> {
+    if name.len() > 253
+        || name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || [b'.', b'-', b'_'].contains(&b))
+        || rooted && !name.ends_with('.')
+        || lowercase && name.bytes().any(|b| b.is_ascii_uppercase())
+    {
+        return Err(Error::Schema);
+    }
+    if name != "."
+        && name
+            .strip_suffix('.')
+            .unwrap_or(name)
+            .split('.')
+            .any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+            })
+    {
+        return Err(Error::Schema);
+    }
+    Ok(())
+}
+/// Zero-allocation readback; source/hash provenance остаётся отдельным proof.
+pub(crate) fn verify_resolver_asset(bytes: &[u8], reference: SnapshotRef) -> Result<()> {
+    if bytes.len() != reference.bytes as usize
+        || bytes.len() > 2 * 1024 * 1024
+        || <[u8; 32]>::from(Sha256::digest(bytes)) != reference.asset
+    {
+        return Err(Error::Hash);
+    }
+    validate_resolver_asset(bytes, reference.source, reference.flags)
+}
+pub(crate) fn validate_resolver_asset(
+    bytes: &[u8],
+    source: [u8; 32],
+    source_flags: u32,
+) -> Result<()> {
+    if !(170..=2 * 1024 * 1024).contains(&bytes.len())
+        || source == [0; 32]
+        || source_flags & !1 != 0
+    {
+        return Err(Error::Bounds);
+    }
+    let mut r = Reader::new(bytes);
+    if r.take(8)? != b"YNKDNS01"
+        || r.u16()? != 1
+        || r.u16()? != 120
+        || r.u32()? as usize != bytes.len()
+        || r.array::<32>()? != source
+    {
+        return Err(Error::Schema);
+    }
+    let nss = r.array::<32>()?;
+    let hosts = r.array::<32>()?;
+    if nss == [0; 32]
+        || hosts == [0; 32]
+        || source_flags == 1 && hosts != <[u8; 32]>::from(Sha256::digest([]))
+    {
+        return Err(Error::Hash);
+    }
+    r.zero(8)?;
+    if r.array::<32>()? == [0; 32] {
+        return Err(Error::Hash);
+    }
+    if !(1..=4).contains(&r.u8()?) || r.u8()? > 15 || !(1..=5).contains(&r.u8()?) {
+        return Err(Error::Schema);
+    }
+    r.zero(1)?;
+    if !(1..=30000).contains(&r.u32()?) || r.u16()? & !31 != 0 {
+        return Err(Error::Schema);
+    }
+    resolver_name(r.string(253)?, false, false)?;
+    let searches = r.u16()?;
+    if searches > 6 {
+        return Err(Error::Budget);
+    }
+    for _ in 0..searches {
+        resolver_name(r.string(253)?, true, false)?;
+    }
+    let peers = r.u16()?;
+    if !(1..=3).contains(&peers) {
+        return Err(Error::Budget);
+    }
+    for _ in 0..peers {
+        let family = r.u8()?;
+        r.zero(1)?;
+        if r.u16()? != 53 {
+            return Err(Error::Schema);
+        }
+        let ip = resolver_ip_read(&mut r, family)?;
+        if ip.is_unspecified()
+            || ip.is_multicast()
+            || matches!(ip, std::net::IpAddr::V4(ip) if ip.is_broadcast())
+            || matches!(ip, std::net::IpAddr::V6(ip) if ip.is_unicast_link_local())
+        {
+            return Err(Error::Schema);
+        }
+    }
+    let count = r.u16()? as usize;
+    if count > 4096 || source_flags == 1 && count != 0 {
+        return Err(Error::Budget);
+    }
+    // Fixed scratch, не heap; сортировка не меняет порядок rows самого asset.
+    let mut aliases = [""; 4096];
+    for alias in &mut aliases[..count] {
+        *alias = r.string(253)?;
+        resolver_name(alias, alias.contains('.'), true)?;
+        let addresses = r.u16()?;
+        if !(1..=16).contains(&addresses) {
+            return Err(Error::Budget);
+        }
+        for _ in 0..addresses {
+            let family = r.u8()?;
+            resolver_ip_read(&mut r, family)?;
+        }
+    }
+    aliases[..count].sort_unstable();
+    if aliases[..count].windows(2).any(|p| p[0] == p[1]) {
+        return Err(Error::Reference);
+    }
+    r.end()
+}
 pub(crate) struct OwnedCapsule {
     bytes: Vec<u8>,
     _memory: crate::helper::memory::ByteLease,
