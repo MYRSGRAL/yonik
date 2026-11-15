@@ -7,7 +7,7 @@ use std::{
     fs::File,
     io::Write,
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::OwnedFd,
         unix::fs::{DirBuilderExt, FileExt, MetadataExt, PermissionsExt},
     },
     path::PathBuf,
@@ -242,6 +242,7 @@ impl Prepared {
         )
         .map_err(rejected)?;
         Ok(Launch {
+            configured: false,
             prepared: Arc::clone(self),
             record,
             host,
@@ -267,6 +268,7 @@ impl Drop for Prepared {
     }
 }
 pub(crate) struct Launch {
+    configured: bool,
     prepared: Arc<Prepared>,
     record: LaunchRecord,
     host: OwnedFd,
@@ -275,23 +277,25 @@ pub(crate) struct Launch {
     owner: OwnedFd,
 }
 impl Launch {
-    pub(crate) fn configure(&self, command: &mut tokio::process::Command) -> Result<(), HostError> {
+    pub(crate) fn configure(
+        &mut self,
+        mut command: tokio::process::Command,
+    ) -> Result<ConfiguredCommand, HostError> {
+        claim_configuration(&mut self.configured, command.as_std())?;
+        use std::os::fd::AsFd;
+        let fds = [
+            self.worker.as_fd(),
+            self.launch.as_fd(),
+            self.owner.as_fd(),
+            self.prepared.root.as_fd(),
+        ];
+        let owned = fds.map(|fd| rustix::io::fcntl_dupfd_cloexec(fd, 3).map_err(rejected));
+        let [control, launch, peer, root] = owned;
+        let owned = [control?, launch?, peer?, root?];
         command.env_clear().env("LANG", "C");
-        for (name, fd) in [
-            ("YONIK_PROFILE_CONTROL_FD", self.worker.as_raw_fd()),
-            ("YONIK_PROFILE_LAUNCH_FD", self.launch.as_raw_fd()),
-            ("YONIK_PROFILE_PEER_PIDFD", self.owner.as_raw_fd()),
-            (
-                "YONIK_PROFILE_ASSET_ROOT_FD",
-                self.prepared.root.as_raw_fd(),
-            ),
-        ] {
-            command.env(name, fd.to_string());
-        }
-        // yonik-linux запрещает unsafe_code. Существующий безопасный nsfs
-        // wrapper устанавливает только parent-death; API child-only FD mapping
-        // пока отсутствует. Parent-wide снятие CLOEXEC утечёт в соседний exec.
-        Err(HostError::Unsupported)
+        yonik_nsfs::local_parent_death::install_local_profile_fds(command.as_std_mut(), owned)
+            .map_err(rejected)?;
+        Ok(ConfiguredCommand { command })
     }
     pub(crate) fn start(
         self,
@@ -302,6 +306,32 @@ impl Launch {
         issuer::ProfileRuntime::start_local(self.record, peer, self.prepared, self.host)
             .map_err(rejected)
     }
+}
+/// После configure raw Command недоступен: нельзя удалить locators и накопить
+/// новые hooks другим Launch. Единственная операция потребляет весь Command.
+pub(crate) struct ConfiguredCommand {
+    command: tokio::process::Command,
+}
+impl ConfiguredCommand {
+    pub(crate) fn spawn(mut self) -> Result<tokio::process::Child, HostError> {
+        self.command.spawn().map_err(|_| HostError::Process)
+    }
+}
+fn claim_configuration(
+    configured: &mut bool,
+    command: &std::process::Command,
+) -> Result<(), HostError> {
+    let names = yonik_nsfs::local_parent_death::LOCAL_PROFILE_LOCATORS;
+    if *configured
+        || command
+            .get_envs()
+            .any(|(name, _)| names.iter().any(|key| name == *key))
+    {
+        return Err(HostError::State);
+    }
+    // Даже неудачная настройка одноразовая, включая повтор после env_clear.
+    *configured = true;
+    Ok(())
 }
 fn stage(
     root: &File,
@@ -413,6 +443,24 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_configure_is_one_shot_even_after_env_clear_or_failed_setup() {
+        let mut command = std::process::Command::new("не-исполняемый-fixture");
+        let mut configured = false;
+        claim_configuration(&mut configured, &command).unwrap();
+        command.env_clear();
+        assert_eq!(
+            claim_configuration(&mut configured, &command),
+            Err(HostError::State)
+        );
+        let mut fresh = false;
+        command.env("YONIK_PROFILE_CONTROL_FD", "20");
+        assert_eq!(
+            claim_configuration(&mut fresh, &command),
+            Err(HostError::State)
+        );
+        assert!(!fresh);
+    }
     #[test]
     fn missing_consumer_denies_before_sources_staging_or_spawn() {
         let intent = ProfileIntent::decode(

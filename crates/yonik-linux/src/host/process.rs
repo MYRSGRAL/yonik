@@ -85,16 +85,17 @@ pub(crate) fn spawn(binary: &BinarySnapshot, checking: bool) -> Result<Child, Ho
 pub(crate) fn spawn_profile(
     binary: &BinarySnapshot,
     checking: bool,
-    profile: Option<&super::local_profile_channel::Launch>,
+    profile: Option<&mut super::local_profile_channel::Launch>,
     assets: Option<&std::path::Path>,
 ) -> Result<Child, HostError> {
     let mut command = binary.command();
-    if let Some(profile) = profile {
-        if checking {
+    if profile.is_some() && checking {
+        return Err(HostError::ConfigRejected);
+    }
+    if let Some(assets) = assets {
+        if profile.is_some() {
             return Err(HostError::ConfigRejected);
         }
-        profile.configure(&mut command)?;
-    } else if let Some(assets) = assets {
         if !checking {
             return Err(HostError::ConfigRejected);
         }
@@ -128,9 +129,12 @@ pub(crate) fn spawn_profile(
             Stdio::null()
         } else {
             Stdio::piped()
-        })
-        .spawn()
-        .map_err(|_| HostError::Process)
+        });
+    if let Some(profile) = profile {
+        profile.configure(command)?.spawn()
+    } else {
+        command.spawn().map_err(|_| HostError::Process)
+    }
 }
 
 pub(crate) async fn write_config(

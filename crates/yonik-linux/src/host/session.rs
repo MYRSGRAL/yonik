@@ -266,8 +266,8 @@ impl LocalSession {
         self.binary = Some(checked.binary);
         let result = async {
             let binary = self.binary.as_ref().ok_or(HostError::State)?;
-            let launch=checked.profile.as_ref().map(|profile|profile.launch(*checked.digest.as_bytes(),cancel)).transpose()?;
-            self.child = Some(if let Some(launch)=&launch {process::spawn_profile(binary,false,Some(launch),None)?}else{process::spawn(binary,false)?});
+            let mut launch=checked.profile.as_ref().map(|profile|profile.launch(*checked.digest.as_bytes(),cancel)).transpose()?;
+            self.child = Some(if let Some(launch)=launch.as_mut() {process::spawn_profile(binary,false,Some(launch),None)?}else{process::spawn(binary,false)?});
             // Image/actual child проверены до чувствительного stdin. HELLO
             // ожидается issuer thread после stdin: Go сначала читает config.
             if let Some(launch)=launch {self.profile=Some(launch.start(self.child.as_ref().ok_or(HostError::State)?,binary)?);}
