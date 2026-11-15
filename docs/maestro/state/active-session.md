@@ -8,7 +8,7 @@ design_approved: true
 implementation_plan_approved: true
 execution_mode: parallel
 execution_backend: native
-current_phase: 2
+current_phase: 3
 total_phases: 8
 current_batch: import_and_compiler
 p1_task_id: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A4b1e8175-889a-4852-b8c6-a82144dfde88
@@ -16,6 +16,16 @@ p1_thread_id: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3ca
 p1_candidate: d6857b21e6992e3d4b7d448b4395a44f6f96d842
 p1_review: scoped_clean
 p1_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A98dc36ca-eb0f-439b-86eb-879a1a7c6a13
+p2_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3Ab182df4b-487a-44c1-a50a-8300e04c0548
+p2_candidate: 7f915fec02a78cb8c2049ec816c2a580888cfcc3
+p2_review: scoped_clean
+p2_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A59cadea6-d4a8-4b5e-8885-104af87bb83d
+p2_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A5dd29e5f-cb87-4ca3-8de1-045356518667
+p3_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A8ac093d3-885f-48c8-a51b-dd536829e681
+p3_candidate: 3572d533ec16db5e3be32574951e86268fc021f5
+p3_candidate_status: compile_scope_complete_review_in_progress
+p3_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3Ac73e19e2-1c96-4434-a0a5-2023682cf7b6
+localdns_go_scope: approved
 p1_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A2fdfb486-f16a-4156-b6f1-5b63eb67b2fc
 design_document: docs/maestro/plans/2026-11-15-happ-full-profiles-design.md
 implementation_plan: docs/maestro/plans/2026-11-15-happ-full-profiles-impl-plan.md
@@ -36,8 +46,24 @@ phases:
       integration_points: ['P2 report.entries and encrypted original', 'P3 trusted native profile validator', 'P4/P5 reviewed source/digest/generation/cancellation grant contract']
       assumptions: ['Fixture synthetic; native extension schemas must be checked against pinned source']
       warnings: ['Go/native implementation and actual acceptance not provided by P1']
-  - {id: 2, name: Импорт и каталог, agent: coder, status: in_progress, parallel: true, blocked_by: [1]}
-  - {id: 3, name: Xray compiler, agent: coder, status: in_progress, parallel: true, blocked_by: [1]}
+  - id: 2
+    name: Импорт и каталог
+    agent: coder
+    status: completed
+    parallel: true
+    blocked_by: [1]
+    files_created: [crates/yonik-linux/src/repository/native_profiles.rs, crates/yonik-linux/tests/full_profile_catalog.rs, docs/proposals/xray-full-profiles/catalog-api.md]
+    files_modified: [crates/yonik-linux/src/repository.rs, crates/yonik-linux/src/repository/backup.rs, crates/yonik-linux/src/subscriptions.rs, crates/yonik-subscription/src/lib.rs]
+    files_deleted: []
+    retry_count: 1
+    preflight_recoveries: 2
+    downstream_context:
+      key_interfaces_introduced: ['CatalogProfile::Server | Xray', 'Opaque CatalogSelection', 'catalog/resolve_catalog/select_catalog_profile/set_catalog_favorite', 'approve_local_profiles/offline_profiles']
+      patterns_established: ['AEAD native projection v2', 'Current live multiset proved from authenticated original', 'Native tables included in format4/5 backup admission']
+      integration_points: ['P6 uses catalog tokens with kind namespace and matches ProfileEntry', 'ProfileStagedUpdate.report exposes entries, not legacy servers/native_json']
+      assumptions: ['HTTP scenarios compile-only', 'Activation and production capability are P4/P5/P6']
+      warnings: ['Numeric native/server IDs use separate namespaces', 'Ambiguous favorites remain unavailable for reselection', 'Global database antirollback outside this change']
+  - {id: 3, name: Xray compiler, agent: coder, status: in_progress, parallel: true, blocked_by: [1], retry_count: 1}
   - {id: 4, name: Native transport, agent: coder, status: pending, parallel: true, blocked_by: [3]}
   - {id: 5, name: System helper, agent: coder, status: pending, parallel: true, blocked_by: [3]}
   - {id: 6, name: Desktop и Connect, agent: coder, status: pending, parallel: false, blocked_by: [2, 4, 5]}
@@ -129,6 +155,57 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
 - Узкий re-check R1 98dc36ca — scoped CLEAN для трёх findings на d6857b2.
   P1 gate закрыт; реализация native grants всё ещё относится к P4/P5.
 - P2/P3 подготовлены к parallel delegation из reviewed P1 + state-only commit.
+- P2 и P3 запущены параллельно в двух T3 worktrees из 7c52e77. P2 владеет
+  repository/subscription/catalog; P3 — engine/native_profile compiler. Shared
+  P1 importer и fixture read-only. Root coordstate не принадлежит исполнителям.
+- P2/P3 preflight остановился без изменений: root ошибочно ограничил shell
+  compile/tests и тем самым запретил чтение файлов. Исправление поручений:
+  read-only shell/Node fs, Git queries, selected tar reads/hashes разрешены;
+  авторство source/docs только apply_patch. Это не новый user permission.
+  Возобновляются те же задачи/worktrees, без новых исполнителей.
+- P2 обнаружил обязательную зависимость backup/restore от server-only profile
+  projection. Root добавил repository/backup.rs в ownership P2 и existing
+  backup_fault_tests.rs/format4_tests.rs при необходимости прямых regressions. Новый native catalog
+  должен входить в строгую schema/AEAD validation; legacy validation сохраняется.
+  Этот scope входит в уже утверждённую миграцию, новых разрешений не требует.
+- P3 c6ca4b9: validator/emitter candidate, 47 выполненных pure tests/clippy/fmt
+  PASS; full seven-provider coverage не доказано. Не интегрирован. Production
+  DAT bridge и typed helper IPC относятся к P5, не являются сами по себе
+  основанием блокировать compiler completion. Автор продолжает P3: memory-only
+  проверка конкретных семи полученных profiles и owned ingress/resource mappings.
+  Разрешено читать только subscription-app-response.private для private DATA
+  диагностики без вывода/копирования секретов и без core/network/SS/userDB.
+- P2 кандидат 365b077 завершён автором: catalog v2, encrypted native projection,
+  opaque selection, migration/reconciliation и backup validation. Семь owned
+  files; 30 pure tests/clippy/fmt PASS. HTTP integration targets compile-only.
+  Gate не закрыт до independent review. P3 остаётся в работе.
+- Root сверил source-final.tar P2 с 365b077: 3048 tracked files и executable
+  bits совпадают, нет лишних/пропущенных/mismatched файлов. Начат R2 source
+  review catalogue/AEAD/selection/backup contracts; actual runtime не проверялся.
+- R2 P2 нашёл два Major на 365b077: live projection count не аутентифицирован
+  составом original (delete row + native_count bypass), format4/5 admission
+  не сравнивает native_profiles/profile_projection live и backup. Автор P2
+  продолжает исправление в своей ветке; P2 gate не пройден. После исправления
+  re-review ограничен этими findings и регрессиями, не всем каталогом.
+- P2 correction 7f915fe: общий composition verifier и native backup comparison;
+  RED 6 failures, GREEN 46 pure tests/clippy/fmt PASS. Нужен narrow re-review.
+- P3 3572d53: private in-memory diagnostic всех семи roots validate/local/system
+  PASS с SYNTHETIC_BINDING_NO_DAT_PROOF, 53 public pure tests/clippy/fmt PASS.
+  Нужен independent compiler review. Production resource/resolver bridge — P5.
+- Root подтвердил localdns context loss по pinned Go: QueryIP(ctx) не передаёт
+  ctx в client; lookup использует Background. Узкий запрос двух source files
+  и tests описан в docs/proposals/xray-full-profiles/localdns-scope.md.
+  До user approval эти Go-файлы не менять; проверки P2/P3 продолжаются.
+- Пользователь явно разрешил описанное DNS-дополнение двух Go-файлов и tests,
+  compile-only/in-memory проверки. Source tests P2/P3 и P4 scope обновлены;
+  запреты runtime/network/services/new dependencies/frozen ABI260 сохранены.
+- Root проверил полные archives P2 corrected 7f915fe (3048 files) и P3 3572d53
+  (3052 files): Git blobs/modes совпадают полностью. Параллельно запущены
+  P2 narrow recheck 59cadea6 и P3 full compiler review c73e19e2. P4/P5 не
+  запускаются до принятого P3 gate; никаких polling или повторных сборок ожидания.
+- R2 narrow 59cadea6 — scoped CLEAN на 7f915fe, оба Major закрыты. P2 source
+  gate принят, сохраняются author RED/GREEN46 и независимый archive binding.
+  Интегрируется обычным local merge в task/happ-full-profiles, не в main.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.

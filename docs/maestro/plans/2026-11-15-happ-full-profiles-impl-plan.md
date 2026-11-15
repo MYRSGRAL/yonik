@@ -196,6 +196,8 @@ Upstream файлы, которые patch вправе менять после �
 - `transport/internet/hysteria/dialer.go`;
 - `transport/internet/grpc/dial.go`;
 - `transport/internet/splithttp/{dialer,client,mux}.go`;
+- `app/dns/nameserver_local.go` и `features/dns/localdns/client.go` — отдельное
+  DNS-дополнение явно утверждено пользователем после SOURCE trace context loss;
 - относящиеся к ним regression tests.
 
 Observatory-only разрешение не покрывает последующие transport файлы: их
