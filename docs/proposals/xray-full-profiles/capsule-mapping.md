@@ -1,6 +1,7 @@
 # Capsule mapping: subjects, scopes и native transitions
 
-Статус: proposed completion scope, implementation не разрешена.
+Статус: source implementation разрешена пользователем через completion-scope.md.
+Это не final ABI freeze и не runtime acceptance.
 Этот документ заменяет table mapping revision2.1; lifetime/receipt/state правила
 revision2.1 с root corrections434b49b сохраняются. Исходный source addendum:
 local/orchestration/evidence/p4-dns-966ee520/capsule-protocol-mapping-addendum.md.

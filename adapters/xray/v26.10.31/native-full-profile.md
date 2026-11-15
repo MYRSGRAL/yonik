@@ -4,6 +4,14 @@
 не реализованы. Builder намеренно не подключает этот patch и не объявляет feature.
 Замороженные descriptors, ABI260 и upstream pin не изменяются.
 
+Пользователь отдельно утвердил source completion scope. Актуальный перечень
+разрешённых файлов и wire mapping задают completion-scope.md, capsule-mapping.md
+и resolver-snapshot-contract.md в docs/proposals/xray-full-profiles/.
+Их mappingVersion3/tableCount11 заменяет промежуточные table layouts ниже;
+остальные lifetime/receipt/state правила revision2.1 сохраняются. Указания ниже
+об ожидании scope approval описывают исторический proposal и больше не блокируют
+разрешённую source implementation. Runtime/provisioning grants отсутствуют.
+
 ## Реализованная часть
 
 `app/dns/nameserver_local.go: LocalNameServer.QueryIP` передаёт query context в

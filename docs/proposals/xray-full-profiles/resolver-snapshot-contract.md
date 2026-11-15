@@ -1,7 +1,8 @@
 # Resolver snapshot и DAT source: proposed contract
 
-Статус: proposed completion scope. Реализация, provisioning и actual runtime
-этим документом не разрешены. Текущий P5 snapshot `hosts: dns`/nameserver-only
+Статус: source implementation разрешена пользователем через completion-scope.md.
+Provisioning и actual runtime этим согласованием не разрешены.
+Текущий P5 snapshot `hosts: dns`/nameserver-only
 не объявляется достаточным для обычной Local/System установки.
 
 ## Семантика resolver
