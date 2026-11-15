@@ -270,20 +270,131 @@ spawn channel, actual child/image verification до sensitive stdin; issuer
 ожидает HELLO после stdin без deadlock. Stop отзывает issuer до terminate/reap,
 Unknown сохраняет custody. Local не выдаёт System stamp/OS attribution.
 
-`Launch::configure` остаётся fail closed. Exact source blocker: workspace
-`Cargo.toml:11` forbids unsafe_code, а единственный existing safe wrapper
-`crates/yonik-nsfs/src/local_parent_death.rs::install_kill_on_parent_death`
-не поддерживает child-only FD inheritance. Этот nsfs файл вне writer ownership.
-Минимальный требуемый API: безопасный wrapper, принимающий owned четыре FD,
-удерживающий их lifetime и снимающий CLOEXEC только в raw pre_exec child,
-с прежним fixed parent-death fence. Parent-wide fcntl неприемлем из-за утечки
-FD в параллельный exec. Новые dependencies, fork/exec helper и scope обходы
-не добавлены. После wrapper root подключает его только в Launch::configure;
-legacy spawn/check не должен получать эти FD. Local API возвращает typed
-`HostError::Unsupported`. Gate также остаётся закрытым до
-installed complete Go consumer proof.
+R10 расширил ownership для Local wrapper. `Launch::configure` теперь передаёт
+ровно четыре CLOEXEC owned duplicates в safe
+`yonik_nsfs::local_parent_death::install_local_profile_fds(&mut Command,[OwnedFd;4])`.
+Canonical env numbers фиксируются до move; parent flags не меняются. Command
+удерживает handles в pre_exec closure. Уже существующий fixed parent-death hook
+из `BinarySnapshot::command` исполняется раньше FD hook; новый wrapper его не
+переустанавливает. Child использует только raw F_GETFD/F_SETFD, Copy flags и
+errno-only errors; снимает только FD_CLOEXEC. Любая ошибка запрещает exec.
+Launch configure одноразовый даже после ошибки/env_clear. Уже настроенный
+Command отвергается до env_clear и до добавления hooks. Fresh Command создаётся
+в `process::spawn_profile`, затем configure потребляет его и возвращает opaque
+ConfiguredCommand с единственным consuming spawn. Raw Command после configure
+не публикуется: удалить locators или добавить ещё один Launch нельзя. Legacy/check вызывают
+старый spawn без FD wrapper. Gate остаётся закрытым до installed complete Go
+consumer proof; Local wrapper не выдаёт System/flow authority.
 
 Pure проверка driver использует injected Channel/Authority: synthetic ACK,
 два flow, pending cancellation, monotonic outgoing sequence, Known/Unknown,
 refresh, receipt kind и rollback/Unknown custody. OS wrappers только компилируются;
 tests не вызывают process, proc, NSS, socketpair, systemd или kernel backend.
+
+## R10 System proof proposal — SOURCE, ещё не implementation
+
+Подтверждённый gap в b04c2c0: `native_profile_channel.rs::Peer::system/capture`
+(1635–1725) читает `/proc/<worker>/exe`; `Peer::socket` (1726–1790) сканирует
+чужой fd table и вызывает pidfd_getfd. Fixed
+`packaging/systemd/yonik-helper.service:28` оставляет только CAP_NET_ADMIN.
+Cross-UID ptrace checks нельзя заменить Root UID, marker/env или session token.
+Эти пути не являются рабочим System proof при pinned privileges. Gate остаётся
+закрытым; CAP_SYS_PTRACE/packaging/ABI260 не меняются.
+
+### Что уже верифицируется и чего это не доказывает
+
+- `native_bootstrap::verify_pending/RuntimeScopeStamp` проверяют admitted worker,
+  owner/kernel namespace custody и frozen binding; `RunRole::into_guard`
+  передаёт owning lifetime. Это не текущий Xray executable FD и не flow owner.
+- `worker::receive_native_payload` проверяет sealed image/config actual bytes;
+  `RunHandoff::exec` (role_handoff.rs284–314) сверяет capsule/config digest, а
+  `ProductionPermit::exec_run` (468+) владеет verified transport до actual exec.
+  Это существующий trusted code path для доставки image, а не kernel
+  аттестация instruction pointer после exec.
+- `receive_verified_transport` (402+) уже проверяет ancillary credentials,
+  YNKEXT01/challenge/task PID/start/frozen binding. Этот authenticated handoff
+  можно удержать для отдельного pre-exec exchange, не меняя frozen frames.
+- `KnownOwnerProof::checked` и serial RemoteLookup остаются единственным proof
+  actual initiator ownership. Exec delivery/socket custody их не заменяют;
+  unchanged tuple, receipt kind/id и original expiry20ms обязательны.
+
+### Предлагаемый exec delivery proof без cross-UID proc
+
+Worker удерживает duplicate существующего authenticated handoff FD до exec.
+После native payload/staging, перед `command.exec`, он посылает отдельный
+versioned YNKEXC01 record плюс **actual image/config readonly sealed FDs**, которые
+использует этот consuming exec path. Helper независимо проверяет credentials
+against admitted task PID/UID/start, exact nonce/session/invocation/generation/
+epoch, record/config/manifest hashes, FD type/seals/size/hash against retained
+WorkerPayload. Затем ACK разрешает только этот pending exec. Replay/другой
+binding/лишние rights закрывают всё; Unknown сохраняет custody. Frozen role
+record/FD counts и YNKEXT01/ACK не меняются — exchange идёт отдельным сообщением
+после существующего payload ACK, на retained authenticated handoff.
+
+Минимальный proposed YNKEXC01 record256 (big endian): prefix16 содержит
+magic8/version u16=1/length u16=256/rights u16=2/reserved u16=0;
+nonce32@16,digest32@48,session16@80,invocation16@96,generation8@112,epoch8@120,
+taskPID4@128,reserved4@132,taskStart8@136,imageHash32@144,configHash32@176,
+manifestHash32@208,imageBytes8@240,configBytes4@248,reserved4@252.
+Config hash обязан совпасть с binding digest. ACK40 — YNKEXA01 + SHA256 всего
+record. Exactly2 rights: image/config. Один pending exchange, existing admission
+deadline, no renewal/replay; никаких owner receipts это сообщение не создаёт.
+
+Результат называется `VerifiedExecDelivery`, а не CurrentImageProof: authority
+выведена из source-verified consuming worker exec path + independent sealed FD
+readback + same task pidfd/PID/start + последующего HELLO. До включения требуется
+review, что между delivery ACK и exec нет alternate exec/spawn path, что
+запускается именно проверенный sealed image и что fd/env/config custody exact.
+Самопереданный Go image hash/FD без этой цепочки недостаточен. Если contract
+требует независимого kernel current-executable measurement после exec, этот
+delivery proof его не заменяет: такой режим остаётся Unsupported.
+
+### Минимальная отдельная socket-proof extension
+
+Runtime YNKCAP01 запрещает rights на каждом frame; existing four locators и
+YNKEXT01 доставляют только один runtime endpoint. Поэтому нельзя тихо принимать
+SCM_RIGHTS в OPEN_INGRESS или использовать pidfd_getfd fallback. Предлагается
+отдельный bootstrap exchange **YNKPF001/version1/length128/rights1**, до HELLO:
+prefix16, nonce32, digest32, session16, invocation16, generation8, epoch8.
+Он доставляет один отдельный proof-channel FD от trusted helper. Все поля
+сверяются с sealed launch record, credentials/pidfd; повтор/timeout/неизвестный
+format даёт отказ. Старый Go consumer не считается совместимым. Это явная новая
+versioned extension для root/Go review, не изменение frozen ABI/четырёх locators
+и не разрешение ancillary в runtime frame decoder.
+
+На proof channel admitted Go передаёт accepted socket через SCM_RIGHTS с exact
+binding/request/source tuple/provenance. Полученный FD — actual kernel object,
+а не новый FlowGrant. Proposed YNKSPF01/version1 record192: prefix16
+(magic/version/length192/rights1/reserved0),binding80@16,nonce32@96,
+runtimeRequestSequence8@128,monotonicProofId8@136,ingressIndex2@144,
+provenance1@146,reserved1@147,tuple40@148,reserved4@188. Exactly1 socket FD;
+для этой версии только acceptedTCP. Helper сопоставляет exact pending
+OPEN_INGRESS sequence/tuple/ingress/provenance один раз, без добавления полей в
+старый OPEN_INGRESS. FD/metadata credit резервируется до read/materialization,
+pending≤64 с existing deadline; wrong/late/replay proof закрывает все rights.
+Runtime и proof channels обслуживаются одним issuer loop; RemoteLookup по-прежнему
+имеет единственного serial owner. Proof-channel EOF отзывает context.
+Порядок binding80 в новой extension: digest32,session16,invocation16,generation8,
+epoch8; это явный новый layout, не копирование runtime header128.
+Переданный FD — kernel object,
+не child assertion о cookie/owner. Helper сам проверяет type/protocol,
+getsockname/getpeername, SO_COOKIE/fstat, exact compiled ingress и неизменный
+initiator tuple. Для namespace нужна **независимая** связь socket→netns:
+SIOCGSKNS на полученном socket FD и сравнение actual nsfs identity с retained
+RuntimeScopeStamp namespace. Existing CAP_NET_ADMIN применима только если
+подтверждена относительно socket net->user_ns; иначе Unsupported, без новых
+capabilities. Потребуется узкий safe nsfs ioctl wrapper с pure injected tests
+и отдельным source approval: он не входит в одобренное R10 Local расширение.
+Child-supplied namespace FD рядом с socket FD не доказывает эту связь.
+
+После independent socket/namespace verification helper делает обычный fresh
+owner lookup инициаторного tuple и связывает flow с FD/cookie, source/provenance,
+original destination, scope/branch/chain, expiry/cancel. Socket proof не заменяет
+Known owner, optional ACL semantics или FlowGrant. Custody и revoke/cancel
+сохраняют прежние правила; один flow не закрывает соседний physical session.
+
+UDP дополнительно требует parent control association → actual UDP FD/cookie →
+ephemeral endpoint → actual UDP initiator proof, с cancel при закрытии control.
+Только переданного UDP FD недостаточно, чтобы доказать association provenance.
+Trusted Probe/DNS paths также не выведены из этого предложения. Все эти gates
+остаются закрытыми до отдельных producers/consumers и review.
