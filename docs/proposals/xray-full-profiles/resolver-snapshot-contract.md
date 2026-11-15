@@ -81,10 +81,13 @@ case-folding следуют pinned netgo rules. Одинаковые aliases coa
 пустым списком, не утверждением из UI; отсутствие/нечитабельность прочих
 обязательных источников даёт Unsupported до admission.
 
-sourceDigest = SHA256(`YONIK-RESOLVER-SOURCES-v2` + NUL + length-prefixed exact
-nss/resolv/hosts bytes + hostname bytes + fixed owned resolver env-policy bytes).
-Каждая length — u32; отсутствующий hosts source имеет отдельный presence byte
-перед его length. Metadata identities проверяются отдельно и не заменяются hash.
+sourceDigest = SHA256(`YONIK-RESOLVER-SOURCES-v2` + один NUL byte +
+u32(nss.len) + nss + u32(resolv.len) + resolv + hostsPresent u8 +
+u32(hosts.len) + hosts + u32(hostname.len) + hostname + envPolicy u16=1).
+Все lengths big endian; hostsPresent0 означает отсутствие и требует пустых
+hosts bytes, 1 — source существует (может быть пустым). hostsContentHash всегда
+SHA256(hosts bytes), а sourceFlags.hosts-absent — инверсия hostsPresent.
+Metadata identities проверяются отдельно и не заменяются hash.
 AssetHash — SHA256 exact YNKDNS01 bytes; это другой digest.
 
 Consumer реализует bounded files/DNS ordering, search/ndots, retries/timeouts,

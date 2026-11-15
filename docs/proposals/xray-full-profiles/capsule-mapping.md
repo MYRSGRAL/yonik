@@ -92,8 +92,22 @@ index Host повторяет P3 equality sniffing+membership каждого ord
 запрещены unused mappings и collisions с DNS internal tags. Это не 16 listeners.
 Alias/index не proof; request issuer берёт provenance из owning ingress receipt.
 
-Tables5/6/8 (resolver/resources/probe) без layout изменений; все их subjectIndex
-теперь unique table1 indices. Probe expanded subjects не становятся scope indices.
+Table5 Resolvers использует прежний row layout, но cap64 rows, backend
+Provider=1/System=2 и protocol TCP=6/UDP=17. До16 snapshot peers могут требовать
+обе UDP/TCP rows; дополнительные provider rows не теряются. Existing aggregate
+firewall cap128 и общий frame64KiB независимо ограничивают итоговый набор.
+Table6 Resources: kind GeoIP=1/GeoSite=2; прежние layout/cap16 category rows.
+Table8 Probes: scheme HTTP=1/HTTPS=2, redirect=0; остальные layout/cap1 прежние.
+Все subjectIndex теперь unique table1 indices; Probe expanded subjects не
+становятся scope indices.
+
+Table7 Ingresses уточняет прежнее поле protocol: это protocolMask u8 с bit0 TCP
+и bit1 UDP (остальные0, хотя бы один bit). kind TUN=1/SOCKS=2/HTTP=3/Probe=4;
+TUN ownedPort=0 и mask3, listener port ненулевой. Это row одного actual owned
+ingress, а не отдельная row на каждый network. OPEN_INGRESS actual tuple network
+обязан входить в mask, а kind/provenance — совпадать с admitted mode/ingress.
+Так cap4 actual ingresses сохраняется без потери TUN или SOCKS UDP ветки.
+
 AUTHORIZE: существующий subjectIndex остаётся table1 identity; после transportIndex
 добавить scopeIndex u16,branch u8(0normal/1mux),reserved u8=0. Проверить
 scope.subject==subjectIndex,branch active,transportIndex==branch active stream
