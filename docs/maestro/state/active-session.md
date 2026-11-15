@@ -30,6 +30,7 @@ p4_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa92
 p4_partial_candidate: 6acfecb459a9d60c59a6cb794c89ea0b578965ff
 p4_issuer_proposal: 57f929683feb959ad87fd5e503acf3ee1932df0a
 p4_issuer_revision2: dccd92659ebca1818678ab1e734d39a0cf45767c
+p4_design_recheck: two_medium_findings_root_corrected_pending_p5_mapping
 p4_design_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A957fec20-7af1-463b-abd0-6e5975f32de5
 p4_design_recheck_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3Ae8691f3f-4b80-4c74-b15b-08aa07799870
 p4_design_correction_task: node:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Athread-send%3A6cd9109e-9343-4dd0-b30d-20a1013cba79
@@ -292,6 +293,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   YNKEXT01 order/custody и уточнённый wire/state. Внешние незакрытые P5 mapping,
   direct firewall и resolver/DAT custody явно исключены из утверждений готовности.
   Review source-only; implementation/runtime scope не расширяется.
+- Narrow R4 e8691f3f: F1/F3 исправлены, F2 в основе исправлен, F4 частично;
+  остались два MEDIUM — ingress TTL≤1s без renewal и fallback lookup без
+  actual-sent frozen Reply. Root исправил контракт: ingress lifetime связан с
+  owned flow/session, grant refresh сохраняет expiry/cancel fences; tagged
+  FrozenSent/SidebandOperation receipts отделяют реальные frozen replies от
+  свежих sideband operations. Bounds/descriptor/hash/diff-check проверены;
+  это source-doc correction без новых implementation/runtime tests.
+  Partial P4/proposal влит для коррекции, builder/authority hooks отключены.
+  Внешние P5 mapping/direct firewall/DAT/resolver prerequisites остаются открыты.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
