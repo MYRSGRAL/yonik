@@ -47,6 +47,9 @@ p5_native_narrow_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-496
 completion_scope_head: e3e3f563428ca43c0087fe162faf748c016f843a
 completion_scope_review_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A84b976a3-2eb0-4fa6-ac80-814e41170e9b
 completion_scope_approval: explicitly_approved_by_user
+completion_implementation_base: 490915d710bfcd52d37351c2dfc8b878d8a24a15
+p4_completion_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A1b4702b1-fc41-4e3e-9f5d-24f4bcecbcac
+p5_completion_thread: thread:delegated-task:command%3Amcp%3A86c209a8-956f-4962-9793-d3caa9268944%3Adelegate-task%3A7f3da3dd-67bb-4d7e-ab13-163b3eb6bc21
 completion_scope_review: three_medium_contract_clarifications_root_corrected
 p3_native_schema_fix: 0aace3297274851bf9ee9a2842d9e695c23196a2
 p5_test_gaps_head: bb425125644c2057c75e2563d6c45193db05ceea
@@ -382,6 +385,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   запреты runtime/services/network/probes/dependencies/frozen ABI260 changes.
   Следующий batch: два отдельных worktree из одной принятой root базы, Go writer
   и Rust writer с общим документированным wire и непересекающимися файлами.
+- Два completion writer запущены из490915d: P4 Go patch/builder/hooks,
+  P5 Rust shared codec/projection/Local+System issuer/custody/payload/dispatch.
+  Оба получили override apply_patch вместо write_file/replace и подтверждение
+  нового разрешения, закрытые scopes и no nested delegation. Private locators:
+  YONIK_PROFILE_CONTROL_FD/LAUNCH_FD/PEER_PIDFD/ASSET_ROOT_FD. Для Local выбран
+  отдельный sealed YNKLOC01 record192 по YNKEXT01 layout, rights0 и pre-spawn
+  workerPid/workerStart0; System record остаётся YNKEXT01 с verified identities.
+  Host проверяет actual child после spawn; env locator сам не authority.
+  Pure tests/compile-only разрешены, actual runtime/provisioning по-прежнему нет.
 - PR229 остаётся OPEN на 155af74: Python падает exact P11 source freshness.
   Предыдущий typed Connect correction 700bd6f и его review/evidence сохранены
   отдельно. Эта ветка не включается неявно в Xray full-profile source base.
