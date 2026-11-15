@@ -59,6 +59,7 @@ class FullProfilePatchTests(unittest.TestCase):
                     "transport/internet/udp/dispatcher.go",
                     "common/mux/client.go",
                     "common/mux/yonik_profile_transport_test.go",
+                    "common/mux/yonik_r9_lifecycle_test.go",
                     "transport/internet/system_dialer.go",
                     "transport/internet/memory_settings.go",
                     "transport/internet/yonik_profile_transport_test.go",

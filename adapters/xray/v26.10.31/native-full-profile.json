@@ -3,7 +3,7 @@
   "version": "26.10.31",
   "source_commit": "a4a3dff5b20c2faae567b742c172c7b95e75c083",
   "base_archive_sha256": "e5184047fd1380472f69114fb8173a0adfd8c50970560eceb9c87fcba0bb35e9",
-  "patch_sha256": "9ee9a668cc7f7a79ba120661a5f404e1b6e7ddf2dbf06d671315cd79b9d83b8e",
+  "patch_sha256": "a37cc380d2e8935f42de645b9625c6ab63bf0b342e6a3dcd2cd7e5da32e14035",
   "status": "partial-physical-transports",
   "runtime_hooks_connected": false,
   "native_protocol": null,
@@ -29,7 +29,7 @@
     "profile_capsule.go": "5b59be54f4fdcfbe6a4ad0c7b5759715feb5552dc4fb8e84d20305c698695fcc",
     "profile_compat_test.go": "f84dd0fe4ba066144fea5b42f218fd6b0a7469b31513e2d33719649884eebc9f",
     "profile_dat.go": "a430745a4221ff4be2a90b6f3d0c13adaadc2bea475800893beeb40d3557f7aa",
-    "profile_flow_hooks_linux.go": "d239a69335a712f28ad24e3bf6a5fb0d88cc67429f2229c590b171b8d86d2c6d",
+    "profile_flow_hooks_linux.go": "7131f743748d8f0437e591b02257cd4effae8fbef1c0c32b540bd2f397f0f925",
     "profile_flow_linux.go": "cf19ad8ad8ae671f7d4f41b994aa40d79f584bfae4de1bfa76f7cdf95e95ab89",
     "profile_flow_linux_test.go": "a743dd726de0c7955b8168018319cd2ded83f3329d17851bf89505ddfa835bbc",
     "profile_flow_other.go": "a09b99b3506369babbc0f077be75f09a1a84255df8c94103338008f07955b395",
@@ -39,7 +39,9 @@
     "profile_launch_other.go": "21b31d0b7a19536438c2c097f2795414f249c05f1955a4cebf7b0d5252acc71a",
     "profile_launch_test.go": "d614d592feed1d6527b82fc1503fb6c1a5416022b53b5b58f43283f0feb5d032",
     "profile_snapshot.go": "bd11a59eda5a2abd30e2825b919dc4d43f4019bc5704f4dc8d6a39411e593d3f",
-    "routing.go": "c7a3a60e04e063865fa467c0f118593528e1ea8cc3f032f3969e8e0d534eebda"
+    "routing.go": "c7a3a60e04e063865fa467c0f118593528e1ea8cc3f032f3969e8e0d534eebda",
+    "profile_cleanup.go": "7c58b2ad6bc4138ca726b070107e7d603925bde3bf10fa56d0326fb30f1a9a71",
+    "profile_cleanup_test.go": "25515efb92d1ffb7a990e5eff6f7955c3de42acf010c6c3aa0e8694ee00766de"
   },
   "callsite_files_sha256": {
     "transport/internet/splithttp/yonik_r9_test.go": "de0efd0442bbb2a6bc9cdca69fa70294b0496c20d5907089cb885d057d968b1e",
@@ -54,8 +56,8 @@
     "transport/internet/hysteria/dialer.go": "951665acff646a5b17d90ecb7a4d74fe078c7330c297a3e5b3372fc0d77c3542",
     "transport/internet/grpc/yonik_profile_transport_test.go": "abeaf6d0003e7d04cc575a7c29ef88cbdc97f5b9f8c1b9ed3c01fd8fedaa019c",
     "transport/internet/grpc/dial.go": "2563d0263f62132de4912dbb77ac15f3266f52480626e913b8bb3f2d138fe8e7",
-    "common/mux/yonik_profile_transport_test.go": "329e6f9b8c56b0281e34b9d5ff19ebe34be18f1a9c0b6b1be8a806f8b83f62ac",
-    "common/mux/client.go": "859c5bed5fe0dde29424d9a4fa8799953a5efcc44ca092a81ffc496c08f17f5a",
+    "common/mux/yonik_profile_transport_test.go": "00ba60dbc72563403927e4058f3ca047e379c288b2e5759ebbe146215141e9c3",
+    "common/mux/client.go": "06846eaacf8ccf3309a40d5e3bbbf51bf1fba3f9a9624788de72395601ab6a60",
     "app/dispatcher/default.go": "9d90bf339a2f2bc7d26eec4af4ecdfd02cde5be67837c36cd9c6e58b2fd62ddc",
     "app/dns/nameserver_local.go": "0bf410a8b93c006850b07250d9dd27551aeb6ff3e95763b701af432e715d2f90",
     "app/proxyman/inbound/worker.go": "1200efadc0a0e6de787eaf42d6a8ad0415d867a2f9e9f99b069244e944891c91",
@@ -69,7 +71,8 @@
     "proxy/socks/server.go": "be27a7345135a02d21a8e70e82ba7940ea8fcd41b65bda2d0ba1eeca9e037b23",
     "proxy/tun/handler.go": "bf175b5a33662adfe8e6eb0311da0ab92b618ec48a790f7c632cfe304245c32f",
     "transport/internet/dialer.go": "bc1839367dff4a586271c0169ab54eee4b4eb5b8feb6607763441da033c17d97",
-    "transport/internet/udp/dispatcher.go": "ebe90ef0ddc321737d5620ec4d0d2fd5ba1fbfd1872280974386fbd8b8d5c3cf"
+    "transport/internet/udp/dispatcher.go": "ebe90ef0ddc321737d5620ec4d0d2fd5ba1fbfd1872280974386fbd8b8d5c3cf",
+    "common/mux/yonik_r9_lifecycle_test.go": "37d1dd5f2fc6ab6e051ba19729bc21d7e7d97cc164e20ed8c88c342860979334"
   },
   "original_flow_receipts_connected": true,
   "authorize_grant_consumer_connected": true,

@@ -264,6 +264,42 @@ Controls воспроизводят cancel→late response→payload write и п
 late factory, factory error+value, sticky Unknown и successful cleanup.
 Это только correction двух findings; DNS/probe/pooled-chain readiness не меняется.
 
+## R9F2: async mux cleanup
+
+`common/mux/client.go::DialingWorkerFactory.createWorker` создаёт managed state,
+retirement callback, cancel и processDone до запуска fetchOutput/monitor/process.
+Private constructor принимает pure runner для управляемого порядка задач.
+Внутренние process/fetch/idle paths вызывают только `requestClose`; managed
+`ClientWorker.Close` ждёт окончательный результат monitor, legacy Close сохраняет
+signal-only поведение. EOF до возврата constructor не теряет callback/state.
+
+Monitor запрещает allocation, пробуждает session.done до join Dispatch, закрывает
+session endpoints и owned link, затем ждёт input/fetch/process exit. Удалённые
+logical sessions сохраняют failed cleanup leaves. Ошибка cleanup остаётся в
+retained final result и повторный Close её не заменяет. `finished` публикуется
+после actual cleanup и join, перед retirement callback: reentrant Close из
+callback не ждёт monitor самого себя. Произвольный внешний callback, выполняемый
+самим process, не должен вызывать ожидающий managed Close; owned internal paths
+используют только requestClose. Picker/group shutdown снимает picker lock до
+ожидания Close и сохраняет aggregate error; закрытый picker не создаёт workers.
+
+`common/yonikbroker/profile_cleanup.go::ProfileCleanupResource(any) error`
+принимает явный `ProfileCleanup() error` или error-returning Close. Для exact
+in-memory transport/pipe Interrupt синхронно закрывает pipe; reader postcondition
+проверяется ReadMultiBuffer, writer — Close. Void-only Interrupt произвольного
+типа не является доказательством: выполняется best effort и возвращается
+`ErrProfileCleanupUnknown`. Flow reader/writer передают cleanup underlying value,
+не маскируя отсутствие proof. Legacy Close/SessionManager API не изменены.
+Ошибка операции Proxy.Process сама по себе не подменяет результат cleanup.
+
+RED на exact6918221 воспроизводит ранние Close/retire при задержанном actual
+session/link cleanup, потерянный error и ложный успех void Interrupt. GREEN
+использует реальные constructor/monitor/Close/Dispatch с fake endpoints и
+управляемым runner; отдельно проверяет delayed process exit, early EOF,
+process-error stop без self-wait, picker lock и retained session error.
+Broker reservation и H1 correction сохранены byte-exact относительно6918221.
+Это исправление оставшегося mux finding, не завершение transport/P4.
+
 ## Детерминированный R8 contract: tuple orientation
 
 Go `profile_flow_hooks_linux.go::ProfileAccept` кодирует original initiator в

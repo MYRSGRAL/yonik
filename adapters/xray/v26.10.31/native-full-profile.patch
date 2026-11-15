@@ -1,3 +1,483 @@
+diff --git a/common/mux/yonik_r9_lifecycle_test.go b/common/mux/yonik_r9_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/mux/yonik_r9_lifecycle_test.go
+@@ -0,0 +1,394 @@
++package mux
++
++import (
++	"context"
++	goerrors "errors"
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/transport"
++	"github.com/xtls/xray-core/transport/internet"
++	"io"
++	"sync"
++	"sync/atomic"
++	"testing"
++)
++
++var r9MuxCleanupError = goerrors.New("R9 mux cleanup Unknown")
++
++type r9MuxEndpoint struct {
++	calls            atomic.Int32
++	once             sync.Once
++	entered, release chan struct{}
++	err              error
++	beforeClose      func()
++}
++
++type r9MuxBlockedInput struct {
++	entered, release    chan struct{}
++	readOnce, closeOnce sync.Once
++}
++
++func (r *r9MuxBlockedInput) ReadMultiBuffer() (buf.MultiBuffer, error) {
++	r.readOnce.Do(func() { close(r.entered) })
++	<-r.release
++	return nil, io.EOF
++}
++func (r *r9MuxBlockedInput) Close() error {
++	r.closeOnce.Do(func() { close(r.release) })
++	return nil
++}
++
++type r9MuxSink struct{}
++
++func (*r9MuxSink) WriteMultiBuffer(b buf.MultiBuffer) error { buf.ReleaseMulti(b); return nil }
++func (*r9MuxSink) Close() error                             { return nil }
++
++func TestYonikR9MuxMonitorWakesWaitingDispatchBeforeJoin(t *testing.T) {
++	retired := make(chan error, 1)
++	w, tasks := r9MuxConstruct(t, transport.Link{Reader: &r9MuxEndpoint{}, Writer: &r9MuxSink{}}, func(e error) { retired <- e })
++	input := &r9MuxBlockedInput{entered: make(chan struct{}), release: make(chan struct{})}
++	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{Target: net.TCPDestination(net.DomainAddress("synthetic.invalid"), 443)}})
++	dispatched := make(chan bool, 1)
++	go func() { dispatched <- w.Dispatch(ctx, &transport.Link{Reader: input, Writer: &r9MuxSink{}}) }()
++	<-input.entered
++	w.requestClose()
++	tasks.fetch()
++	tasks.monitor()
++	if !<-dispatched || w.Close() != nil || <-retired != nil {
++		t.Fatal("monitor не дождался Dispatch/input cleanup")
++	}
++}
++
++func (e *r9MuxEndpoint) ReadMultiBuffer() (buf.MultiBuffer, error) { return nil, io.EOF }
++func (e *r9MuxEndpoint) WriteMultiBuffer(b buf.MultiBuffer) error {
++	buf.ReleaseMulti(b)
++	return io.ErrClosedPipe
++}
++func (e *r9MuxEndpoint) Close() error {
++	e.once.Do(func() {
++		e.calls.Add(1)
++		if e.beforeClose != nil {
++			e.beforeClose()
++		}
++		if e.entered != nil {
++			close(e.entered)
++			<-e.release
++		}
++	})
++	return e.err
++}
++
++type r9MuxVoid struct{ interrupted atomic.Bool }
++
++func (e *r9MuxVoid) ReadMultiBuffer() (buf.MultiBuffer, error) { return nil, io.EOF }
++func (e *r9MuxVoid) WriteMultiBuffer(b buf.MultiBuffer) error {
++	buf.ReleaseMulti(b)
++	return io.ErrClosedPipe
++}
++func (e *r9MuxVoid) Interrupt() { e.interrupted.Store(true) }
++
++type r9MuxTasks struct{ fetch, monitor func() }
++
++// Pure constructor runner удерживает реальные fetch/monitor до fake barriers.
++func r9MuxConstruct(t *testing.T, link transport.Link, retire func(error)) (*ClientWorker, r9MuxTasks) {
++	t.Helper()
++	var options *profileWorkerOptions
++	if retire != nil {
++		options = &profileWorkerOptions{retire: retire}
++	}
++	var queued []func()
++	w, e := newClientWorker(link, ClientStrategy{}, options, func(task func()) { queued = append(queued, task) })
++	if e != nil {
++		t.Fatal(e)
++	}
++	t.Cleanup(func() { w.timer.Stop() })
++	if len(queued) != 2 {
++		t.Fatal("constructor tasks")
++	}
++	return w, r9MuxTasks{fetch: queued[0], monitor: queued[1]}
++}
++
++func TestYonikR9MuxCloseWaitsForActualMonitorCleanup(t *testing.T) {
++	for _, phase := range []string{"session", "writer", "reader"} {
++		t.Run(phase, func(t *testing.T) {
++			input, output, reader, writer := &r9MuxEndpoint{}, &r9MuxEndpoint{}, &r9MuxEndpoint{}, &r9MuxEndpoint{}
++			target := input
++			if phase == "writer" {
++				target = writer
++			}
++			if phase == "reader" {
++				target = reader
++			}
++			target.err = r9MuxCleanupError
++			target.entered = make(chan struct{})
++			target.release = make(chan struct{})
++			retired := make(chan error, 1)
++			w, tasks := r9MuxConstruct(t, transport.Link{Reader: reader, Writer: writer}, func(e error) { retired <- e })
++			if s := w.sessionManager.Allocate(&ClientStrategy{}, input, output); s == nil {
++				t.Fatal("session fixture")
++			}
++			closed := make(chan error, 1)
++			go func() { closed <- w.Close() }()
++			<-w.done.Wait()
++			tasks.fetch()
++			monitorDone := make(chan struct{})
++			go func() { tasks.monitor(); close(monitorDone) }()
++			<-target.entered
++			var earlyClose, earlyRetire bool
++			var closeErr, retireErr error
++			select {
++			case closeErr = <-closed:
++				earlyClose = true
++			default:
++			}
++			select {
++			case retireErr = <-retired:
++				earlyRetire = true
++			default:
++			}
++			close(target.release)
++			<-monitorDone
++			if !earlyClose {
++				closeErr = <-closed
++			}
++			if !earlyRetire {
++				retireErr = <-retired
++			}
++			if earlyClose || earlyRetire || !goerrors.Is(closeErr, r9MuxCleanupError) || !goerrors.Is(retireErr, r9MuxCleanupError) {
++				t.Fatalf("cleanup не подтверждён: earlyClose=%v earlyRetire=%v close=%v retire=%v", earlyClose, earlyRetire, closeErr, retireErr)
++			}
++			if again := w.Close(); again != closeErr {
++				t.Fatal("повторный Close изменил final result", again, closeErr)
++			}
++			for _, e := range []*r9MuxEndpoint{input, output, reader, writer} {
++				if e.calls.Load() != 1 {
++					t.Fatal("cleanup повторён или потерян", e.calls.Load())
++				}
++			}
++			select {
++			case <-retired:
++				t.Fatal("повторный retirement")
++			default:
++			}
++		})
++	}
++}
++
++func TestYonikR9MuxVoidInterruptIsNotCleanupProof(t *testing.T) {
++	leaf := &r9MuxVoid{}
++	retired := make(chan error, 1)
++	w, tasks := r9MuxConstruct(t, transport.Link{Reader: leaf, Writer: leaf}, func(e error) { retired <- e })
++	result := make(chan error, 1)
++	go func() { result <- w.Close() }()
++	<-w.done.Wait()
++	tasks.fetch()
++	tasks.monitor()
++	if e := <-result; e == nil {
++		t.Fatal("void Interrupt выдан за KnownClosed")
++	}
++	if e := <-retired; e == nil {
++		t.Fatal("неподтверждённый cleanup освободил custody")
++	}
++	if !leaf.interrupted.Load() {
++		t.Fatal("не сделана даже best-effort остановка")
++	}
++}
++
++func TestYonikR9MuxLegacyCloseStillSignalOnly(t *testing.T) {
++	reader, writer := &r9MuxEndpoint{}, &r9MuxEndpoint{}
++	w, tasks := r9MuxConstruct(t, transport.Link{Reader: reader, Writer: writer}, nil)
++	if e := w.Close(); e != nil {
++		t.Fatal(e)
++	}
++	if reader.calls.Load() != 0 || writer.calls.Load() != 0 {
++		t.Fatal("legacy Close стал synchronous cleanup")
++	}
++	tasks.fetch()
++	tasks.monitor()
++}
++
++type r9MuxNeverFactory struct{ calls atomic.Int32 }
++
++func (f *r9MuxNeverFactory) Create() (*ClientWorker, error) {
++	f.calls.Add(1)
++	return nil, goerrors.New("unexpected factory")
++}
++func TestYonikR9MuxGroupShutdownReleasesPickerLockAndRetainsError(t *testing.T) {
++	reader, writer := &r9MuxEndpoint{}, &r9MuxEndpoint{err: r9MuxCleanupError}
++	w, tasks := r9MuxConstruct(t, transport.Link{Reader: reader, Writer: writer}, func(error) {})
++	factory := &r9MuxNeverFactory{}
++	picker := &IncrementalWorkerPicker{Factory: factory, workers: []*ClientWorker{w}}
++	group := &profileWorkers{picker: picker}
++	writer.beforeClose = func() { picker.access.Lock(); picker.access.Unlock() }
++	result := make(chan error, 1)
++	go func() { result <- group.Close() }()
++	<-w.done.Wait()
++	tasks.fetch()
++	tasks.monitor()
++	err := <-result
++	if !goerrors.Is(err, r9MuxCleanupError) {
++		t.Fatal("group потерял cleanup error", err)
++	}
++	if again := group.Close(); again != err {
++		t.Fatal("повторный group Close потерял Unknown")
++	}
++	if _, _, e := picker.pickInternal(); e == nil || factory.calls.Load() != 0 {
++		t.Fatal("shutdown picker создаёт новый worker")
++	}
++}
++
++func TestYonikR9MuxConstructorEOFPublishesStateBeforeTasks(t *testing.T) {
++	var queued []func()
++	starts := 0
++	retired := 0
++	var worker *ClientWorker
++	reader, writer := &r9MuxEndpoint{}, &r9MuxEndpoint{}
++	options := &profileWorkerOptions{retire: func(e error) {
++		retired++
++		if e != nil || worker.Close() != nil {
++			t.Error("reentrant retirement Close")
++		}
++	}}
++	var e error
++	worker, e = newClientWorker(transport.Link{Reader: reader, Writer: writer}, ClientStrategy{}, options, func(task func()) {
++		starts++
++		if starts == 1 {
++			task()
++		} else {
++			queued = append(queued, task)
++		}
++	})
++	if e != nil {
++		t.Fatal(e)
++	}
++	if !worker.Closed() || worker.managed == nil || retired != 0 {
++		t.Fatal("early EOF потерял lifecycle до публикации")
++	}
++	queued[0]()
++	if worker.Close() != nil || retired != 1 || reader.calls.Load() != 1 || writer.calls.Load() != 1 {
++		t.Fatal("EOF cleanup не завершён")
++	}
++}
++
++type r9MuxProxy struct {
++	process func(context.Context, *transport.Link, internet.Dialer) error
++}
++
++func (p r9MuxProxy) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
++	return p.process(ctx, link, dialer)
++}
++
++func TestYonikR9MuxFactoryProcessStopAndEarlyEOFDoNotSelfWait(t *testing.T) {
++	for _, early := range []bool{false, true} {
++		entered := make(chan struct{})
++		canceled, releaseProcess := make(chan struct{}), make(chan struct{})
++		var processCalls, processExited atomic.Int32
++		factory := &DialingWorkerFactory{profileContext: context.Background(), Proxy: r9MuxProxy{process: func(ctx context.Context, _ *transport.Link, _ internet.Dialer) error {
++			processCalls.Add(1)
++			close(entered)
++			defer processExited.Add(1)
++			<-ctx.Done()
++			close(canceled)
++			<-releaseProcess
++			return ctx.Err()
++		}}}
++		var tasks []func()
++		retired := make(chan error, 1)
++		worker, e := factory.createWorker(func(e error) { retired <- e }, func(task func()) { tasks = append(tasks, task) })
++		if e != nil {
++			t.Fatal(e)
++		}
++		if len(tasks) != 3 || worker.managed == nil {
++			t.Fatal("factory lifecycle не установлен до goroutines")
++		}
++		if early {
++			worker.requestClose()
++			tasks[2]()
++		} else {
++			go tasks[2]()
++			<-entered
++		}
++		result := make(chan error, 1)
++		go func() { result <- worker.Close() }()
++		<-worker.done.Wait()
++		go tasks[0]()
++		monitorDone := make(chan struct{})
++		go func() { tasks[1](); close(monitorDone) }()
++		if !early {
++			<-canceled
++			select {
++			case <-result:
++				t.Fatal("Close не дождался actual process exit")
++			default:
++			}
++			select {
++			case <-retired:
++				t.Fatal("retirement до actual process exit")
++			default:
++			}
++			close(releaseProcess)
++		}
++		<-monitorDone
++		if e = <-result; e != nil {
++			t.Fatal(e)
++		}
++		if e = <-retired; e != nil {
++			t.Fatal(e)
++		}
++		want := int32(1)
++		if early {
++			want = 0
++		}
++		if processCalls.Load() != want || processExited.Load() != want {
++			t.Fatal("process стартовал после stop или cleanup не дождался process")
++		}
++	}
++}
++
++func TestYonikR9MuxFactoryProcessErrorRequestsStopWithoutSelfWait(t *testing.T) {
++	factory := &DialingWorkerFactory{profileContext: context.Background(), Proxy: r9MuxProxy{process: func(context.Context, *transport.Link, internet.Dialer) error {
++		return goerrors.New("synthetic operation denied")
++	}}}
++	var tasks []func()
++	retired := make(chan error, 1)
++	w, err := factory.createWorker(func(e error) { retired <- e }, func(task func()) { tasks = append(tasks, task) })
++	if err != nil {
++		t.Fatal(err)
++	}
++	tasks[2]()
++	if !w.Closed() {
++		t.Fatal("process error не запросил stop")
++	}
++	go tasks[0]()
++	tasks[1]()
++	if w.Close() != nil || <-retired != nil {
++		t.Fatal("operation error подменил cleanup result")
++	}
++}
++
++func TestYonikR9MuxSessionErrorSurvivesRemoval(t *testing.T) {
++	reader, writer := &r9MuxEndpoint{}, &r9MuxEndpoint{}
++	retired := make(chan error, 1)
++	worker, tasks := r9MuxConstruct(t, transport.Link{Reader: reader, Writer: writer}, func(e error) { retired <- e })
++	input, output := &r9MuxEndpoint{err: r9MuxCleanupError}, &r9MuxEndpoint{}
++	session := worker.allocateManagedSession(&transport.Link{Reader: input, Writer: output})
++	if session == nil {
++		t.Fatal("managed session")
++	}
++	session.Close(false)
++	if worker.sessionManager.Size() != 0 {
++		t.Fatal("session не удалена")
++	}
++	tasks.fetch()
++	tasks.monitor()
++	if e := worker.Close(); !goerrors.Is(e, r9MuxCleanupError) {
++		t.Fatal("утрачена ошибка удалённой session", e)
++	}
++	if e := <-retired; !goerrors.Is(e, r9MuxCleanupError) {
++		t.Fatal("retirement потерял Unknown", e)
++	}
++	if input.calls.Load() != 1 || output.calls.Load() != 1 {
++		t.Fatal("leaf cleanup повторён")
++	}
++}
+diff --git a/common/yonikbroker/profile_cleanup.go b/common/yonikbroker/profile_cleanup.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_cleanup.go
+@@ -0,0 +1,42 @@
++package nativehooks
++
++import (
++	"errors"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/transport/pipe"
++	"io"
++)
++
++var ErrProfileCleanupUnknown = errors.New("full-profile cleanup unconfirmed")
++
++// Void Interrupt сам по себе не подтверждает cleanup. Для concrete owned pipe
++// проверяется синхронный closed postcondition; другой void API даёт Unknown.
++func ProfileCleanupResource(value any) error {
++	if resource, ok := value.(interface{ ProfileCleanup() error }); ok {
++		return resource.ProfileCleanup()
++	}
++	switch resource := value.(type) {
++	case *pipe.Reader:
++		resource.Interrupt()
++		pending, err := resource.ReadMultiBuffer()
++		if len(pending) != 0 {
++			buf.ReleaseMulti(pending)
++			return ErrProfileCleanupUnknown
++		}
++		if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, io.EOF) {
++			return nil
++		}
++		return errors.Join(ErrProfileCleanupUnknown, err)
++	case *pipe.Writer:
++		resource.Interrupt()
++		return resource.Close()
++	case io.Closer:
++		return resource.Close()
++	default:
++		if resource, ok := value.(common.Interruptible); ok {
++			resource.Interrupt()
++		}
++		return ErrProfileCleanupUnknown
++	}
++}
+diff --git a/common/yonikbroker/profile_cleanup_test.go b/common/yonikbroker/profile_cleanup_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_cleanup_test.go
+@@ -0,0 +1,29 @@
++package nativehooks
++
++import (
++	"errors"
++	"github.com/xtls/xray-core/transport/pipe"
++	"testing"
++)
++
++type profileVoidCleanup struct{ called bool }
++
++func (c *profileVoidCleanup) Interrupt() { c.called = true }
++func TestProfileManagedCleanupRequiresResult(t *testing.T) {
++	c := &profileVoidCleanup{}
++	if e := ProfileCleanupResource(c); !errors.Is(e, ErrProfileCleanupUnknown) || !c.called {
++		t.Fatal("void Interrupt подтвердил cleanup", e)
++	}
++}
++func TestProfileOwnedMemoryPipeCleanupConfirmsClosed(t *testing.T) {
++	r, w := pipe.New()
++	if e := ProfileCleanupResource(r); e != nil {
++		t.Fatal(e)
++	}
++	if e := ProfileCleanupResource(w); e != nil {
++		t.Fatal(e)
++	}
++	if e := ProfileCleanupResource(r); e != nil {
++		t.Fatal(e)
++	}
++}
 diff --git a/transport/internet/splithttp/yonik_r9_test.go b/transport/internet/splithttp/yonik_r9_test.go
 new file mode 100644
 --- /dev/null
@@ -2896,14 +3376,14 @@ diff --git a/common/mux/yonik_profile_transport_test.go b/common/mux/yonik_profi
 new file mode 100644
 --- /dev/null
 +++ b/common/mux/yonik_profile_transport_test.go
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,46 @@
 +package mux
 +
 +import (
 +	"context"
 +	"github.com/xtls/xray-core/common/net"
 +	"github.com/xtls/xray-core/common/session"
-+	"github.com/xtls/xray-core/common/signal/done"
++	"github.com/xtls/xray-core/transport"
 +	"testing"
 +)
 +
@@ -2934,8 +3414,10 @@ new file mode 100644
 +	if target.Network != net.Network_TCP || target.Address != muxCoolAddress {
 +		t.Fatal("mux worker input changed")
 +	}
-+	worker := &ClientWorker{done: done.New(), profileRetire: func(error) { count++ }}
-+	worker.Close()
++	worker, tasks := r9MuxConstruct(t, transport.Link{Reader: &r9MuxEndpoint{}, Writer: &r9MuxEndpoint{}}, func(error) { count++ })
++	worker.requestClose()
++	tasks.fetch()
++	tasks.monitor()
 +	worker.Close()
 +	if count != 1 || !worker.Closed() {
 +		t.Fatal("worker retirement")
@@ -2989,41 +3471,71 @@ diff --git a/common/mux/client.go b/common/mux/client.go
  		if err != nil {
  			return err
  		}
-@@ -43,6 +71,24 @@
- 
- type WorkerPicker interface {
+@@ -45,12 +73,41 @@
  	PickAvailable() (*ClientWorker, error)
+ }
+ 
++type profileWorkers struct {
++	picker *IncrementalWorkerPicker
++	once   sync.Once
++	result error
 +}
-+
-+type profileWorkers struct{ picker *IncrementalWorkerPicker }
 +type profileMuxSession struct{ s *Session }
 +
 +func (c profileMuxSession) Close() error { return c.s.Close(false) }
 +
 +func (w *profileWorkers) Close() error {
-+	w.picker.access.Lock()
-+	defer w.picker.access.Unlock()
-+	if w.picker.cleanupTask != nil {
-+		w.picker.cleanupTask.Close()
-+	}
-+	for _, worker := range w.picker.workers {
-+		worker.done.Close()
-+	}
-+	w.picker.workers = nil
-+	return nil
++	w.once.Do(func() {
++		p := w.picker
++		p.access.Lock()
++		p.profileClosed = true
++		workers := p.workers
++		p.workers = nil
++		periodic := p.cleanupTask
++		p.access.Unlock()
++		if periodic != nil {
++			w.result = goerrors.Join(w.result, periodic.Close())
++		}
++		for _, worker := range workers {
++			w.result = goerrors.Join(w.result, worker.Close())
++		}
++	})
++	return w.result
++}
++
+ type IncrementalWorkerPicker struct {
+ 	Factory ClientWorkerFactory
+ 
+-	access      sync.Mutex
+-	workers     []*ClientWorker
+-	cleanupTask *task.Periodic
++	access        sync.Mutex
++	workers       []*ClientWorker
++	cleanupTask   *task.Periodic
++	profileClosed bool
  }
  
- type IncrementalWorkerPicker struct {
-@@ -70,6 +116,8 @@
+ func (p *IncrementalWorkerPicker) cleanupFunc() error {
+@@ -70,6 +127,8 @@
  	for _, w := range p.workers {
  		if !w.Closed() {
  			activeWorkers = append(activeWorkers, w)
-+		} else if w.profileRetire != nil {
-+			w.Close()
++		} else if w.managed != nil {
++			w.requestClose()
  		}
  	}
  	p.workers = activeWorkers
-@@ -130,12 +178,35 @@
+@@ -88,6 +147,9 @@
+ func (p *IncrementalWorkerPicker) pickInternal() (*ClientWorker, bool, error) {
+ 	p.access.Lock()
+ 	defer p.access.Unlock()
++	if p.profileClosed {
++		return nil, false, errors.New("owned mux picker closed")
++	}
+ 
+ 	idx := p.findAvailable()
+ 	if idx >= 0 {
+@@ -130,42 +192,80 @@
  }
  
  type DialingWorkerFactory struct {
@@ -3043,12 +3555,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
 +			return nil, e
 +		}
 +		value, e := pool.NewResource(func(_ context.Context, retire func(error)) (hooks.ProfileCloser, error) {
-+			worker, e := f.create()
-+			if e != nil {
-+				return nil, e
-+			}
-+			worker.profileRetire = retire
-+			return worker, nil
++			return f.createWorker(retire, profileStartWorker)
 +		})
 +		if e != nil {
 +			return nil, e
@@ -3058,63 +3565,359 @@ diff --git a/common/mux/client.go b/common/mux/client.go
 +	return f.create()
 +}
 +
++func profileStartWorker(task func()) { go task() }
 +func (f *DialingWorkerFactory) create() (*ClientWorker, error) {
++	return f.createWorker(nil, profileStartWorker)
++}
++func (f *DialingWorkerFactory) createWorker(retire func(error), start func(func())) (*ClientWorker, error) {
  	opts := []pipe.Option{pipe.WithSizeLimit(64 * 1024)}
- 	uplinkReader, upLinkWriter := pipe.New(opts...)
+-	uplinkReader, upLinkWriter := pipe.New(opts...)
++	uplinkReader, uplinkWriter := pipe.New(opts...)
  	downlinkReader, downlinkWriter := pipe.New(opts...)
-@@ -149,11 +220,10 @@
- 	}
- 
- 	go func(p proxy.Outbound, d internet.Dialer, c common.Closable) {
+-
+-	c, err := NewClientWorker(transport.Link{
+-		Reader: downlinkReader,
+-		Writer: upLinkWriter,
+-	}, f.Strategy)
++	closeLink := func() error {
++		return goerrors.Join(hooks.ProfileCleanupResource(uplinkReader), hooks.ProfileCleanupResource(uplinkWriter), hooks.ProfileCleanupResource(downlinkReader), hooks.ProfileCleanupResource(downlinkWriter))
++	}
++	ctx, cancel := f.workerContext()
++	var managed *profileWorkerOptions
++	var processDone chan struct{}
++	if retire != nil {
++		processDone = make(chan struct{})
++		managed = &profileWorkerOptions{retire: retire, cancelProcess: cancel, processDone: processDone, closeLink: closeLink}
++	}
++	worker, err := newClientWorker(transport.Link{Reader: downlinkReader, Writer: uplinkWriter}, f.Strategy, managed, start)
+ 	if err != nil {
+-		return nil, err
+-	}
+-
+-	go func(p proxy.Outbound, d internet.Dialer, c common.Closable) {
 -		outbounds := []*session.Outbound{{
 -			Target: net.TCPDestination(muxCoolAddress, muxCoolPort),
 -		}}
 -		ctx := session.ContextWithOutbounds(context.Background(), outbounds)
 -		ctx, cancel := context.WithCancel(ctx)
-+		ctx, cancel := f.workerContext()
+-
+-		if errP := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); errP != nil {
+-			errC := errors.Cause(errP)
+-			if !(goerrors.Is(errC, io.EOF) || goerrors.Is(errC, io.ErrClosedPipe) || goerrors.Is(errC, context.Canceled)) {
++		cancel()
++		return nil, goerrors.Join(err, closeLink())
++	}
++	start(func() {
++		if processDone != nil {
++			defer close(processDone)
++		}
 +		defer cancel()
-+		stop := context.AfterFunc(ctx, func() { c.Close() })
++		defer worker.requestClose()
++		stop := context.AfterFunc(ctx, worker.requestClose)
 +		defer stop()
- 
- 		if errP := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); errP != nil {
- 			errC := errors.Cause(errP)
-@@ -168,12 +238,22 @@
- 	return c, nil
- }
- 
++		// EOF/revoke до запуска process не создаёт новый proxy operation.
++		if managed != nil && (ctx.Err() != nil || worker.Closed()) {
++			return
++		}
++		if errP := f.Proxy.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, f.Dialer); errP != nil {
++			cause := errors.Cause(errP)
++			if !(goerrors.Is(cause, io.EOF) || goerrors.Is(cause, io.ErrClosedPipe) || goerrors.Is(cause, context.Canceled)) {
+ 				errors.LogInfoInner(ctx, errP, "failed to handler mux client connection")
+ 			}
+ 		}
+-		common.Must(c.Close())
+-		cancel()
+-	}(f.Proxy, f.Dialer, c.done)
+-
+-	return c, nil
++	})
++	return worker, nil
++}
++
 +func (f *DialingWorkerFactory) workerContext() (context.Context, context.CancelFunc) {
 +	parent := context.Background()
 +	if f.profileContext != nil {
 +		parent = f.profileContext
 +	}
 +	return context.WithCancel(session.ContextWithOutbounds(parent, []*session.Outbound{{Target: net.TCPDestination(muxCoolAddress, muxCoolPort)}}))
-+}
-+
+ }
+ 
  type ClientStrategy struct {
- 	MaxConcurrency uint32
- 	MaxConnection  uint32
+@@ -174,6 +274,7 @@
  }
  
  type ClientWorker struct {
-+	profileRetire  func(error)
-+	profileOnce    sync.Once
++	managed        *profileManagedWorker
  	sessionManager *SessionManager
  	link           transport.Link
  	done           *done.Instance
-@@ -220,7 +300,11 @@
+@@ -181,6 +282,198 @@
+ 	strategy       ClientStrategy
  }
  
++type profileWorkerOptions struct {
++	retire        func(error)
++	cancelProcess context.CancelFunc
++	processDone   <-chan struct{}
++	closeLink     func() error
++}
++type profileManagedWorker struct {
++	options             profileWorkerOptions
++	mu                  sync.Mutex
++	closing             bool
++	firstError          error
++	result              error
++	finished, fetchDone chan struct{}
++	dispatches, inputs  sync.WaitGroup
++	cleanup             sync.Once
++	leaves              map[*profileManagedLeaf]struct{}
++}
++type profileManagedLeaf struct {
++	worker *ClientWorker
++	value  any
++	once   sync.Once
++	result error
++}
++
++func (s *profileManagedWorker) record(worker *ClientWorker, err error) {
++	if err == nil {
++		return
++	}
++	s.mu.Lock()
++	if s.firstError == nil {
++		s.firstError = err
++	}
++	s.mu.Unlock()
++	worker.requestClose()
++}
++func (l *profileManagedLeaf) Close() error {
++	l.once.Do(func() {
++		l.result = hooks.ProfileCleanupResource(l.value)
++		state := l.worker.managed
++		state.mu.Lock()
++		if l.result == nil {
++			delete(state.leaves, l)
++		}
++		state.mu.Unlock()
++		state.record(l.worker, l.result)
++	})
++	return l.result
++}
++
++type profileManagedReader struct {
++	source buf.Reader
++	leaf   *profileManagedLeaf
++}
++
++func (r *profileManagedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
++	return r.source.ReadMultiBuffer()
++}
++func (r *profileManagedReader) ReadMultiBufferTimeout(d time.Duration) (buf.MultiBuffer, error) {
++	if reader, ok := r.source.(buf.TimeoutReader); ok {
++		return reader.ReadMultiBufferTimeout(d)
++	}
++	return nil, buf.ErrNotTimeoutReader
++}
++func (r *profileManagedReader) Close() error { return r.leaf.Close() }
++
++type profileManagedWriter struct {
++	source buf.Writer
++	leaf   *profileManagedLeaf
++}
++
++func (w *profileManagedWriter) WriteMultiBuffer(b buf.MultiBuffer) error {
++	return w.source.WriteMultiBuffer(b)
++}
++func (w *profileManagedWriter) Close() error { return w.leaf.Close() }
++func (m *ClientWorker) managedLeaf(value any) *profileManagedLeaf {
++	leaf := &profileManagedLeaf{worker: m, value: value}
++	s := m.managed
++	s.mu.Lock()
++	s.leaves[leaf] = struct{}{}
++	s.mu.Unlock()
++	return leaf
++}
++func (s *profileManagedWorker) beginDispatch() bool {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closing {
++		return false
++	}
++	s.dispatches.Add(1)
++	return true
++}
++
++// Публикация Session и wrappers атомарна под manager lock. Ни один path не
++// удерживает managed.mu при ожидании manager lock или actual Close.
++func (m *ClientWorker) allocateManagedSession(link *transport.Link) *Session {
++	if link == nil {
++		return nil
++	}
++	sm := m.sessionManager
++	sm.Lock()
++	defer sm.Unlock()
++	strategy := m.strategy
++	if m.done.Done() || sm.closed || (strategy.MaxConcurrency > 0 && len(sm.sessions) >= int(strategy.MaxConcurrency)) || (strategy.MaxConnection > 0 && sm.count >= uint16(strategy.MaxConnection)) {
++		return nil
++	}
++	input := &profileManagedReader{source: link.Reader, leaf: m.managedLeaf(link.Reader)}
++	output := &profileManagedWriter{source: link.Writer, leaf: m.managedLeaf(link.Writer)}
++	sm.count++
++	s := &Session{input: input, output: output, parent: sm, ID: sm.count, done: done.New()}
++	sm.sessions[s.ID] = s
++	return s
++}
++func (m *ClientWorker) startManagedInput(ctx context.Context, session *Session) bool {
++	s := m.managed
++	s.mu.Lock()
++	if s.closing {
++		s.mu.Unlock()
++		return false
++	}
++	s.inputs.Add(1)
++	s.mu.Unlock()
++	go func() { defer s.inputs.Done(); fetchInput(ctx, session, m.link.Writer) }()
++	return true
++}
++func (m *ClientWorker) finishManagedCleanup() {
++	state := m.managed
++	state.cleanup.Do(func() {
++		m.timer.Stop()
++		state.mu.Lock()
++		state.closing = true
++		state.mu.Unlock()
++		if state.options.cancelProcess != nil {
++			state.options.cancelProcess()
++		}
++		sm := m.sessionManager
++		sm.Lock()
++		sm.closed = true
++		sessions := make([]*Session, 0, len(sm.sessions))
++		for _, session := range sm.sessions {
++			session.closed = true
++			if session.done != nil {
++				session.done.Close()
++			}
++			sessions = append(sessions, session)
++		}
++		sm.Unlock()
++		// Dispatch может ждать session.done: сначала запрещаем allocation и
++		// пробуждаем sessions, затем дожидаемся выхода dispatch callers.
++		state.dispatches.Wait()
++		for _, session := range sessions {
++			if session.XUDP != nil {
++				state.record(m, hooks.ErrProfileCleanupUnknown)
++			}
++			state.record(m, hooks.ProfileCleanupResource(session.input))
++			state.record(m, hooks.ProfileCleanupResource(session.output))
++		}
++		// Также удерживаются failed leaves уже удалённых logical sessions.
++		state.mu.Lock()
++		leaves := make([]*profileManagedLeaf, 0, len(state.leaves))
++		for leaf := range state.leaves {
++			leaves = append(leaves, leaf)
++		}
++		state.mu.Unlock()
++		for _, leaf := range leaves {
++			state.record(m, leaf.Close())
++		}
++		if state.options.closeLink != nil {
++			state.record(m, state.options.closeLink())
++		} else {
++			state.record(m, hooks.ProfileCleanupResource(m.link.Writer))
++			state.record(m, hooks.ProfileCleanupResource(m.link.Reader))
++		}
++		state.inputs.Wait()
++		<-state.fetchDone
++		if state.options.processDone != nil {
++			<-state.options.processDone
++		}
++		state.mu.Lock()
++		state.result = state.firstError
++		state.mu.Unlock()
++		if state.result == nil {
++			sm.Lock()
++			sm.sessions = nil
++			sm.Unlock()
++		}
++		// Cleanup proof публикуется до callback: reentrant Close из retirement не
++		// ждёт monitor самого себя. Ни один I/O/task не остаётся незавершённым.
++		close(state.finished)
++		state.options.retire(state.result)
++	})
++}
++
+ var (
+ 	muxCoolAddress = net.DomainAddress("v1.mux.cool")
+ 	muxCoolPort    = net.Port(9527)
+@@ -188,6 +481,13 @@
+ 
+ // NewClientWorker creates a new mux.Client.
+ func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
++	return newClientWorker(stream, s, nil, profileStartWorker)
++}
++
++func newClientWorker(stream transport.Link, s ClientStrategy, options *profileWorkerOptions, start func(func())) (*ClientWorker, error) {
++	if start == nil || (options != nil && options.retire == nil) {
++		return nil, hooks.ErrProfileCleanupUnknown
++	}
+ 	c := &ClientWorker{
+ 		sessionManager: NewSessionManager(),
+ 		link:           stream,
+@@ -196,8 +496,16 @@
+ 		strategy:       s,
+ 	}
+ 
+-	go c.fetchOutput()
+-	go c.monitor()
++	if options != nil {
++		c.managed = &profileManagedWorker{options: *options, finished: make(chan struct{}), fetchDone: make(chan struct{}), leaves: make(map[*profileManagedLeaf]struct{})}
++	}
++	start(func() {
++		if c.managed != nil {
++			defer close(c.managed.fetchDone)
++		}
++		c.fetchOutput()
++	})
++	start(c.monitor)
+ 
+ 	return c, nil
+ }
+@@ -219,8 +527,15 @@
+ 	return m.done.Wait()
+ }
+ 
++// Внутренние worker paths только запрашивают stop: они не ждут сами себя.
++func (m *ClientWorker) requestClose() { _ = m.done.Close() }
  func (m *ClientWorker) Close() error {
 -	return m.done.Close()
-+	e := m.done.Close()
-+	if m.profileRetire != nil {
-+		m.profileOnce.Do(func() { m.profileRetire(e) })
++	m.requestClose()
++	if m.managed == nil {
++		return nil
 +	}
-+	return e
++	<-m.managed.finished
++	return m.managed.result
  }
  
  func (m *ClientWorker) monitor() {
-@@ -309,6 +393,9 @@
+@@ -231,9 +546,13 @@
+ 		checkCount := m.sessionManager.Count()
+ 		select {
+ 		case <-m.done.Wait():
+-			m.sessionManager.Close()
+-			common.Interrupt(m.link.Writer)
+-			common.Interrupt(m.link.Reader)
++			if m.managed != nil {
++				m.finishManagedCleanup()
++			} else {
++				m.sessionManager.Close()
++				common.Interrupt(m.link.Writer)
++				common.Interrupt(m.link.Reader)
++			}
+ 			return
+ 		case <-m.timer.C:
+ 			if m.sessionManager.CloseIfNoSessionAndIdle(checkSize, checkCount) {
+@@ -309,16 +628,41 @@
  }
  
  func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool {
@@ -3124,19 +3927,51 @@ diff --git a/common/mux/client.go b/common/mux/client.go
  	if m.IsFull() {
  		return false
  	}
-@@ -317,6 +404,12 @@
- 	s := sm.Allocate(&m.strategy, link.Reader, link.Writer)
+ 
+ 	sm := m.sessionManager
+-	s := sm.Allocate(&m.strategy, link.Reader, link.Writer)
++	var s *Session
++	if m.managed != nil {
++		if !m.managed.beginDispatch() {
++			return false
++		}
++		defer m.managed.dispatches.Done()
++		s = m.allocateManagedSession(link)
++	} else {
++		s = sm.Allocate(&m.strategy, link.Reader, link.Writer)
++	}
  	if s == nil {
  		return false
-+	}
+ 	}
+-	go fetchInput(ctx, s, m.link.Writer)
 +	if hooks.ProfileSession(ctx) {
 +		if hooks.ProfileAttachLogical(ctx, profileMuxSession{s}) != nil {
 +			s.Close(false)
 +			return false
 +		}
- 	}
- 	go fetchInput(ctx, s, m.link.Writer)
++	}
++	if m.managed != nil {
++		if !m.startManagedInput(ctx, s) {
++			s.Close(false)
++			return true
++		}
++	} else {
++		go fetchInput(ctx, s, m.link.Writer)
++	}
  	if _, ok := link.Reader.(*pipe.Reader); !ok {
+ 		select {
+ 		case <-ctx.Done():
+@@ -378,9 +722,7 @@
+ }
+ 
+ func (m *ClientWorker) fetchOutput() {
+-	defer func() {
+-		common.Must(m.done.Close())
+-	}()
++	defer m.requestClose()
+ 
+ 	reader := &buf.BufferedReader{Reader: m.link.Reader}
+ 
 diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
 --- a/app/dispatcher/default.go
 +++ b/app/dispatcher/default.go
@@ -4538,7 +5373,7 @@ diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_hooks_linux.go
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,589 @@
 +//go:build linux
 +
 +package nativehooks
@@ -5102,7 +5937,8 @@ new file mode 100644
 +	}
 +	return mb, e
 +}
-+func (r *profileFlowReader) Close() error { return common.Interrupt(r.reader) }
++func (r *profileFlowReader) Close() error          { return common.Interrupt(r.reader) }
++func (r *profileFlowReader) ProfileCleanup() error { return ProfileCleanupResource(r.reader) }
 +
 +type profileFlowWriter struct {
 +	ctx    context.Context
@@ -5117,7 +5953,8 @@ new file mode 100644
 +	}
 +	return w.writer.WriteMultiBuffer(mb)
 +}
-+func (w *profileFlowWriter) Close() error { return common.Close(w.writer) }
++func (w *profileFlowWriter) Close() error          { return common.Close(w.writer) }
++func (w *profileFlowWriter) ProfileCleanup() error { return ProfileCleanupResource(w.writer) }
 +func ProfileGuardLink(ctx context.Context, link *transport.Link) {
 +	if !ProfileSession(ctx) {
 +		return
