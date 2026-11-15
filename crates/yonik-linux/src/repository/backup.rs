@@ -173,6 +173,7 @@ fn validate_controlled(
             decrypt(key, &id, 8, 0, 0, revision, &raw, 262144)?;
         }
     }
+    native_profiles::validate_backup(connection, key, &id, control)?;
     Ok(())
 }
 

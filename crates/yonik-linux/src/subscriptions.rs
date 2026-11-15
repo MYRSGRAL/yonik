@@ -21,7 +21,7 @@ use yonik_import::ImportReport;
 pub use yonik_subscription::scheduler::{
     Policy as SubscriptionPolicy, RetryState as SubscriptionRetryState,
 };
-use yonik_subscription::{ApprovedUpdate, StagedUpdate, Subscription, Summary};
+use yonik_subscription::{ProfileApprovedUpdate, ProfileStagedUpdate, Subscription, Summary};
 
 /// Подменяемая граница транспорта; реализация обязана соблюдать route и отмену.
 pub trait SubscriptionFetch: Send + Sync {
@@ -367,7 +367,7 @@ pub struct SubscriptionSourcesPage {
     pub total: usize,
     pub offset: usize,
 }
-pub struct PendingRefresh {
+pub struct PendingRefresh<T = ProfileStagedUpdate> {
     service: Arc<()>,
     request: u64,
     id: i64,
@@ -375,11 +375,11 @@ pub struct PendingRefresh {
     revision: i64,
     validators: Vec<u8>,
     controller: Subscription,
-    staged: StagedUpdate,
+    staged: T,
 }
 pub struct ApprovedRefresh {
     pending: PendingData,
-    approved: ApprovedUpdate,
+    approved: ProfileApprovedUpdate,
 }
 struct PendingData {
     service: Arc<()>,
@@ -401,7 +401,7 @@ impl PendingRefresh {
     pub fn summary(&self) -> Summary {
         self.staged.summary()
     }
-    pub fn report(&self) -> &ImportReport {
+    pub fn report(&self) -> &yonik_import::ProfileImportReport {
         self.staged.report()
     }
     pub fn accept_clean(self) -> Result<ApprovedRefresh, SubscriptionError> {
@@ -417,7 +417,7 @@ impl PendingRefresh {
             approved: staged.approve_after_review(),
         }
     }
-    fn parts(self) -> (PendingData, StagedUpdate) {
+    fn parts(self) -> (PendingData, ProfileStagedUpdate) {
         (
             PendingData {
                 service: self.service,
@@ -433,6 +433,32 @@ impl PendingRefresh {
     }
 }
 
+// Bridge для существующего server-only staging. Fetch всегда создаёт v2.
+impl PendingRefresh<yonik_subscription::StagedUpdate> {
+    pub fn accept_clean(self) -> Result<ApprovedRefresh, SubscriptionError> {
+        if self.staged.summary().needs_review() {
+            return Err(SubscriptionError::Import(
+                yonik_subscription::Error::ReviewRequired,
+            ));
+        }
+        let staged = self
+            .controller
+            .upgrade_staged(self.staged)
+            .map_err(SubscriptionError::Import)?;
+        PendingRefresh {
+            service: self.service,
+            request: self.request,
+            id: self.id,
+            generation: self.generation,
+            revision: self.revision,
+            validators: self.validators,
+            controller: self.controller,
+            staged,
+        }
+        .accept_clean()
+    }
+}
+
 impl ScheduleMetadata {
     pub fn is_local(&self) -> bool {
         serde_json::from_slice::<SourceData>(&self.payload).map_or(true, |data| data.local)
@@ -440,6 +466,80 @@ impl ScheduleMetadata {
 }
 
 impl SubscriptionService {
+    pub async fn catalog(
+        &self,
+        source: i64,
+        query: ProfileQuery,
+    ) -> Result<crate::CatalogPage, SubscriptionError> {
+        Ok(self.repository.catalog(source, query).await?)
+    }
+    pub async fn select_catalog_profile(
+        &self,
+        selection: crate::CatalogSelection,
+    ) -> Result<crate::ResolvedCatalogProfile, SubscriptionError> {
+        Ok(self.repository.resolve_catalog(selection).await?)
+    }
+    pub async fn set_catalog_favorite(
+        &self,
+        selection: crate::CatalogSelection,
+        favorite: bool,
+    ) -> Result<(), SubscriptionError> {
+        Ok(self
+            .repository
+            .set_catalog_favorite(selection, favorite)
+            .await?)
+    }
+    /// Отдельный DATA API для P6: старый offline остаётся server-only совместимым.
+    pub async fn offline_profiles(
+        &self,
+        id: i64,
+        cancel: crate::Cancellation,
+    ) -> Result<yonik_import::ProfileImportReport, SubscriptionError> {
+        cancel.check().map_err(|_| cancelled())?;
+        let record = self
+            .repository
+            .load(id)
+            .await?
+            .ok_or(SubscriptionError::NotFound)?;
+        let snapshot = record.snapshot.ok_or(SubscriptionError::NoSnapshot)?;
+        let permit = IMPORT_GATE
+            .acquire()
+            .await
+            .map_err(|_| SubscriptionError::Worker)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            cancel.check().map_err(|_| cancelled())?;
+            let report = yonik_import::import_profiles(snapshot.body.to_vec())
+                .map_err(|_| SubscriptionError::CorruptSnapshot)?;
+            cancel.check().map_err(|_| cancelled())?;
+            Ok(report)
+        })
+        .await
+        .map_err(|_| SubscriptionError::Worker)?
+    }
+    pub async fn approve_local_profiles(
+        &self,
+        name: String,
+        report: &yonik_import::ProfileImportReport,
+        cancel: crate::Cancellation,
+        backup: Option<std::path::PathBuf>,
+    ) -> Result<i64, SubscriptionError> {
+        if report.entries.is_empty() {
+            return Err(SubscriptionError::InvalidSource);
+        }
+        let source = SubscriptionSource::local(name)?;
+        Ok(self
+            .repository
+            .create_local_snapshot(
+                source.encode()?,
+                report.original().expose().as_bytes().to_vec(),
+                cancel,
+                backup,
+            )
+            .await?
+            .id)
+    }
+
     pub fn new(repository: EncryptedSubscriptionRepository) -> Self {
         Self {
             repository,
@@ -1071,8 +1171,8 @@ impl SubscriptionService {
             .map_err(|_| SubscriptionError::Worker)?;
         let report = approved.report();
         let metadata = serde_json::to_vec(&serde_json::json!({ "version": 1,
-            "accepted": report.servers.len(), "rejected": report.issues.len(),
-            "native_json": report.native_json.is_some() }))
+            "accepted": report.entries.len(), "rejected": report.issues.len(),
+            "native_json": report.entries.iter().any(|entry| matches!(entry, yonik_import::ProfileEntry::Xray(_))) }))
         .map_err(|_| SubscriptionError::CorruptSnapshot)?;
         let result = self
             .repository
@@ -1101,7 +1201,7 @@ impl SubscriptionService {
         let revision = result?;
         pending
             .controller
-            .commit(approved)
+            .commit_profiles(approved)
             .map_err(SubscriptionError::Import)?;
         Ok(revision)
     }
@@ -1140,7 +1240,7 @@ async fn stage_body(
     body: Vec<u8>,
     mut cancel: crate::Cancellation,
     ack: Arc<Semaphore>,
-) -> Result<(Subscription, StagedUpdate), SubscriptionError> {
+) -> Result<(Subscription, ProfileStagedUpdate), SubscriptionError> {
     // Permit остаётся внутри blocking-задачи даже при отмене ожидающего future.
     let ack = ack
         .acquire_owned()
@@ -1163,7 +1263,7 @@ async fn stage_body(
             Subscription::new(NonZeroU64::new(next).ok_or(SubscriptionError::Exhausted)?);
         let ticket = controller.begin().map_err(SubscriptionError::Import)?;
         let staged = controller
-            .stage_cancellable(ticket, body, || cancel.check().is_ok())
+            .stage_profiles_cancellable(ticket, body, || cancel.check().is_ok())
             .map_err(|error| match error {
                 yonik_subscription::CancellableStageError::Cancelled => cancelled(),
                 yonik_subscription::CancellableStageError::Stage(error) => {

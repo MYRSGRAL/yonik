@@ -4,6 +4,10 @@ mod backup;
 mod maintenance;
 pub use maintenance::{MaintenanceAccess, MaintenanceControl, MaintenanceError};
 mod batch_targets;
+mod native_profiles;
+pub use native_profiles::{
+    CatalogPage, CatalogProfile, CatalogSelection, NativeSummary, ResolvedCatalogProfile,
+};
 #[cfg(test)]
 mod cancellation_tests;
 #[cfg(any(test, feature = "test-support"))]
@@ -528,6 +532,10 @@ impl EncryptedSubscriptionRepository {
                 .map_err(storage)?;
             tx.execute("DELETE FROM profiles WHERE source_id=?1", [id])
                 .map_err(storage)?;
+            tx.execute("DELETE FROM native_profiles WHERE source_id=?1", [id])
+                .map_err(storage)?;
+            tx.execute("DELETE FROM profile_projection WHERE source_id=?1", [id])
+                .map_err(storage)?;
             tx.execute("DELETE FROM profile_catalog WHERE source_id=?1", [id])
                 .map_err(storage)?;
             tx.execute("DELETE FROM snapshots WHERE source_id=?1", [id])
@@ -846,6 +854,7 @@ impl Database {
             tx.commit().map_err(storage)?;
         }
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;").map_err(storage)?;
+        native_profiles::initialize(&mut connection)?;
         Ok(Self {
             #[cfg(test)]
             fail_format4: false,
@@ -1914,6 +1923,7 @@ struct Prepared {
 struct PreparedCatalog {
     raw: usize,
     rows: Vec<Prepared>,
+    native: Vec<native_profiles::PreparedNative>,
 }
 struct ProfileRow {
     id: i64,
@@ -1959,11 +1969,37 @@ fn prepare_profiles_checked(
     body: &[u8],
     check: &impl Fn() -> std::result::Result<(), SnapshotCommitError>,
 ) -> std::result::Result<PreparedCatalog, SnapshotCommitError> {
-    let report = yonik_import::import_bytes_cancellable(body.to_vec(), || check().is_ok())
+    check()?;
+    let profiles = yonik_import::import_profiles(body.to_vec());
+    if let Err(error) = &profiles {
+        if error.kind() != yonik_import::FatalError::UnsupportedFormat {
+            return Err(RepositoryError::InvalidInput.into());
+        }
+    }
+    if let Ok(report) = profiles {
+        check()?;
+        if report
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, yonik_import::ProfileEntry::Xray(_)))
+        {
+            let native = native_profiles::prepare(key, db, source, report, check)?;
+            return Ok(PreparedCatalog {
+                raw: 0,
+                rows: Vec::new(),
+                native,
+            });
+        }
+    }
+    let mut report = yonik_import::import_bytes_cancellable(body.to_vec(), || check().is_ok())
         .map_err(|error| match error {
             yonik_import::CancellableImportError::Cancelled => SnapshotCommitError::Cancelled,
             yonik_import::CancellableImportError::Import(_) => RepositoryError::InvalidInput.into(),
         })?;
+    // Legacy native DATA (в том числе sing-box) сохраняются без fake endpoints.
+    if report.native_json.is_some() {
+        report.servers.clear();
+    }
     if report.servers.len() > 20_000 || (report.servers.is_empty() && report.native_json.is_none())
     {
         return Err(RepositoryError::InvalidInput.into());
@@ -1985,7 +2021,11 @@ fn prepare_profiles_checked(
             });
         }
     }
-    Ok(PreparedCatalog { raw, rows })
+    Ok(PreparedCatalog {
+        raw,
+        rows,
+        native: Vec::new(),
+    })
 }
 fn profile_aad(db: &[u8; 32], r: &ProfileRow) -> Vec<u8> {
     let mut v = aad(db, 5, r.id, r.generation, r.revision).to_vec();
@@ -2125,6 +2165,16 @@ fn reconcile_checked(
     prepared: PreparedCatalog,
     check: &impl Fn() -> std::result::Result<(), SnapshotCommitError>,
 ) -> std::result::Result<(), SnapshotCommitError> {
+    native_profiles::reconcile(
+        tx,
+        key,
+        db,
+        source,
+        generation,
+        revision,
+        &prepared.native,
+        check,
+    )?;
     let mut old = std::collections::HashMap::new();
     for r in read_profiles_checked(tx, source, check)? {
         check()?;
@@ -2210,7 +2260,10 @@ fn ensure_catalog(
         {
             return Err(RepositoryError::Corrupt);
         }
-        if value.0 == generation && value.1 == revision {
+        if value.0 == generation
+            && value.1 == revision
+            && native_profiles::is_current(tx, source, generation, revision)?
+        {
             return Ok(value);
         }
     }
@@ -2311,7 +2364,7 @@ impl EncryptedSubscriptionRepository {
                 .map_err(storage)?
                 .ok_or(RepositoryError::NotFound)?;
             let rows = read_profiles(&tx, source)?;
-            let mut favorites = 0;
+            let mut favorites = native_profiles::favorite_count(&tx, &db.key, &db.id, source)?;
             let mut target = None;
             for r in rows {
                 let p = open_profile(&db.key, &db.id, &r)?;
