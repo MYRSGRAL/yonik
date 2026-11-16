@@ -14813,7 +14813,7 @@ diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_hooks_linux.go
-@@ -0,0 +1,905 @@
+@@ -0,0 +1,902 @@
 +//go:build linux
 +
 +package nativehooks
@@ -15544,10 +15544,7 @@ new file mode 100644
 +				return errProfile
 +			}
 +			if endpoint.family == 3 {
-+				if _, e := profileDNSFirstHop(&p.flow.manifest, root.scope, root.branch, choose); e != nil {
-+					return e
-+				}
-+				return ErrProfileUnsupported
++				return profilePrepareHostsObservation(ctx, root)
 +			}
 +			p.flow.mu.Lock()
 +			for item := root; item != nil; item = item.next {
@@ -15723,7 +15720,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,1154 @@
+@@ -0,0 +1,1181 @@
 +//go:build linux
 +
 +package nativehooks
@@ -15838,6 +15835,7 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	hostsObservation                        *profileHostsObservation
 +	dnsContext4                             *profileDNSContext4
 +	dns4CancelSequence                      uint64
 +	dns4Replied, dns4CancelAck, dns4Settled bool
@@ -15872,6 +15870,8 @@ new file mode 100644
 +	replied, cancelled                                       bool
 +}
 +type profileFlowControl struct {
++	hostsObservations                              [64]*profileHostsObservation
++	hostsObservationUsed                           int
 +	dnsContexts4                                   [64]*profileDNSContext4
 +	dnsContext4Used                                int
 +	dnsExported                                    [256]*profileDNSContextIdentity
@@ -16142,6 +16142,11 @@ new file mode 100644
 +	}
 +}
 +func (c *profileFlowControl) finish(op *profileOperation, e error) {
++	if op.hostsObservation != nil {
++		c.hostsObservationClose(op.hostsObservation)
++		c.dnsNotify(op, e)
++		return
++	}
 +	if op.dnsContext4 != nil {
 +		c.dnsContext4Close(op.dnsContext4)
 +		c.dnsNotify(op, e)
@@ -16193,6 +16198,10 @@ new file mode 100644
 +func (c *profileFlowControl) abort(op *profileOperation) {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
++	if op.hostsObservation != nil {
++		c.hostsObservationClose(op.hostsObservation)
++		return
++	}
 +	if op.dnsContext4 != nil {
 +		c.dnsContext4Close(op.dnsContext4)
 +		return
@@ -16320,6 +16329,9 @@ new file mode 100644
 +	return c.dispatchLocked(op)
 +}
 +func (c *profileFlowControl) dispatchLocked(op *profileOperation) error {
++	if op.hostsObservation != nil {
++		return c.hostsObservationDispatch(op)
++	}
 +	if op.dnsContext4 != nil {
 +		return c.dnsContext4Dispatch(op)
 +	}
@@ -16414,6 +16426,9 @@ new file mode 100644
 +		return err
 +	}
 +	if profileDNSV2Operation(f.kind) {
++		if handled, err := c.hostsObservationAccept(f); handled {
++			return err
++		}
 +		if handled, err := c.dnsContext4Accept(f); handled {
 +			return err
 +		}
@@ -16835,6 +16850,15 @@ new file mode 100644
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
 +	c.revoked = true
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		c.hostsObservationClose(h)
++		if !h.released {
++			h.unknown = true
++		}
++		if h.pending != nil {
++			c.dnsNotify(h.pending, errProfile)
++		}
++	}
 +	for _, x := range c.dnsContexts4[:c.dnsContext4Used] {
 +		c.dnsContext4Close(x)
 +		if !x.released {
@@ -30029,12 +30053,486 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux.go
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,577 @@
 +//go:build linux
 +
 +package nativehooks
 +
-+import xnet "github.com/xtls/xray-core/common/net"
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	xnet "github.com/xtls/xray-core/common/net"
++	"strings"
++	"time"
++)
++
++const profileHostsObservationCredit = 16 * 1024
++const profileHostsObservationPending = 3
++
++type profileHostsSelection struct {
++	row     uint16
++	count   int
++	members [16]uint16
++	key     string
++}
++type profileHostsObservation struct {
++	runtime                                                 *ProfileRuntime
++	ctx                                                     context.Context
++	cancel                                                  context.CancelFunc
++	root                                                    *profileGrant
++	frontier                                                profileDNSFrontier
++	snapshot                                                *profileSnapshot
++	selection                                               profileHostsSelection
++	context                                                 *profileDNSContext4
++	pending                                                 *profileOperation
++	deadline, cleanupDeadline                               time.Time
++	reservation, observation                                uint64
++	bodyHash                                                [32]byte
++	cancelSequence, closeSequence                           uint64
++	replied, cancelAck, closeAck, closed, unknown, released bool
++}
++
++func profileHostsSelect(s *profileSnapshot, name string) (profileHostsSelection, error) {
++	var selected profileHostsSelection
++	if s == nil || len(s.encoded) < 170 || s.order != 1 && s.order != 3 {
++		return selected, ErrProfileUnsupported
++	}
++	key := strings.ToLower(name)
++	if strings.Contains(key, ".") && !strings.HasSuffix(key, ".") {
++		key += "."
++	}
++	c := profileCursor{b: s.encoded[152:]}
++	c.take(10)
++	c.str(253)
++	search := int(c.n16())
++	if search > 6 {
++		return selected, errProfile
++	}
++	for i := 0; i < search; i++ {
++		c.str(253)
++	}
++	peers := int(c.n16())
++	if peers < 1 || peers > 3 {
++		return selected, errProfile
++	}
++	for i := 0; i < peers; i++ {
++		h := c.take(4)
++		if h == nil {
++			return selected, errProfile
++		}
++		n := 4
++		if h[0] == 6 {
++			n = 16
++		} else if h[0] != 4 {
++			return selected, errProfile
++		}
++		c.take(n)
++	}
++	rows := int(c.n16())
++	if rows > 4096 {
++		return selected, errProfile
++	}
++	for row := 0; row < rows; row++ {
++		alias := c.str(253)
++		n := int(c.n16())
++		if n < 1 || n > 16 {
++			return selected, errProfile
++		}
++		for i := 0; i < n; i++ {
++			family := c.take(1)
++			if family == nil {
++				return selected, errProfile
++			}
++			size := 4
++			if family[0] == 6 {
++				size = 16
++			} else if family[0] != 4 {
++				return selected, errProfile
++			}
++			c.take(size)
++		}
++		if c.bad {
++			return selected, errProfile
++		}
++		if string(alias) == key {
++			selected.row = uint16(row)
++			selected.count = n
++			selected.key = key
++			for i := 0; i < n; i++ {
++				selected.members[i] = uint16(i)
++			}
++			return selected, nil
++		}
++	}
++	return selected, ErrProfileUnsupported
++}
++func (c *profileFlowControl) hostsSnapshotLive(p *ProfileRuntime, s *profileSnapshot) bool {
++	if p == nil || !p.dns4CaptureReviewed || !p.dnsV2 || c.manifest.mapping != 4 || s == nil || s != p.snapshot || len(c.manifest.rows[10]) != 1 || len(s.encoded) < 170 {
++		return false
++	}
++	r := c.manifest.rows[10][0]
++	if len(r) != 76 || u32(r, 72)&4 == 0 || int(u32(r, 64)) != len(s.encoded) || !bytes.Equal(r[:32], s.encoded[16:48]) {
++		return false
++	}
++	hash := sha256.Sum256(s.encoded)
++	return bytes.Equal(hash[:], r[32:64])
++}
++func (c *profileFlowControl) hostsParentFrontier(root *profileGrant) (profileDNSFrontier, time.Time, error) {
++	var empty profileDNSFrontier
++	deadline := c.sessionDeadline
++	if root == nil || root.parent != nil {
++		return empty, deadline, errProfile
++	}
++	for g, n := root, 0; g != nil; g, n = g.next, n+1 {
++		if n >= 256 || g.class != 0 && g.class != 1 || g.receipt == nil || !c.grantLive(g) || g.receipt != root.receipt || g.revision != c.manifest.policy || g.receipt.revision != c.manifest.policy || g != root && (g.parent == nil || g.parent.next != g) {
++			return empty, deadline, errProfile
++		}
++		if g.deadline.Before(deadline) {
++			deadline = g.deadline
++		}
++		if c.mode == 2 {
++			if g.ownerKind < 1 || g.ownerKind > 2 || !profileDNSV2ID(g.ownerID) || !c.clock().Before(g.ownerDeadline) {
++				return empty, deadline, errProfile
++			}
++			if g.ownerDeadline.Before(deadline) {
++				deadline = g.ownerDeadline
++			}
++		}
++	}
++	g := root
++	frontier, err := profileDNSFirstHop(&c.manifest, root.scope, root.branch, func(_ string, dst xnet.Destination) (bool, error) {
++		g = g.next
++		if g == nil {
++			return false, errProfile
++		}
++		value, e := profileValue(dst)
++		if e != nil || value != g.effective {
++			return false, errProfile
++		}
++		return g.branch == 1, nil
++	})
++	if err != nil {
++		return empty, deadline, err
++	}
++	g = root
++	for _, hop := range frontier.path[:frontier.count] {
++		if g == nil || g.scope != hop.scope || g.branch != hop.branch {
++			return empty, deadline, errProfile
++		}
++		g = g.next
++	}
++	if g != nil {
++		return empty, deadline, errProfile
++	}
++	if frontier.target.family != 3 {
++		return empty, deadline, ErrProfileUnsupported
++	}
++	return frontier, deadline, nil
++}
++
++// Actual chain caller не получает IP или permission: этот cut заканчивается
++// issuer observation. Publish/Waiter/Numeric/physical conjunction пока закрыты.
++func profilePrepareHostsObservation(ctx context.Context, root *profileGrant) error {
++	p := profileRuntime(ctx)
++	if p == nil || !p.dns4CaptureReviewed {
++		return ErrProfileUnsupported
++	}
++	c := p.flow
++	c.mu.Lock()
++	for n := 0; root != nil && root.parent != nil; n++ {
++		if n >= 255 || root.parent.next != root {
++			c.mu.Unlock()
++			return errProfile
++		}
++		root = root.parent
++	}
++	frontier, deadline, err := c.hostsParentFrontier(root)
++	if err != nil || !c.hostsSnapshotLive(p, p.snapshot) || ctx.Err() != nil || profileReceiptFrom(ctx) != root.receipt || c.nextDNSQuery >= ^uint64(0)-1 {
++		c.mu.Unlock()
++		return ErrProfileUnsupported
++	}
++	if c.hostsObservationUsed >= len(c.hostsObservations) || c.profilePendingUsed()+profileHostsObservationPending > min(64, int(c.manifest.caps[3])) || c.buffered+c.manifest.memoryCredit+profileHostsObservationCredit > uint64(c.manifest.caps[4]) || !c.dnsReserveHistory(profileHostsObservationPending) {
++		c.mu.Unlock()
++		return errProfileFlowBusy
++	}
++	c.operations += profileHostsObservationPending
++	c.buffered += profileHostsObservationCredit
++	base := context.WithValue(ctx, profileGrantKey{}, root)
++	child, cancel := context.WithCancel(base)
++	h := &profileHostsObservation{runtime: p, ctx: child, cancel: cancel, root: root, frontier: frontier, snapshot: p.snapshot, deadline: deadline, cleanupDeadline: deadline.Add(time.Second)}
++	if c.sessionDeadline.Before(h.cleanupDeadline) {
++		h.cleanupDeadline = c.sessionDeadline
++	}
++	c.hostsObservations[c.hostsObservationUsed] = h
++	c.hostsObservationUsed++
++	h.selection, err = profileHostsSelect(p.snapshot, frontier.target.address)
++	query := c.nextDNSQuery + 1
++	c.mu.Unlock()
++	defer func() { c.mu.Lock(); c.hostsObservationClose(h); c.mu.Unlock() }()
++	if err != nil {
++		return err
++	}
++	source := &profileDNSCapture4{runtime: p, parent: root, frontier: frontier, snapshot: h.snapshot, query: query, epoch: p.admission.launch.epoch, resolver: 65535, hosts: true, deadline: deadline}
++	captured := context.WithValue(child, profileDNSCapture4Key{}, source)
++	metadata, release, err := ProfileDNSAcquirePhysicalContext(captured)
++	if err != nil {
++		return err
++	}
++	defer release()
++	x, _ := metadata.Value(profileDNSContext4Key{}).(*profileDNSContext4)
++	c.mu.Lock()
++	if !c.dnsContext4Live(x) || x.identity.kind != profileDNSHostsRoot || !c.hostsObservationSourceLive(h) {
++		c.mu.Unlock()
++		return errProfile
++	}
++	h.context = x
++	x.hostReferences++
++	if until := x.deadline.Add(time.Second); until.Before(h.cleanupDeadline) {
++		h.cleanupDeadline = until
++	}
++	body := make([]byte, 96+len(frontier.target.address)+8)
++	be.PutUint16(body, 2)
++	body[2] = 3
++	be.PutUint64(body[8:], query)
++	be.PutUint64(body[48:], source.epoch)
++	be.PutUint64(body[56:], uint64(time.Second))
++	for _, field := range [][2]uint16{{64, 65535}, {66, frontier.subject}, {68, frontier.endpoint}, {70, frontier.scope}, {80, uint16(len(frontier.target.address))}, {84, 8}} {
++		be.PutUint16(body[field[0]:], field[1])
++	}
++	body[74], body[75], body[76], body[77], body[78], body[79] = 3, 2, frontier.carrier, 3, 2, frontier.branch
++	copy(body[96:], frontier.target.address)
++	at := 96 + len(frontier.target.address)
++	be.PutUint16(body[at:], 2)
++	be.PutUint16(body[at+2:], frontier.endpoint)
++	be.PutUint16(body[at+4:], frontier.subject)
++	be.PutUint16(body[at+6:], 65535)
++	op := &profileOperation{hostsObservation: h, ctx: child, kind: 35, body: body, done: make(chan struct{})}
++	h.pending = op
++	h.bodyHash = sha256.Sum256(body)
++	c.mu.Unlock()
++	if err = p.flowRPC(op); err != nil {
++		return err
++	}
++	// Observation ID не SourcePermission. Даже successful ACK не открывает dial.
++	return ErrProfileUnsupported
++}
++func (c *profileFlowControl) hostsObservationSourceLive(h *profileHostsObservation) bool {
++	if h == nil || h.closed || h.unknown || h.ctx.Err() != nil || !c.clock().Before(h.deadline) || !c.hostsSnapshotLive(h.runtime, h.snapshot) {
++		return false
++	}
++	f, _, err := c.hostsParentFrontier(h.root)
++	if err != nil || f != h.frontier {
++		return false
++	}
++	s, err := profileHostsSelect(h.snapshot, f.target.address)
++	return err == nil && s == h.selection
++}
++func (c *profileFlowControl) hostsObservationClose(h *profileHostsObservation) {
++	if !h.closed {
++		h.closed = true
++		h.cancel()
++	}
++}
++func (c *profileFlowControl) hostsObservationDispatch(op *profileOperation) error {
++	h := op.hostsObservation
++	if op.submitted || op.completed {
++		return nil
++	}
++	if !c.hostsObservationSourceLive(h) || !c.dnsContext4Live(h.context) || h.context.identity.kind != profileDNSHostsRoot || sha256.Sum256(op.body) != h.bodyHash || !profileDNSV2Body(35, op.body) {
++		c.hostsObservationClose(h)
++		c.dnsNotify(op, errProfile)
++		return nil
++	}
++	op.sent = c.clock()
++	op.deadline = h.deadline
++	if h.context.deadline.Before(op.deadline) {
++		op.deadline = h.context.deadline
++	}
++	if d, ok := op.ctx.Deadline(); ok && d.Before(op.deadline) {
++		op.deadline = d
++	}
++	if !op.sent.Before(op.deadline) {
++		c.hostsObservationClose(h)
++		c.dnsNotify(op, errProfile)
++		return nil
++	}
++	be.PutUint64(op.body[56:], uint64(op.deadline.Sub(op.sent)))
++	op.submitted = true
++	seq, err := c.write(35, 0, op.body)
++	op.sequence = seq
++	if seq > c.lastSent {
++		c.lastSent = seq
++	}
++	if err != nil || !profileDNSV2ID(seq) {
++		h.unknown = true
++		c.hostsObservationClose(h)
++		c.dnsNotify(op, errProfile)
++		return errProfile
++	}
++	return nil
++}
++func (c *profileFlowControl) hostsObservationAccept(f profilePacket) (bool, error) {
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		op := h.pending
++		if op != nil && op.submitted && f.kind == 36 && f.reply == op.sequence {
++			if h.replied || h.cancelAck || f.object != 0 || !profileDNSV2Body(36, f.body) {
++				h.unknown = true
++				c.hostsObservationClose(h)
++				c.dnsNotify(op, errProfile)
++				return true, errProfile
++			}
++			h.replied = true
++			b := f.body
++			if b[2] != 1 {
++				if b[2] == 3 {
++					h.unknown = true
++				}
++				c.hostsObservationClose(h)
++				c.dnsNotify(op, errProfile)
++				return true, nil
++			}
++			h.reservation, h.observation = u64(b, 8), u64(b, 32)
++			valid := u64(b, 16) == h.context.source.query && u64(b, 24) == 0 && u64(b, 40) == h.context.source.epoch && u64(b, 48) <= u64(op.body, 56) && u16(b, 56) == 0 && u16(b, 58) == 1 && b[60] == 3
++			for _, other := range c.hostsObservations[:c.hostsObservationUsed] {
++				if other != h && (other.reservation == h.reservation || other.observation == h.observation) {
++					valid = false
++				}
++			}
++			for _, other := range c.dnsResults[:c.dnsResultUsed] {
++				if other.waiter != nil && other.waiter.reservation == h.reservation {
++					valid = false
++				}
++			}
++			for _, other := range c.dnsDirect[:c.dnsDirectUsed] {
++				if other.exchangeReservation == h.reservation || other.physicalReservation == h.reservation {
++					valid = false
++				}
++			}
++			if !valid {
++				h.unknown = true
++				c.hostsObservationClose(h)
++				c.dnsNotify(op, errProfile)
++				return true, errProfile
++			}
++			until := op.sent.Add(time.Duration(u64(b, 48)))
++			if !c.hostsObservationSourceLive(h) || !c.dnsContext4Live(h.context) || !c.clock().Before(until) || !c.clock().Before(op.deadline) {
++				c.hostsObservationClose(h)
++				c.dnsNotify(op, errProfile)
++				return true, nil
++			}
++			h.deadline = until
++			if cleanup := until.Add(time.Second); cleanup.Before(h.cleanupDeadline) {
++				h.cleanupDeadline = cleanup
++			}
++			c.dnsNotify(op, nil)
++			return true, nil
++		}
++		if f.kind == 48 && f.reply != 0 && (f.reply == h.cancelSequence || f.reply == h.closeSequence) {
++			if f.object != 0 || !profileDNSV2Body(48, f.body) || !c.clock().Before(h.cleanupDeadline) {
++				h.unknown = true
++				return true, errProfile
++			}
++			if f.body[2] != 1 {
++				h.unknown = true
++				return true, nil
++			}
++			expected := h.reservation
++			if f.reply == h.cancelSequence {
++				expected = op.sequence
++			}
++			if u64(f.body, 8) != expected || f.reply == h.cancelSequence && h.cancelAck || f.reply == h.closeSequence && h.closeAck {
++				h.unknown = true
++				return true, errProfile
++			}
++			if f.reply == h.cancelSequence {
++				h.cancelAck = true
++			} else {
++				h.closeAck = true
++			}
++			return true, nil
++		}
++	}
++	return false, nil
++}
++func (c *profileFlowControl) hostsObservationTick() error {
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		if h.released || h.unknown {
++			continue
++		}
++		if !c.hostsObservationSourceLive(h) || h.context != nil && !c.dnsContext4Live(h.context) || h.pending != nil && h.pending.submitted && !h.replied && !c.clock().Before(h.pending.deadline) {
++			c.hostsObservationClose(h)
++		}
++		if !h.closed {
++			continue
++		}
++		if !c.clock().Before(h.cleanupDeadline) {
++			h.unknown = true
++			continue
++		}
++		op := h.pending
++		if op != nil && op.submitted && !h.replied {
++			c.dnsNotify(op, errProfile)
++			if h.cancelSequence == 0 {
++				seq, err := c.dnsCancel(1, op.sequence)
++				h.cancelSequence = seq
++				if err != nil {
++					h.unknown = true
++					return err
++				}
++			}
++			if !h.cancelAck || c.clock().Before(op.deadline) {
++				continue
++			}
++			h.replied = true
++		}
++		if h.reservation != 0 && !h.closeAck {
++			if h.closeSequence == 0 {
++				seq, err := c.dnsCancel(7, h.reservation)
++				h.closeSequence = seq
++				if err != nil {
++					h.unknown = true
++					return err
++				}
++			}
++			continue
++		}
++		h.released = true
++		c.operations -= profileHostsObservationPending
++		// Retained selection/IDs оплачены до effects, eviction/compaction нет.
++		if h.context != nil {
++			h.context.hostReferences--
++			c.dnsContext4Close(h.context)
++		}
++	}
++	return nil
++}
++func (c *profileFlowControl) hostsObservationFloor(floor uint64) uint64 {
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		if h.released {
++			continue
++		}
++		if op := h.pending; op != nil && op.submitted && !h.replied && op.sequence < floor {
++			floor = op.sequence
++		}
++		if h.cancelSequence != 0 && !h.cancelAck && h.cancelSequence < floor {
++			floor = h.cancelSequence
++		}
++		if h.closeSequence != 0 && !h.closeAck && h.closeSequence < floor {
++			floor = h.closeSequence
++		}
++	}
++	return floor
++}
++
++func (c *profileFlowControl) hostsReservationUsed(id uint64) bool {
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		if h.reservation != 0 && h.reservation == id {
++			return true
++		}
++	}
++	return false
++}
 +
 +type profileDNSHop struct {
 +	scope  uint16
@@ -30137,16 +30635,417 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux_test.go b/common/yoni
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux_test.go
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,504 @@
 +//go:build linux
 +
 +package nativehooks
 +
 +import (
 +	"context"
++	"crypto/sha256"
 +	xnet "github.com/xtls/xray-core/common/net"
 +	"testing"
++	"time"
 +)
++
++func hostsCallerFixture(t *testing.T, modes ...byte) (*flowFixture, context.Context) {
++	t.Helper()
++	f, ctx, _ := dnsContext4Fixture(t, true, modes...)
++	b, _ := syntheticProfileSnapshot()
++	b = b[:len(b)-2]
++	b = append(b, 0, 2)
++	for _, name := range []string{"zzz.invalid.", "physical.invalid."} {
++		field := make([]byte, 2)
++		be.PutUint16(field, uint16(len(name)))
++		b = append(b, field...)
++		b = append(b, name...)
++		b = append(b, 0, 2, 4, 0, 0, 0, 0, 4, 203, 0, 113, 7)
++	}
++	be.PutUint32(b[12:], uint32(len(b)))
++	asset := snapshotAsset(b)
++	snapshot, err := decodeProfileSnapshot(b, asset)
++	if err != nil {
++		t.Fatal(err)
++	}
++	f.p.snapshot = snapshot
++	row := make([]byte, 76)
++	copy(row, asset.source[:])
++	digest := sha256.Sum256(b)
++	copy(row[32:], digest[:])
++	be.PutUint32(row[64:], uint32(len(b)))
++	be.PutUint16(row[68:], 1)
++	be.PutUint32(row[72:], 4)
++	f.c.manifest.rows[10] = [][]byte{row}
++	ctx = context.WithValue(ctx, profileDNSCapture4Key{}, (*profileDNSCapture4)(nil))
++	return f, ctx
++}
++func TestProfileHostsActualChainCallerMustAcquireBeforeObservation(t *testing.T) {
++	f, ctx := hostsCallerFixture(t)
++	done := make(chan error, 1)
++	go func() { done <- ProfilePrepareChain(ctx, nil) }()
++	select {
++	case err := <-done:
++		t.Fatal("actual chain returned before Hosts context RPC", err)
++	case op := <-f.p.flowQueue:
++		if op.kind != 55 || u16(op.body, 48) != 8 || u64(op.body, 8) != 0 || u16(op.body, 60) != 65535 {
++			t.Fatal("Hosts context request")
++		}
++		if f.c.dispatch(op) != nil || f.c.accept(dnsBundleReply(op, 800, 1)) != nil {
++			t.Fatal("context ACK")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("missing actual caller")
++	}
++	select {
++	case err := <-done:
++		t.Fatal("caller returned before issuer observation", err)
++	case op := <-f.p.flowQueue:
++		if op.kind != 35 || op.body[2] != 3 || u64(op.body, 16) != 0 || u64(op.body, 24) != 0 || u16(op.body, 64) != 65535 || op.body[74] != 3 || op.body[75] != 2 {
++			t.Fatal("Hosts reserve request")
++		}
++		if f.c.dispatch(op) != nil {
++			t.Fatal("reserve dispatch")
++		}
++		b := make([]byte, 64)
++		be.PutUint16(b, 2)
++		b[2] = 1
++		be.PutUint64(b[8:], 801)
++		be.PutUint64(b[16:], u64(op.body, 8))
++		be.PutUint64(b[32:], 802)
++		be.PutUint64(b[40:], u64(op.body, 48))
++		be.PutUint64(b[48:], u64(op.body, 56))
++		be.PutUint16(b[58:], 1)
++		b[60] = 3
++		if f.c.accept(profilePacket{kind: 36, reply: op.sequence, body: b}) != nil {
++			t.Fatal("observation ACK")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("missing reserve")
++	}
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("observation became physical permission")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("caller not settled")
++	}
++	h := f.c.hostsObservations[0]
++	if h.selection.row != 1 || h.selection.count != 2 || h.selection.members[0] != 0 || h.selection.members[1] != 1 || h.selection.key != "physical.invalid." || h.frontier.target.address != "Physical.INVALID" {
++		t.Fatal("encoded row/indices/original changed")
++	}
++	if h.observation != 802 || h.reservation != 801 || h.context.hostReferences != 1 || !h.closed {
++		t.Fatal("issuer observation ownership")
++	}
++	if f.c.dnsTick() != nil || h.closeSequence == 0 || h.context.closeSequence != 0 {
++		t.Fatal("context retired before observation")
++	}
++	ack := make([]byte, 32)
++	be.PutUint16(ack, 2)
++	ack[2] = 1
++	be.PutUint64(ack[8:], 801)
++	be.PutUint64(ack[16:], f.c.lastSent)
++	if f.c.accept(profilePacket{kind: 48, reply: h.closeSequence, body: ack}) != nil || f.c.dnsTick() != nil || !h.released || h.context.hostReferences != 0 || h.context.closeSequence == 0 {
++		t.Fatal("observation cancel7 barrier")
++	}
++	be.PutUint64(ack[8:], 800)
++	be.PutUint64(ack[16:], f.c.lastSent)
++	if f.c.accept(profilePacket{kind: 48, reply: h.context.closeSequence, body: ack}) != nil || f.c.dnsTick() != nil || !h.context.released || f.c.operations != 0 {
++		t.Fatal("context cancel8 barrier")
++	}
++}
++
++func hostsReserveReply(op *profileOperation) profilePacket {
++	b := make([]byte, 64)
++	be.PutUint16(b, 2)
++	b[2] = 1
++	be.PutUint64(b[8:], 901)
++	be.PutUint64(b[16:], u64(op.body, 8))
++	be.PutUint64(b[32:], 902)
++	be.PutUint64(b[40:], u64(op.body, 48))
++	be.PutUint64(b[48:], u64(op.body, 56))
++	be.PutUint16(b[58:], 1)
++	b[60] = 3
++	return profilePacket{kind: 36, reply: op.sequence, body: b}
++}
++func hostsCallerReserve(t *testing.T, f *flowFixture, ctx context.Context) (*profileOperation, <-chan error) {
++	t.Helper()
++	done := make(chan error, 1)
++	go func() { done <- ProfilePrepareChain(ctx, nil) }()
++	select {
++	case op := <-f.p.flowQueue:
++		if op.kind != 55 || f.c.dispatch(op) != nil || f.c.accept(dnsBundleReply(op, 900, 1)) != nil {
++			t.Fatal("context")
++		}
++	case err := <-done:
++		t.Fatal("constructor", err)
++	case <-time.After(time.Second):
++		t.Fatal("context blocked")
++	}
++	select {
++	case op := <-f.p.flowQueue:
++		if op.kind != 35 {
++			return nil, done
++		}
++		return op, done
++	case err := <-done:
++		t.Fatal("reserve missing", err)
++	case <-time.After(time.Second):
++		t.Fatal("reserve blocked")
++	}
++	return nil, done
++}
++func TestProfileHostsCallerPreflightAndPinnedLookupOrder(t *testing.T) {
++	for _, fault := range []string{"gate", "role", "mapping", "asset", "source", "dns-only", "dns-first", "pending", "memory", "history", "foreign"} {
++		t.Run(fault, func(t *testing.T) {
++			f, ctx := hostsCallerFixture(t)
++			switch fault {
++			case "gate":
++				f.p.dns4CaptureReviewed = false
++			case "role":
++				be.PutUint32(f.c.manifest.rows[10][0][72:], 2)
++			case "mapping":
++				f.c.manifest.mapping = 3
++			case "asset":
++				f.c.manifest.rows[10][0][32] ^= 1
++			case "source":
++				f.c.manifest.rows[10][0][0] ^= 1
++			case "dns-only":
++				f.p.snapshot.order = 2
++			case "dns-first":
++				f.p.snapshot.order = 4
++			case "pending":
++				f.c.operations = 64
++			case "memory":
++				f.c.buffered = uint64(f.c.manifest.caps[4])
++			case "history":
++				f.c.dnsHistoryUsed = 256
++			case "foreign":
++				ctx = context.WithValue(ctx, profileReceiptKey{}, f.admittedReceipt(t, "neighbor.invalid"))
++			}
++			before := len(f.writes)
++			if ProfilePrepareChain(ctx, nil) == nil || len(f.p.flowQueue) != 0 || len(f.writes) != before || f.p.ctx.Err() != nil {
++				t.Fatal("preflight effects/authority")
++			}
++		})
++	}
++}
++func TestProfileHostsCallerObservationReplyBindingsAndLateCancel(t *testing.T) {
++	for _, fault := range []string{"query", "bundle", "epoch", "role", "credits", "zero-observation", "max-observation", "lease", "expired", "cancel", "snapshot", "unknown"} {
++		t.Run(fault, func(t *testing.T) {
++			f, ctx := hostsCallerFixture(t)
++			op, done := hostsCallerReserve(t, f, ctx)
++			if op == nil {
++				t.Fatal("wrong op")
++			}
++			if f.c.dispatch(op) != nil {
++				t.Fatal("dispatch")
++			}
++			h := op.hostsObservation
++			reply := hostsReserveReply(op)
++			switch fault {
++			case "query":
++				be.PutUint64(reply.body[16:], 99)
++			case "bundle":
++				be.PutUint64(reply.body[24:], 900)
++			case "epoch":
++				be.PutUint64(reply.body[40:], 99)
++			case "role":
++				reply.body[60] = 1
++			case "credits":
++				be.PutUint16(reply.body[56:], 1)
++			case "zero-observation":
++				be.PutUint64(reply.body[32:], 0)
++			case "max-observation":
++				be.PutUint64(reply.body[32:], ^uint64(0))
++			case "lease":
++				be.PutUint64(reply.body[48:], u64(op.body, 56)+1)
++			case "expired":
++				f.now = op.deadline
++			case "snapshot":
++				f.c.manifest.rows[10][0][32] ^= 1
++			case "unknown":
++				clear(reply.body[3:])
++				reply.body[2] = 3
++			case "cancel":
++				h.cancel()
++				if f.c.dnsTick() != nil || h.cancelSequence == 0 {
++					t.Fatal("cancel1")
++				}
++				ack := make([]byte, 32)
++				be.PutUint16(ack, 2)
++				ack[2] = 1
++				be.PutUint64(ack[8:], op.sequence)
++				be.PutUint64(ack[16:], f.c.lastSent)
++				if f.c.accept(profilePacket{kind: 48, reply: h.cancelSequence, body: ack}) != nil {
++					t.Fatal("cancel ACK")
++				}
++			}
++			_ = f.c.accept(reply)
++			select {
++			case err := <-done:
++				if err == nil {
++					t.Fatal("observation allowed physical open")
++				}
++			case <-time.After(time.Second):
++				t.Fatal("caller not settled")
++			}
++			if !h.closed || f.p.ctx.Err() != nil {
++				t.Fatal("invalid observation published or neighbor killed")
++			}
++			if fault != "expired" && fault != "snapshot" && !h.unknown {
++				t.Fatal("uncertain reply lost custody")
++			}
++		})
++	}
++}
++func TestProfileHostsCallerUnknownReservationCleanupKeepsContextCustody(t *testing.T) {
++	f, ctx := hostsCallerFixture(t)
++	op, done := hostsCallerReserve(t, f, ctx)
++	if f.c.dispatch(op) != nil || f.c.accept(hostsReserveReply(op)) != nil {
++		t.Fatal("observation")
++	}
++	<-done
++	h := op.hostsObservation
++	if f.c.dnsTick() != nil || h.closeSequence == 0 || h.context.closeSequence != 0 {
++		t.Fatal("cleanup order")
++	}
++	b := make([]byte, 32)
++	be.PutUint16(b, 2)
++	b[2] = 3
++	if f.c.accept(profilePacket{kind: 48, reply: h.closeSequence, body: b}) != nil || !h.unknown || h.released || h.context.hostReferences != 1 {
++		t.Fatal("Unknown lost observation custody")
++	}
++	if f.c.dnsTick() != nil || h.context.closeSequence != 0 || f.p.ctx.Err() != nil {
++		t.Fatal("Unknown retired parent or session")
++	}
++}
++
++func TestProfileHostsConstructorUsesCompleteParentPathNotRemoteHostname(t *testing.T) {
++	f, ctx := hostsCallerFixture(t)
++	root := ctx.Value(profileGrantKey{}).(*profileGrant)
++	physical := append([]byte(nil), f.c.manifest.rows[1][0]...)
++	remote := profileDestinationValue{family: 3, network: 6, address: "Remote.INVALID", port: 443}
++	f.c.manifest.rows[1] = [][]byte{remote.encode(), physical}
++	childScope := append([]byte(nil), f.c.manifest.rows[8][0]...)
++	be.PutUint16(childScope, 1)
++	be.PutUint16(childScope[8:], 1)
++	parentScope := f.c.manifest.rows[8][0]
++	parentScope[20] = 2
++	be.PutUint16(parentScope[16:], 0)
++	f.c.manifest.rows[8] = [][]byte{parentScope, childScope}
++	edge := make([]byte, 8)
++	be.PutUint16(edge[2:], 1)
++	edge[5] = 1
++	f.c.manifest.rows[2] = [][]byte{edge}
++	root.chain = 0
++	subject := append([]byte(nil), f.c.manifest.rows[0][0]...)
++	subject[2] = 'b'
++	be.PutUint16(subject[len(subject)-4:], 1)
++	f.c.manifest.rows[0] = append(f.c.manifest.rows[0], subject)
++	child, grantOp, err := f.c.authorize(ctx, root.receipt, 1, 0, remote, nil)
++	if err != nil || f.c.dispatch(grantOp) != nil || f.c.accept(f.grantReply(grantOp, 0)) != nil {
++		t.Fatal("private hop", err)
++	}
++	root.next = child
++	child.parent = root
++	done := make(chan error, 1)
++	go func() { done <- profilePrepareHostsObservation(ctx, root) }()
++	select {
++	case op := <-f.p.flowQueue:
++		if op.kind != 55 || u16(op.body, 50) != 2 {
++			t.Fatal("full path absent")
++		}
++		start := 72 + int(u16(op.body, 48))
++		if string(op.body[start:start+int(u16(op.body, 58))]) != "Physical.INVALID" {
++			t.Fatal("remote hostname promoted to physical leaf")
++		}
++		tail := op.body[start+int(u16(op.body, 58)):]
++		if u16(tail, 0) != 0 || u16(tail, 4) != 1 {
++			t.Fatal("path changed")
++		}
++		if f.c.dispatch(op) != nil || f.c.accept(dnsBundleReply(op, 950, 1)) != nil {
++			t.Fatal("context ACK")
++		}
++	case err := <-done:
++		t.Fatal(err)
++	case <-time.After(time.Second):
++		t.Fatal("context blocked")
++	}
++	select {
++	case op := <-f.p.flowQueue:
++		if op.kind != 35 || u16(op.body, 66) != 1 || u16(op.body, 68) != 1 || u16(op.body, 70) != 1 {
++			t.Fatal("terminal binding")
++		}
++		if f.c.dispatch(op) != nil {
++			t.Fatal("reserve")
++		}
++		b := make([]byte, 64)
++		be.PutUint16(b, 2)
++		b[2] = 2
++		if f.c.accept(profilePacket{kind: 36, reply: op.sequence, body: b}) != nil {
++			t.Fatal("denial")
++		}
++	case err := <-done:
++		t.Fatal(err)
++	case <-time.After(time.Second):
++		t.Fatal("reserve blocked")
++	}
++	if err := <-done; err == nil {
++		t.Fatal("denial opened flow")
++	}
++}
++func TestProfileHostsSystemObservationCannotExtendOriginalKnown(t *testing.T) {
++	f, ctx := hostsCallerFixture(t, 2)
++	op, done := hostsCallerReserve(t, f, ctx)
++	if f.c.dispatch(op) != nil || u64(op.body, 56) > uint64(20*time.Millisecond) {
++		t.Fatal("Known deadline extended")
++	}
++	h := op.hostsObservation
++	f.now = op.deadline
++	if f.c.accept(hostsReserveReply(op)) != nil {
++		t.Fatal("late ACK handling")
++	}
++	if err := <-done; err == nil || !h.closed {
++		t.Fatal("expired USER parent received authority")
++	}
++	for _, g := range f.c.grants {
++		if g != nil && g.class == 3 {
++			t.Fatal("Hosts minted fake service grant")
++		}
++	}
++}
++
++func TestProfileHostsObservationTimeoutUsesShortContextLease(t *testing.T) {
++	f, ctx := hostsCallerFixture(t)
++	done := make(chan error, 1)
++	go func() { done <- ProfilePrepareChain(ctx, nil) }()
++	op := <-f.p.flowQueue
++	if f.c.dispatch(op) != nil {
++		t.Fatal("dispatch")
++	}
++	reply := dnsBundleReply(op, 970, 1)
++	be.PutUint64(reply.body[40:], uint64(time.Millisecond))
++	if f.c.accept(reply) != nil {
++		t.Fatal("context lease")
++	}
++	op = <-f.p.flowQueue
++	if f.c.dispatch(op) != nil || u64(op.body, 56) > uint64(time.Millisecond) {
++		t.Fatal("reserve escaped context deadline")
++	}
++	f.now = op.deadline
++	if f.c.dnsTick() != nil {
++		t.Fatal("tick")
++	}
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("expired observation allowed")
++		}
++	case <-time.After(100 * time.Millisecond):
++		t.Fatal("pending Reserve outlived short context lease")
++	}
++}
 +
 +func TestProfileDNSQueryCannotBorrowUserAuthorizeAtSameDestination(t *testing.T) {
 +	f := newFlowFixture(t, 1)
@@ -31768,7 +32667,7 @@ diff --git a/common/yonikbroker/profile_dns_bundle_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_bundle_linux.go
-@@ -0,0 +1,1459 @@
+@@ -0,0 +1,1469 @@
 +//go:build linux
 +
 +package nativehooks
@@ -31830,6 +32729,7 @@ new file mode 100644
 +	deadline                          time.Time
 +}
 +type profileDNSContext4 struct {
++	hostReferences            int
 +	source                    profileDNSCapture4
 +	identity                  *profileDNSContextIdentity
 +	ctx                       context.Context
@@ -32214,7 +33114,7 @@ new file mode 100644
 +			x.unknown = true
 +			continue
 +		}
-+		if x.pending == nil && x.identity.id != 0 && x.closeSequence == 0 {
++		if x.pending == nil && x.identity.id != 0 && x.closeSequence == 0 && x.hostReferences == 0 {
 +			seq, err := c.dnsCancel(8, x.identity.id)
 +			x.closeSequence = seq
 +			if err != nil {
@@ -32222,7 +33122,7 @@ new file mode 100644
 +				return err
 +			}
 +		}
-+		if x.pending == nil && (x.identity.id == 0 || x.closeAck) {
++		if x.pending == nil && x.hostReferences == 0 && (x.identity.id == 0 || x.closeAck) {
 +			x.released = true
 +			c.operations--
 +			if x.source.service != nil {
@@ -32957,6 +33857,9 @@ new file mode 100644
 +	return errProfile
 +}
 +func (c *profileFlowControl) dnsTick() error {
++	if err := c.hostsObservationTick(); err != nil {
++		return err
++	}
 +	if err := c.dnsContext4Tick(); err != nil {
 +		return err
 +	}
@@ -33017,6 +33920,7 @@ new file mode 100644
 +}
 +
 +func (c *profileFlowControl) dnsFloor(floor uint64) uint64 {
++	floor = c.hostsObservationFloor(floor)
 +	floor = c.dnsContext4Floor(floor)
 +	floor = c.numericFloor(floor)
 +	floor = c.dnsResultsFloor(floor)
@@ -33051,6 +33955,11 @@ new file mode 100644
 +func (c *profileFlowControl) dnsCleanupResult() error {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		if !h.released || h.unknown {
++			return ErrProfileCleanupUnknown
++		}
++	}
 +	for _, x := range c.dnsContexts4[:c.dnsContext4Used] {
 +		if !x.released || x.unknown {
 +			return ErrProfileCleanupUnknown
@@ -36689,7 +37598,7 @@ new file mode 100644
 +			valid := true
 +			switch f.kind {
 +			case 36:
-+				valid = u64(b, 16) == e.id && u64(b, 24) == t.bundle.id && u64(b, 40) == e.query.runtime.admission.launch.epoch && b[60] == op.body[2]
++				valid = !c.hostsReservationUsed(u64(b, 8)) && u64(b, 16) == e.id && u64(b, 24) == t.bundle.id && u64(b, 40) == e.query.runtime.admission.launch.epoch && b[60] == op.body[2]
 +				if r.physical {
 +					valid = valid && u64(b, 32) == t.exchangeReservation && u16(b, 56) >= 2
 +					t.physicalReservation = u64(b, 8)
@@ -38251,7 +39160,7 @@ new file mode 100644
 +				e := w.bundle.exchange
 +				w.reservation = u64(b, 8)
 +				remaining = u64(b, 48)
-+				valid = u64(b, 16) == e.id && u64(b, 24) == w.bundle.id && u64(b, 32) == 0 && u64(b, 40) == w.data.epoch && u16(b, 56) == 0 && u16(b, 58) == 1 && b[60] == 3
++				valid = !c.hostsReservationUsed(w.reservation) && u64(b, 16) == e.id && u64(b, 24) == w.bundle.id && u64(b, 32) == 0 && u64(b, 40) == w.data.epoch && u16(b, 56) == 0 && u16(b, 58) == 1 && b[60] == 3
 +				w.reservationDeadline = op.sent.Add(time.Duration(remaining))
 +				if op.deadline.Before(w.reservationDeadline) {
 +					w.reservationDeadline = op.deadline

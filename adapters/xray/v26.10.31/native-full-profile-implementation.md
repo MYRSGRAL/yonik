@@ -1294,3 +1294,59 @@ DirectSystemTransportPermit, RRset/Waiter/Numeric bootstrap и actual service I/
 не подключены этим context unit. UserDns CODEC3 semantics/Numeric one-attempt
 сохранены под negotiated CODEC4. Registry/builder/allowlists/install/gates не
 менялись; новый patch требует отдельного source/schema4 review и literal pin.
+
+### CODEC4 Hosts: actual constructor и observation, без Publish/Numeric
+
+В hostname physical-leaf ветке `ProfilePrepareChain` теперь вызывается
+`profilePrepareHostsObservation`. Он нормализует retained private parent до
+chain root и повторно выводит `profileDNSFirstHop` по actual ACKed grant hops:
+exact scope/branch/effective target, carrier→nextInput, общий original receipt,
+policy revision и свежесть каждого hop. В context55 передаётся весь ordered
+path; remote chained hostname не становится physical original. Dynamic Direct
+hostname/use1 не подменяется bootstrap path.
+
+Constructor использует только retained `ProfileRuntime.snapshot`: mapping4,
+table11 role4 (role2 недостаточен), exact source digest/asset SHA256/size/epoch.
+Перед RPC и при observation ACK повторяются source/path/parent checks.
+Нет чтения live resolver files, env fallback или замены provider DNS. Для этого
+bounded unit поддержаны files-only и files→DNS при actual Hosts hit. DNS-only,
+DNS→files без проверенного network-negative результата и files miss закрыты.
+Lookup key следует pinned netgo lower/dot rules; wire original берётся из
+table2 без изменения регистра, port или carrier.
+
+`profileHostsSelect` сканирует исходный encoded asset, сохраняя original row и
+ordered member indices≤16. Sorted lookup views decoder не используются как
+wire row index. Нулевой Hosts literal является DATA; IP/TTL caller не получает.
+Constructor создаёт private capture4 из этого snapshot и actual parent path,
+после чего existing actor выдаёт ACKed HostsPath context56. Прежняя необходимость
+вручную инъецировать private capture DATA в production caller устранена.
+
+Только затем тот же caller выполняет Reserve35 role3: bundle/grant/flow/revision0,
+resolverFFFF,qtype/query/options/payload0,purpose3/source2/use2/class3 и Probe8.
+Reserved36 обязан echo query/epoch/role/pending1/physical0; bundle0, nonzero
+reservationId и issuer-issued SourceObservationId@32. Remaining ограничен
+исходным context/parent/owner/session deadline с вычетом полного RTT. Observation
+ID не выбирается child и не равен разрешению по факту успешного decode.
+Typed namespaces context/reservation/observation не alias-ятся; новые reservation
+IDs проверяются против existing Direct/cache owners и наоборот.
+
+До constructor allocation/effects оплачиваются16KiB и3 общих pending/history
+credits; context actor оплачивает собственные bounded metadata/RPC отдельно.
+R39 permanent RX scratch и FD64/pending64/history256/8MiB не менялись. Новый
+reader, socket, FD duplicate или I/O task не создаётся. Metadata/IDs остаются
+оплаченными terminal records без compaction. Pending35 получает Cancel1 barrier;
+после observation требуется Cancel7 reservation, и лишь затем снимается retained
+context reference и допускается Cancel8. Short context/Reserve deadline не
+продлевается ожиданием ACK; cleanup window ограничен исходными deadlines+1s.
+Unknown/late/replay/failed cleanup удерживает custody и не превращается в Known.
+
+**Граница результата:** actual constructor→context→observation подключён, но
+caller после ACK возвращает Unsupported. Hosts Publish/Waiter/Numeric use2 и
+conjunction с physical permission ещё закрыты; наблюдение не выпускает IP,
+synthetic TTL, service grant или physical dial. Этот caller использует настоящий
+USER parent; Probe/service-parent пути не заявлены завершёнными. Network service
+I/O не добавлен. `dns4CaptureReviewed` остаётся false в production; новый protected
+schema4 source proof/record и root literal pin требуют отдельного review.
+Rust/canonical wire/schema/corpus, registry/builder/allowlists и public gates
+не менялись. Из ранее принятого Direct consumer затронута только дополнительная
+reservation-ID collision guard; consuming-close/joins и frozen guards сохранены.

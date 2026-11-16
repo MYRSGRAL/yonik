@@ -12,6 +12,30 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_hosts_constructor_is_called_from_actual_chain_and_observation_is_not_ip(
+        self,
+    ) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "return profilePrepareHostsObservation(ctx, root)",
+            "func (c *profileFlowControl) hostsParentFrontier(",
+            "func profileHostsSelect(",
+            "ProfileDNSAcquirePhysicalContext(captured)",
+            "c.hostsObservationDispatch(op)",
+            "c.hostsObservationAccept(f)",
+            "c.dnsCancel(7, h.reservation)",
+            "x.hostReferences == 0",
+            "!c.hostsReservationUsed(u64(b, 8))",
+        ):
+            self.assertTrue(anchor in patch, anchor)
+        section = patch.split(
+            "+++ b/common/yonikbroker/profile_dns_frontier_linux.go\n", 1
+        )[1].split("diff --git ", 1)[0]
+        self.assertNotIn("UnixNano", section)
+        self.assertNotIn("net.DefaultResolver", section)
+        self.assertNotIn("dns4CaptureReviewed = true", section)
+        self.assertTrue("return ErrProfileUnsupported" in section)
+
     def test_codec4_contexts_have_separate_schema_and_closed_capture_gate(self) -> None:
         raw = (ADAPTER / "full-profile-fixtures/dns-v2-codec4.json").read_bytes()
         self.assertEqual(
