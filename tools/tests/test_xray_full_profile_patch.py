@@ -12,6 +12,31 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_dns_v2_canonical_pin_is_data_only_and_embedded_exactly(self) -> None:
+        raw = (ADAPTER / "full-profile-fixtures/dns-v2-canonical.json").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            "5703a0f556ec76158d79c196f4896c19b13ff05f44570fadfe2408c961e30ae5",
+        )
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        added = patch.split(
+            "+++ b/common/yonikbroker/profile-dns-v2-canonical.json\n", 1
+        )[1].split("diff --git ", 1)[0]
+        embedded = (
+            "\n".join(line[1:] for line in added.splitlines() if line.startswith("+"))
+            + "\n"
+        ).encode()
+        self.assertEqual(raw, embedded)
+        corpus = json.loads(raw)
+        self.assertEqual(len(corpus["vectors"]), 76)
+        self.assertEqual(len(corpus["rejectedBodies"]), 164)
+        self.assertEqual(len(corpus["rejectedFrames"]), 14)
+        self.assertIn("p.negotiateDNSV2(record, initialDeadline)", patch)
+        self.assertIn("task.OwnContext(dnsCtx, conn)", patch)
+        metadata = json.loads((ADAPTER / "native-full-profile.json").read_text())
+        self.assertFalse(metadata["builder_apply_enabled"])
+        self.assertFalse(metadata["authority_issuer_connected"])
+
     def test_descriptor_binds_patch_without_claiming_runtime_acceptance(self) -> None:
         metadata = json.loads((ADAPTER / "native-full-profile.json").read_text())
         patch = (ADAPTER / "native-full-profile.patch").read_bytes()
@@ -70,6 +95,14 @@ class FullProfilePatchTests(unittest.TestCase):
                     "app/dns/dns.go",
                     "app/dns/nameserver.go",
                     "app/dns/yonik_outer_test.go",
+                    "app/dns/dnscommon.go",
+                    "app/dns/dnscommon_test.go",
+                    "app/dns/cache_controller.go",
+                    "app/dns/nameserver_cached.go",
+                    "app/dns/yonik_exchange.go",
+                    "app/dns/nameserver_udp.go",
+                    "app/dns/nameserver_tcp.go",
+                    "app/dns/yonik_lineage_test.go",
                     "features/dns/localdns/client.go",
                     "features/dns/localdns/yonik_context_test.go",
                     "common/yonikbroker/routing.go",

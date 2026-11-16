@@ -837,3 +837,45 @@ Client tests исполняют оба режима фильтрации с fake
 proof, provider/cache waiter authority и physical hostname RRset handoff.
 System class3 required/Known≤20ms не изменён. Wire/ABI260, UDP/R9–R25 guards
 и все глобальные readiness/builder gates сохранены; runtime не исполнялся.
+
+## DNS completion: текущая независимая producer часть
+
+Classic UDP/TCP callers используют strict request/response matching до cache
+update: ID, единственный IN A/AAAA question, class/type, bounded CNAME membership,
+TTL и exact frame extent. UDP callback дополнительно сохраняет private exchange
+identity и logical DNS destination; это не physical peer/netns proof. TCP worker
+держит query custody до завершения I/O/Close. Его собственный deadline управляет
+cleanup, даже если parent query ещё live. Dispatcher, UDP reader и managed mux
+input резервируют task/buffer credit до allocation/goroutine; Unknown cleanup
+удерживает resource/query/credit и отзывает runtime. History не переиспользуется.
+
+Cache guards удерживают только immutable DATA: без legacy IPRecord provenance,
+истёкшего absolute expiry, serveStale/TTL1 и WithoutCancel. IP bytes каждого
+waiter копируются отдельно. Этот шаг не создаёт ProducerRRsetId/WaiterReceiptId:
+существующий outer answer guard продолжает отказывать без собственного proof.
+DNS query context не проходит обычный USER AUTHORIZE даже при совпавшем target.
+
+Canonical CODEC-1 pin: Rust `6dc32a1533f03a701cc0ecc08819476e66d61071`,
+`full-profile-fixtures/dns-v2-canonical.json`, SHA256
+`5703a0f556ec76158d79c196f4896c19b13ff05f44570fadfe2408c961e30ae5`.
+Go DATA preflight/encoder проверяет 76 positive, 164 negative bodies,
+14 negative envelopes и 6 snapshot role rows; JSON integers читаются RawMessage
+напрямую в uint64. PhysicalBind остаётся raw192 без Header128; runtime DNS
+frames — Header128/rights0, отдельный SCM packet — FD1/credentials1. Typed
+authority из этих DATA helpers не следует.
+
+Для mapping4 production launch после ADMIT_ACK синхронно посылает Descriptor272,
+получает exact ACK40 и лишь затем создаёт flow actor/monitor. Deadline — прежний
+initial admission deadline, без renewal. OS boundary аутентифицирует credentials
+и pidfd peer; DATA codec получает уже проверенный rights-free payload. Unexpected
+rights закрываются с сохранением Unknown custody при cleanup error. Proof
+bootstrap до HELLO и ABI260 не изменены. Mapping3 сохраняет прежний launch.
+
+Полный DNS vertical ещё закрыт. Root подтвердил отсутствие legitimate выдачи
+DNSBundleId в CODEC-1. Новый нормативный CODEC-2 `4bc87da` добавляет BundleAcquire55
+и BundleGranted56 с issuer-owned hop permits; до canonical codec/goldens эти
+kinds здесь не сериализуются и не принимаются. Нет alias grantId→BundleId,
+class3→USER fallback или выдачи provider permission по tag. Остаются actual
+bundle/PhysicalBind/append/Publish/WaiterBind, StubBind и numeric durable handoff.
+Internal `proxy/dns` subject остаётся Unsupported и вне текущих изменений.
+Global runtime/consumer/builder gates остаются false.
