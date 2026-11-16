@@ -508,7 +508,9 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   payload-sniffing перед dispatch и выдачу reader без transfer/live bound grant.
   RED старого producer → GREEN UDP suite, fresh81 pins и Python9+9 PASS;
   evidence r25-root-sniff сохранён до tests, собственная сборка очищена.
-  Narrow source recheck ожидается; native/runtime gates не открывались.
+  R25a narrow SOURCE CLOSED: payload-sniffing отклоняется до dispatcher,
+  MetadataOnly не читает Cache; reader требует transfer и live bound grant.
+  R25b counterpart scoped CLEAN сохранён. Native/runtime gates не открывались.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
