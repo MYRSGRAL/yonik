@@ -939,7 +939,7 @@ Registry schema2 принимает optional `native_profile_producer`, schema1 
 `version=1`, `source_commit`, `source_sha256`, `patch_sha256`, `builder_sha256`,
 `toolchain_sha256`, `build_inputs_sha256`, `elf_sha256`; digests — bounded
 lowercase hex64/nonzero. Source commit закреплён на26.10.31; patch allowlist
-закреплён на accepted83863e6f… source contract. Следующий DNS patchset обязан
+закреплён root8c5fa41 на patch205b5337… после DNS review R27. Следующий patchset обязан
 пройти root source review и обновить allowlist; semantic contract и exact
 artifact digest не смешиваются. Наличие этого record не означает full readiness.
 

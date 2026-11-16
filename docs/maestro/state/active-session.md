@@ -530,6 +530,17 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   Source/ELF evidence p4-dnsouter-f36 сохранён, собственная сборка очищена.
   Full P4/P5/runtime не PASS; installed e14 не обновлён, readiness gates false.
 
+- Producer binding6636fd2 интегрирован после R28a registry/builder и R28b
+  Local/System launch SOURCE scoped CLEAN. Compile-only build record становится
+  authority только через protected install; фактической установки не было.
+  Root8c5fa41 согласует registry/builder pin с reviewed DNS009c03b patch205b5337…;
+  regression связывает registry pin с adapter metadata. Четыре exact registry
+  pure и два builder fake tests, linux+desktop all-targets clippy/fmt/Ruff PASS.
+  Начальный широкий test filter остановлен до ELF/tests; выполнялись только
+  четыре явных pure cases. Evidence r28-root-dns-pin сохранён до tests,
+  cargo clean удалил2.3GiB. Public gates остаются false, native Connect/P6,
+  remaining DNS/domain/compaction и runtime acceptance не завершены.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
