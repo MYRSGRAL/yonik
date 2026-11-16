@@ -663,6 +663,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   Numeric42→durable USER GRANT ещё не реализован; production transcript
   pin DNS_WIRE_REVIEWED_PATCH=None, public gates закрыты.
 
+- Parallel compiler2d57558 прошёл R45 SOURCE scoped CLEAN и интегрирован:
+  PhysicalFirstHopBootstrap checked frontier/path≤256, role4 отдельно App role2,
+  retained snapshot capture даже при provider-only DNS. Mapping4/table11 builder
+  и production issuer frontier/custody пока не подключены; bootstrap-only prepare
+  остаётся fail-closed Reference. Следующий отдельный writer cut — capsule mapping,
+  без изменения DNS_V2 wire/issuer authority. Public/runtime gates остаются false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
