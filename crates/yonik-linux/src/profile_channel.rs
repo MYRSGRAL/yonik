@@ -2690,6 +2690,27 @@ impl<'a> Destination<'a> {
             return Err(Error::Schema);
         }
         let bytes = r.take(n)?;
+        let destination = Self {
+            protocol,
+            port,
+            family,
+            bytes,
+        };
+        destination.validate_original()?;
+        Ok(destination)
+    }
+    pub(crate) fn validate_original(self) -> Result<()> {
+        let Self {
+            protocol,
+            port,
+            family,
+            bytes,
+        } = self;
+        network(protocol)?;
+        let n = bytes.len();
+        if port == 0 || n > 253 {
+            return Err(Error::Schema);
+        }
         match family {
             3 => {
                 let host = std::str::from_utf8(bytes).map_err(|_| Error::Schema)?;
@@ -2716,12 +2737,7 @@ impl<'a> Destination<'a> {
             }
             _ => return Err(Error::Schema),
         }
-        Ok(Self {
-            protocol,
-            port,
-            family,
-            bytes,
-        })
+        Ok(())
     }
 }
 struct Subject<'a> {

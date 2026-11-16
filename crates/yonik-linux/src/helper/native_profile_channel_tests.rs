@@ -2,6 +2,85 @@ use super::*;
 use std::collections::BTreeSet;
 
 #[test]
+fn udp_packet_and_runtime_open_share_immutable_original_name_grammar() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Case {
+        name: String,
+        allowed: bool,
+    }
+    let cases: Vec<Case> = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/xray-profile-channel-v3/udp-original-destination-v1.json"
+    ))
+    .unwrap();
+    let record = issuer(Mode::System).record;
+    for case in cases {
+        let name = case.name.as_bytes();
+        let mut packet = vec![0, 0, 0, 3, name.len() as u8];
+        packet.extend_from_slice(name);
+        packet.extend_from_slice(&53u16.to_be_bytes());
+        packet.extend_from_slice(b"data");
+        let parsed = udp_original(&packet);
+        assert_eq!(parsed.is_ok(), case.allowed, "packet name={:?}", case.name);
+        let mut local = [0; 16];
+        local[..4].copy_from_slice(&[192, 0, 2, 10]);
+        let mut remote = [0; 16];
+        remote[..4].copy_from_slice(&[127, 0, 0, 1]);
+        let message = wire::Message::OpenIngress {
+            ingress: 0,
+            provenance: 3,
+            tuple: Tuple {
+                family: 4,
+                protocol: 17,
+                local_port: 32001,
+                remote_port: 49152,
+                local,
+                remote,
+            },
+            original: wire::Destination {
+                family: 3,
+                protocol: 17,
+                port: 53,
+                bytes: b"valid.invalid",
+            },
+        };
+        let mut bytes = [0; 1153];
+        let header = wire::Header {
+            kind: wire::Kind::OpenIngress,
+            sequence: 2,
+            reply_to: 0,
+            binding: record.binding,
+            object_id: 0,
+        };
+        wire::Frame::encode(header, &message, &mut bytes).unwrap();
+        // Canonical encoder отвергает malformed destination: меняем только
+        // name bytes/length в otherwise valid frame, чтобы проверить decoder.
+        const DESTINATION: usize = 128 + 4 + 40;
+        const NAME: usize = DESTINATION + 8;
+        let n = NAME + name.len();
+        bytes[DESTINATION + 4..DESTINATION + 6].copy_from_slice(&(name.len() as u16).to_be_bytes());
+        bytes[NAME..n].copy_from_slice(name);
+        bytes[..128].copy_from_slice(&header.encode(n - 128).unwrap());
+        let decoded = wire::Frame::decode(&bytes[..n], record.binding, record.mode, false);
+        assert_eq!(decoded.is_ok(), case.allowed, "OPEN name={:?}", case.name);
+        if let Ok(wire::Frame {
+            message: wire::Message::OpenIngress { original, .. },
+            ..
+        }) = decoded
+        {
+            assert_eq!(original.bytes, name);
+        }
+        if let Ok((target, header)) = parsed {
+            assert_eq!(target.wire().bytes, name);
+            assert_eq!(target.wire().family, 3);
+            assert_eq!(target.wire().protocol, 17);
+            assert_eq!(target.wire().port, 53);
+            assert_eq!(usize::from(header), 7 + name.len());
+        }
+    }
+}
+
+#[test]
 fn runtime_receive_reserves_rights_scratch_before_call_and_releases_on_error() {
     let slots = SidebandCredits::new();
     let occupied = slots.fds.reserve(49).unwrap();

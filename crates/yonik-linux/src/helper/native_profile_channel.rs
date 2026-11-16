@@ -1039,26 +1039,14 @@ fn udp_original(bytes: &[u8]) -> Result<(Target, u16), ServiceError> {
         .get(end..end + 2)
         .ok_or(ServiceError::InvalidRequest)?;
     let port = u16::from_be_bytes([port[0], port[1]]);
-    if port == 0
-        || family == 3
-            && wire::resolver_name(
-                std::str::from_utf8(address).map_err(unavailable)?,
-                false,
-                true,
-            )
-            .is_err()
-    {
-        return Err(ServiceError::InvalidRequest);
-    }
-    Ok((
-        Target::copy(wire::Destination {
-            family,
-            protocol: 17,
-            port,
-            bytes: address,
-        })?,
-        (end + 2) as u16,
-    ))
+    let original = wire::Destination {
+        family,
+        protocol: 17,
+        port,
+        bytes: address,
+    };
+    original.validate_original().map_err(unavailable)?;
+    Ok((Target::copy(original)?, (end + 2) as u16))
 }
 struct KernelControl {
     socket: tokio::net::TcpStream,
