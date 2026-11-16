@@ -75,14 +75,12 @@ The compiler keeps mixed DNS/Fake-IP disabled and the desktop engine is unchange
 The UI redesign direction is a nearly black theme with lavender accents and a
 simple connect screen. All configuration moves to Settings. Variant A, with a
 large central connect button, has been selected in the [interactive concepts](design/ui-variants.html).
-The [isolated Qt/GTK4/Slint benchmark](bench/ui/README.md) is separate from the
-application; real-window measurements and toolkit selection remain pending.
 The native Qt prototype now implements A: server card, central connect/stop button,
 and connection status. The server card opens **Servers**; a gear in the upper right
 opens **Settings**. Back returns to the previous level. The home screen has no
 extra action buttons, mode badge or subscription summary.
 The window starts at 420×760 logical pixels (minimum 380×600). Onest/Unbounded
-fonts and OFL licenses are embedded. This working UI does not wait for the benchmark or system TUN.
+fonts and OFL licenses are embedded. This working UI does not wait for system TUN.
 [UI direction](docs/specs/ui-direction.md).
 [Main-screen/backend contract](docs/specs/ui-backend-contract.md).
 [Native A implementation and checks](docs/validation/2026-11-09-ui-a-native.md).
