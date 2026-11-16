@@ -4,16 +4,16 @@ mod graph;
 mod intent;
 mod validate;
 pub use intent::{
-    BranchProjection, MAX_INTENT_BYTES, ProfileIntent, WireAction, WireNetwork, WireSecurity,
-    WireTransportKind,
+    BranchProjection, MAX_INTENT_BYTES, PhysicalBootstrapFrontier, ProfileIntent, WireAction,
+    WireNetwork, WireSecurity, WireTransportKind,
 };
 
 use crate::{CompiledConfig, SystemTun};
 pub use graph::{
-    EgressPlan, IngressRequirement, OwnedResourceRequirement, PhysicalEndpoint, ProbeRequirement,
-    ProfileCompileError, ProviderIngressProtocol, ResolverRequirement, SystemResolverBinding,
-    SystemResolverRequirement, TransportProtocol, ValidatedGraph, VerifiedNativeResources,
-    VerifiedSystemResolver,
+    EgressPlan, IngressRequirement, OwnedResourceRequirement, PhysicalEndpoint,
+    PhysicalFirstHopBootstrap, ProbeRequirement, ProfileCompileError, ProviderIngressProtocol,
+    ResolverRequirement, SystemResolverBinding, SystemResolverRequirement, TransportProtocol,
+    ValidatedGraph, VerifiedNativeResources, VerifiedSystemResolver,
 };
 use std::{collections::BTreeMap, num::NonZeroU16};
 use yonik_import::NativeProfile;

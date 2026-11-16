@@ -274,7 +274,7 @@ impl FullProfileSources {
         check_cancel(cancel)?;
         let graph = intent.validate().map_err(|_| EgressError::Encoding)?;
         let resources = NativeResourceSet::capture(&graph, cancel)?;
-        let resolver = if graph.egress().system_resolvers().is_empty() {
+        let resolver = if !graph.egress().requires_system_snapshot() {
             None
         } else {
             Some(PinnedResolverSnapshot::capture(cancel)?)

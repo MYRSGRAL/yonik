@@ -74,6 +74,21 @@ impl BranchProjection<'_> {
     }
 }
 
+/// Checked physical frontier. Индексы table2/9 назначает capsule из этих subjects.
+pub struct PhysicalBootstrapFrontier {
+    endpoint: super::PhysicalEndpoint,
+    path: Vec<(String, WireNetwork, bool)>,
+}
+impl PhysicalBootstrapFrontier {
+    pub fn endpoint(&self) -> &super::PhysicalEndpoint {
+        &self.endpoint
+    }
+    /// Ordered subject/input/branch, включая последний physical leaf.
+    pub fn path(&self) -> &[(String, WireNetwork, bool)] {
+        &self.path
+    }
+}
+
 // Все extension objects закрыты. Семантический validator P3 остаётся единственным
 // источником правил protocol/reference/chain/resource, wire его не заменяет.
 macro_rules! object {
@@ -390,6 +405,75 @@ impl ProfileIntent {
             Some(_) => selected,
             None => selected | at443,
         })
+    }
+    /// Выводит frontier из exact ordered branch decisions. Не выдаёт grant.
+    /// Ни remote hostname, ни caller-supplied IP не являются входом API.
+    pub fn physical_bootstrap_frontier(
+        &self,
+        subject: &str,
+        input: WireNetwork,
+        destination_port: u16,
+        branches: &[bool],
+    ) -> Result<Option<PhysicalBootstrapFrontier>, Error> {
+        if destination_port == 0 || branches.is_empty() || branches.len() > 256 {
+            return Err(Error::Budget);
+        }
+        let graph = self.validate()?;
+        let mut cursor = subject;
+        let mut network = input;
+        let mut port = destination_port;
+        let mut path = Vec::with_capacity(branches.len());
+        for (index, worker) in branches.iter().copied().enumerate() {
+            let mask = self.branch_mask(cursor, network, Some(port))?;
+            if mask & (if worker { 2 } else { 1 }) == 0 {
+                return Err(Error::Reference);
+            }
+            let projection = self.project_branch(cursor, network, worker)?;
+            path.push((cursor.to_owned(), network, worker));
+            match projection.action() {
+                WireAction::Chain => {
+                    // Следующий proxy получает адрес текущего proxy, а не user port.
+                    port = graph
+                        .egress()
+                        .subject_endpoints()
+                        .iter()
+                        .find(|(tag, _)| tag == cursor)
+                        .map(|(_, endpoint)| endpoint.port())
+                        .ok_or(Error::Reference)?;
+                    cursor = projection.next_subject.ok_or(Error::Reference)?;
+                    network = projection.carrier().ok_or(Error::Reference)?;
+                }
+                WireAction::PhysicalStatic => {
+                    if index + 1 != branches.len() {
+                        return Err(Error::Reference);
+                    }
+                    let protocol = match projection.carrier().ok_or(Error::Reference)? {
+                        WireNetwork::Tcp => super::TransportProtocol::Tcp,
+                        WireNetwork::Udp => super::TransportProtocol::Udp,
+                    };
+                    let endpoint = graph
+                        .egress()
+                        .subject_endpoints()
+                        .iter()
+                        .find(|(tag, endpoint)| tag == cursor && endpoint.protocol() == protocol)
+                        .map(|(_, endpoint)| endpoint)
+                        .ok_or(Error::Reference)?;
+                    return Ok(endpoint
+                        .requires_bootstrap()
+                        .then(|| PhysicalBootstrapFrontier {
+                            endpoint: endpoint.clone(),
+                            path,
+                        }));
+                }
+                WireAction::DirectDynamic | WireAction::NoDial => {
+                    if index + 1 != branches.len() {
+                        return Err(Error::Reference);
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+        Err(Error::Reference)
     }
     pub fn proxy_kind(&self, subject: &str) -> Result<u8, Error> {
         let o = self.outbound(subject)?;
@@ -781,6 +865,93 @@ mod tests {
         }
     }
     #[test]
+    fn physical_bootstrap_is_independent_of_provider_dns_and_remote_hostname() {
+        let wire = serde_json::json!({"version":1,"graph":{"dns":{"servers":["192.0.2.53"]},"outbounds":[
+            {"tag":"remote","protocol":"shadowsocks","settings":{"servers":[{"address":"remote.invalid","port":443,"method":"aes-128-gcm","password":"fixture"}]},"proxySettings":{"tag":"leaf","transportLayer":true}},
+            {"tag":"leaf","protocol":"shadowsocks","settings":{"servers":[{"address":"Edge.invalid","port":8443,"method":"aes-128-gcm","password":"fixture"}]}}
+        ]}});
+        let intent = ProfileIntent::decode(&wire.to_string()).unwrap();
+        let graph = intent.validate().unwrap();
+        assert!(graph.egress().system_resolvers().is_empty());
+        assert!(graph.egress().requires_system_snapshot());
+        let requirements = graph.egress().physical_bootstrap();
+        assert_eq!(requirements.len(), 2);
+        assert!(
+            requirements
+                .iter()
+                .all(|r| r.subject() == "leaf" && r.endpoint().host() == "Edge.invalid")
+        );
+        assert_eq!(graph.egress().system_resolver_roles(), 4);
+        let frontier = intent
+            .physical_bootstrap_frontier("remote", WireNetwork::Udp, 80, &[false, false])
+            .unwrap()
+            .unwrap();
+        assert_eq!(frontier.endpoint().host(), "Edge.invalid");
+        assert_eq!(
+            frontier.endpoint().protocol(),
+            super::super::TransportProtocol::Udp
+        );
+        assert_eq!(
+            frontier
+                .path()
+                .iter()
+                .map(|step| step.0.as_str())
+                .collect::<Vec<_>>(),
+            ["remote", "leaf"]
+        );
+        assert!(
+            intent
+                .physical_bootstrap_frontier("remote", WireNetwork::Udp, 80, &[false])
+                .is_err()
+        );
+        assert!(
+            intent
+                .physical_bootstrap_frontier("remote", WireNetwork::Udp, 80, &[true, false])
+                .is_err()
+        );
+        assert!(
+            intent
+                .physical_bootstrap_frontier("remote", WireNetwork::Udp, 80, &[false, false, false])
+                .is_err()
+        );
+        let mut chained_mux = wire;
+        chained_mux["graph"]["outbounds"][1]["mux"] = serde_json::json!({"enabled":true,"concurrency":8,"xudpConcurrency":8,"xudpProxyUDP443":"skip"});
+        let intent = ProfileIntent::decode(&chained_mux.to_string()).unwrap();
+        // У leaf destination port443 (remote proxy), хотя user port80.
+        assert!(
+            intent
+                .physical_bootstrap_frontier("remote", WireNetwork::Udp, 80, &[false, false])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            intent
+                .physical_bootstrap_frontier("remote", WireNetwork::Udp, 80, &[false, true])
+                .is_err()
+        );
+    }
+    #[test]
+    fn physical_bootstrap_retains_long_path_and_rejects_over_budget() {
+        let outbounds: Vec<_> = (0..8).map(|index| {
+            let mut outbound = serde_json::json!({"tag":format!("p{index}"),"protocol":"shadowsocks","settings":{"servers":[{"address":"leaf.invalid","port":443,"method":"aes-128-gcm","password":"fixture"}]}});
+            if index < 7 { outbound["proxySettings"] = serde_json::json!({"tag":format!("p{}",index+1),"transportLayer":true}); }
+            outbound
+        }).collect();
+        let wire = serde_json::json!({"version":1,"graph":{"dns":{"servers":["192.0.2.53"]},"outbounds":outbounds}});
+        let intent = ProfileIntent::decode(&wire.to_string()).unwrap();
+        let frontier = intent
+            .physical_bootstrap_frontier("p0", WireNetwork::Tcp, 80, &[false; 8])
+            .unwrap()
+            .unwrap();
+        assert_eq!(frontier.path().len(), 8);
+        assert_eq!(frontier.path()[7].0, "p7");
+        assert!(
+            intent
+                .physical_bootstrap_frontier("p0", WireNetwork::Tcp, 80, &[false; 257])
+                .is_err()
+        );
+    }
+    #[test]
     fn closed_carrier_projection_preserves_raw_udp_and_exact_h3() {
         let wire = serde_json::json!({"version":1,"graph":{"outbounds":[
             {"tag":"ss","protocol":"shadowsocks","settings":{"servers":[{"address":"192.0.2.1","port":443,"method":"aes-128-gcm","password":"fixture"}]},"streamSettings":{"network":"grpc"}},
@@ -857,6 +1028,32 @@ mod tests {
             intent.write_sensitive(&mut bytes).unwrap();
             let decoded = ProfileIntent::decode(std::str::from_utf8(&bytes).unwrap()).unwrap();
             let original = super::super::validate_profile(profile).unwrap();
+            let roles = original.egress().system_resolver_roles();
+            assert_eq!(
+                roles & 2 != 0,
+                !original.egress().system_resolvers().is_empty()
+            );
+            assert_eq!(
+                roles & 4 != 0,
+                !original.egress().physical_bootstrap().is_empty()
+            );
+            for requirement in original.egress().physical_bootstrap() {
+                assert!(requirement.endpoint().requires_bootstrap());
+                assert!(
+                    original
+                        .egress()
+                        .physical()
+                        .contains(requirement.endpoint())
+                );
+                assert!(
+                    !original
+                        .egress()
+                        .chains()
+                        .iter()
+                        .any(|(from, _)| from == requirement.subject())
+                );
+            }
+
             for subject in original.subjects() {
                 let mut before = Vec::new();
                 let mut after = Vec::new();
