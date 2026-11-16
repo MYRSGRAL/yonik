@@ -102,30 +102,192 @@ const DNS_WIRE_REVIEWED_PATCH: Option<&str> =
 // Семантический contract отдельно от artifact pin. Новый DNS patchset должен
 // пройти root source review и обновить allowlist до trusted install.
 const PRODUCER_PATCH: &str = "6e6abdbdcedae5b7c4548e9225ae4f8531a4489b8788141a2b6b4cf64a083c7e";
-#[derive(Clone)]
-pub(crate) struct ImageContract {
-    image: [u8; 32],
-    dns_release: bool,
-    dns_wire: bool,
+// Отдельный review для CODEC4 отсутствует; Direct3 pin его не заменяет.
+const DNS_CODEC4_REVIEWED_PATCH: Option<&str> = None;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DnsSchema {
+    Codec3,
+    Codec4,
 }
-impl ImageContract {
-    pub(crate) fn check_dns_wire(&self, image: [u8; 32]) -> Result<(), RegistryError> {
-        self.check(image)?;
-        if !self.dns_wire {
+impl DnsSchema {
+    fn digest(self) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(match self {
+            Self::Codec3 => b"YONIK-DNS-V2-CODEC-3\0",
+            Self::Codec4 => b"YONIK-DNS-V2-CODEC-4\0",
+        })
+        .into()
+    }
+    pub(crate) fn current() -> Result<Self, RegistryError> {
+        use sha2::Digest;
+        let hash: [u8; 32] = sha2::Sha256::digest(crate::profile_channel::dns_v2::SCHEMA).into();
+        [Self::Codec3, Self::Codec4]
+            .into_iter()
+            .find(|s| s.digest() == hash)
+            .ok_or(RegistryError::Version)
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DnsContract {
+    Release,
+    Wire,
+}
+impl DnsContract {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Release => "direct-dns-consuming-close-join-v1",
+            Self::Wire => "direct-dns-bound-request-response-v1",
+        }
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DnsScope {
+    DirectUserDns,
+}
+#[derive(Clone)]
+struct DnsProvenance {
+    schema: DnsSchema,
+    contract: DnsContract,
+    scope: DnsScope,
+    source_patch: [u8; 32],
+    reviewed_patch: Option<[u8; 32]>,
+}
+impl DnsProvenance {
+    fn decode(
+        record: &DnsReleaseRecord,
+        contract: DnsContract,
+        patch: &str,
+        review3: Option<&str>,
+        review4: Option<&str>,
+    ) -> Result<Self, RegistryError> {
+        use sha2::Digest;
+        let contract_hash = format!(
+            "{:x}",
+            sha2::Sha256::digest(format!("{}\0", contract.name()).as_bytes())
+        );
+        if record.contract != contract.name()
+            || record.version != 1
+            || record.contract_sha256 != contract_hash
+        {
+            return Err(RegistryError::Version);
+        }
+        if record.schema_sha256.len() != 64
+            || !record
+                .schema_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(RegistryError::Version);
+        }
+        let schema = [DnsSchema::Codec3, DnsSchema::Codec4]
+            .into_iter()
+            .find(|s| Sha256::from_str(&record.schema_sha256).is_ok_and(|v| v.0 == s.digest()))
+            .ok_or(RegistryError::Version)?;
+        let source_patch = Sha256::from_str(patch)
+            .map_err(|_| RegistryError::Manifest)?
+            .0;
+        let review = match schema {
+            DnsSchema::Codec3 => review3,
+            DnsSchema::Codec4 => review4,
+        };
+        let reviewed_patch = review.filter(|p| *p == patch).map(|_| source_patch);
+        Ok(Self {
+            schema,
+            contract,
+            scope: DnsScope::DirectUserDns,
+            source_patch,
+            reviewed_patch,
+        })
+    }
+    fn check(&self, schema: DnsSchema, contract: DnsContract) -> Result<(), RegistryError> {
+        if self.schema != schema
+            || self.contract != contract
+            || self.scope != DnsScope::DirectUserDns
+            || self.reviewed_patch != Some(self.source_patch)
+        {
             return Err(RegistryError::Version);
         }
         Ok(())
     }
-    pub(crate) fn check_dns(&self, image: [u8; 32]) -> Result<(), RegistryError> {
-        self.check(image)?;
-        if !self.dns_release {
-            return Err(RegistryError::Version);
+}
+/// Opaque retained contract/scope/schema; constructor только из checked record.
+#[derive(Clone)]
+pub(crate) struct DnsCapability {
+    image: [u8; 32],
+    proof: DnsProvenance,
+}
+impl DnsCapability {
+    pub(crate) fn check_release(&self) -> Result<(), RegistryError> {
+        self.proof
+            .check(DnsSchema::current()?, DnsContract::Release)
+    }
+    pub(crate) fn check_wire(&self) -> Result<(), RegistryError> {
+        self.proof.check(DnsSchema::current()?, DnsContract::Wire)
+    }
+    fn bound(
+        &self,
+        image: [u8; 32],
+        schema: DnsSchema,
+        contract: DnsContract,
+    ) -> Result<(), RegistryError> {
+        if self.image != image {
+            return Err(RegistryError::HashMismatch);
         }
-        Ok(())
+        self.proof.check(schema, contract)
+    }
+}
+#[derive(Clone)]
+pub(crate) struct ImageContract {
+    image: [u8; 32],
+    udp_reviewed: bool,
+    dns_release: Option<DnsProvenance>,
+    dns_wire: Option<DnsProvenance>,
+}
+impl ImageContract {
+    #[cfg(test)]
+    pub(crate) fn check_dns_wire(&self, image: [u8; 32]) -> Result<(), RegistryError> {
+        self.dns_capability(image, DnsSchema::Codec3, DnsContract::Wire)
+            .map(|_| ())
+    }
+    #[cfg(test)]
+    pub(crate) fn check_dns(&self, image: [u8; 32]) -> Result<(), RegistryError> {
+        self.dns_capability(image, DnsSchema::Codec3, DnsContract::Release)
+            .map(|_| ())
+    }
+    pub(crate) fn dns_wire_channel(&self, image: [u8; 32]) -> Result<DnsCapability, RegistryError> {
+        self.dns_capability(image, DnsSchema::current()?, DnsContract::Wire)
+    }
+    pub(crate) fn dns_release_channel(
+        &self,
+        image: [u8; 32],
+    ) -> Result<DnsCapability, RegistryError> {
+        self.dns_capability(image, DnsSchema::current()?, DnsContract::Release)
+    }
+    fn dns_capability(
+        &self,
+        image: [u8; 32],
+        schema: DnsSchema,
+        contract: DnsContract,
+    ) -> Result<DnsCapability, RegistryError> {
+        let proof = match contract {
+            DnsContract::Release => &self.dns_release,
+            DnsContract::Wire => &self.dns_wire,
+        }
+        .as_ref()
+        .ok_or(RegistryError::Version)?
+        .clone();
+        let capability = DnsCapability {
+            image: self.image,
+            proof,
+        };
+        capability.bound(image, schema, contract)?;
+        Ok(capability)
     }
     pub(crate) fn check(&self, image: [u8; 32]) -> Result<(), RegistryError> {
         if self.image != image {
             Err(RegistryError::HashMismatch)
+        } else if !self.udp_reviewed {
+            Err(RegistryError::Version)
         } else {
             Ok(())
         }
@@ -175,40 +337,40 @@ impl ProducerRecord {
         if actual.0 != image.0 {
             return Err(RegistryError::HashMismatch);
         }
-        let dns_release = if let Some(record) = &self.dns_release {
-            use sha2::Digest;
-            let digest = |value: &[u8]| format!("{:x}", sha2::Sha256::digest(value));
-            if record.contract != "direct-dns-consuming-close-join-v1"
-                || record.version != 1
-                || record.contract_sha256 != digest(b"direct-dns-consuming-close-join-v1\0")
-                || record.schema_sha256 != digest(b"YONIK-DNS-V2-CODEC-3\0")
-            {
+        let dns_release = self
+            .dns_release
+            .as_ref()
+            .map(|r| {
+                DnsProvenance::decode(
+                    r,
+                    DnsContract::Release,
+                    &self.patch_sha256,
+                    reviewed_dns,
+                    DNS_CODEC4_REVIEWED_PATCH,
+                )
+            })
+            .transpose()?;
+        let dns_wire = self
+            .dns_wire
+            .as_ref()
+            .map(|r| {
+                DnsProvenance::decode(
+                    r,
+                    DnsContract::Wire,
+                    &self.patch_sha256,
+                    reviewed_wire,
+                    DNS_CODEC4_REVIEWED_PATCH,
+                )
+            })
+            .transpose()?;
+        if let (Some(a), Some(b)) = (&dns_release, &dns_wire) {
+            if a.schema != b.schema {
                 return Err(RegistryError::Version);
             }
-            reviewed_dns == Some(self.patch_sha256.as_str())
-        } else {
-            false
-        };
-        let dns_wire = if let Some(record) = &self.dns_wire {
-            use sha2::Digest;
-            if record.contract != "direct-dns-bound-request-response-v1"
-                || record.version != 1
-                || record.contract_sha256
-                    != format!(
-                        "{:x}",
-                        sha2::Sha256::digest(b"direct-dns-bound-request-response-v1\0")
-                    )
-                || record.schema_sha256
-                    != format!("{:x}", sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-3\0"))
-            {
-                return Err(RegistryError::Version);
-            }
-            reviewed_wire == Some(self.patch_sha256.as_str())
-        } else {
-            false
-        };
+        }
         Ok(ImageContract {
             image: image.0,
+            udp_reviewed: true,
             dns_release,
             dns_wire,
         })
@@ -233,6 +395,25 @@ fn fake_dns_record(image: [u8; 32]) -> ProducerRecord {
             "contract_sha256":format!("{:x}",sha2::Sha256::digest(b"direct-dns-consuming-close-join-v1\0")),
             "schema_sha256":format!("{:x}",sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-3\0"))}});
     serde_json::from_value(value).unwrap()
+}
+/// Явный injected review отдельного synthetic source4 record; это не Direct3 pin.
+#[cfg(test)]
+pub(crate) fn fake_dns4_image(image: [u8; 32]) -> ImageContract {
+    use sha2::Digest;
+    let patch = "44".repeat(32);
+    let record = |contract: DnsContract| {
+        let value = serde_json::json!({"contract":contract.name(),"version":1,
+            "contract_sha256":format!("{:x}",sha2::Sha256::digest(format!("{}\0",contract.name()).as_bytes())),
+            "schema_sha256":format!("{:x}",sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-4\0"))});
+        let record: DnsReleaseRecord = serde_json::from_value(value).unwrap();
+        DnsProvenance::decode(&record, contract, &patch, None, Some(&patch)).unwrap()
+    };
+    ImageContract {
+        image,
+        udp_reviewed: false,
+        dns_release: Some(record(DnsContract::Release)),
+        dns_wire: Some(record(DnsContract::Wire)),
+    }
 }
 #[cfg(test)]
 pub(crate) fn fake_dns_image(image: [u8; 32]) -> ImageContract {
@@ -553,6 +734,83 @@ fn validate_regular_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dns_schema_provenance_scope_image_optional_and_review_are_independent() {
+        use super::*;
+        let image = [17; 32];
+        let three = fake_dns_wire_image(image);
+        assert!(three.check(image).is_ok());
+        assert!(three.check_dns(image).is_ok());
+        assert!(three.check_dns_wire(image).is_ok());
+        assert!(three.dns_wire_channel(image).is_err());
+        assert!(three.dns_release_channel(image).is_err());
+        let four = fake_dns4_image(image);
+        assert!(four.check(image).is_err());
+        assert!(four.check_dns(image).is_err());
+        let wire = four.dns_wire_channel(image).unwrap();
+        assert!(wire.check_wire().is_ok());
+        assert!(wire.check_release().is_err());
+        assert!(
+            four.dns_release_channel(image)
+                .unwrap()
+                .check_release()
+                .is_ok()
+        );
+        assert!(four.dns_wire_channel([18; 32]).is_err());
+        assert!(four.dns_release_channel([18; 32]).is_err());
+        let mut optional = four.clone();
+        optional.dns_release = None;
+        assert!(optional.dns_wire_channel(image).is_ok());
+        assert!(optional.dns_release_channel(image).is_err());
+        optional.dns_release = four.dns_release.clone();
+        optional.dns_wire = None;
+        assert!(optional.dns_release_channel(image).is_ok());
+        assert!(optional.dns_wire_channel(image).is_err());
+        optional.dns_wire = optional.dns_release.clone();
+        assert!(optional.dns_wire_channel(image).is_err());
+        optional.dns_release.as_mut().unwrap().reviewed_patch = None;
+        assert!(optional.dns_release_channel(image).is_err());
+    }
+    #[test]
+    fn dns_schema_provenance_record4_without_review_mixed_unknown_and_hash_fail_closed() {
+        use super::*;
+        use sha2::Digest;
+        let image = Sha256([17; 32]);
+        let mut record = fake_dns_record(image.0);
+        record.dns_release.as_mut().unwrap().schema_sha256 =
+            format!("{:x}", sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-4\0"));
+        let parsed = record.validate(image).unwrap();
+        assert!(parsed.check(image.0).is_ok());
+        assert!(parsed.dns_release_channel(image.0).is_err());
+        let mut wire = record.dns_release.clone().unwrap();
+        wire.contract = DnsContract::Wire.name().into();
+        wire.contract_sha256 = format!(
+            "{:x}",
+            sha2::Sha256::digest(b"direct-dns-bound-request-response-v1\0")
+        );
+        wire.schema_sha256 = format!("{:x}", sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-3\0"));
+        record.dns_wire = Some(wire);
+        assert!(record.validate(image).is_err());
+        record.dns_wire = None;
+        for schema in [
+            "00".repeat(32),
+            format!("{:x}", sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-2\0")),
+        ] {
+            let mut bad = record.clone();
+            bad.dns_release.as_mut().unwrap().schema_sha256 = schema;
+            assert!(bad.validate(image).is_err());
+        }
+        for field in [0, 1, 2] {
+            let mut bad = record.clone();
+            let r = bad.dns_release.as_mut().unwrap();
+            match field {
+                0 => r.contract = "bootstrap-choice".into(),
+                1 => r.version = 2,
+                _ => r.contract_sha256 = "00".repeat(32),
+            }
+            assert!(bad.validate(image).is_err());
+        }
+    }
     #[test]
     fn reviewed_direct_dns_records_require_both_exact_contracts_and_patch() {
         use sha2::Digest;

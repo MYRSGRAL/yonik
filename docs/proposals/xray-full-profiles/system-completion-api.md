@@ -1298,6 +1298,21 @@ OS wrappers не исполнялись, public gates false, runtime acceptance 
 
 ### USER ProxiedLogical + Append: CODEC3 SOURCE/PURE cut
 
+CODEC4 schema-provenance prerequisite: `ImageContract` теперь удерживает separate
+optional DNS provenance (schema3/4, exact V1 contract, DirectUserDns scope,
+source patch и его exact review), не erased bool. `DnsCapability` не имеет
+public constructor: mint сверяет image и current descriptor schema, channel
+сохраняет capability вместе с exact launch и повторяет schema/contract check при
+wire/release use. System setup возвращает None для отсутствующей current-schema
+capability; fallback к descriptor1/2/3 отсутствует. Config/manifest/launch и
+consuming exec custody checks сохранены, current-image measurement не заявляется.
+Root53 reviewed Direct3 pins сохранены только как3. Optional record4 grammar
+распознаётся, но отдельный CODEC4 review pin None; mixed3/4 record отвергается.
+UDP eligibility независима от DNS. Positive pure fixtures inject-ят explicit
+synthetic record4 с другим source patch и отдельным review, без UDP authority;
+это не install approval и не reinterpretation Direct3 record. Bootstrap/Hosts
+root/context реализация остаётся следующим unit, public gates false.
+
 `dns_transport_binding` выводит из всего live checked bundle два разных target:
 logical resolver peer и actual numeric physical frontier. Последний следует
 carrier→nextInput через manifest path; Physical Reserve/SCM сверяет terminal

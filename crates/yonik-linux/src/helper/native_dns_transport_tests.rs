@@ -473,6 +473,18 @@ impl Driver {
         Ok(())
     }
     fn queue(&self, sequence: u64, kind: Operation, body: &[u8]) {
+        if kind == Operation::NumericAuthorize && self.numeric_fault.get() == NumericFault::Use {
+            // CODEC4 use2 требует Probe8. Пакуем valid control и повреждаем
+            // use после encoder, как foreign peer, сохраняя прежний class.
+            let mut valid = body.to_vec();
+            valid[14] = 1;
+            valid[15] = 1;
+            let mut packet = dns_packet(self.record, sequence, kind, &valid);
+            packet[128 + 14] = body[14];
+            packet[128 + 15] = body[15];
+            self.input.borrow_mut().push_back(packet);
+            return;
+        }
         self.input
             .borrow_mut()
             .push_back(dns_packet(self.record, sequence, kind, body));
@@ -688,7 +700,7 @@ impl Channel for Driver {
         if !self.fault.publishing() || self.fault == Fault::PublishNoAuthority {
             return Ok(None);
         }
-        let proof = super::super::registry::fake_dns_wire_image([17; 32]);
+        let proof = super::super::registry::fake_dns4_image([17; 32]);
         Ok(Some(VerifiedDnsWireProducer::mint(
             &proof,
             [17; 32],
@@ -704,7 +716,7 @@ impl Channel for Driver {
         if !self.fault.releasing() {
             return Ok(None);
         }
-        let proof = super::super::registry::fake_dns_image([17; 32]);
+        let proof = super::super::registry::fake_dns4_image([17; 32]);
         let mut record = record;
         if self.fault == Fault::ReleaseWrongLaunch {
             record.nonce[0] ^= 1;
@@ -1759,7 +1771,15 @@ fn dns_numeric_driver_invalid_binding_narrowing_and_authority_before_route() {
     ] {
         let (mut issuer, io) = numeric_fixture(fault, Duration::ZERO, false);
         run(&mut issuer, &io);
-        assert_eq!(statuses(&io).last(), Some(&(19, 2, 11)), "{fault:?}");
+        if fault == NumericFault::Use {
+            assert!(
+                !statuses(&io)
+                    .iter()
+                    .any(|(kind, status, _)| *kind == 19 && *status == 1)
+            );
+        } else {
+            assert_eq!(statuses(&io).last(), Some(&(19, 2, 11)), "{fault:?}");
+        }
         assert_eq!(issuer.authority.route_count, 4, "{fault:?}");
         assert_eq!(issuer.authority.live.len(), 4);
         assert!(!issuer.unknown);
@@ -2227,7 +2247,7 @@ fn dns_transport_driver_closed_socket_does_not_claim_durable_ticket_closed() {
 fn dns_transport_driver_dns_record_does_not_replace_image_config_manifest_binding() {
     let (issuer, _) = bundle_fixture(Mode::System, false);
     let record = issuer.record;
-    let proof = super::super::registry::fake_dns_image([17; 32]);
+    let proof = super::super::registry::fake_dns4_image([17; 32]);
     for (image, config, manifest) in [
         ([18; 32], record.binding.digest, record.manifest),
         ([17; 32], [18; 32], record.manifest),

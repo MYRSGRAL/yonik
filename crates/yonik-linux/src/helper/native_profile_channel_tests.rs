@@ -1,4 +1,69 @@
 use super::*;
+#[test]
+fn dns_schema_provenance_direct3_never_mints_descriptor4_channel() {
+    let issuer = issuer(Mode::Local);
+    let launch = issuer.record;
+    let record = super::super::registry::fake_dns_wire_image([17; 32]);
+    assert!(
+        VerifiedDnsWireProducer::mint(
+            &record,
+            [17; 32],
+            launch.binding.digest,
+            launch.manifest,
+            launch
+        )
+        .is_err()
+    );
+    assert!(
+        VerifiedDnsProducer::mint(
+            &record,
+            [17; 32],
+            launch.binding.digest,
+            launch.manifest,
+            launch
+        )
+        .is_err()
+    );
+}
+#[test]
+fn dns_schema_provenance_explicit_record4_channel_retains_exact_launch_and_image() {
+    for mode in [Mode::Local, Mode::System] {
+        let launch = issuer(mode).record;
+        let record = super::super::registry::fake_dns4_image([17; 32]);
+        let wire = VerifiedDnsWireProducer::mint(
+            &record,
+            [17; 32],
+            launch.binding.digest,
+            launch.manifest,
+            launch,
+        )
+        .unwrap();
+        let release = VerifiedDnsProducer::mint(
+            &record,
+            [17; 32],
+            launch.binding.digest,
+            launch.manifest,
+            launch,
+        )
+        .unwrap();
+        assert!(wire.bound(launch).is_ok());
+        assert!(release.bound(launch).is_ok());
+        let mut wrong = launch;
+        wrong.nonce[0] ^= 1;
+        assert!(wire.bound(wrong).is_err());
+        assert!(release.bound(wrong).is_err());
+        for (image, config, manifest) in [
+            ([18; 32], launch.binding.digest, launch.manifest),
+            ([17; 32], [18; 32], launch.manifest),
+            ([17; 32], launch.binding.digest, [18; 32]),
+        ] {
+            assert!(
+                VerifiedDnsWireProducer::mint(&record, image, config, manifest, launch).is_err()
+            );
+            assert!(VerifiedDnsProducer::mint(&record, image, config, manifest, launch).is_err());
+        }
+    }
+}
 use std::collections::BTreeSet;
 
 #[test]

@@ -1134,11 +1134,13 @@ pub(crate) struct VerifiedUdpProducer {
 /// Только protected installed record + retained consuming exec custody.
 /// Это не current-image measurement и не child receipt.
 pub(super) struct VerifiedDnsProducer {
+    capability: super::registry::DnsCapability,
     launch: LaunchRecord,
 }
 /// Отдельный audited producer contract: exact request/response actual bound peer.
 /// Consuming-close contract не создаёт этот token.
 pub(super) struct VerifiedDnsWireProducer {
+    capability: super::registry::DnsCapability,
     launch: LaunchRecord,
 }
 /// Отдельный protected source contract logical handler/stream → exchange →
@@ -1163,14 +1165,15 @@ impl VerifiedDnsWireProducer {
         manifest: [u8; 32],
         launch: LaunchRecord,
     ) -> Result<Self, ServiceError> {
-        proof.check_dns_wire(image).map_err(unavailable)?;
+        let capability = proof.dns_wire_channel(image).map_err(unavailable)?;
         launch.encode().map_err(unavailable)?;
         if config != launch.binding.digest || manifest != launch.manifest {
             return Err(ServiceError::Unavailable);
         }
-        Ok(Self { launch })
+        Ok(Self { launch, capability })
     }
     fn bound(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
+        self.capability.check_wire().map_err(unavailable)?;
         if self.launch != launch {
             return Err(ServiceError::Unavailable);
         }
@@ -1185,14 +1188,15 @@ impl VerifiedDnsProducer {
         manifest: [u8; 32],
         launch: LaunchRecord,
     ) -> Result<Self, ServiceError> {
-        proof.check_dns(image).map_err(unavailable)?;
+        let capability = proof.dns_release_channel(image).map_err(unavailable)?;
         launch.encode().map_err(unavailable)?;
         if config != launch.binding.digest || manifest != launch.manifest {
             return Err(ServiceError::Unavailable);
         }
-        Ok(Self { launch })
+        Ok(Self { launch, capability })
     }
     fn bound(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
+        self.capability.check_release().map_err(unavailable)?;
         if self.launch != launch {
             return Err(ServiceError::Unavailable);
         }
@@ -4144,7 +4148,7 @@ impl Channel for SystemChannel {
             .producer
             .as_ref()
             .ok_or(ServiceError::Unsupported)?;
-        if proof.check_dns_wire(self.peer.image_hash).is_err() {
+        if proof.dns_wire_channel(self.peer.image_hash).is_err() {
             return Ok(None);
         }
         Ok(Some(VerifiedDnsWireProducer::mint(
@@ -4165,11 +4169,16 @@ impl Channel for SystemChannel {
         }
         let cap = wire::Capsule::decode(self.capsule.bytes(), &self.peer.config_hash)
             .map_err(unavailable)?;
+        let proof = self
+            .peer
+            .producer
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?;
+        if proof.dns_release_channel(self.peer.image_hash).is_err() {
+            return Ok(None);
+        }
         Ok(Some(VerifiedDnsProducer::mint(
-            self.peer
-                .producer
-                .as_ref()
-                .ok_or(ServiceError::Unsupported)?,
+            proof,
             self.peer.image_hash,
             self.peer.config_hash,
             cap.manifest,
