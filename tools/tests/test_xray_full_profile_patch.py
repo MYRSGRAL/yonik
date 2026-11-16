@@ -30,6 +30,12 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertFalse(metadata["authority_issuer_connected"])
         self.assertTrue(metadata["system_tcp_proof_consumer_connected"])
         self.assertFalse(metadata["system_udp_association_proof_connected"])
+        self.assertTrue(metadata["udp_v2_codec_source"])
+        self.assertTrue(metadata["udp_v2_private_state_source"])
+        self.assertTrue(metadata["udp_v2_socks_guard_connected"])
+        self.assertFalse(metadata["udp_v2_actor_delivery_connected"])
+        self.assertFalse(metadata["udp_v2_consumer_ready"])
+        self.assertFalse(metadata["udp_v2_name_policy_parity"])
         self.assertTrue(metadata["dns_service_consumer_connected"])
         self.assertTrue(metadata["probe_service_consumer_connected"])
         self.assertTrue(metadata["snapshot_query_engine_connected"])
@@ -61,6 +67,7 @@ class FullProfilePatchTests(unittest.TestCase):
                     "common/yonikbroker/routing.go",
                     "app/proxyman/inbound/worker.go",
                     "proxy/socks/server.go",
+                    "proxy/socks/yonik_udp_v2_test.go",
                     "proxy/http/server.go",
                     "proxy/tun/handler.go",
                     "app/dispatcher/default.go",
@@ -124,6 +131,45 @@ class FullProfilePatchTests(unittest.TestCase):
         )
         self.assertNotIn("+++ b/app/dns/dns.go", patch)
         self.assertNotIn("+++ b/app/dns/nameserver.go", patch)
+
+    def test_udp_v2_source_and_rust_vectors_stay_closed_and_byte_exact(self) -> None:
+        metadata = json.loads((ADAPTER / "native-full-profile.json").read_text())
+        self.assertEqual(
+            metadata["udp_v2_rust_fixture_head"],
+            "d79a26fc0979b6fadb7aa01cf1f4d362565ada26",
+        )
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for fixture, member in (
+            ("udp-proof-v2-source-vectors.json", "profile-udp-proof-v2-source.json"),
+            ("udp-proof-v2-rust-d79a26f.json", "profile-udp-proof-v2-rust.json"),
+        ):
+            raw = (ADAPTER / "full-profile-fixtures" / fixture).read_bytes()
+            added = patch.split(f"+++ b/common/yonikbroker/{member}\n", 1)[1]
+            added = added.split("diff --git ", 1)[0]
+            embedded = (
+                "\n".join(
+                    line[1:] for line in added.splitlines() if line.startswith("+")
+                )
+                + "\n"
+            ).encode()
+            self.assertEqual(embedded, raw)
+        rust = json.loads(
+            (
+                ADAPTER / "full-profile-fixtures/udp-proof-v2-rust-d79a26f.json"
+            ).read_text()
+        )
+        bootstrap = bytes.fromhex(rust["bootstrap_hex"])
+        self.assertEqual(bootstrap[:8], b"YNKPF002")
+        self.assertEqual(struct.unpack_from("!HHH", bootstrap, 8), (2, 128, 1))
+        self.assertEqual(
+            bytes.fromhex(rust["ack_hex"]),
+            b"YNKPFA02" + hashlib.sha256(bootstrap).digest(),
+        )
+        self.assertEqual(len(rust["vectors"]), 10)
+        self.assertIn(
+            "profileHandshakeBeforeUDPFactory(svrSession, reader, conn", patch
+        )
+        self.assertIn('string(body[:8]) == "YNKPF002"', patch)
 
     def test_system_proof_fixture_is_embedded_byte_exact(self) -> None:
         fixture = ADAPTER / "full-profile-fixtures/system-proof-extension-v1.json"

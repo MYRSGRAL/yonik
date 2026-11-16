@@ -582,3 +582,65 @@ snapshot query engine описаны выше. Остаток P4: интегра
 policy, DNS outer/provider cache, authenticated resolver-peer/RRset endpoint
 handoff и отдельно утверждённое UDP issuer association binding.
 Gate остаётся false; full runtime acceptance не выполнялся.
+
+## UDP v2: первый закрытый Go source milestone
+
+Контракт — UDP v2 ba1/ceb в system-completion-api.md; exact counterpart
+`d79a26fc0979b6fadb7aa01cf1f4d362565ada26` (раздел729+). Это partial source,
+не installed consumer/runtime readiness. `receiveBootstrap` явно отвергает
+PF002 до ACK; Rust admission также остаётся v1. Local v2 не подключён.
+Frozen ABI260/четыре locators/launch records/runtime rights0 не менялись.
+
+Pure authenticated bootstrap consumer различает PF001/PFA01 и PF002/PFA02.
+PF002=128,version2,rights1; ACK40=YNKPFA02+SHA256 exact128. V1 bytes прежние.
+UDP prefix128: magic8,version1@8,length2@10,rights2@12,reserved0@14,
+binding80@16 (digest/session/invocation/generation/epoch),nonce32@96.
+Records (length/rights, G=Go,I=issuer): UCS192/1 G→I, UCA160/0 I→G,
+UAQ160/0 G→I,UAC192/1 I→G,UPQ160/0 G→I,URP256/0 I→G,
+UCM256/0 G→I,UMR192/0 I→G,UCQ160/0 I→G,UCR192/0 G→I.
+Magic каждого: YNK + указанное трёхбуквенное имя + 01. Поля/offsets совпадают
+с exact Rust fixture; decoder не аллоцирует, проверяет direction/rights/reserved.
+Cookie — opaque nonzero u64 (MAX допустим), остальные counters MAX запрещают.
+Control/packet ingress — IPv4 loopback; fingerprint ненулевой, flags0.
+
+`udp-proof-v2-rust-d79a26f.json` скопирован byte-exact и embedded как
+`profile-udp-proof-v2-rust.json`. Go проверяет все10 records/re-encode, PF002,
+ACK hash и whole-datagram fingerprint; `udp-proof-v2-source-vectors.json` —
+второй независимый Python corpus. Это DATA, не FD/owner/closure authority.
+
+`profileInitUDPBudget` требует private consumed System PF002/ADMIT binding,
+до flow operations резервирует32768 bytes из existing8MiB. Production его пока
+не вызывает. В shared ledger≤min(caps7,256) retained entries хранятся runtime
+и proof operation IDs/packet/permit/sequence, без eviction/reset/compaction.
+`c.operation` и state proof reservations используют общий cap/pending≤64.
+Association≤8, pair65536+65536+metadata2048=133120 резервируется до factory.
+Private injected receiver имеет только Receive/Close/Join, без FD/Write/Peek API.
+ConsumePermit эксклюзивен; проверяет actual peer/cookie/bound endpoint/flags,
+RCVBUF≤128KiB/GRO0/overflow и весь hash/header/length. Это проверка наблюдений
+будущего source-verified OS wrapper, не доказательство hard kernel queue bound.
+Matched не выдаёт user authority и не освобождает payload. Только terminal
+denial + явный RetirePayload либо close очищают буферы; следующий peek до этого
+закрыт. Close ждёт actual Receive и Join, повтор возвращает final result;
+ошибка сохраняет receiver/credit и sticky Unknown. Local Closed state сам по
+себе не публикует UCR/KnownClosed и не доказывает issuer/durable cleanup.
+
+Реальный `socks.Server.processTCP` выбирает `profileHandshakeBeforeUDPFactory`
+для System profile: native auth/address/TCP response helpers сохранены, но
+command3 вызывает `ProfileAdmitSOCKSUDPControl` ДО native handshake5 listener.
+Этот endpoint пока всегда Unsupported; даже nil control ACK не даёт success,
+child port/socket не создаются. Local legacy и SOCKS4/TCP проверены pure parity.
+
+Остаток перед readiness: actor control-only exchange и operation rendezvous,
+общий accounting всех channel/close operations, заранее reserved close IDs,
+6 FD credits/association и physical128/pending64 до SCM materialization;
+actual issuer FD delivery/inspection и exclusive OS receive/queue readbacks;
+provenance3 OPEN↔Consumed, verified private SourceFlow/UDP Known≤20ms/GRANT,
+separately credited downstream payload retirement, exact flow/durable retirement,
+GoDuplicateClosed receipt и supervisor Unknown custody. Никакой из этих
+недостающих proofs не заменён TCP owner, metadata cookie или session credential.
+
+Name-policy gap для root: d79 `udp_original` (native_profile_channel.rs:869+)
+использует resolver_name(false,true): lowercase, но `_`/final dot допускаются;
+runtime Destination::read/hostname иначе проверяет hostname. Go пока сохраняет
+runtime Destination constraints; name-policy parity до отдельного source ruling
+не объявляется. Record/ACK/fingerprint byte parity не снимает этот gate.
