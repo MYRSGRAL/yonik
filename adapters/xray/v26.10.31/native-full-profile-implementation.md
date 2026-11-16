@@ -880,7 +880,7 @@ bundle/PhysicalBind/append/Publish/WaiterBind, StubBind и numeric durable hando
 Internal `proxy/dns` subject остаётся Unsupported и вне текущих изменений.
 Global runtime/consumer/builder gates остаются false.
 
-## CODEC-2 и private DNS bundle consumer
+## Историческая база CODEC-2 и private DNS bundle consumer
 
 Canonical pin `a7a9544e233689659a5df5a39f90d01def4c3239`; corpus SHA256
 `10d798ffd45f7d250e4c3f38c02b9f394671d1f9ee4871cdcd39b9d042e59359`:
@@ -948,7 +948,7 @@ manifest resolver row. Service flow0/internal DNS/ambiguous resolver не пол
 
 ## DNS DirectSocket: Reserve → raw PhysicalBind → LogicalAck
 
-Canonical CODEC-2/corpus pin не изменён. Новый private consumer использует
+Первый cut использовал CODEC-2; текущий CODEC-3 pin указан ниже. Layouts прежние:
 Kind35/36 Exchange, отдельный Kind35/36 Physical, raw DNSPHY02/192 Kind52
 с одним SCM FD и kernel credentials на existing proof endpoint, Kind37,
 затем Kind38/39 Direct/revision1. Raw52 не получает Header128 или свой runtime
@@ -957,14 +957,14 @@ PhysicalAck считается от исходного Reserve send, включ�
 
 Production chain: classic UDP/TCP producer → native Handler.Dispatch actual
 chooser → ProfileDNSPrepareHandler/ForwardReady → Handler.Dial/internet.Dial →
-guardedSystemDial → ProfileDialPhysical → profileDNSDialDirect. ForwardReady
+guardedSystemDial → ProfileDialDNSDirect → profileDNSDialDirect. ForwardReady
 разрешает лишь terminal unmuxed numeric nonloopback DirectSocket metadata path;
 ProxiedLogical/hostname/loopback/chain/mux остаются Unsupported. Отдельный
 private factory context появляется после обоих Reserved ACK. USER/Probe grant,
 tag, session и исходный class3 root не заменяют resource/proof authority.
 
-Actual TCPConn/connected UDPConn поступает в broker до wrappers/crypto. Broker
-получает CLOEXEC duplicate через syscall.Conn/RawConn, проверяет kernel type,
+Actual raw TCP/connected UDP socket создаётся private consuming factory ниже.
+Broker получает единственный CLOEXEC duplicate до bind, проверяет kernel type,
 protocol, actual numeric connected peer, nonblocking и nonzero namespace cookie.
 Namespace сравнивается с retained actual accepted TCP source proof через
 SO_NETNS_COOKIE; Rust независимо проверяет retained stamp/peer/netns/route.
@@ -973,10 +973,10 @@ proof channel и retained source FD; Local/TUN/missing proof остаются Un
 новый bootstrap или capability не выдумывается. Pure tests используют private
 injected inspector/sender; OS wrappers только компилируются.
 
-System dialer для этого private UDP factory использует connected UDP вместо
-legacy unconnected PacketConnWrapper. Legacy ветвь сохраняется. Native
-socket settings/controllers проходят прежний protected producer path после
-reservation; returned raw socket не экспортируется downstream. Только после
+System dialer направляет этот cut в собственную TCP/connected UDP FD factory;
+legacy unconnected PacketConnWrapper остаётся только legacy path. Настроенные
+socket settings/controllers/source gateway и transport wrappers закрыты до
+factory/reservation. Raw socket не экспортируется downstream. Только после
 exact live PhysicalAck и LogicalAck публикуется закрытый net.Conn wrapper.
 Read/Write проверяют собственный query/bundle/root, source epoch, remaining,
 revision1 и cancel. Root/bundle renewal не продлевает старый physical proof.
@@ -1046,3 +1046,64 @@ neighbor isolation, proof/runtime exclusivity, repeated release и Unknown.
 Изменения UDP tests относятся только к accounting assertions; wire, namespace
 proof, R9/H1/mux cleanup и прочие transport features не меняются. Public gates
 по-прежнему false; этот correction не является runtime acceptance.
+
+## R41: consuming FD owner и canonical CODEC-3
+
+Canonical pin `e372dce6af2155335978b661e3969a2bdd68f29a`, corpus SHA256
+`1e597fdc11441209455c5c5ceafe85b4fbcd6a6756dfdae77ea0882149e83e88`.
+Go проверяет все86 positive/218 body negatives/17 envelope negatives; descriptor
+принимает только CODEC-3, включая отказ на корректный ACK для CODEC-1/2.
+Kinds/layouts, raw DNSPHY02/192, ABI260 и четыре locators не изменены.
+
+Семантический contract — `direct-dns-consuming-close-join-v1`, version1;
+SHA256(name+NUL) `bc4497a223eea1ff17c893b7d94e08d59f10a44082c0f17413fcd39b0f5a1974`.
+Schema SHA256 `8f5e499181cf4d94c66b04001a792b7974f29ad1b365c789a8a5088127df576b`.
+Эти значения — matching DATA, не authority. Нужен отдельный root-reviewed patch/
+image/toolchain/recipe pin и protected install record. Старый UDP contract DNS
+release не разрешает; DNS_REVIEWED_PATCH=None/public gates false сохраняются.
+Rust counterpart1ed52b1 принят по R42 SOURCE; actual Go/Rust runtime/pair не
+исполнялся. Pure fake issuer проверяет ordering, а не kernel/image proof.
+
+Произвольный `func(context.Context) net.Conn` больше не является DNS factory.
+`ProfileDialPhysical` отказывает DNS context до admission и callback.
+`internet.Dial` для private DNS обходит registered transports и принимает только
+пустые raw default settings; masks/TLS/Reality/custom protocol/socket/source
+settings/controllers отклоняются до effects. Это явный Unsupported, без замены
+на иной provider DNS. `guardedSystemDial` вызывает новый broker caller
+`ProfileDialDNSDirect(ctx,destination)`, у которого нет внешнего factory argument.
+
+Default factory — только AF_INET/AF_INET6 + SOCK_STREAM/IPPROTO_TCP либо connected
+SOCK_DGRAM/IPPROTO_UDP с SOCK_NONBLOCK|SOCK_CLOEXEC. Socket/connect/poll выполняются
+синхронно; новых goroutine/poller/Conn wrappers она не создаёт. Каждый созданный
+FD возвращается с retained product даже при setup/connect error. Один private
+`profileDNSOwnedFD` владеет syscall handle, один pre-bind F_DUPFD_CLOEXEC создаёт
+Go sender duplicate; дальнейший prepare/dup запрещён. Нет os.File/File/Fd/
+SyscallConn/ReaderFrom/WriterTo/Unwrap и exported embedded Conn. Адреса — immutable
+значения. Все aliases FD holder остаются внутри private reviewed producer;
+наружу выходит только закрытый guarded net.Conn facade.
+
+Nonblocking recv/send используют MSG_DONTWAIT, send — также MSG_NOSIGNAL;
+UDP truncation/partial send не превращается в новый полный payload retry.
+Poll ограничен20ms и исходным context/deadline. На каждого owner максимум один
+Read и один Write; все FD-bearing calls учтены. Stopping закрывает admission,
+отменяет context и join-ит эти операции перед consuming syscall close. Затем
+outer Close сохраняет прежний порядок actual owner → sender duplicate → outer
+task joins. Close result сохраняется ровно один раз, включая EINTR/uncertainty;
+повторного close по raw number нет. Любой error удерживает Unknown/custody и
+запрещает Retire RPC. Unusual fake Conn не является production proof: test hooks
+подменяют primitive IO только в pure tests; production constructor не принимает
+net.Conn или callback от caller.
+
+Основание redesign: pinned Go1.27.1 internal/poll FD.Close может отдать последний
+destroy readUnlock/writeUnlock, где error не возвращается Close caller. Даже
+nil arbitrary Conn.Close не доказывает consuming result/no aliases. Новая private
+factory не использует этот contract и не имеет скрытых net.Dialer tasks.
+
+Go production retirement сохраняет Proof4 → Resource3 → physical Reservation7
+→ parent Reservation7 → Exchange2 с exact отдельными ACK. Bundle Cancel8/route
+ticket release ждёт полного transport retirement; Resource ACK его не заменяет.
+Cleanup window фиксирован: не позже исходного physical expiry+1s/session;
+новый RPC его не продлевает. Late/Unknown ACK не возвращает custody/credits как
+KnownClosed; pending operations/replay tombstones остаются bounded. R39 scratch
+и FD2/pending12/64KiB owner credits не менялись. RRset/Waiter/Numeric/Append/
+Proxy/flow0/loopback здесь не включены, outer DNS answer guard остаётся deny.

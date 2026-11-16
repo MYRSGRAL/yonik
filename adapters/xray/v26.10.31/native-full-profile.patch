@@ -9658,11 +9658,18 @@ diff --git a/transport/internet/yonik_profile_transport_test.go b/transport/inte
 new file mode 100644
 --- /dev/null
 +++ b/transport/internet/yonik_profile_transport_test.go
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,80 @@
 +package internet
 +
 +import (
 +	"context"
++	xnet "github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/transport/internet/finalmask"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/reflect/protodesc"
++	"google.golang.org/protobuf/reflect/protoreflect"
++	"google.golang.org/protobuf/types/descriptorpb"
++	"google.golang.org/protobuf/types/dynamicpb"
 +	"io"
 +	"net"
 +	"testing"
@@ -9685,49 +9692,72 @@ new file mode 100644
 +		t.Fatal("unknown UDP connection accepted")
 +	}
 +}
++
++func TestYonikDNSDirectRawSettingsRejectsUnprovedWrappers(t *testing.T) {
++	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{Name: proto.String("dns-raw-test.proto"), Package: proto.String("xray.transport.internet.tcp"), Syntax: proto.String("proto3"), MessageType: []*descriptorpb.DescriptorProto{{Name: proto.String("Config"), Field: []*descriptorpb.FieldDescriptorProto{{Name: proto.String("active"), Number: proto.Int32(1), Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(), Type: descriptorpb.FieldDescriptorProto_TYPE_BOOL.Enum()}}}}}, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	empty := dynamicpb.NewMessage(file.Messages().Get(0))
++	base := MemoryStreamConfig{ProtocolName: "tcp", ProtocolSettings: empty}
++	// DATA-only пустые settings не являются Conn/FD proof; factory их не вызывает.
++	if !profileDNSRawSettings(nil) || !profileDNSRawSettings(&base) {
++		t.Fatal("raw default rejected")
++	}
++	for _, field := range []string{"protocol", "security", "security-data", "mask", "socket", "destination", "download", "quic", "active-protocol", "unknown-protocol", "nil-protocol"} {
++		t.Run(field, func(t *testing.T) {
++			settings := base
++			switch field {
++			case "protocol":
++				settings.ProtocolName = "grpc"
++			case "security":
++				settings.SecurityType = "tls"
++			case "security-data":
++				settings.SecuritySettings = struct{}{}
++			case "mask":
++				settings.FinalMask = new(finalmask.FinalMask)
++			case "socket":
++				settings.SocketSettings = &SocketConfig{}
++			case "destination":
++				settings.Destination = &xnet.Destination{}
++			case "download":
++				settings.DownloadSettings = &MemoryStreamConfig{}
++			case "quic":
++				settings.QuicParams = &QuicParams{}
++			case "active-protocol":
++				active := dynamicpb.NewMessage(empty.Descriptor())
++				active.Set(active.Descriptor().Fields().Get(0), protoreflect.ValueOfBool(true))
++				settings.ProtocolSettings = active
++			case "unknown-protocol":
++				settings.ProtocolSettings = &SocketConfig{}
++			case "nil-protocol":
++				settings.ProtocolSettings = (*dynamicpb.Message)(nil)
++			}
++			if profileDNSRawSettings(&settings) {
++				t.Fatal("unproved transport wrapper accepted")
++			}
++		})
++	}
++}
 diff --git a/transport/internet/system_dialer.go b/transport/internet/system_dialer.go
 --- a/transport/internet/system_dialer.go
 +++ b/transport/internet/system_dialer.go
-@@ -51,6 +51,32 @@
- 
- func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
- 	errors.LogDebug(ctx, "dialing to "+dest.String())
-+	// Classic DNS DirectSocket использует connected UDP: actual kernel peer
-+	// проверяется до DNSPHY02. Legacy packet factory остаётся прежней.
-+	if dest.Network == net.Network_UDP && hooks.ProfileDNSDirectFactory(ctx) {
-+		dialer := net.Dialer{LocalAddr: resolveSrcAddr(dest.Network, src)}
-+		dialer.Control = func(network, address string, raw syscall.RawConn) error {
-+			for _, ctl := range Controllers {
-+				if err := ctl(network, address, raw); err != nil {
-+					return err
-+				}
-+			}
-+			var result error
-+			err := raw.Control(func(fd uintptr) {
-+				if sockopt != nil {
-+					result = applyOutboundSocketOptions(network, address, fd, sockopt)
-+				}
-+			})
-+			if result != nil {
-+				return result
-+			}
-+			return err
-+		}
-+		if err := hooks.BeforeSocketDial(ctx); err != nil {
-+			return nil, err
-+		}
-+		return dialer.DialContext(ctx, "udp", dest.NetAddr())
-+	}
- 
- 	if dest.Network == net.Network_UDP {
- 		destAddr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
-@@ -257,6 +283,14 @@
+@@ -257,6 +257,23 @@
  
  // guardedSystemDial закрывает все вызовы effective dialer, включая Happy Eyeballs.
  func guardedSystemDial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
 +	if hooks.ProfileSession(ctx) {
 +		if _, ok := effectiveSystemDialer.(*DefaultSystemDialer); !ok {
 +			return nil, errors.New("full-profile alternative dialer denied")
++		}
++		if hooks.ProfileDNSDirectRequired(ctx) {
++			ControllersLock.Lock()
++			controlled := len(Controllers) != 0
++			ControllersLock.Unlock()
++			if src != nil && src != net.AnyIP || sockopt != nil || controlled {
++				return nil, hooks.ErrProfileUnsupported
++			}
++			return hooks.ProfileDialDNSDirect(ctx, dest)
 +		}
 +		return hooks.ProfileDialPhysical(ctx, dest, func(physical context.Context) (net.Conn, error) {
 +			return effectiveSystemDialer.Dial(physical, src, dest, sockopt)
@@ -9736,7 +9766,7 @@ diff --git a/transport/internet/system_dialer.go b/transport/internet/system_dia
  	if err := hooks.BeforeSocketDial(ctx); err != nil {
  		return nil, err
  	}
-@@ -268,13 +302,55 @@
+@@ -268,13 +285,55 @@
  	if err != nil {
  		return nil, err
  	}
@@ -12249,7 +12279,7 @@ new file mode 100644
 +}
 +func ProfileDialPhysical(ctx context.Context, dest xnet.Destination, runner func(context.Context) (net.Conn, error)) (net.Conn, error) {
 +	if profileDNSExchangeFrom(ctx) != nil {
-+		return profileDNSDialDirect(ctx, dest, runner)
++		return nil, ErrProfileUnsupported
 +	}
 +	// До pinned snapshot query/peer proof integration domain нельзя передать
 +	// net.Dialer: тот запустит live netgo resolver без service grant.
@@ -19877,7 +19907,16 @@ diff --git a/proxy/tun/handler.go b/proxy/tun/handler.go
 diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
 --- a/transport/internet/dialer.go
 +++ b/transport/internet/dialer.go
-@@ -11,6 +11,7 @@
+@@ -3,6 +3,8 @@
+ import (
+ 	"context"
+ 	"fmt"
++	"google.golang.org/protobuf/proto"
++	"reflect"
+ 	"strings"
+ 
+ 	"github.com/xtls/xray-core/common"
+@@ -11,6 +13,7 @@
  	"github.com/xtls/xray-core/common/net"
  	"github.com/xtls/xray-core/common/net/cnc"
  	"github.com/xtls/xray-core/common/session"
@@ -19885,17 +19924,50 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	"github.com/xtls/xray-core/features/dns"
  	"github.com/xtls/xray-core/features/outbound"
  	"github.com/xtls/xray-core/transport"
-@@ -46,6 +47,9 @@
+@@ -35,6 +38,26 @@
+ 
+ var transportDialerCache = make(map[string]dialFunc)
+ 
++// DirectSocket DNS не вызывает registered transports, masks или crypto tasks.
++// Допустим лишь default raw TCP config (он же default carrier UDP handler).
++func profileDNSRawSettings(s *MemoryStreamConfig) bool {
++	if s == nil {
++		return true
++	}
++	if s.ProtocolName != "tcp" || s.Destination != nil || s.SecurityType != "" || s.SecuritySettings != nil || s.FinalMask != nil || s.QuicParams != nil || s.SocketSettings != nil || s.DownloadSettings != nil {
++		return false
++	}
++	m, ok := s.ProtocolSettings.(proto.Message)
++	if !ok || m == nil {
++		return false
++	}
++	value := reflect.ValueOf(m)
++	if value.Kind() == reflect.Pointer && value.IsNil() {
++		return false
++	}
++	return m.ProtoReflect().Descriptor().FullName() == "xray.transport.internet.tcp.Config" && proto.Size(m) == 0
++}
++
+ // RegisterTransportDialer registers a Dialer with given name.
+ func RegisterTransportDialer(protocol string, dialer dialFunc) error {
+ 	if _, found := transportDialerCache[protocol]; found {
+@@ -46,6 +69,15 @@
  
  // Dial dials a internet connection towards the given destination.
  func Dial(ctx context.Context, dest net.Destination, streamSettings *MemoryStreamConfig) (stat.Connection, error) {
 +	if e := nativehooks.ProfileCheckDial(ctx, dest, false); e != nil {
 +		return nil, e
 +	}
++	if nativehooks.ProfileDNSDirectRequired(ctx) {
++		if !profileDNSRawSettings(streamSettings) {
++			return nil, nativehooks.ErrProfileUnsupported
++		}
++		return DialSystem(ctx, dest, nil)
++	}
  	if dest.Network == net.Network_TCP {
  		if streamSettings == nil {
  			s, err := ToMemoryStreamConfig(nil)
-@@ -56,11 +60,36 @@
+@@ -56,11 +88,36 @@
  		}
  
  		protocol := streamSettings.ProtocolName
@@ -19933,7 +20005,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	}
  
  	if dest.Network == net.Network_UDP {
-@@ -68,7 +97,14 @@
+@@ -68,7 +125,14 @@
  		if udpDialer == nil {
  			return nil, errors.New("UDP dialer not registered")
  		}
@@ -19949,7 +20021,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	}
  
  	return nil, errors.New("unknown network ", dest.Network)
-@@ -108,7 +144,12 @@
+@@ -108,7 +172,12 @@
  	return ips, err
  }
  
@@ -19963,7 +20035,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	errors.LogInfo(ctx, "redirecting request "+dst.String()+" to "+obt)
  	outbounds := session.OutboundsFromContext(ctx)
  	ctx = session.ContextWithOutbounds(ctx, append(outbounds, &session.Outbound{
-@@ -120,7 +161,11 @@
+@@ -120,7 +189,11 @@
  	ur, uw := pipe.New(pipe.OptionsFromContext(ctx)...)
  	dr, dw := pipe.New(pipe.OptionsFromContext(ctx)...)
  
@@ -19976,7 +20048,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	var readerOpt cnc.ConnectionOption
  	if dst.Network == net.Network_TCP {
  		readerOpt = cnc.ConnectionOutputMulti(dr)
-@@ -132,7 +177,7 @@
+@@ -132,7 +205,7 @@
  		readerOpt,
  		cnc.ConnectionOnClose(common.ChainedClosable{uw, dw}),
  	)
@@ -19985,7 +20057,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  }
  
  func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (*net.Destination, error) {
-@@ -224,6 +269,9 @@
+@@ -224,6 +297,9 @@
  
  // DialSystem calls system dialer to create a network connection.
  func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
@@ -19995,7 +20067,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	var src net.Address
  	outbounds := session.OutboundsFromContext(ctx)
  	var outboundName string
-@@ -242,6 +290,9 @@
+@@ -242,6 +318,9 @@
  	if sockopt == nil {
  		return guardedSystemDial(ctx, src, dest, sockopt)
  	}
@@ -20005,7 +20077,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  
  	if newDest, err := checkAddressPortStrategy(ctx, dest, sockopt); err == nil && newDest != nil {
  		errors.LogInfo(ctx, "replace destination with "+newDest.String())
-@@ -275,7 +326,7 @@
+@@ -275,7 +354,7 @@
  		if h == nil {
  			return nil, errors.New("there is no outbound handler for dialerProxy")
  		}
@@ -21731,21 +21803,21 @@ new file mode 100644
 +++ b/common/yonikbroker/profile-dns-v2-canonical.json
 @@ -0,0 +1,7758 @@
 +{
-+  "contract": "DNS_V2-CODEC-2",
++  "contract": "DNS_V2-CODEC-3",
 +  "packing": "stdlib struct.pack + explicit offset/type/value tables; no Rust encoder",
 +  "maximumDnsPayloadIsBoundsOnly": true,
 +  "negotiations": [
 +    {
 +      "mode": 1,
 +      "launchHex": "594e4b4c4f433031000100c00000000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e900000000000000000000002a000000000000000003030303030303030303030303030303030303030303030303030303030303030000000000000000",
-+      "descriptorHex": "444e534e454730320002011000000000594e4b4c4f433031000100c00000000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e900000000000000000000002a0000000000000000030303030303030303030303030303030303030303030303030303030303030300000000000000007b2975158f31a515488251dab5abf956c1921b1548562cd64b95da0a506375cb0004000b00800000004000400040010001000000000000000000000000000000",
-+      "ackHex": "444e5341434b3032fb922e79dc9cfa7f6fb4745618076694131574a7d9cb8008d9c8ce0146962415"
++      "descriptorHex": "444e534e454730320002011000000000594e4b4c4f433031000100c00000000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e900000000000000000000002a0000000000000000030303030303030303030303030303030303030303030303030303030303030300000000000000008f5e499181cf4d94c66b04001a792b7974f29ad1b365c789a8a5088127df576b0004000b00800000004000400040010001000000000000000000000000000000",
++      "ackHex": "444e5341434b3032b2b00bd10014e8f91c2ec35d22e07f9144ded561c731219d95286ba669c263a1"
 +    },
 +    {
 +      "mode": 2,
 +      "launchHex": "594e4b4558543031000100c00001000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e9000007d2000000000000002a000000000000002b03030303030303030303030303030303030303030303030303030303030303030000000000000000",
-+      "descriptorHex": "444e534e454730320002011000000000594e4b4558543031000100c00001000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e9000007d2000000000000002a000000000000002b030303030303030303030303030303030303030303030303030303030303030300000000000000007b2975158f31a515488251dab5abf956c1921b1548562cd64b95da0a506375cb0004000b00800000004000400040010001000000000000000000000000000000",
-+      "ackHex": "444e5341434b30322e1c286a295962fb1875b77f2bf5a4eb4b8a2c76962e3f6ea558f6680fcd9386"
++      "descriptorHex": "444e534e454730320002011000000000594e4b4558543031000100c00001000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e9000007d2000000000000002a000000000000002b030303030303030303030303030303030303030303030303030303030303030300000000000000008f5e499181cf4d94c66b04001a792b7974f29ad1b365c789a8a5088127df576b0004000b00800000004000400040010001000000000000000000000000000000",
++      "ackHex": "444e5341434b303252797dd9470993c56fdc48242c80cb50cdb10e0f3558b8b848d8a05f905cc345"
 +    }
 +  ],
 +  "vectors": [
@@ -30286,7 +30358,7 @@ new file mode 100644
 +	be.PutUint16(out[8:], 2)
 +	be.PutUint16(out[10:], 272)
 +	copy(out[16:], launch)
-+	hash := sha256.Sum256([]byte("YONIK-DNS-V2-CODEC-2\x00"))
++	hash := sha256.Sum256([]byte("YONIK-DNS-V2-CODEC-3\x00"))
 +	copy(out[208:], hash[:])
 +	for _, v := range [][2]uint16{{240, 4}, {242, 11}, {248, 64}, {250, 64}, {252, 64}, {254, 256}, {256, 256}} {
 +		be.PutUint16(out[v[0]:], v[1])
@@ -30982,7 +31054,7 @@ new file mode 100644
 +func TestProfileDNSV2CanonicalBodies(t *testing.T) {
 +	raw := profileDNSV2Golden
 +	var e error
-+	if sha256.Sum256(raw) != [32]byte{0x10, 0xd7, 0x98, 0xff, 0xd4, 0x5f, 0x7d, 0x25, 0x0e, 0x4c, 0x3f, 0x38, 0xc0, 0x2b, 0x9f, 0x39, 0x46, 0x71, 0xd1, 0xf9, 0xee, 0x48, 0x71, 0xcd, 0xcd, 0x39, 0xb9, 0xd0, 0x42, 0xe5, 0x93, 0x59} {
++	if sha256.Sum256(raw) != [32]byte{0x1e, 0x59, 0x7f, 0xdc, 0x11, 0x44, 0x12, 0x09, 0x45, 0x5c, 0x5c, 0x5c, 0xea, 0xfe, 0x85, 0xb4, 0xfb, 0xcd, 0x6a, 0x67, 0x56, 0xdf, 0xda, 0xe7, 0x7e, 0xa0, 0x88, 0x21, 0x49, 0xe8, 0x3e, 0x88} {
 +		t.Fatal("canonical corpus pin")
 +	}
 +	var corpus struct {
@@ -31056,7 +31128,7 @@ diff --git a/common/yonikbroker/profile_dns_bundle_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_bundle_linux.go
-@@ -0,0 +1,939 @@
+@@ -0,0 +1,947 @@
 +//go:build linux
 +
 +package nativehooks
@@ -31556,7 +31628,7 @@ new file mode 100644
 +	}
 +}
 +func (c *profileFlowControl) dnsRelease(b *profileDNSBundle) {
-+	if b.released || b.unknown || !b.closed || b.pending != nil || b.id != 0 && !b.closeAck {
++	if b.released || b.unknown || !b.closed || b.pending != nil || b.id != 0 && !b.closeAck || !c.dnsDirectReleasedForBundle(b) {
 +		return
 +	}
 +	b.released = true
@@ -31747,6 +31819,10 @@ new file mode 100644
 +				if b.closeAck {
 +					return errProfile
 +				}
++				if until, ok := c.dnsDirectBundleCleanupWindow(b); ok && !c.clock().Before(until) {
++					c.dnsUnknown(b)
++					return errProfile
++				}
 +				b.closeAck = true
 +			}
 +			c.dnsRelease(b)
@@ -31788,7 +31864,11 @@ new file mode 100644
 +				}
 +			}
 +		}
-+		if b.closed && b.id != 0 && !b.closeSent {
++		if b.closed && b.id != 0 && !b.closeSent && c.dnsDirectReleasedForBundle(b) {
++			if until, ok := c.dnsDirectBundleCleanupWindow(b); ok && !c.clock().Before(until) {
++				c.dnsUnknown(b)
++				continue
++			}
 +			seq, e := c.dnsCancel(8, b.id)
 +			if e != nil {
 +				c.dnsUnknown(b)
@@ -32000,7 +32080,7 @@ diff --git a/common/yonikbroker/profile_dns_bundle_linux_test.go b/common/yonikb
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_bundle_linux_test.go
-@@ -0,0 +1,735 @@
+@@ -0,0 +1,737 @@
 +//go:build linux
 +
 +package nativehooks
@@ -32434,7 +32514,7 @@ new file mode 100644
 +		t.Fatal("invalid lease lost custody or published authority")
 +	}
 +}
-+func TestProfileDNSBundleCanonicalNegotiationRejectsSchemaOne(t *testing.T) {
++func TestProfileDNSBundleCanonicalNegotiationRejectsLegacySchemas(t *testing.T) {
 +	var corpus struct {
 +		Negotiations []struct{ LaunchHex, DescriptorHex, AckHex string }
 +	}
@@ -32448,12 +32528,14 @@ new file mode 100644
 +			t.Fatal(e)
 +		}
 +		descriptor, _ := hex.DecodeString(v.DescriptorHex)
-+		old := sha256.Sum256([]byte("YONIK-DNS-V2-CODEC-1\x00"))
-+		copy(descriptor[208:], old[:])
-+		h := sha256.Sum256(descriptor)
-+		ack := append([]byte("DNSACK02"), h[:]...)
-+		if profileDNSV2Negotiate(r, descriptor, ack, 0, 0) {
-+			t.Fatal("schema1 downgraded CODEC2")
++		for _, schema := range []string{"YONIK-DNS-V2-CODEC-1\x00", "YONIK-DNS-V2-CODEC-2\x00"} {
++			old := sha256.Sum256([]byte(schema))
++			copy(descriptor[208:], old[:])
++			h := sha256.Sum256(descriptor)
++			ack := append([]byte("DNSACK02"), h[:]...)
++			if profileDNSV2Negotiate(r, descriptor, ack, 0, 0) {
++				t.Fatal("legacy schema downgraded CODEC3", schema)
++			}
 +		}
 +	}
 +}
@@ -32740,7 +32822,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_linux_test.go b/common/yonikb
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux_test.go
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,1108 @@
 +//go:build linux
 +
 +package nativehooks
@@ -32749,16 +32831,78 @@ new file mode 100644
 +	"context"
 +	"errors"
 +	xnet "github.com/xtls/xray-core/common/net"
++	"golang.org/x/sys/unix"
 +	"net"
++	"reflect"
 +	"strconv"
 +	"sync"
 +	"testing"
 +	"time"
 +)
 +
++func TestProfileDNSFactoryGenericRunnerDeniedBeforeAdmission(t *testing.T) {
++	f, ctx, target := dnsBundleFixture(t, 1)
++	b, op := dnsAcquirePure(t, f, ctx)
++	if err := f.c.accept(dnsBundleReply(op, 41, 1)); err != nil {
++		t.Fatal(err)
++	}
++	// Даже injected private IO не делает generic runner допустимым.
++	done := make(chan error, 1)
++	go func() {
++		_, err := ProfileDialPhysical(dnsUse(b), target, func(context.Context) (net.Conn, error) {
++			t.Error("generic factory executed")
++			return &dnsDirectFakeConn{}, nil
++		})
++		done <- err
++	}()
++	select {
++	case request := <-f.p.flowQueue:
++		f.c.abort(request)
++		<-done
++		t.Fatal("generic net.Conn factory admitted before ownership proof")
++	case err := <-done:
++		if !errors.Is(err, ErrProfileUnsupported) {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("no admission result")
++	}
++}
++func TestProfileDNSFactoryPublishedConnDoesNotExposeUnderlyingAlias(t *testing.T) {
++	h := dnsDirectStart(t, 6, nil, nil)
++	conn := h.ready(t)
++	defer conn.Close()
++	value := reflect.ValueOf(conn).Elem()
++	for i := 0; i < value.NumField(); i++ {
++		if value.Field(i).CanInterface() {
++			if _, ok := value.Field(i).Interface().(net.Conn); ok {
++				t.Fatal("published Conn exposes underlying alias")
++			}
++		}
++	}
++}
++
++func TestProfileDNSFactoryAbsentPrivateContextCannotOpen(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	target := xnet.TCPDestination(xnet.ParseAddress("192.0.2.53"), 53)
++	for _, ctx := range []context.Context{nil, context.Background(), context.WithValue(f.p.ctx, profileContextKey{}, f.p)} {
++		if conn, err := ProfileDialDNSDirect(ctx, target); err == nil || conn != nil {
++			t.Fatal("missing private query/bundle admitted")
++		}
++	}
++	if f.c.dnsDirectUsed != 0 || len(f.writes) != 0 {
++		t.Fatal("absent proof had admission effects")
++	}
++}
++
 +func TestProfileDNSDirectActualCallerReservesBeforeFactory(t *testing.T) {
 +	f, ctx, target := dnsBundleFixture(t, 1)
-+	f.p.dnsDirectIO = &profileDNSDirectIO{duplicate: func(net.Conn, profileDestinationValue) (profileProofFD, error) { return &proofFakeFD{}, nil }, send: func([]byte, profileProofFD) error { return nil }}
++	f.p.dnsDirectIO = &profileDNSDirectIO{create: func(context.Context, profileDestinationValue) (*profileDNSOwnedSocket, error) {
++		t.Error("factory before Reserve ACK")
++		return nil, errProfile
++	}, duplicate: func(*profileDNSOwnedSocket, profileDestinationValue) (profileProofFD, error) {
++		return &proofFakeFD{}, nil
++	}, send: func([]byte, profileProofFD) error { return nil }}
 +	b, op := dnsAcquirePure(t, f, ctx)
 +	if err := f.c.accept(dnsBundleReply(op, 41, 1)); err != nil {
 +		t.Fatal(err)
@@ -32767,7 +32911,7 @@ new file mode 100644
 +	child, cancel := context.WithCancel(dnsUse(b))
 +	defer cancel()
 +	go func() {
-+		_, err := ProfileDialPhysical(child, target, func(context.Context) (net.Conn, error) { t.Error("factory before Reserve ACK"); return nil, errProfile })
++		_, err := ProfileDialDNSDirect(child, target)
 +		done <- err
 +	}()
 +	select {
@@ -32793,6 +32937,8 @@ new file mode 100644
 +	closeRelease                chan struct{}
 +	readEntered                 chan struct{}
 +	readRelease                 chan struct{}
++	writeEntered                chan struct{}
++	writeRelease                chan struct{}
 +	readDeadline, writeDeadline time.Time
 +}
 +
@@ -32827,8 +32973,12 @@ new file mode 100644
 +
 +func (c *dnsDirectFakeConn) Write(b []byte) (int, error) {
 +	c.mu.Lock()
-+	defer c.mu.Unlock()
 +	c.writes++
++	c.mu.Unlock()
++	if c.writeEntered != nil {
++		close(c.writeEntered)
++		<-c.writeRelease
++	}
 +	return len(b), nil
 +}
 +func (c *dnsDirectFakeConn) Close() error {
@@ -32883,7 +33033,26 @@ new file mode 100644
 +func dnsDirectStartBundle(t *testing.T, f *flowFixture, b *profileDNSBundle, target xnet.Destination, inspectError error, block <-chan struct{}) *dnsDirectHarness {
 +	t.Helper()
 +	h := &dnsDirectHarness{f: f, b: b, ctx: dnsUse(b), conn: &dnsDirectFakeConn{}, fd: &proofFakeFD{}, done: make(chan dnsDirectResult, 1), factory: make(chan struct{}), proof: make(chan []byte, 1)}
-+	f.p.dnsDirectIO = &profileDNSDirectIO{duplicate: func(net.Conn, profileDestinationValue) (profileProofFD, error) { return h.fd, inspectError }, send: func(raw []byte, fd profileProofFD) error {
++	f.p.dnsDirectIO = &profileDNSDirectIO{create: func(factory context.Context, want profileDestinationValue) (*profileDNSOwnedSocket, error) {
++		if !ProfileDNSDirectFactory(factory) {
++			return nil, errProfile
++		}
++		close(h.factory)
++		if block != nil {
++			<-block
++		}
++		owner := factory.Value(profileDNSFactoryKey{}).(*profileDNSDirect)
++		life, cancel := context.WithCancel(owner.ctx)
++		return &profileDNSOwnedSocket{ctx: life, cancel: cancel, destination: want, fd: &proofFakeFD{}, readIO: h.conn.Read, writeIO: h.conn.Write, closeFD: h.conn.Close, waitIO: func(context.Context, bool, time.Time) error { return errProfile }}, nil
++	}, duplicate: func(socket *profileDNSOwnedSocket, _ profileDestinationValue) (profileProofFD, error) {
++		socket.mu.Lock()
++		defer socket.mu.Unlock()
++		if socket.prepared {
++			return nil, errProfile
++		}
++		socket.prepared = true
++		return h.fd, inspectError
++	}, send: func(raw []byte, fd profileProofFD) error {
 +		if fd != h.fd || !profileDNSV2Envelope(f.p.admission.launch, raw, false, 1, 1, 0) {
 +			return errProfile
 +		}
@@ -32891,16 +33060,7 @@ new file mode 100644
 +		return nil
 +	}}
 +	go func() {
-+		conn, err := ProfileDialPhysical(h.ctx, target, func(factory context.Context) (net.Conn, error) {
-+			if !ProfileDNSDirectFactory(factory) {
-+				return nil, errProfile
-+			}
-+			close(h.factory)
-+			if block != nil {
-+				<-block
-+			}
-+			return h.conn, nil
-+		})
++		conn, err := ProfileDialDNSDirect(h.ctx, target)
 +		h.done <- dnsDirectResult{conn, err}
 +	}()
 +	return h
@@ -33172,7 +33332,10 @@ new file mode 100644
 +			if err := f.c.accept(dnsBundleReply(op, 41, 1)); err != nil {
 +				t.Fatal(err)
 +			}
-+			f.p.dnsDirectIO = &profileDNSDirectIO{duplicate: func(net.Conn, profileDestinationValue) (profileProofFD, error) {
++			f.p.dnsDirectIO = &profileDNSDirectIO{create: func(context.Context, profileDestinationValue) (*profileDNSOwnedSocket, error) {
++				t.Error("factory before shared credit")
++				return nil, errProfile
++			}, duplicate: func(*profileDNSOwnedSocket, profileDestinationValue) (profileProofFD, error) {
 +				t.Error("inspect after exhausted credit")
 +				return nil, errProfile
 +			}, send: func([]byte, profileProofFD) error { t.Error("SCM after exhausted credit"); return errProfile }}
@@ -33191,10 +33354,7 @@ new file mode 100644
 +				f.c.udpBudget = &profileUDPBudget{fdSlots: 63}
 +			}
 +			before := f.c.buffered
-+			_, err := ProfileDialPhysical(dnsUse(b), target, func(context.Context) (net.Conn, error) {
-+				t.Error("factory before shared credit")
-+				return nil, errProfile
-+			})
++			_, err := ProfileDialDNSDirect(dnsUse(b), target)
 +			if err == nil || f.c.dnsDirectUsed != 0 || f.c.buffered != before {
 +				t.Fatal("overflow allocated/published transport")
 +			}
@@ -33231,7 +33391,7 @@ new file mode 100644
 +	h := dnsDirectStart(t, 6, nil, nil)
 +	conn := h.ready(t)
 +	defer conn.Close()
-+	_, err := ProfileDialPhysical(h.ctx, xnet.TCPDestination(xnet.ParseAddress("192.0.2.53"), 53), func(context.Context) (net.Conn, error) { t.Error("duplicate query factory"); return nil, errProfile })
++	_, err := ProfileDialDNSDirect(h.ctx, xnet.TCPDestination(xnet.ParseAddress("192.0.2.53"), 53))
 +	if err == nil {
 +		t.Fatal("same query reopened Exchange")
 +	}
@@ -33335,7 +33495,8 @@ new file mode 100644
 +	if err := conn.SetDeadline(deadline.Add(time.Hour)); err != nil {
 +		t.Fatal(err)
 +	}
-+	if !h.conn.readDeadline.Equal(deadline) || !h.conn.writeDeadline.Equal(deadline) {
++	socket := h.f.c.dnsDirect[0].conn
++	if !socket.readDeadline.Equal(deadline) || !socket.writeDeadline.Equal(deadline) {
 +		t.Fatal("caller extended proof deadline")
 +	}
 +	earlier := deadline.Add(-time.Millisecond)
@@ -33345,13 +33506,13 @@ new file mode 100644
 +	if _, err := conn.Write([]byte("query")); err != nil {
 +		t.Fatal(err)
 +	}
-+	if !h.conn.writeDeadline.Equal(earlier) {
++	if !socket.writeDeadline.Equal(earlier) {
 +		t.Fatal("write lost stricter caller deadline")
 +	}
 +	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
 +		t.Fatal(err)
 +	}
-+	if !h.conn.writeDeadline.Equal(deadline) {
++	if !socket.writeDeadline.Equal(deadline) {
 +		t.Fatal("zero deadline removed proof fence")
 +	}
 +}
@@ -33363,7 +33524,7 @@ new file mode 100644
 +			source := &proofFakeFD{}
 +			// Та же независимая kernel-fact comparison, что default production IO;
 +			// metadata/cookie от issuer не являются namespace proof.
-+			inspect := func(net.Conn, profileDestinationValue) (profileProofFD, error) {
++			inspect := func(*profileDNSOwnedSocket, profileDestinationValue) (profileProofFD, error) {
 +				var retained profileProofFD = source
 +				if control == "missing" {
 +					retained = nil
@@ -33503,11 +33664,278 @@ new file mode 100644
 +	default:
 +	}
 +}
++
++func TestProfileDNSFactoryBlockedWriteJoinsBeforeFDClosureAndRetire(t *testing.T) {
++	h := dnsDirectStart(t, 6, nil, nil)
++	conn := h.ready(t)
++	h.conn.writeEntered = make(chan struct{})
++	h.conn.writeRelease = make(chan struct{})
++	written := make(chan error, 1)
++	go func() { _, err := conn.Write([]byte("query")); written <- err }()
++	<-h.conn.writeEntered
++	if _, err := conn.Write([]byte("concurrent")); err == nil {
++		t.Fatal("unbounded same-direction owner")
++	}
++	done := make(chan error, 1)
++	go func() { done <- conn.Close() }()
++	owner := h.f.c.dnsDirect[0]
++	<-owner.ctx.Done()
++	before := len(h.f.writes)
++	if err := h.f.c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	if owner.localDone || owner.released || h.conn.closes != 0 || len(h.f.writes) != before {
++		t.Fatal("release/FD close before blocked Write join")
++	}
++	select {
++	case <-done:
++		t.Fatal("Close before Write join")
++	default:
++	}
++	close(h.conn.writeRelease)
++	<-written
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++	if !owner.localDone || h.conn.closes != 1 || h.fd.calls != 1 {
++		t.Fatal("missing consuming close after join")
++	}
++	if err := h.f.c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	last := h.f.writes[len(h.f.writes)-1]
++	if last.kind != 45 || last.body[2] != 4 {
++		t.Fatal("first release is not Proof Retire")
++	}
++}
++func TestProfileDNSFactoryPartialCloseIsStickyAndCannotSendReceipt(t *testing.T) {
++	for _, which := range []string{"socket", "duplicate"} {
++		t.Run(which, func(t *testing.T) {
++			h := dnsDirectStart(t, 6, nil, nil)
++			conn := h.ready(t)
++			if which == "socket" {
++				h.conn.closeError = errors.New("uncertain consuming socket close")
++			} else {
++				h.fd.result = errors.New("uncertain duplicate close")
++			}
++			before := len(h.f.writes)
++			err := conn.Close()
++			if err == nil {
++				t.Fatal("partial close became KnownClosed")
++			}
++			if repeated := conn.Close(); repeated != err {
++				t.Fatal("Close retried/replaced retained outcome")
++			}
++			if err = h.f.c.tick(); err != nil {
++				t.Fatal(err)
++			}
++			owner := h.f.c.dnsDirect[0]
++			if len(h.f.writes) != before || !owner.unknown || owner.released || h.conn.closes != 1 || h.fd.calls != 1 {
++				t.Fatal("Unknown emitted receipt or retried close")
++			}
++		})
++	}
++}
++func TestProfileDNSFactoryCancelWritableWaitDoesNotRetryPayload(t *testing.T) {
++	h := dnsDirectStart(t, 17, nil, nil)
++	conn := h.ready(t)
++	socket := h.f.c.dnsDirect[0].conn
++	entered, release := make(chan struct{}), make(chan struct{})
++	attempts := 0
++	socket.writeIO = func([]byte) (int, error) { attempts++; return 0, unix.EAGAIN }
++	socket.waitIO = func(context.Context, bool, time.Time) error { close(entered); <-release; return nil }
++	done := make(chan error, 1)
++	go func() { _, err := conn.Write([]byte("query")); done <- err }()
++	<-entered
++	closing := make(chan error, 1)
++	go func() { closing <- conn.Close() }()
++	<-h.f.c.dnsDirect[0].ctx.Done()
++	close(release)
++	if err := <-done; err == nil {
++		t.Fatal("canceled send succeeded")
++	}
++	if err := <-closing; err != nil {
++		t.Fatal(err)
++	}
++	if attempts != 1 {
++		t.Fatal("retried payload after canceled writable wait")
++	}
++}
++
++type dnsNoKernelFD struct{ calls int }
++
++func (f *dnsNoKernelFD) Close() error                 { return nil }
++func (f *dnsNoKernelFD) withFD(func(int) error) error { f.calls++; return errProfile }
++func TestProfileDNSFactoryNoDupOrSyscallConnAfterBind(t *testing.T) {
++	h := dnsDirectStart(t, 6, nil, nil)
++	conn := h.ready(t)
++	defer conn.Close()
++	for _, name := range []string{"File", "Fd", "SyscallConn", "Unwrap", "ProfilePacketConn"} {
++		if _, ok := reflect.TypeOf(conn).MethodByName(name); ok {
++			t.Fatal("raw alias method exposed", name)
++		}
++	}
++	socket := h.f.c.dnsDirect[0].conn
++	closedFD := &dnsNoKernelFD{}
++	socket.fd = closedFD
++	if _, err := profileDNSDuplicateDirect(socket, socket.destination); err == nil || closedFD.calls != 0 {
++		t.Fatal("post-bind duplicate reached kernel callback")
++	}
++}
++
++func TestProfileDNSFactoryBundleCancelWaitsForTransportRetirement(t *testing.T) {
++	h := dnsDirectStart(t, 6, nil, nil)
++	conn := h.ready(t)
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++	h.f.c.mu.Lock()
++	h.f.c.dnsClose(h.b)
++	h.f.c.mu.Unlock()
++	if err := h.f.c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	for _, packet := range h.f.writes {
++		if packet.kind == 47 && packet.body[2] == 8 {
++			t.Fatal("bundle route tickets canceled before Proof/Resource retirement")
++		}
++	}
++	if h.b.released {
++		t.Fatal("bundle credits released while transport owns custody")
++	}
++}
++
++func TestProfileDNSFactoryConsumingPrimitiveRetainsResultAndNeverRetries(t *testing.T) {
++	for _, failure := range []bool{false, true} {
++		calls := 0
++		fd := &profileDNSOwnedFD{number: 71, closeRaw: func(number int) error {
++			calls++
++			if number != 71 {
++				t.Fatal("FD changed")
++			}
++			if failure {
++				return unix.EINTR
++			}
++			return nil
++		}}
++		first := fd.Close()
++		second := fd.Close()
++		if calls != 1 || first != second || (first != nil) != failure {
++			t.Fatal("consuming close result/retry mismatch")
++		}
++		used := false
++		if err := fd.withFD(func(int) error { used = true; return nil }); err == nil || used {
++			t.Fatal("closed/uncertain numeric FD reused")
++		}
++	}
++}
++func dnsFactoryRetired(op *profileOperation, status byte) profilePacket {
++	body := make([]byte, 40)
++	be.PutUint16(body, 2)
++	body[2], body[3] = status, op.body[2]
++	be.PutUint64(body[8:], u64(op.body, 8))
++	be.PutUint64(body[16:], u64(op.body, 16))
++	be.PutUint64(body[32:], op.sequence)
++	if status == 1 {
++		body[28] = 1
++	} else {
++		be.PutUint16(body[26:], 1)
++	}
++	return profilePacket{kind: 46, reply: op.sequence, body: body}
++}
++func TestProfileDNSFactoryCodec3RetirementPairKeepsRouteBarrier(t *testing.T) {
++	for _, unknown := range []bool{false, true} {
++		t.Run(strconv.FormatBool(unknown), func(t *testing.T) {
++			h := dnsDirectStart(t, 6, nil, nil)
++			conn := h.ready(t)
++			if err := conn.Close(); err != nil {
++				t.Fatal(err)
++			}
++			h.f.c.mu.Lock()
++			h.f.c.dnsClose(h.b)
++			h.f.c.mu.Unlock()
++			owner := h.f.c.dnsDirect[0]
++			for step := 0; step < 5; step++ {
++				if err := h.f.c.tick(); err != nil {
++					t.Fatal(err)
++				}
++				op := owner.requests[owner.used-1]
++				if op.kind == 47 && op.body[2] == 8 {
++					t.Fatal("route release overtook physical custody")
++				}
++				reply := dnsCancelAck(op.sequence, u64(op.body, 8))
++				if op.kind == 45 {
++					status := byte(1)
++					if unknown && op.body[2] == 3 {
++						status = 3
++					}
++					reply = dnsFactoryRetired(op, status)
++				}
++				if err := h.f.c.accept(reply); err != nil {
++					t.Fatal(err)
++				}
++				if unknown && step == 1 {
++					if err := h.f.c.tick(); err != nil {
++						t.Fatal(err)
++					}
++					if !owner.unknown || owner.released || h.b.closeSent || h.b.released || h.f.c.dnsHopCredits == 0 {
++						t.Fatal("Unknown resource released route/credits")
++					}
++					return
++				}
++			}
++			if err := h.f.c.tick(); err != nil {
++				t.Fatal(err)
++			}
++			if !owner.released || !h.b.closeSent || h.b.released {
++				t.Fatal("separate route ACK barrier missing")
++			}
++			if err := h.f.c.accept(dnsCancelAck(h.b.closeSequence, h.b.id)); err != nil {
++				t.Fatal(err)
++			}
++			if !h.b.released || h.f.c.dnsHopCredits != 0 || h.f.c.dnsFDUsed != profileRXFD {
++				t.Fatal("complete pair did not release exact credits")
++			}
++		})
++	}
++}
++func TestProfileDNSFactoryCleanupWindowDoesNotExtendOrAcceptLateACK(t *testing.T) {
++	h := dnsDirectStart(t, 6, nil, nil)
++	conn := h.ready(t)
++	owner := h.f.c.dnsDirect[0]
++	original := owner.cleanupDeadline
++	h.f.now = owner.deadline.Add(200 * time.Millisecond)
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := h.f.c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	op := owner.requests[owner.used-1]
++	if op.kind != 45 || op.body[2] != 4 || op.deadline != original {
++		t.Fatal("cleanup window reset by RPC")
++	}
++	if err := h.f.c.accept(dnsFactoryRetired(op, 1)); err != nil {
++		t.Fatal(err)
++	}
++	h.f.now = h.f.now.Add(100 * time.Millisecond)
++	if err := h.f.c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	op = owner.requests[owner.used-1]
++	if op.deadline != original {
++		t.Fatal("Resource retry extended cleanup")
++	}
++	h.f.now = original
++	if err := h.f.c.accept(dnsFactoryRetired(op, 1)); err == nil || !owner.unknown || owner.released {
++		t.Fatal("late cleanup ACK became KnownClosed")
++	}
++}
 diff --git a/common/yonikbroker/profile_dns_direct_linux.go b/common/yonikbroker/profile_dns_direct_linux.go
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux.go
-@@ -0,0 +1,859 @@
+@@ -0,0 +1,1286 @@
 +//go:build linux
 +
 +package nativehooks
@@ -33515,10 +33943,11 @@ new file mode 100644
 +import (
 +	"context"
 +	"errors"
++	"io"
 +	"net"
 +	"net/netip"
++	"strconv"
 +	"sync"
-+	"syscall"
 +	"time"
 +
 +	xnet "github.com/xtls/xray-core/common/net"
@@ -33528,8 +33957,360 @@ new file mode 100644
 +const profileDNSDirectCredit = 64 * 1024
 +const profileDNSDirectPending = 12
 +
++// FD принадлежит только этому owner; нет os.File, Fd, File или SyscallConn.
++// Ошибка consuming close сохраняется, числовой FD повторно не закрывается.
++type profileDNSOwnedFD struct {
++	mu       sync.Mutex
++	number   int
++	closed   bool
++	result   error
++	closeRaw func(int) error
++}
++
++func profileDNSOwnFD(number int) *profileDNSOwnedFD {
++	return &profileDNSOwnedFD{number: number, closeRaw: unix.Close}
++}
++
++func (f *profileDNSOwnedFD) withFD(fn func(int) error) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.closed {
++		return net.ErrClosed
++	}
++	return fn(f.number)
++}
++func (f *profileDNSOwnedFD) Close() error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if !f.closed {
++		f.closed = true
++		if f.closeRaw == nil {
++			f.result = ErrProfileCleanupUnknown
++		} else {
++			f.result = f.closeRaw(f.number)
++		}
++	}
++	return f.result
++}
++
++type profileDNSOwnedAddress struct{ network, address string }
++
++func (a profileDNSOwnedAddress) Network() string { return a.network }
++func (a profileDNSOwnedAddress) String() string  { return a.address }
++
++// Sealed factory product. Production constructor ниже устанавливает только
++// nonblocking syscalls; callbacks здесь — закрытая dependency injection seam.
++// Ни arbitrary net.Conn, ни его Close не становятся consuming/join proof.
++type profileDNSOwnedSocket struct {
++	mu                          sync.Mutex
++	tasks                       sync.WaitGroup
++	once                        sync.Once
++	ctx                         context.Context
++	cancel                      context.CancelFunc
++	closing, prepared           bool
++	readActive, writeActive     bool
++	result                      error
++	fd                          profileProofFD
++	destination                 profileDestinationValue
++	local, remote               net.Addr
++	readDeadline, writeDeadline time.Time
++	readIO, writeIO             func([]byte) (int, error)
++	waitIO                      func(context.Context, bool, time.Time) error
++	closeFD                     func() error
++}
++
++func (s *profileDNSOwnedSocket) LocalAddr() net.Addr  { return s.local }
++func (s *profileDNSOwnedSocket) RemoteAddr() net.Addr { return s.remote }
++func (s *profileDNSOwnedSocket) begin(write bool) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closing || s.ctx.Err() != nil {
++		return net.ErrClosed
++	}
++	if write {
++		if s.writeActive {
++			return errProfileFlowBusy
++		}
++		s.writeActive = true
++	} else {
++		if s.readActive {
++			return errProfileFlowBusy
++		}
++		s.readActive = true
++	}
++	s.tasks.Add(1)
++	return nil
++}
++func (s *profileDNSOwnedSocket) end(write bool) {
++	s.mu.Lock()
++	if write {
++		s.writeActive = false
++	} else {
++		s.readActive = false
++	}
++	s.mu.Unlock()
++	s.tasks.Done()
++}
++func (s *profileDNSOwnedSocket) deadline(write bool) (time.Time, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closing || s.ctx.Err() != nil {
++		return time.Time{}, net.ErrClosed
++	}
++	deadline := s.readDeadline
++	if write {
++		deadline = s.writeDeadline
++	}
++	if d, ok := s.ctx.Deadline(); ok && (deadline.IsZero() || d.Before(deadline)) {
++		deadline = d
++	}
++	if !deadline.IsZero() && !time.Now().Before(deadline) {
++		return deadline, context.DeadlineExceeded
++	}
++	return deadline, nil
++}
++func (s *profileDNSOwnedSocket) operate(b []byte, write bool) (int, error) {
++	if err := s.begin(write); err != nil {
++		return 0, err
++	}
++	defer s.end(write)
++	for {
++		deadline, err := s.deadline(write)
++		if err != nil {
++			return 0, err
++		}
++		if len(b) == 0 {
++			return 0, nil
++		}
++		var n int
++		if write {
++			n, err = s.writeIO(b)
++		} else {
++			n, err = s.readIO(b)
++		}
++		if n < 0 {
++			n = 0
++		}
++		if n > len(b) {
++			return 0, errProfile
++		}
++		if n > 0 {
++			if write && n != len(b) && err == nil {
++				err = io.ErrShortWrite
++			}
++			return n, err
++		}
++		if err == unix.EINTR {
++			continue
++		}
++		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
++			if err = s.waitIO(s.ctx, write, deadline); err != nil {
++				return 0, err
++			}
++			continue
++		}
++		if !write && err == nil {
++			err = io.EOF
++		}
++		return n, err
++	}
++}
++func (s *profileDNSOwnedSocket) Read(b []byte) (int, error)  { return s.operate(b, false) }
++func (s *profileDNSOwnedSocket) Write(b []byte) (int, error) { return s.operate(b, true) }
++func (s *profileDNSOwnedSocket) SetDeadline(d time.Time) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closing {
++		return net.ErrClosed
++	}
++	s.readDeadline, s.writeDeadline = d, d
++	return nil
++}
++func (s *profileDNSOwnedSocket) SetReadDeadline(d time.Time) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closing {
++		return net.ErrClosed
++	}
++	s.readDeadline = d
++	return nil
++}
++func (s *profileDNSOwnedSocket) SetWriteDeadline(d time.Time) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closing {
++		return net.ErrClosed
++	}
++	s.writeDeadline = d
++	return nil
++}
++func (s *profileDNSOwnedSocket) Close() error {
++	s.once.Do(func() {
++		s.mu.Lock()
++		s.closing = true
++		if s.cancel != nil {
++			s.cancel()
++		}
++		s.mu.Unlock()
++		// Default syscalls nonblocking, poll slices≤20ms. Нет hidden Conn owners;
++		// все active operations завершаются до единственного consuming raw close.
++		s.tasks.Wait()
++		if s.closeFD == nil {
++			s.result = ErrProfileCleanupUnknown
++		} else {
++			s.result = s.closeFD()
++		}
++	})
++	return s.result
++}
++func profileDNSWaitOwned(fd profileProofFD, ctx context.Context, write bool, deadline time.Time) error {
++	if ctx.Err() != nil {
++		return ctx.Err()
++	}
++	wait := 20 * time.Millisecond
++	if d, ok := ctx.Deadline(); ok && (deadline.IsZero() || d.Before(deadline)) {
++		deadline = d
++	}
++	if !deadline.IsZero() {
++		left := time.Until(deadline)
++		if left <= 0 {
++			return context.DeadlineExceeded
++		}
++		if left < wait {
++			wait = left
++		}
++	}
++	return fd.withFD(func(n int) error {
++		event := int16(unix.POLLIN)
++		if write {
++			event = unix.POLLOUT
++		}
++		fds := [1]unix.PollFd{{Fd: int32(n), Events: event}}
++		_, err := unix.Poll(fds[:], int((wait+time.Millisecond-1)/time.Millisecond))
++		if err == unix.EINTR {
++			return nil
++		}
++		if err != nil || fds[0].Revents&unix.POLLNVAL != 0 {
++			return errors.Join(errProfile, err)
++		}
++		return nil
++	})
++}
++
++// Exhaustive native factory: numeric IPv4/IPv6, TCP/connected UDP only.
++// Socket возвращается с custody даже при setup/connect error; нет Dialer
++// goroutines, RawConn/File aliases, external controllers или crypto wrappers.
++func profileDNSCreateOwnedSocket(ctx context.Context, want profileDestinationValue) (*profileDNSOwnedSocket, error) {
++	t, _ := ctx.Value(profileDNSFactoryKey{}).(*profileDNSDirect)
++	if t == nil || want != t.destination || !ProfileDNSDirectFactory(ctx) {
++		return nil, errProfile
++	}
++	ip, err := netip.ParseAddr(want.address)
++	if err != nil || !want.valid() || ip.IsLoopback() || want.family == 3 {
++		return nil, ErrProfileUnsupported
++	}
++	domain := unix.AF_INET
++	var peer unix.Sockaddr
++	if want.family == 4 {
++		peer = &unix.SockaddrInet4{Port: int(want.port), Addr: ip.As4()}
++	} else if want.family == 6 {
++		domain = unix.AF_INET6
++		peer = &unix.SockaddrInet6{Port: int(want.port), Addr: ip.As16()}
++	} else {
++		return nil, ErrProfileUnsupported
++	}
++	typ, protocol := unix.SOCK_STREAM, unix.IPPROTO_TCP
++	network := "tcp"
++	if want.network == 17 {
++		typ, protocol, network = unix.SOCK_DGRAM, unix.IPPROTO_UDP, "udp"
++	} else if want.network != 6 {
++		return nil, ErrProfileUnsupported
++	}
++	n, err := unix.Socket(domain, typ|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, protocol)
++	if n < 0 {
++		return nil, errors.Join(errProfile, err)
++	}
++	fd := profileDNSOwnFD(n)
++	life, cancel := context.WithCancel(t.ctx)
++	s := &profileDNSOwnedSocket{ctx: life, cancel: cancel, fd: fd, destination: want, remote: profileDNSOwnedAddress{network, net.JoinHostPort(want.address, strconv.Itoa(int(want.port)))}, closeFD: fd.Close}
++	s.waitIO = func(c context.Context, w bool, d time.Time) error { return profileDNSWaitOwned(fd, c, w, d) }
++	s.readIO = func(b []byte) (size int, result error) {
++		result = fd.withFD(func(number int) error {
++			flags := unix.MSG_DONTWAIT
++			if want.network == 17 {
++				flags |= unix.MSG_TRUNC
++			}
++			size, _, result = unix.Recvfrom(number, b, flags)
++			return result
++		})
++		return
++	}
++	s.writeIO = func(b []byte) (size int, result error) {
++		result = fd.withFD(func(number int) error {
++			size, result = unix.SendmsgN(number, b, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++			return result
++		})
++		return
++	}
++	if err != nil {
++		return s, err
++	}
++	if domain == unix.AF_INET6 {
++		if err = unix.SetsockoptInt(n, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1); err != nil {
++			return s, err
++		}
++	}
++	if want.network == 6 {
++		// Прежние DefaultSystemDialer TCP defaults, без external sockopt callbacks.
++		for _, option := range [][3]int{{unix.IPPROTO_TCP, unix.TCP_NODELAY, 1}, {unix.SOL_SOCKET, unix.SO_KEEPALIVE, 1}, {unix.IPPROTO_TCP, unix.TCP_KEEPIDLE, 45}, {unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, 45}} {
++			if err = unix.SetsockoptInt(n, option[0], option[1], option[2]); err != nil {
++				return s, err
++			}
++		}
++	}
++	if !ProfileDNSDirectFactory(ctx) {
++		return s, errProfile
++	}
++	err = unix.Connect(n, peer)
++	if err == unix.EINPROGRESS || err == unix.EALREADY || err == unix.EINTR {
++		for {
++			if err = s.waitIO(ctx, true, time.Time{}); err != nil {
++				return s, err
++			}
++			code, e := unix.GetsockoptInt(n, unix.SOL_SOCKET, unix.SO_ERROR)
++			if e != nil {
++				return s, e
++			}
++			if unix.Errno(code) == unix.EINPROGRESS || unix.Errno(code) == unix.EALREADY {
++				continue
++			}
++			if code != 0 {
++				return s, unix.Errno(code)
++			}
++			if _, err = unix.Getpeername(n); err == unix.ENOTCONN {
++				continue
++			}
++			break
++		}
++	}
++	if err != nil {
++		return s, err
++	}
++	local, err := unix.Getsockname(n)
++	if err != nil {
++		return s, err
++	}
++	address, err := profileSockaddrValue(local)
++	if err != nil {
++		return s, err
++	}
++	s.local = profileDNSOwnedAddress{network, net.JoinHostPort(address.address, strconv.Itoa(int(address.port)))}
++	return s, nil
++}
++
 +type profileDNSDirectIO struct {
-+	duplicate func(net.Conn, profileDestinationValue) (profileProofFD, error)
++	create    func(context.Context, profileDestinationValue) (*profileDNSOwnedSocket, error)
++	duplicate func(*profileDNSOwnedSocket, profileDestinationValue) (profileProofFD, error)
 +	send      func([]byte, profileProofFD) error
 +}
 +type profileDNSDirectRPC struct {
@@ -33552,13 +34333,22 @@ new file mode 100644
 +	revision                                                            uint64
 +	epoch                                                               uint64
 +	deadline                                                            time.Time
-+	conn                                                                net.Conn
++	cleanupDeadline                                                     time.Time
++	conn                                                                *profileDNSOwnedSocket
 +	duplicate                                                           profileProofFD
 +	factory, closed, localDone, unknown, released                       bool
 +	localError                                                          error
 +	io                                                                  profileDNSDirectIO
 +}
 +type profileDNSFactoryKey struct{}
++
++func ProfileDNSDirectRequired(ctx context.Context) bool { return profileDNSExchangeFrom(ctx) != nil }
++
++// Никакого caller-supplied Conn/factory. Raw resource создаётся только private
++// consuming factory, после reservations; injected IO используется pure tests.
++func ProfileDialDNSDirect(ctx context.Context, target xnet.Destination) (net.Conn, error) {
++	return profileDNSDialDirect(ctx, target)
++}
 +
 +func ProfileDNSDirectFactory(ctx context.Context) bool {
 +	if ctx == nil {
@@ -33571,6 +34361,9 @@ new file mode 100644
 +// Только terminal DirectSocket без mux, bootstrap, domain и loopback stub.
 +// Проверка не создаёт resource authority; runner получает отдельный private key.
 +func profileDNSDirectShape(ctx context.Context, target xnet.Destination) (*profileDNSBundle, error) {
++	if ctx == nil {
++		return nil, ErrProfileUnsupported
++	}
 +	p := profileRuntime(ctx)
 +	use, ok := ctx.Value(profileDNSBundleKey{}).(profileDNSBundleUse)
 +	value, err := profileValue(target)
@@ -33605,7 +34398,7 @@ new file mode 100644
 +	}
 +	pending := c.profilePendingUsed() + profileDNSDirectPending
 +	fds := c.profileFDUsed() + 2
-+	if !c.dnsBundleLive(b) || ctx.Err() != nil || io.duplicate == nil || io.send == nil || c.dnsDirectUsed >= len(c.dnsDirect) || pending > min(int(c.manifest.caps[3]), 64) || fds > 64 || c.buffered+c.manifest.memoryCredit+profileDNSDirectCredit > uint64(c.manifest.caps[4]) || !c.dnsReserveHistory(profileDNSDirectPending) {
++	if !c.dnsBundleLive(b) || ctx.Err() != nil || io.create == nil || io.duplicate == nil || io.send == nil || c.dnsDirectUsed >= len(c.dnsDirect) || pending > min(int(c.manifest.caps[3]), 64) || fds > 64 || c.buffered+c.manifest.memoryCredit+profileDNSDirectCredit > uint64(c.manifest.caps[4]) || !c.dnsReserveHistory(profileDNSDirectPending) {
 +		return nil, errProfileFlowBusy
 +	}
 +	// Сначала общие credits и retained slot, затем contexts/body/factory.
@@ -33613,7 +34406,11 @@ new file mode 100644
 +	c.dnsFDUsed += 2
 +	c.buffered += profileDNSDirectCredit
 +	child, cancel := context.WithDeadline(ctx, b.deadline)
-+	t := &profileDNSDirect{bundle: b, ctx: child, cancel: cancel, destination: b.exchange.target, deadline: b.deadline, io: io, epoch: b.exchange.query.runtime.admission.launch.epoch}
++	cleanupDeadline := b.deadline.Add(time.Second)
++	if c.sessionDeadline.Before(cleanupDeadline) {
++		cleanupDeadline = c.sessionDeadline
++	}
++	t := &profileDNSDirect{bundle: b, ctx: child, cancel: cancel, destination: b.exchange.target, deadline: b.deadline, cleanupDeadline: cleanupDeadline, io: io, epoch: b.exchange.query.runtime.admission.launch.epoch}
 +	b.exchange.query.refs++
 +	c.dnsDirect[c.dnsDirectUsed] = t
 +	c.dnsDirectUsed++
@@ -33685,11 +34482,17 @@ new file mode 100644
 +	op.deadline = t.deadline
 +	if op.dnsDirect.cleanup {
 +		op.deadline = op.sent.Add(time.Second)
++		if t.cleanupDeadline.Before(op.deadline) {
++			op.deadline = t.cleanupDeadline
++		}
 +	}
 +	if !op.dnsDirect.cleanup && t.bundle.deadline.Before(op.deadline) {
 +		op.deadline = t.bundle.deadline
 +	}
 +	if !op.sent.Before(op.deadline) {
++		if op.dnsDirect.cleanup {
++			t.unknown = true
++		}
 +		c.dnsNotify(op, errProfile)
 +		return nil
 +	}
@@ -33739,7 +34542,7 @@ new file mode 100644
 +		for _, op := range t.requests[:t.used] {
 +			r := op.dnsDirect
 +			if f.reply == r.cancelSequence && r.cancelSequence != 0 && f.kind == 48 {
-+				if r.cancelAck || f.body[2] != 1 || u64(f.body, 8) != op.sequence {
++				if r.cancelAck || f.body[2] != 1 || u64(f.body, 8) != op.sequence || !c.clock().Before(t.cleanupDeadline) {
 +					t.unknown = true
 +					return true, errProfile
 +				}
@@ -33807,6 +34610,14 @@ new file mode 100644
 +				if deadline.Before(t.deadline) {
 +					t.deadline = deadline
 +				}
++				if f.kind == 37 {
++					until := t.deadline.Add(time.Second)
++					if until.Before(t.cleanupDeadline) {
++						t.cleanupDeadline = until
++					}
++				}
++			} else if !c.clock().Before(op.deadline) || !c.clock().Before(t.cleanupDeadline) {
++				valid = false
 +			}
 +			if !valid {
 +				t.unknown = true
@@ -33883,7 +34694,7 @@ new file mode 100644
 +
 +// DirectSocket production caller: только private bundle → authenticated
 +// reservation → raw FD proof → LogicalAck. Runner никогда не получает grant API.
-+func profileDNSDialDirect(ctx context.Context, target xnet.Destination, runner func(context.Context) (net.Conn, error)) (net.Conn, error) {
++func profileDNSDialDirect(ctx context.Context, target xnet.Destination) (net.Conn, error) {
 +	b, err := profileDNSDirectShape(ctx, target)
 +	if err != nil {
 +		return nil, err
@@ -33898,7 +34709,7 @@ new file mode 100644
 +		if source == nil {
 +			return nil, ErrProfileUnsupported
 +		}
-+		io = &profileDNSDirectIO{duplicate: func(conn net.Conn, want profileDestinationValue) (profileProofFD, error) {
++		io = &profileDNSDirectIO{create: profileDNSCreateOwnedSocket, duplicate: func(conn *profileDNSOwnedSocket, want profileDestinationValue) (profileProofFD, error) {
 +			fd, e := profileDNSDuplicateDirect(conn, want)
 +			if e != nil || fd == nil {
 +				return fd, errors.Join(errProfile, e)
@@ -33956,15 +34767,19 @@ new file mode 100644
 +	factoryDeadline := t.deadline
 +	c.mu.Unlock()
 +	factoryContext, finishFactory := context.WithDeadline(context.WithValue(t.ctx, profileDNSFactoryKey{}, t), factoryDeadline)
-+	conn, factoryError := runner(factoryContext)
++	conn, factoryError := t.io.create(factoryContext, t.destination)
 +	finishFactory()
 +	c.mu.Lock()
 +	t.conn = conn
 +	t.factory = false
 +	c.mu.Unlock()
-+	owned = &profileDNSDirectConn{Conn: conn, owner: t}
++	owned = &profileDNSDirectConn{socket: conn, owner: t}
 +	if factoryError != nil || conn == nil {
 +		err = errors.Join(errProfile, factoryError)
++		return nil, err
++	}
++	if conn.ctx == nil || conn.cancel == nil || conn.fd == nil || conn.destination != t.destination || conn.readIO == nil || conn.writeIO == nil || conn.waitIO == nil || conn.closeFD == nil {
++		err = ErrProfileUnsupported
 +		return nil, err
 +	}
 +	c.mu.Lock()
@@ -34004,15 +34819,19 @@ new file mode 100644
 +}
 +
 +type profileDNSDirectConn struct {
-+	net.Conn
++	socket                      *profileDNSOwnedSocket
 +	owner                       *profileDNSDirect
 +	mu                          sync.Mutex
 +	closing                     bool
++	readActive, writeActive     bool
 +	tasks                       sync.WaitGroup
 +	once                        sync.Once
 +	result                      error
 +	readDeadline, writeDeadline time.Time
 +}
++
++func (s *profileDNSDirectConn) LocalAddr() net.Addr  { return s.socket.LocalAddr() }
++func (s *profileDNSDirectConn) RemoteAddr() net.Addr { return s.socket.RemoteAddr() }
 +
 +func (s *profileDNSDirectConn) gate() error {
 +	t := s.owner
@@ -34024,41 +34843,62 @@ new file mode 100644
 +	}
 +	return nil
 +}
-+func (s *profileDNSDirectConn) begin() error {
++func (s *profileDNSDirectConn) begin(write bool) error {
 +	s.mu.Lock()
 +	defer s.mu.Unlock()
 +	if s.closing || s.gate() != nil {
 +		return errProfile
 +	}
++	if write {
++		if s.writeActive {
++			return errProfileFlowBusy
++		}
++		s.writeActive = true
++	} else {
++		if s.readActive {
++			return errProfileFlowBusy
++		}
++		s.readActive = true
++	}
 +	s.tasks.Add(1)
 +	return nil
 +}
++func (s *profileDNSDirectConn) end(write bool) {
++	s.mu.Lock()
++	if write {
++		s.writeActive = false
++	} else {
++		s.readActive = false
++	}
++	s.mu.Unlock()
++	s.tasks.Done()
++}
 +func (s *profileDNSDirectConn) Read(b []byte) (int, error) {
-+	if err := s.begin(); err != nil {
++	if err := s.begin(false); err != nil {
 +		return 0, err
 +	}
-+	defer s.tasks.Done()
++	defer s.end(false)
 +	if err := s.applyDeadline(false); err != nil {
 +		return 0, err
 +	}
-+	n, err := s.Conn.Read(b)
++	n, err := s.socket.Read(b)
 +	if s.gate() != nil {
 +		return 0, errProfile
 +	}
 +	return n, err
 +}
 +func (s *profileDNSDirectConn) Write(b []byte) (int, error) {
-+	if err := s.begin(); err != nil {
++	if err := s.begin(true); err != nil {
 +		return 0, err
 +	}
-+	defer s.tasks.Done()
++	defer s.end(true)
 +	if err := s.applyDeadline(true); err != nil {
 +		return 0, err
 +	}
 +	if err := s.gate(); err != nil {
 +		return 0, err
 +	}
-+	return s.Conn.Write(b)
++	return s.socket.Write(b)
 +}
 +
 +func (s *profileDNSDirectConn) boundedDeadline(requested time.Time) time.Time {
@@ -34078,9 +34918,9 @@ new file mode 100644
 +		return errProfile
 +	}
 +	if write {
-+		return s.Conn.SetWriteDeadline(s.boundedDeadline(s.writeDeadline))
++		return s.socket.SetWriteDeadline(s.boundedDeadline(s.writeDeadline))
 +	}
-+	return s.Conn.SetReadDeadline(s.boundedDeadline(s.readDeadline))
++	return s.socket.SetReadDeadline(s.boundedDeadline(s.readDeadline))
 +}
 +func (s *profileDNSDirectConn) SetDeadline(deadline time.Time) error {
 +	s.mu.Lock()
@@ -34089,7 +34929,7 @@ new file mode 100644
 +		return errProfile
 +	}
 +	s.readDeadline, s.writeDeadline = deadline, deadline
-+	return s.Conn.SetDeadline(s.boundedDeadline(deadline))
++	return s.socket.SetDeadline(s.boundedDeadline(deadline))
 +}
 +func (s *profileDNSDirectConn) SetReadDeadline(deadline time.Time) error {
 +	s.mu.Lock()
@@ -34098,7 +34938,7 @@ new file mode 100644
 +		return errProfile
 +	}
 +	s.readDeadline = deadline
-+	return s.Conn.SetReadDeadline(s.boundedDeadline(deadline))
++	return s.socket.SetReadDeadline(s.boundedDeadline(deadline))
 +}
 +func (s *profileDNSDirectConn) SetWriteDeadline(deadline time.Time) error {
 +	s.mu.Lock()
@@ -34107,7 +34947,7 @@ new file mode 100644
 +		return errProfile
 +	}
 +	s.writeDeadline = deadline
-+	return s.Conn.SetWriteDeadline(s.boundedDeadline(deadline))
++	return s.socket.SetWriteDeadline(s.boundedDeadline(deadline))
 +}
 +func (s *profileDNSDirectConn) Close() error {
 +	s.once.Do(func() {
@@ -34120,8 +34960,8 @@ new file mode 100644
 +		t.closed = true
 +		t.cancel()
 +		c.mu.Unlock()
-+		if s.Conn != nil {
-+			s.result = s.Conn.Close()
++		if s.socket != nil {
++			s.result = s.socket.Close()
 +		}
 +		if t.duplicate != nil {
 +			s.result = errors.Join(s.result, t.duplicate.Close())
@@ -34140,27 +34980,24 @@ new file mode 100644
 +
 +// Kernel inspection выполняется до wrappers/crypto. Duplicate закрывается
 +// вместе с actual connection; peer/netns повторно проверяет issuer независимо.
-+func profileDNSDuplicateDirect(conn net.Conn, want profileDestinationValue) (profileProofFD, error) {
-+	raw, ok := conn.(syscall.Conn)
-+	if !ok {
-+		return nil, ErrProfileUnsupported
++func profileDNSDuplicateDirect(conn *profileDNSOwnedSocket, want profileDestinationValue) (profileProofFD, error) {
++	conn.mu.Lock()
++	if conn.prepared || conn.closing || conn.destination != want || conn.fd == nil {
++		conn.mu.Unlock()
++		return nil, errProfile
 +	}
-+	handle, err := raw.SyscallConn()
-+	if err != nil {
-+		return nil, err
-+	}
-+	var fd profileProofFD
-+	var result error
-+	err = handle.Control(func(n uintptr) {
-+		duplicate, e := unix.FcntlInt(n, unix.F_DUPFD_CLOEXEC, 3)
++	conn.prepared = true
++	conn.mu.Unlock()
++	var duplicate profileProofFD
++	err := conn.fd.withFD(func(n int) error {
++		owned, e := unix.FcntlInt(uintptr(n), unix.F_DUPFD_CLOEXEC, 3)
 +		if e != nil {
-+			result = e
-+			return
++			return e
 +		}
-+		fd = profileAdoptFD(duplicate)
-+		result = profileDNSInspectDirect(duplicate, want)
++		duplicate = profileDNSOwnFD(owned)
++		return profileDNSInspectDirect(owned, want)
 +	})
-+	return fd, errors.Join(result, err)
++	return duplicate, err
 +}
 +func profileDNSInspectDirect(fd int, want profileDestinationValue) error {
 +	typ, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
@@ -34367,18 +35204,44 @@ new file mode 100644
 +	}
 +	return nil
 +}
++
++func (c *profileFlowControl) dnsDirectReleasedForBundle(b *profileDNSBundle) bool {
++	for _, t := range c.dnsDirect[:c.dnsDirectUsed] {
++		if t.bundle == b && !t.released {
++			return false
++		}
++	}
++	return true
++}
++func (c *profileFlowControl) dnsDirectBundleCleanupWindow(b *profileDNSBundle) (time.Time, bool) {
++	var until time.Time
++	for _, t := range c.dnsDirect[:c.dnsDirectUsed] {
++		if t.bundle == b && (until.IsZero() || t.cleanupDeadline.Before(until)) {
++			until = t.cleanupDeadline
++		}
++	}
++	return until, !until.IsZero()
++}
 diff --git a/common/yonikbroker/profile_dns_direct_other.go b/common/yonikbroker/profile_dns_direct_other.go
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_other.go
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,15 @@
 +//go:build !linux
 +
 +package nativehooks
 +
-+import "context"
++import (
++	"context"
++	xnet "github.com/xtls/xray-core/common/net"
++	"net"
++)
 +
-+func ProfileDNSDirectFactory(context.Context) bool { return false }
++func ProfileDNSDirectFactory(context.Context) bool  { return false }
++func ProfileDNSDirectRequired(context.Context) bool { return false }
++func ProfileDialDNSDirect(context.Context, xnet.Destination) (net.Conn, error) {
++	return nil, ErrProfileUnsupported
++}
 diff --git a/common/yonikbroker/profile_rx_budget_linux_test.go b/common/yonikbroker/profile_rx_budget_linux_test.go
 new file mode 100644
 --- /dev/null
