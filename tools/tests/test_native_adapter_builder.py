@@ -323,6 +323,15 @@ class BuilderTests(unittest.TestCase):
         )
         self.assertNotIn("dns_release", record)
         self.assertEqual(
+            candidate["candidate_record"]["dns_wire"]["contract"],
+            "direct-dns-bound-request-response-v1",
+        )
+        self.assertEqual(
+            candidate["candidate_record"]["dns_wire"]["schema_sha256"],
+            hashlib.sha256(b"YONIK-DNS-V2-CODEC-3\0").hexdigest(),
+        )
+        self.assertNotIn("dns_wire", record)
+        self.assertEqual(
             record["builder_sha256"], original_hash(Path(builder.__file__))
         )
         self.assertFalse(

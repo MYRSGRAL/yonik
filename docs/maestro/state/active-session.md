@@ -703,6 +703,19 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   и Stub runtime не проверялись. Эта ветка ждёт deployment contract; произвольный
   host unit не выбирается автоматически. Остальные DNS workstreams продолжаются.
 
+- R52 SOURCE scoped CLEAN: Rust Proxy/Append25ee19b интегрирован; отдельный
+  logical producer token сохраняет closed gate. R50 SOURCE scoped CLEAN:
+  Go Publish/Waiter5f10655 интегрирован, direct request/response contract принят
+  root по exact patch6e6abdbd…a083c7e после R44 consuming-owner и R50 capture review.
+  Registry/builder pins обновлены только для Direct CODEC3 release/wire; pins
+  независимы от общего producer pin. Candidate record install_authority=false;
+  public require_consumer/Connect/runtime gates не менялись. Проверено5 registry
+  pure +2 fake-builder normal/2 -O, no-run/linuxdesktop clippy/fmt/Ruff; source/
+  compiler/ELF binding r50-root-pin сохранён, cargo clean выполнен. Старые fake
+  helpers проверяют unreviewed branch явно, не зависят от production pin=None.
+  CODEC4contract2684084 source-contract-ready R51, canonical implementation
+  выполняется отдельно. Logical/bootstrap/Hosts capabilities этим pin не выданы.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение

@@ -35,7 +35,7 @@ EXTRA_PATCHES = (
 XRAY_URL = "https://github.com/XTLS/Xray-core.git"
 XRAY_TAG = "v26.10.31"
 XRAY_COMMIT = "a4a3dff5b20c2faae567b742c172c7b95e75c083"
-PROFILE_PATCH = "205b5337b8c38c608e4a341885dfe02174b33761e4dfda7724432359e84910c6"
+PROFILE_PATCH = "6e6abdbdcedae5b7c4548e9225ae4f8531a4489b8788141a2b6b4cf64a083c7e"
 LOG = logging.getLogger("yonik.native_adapter")
 COMMAND_TIMEOUT = 180
 BUILD_TIMEOUT = 900
@@ -49,6 +49,14 @@ def dns_release_candidate(record: dict[str, object]) -> dict[str, object]:
         "version": 1,
         "contract_sha256": hashlib.sha256(
             b"direct-dns-consuming-close-join-v1\0"
+        ).hexdigest(),
+        "schema_sha256": hashlib.sha256(b"YONIK-DNS-V2-CODEC-3\0").hexdigest(),
+    }
+    candidate["dns_wire"] = {
+        "contract": "direct-dns-bound-request-response-v1",
+        "version": 1,
+        "contract_sha256": hashlib.sha256(
+            b"direct-dns-bound-request-response-v1\0"
         ).hexdigest(),
         "schema_sha256": hashlib.sha256(b"YONIK-DNS-V2-CODEC-3\0").hexdigest(),
     }

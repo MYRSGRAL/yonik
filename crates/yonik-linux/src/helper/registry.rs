@@ -95,11 +95,13 @@ struct DnsReleaseRecord {
 }
 // Root должен отдельно принять actual factory/Conn ownership и exact patch.
 // Старый UDP pin не является DNS consuming-close/join authority.
-const DNS_REVIEWED_PATCH: Option<&str> = None;
-const DNS_WIRE_REVIEWED_PATCH: Option<&str> = None;
+const DNS_REVIEWED_PATCH: Option<&str> =
+    Some("6e6abdbdcedae5b7c4548e9225ae4f8531a4489b8788141a2b6b4cf64a083c7e");
+const DNS_WIRE_REVIEWED_PATCH: Option<&str> =
+    Some("6e6abdbdcedae5b7c4548e9225ae4f8531a4489b8788141a2b6b4cf64a083c7e");
 // Семантический contract отдельно от artifact pin. Новый DNS patchset должен
 // пройти root source review и обновить allowlist до trusted install.
-const PRODUCER_PATCH: &str = "205b5337b8c38c608e4a341885dfe02174b33761e4dfda7724432359e84910c6";
+const PRODUCER_PATCH: &str = "6e6abdbdcedae5b7c4548e9225ae4f8531a4489b8788141a2b6b4cf64a083c7e";
 #[derive(Clone)]
 pub(crate) struct ImageContract {
     image: [u8; 32],
@@ -237,7 +239,7 @@ pub(crate) fn fake_dns_image(image: [u8; 32]) -> ImageContract {
     let record = fake_dns_record(image);
     assert!(
         record
-            .validate(Sha256(image))
+            .validate_dns_pins(Sha256(image), None, None)
             .unwrap()
             .check_dns(image)
             .is_err()
@@ -262,7 +264,7 @@ pub(crate) fn fake_dns_wire_image(image: [u8; 32]) -> ImageContract {
     });
     assert!(
         record
-            .validate(Sha256(image))
+            .validate_dns_pins(Sha256(image), None, None)
             .unwrap()
             .check_dns_wire(image)
             .is_err()
@@ -552,6 +554,32 @@ fn validate_regular_metadata(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn reviewed_direct_dns_records_require_both_exact_contracts_and_patch() {
+        use sha2::Digest;
+        let image = super::Sha256([17; 32]);
+        let mut record = super::fake_dns_record(image.0);
+        let mut wire = record.dns_release.clone().unwrap();
+        wire.contract = "direct-dns-bound-request-response-v1".into();
+        wire.contract_sha256 = format!(
+            "{:x}",
+            sha2::Sha256::digest(b"direct-dns-bound-request-response-v1\0")
+        );
+        record.dns_wire = Some(wire);
+        let checked = record.validate(image).unwrap();
+        assert!(checked.check_dns(image.0).is_ok());
+        assert!(checked.check_dns_wire(image.0).is_ok());
+        let unreviewed = record.validate_dns_pins(image, None, None).unwrap();
+        assert!(unreviewed.check_dns(image.0).is_err());
+        assert!(unreviewed.check_dns_wire(image.0).is_err());
+        let mut old = record.clone();
+        old.patch_sha256 =
+            "205b5337b8c38c608e4a341885dfe02174b33761e4dfda7724432359e84910c6".into();
+        assert!(old.validate(image).is_err());
+        record.dns_wire.as_mut().unwrap().schema_sha256 =
+            format!("{:x}", sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-2\0"));
+        assert!(record.validate(image).is_err());
+    }
+    #[test]
     fn dns_wire_contract_does_not_inherit_consuming_close_authority() {
         let image = [17; 32];
         assert!(super::fake_dns_image(image).check_dns_wire(image).is_err());
@@ -574,7 +602,14 @@ mod tests {
     fn dns_release_record_schema_contract_image_and_separate_review_pin() {
         let image = crate::host::Sha256([17; 32]);
         let mut record = super::fake_dns_record(image.0);
-        assert!(record.validate(image).unwrap().check_dns(image.0).is_err());
+        assert!(record.validate(image).unwrap().check_dns(image.0).is_ok());
+        assert!(
+            record
+                .validate_dns_pins(image, None, None)
+                .unwrap()
+                .check_dns(image.0)
+                .is_err()
+        );
         assert!(
             record
                 .validate_dns_pin(image, Some(super::PRODUCER_PATCH))
