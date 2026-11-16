@@ -3743,6 +3743,16 @@ impl<'a> Capsule<'a> {
         }
         self.endpoint(index)
     }
+    /// Borrowed projection: source/asset custody остаётся обязанностью issuer.
+    pub(crate) fn bootstrap_snapshot(&self) -> Result<dns_v2::SnapshotRoleView<'_>> {
+        if self.tables[10].count != 1 {
+            return Err(Error::Reference);
+        }
+        dns_v2::SnapshotRoleView::decode(
+            u16::from_be_bytes([self.body[78], self.body[79]]),
+            self.tables[10].row(0)?,
+        )
+    }
     pub(crate) fn limits(&self) -> [u32; 8] {
         std::array::from_fn(|i| {
             let p = 88 + i * 4;

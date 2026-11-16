@@ -15,12 +15,21 @@ use std::{
     time::{Duration, Instant},
 };
 use wire::dns_v2::{Direction, DnsFrame, Envelope, Negotiated, Operation, Record, View};
+#[path = "native_dns_roots.rs"]
+pub(super) mod roots;
 
 pub(super) struct Bundles {
+    queries: [u64; 256],
+    roots: [u64; 256],
+    kinds: [u8; 256],
+    observations: BTreeMap<u64, Box<roots::Observation>>,
+    next_observation: u64,
+    _ledger_credit: super::super::memory::ByteLease,
     live: BTreeMap<u64, Box<Bundle>>,
     next: u64,
     history: usize,
 }
+#[derive(Clone, Copy)]
 struct DnsHopPermit {
     bundle: u64,
     index: u16,
@@ -35,6 +44,8 @@ struct DnsHopPermit {
     ticket: Option<u64>,
 }
 struct Bundle {
+    root_kind: wire::dns_v2::Root,
+    bootstrap: Option<Box<roots::Context>>,
     base_hash: [u8; 32],
     qtype: u16,
     options: u16,
@@ -52,12 +63,47 @@ struct Bundle {
     _routes: super::super::memory::ByteLease,
 }
 impl Bundles {
-    pub(super) fn new() -> Self {
-        Self {
+    pub(super) fn wakeup(&self, now: Instant) -> Option<Instant> {
+        self.live
+            .values()
+            .map(|b| b.expires)
+            .filter(|until| *until > now)
+            .min()
+    }
+    pub(super) fn new(budget: &super::super::memory::ByteBudget) -> Result<Self, ServiceError> {
+        Ok(Self {
+            queries: [0; 256],
+            roots: [0; 256],
+            kinds: [0; 256],
+            observations: BTreeMap::new(),
+            next_observation: 0,
+            _ledger_credit: budget
+                .reserve(std::mem::size_of::<Self>())
+                .map_err(unavailable)?,
             live: BTreeMap::new(),
             next: 0,
             history: 0,
+        })
+    }
+    fn allocate(&mut self, root: wire::dns_v2::Root, query: u64) -> Result<u64, ServiceError> {
+        let (kind, root) = match root {
+            wire::dns_v2::Root::UserDns(id) => (0, id.get()),
+            wire::dns_v2::Root::BootstrapService(id) => (1, id.get()),
+            wire::dns_v2::Root::HostsPath => (2, 0),
+        };
+        if self.next >= 256
+            || self.queries.iter().enumerate().any(|(i, q)| {
+                *q == query && (kind != 0 || self.kinds[i] != kind || self.roots[i] != root)
+            })
+        {
+            return Err(ServiceError::Busy);
         }
+        self.next += 1;
+        let i = (self.next - 1) as usize;
+        self.queries[i] = query;
+        self.roots[i] = root;
+        self.kinds[i] = kind;
+        Ok(self.next)
     }
     #[cfg(test)]
     pub(super) fn count(&self) -> usize {
@@ -92,6 +138,9 @@ impl<A: Authority> Issuer<A> {
     ) -> Result<super::dns_transport::Binding, ServiceError> {
         let expires = self.bundle_live(id)?;
         let b = self.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
+        if b.bootstrap.is_some() {
+            return self.bootstrap_binding(id, expires);
+        }
         let h = b.hops.first().ok_or(ServiceError::Unsupported)?;
         let physical = b.hops.last().ok_or(ServiceError::Unsupported)?;
         let cap = self.capsule()?;
@@ -131,6 +180,8 @@ impl<A: Authority> Issuer<A> {
         }
         reject_unproved_stub(target)?;
         Ok(super::dns_transport::Binding {
+            bootstrap: false,
+            parent_carrier: resolver.peer.protocol,
             proxied,
             physical_peer: Target::copy(target)?,
             physical_scope: physical.scope,
@@ -222,6 +273,18 @@ impl<A: Authority> Issuer<A> {
             self.retire_bundle_value(previous)?;
         }
         bundle.previous = None;
+        if let Some(context) = bundle.bootstrap.as_mut() {
+            if let Some(permit) = context.permit.as_mut() {
+                if let Some(ticket) = permit.ticket {
+                    if self.authority.release(ticket).is_err() {
+                        self.unknown = true;
+                        self.authority.revoke();
+                        return Err(ServiceError::Unavailable);
+                    }
+                    permit.ticket = None;
+                }
+            }
+        }
         for hop in &mut bundle.hops {
             if let Some(ticket) = hop.ticket {
                 if self.authority.release(ticket).is_err() {
@@ -235,6 +298,16 @@ impl<A: Authority> Issuer<A> {
         Ok(())
     }
     pub(super) fn cancel_dns_bundle(&mut self, id: u64) -> Result<(), ServiceError> {
+        if id == 0
+            || self
+                .dns
+                .queries
+                .get((id - 1) as usize)
+                .is_none_or(|v| *v == 0)
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.cancel_host_observations(id);
         self.rrsets.cancel_bundle(id);
         self.cancel_numeric_dependents()?;
         if self.unknown {
@@ -258,11 +331,14 @@ impl<A: Authority> Issuer<A> {
         }
         Ok(())
     }
-    pub(super) fn cancel_dns_root(&mut self, root: u64) -> Result<(), ServiceError> {
+    pub(super) fn cancel_dns_root(&mut self, root: u64, service: bool) -> Result<(), ServiceError> {
         let mut ids = [0; 256];
         let mut n = 0;
         for (id, b) in &self.dns.live {
-            if b.root == root {
+            if b.root == root
+                && matches!(b.root_kind, wire::dns_v2::Root::BootstrapService(_)) == service
+                && b.root_kind != wire::dns_v2::Root::HostsPath
+            {
                 *ids.get_mut(n).ok_or(ServiceError::Busy)? = *id;
                 n += 1;
             }
@@ -273,6 +349,7 @@ impl<A: Authority> Issuer<A> {
         Ok(())
     }
     pub(super) fn cancel_dns_request(&mut self, request: u64) -> Result<(), ServiceError> {
+        self.cancel_host_request(request);
         let id = self
             .dns
             .live
@@ -289,8 +366,12 @@ impl<A: Authority> Issuer<A> {
         let mut ids = [0; 256];
         let mut n = 0;
         for (id, b) in &self.dns.live {
-            if (now >= b.expires || !self.grants.contains_key(&b.root))
-                && !self.transport.holds_root_cleanup(b.root, now)
+            let root_missing = match b.root_kind {
+                wire::dns_v2::Root::UserDns(_) => !self.grants.contains_key(&b.root),
+                wire::dns_v2::Root::BootstrapService(_) => !self.services.contains_key(&b.root),
+                wire::dns_v2::Root::HostsPath => false,
+            };
+            if (now >= b.expires || root_missing) && !self.transport.holds_root_cleanup(b.root, now)
             {
                 *ids.get_mut(n).ok_or(ServiceError::Busy)? = *id;
                 n += 1;
@@ -334,6 +415,12 @@ impl<A: Authority> Issuer<A> {
         view: View<'_, 55>,
         session: Instant,
     ) -> Result<u64, ServiceError> {
+        if !matches!(
+            view.root().map_err(unavailable)?,
+            wire::dns_v2::Root::UserDns(_)
+        ) {
+            return self.acquire_bootstrap(request, view, session);
+        }
         let started = self.authority.now();
         let (source, proof, root_expiry) = self.bundle_root(view)?;
         let b = view.bytes();
@@ -353,7 +440,9 @@ impl<A: Authority> Issuer<A> {
                 return Err(ServiceError::Unsupported);
             }
             let old = self.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
-            if old.revision != expected.get()
+            if old.root_kind != view.root().map_err(unavailable)?
+                || old.bootstrap.is_some()
+                || old.revision != expected.get()
                 || old.fingerprint != fingerprint
                 || old.root != root
                 || old.query != query
@@ -376,7 +465,11 @@ impl<A: Authority> Issuer<A> {
             {
                 return Err(ServiceError::Busy);
             }
-            (Self::id(&mut self.dns.next)?, 1)
+            (
+                self.dns
+                    .allocate(view.root().map_err(unavailable)?, query)?,
+                1,
+            )
         };
         // Все allocation/route/history credits до backend effects.
         let memory = self
@@ -467,6 +560,8 @@ impl<A: Authority> Issuer<A> {
         self.dns.live.insert(
             id,
             Box::new(Bundle {
+                root_kind: view.root().map_err(unavailable)?,
+                bootstrap: None,
                 base_hash: Sha256::digest(view.base()).into(),
                 qtype: u16_at(b, 52),
                 options: u16_at(b, 54),
@@ -543,6 +638,9 @@ impl<A: Authority> Issuer<A> {
     pub(super) fn bundle_live(&self, id: u64) -> Result<Instant, ServiceError> {
         self.fence()?;
         let b = self.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
+        if b.bootstrap.is_some() {
+            return self.bootstrap_live(id, true);
+        }
         let g = self.grants.get(&b.root).ok_or(ServiceError::Unavailable)?;
         let source = self.flows.get(&g.source).ok_or(ServiceError::Unavailable)?;
         self.authority.check_ingress(&source.socket)?;
@@ -674,6 +772,13 @@ pub(super) fn dispatch<A: Authority>(
     body[..2].copy_from_slice(&2u16.to_be_bytes());
     let op = match frame.record {
         Record::BundleAcquire(view) => {
+            if !matches!(
+                view.root().map_err(unavailable)?,
+                wire::dns_v2::Root::UserDns(_)
+            ) && !issuer.unknown
+            {
+                drain(issuer)?;
+            }
             let acquired = if issuer.retired.iter().any(|(request, _)| *request == reply) {
                 Err(ServiceError::Unavailable)
             } else {
@@ -724,14 +829,19 @@ pub(super) fn dispatch<A: Authority>(
         }
         // Unknown cleanup report не превращается в KnownClosed/Allow.
         if !issuer.unknown {
+            drain(issuer)?;
             issuer.fence()?;
         }
         if op == Operation::BundleGranted && body[2] == 1 {
             let id = u64_at(&body, 8);
-            let now = issuer.authority.now();
-            if let Ok(until) = issuer.bundle_live(id) {
+            if let Ok((until, checked)) = issuer.context_reply_live(id).and_then(|until| {
+                let checked = issuer.authority.now();
+                (checked < until)
+                    .then_some((until, checked))
+                    .ok_or(ServiceError::Unavailable)
+            }) {
                 body[40..48].copy_from_slice(
-                    &((until - now).as_nanos().min(1_000_000_000) as u64).to_be_bytes(),
+                    &((until - checked).as_nanos().min(1_000_000_000) as u64).to_be_bytes(),
                 );
             } else {
                 issuer.cancel_dns_bundle(id)?;
@@ -752,7 +862,25 @@ pub(super) fn dispatch<A: Authority>(
         }
         .encode(&neg, &mut out)
         .map_err(unavailable)?;
-        if socket.write(&out[..n])? {
+        let sent = match socket.write(&out[..n]) {
+            Ok(sent) => sent,
+            Err(error) => {
+                issuer.unknown = true;
+                issuer.authority.revoke();
+                return Err(error);
+            }
+        };
+        if sent {
+            if op == Operation::BundleGranted && body[2] == 1 {
+                if let Some(c) = issuer
+                    .dns
+                    .live
+                    .get_mut(&u64_at(&body, 8))
+                    .and_then(|b| b.bootstrap.as_mut())
+                {
+                    c.acked = true;
+                }
+            }
             return Ok(());
         }
         socket.writable_until(session.min(issuer.authority.now() + Duration::from_millis(20)));
@@ -772,6 +900,9 @@ pub(super) fn cancel<A: Authority>(
         1 if id < sequence => issuer.cancel_request(id),
         2..=4 => super::dns_transport::cancel(issuer, target, id),
         7 => {
+            if issuer.cancel_host_reservation(id) {
+                return Ok(());
+            }
             super::dns_transport::cancel(issuer, target, id)?;
             issuer.rrsets.cancel_reservation(id);
             issuer.cancel_numeric_dependents()?;
