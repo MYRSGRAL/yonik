@@ -686,10 +686,49 @@ Host считает его из actual MSG_PEEK bytes; Go пересчитыва
    INGRESS_REPLY только создаёт private original flow; forwarding требует
    existing AUTHORIZE/GRANT19. До последнего match/GRANT **никаких forward/send**.
 
-Relay socket — receive-only **logical** ingress resource. Outbound UDP использует
-отдельные D→C→chain checks/FlowGrant и guarded physical factory; нельзя отправлять
-через relay FD или выдать association/control credential за outbound grant.
+Relay socket — **logical** ingress resource; его reader остаётся Receive/Close/Join.
+Outbound UDP использует отдельные D→C→chain checks/FlowGrant и guarded physical
+factory; relay FD нельзя использовать для outbound target или выдать
+association/control credential за outbound grant. Единственное разрешённое
+обратное использование — закрытый ingress-response sink ниже.
 SourceFlow связывает association+packet+actual UDP tuple+original, не TCP original.
+
+### Обратный SOCKS UDP response без расширения wire
+
+Private response sink использует тот же retained relay duplicate только для
+ответа в существующий user flow. Это duplex-сторона принятого ingress, отдельной
+issuer-send операции и нового wire selector/ACK не требуется. Constructor sink
+доступен лишь после ConsumedMatch и private provenance3 receipt с class1 GRANT;
+association/control/service grant сам по себе sink не создаёт.
+
+- Адресат send — immutable initiator endpoint из actual UDP tuple этого receipt.
+  Caller не передаёт destination, FD, namespace, cookie или произвольный WriteTo.
+  TCP control tuple не заменяет UDP initiator. Никакого connect/dial через relay.
+- Response context сохраняет exact sourceFlow/binding/generation/revision и его
+  live logical grant bundle. Перед каждой отправкой действуют существующие
+  cancel/expiry/renewal и System Known freshness fences; grant соседа не подходит.
+  Долгое ожидание upstream response не продлевает исходный owner proof.
+- Sink принимает только response соответствующего guarded downstream flow.
+  На текущем numeric milestone SOCKS response endpoint обязан совпадать с его
+  checked numeric target; payload.UDP не может выбрать другой адрес. Hostname,
+  alternate endpoint или unsolicited response без отдельного proof запрещены.
+  SOCKS header создаётся внутри sink, FRAG=0; raw datagram API не экспортируется.
+- Buffer/byte/send-task credits резервируются до encoding/allocation/send в общем
+  bounded budget. Отдельных неограниченных очередей или goroutine на packet нет.
+  Передача request payload downstream и владение response buffers учитываются
+  раздельно; новый Peek не освобождает ещё используемый response buffer.
+- Cancellation/deadline охватывают manual nonblocking send и ожидание writable.
+  Cancel одной association не закрывает соседей. После partial/неопределённого
+  send нет автоматического retry; результат обрабатывается как terminal error.
+- Close сначала запрещает новые response sends и отменяет ожидающие, затем
+  CloseAndJoin ждёт все send/read/downstream tasks и actual duplicate close.
+  До этих fences UCR KnownClosed запрещён; ошибка сохраняет sticky Unknown,
+  retained custody/credits и прежние supervisor/durable retirement требования.
+
+Pure caller regressions должны отвергать отправку до match/grant, чужой receipt,
+подмену tuple/response endpoint, expired/cancelled grant, исчерпание credits и
+send после Close; delayed send обязан задерживать KnownClosed. OS send wrapper
+пока проверяется только компиляцией. Readiness gates и wire bytes не меняются.
 
 ### API завершения и доказательство закрытия duplicate
 
