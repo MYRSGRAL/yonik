@@ -755,6 +755,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   Production pins не обновлены; совместный runtime и установленный app не
   проверялись, readiness/public gates false.
 
+- R59 SOURCE scoped CLEAN: Hosts constructor/observation b320522 интегрирован.
+  Actual ProfilePrepareChain использует retained snapshot/role4/full parent path,
+  ACKed HostsPath и issuer observation; files-only/files→DNS hit поддержаны,
+  DNS-first без negative закрыт. Cancel7 предшествует Cancel8, deadlines/RTT/
+  System Known/custody сохранены. Publish/Numeric use2, original-parent
+  conjunction и service callers остаются следующими переходами. Capture gate,
+  production pins/readiness false; runtime не выполнялся.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
