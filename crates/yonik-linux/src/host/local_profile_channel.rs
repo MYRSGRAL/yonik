@@ -18,6 +18,35 @@ use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent};
 fn rejected<T>(_: T) -> HostError {
     HostError::ConfigRejected
 }
+/// Source-bound normal Host factory. Не System namespace/owner proof.
+pub(crate) fn create_udp_relay() -> Result<(OwnedFd, OwnedFd), HostError> {
+    let before = File::open("/proc/thread-self/ns/net").map_err(rejected)?;
+    if yonik_nsfs::namespace_type(&before).map_err(rejected)? != yonik_nsfs::NamespaceType::Net {
+        return Err(HostError::Unsupported);
+    }
+    let identity = before.metadata().map_err(rejected)?;
+    let fd = rustix::net::socket_with(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+        Some(rustix::net::ipproto::UDP),
+    )
+    .map_err(rejected)?;
+    rustix::net::bind(
+        &fd,
+        &std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+    )
+    .map_err(rejected)?;
+    yonik_nsfs::socket_namespace::prepare_profile_udp(&fd).map_err(rejected)?;
+    let after = File::open("/proc/thread-self/ns/net")
+        .map_err(rejected)?
+        .metadata()
+        .map_err(rejected)?;
+    if (identity.dev(), identity.ino()) != (after.dev(), after.ino()) {
+        return Err(HostError::Unsupported);
+    }
+    Ok((fd, before.into()))
+}
 pub(crate) struct Prepared {
     intent: ProfileIntent,
     sources: FullProfileSources,

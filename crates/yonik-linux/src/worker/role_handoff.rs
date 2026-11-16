@@ -338,22 +338,13 @@ pub(crate) fn send_proof_bootstrap(
     pid: u32,
     uid: u32,
     deadline: Instant,
-) -> Result<(), WorkerError> {
+) -> Result<u8, WorkerError> {
+    let (record, ack, version) = crate::helper::native_profile_channel::profile_proof_setup(launch)
+        .map_err(|_| WorkerError::Peer)?;
     setup(socket, deadline)?;
-    send_packet(
-        socket,
-        &crate::profile_channel::proof_bootstrap(launch).map_err(|_| WorkerError::Protocol)?,
-        &[proof.as_fd()],
-    )?;
-    receive_packet(
-        socket,
-        &crate::profile_channel::proof_bootstrap_ack(launch).map_err(|_| WorkerError::Protocol)?,
-        pid,
-        uid,
-        0,
-        deadline,
-    )?;
-    Ok(())
+    send_packet(socket, &record, &[proof.as_fd()])?;
+    receive_packet(socket, &ack, pid, uid, 0, deadline)?;
+    Ok(version)
 }
 
 fn profile_binding(

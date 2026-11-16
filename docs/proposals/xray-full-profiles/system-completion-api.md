@@ -725,3 +725,52 @@ Local factory работает normal Host без daemon; SIOCGSKNS privilege н
 нужен retained own-thread namespace-at-creation proof и source-checked no-setns
 factory. Child namespace FD вместо этого proof не принимается; невозможность
 связать namespace — Unsupported. Ни factory, ни wire v2 до root review не включены.
+
+### Rust SOURCE/PURE milestone UDP-v2 после R16
+
+`profile_channel::udp_v2::{Record, Packet}` — fixed-size private DATA codec всех
+десяти records таблицы выше. Decode сначала проверяет exact length/direction/rights,
+затем canonical re-encode проверяет reserved bytes, binding/nonce и bounded fields.
+Никаких allocations при decode. Независимый Python `struct.pack/hashlib` corpus:
+`tests/fixtures/xray-profile-channel-v3/udp-proof-v2.json`; содержит bootstrap,
+ACK, все десять records, whole-datagram fingerprint с различными TCP listener1080,
+initiator32001 и UDP initiator32002/relay49152. Mode/authority из этих DATA не выводится.
+
+`helper/native_profile_channel::AssociationIssuer<O: UdpOperations>` — настоящий
+private issuer state, используемый production `SystemChannel` v2 dispatch и pure
+injected operations. `handle` принимает Control/Associate/Peek/Consumed/Closed;
+`progress/tick` обслуживаются тем же issuer loop через Tokio readiness, без нового
+owner reader. `bind_source/check_grant/granted` разделяют matched original flow,
+fresh UDP principal и actual successful runtime publication. `retire/cancel_flow`
+удерживают relay/buffer/namespace custody; canonical Known ACK без независимого
+`duplicate_closed` receipt не освобождает resources. Ошибки readiness/deadline
+делают Unknown sticky и revoke; поздний ACK не восстанавливает issuer.
+
+`InvocationHistory` — одна история на invocation для runtime sequence, proof
+operation и заранее reserved close ID; общий cap `min(caps[7],256)`, без eviction.
+Control IDs берутся из общего source counter, но хранятся в отдельном typed
+ledger, без fake original destination/UserSourceFlow. Pair budget133120/association
+занят до separately credited payload retirement; сам GRANT не освобождает buffer.
+Второй Peek/Permit до этого возвращает Busy без socket/read/overwrite effect.
+
+Production adapters скомпилированы, но не исполнялись: `KernelUdpOperations`
+удерживает actual TCP FD/cookie/nsfs, использует существующий serial OwnerEndpoint;
+`host/local_profile_channel::create_udp_relay` создаёт только normal Host loopback
+socket с own-thread namespace custody. `yonik_nsfs::socket_namespace` экспортирует
+только fixed `prepare_profile_udp/inspect_profile_udp/peek_profile_udp`, включая
+RXQ_OVFL whitelist, truncation flags, GRO=0 и bounded receive-buffer readback.
+Ни generic ioctl API, ни unsafe в yonik-linux, ни новые capabilities не добавлены.
+
+**Admission остаётся закрытым.** `profile_proof_setup` выбирает v1, пока
+`udp_v2_consumer_ready` возвращает Unsupported. Нельзя включить v2 только сменой
+флага: `KernelUdpOperations::payload_retired/duplicate_closed` также закрыты до
+source-verified Go ConsumePermit/CloseAndJoin counterpart. `consumed` ещё не
+предоставляет самостоятельный consuming proof. Требуются actual provenance3 OPEN
+adapter в `Peer::socket` с bounded OPEN↔Consumed rendezvous, общий runtime+proof
+pending/FD-credit accounting до materialization, cancellation всех association
+flows с durable rule retirement и передача Unknown relay ledger в supervisor/
+exact-child retired custody. Local session пока не negotiates v2. Эти endpoints
+не объявлены готовыми, user/DNS/Probe authority и gates не ослаблены.
+
+Это bounded initial contract. После исчерпания общей истории новые effects
+закрыты; безопасная watermark compaction и long-lived UDP readiness не доказаны.
