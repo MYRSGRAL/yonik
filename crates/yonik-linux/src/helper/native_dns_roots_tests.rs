@@ -17,6 +17,7 @@ struct Facts {
     observed: AtomicUsize,
     invalid_source: AtomicBool,
     change_after_choice: AtomicBool,
+    failed_operation: AtomicUsize,
 }
 impl Source for Facts {
     fn question(
@@ -27,6 +28,9 @@ impl Source for Facts {
         options: u16,
         payload: u16,
     ) -> Result<Question, ServiceError> {
+        if self.failed_operation.load(Ordering::Acquire) == 3 {
+            return Err(ServiceError::Unavailable);
+        }
         self.parent(p)?;
         self.snapshot(self.launch, r)?;
         if ![1, 28].contains(&qtype) || options != 0 || payload != 0 {
@@ -41,7 +45,8 @@ impl Source for Facts {
         })
     }
     fn parent(&self, p: Parent<'_>) -> Result<Instant, ServiceError> {
-        if p.launch != self.launch
+        if self.failed_operation.load(Ordering::Acquire) == 1
+            || p.launch != self.launch
             || match p.root {
                 wire::dns_v2::Root::HostsPath => p.selector.resolver.is_some(),
                 wire::dns_v2::Root::BootstrapService(id) => {
@@ -66,7 +71,8 @@ impl Source for Facts {
         launch: LaunchRecord,
         r: wire::SnapshotRef,
     ) -> Result<Instant, ServiceError> {
-        if self.invalid_source.load(Ordering::Acquire)
+        if self.failed_operation.load(Ordering::Acquire) == 2
+            || self.invalid_source.load(Ordering::Acquire)
             || launch != self.launch
             || (r.source, r.asset, r.bytes, r.flags)
                 != (
@@ -197,6 +203,7 @@ fn fixture(mode: Mode) -> (Issuer<Fake>, Arc<Facts>) {
         observed: AtomicUsize::new(0),
         invalid_source: AtomicBool::new(false),
         change_after_choice: AtomicBool::new(false),
+        failed_operation: AtomicUsize::new(0),
     });
     (issuer, facts)
 }
@@ -632,6 +639,69 @@ fn codec4_roots_driver_context_cancel_is_typed_nonreusing_and_neighbor_survives(
     assert!(issuer.dns.observations[&1].acked);
     assert!(!issuer.unknown);
 }
+#[test]
+fn codec4_roots_renewal_source_failure_is_sticky_after_recovery() {
+    for hosts in [true, false] {
+        for fault in 1..=if hosts { 2 } else { 3 } {
+            let (mut issuer, f) = fixture(Mode::System);
+            let root = if hosts { 0 } else { service(&mut issuer, &f) };
+            let mut io = BundleIo::new(
+                f.launch,
+                vec![dns_packet(
+                    f.launch,
+                    3,
+                    Operation::BundleAcquire,
+                    &acquire(&f, hosts, root, 9),
+                )],
+            );
+            io.source = Some(f.clone());
+            drive(&mut issuer, &io);
+            assert_eq!(io.output.borrow()[0][130], 1);
+            let mut renewal = acquire(&f, hosts, root, 9);
+            renewal[32..40].copy_from_slice(&1u64.to_be_bytes());
+            renewal[64..72].copy_from_slice(&1u64.to_be_bytes());
+            let Record::BundleAcquire(view) =
+                Record::decode(Operation::BundleAcquire, &renewal).unwrap()
+            else {
+                panic!("renewal")
+            };
+            f.failed_operation.store(fault, Ordering::Release);
+            let mut foreign = renewal.clone();
+            foreign[16..24].copy_from_slice(&10u64.to_be_bytes());
+            let Record::BundleAcquire(foreign) =
+                Record::decode(Operation::BundleAcquire, &foreign).unwrap()
+            else {
+                panic!("foreign renewal")
+            };
+            assert!(issuer.acquire_bootstrap(4, foreign, f.expiry).is_err());
+            assert!(
+                !issuer.dns.live[&1]
+                    .bootstrap
+                    .as_ref()
+                    .unwrap()
+                    .invalid
+                    .load(Ordering::Acquire)
+            );
+            assert!(issuer.acquire_bootstrap(4, view, f.expiry).is_err());
+            f.failed_operation.store(0, Ordering::Release);
+            assert!(
+                issuer.bootstrap_live(1, true).is_err(),
+                "Source recovery не оживляет context"
+            );
+            assert!(issuer.dns.live.contains_key(&1), "Custody сохраняется");
+            if hosts {
+                let body = reserve(&f, true, 3, 9);
+                let Record::Reserve(view) = Record::decode(Operation::Reserve, &body).unwrap()
+                else {
+                    panic!("reserve")
+                };
+                assert!(issuer.reserve_hosts(view, 5, &io, f.expiry).is_err());
+                assert!(issuer.dns.observations.is_empty());
+            }
+        }
+    }
+}
+
 #[test]
 fn codec4_roots_driver_renew_exact_revision_does_not_extend_deadline() {
     for wrong in [false, true] {

@@ -771,6 +771,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   BootstrapPhysicalPermission/live original parent. Эти переходы закрыты,
   public/runtime flags false; реального запуска/установки не было.
 
+- CODEC4 issuer roots/reservations7bc7033 интегрированы с root-коррекцией R61P2.
+  До Source проверяется exact renewal context/root/revision/fingerprint; ошибки
+  snapshot/parent/question теперь sticky-invalid для этого context с сохранением
+  custody. Чужой renewal не инвалидирует context. Остальной R61 scoped SOURCE
+  review новых P1/P2 не выявил. Bootstrap source producer остаётся None;
+  Publish/Waiter/Numeric service/Hosts и transport/close продолжаются отдельно.
+  Wire/schema/public gates не менялись; runtime/bootstrap PASS не заявлен.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение

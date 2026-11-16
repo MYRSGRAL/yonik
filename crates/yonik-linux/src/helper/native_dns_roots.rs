@@ -335,20 +335,63 @@ impl<A: Authority> Issuer<A> {
                 ticket: None,
             });
         }
-        let source = self.root_source()?;
-        let mut expires = source
-            .snapshot(self.record, reference)?
+        let fingerprint_for = |question: Option<Target>| {
+            let mut hash = Sha256::new();
+            hash.update(b"YNK-CODEC4-ROOT\0");
+            hash.update(self.record.manifest);
+            hash.update(&b[..32]);
+            hash.update(&b[48..64]);
+            hash.update(&b[72..]);
+            hash.update(reference.source);
+            hash.update(reference.asset);
+            if let Some(q) = question {
+                hash.update(q.wire().bytes);
+            }
+            <[u8; 32]>::from(hash.finalize())
+        };
+        // Ошибка чужого renewal не должна инвалидировать существующий context.
+        let renewing =
+            if let Some((context, revision)) = v.context_renewal().map_err(unavailable)? {
+                let id = match context {
+                    wire::dns_v2::DnsContext::Network(id) => id.get(),
+                    wire::dns_v2::DnsContext::HostsPath(id) => id.get(),
+                };
+                let old = self.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
+                let c = old.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
+                if old.root_kind != kind
+                    || old.revision != revision.get()
+                    || old.fingerprint != fingerprint_for(c.question)
+                    || old.previous.is_some()
+                    || self.transport.references(id)
+                    || self.dns.observations.values().any(|o| o.context == id)
+                {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                if c.invalid.load(Ordering::Acquire) || !c.acked || now >= old.expires {
+                    return Err(ServiceError::Unavailable);
+                }
+                Some(id)
+            } else {
+                None
+            };
+        let context = renewing.unwrap_or(0);
+        let source = self.source_result(context, self.root_source())?;
+        let mut expires = self
+            .source_result(context, source.snapshot(self.record, reference))?
             .min(
-                source.parent(
-                    Parent {
-                        root: kind,
-                        launch: self.record,
-                        query: u64_at(b, 16),
-                        selector,
-                        original: original.wire(),
-                        path: &path[..count],
-                    }
-                    .checked()?,
+                self.source_result(
+                    context,
+                    source.parent(
+                        Parent {
+                            root: kind,
+                            launch: self.record,
+                            query: u64_at(b, 16),
+                            selector,
+                            original: original.wire(),
+                            path: &path[..count],
+                        }
+                        .checked()?,
+                    ),
                 )?,
             )
             .min(session)
@@ -380,20 +423,23 @@ impl<A: Authority> Issuer<A> {
                 reject_unproved_stub(row.peer)?;
                 expires = expires.min(grant.expires);
                 peer = Some(Target::copy(row.peer)?);
-                let selected = source.question(
-                    Parent {
-                        root: kind,
-                        launch: self.record,
-                        query: u64_at(b, 16),
-                        selector,
-                        original: original.wire(),
-                        path: &path[..count],
-                    }
-                    .checked()?,
-                    reference,
-                    u16_at(b, 52),
-                    u16_at(b, 54),
-                    u16_at(b, 56),
+                let selected = self.source_result(
+                    context,
+                    source.question(
+                        Parent {
+                            root: kind,
+                            launch: self.record,
+                            query: u64_at(b, 16),
+                            selector,
+                            original: original.wire(),
+                            path: &path[..count],
+                        }
+                        .checked()?,
+                        reference,
+                        u16_at(b, 52),
+                        u16_at(b, 54),
+                        u16_at(b, 56),
+                    ),
                 )?;
                 if selected.len == 0 || selected.len > 253 {
                     return Err(ServiceError::InvalidRequest);
@@ -407,18 +453,7 @@ impl<A: Authority> Issuer<A> {
             wire::dns_v2::Root::HostsPath => {}
             _ => return Err(ServiceError::InvalidRequest),
         }
-        let mut hash = Sha256::new();
-        hash.update(b"YNK-CODEC4-ROOT\0");
-        hash.update(self.record.manifest);
-        hash.update(&b[..32]);
-        hash.update(&b[48..64]);
-        hash.update(&b[72..]);
-        hash.update(reference.source);
-        hash.update(reference.asset);
-        if let Some(q) = question {
-            hash.update(q.wire().bytes);
-        }
-        let fingerprint = hash.finalize().into();
+        let fingerprint = fingerprint_for(question);
         let (id, revision) =
             if let Some((context, revision)) = v.context_renewal().map_err(unavailable)? {
                 let id = match context {
