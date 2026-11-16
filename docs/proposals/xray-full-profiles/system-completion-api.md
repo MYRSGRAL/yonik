@@ -867,3 +867,31 @@ negotiation по-прежнему закрыта, нормальный Host fact
 Wire bytes/ten goldens/ACK hash d79a26fc не изменены. Никакие OS wrappers этого
 подключения не исполнялись. До общей Go compatibility, service proof и production
 acceptance полный P5/long-lived UDP readiness не заявляются.
+
+### Внутренняя negotiation после root13a0bc26
+
+System caller теперь требует `Peer::verified_udp_producer` после получения
+VerifiedExecDelivery и до proof channel/bootstrap; `send_proof_bootstrap`
+принимает private `VerifiedUdpProducer`, а не caller version/bool. Его `setup`
+выбирает только PF002/PFA02 для exact launch binding; mismatch возвращает ошибку
+без downgrade. KernelUdpOperations удерживает этот же proof и использует его
+в ready/payload_retired/duplicate_closed. Public require_consumer не изменён.
+Local start_local вызывает тот же installed-proof preflight после actual child
+verification и до actor/HELLO. Local v2 exchange пока не завершён.
+
+Конкретный blocker: `Peer::verified_udp_producer` не имеет legitimate production
+constructor. Нужен trusted installed builder attestation producer, связывающий
+accepted Go consuming/CloseAndJoin contract с actual executable identity,
+sealed final config digest, manifest и exact launch/session/invocation/epoch.
+Точки потребления: start_system после Peer::system и start_local после
+Peer::local. BinarySnapshot/VerifiedExecDelivery доказывают custody, не current
+image measurement. Adapter JSON/source hash/ACK/env не создают attestation.
+Поэтому текущий constructor возвращает Unsupported до negotiation. Private
+synthetic proof в pure tests проверяет только выбор wire/receipt branches;
+он не production installed-image proof и не закрывает blocker.
+
+Go native-full-profile-implementation.md actor/producer contract0ea9495 и root
+pregrant correction da1c80b приняты как SOURCE prerequisite. Private payload
+sniffing остаётся Unsupported, metadataOnly не даёт чтения payload. Ready gates,
+Local v2 exchange и installed-image acceptance нельзя объявлять завершёнными
+на основании этих Rust synthetic vectors.

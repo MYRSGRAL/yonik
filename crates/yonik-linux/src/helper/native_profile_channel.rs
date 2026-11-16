@@ -1063,17 +1063,64 @@ struct KernelRelay {
     port: u16,
 }
 struct KernelUdpOperations {
+    producer: Arc<VerifiedUdpProducer>,
     peer: Arc<Peer>,
     owner: Option<Arc<OwnerEndpoint>>,
     record: LaunchRecord,
     capsule: Arc<wire::OwnedCapsule>,
     handle: tokio::runtime::Handle,
 }
+/// Не source hash и не child ACK. Production constructor требует attestation
+/// installed builder; такого producer в текущем deployment contract ещё нет.
+pub(crate) struct VerifiedUdpProducer {
+    launch: LaunchRecord,
+}
+impl VerifiedUdpProducer {
+    fn payload_retired(&self, record: LaunchRecord) -> Result<bool, ServiceError> {
+        self.setup(record)?;
+        Ok(true)
+    }
+    fn duplicate_closed(
+        &self,
+        record: LaunchRecord,
+        receipt: wire::udp_v2::Record,
+    ) -> Result<(), ServiceError> {
+        self.setup(record)?;
+        if !matches!(
+            receipt,
+            wire::udp_v2::Record::Closed {
+                status: 1,
+                pending: 0,
+                joined: true,
+                duplicates: 0,
+                ..
+            }
+        ) {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
+    pub(crate) fn setup(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<([u8; 128], [u8; 40], u8), ServiceError> {
+        if record != self.launch {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok((
+            wire::udp_v2::bootstrap(record).map_err(unavailable)?,
+            wire::udp_v2::bootstrap_ack(record).map_err(unavailable)?,
+            2,
+        ))
+    }
+}
 /// Gate именно consuming producer/duplicate-close source proof, не env flag.
 /// Runtime admission v2 этим milestone не разрешён.
+#[cfg(test)]
 fn udp_v2_consumer_ready() -> Result<(), ServiceError> {
     Err(ServiceError::Unsupported)
 }
+#[cfg(test)]
 pub(crate) fn profile_proof_setup(
     record: LaunchRecord,
 ) -> Result<([u8; 128], [u8; 40], u8), ServiceError> {
@@ -1151,8 +1198,7 @@ impl UdpOperations for KernelUdpOperations {
     type Relay = KernelRelay;
     type Transfer = OwnedFd;
     fn ready(&self) -> Result<(), ServiceError> {
-        udp_v2_consumer_ready()?;
-        require_consumer()?;
+        self.producer.setup(self.record)?;
         self.peer.validate()
     }
     fn fence(&self) -> Result<(), ServiceError> {
@@ -1370,7 +1416,7 @@ impl UdpOperations for KernelUdpOperations {
         // Только authenticated next Peek от source-verified exclusive producer:
         // его contract запрещает Peek до downstream-credit transfer/destruction.
         self.peer.validate()?;
-        Ok(true)
+        self.producer.payload_retired(self.record)
     }
     fn duplicate_closed(
         &self,
@@ -1380,21 +1426,9 @@ impl UdpOperations for KernelUdpOperations {
         self.ready()?;
         self.relay_valid(relay)?;
         self.peer.validate()?;
-        if !matches!(
-            record,
-            wire::udp_v2::Record::Closed {
-                status: 1,
-                pending: 0,
-                joined: true,
-                duplicates: 0,
-                ..
-            }
-        ) {
-            return Err(ServiceError::Unavailable);
-        }
         // Такой record принимается лишь под готовым pinned producer contract,
         // а не как произвольное child assertion при старом installed image.
-        Ok(())
+        self.producer.duplicate_closed(self.record, record)
     }
     fn revoke(&self) {
         if let Some(scope) = &self.peer.system_scope {
@@ -2471,6 +2505,9 @@ impl ProfileRuntime {
         if record.mode != Mode::Local {
             return Err(ServiceError::Unsupported);
         }
+        // Проверка installed proof выполняется после actual child verification,
+        // до HELLO/negotiation; невозможность v2 не превращается в v1 fallback.
+        let _producer = peer.verified_udp_producer(record)?;
         let stop = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -2579,10 +2616,12 @@ impl ProfileRuntime {
                             .ok_or(ServiceError::Unavailable)?,
                     )?;
                     resources.peer = Some(Arc::clone(&peer));
+                    let producer = peer.verified_udp_producer(record)?;
                     let (proof, go_proof) = channel_pair()?;
                     let proof_version = crate::worker::role_handoff::send_proof_bootstrap(
                         &resources.channel,
                         record,
+                        &producer,
                         &go_proof,
                         record.child_pid,
                         uid,
@@ -2617,6 +2656,7 @@ impl ProfileRuntime {
                         handle,
                         thread_wake,
                         proof_version,
+                        producer,
                         owner,
                         Arc::clone(&capsule),
                         budget,
@@ -3387,6 +3427,7 @@ impl SystemChannel {
         handle: tokio::runtime::Handle,
         wake: Arc<tokio::sync::Notify>,
         version: u8,
+        producer: VerifiedUdpProducer,
         owner: Arc<OwnerEndpoint>,
         capsule: Arc<wire::OwnedCapsule>,
         budget: Arc<ChannelBudget>,
@@ -3396,6 +3437,7 @@ impl SystemChannel {
         }
         let udp = if version == 2 {
             let ops = KernelUdpOperations {
+                producer: Arc::new(producer),
                 peer: Arc::clone(&peer),
                 owner: Some(owner),
                 record: launch,
@@ -4573,6 +4615,15 @@ pub(crate) struct Peer {
     _memory: super::memory::ByteLease,
 }
 impl Peer {
+    fn verified_udp_producer(
+        &self,
+        _record: LaunchRecord,
+    ) -> Result<VerifiedUdpProducer, ServiceError> {
+        // Отсутствует producer: trusted installed builder должен связать exact
+        // image/config/manifest/launch с consuming/close contract. Custody из
+        // BinarySnapshot/VerifiedExecDelivery не является этим measurement.
+        Err(ServiceError::Unsupported)
+    }
     pub(crate) fn local(
         record: LaunchRecord,
         child: &tokio::process::Child,

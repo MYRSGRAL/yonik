@@ -334,13 +334,13 @@ pub(crate) fn receive_exec_delivery(
 pub(crate) fn send_proof_bootstrap(
     socket: &OwnedFd,
     launch: crate::profile_channel::LaunchRecord,
+    producer: &crate::helper::native_profile_channel::VerifiedUdpProducer,
     proof: &OwnedFd,
     pid: u32,
     uid: u32,
     deadline: Instant,
 ) -> Result<u8, WorkerError> {
-    let (record, ack, version) = crate::helper::native_profile_channel::profile_proof_setup(launch)
-        .map_err(|_| WorkerError::Peer)?;
+    let (record, ack, version) = producer.setup(launch).map_err(|_| WorkerError::Peer)?;
     setup(socket, deadline)?;
     send_packet(socket, &record, &[proof.as_fd()])?;
     receive_packet(socket, &ack, pid, uid, 0, deadline)?;
