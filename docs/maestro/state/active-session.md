@@ -763,6 +763,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   conjunction и service callers остаются следующими переходами. Capture gate,
   production pins/readiness false; runtime не выполнялся.
 
+- R60 SOURCE scoped CLEAN: Hosts Publish19ee098 интегрирован. Actual caller
+  publishes DNHOST02 с issuer observation/full context и принимает только
+  exact Published DATA; observation/RTT/System deadline не продлевается.
+  Cleanup Cancel1→5→7→8 удерживает custody/credits до ACK. Numeric42 требует
+  отдельного WaiterReceipt53/54; physical gate пока не представляет conjunction
+  BootstrapPhysicalPermission/live original parent. Эти переходы закрыты,
+  public/runtime flags false; реального запуска/установки не было.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
