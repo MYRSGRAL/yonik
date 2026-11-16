@@ -97,13 +97,14 @@ impl FullProfileRequest {
             .compile_system(&plan)
             .map_err(|_| EgressError::Encoding)?;
         let retained = RetainedSystemProfile::seal(compiled, self.generation, self.selection)?;
-        let capsule = crate::profile_channel::OwnedCapsule::build(
+        let capsule = crate::profile_channel::OwnedCapsule::build_retained(
             &self.intent,
             &plan,
             resolver.as_ref().map(PinnedResolverSnapshot::reference),
             *retained.digest(),
             policy_revision,
             admission_id,
+            retained.compiled(),
         )
         .map_err(|_| EgressError::InvalidBinding)?;
         let prepared = PreparedFullProfile {
