@@ -1,5 +1,0 @@
-{
-  "pid": 1486451,
-  "exit": 1,
-  "output": "warning: yonik: /var/tmp/codex-myrs/transient/a4-mtree4-98pc7ol7/root/usr/share/applications/cloud.highpriority.yonik.desktop (Modification time mismatch)\nwarning: yonik: /var/tmp/codex-myrs/transient/a4-mtree4-98pc7ol7/root/usr/share/applications/cloud.highpriority.yonik.desktop (Size mismatch)\nwarning: yonik: /var/tmp/codex-myrs/transient/a4-mtree4-98pc7ol7/root/usr/share/applications/cloud.highpriority.yonik.desktop (SHA256 checksum mismatch)\nyonik: 508 total files, 1 altered file\n"
-}

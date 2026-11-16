@@ -1,6 +1,6 @@
 # Типизированный профиль и сетевой план сессии
 
-Продолжение [плана интеграции](../superpowers/plans/2026-11-10-system-session-integration.md).
+Продолжение [плана интеграции](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-10-system-session-integration.md).
 Этот срез готовит вход и сетевую часть SystemSessionHost. Сам авторизованный
 session host, его IPC и GUI пока не реализованы; `system_tun:false` сохраняется.
 

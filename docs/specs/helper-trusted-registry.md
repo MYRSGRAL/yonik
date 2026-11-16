@@ -61,5 +61,5 @@ Apply повторно проверяет авторизацию, окружен
 TUN. Эти методы и реальная системная установка остаются отдельными частями P12.
 
 Контракты: [авторизация](helper-authorization.md),
-[план сервиса](../superpowers/plans/2026-11-09-linux-network-helper.md).
+[план сервиса](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-09-linux-network-helper.md).
 Тестовые пути/UID разрешены только закрытым cfg(test) constructor.

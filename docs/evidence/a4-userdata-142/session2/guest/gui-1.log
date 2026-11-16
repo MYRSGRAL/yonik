@@ -1,1 +1,0 @@
-/usr/bin/yonik-desktop: /usr/lib/libQt6Core.so.6: version `Qt_6.12' not found (required by /usr/bin/yonik-desktop)

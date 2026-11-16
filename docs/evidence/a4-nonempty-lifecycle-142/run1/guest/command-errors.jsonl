@@ -1,1 +1,0 @@
-{"argv": ["busctl", "--address=unix:path=/home/fixture/runtime/bus", "--json=short", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", "s", "org.freedesktop.secrets"], "exit": 1, "stderr": "Call failed: Could not get owner of name 'org.freedesktop.secrets': no such name\n"}

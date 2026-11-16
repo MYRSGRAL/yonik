@@ -1,6 +1,6 @@
 # Linux host локального SOCKS
 
-9 ноября 2026, Linux x86_64. [План](../superpowers/plans/2026-11-09-linux-engine-host.md).
+9 ноября 2026, Linux x86_64. [План](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-09-linux-engine-host.md).
 Продолжение EngineHost/FR-03/04/10, не закрытие всех Linux/network gates.
 
 ## Реализованный контракт

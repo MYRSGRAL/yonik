@@ -1,7 +1,0 @@
-{
-  "path": "/home/myrs/.cargo/config.toml",
-  "sha256": "6f141cbeaae50242a1580523eb3bcea7588adbb3ff69ada492f24e564059fada",
-  "content": "[build]\njobs = 2\nrustc-wrapper = \"/home/myrs/.local/libexec/cargo-build-budget\"\n",
-  "first_attempt_wrapper_env": "RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER absent; global config applied",
-  "observed_scope_evidence": "witness-running-cgroup.json"
-}
