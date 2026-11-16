@@ -38,8 +38,9 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertTrue(metadata["udp_v2_name_policy_parity"])
         self.assertTrue(metadata["udp_v2_receive_os_source"])
         self.assertTrue(metadata["udp_v2_namespace_binding_source"])
-        self.assertFalse(metadata["udp_v2_runtime_flow_handoff_connected"])
-        self.assertFalse(metadata["udp_v2_close_receipt_connected"])
+        self.assertTrue(metadata["udp_v2_runtime_flow_handoff_connected"])
+        self.assertTrue(metadata["udp_v2_close_receipt_connected"])
+        self.assertTrue(metadata["udp_v2_response_sink_source"])
         self.assertTrue(metadata["dns_service_consumer_connected"])
         self.assertTrue(metadata["probe_service_consumer_connected"])
         self.assertTrue(metadata["snapshot_query_engine_connected"])
@@ -184,6 +185,25 @@ class FullProfilePatchTests(unittest.TestCase):
             metadata["udp_v2_original_grammar_head"],
             "7f1f5a8139ecd7f06e64b483b44c627ae2f99654",
         )
+
+    def test_udp_producer_uses_private_flow_and_duplex_reply_without_wire_extension(
+        self,
+    ) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        self.assertIn("privateUDP.Serve(dispatcher.DispatchLink", patch)
+        self.assertIn("p.udpActor.producerTick()", patch)
+        self.assertIn("p.openConsumed()", patch)
+        self.assertIn("p.association.CloseAndJoin()", patch)
+        self.assertIn("profileReceiptFrom(u.grantContext) != u.receipt", patch)
+        self.assertIn("profileUDPDownstreamCredit", patch)
+        self.assertIn("hooks.ProfileBeginLogicalTask(ctx)", patch)
+        self.assertIn("errProfileUDPResponseUncertain", patch)
+        self.assertIn(
+            "TestProfileUDPProducerDelayedSendBlocksKnownCloseAndUncertainIsSticky",
+            patch,
+        )
+        self.assertNotIn("+++ b/app/dns/dns.go", patch)
+        self.assertNotIn("+++ b/app/dns/nameserver.go", patch)
 
     def test_system_proof_fixture_is_embedded_byte_exact(self) -> None:
         fixture = ADAPTER / "full-profile-fixtures/system-proof-extension-v1.json"
