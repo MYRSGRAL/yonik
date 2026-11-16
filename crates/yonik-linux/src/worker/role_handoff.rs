@@ -257,6 +257,23 @@ pub(crate) struct VerifiedExecDelivery {
     _credit: crate::helper::memory::ByteLease,
 }
 impl VerifiedExecDelivery {
+    pub(crate) fn producer_image(
+        &self,
+        launch: crate::profile_channel::LaunchRecord,
+    ) -> Result<[u8; 32], WorkerError> {
+        crate::profile_channel::ExecDelivery::decode(
+            &self.record.encode().map_err(|_| WorkerError::Protocol)?,
+            launch,
+        )
+        .map_err(|_| WorkerError::Peer)?;
+        Ok(self.record.image)
+    }
+    pub(crate) fn image_digest(&self) -> [u8; 32] {
+        self.record.image
+    }
+    pub(crate) fn config_digest(&self) -> [u8; 32] {
+        self.record.launch.binding.digest
+    }
     pub(crate) fn files(
         &self,
         launch: crate::profile_channel::LaunchRecord,
@@ -318,12 +335,19 @@ pub(crate) fn receive_exec_delivery(
     {
         return Err(WorkerError::Peer);
     }
-    deliver(VerifiedExecDelivery {
+    let verified = VerifiedExecDelivery {
         record: expected,
         image,
         config,
         _credit: credit,
-    })?;
+    };
+    // До ACK, разрешающего consuming exec: user expected hash/child record
+    // без protected install provenance не запускают full-profile image.
+    crate::helper::TrustedRegistry::system()
+        .map_err(|_| WorkerError::Peer)?
+        .producer_for_delivery(&verified, launch)
+        .map_err(|_| WorkerError::Peer)?;
+    deliver(verified)?;
     setup(socket, deadline)?;
     send_packet(
         socket,

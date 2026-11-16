@@ -330,8 +330,9 @@ impl Launch {
         self,
         child: &tokio::process::Child,
         binary: &BinarySnapshot,
+        config: &[u8],
     ) -> Result<issuer::ProfileRuntime, HostError> {
-        let peer = issuer::Peer::local(self.record, child, binary).map_err(rejected)?;
+        let peer = issuer::Peer::local(self.record, child, binary, config).map_err(rejected)?;
         issuer::ProfileRuntime::start_local(self.record, peer, self.prepared, self.host)
             .map_err(rejected)
     }

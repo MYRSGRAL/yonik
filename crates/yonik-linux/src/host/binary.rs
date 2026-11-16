@@ -49,6 +49,7 @@ impl FromStr for Sha256 {
 /// Один sealed inode используется для version/config-check/start. Исходный путь
 /// после копирования больше не читается; ни пути, ни содержимое не попадают в Debug.
 pub struct BinarySnapshot {
+    producer: Option<crate::helper::ImageContract>,
     pub(crate) file: File,
     pub(crate) engine: Engine,
     image: Arc<SharedImage>,
@@ -67,6 +68,13 @@ impl std::fmt::Debug for BinarySnapshot {
     }
 }
 impl BinarySnapshot {
+    pub(crate) fn with_producer(mut self, proof: Option<crate::helper::ImageContract>) -> Self {
+        self.producer = proof;
+        self
+    }
+    pub(crate) fn producer(&self) -> Option<crate::helper::ImageContract> {
+        self.producer.clone()
+    }
     pub(crate) const MAX_SIZE: u64 = 128 * 1024 * 1024;
     pub fn load(path: &Path, expected: Sha256, engine: Engine) -> Result<Self, HostError> {
         let source = OpenOptions::new()
@@ -198,6 +206,7 @@ impl BinarySnapshot {
         }
         let file = image.file.try_clone().map_err(|_| HostError::Snapshot)?;
         Ok(Self {
+            producer: None,
             file,
             engine,
             image,

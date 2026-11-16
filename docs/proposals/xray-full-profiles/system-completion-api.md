@@ -930,3 +930,45 @@ public require_consumer/capabilities/builder readiness остаются закр
 registry/binary/builder и DNS caller-файлы с тестами. Negative controls: legacy/no-contract, untrusted
 record, wrong ELF/patch/contract/launch/config/manifest; positive exact-image
 binding проверяется без OS exec.
+
+### Реализация protected producer binding после4ea6c087
+
+Предыдущий R26 blocker superseded принятым trusted consuming-launcher contract.
+Registry schema2 принимает optional `native_profile_producer`, schema1 не выдаёт
+такой authority. Record имеет поля `contract="yonik-xray-profile-udp-v2"`,
+`version=1`, `source_commit`, `source_sha256`, `patch_sha256`, `builder_sha256`,
+`toolchain_sha256`, `build_inputs_sha256`, `elf_sha256`; digests — bounded
+lowercase hex64/nonzero. Source commit закреплён на26.10.31; patch allowlist
+закреплён на accepted83863e6f… source contract. Следующий DNS patchset обязан
+пройти root source review и обновить allowlist; semantic contract и exact
+artifact digest не смешиваются. Наличие этого record не означает full readiness.
+
+Production record читается только через existing protected root path walk,
+NOFOLLOW/uid0/mode/nlink/size guards. `ProducerRecord::validate` private;
+`ImageContract` opaque, без Deserialize/public constructor. Registry snapshot
+прикрепляет contract к checked sealed BinarySnapshot; public user-path load
+оставляет contract=None. System связывает protected entry hash с opaque
+VerifiedExecDelivery, уже проверившим actual retained sealed image/config;
+повторная полная копия executable для этого не нужна. Это consuming custody,
+не continuous current-image measurement.
+
+`Peer::verified_udp_producer` проверяет exact retained LaunchRecord, config hash,
+capsule mode/manifest и image-contract, затем mint-ит private token. Local
+вычисляет config hash из тех же immutable checked bytes, которые caller пишет
+в stdin, и удерживает sealed config memfd до cleanup. Producer absence запрещает
+Local spawn до configure/inheritance; legacy/check path producer не получает.
+Local normal Host вызывает PF002/PFA02 exchange в dedicated owner thread;
+parent сначала проверяет actual child и продолжает bounded stdin независимо
+от ACK, затем owner ждёт HELLO с exact Local mode. Четыре locators и frozen FD
+counts не изменены. Нет privileged Local daemon/System attribution.
+
+Builder `--experimental-profile --engine xray --compile-only` требует готовый
+offline clean source, применяет codec+full patch с exact source/callsite pins,
+проверяет полный source tree/modules до/после build, исключает inherited
+Git/loader overrides, сохраняет hashes actual Go driver/compile/link
+и повторно проверяет их после build. Выход `native-profile-producer.json`
+содержит artifact provenance; builder НЕ устанавливает root registry record.
+Trusted provider отдельно проверяет final source review/evidence и устанавливает
+schema2 entry вместе с exact ELF. Текущий patch pin — reviewed UDP source
+prerequisite, не обещание полной DNS/P4/P5 semantics или production-ready ELF.
+Public require_consumer/capabilities/builder_apply_enabled/Connect остаются false.

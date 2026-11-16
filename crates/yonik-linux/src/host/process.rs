@@ -131,6 +131,11 @@ pub(crate) fn spawn_profile(
             Stdio::piped()
         });
     if let Some(profile) = profile {
+        binary
+            .producer()
+            .ok_or(HostError::Unsupported)?
+            .check(binary.trusted_hash())
+            .map_err(|_| HostError::Unsupported)?;
         profile.configure(command)?.spawn()
     } else {
         command.spawn().map_err(|_| HostError::Process)
