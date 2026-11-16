@@ -1,3 +1,1527 @@
+diff --git a/proxy/socks/yonik_udp_v2_test.go b/proxy/socks/yonik_udp_v2_test.go
+new file mode 100644
+--- /dev/null
++++ b/proxy/socks/yonik_udp_v2_test.go
+@@ -0,0 +1,61 @@
++package socks
++
++import (
++	"bytes"
++	"errors"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
++	"io"
++	gonet "net"
++	"testing"
++	"time"
++)
++
++type profileHandshakeConn struct{ bytes.Buffer }
++
++func (*profileHandshakeConn) Read([]byte) (int, error) { return 0, io.EOF }
++func (*profileHandshakeConn) Close() error             { return nil }
++func (*profileHandshakeConn) LocalAddr() gonet.Addr {
++	return &gonet.TCPAddr{IP: gonet.IPv4(127, 0, 0, 1), Port: 1080}
++}
++func (*profileHandshakeConn) RemoteAddr() gonet.Addr {
++	return &gonet.TCPAddr{IP: gonet.IPv4(192, 0, 2, 1), Port: 32001}
++}
++func (*profileHandshakeConn) SetDeadline(time.Time) error      { return nil }
++func (*profileHandshakeConn) SetReadDeadline(time.Time) error  { return nil }
++func (*profileHandshakeConn) SetWriteDeadline(time.Time) error { return nil }
++
++func TestYonikUDPv2SOCKSControlCannotBecomeChildListener(t *testing.T) {
++	for _, ack := range []error{nil, hooks.ErrProfileUnsupported} {
++		s := &ServerSession{config: &ServerConfig{UdpEnabled: true}, address: net.LocalHostIP, port: 1080}
++		conn := &profileHandshakeConn{}
++		calls := 0
++		request, e := profileHandshakeBeforeUDPFactory(s, bytes.NewReader([]byte{5, 1, 0, 5, 3, 0}), conn, func() error { calls++; return ack })
++		if request != nil || !errors.Is(e, hooks.ErrProfileUnsupported) || calls != 1 {
++			t.Fatal("control ACK created authority", e, calls)
++		}
++		response := conn.Bytes()
++		if len(response) != 12 || response[3] != statusCmdNotSupport {
++			t.Fatal("UDP success response", response)
++		}
++	}
++}
++func TestYonikUDPv2SOCKSTCPKeepsNativeHandshake(t *testing.T) {
++	for _, input := range [][]byte{{5, 1, 0, 5, 1, 0, 1, 192, 0, 2, 2, 1, 187}, {4, 1, 1, 187, 192, 0, 2, 2, 0}} {
++		s := &ServerSession{config: &ServerConfig{UdpEnabled: true}, address: net.LocalHostIP, port: 1080}
++		actual, legacy := &profileHandshakeConn{}, &profileHandshakeConn{}
++		request, e := profileHandshakeBeforeUDPFactory(s, bytes.NewReader(input), actual, func() error { t.Fatal("TCP entered UDP admission"); return nil })
++		old, udp, oldError := s.Handshake(bytes.NewReader(input), legacy)
++		if e != nil || oldError != nil || udp != nil || request.Command != protocol.RequestCommandTCP || request.Destination() != old.Destination() || !bytes.Equal(actual.Bytes(), legacy.Bytes()) {
++			t.Fatal("TCP native parity", e, oldError)
++		}
++	}
++}
++func TestYonikUDPv2SOCKSAuthFailureNeverAdmitsControl(t *testing.T) {
++	s := &ServerSession{config: &ServerConfig{UdpEnabled: true}}
++	_, e := profileHandshakeBeforeUDPFactory(s, bytes.NewReader([]byte{5, 1, 2}), &profileHandshakeConn{}, func() error { t.Fatal("unauthenticated admission"); return nil })
++	if e == nil {
++		t.Fatal("auth failure accepted")
++	}
++}
+diff --git a/common/yonikbroker/profile-udp-proof-v2-rust.json b/common/yonikbroker/profile-udp-proof-v2-rust.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-udp-proof-v2-rust.json
+@@ -0,0 +1,70 @@
++{
++  "provenance": "Независимый Python struct.pack/hashlib; synthetic DATA, не runtime proof",
++  "launch_hex": "594e4b4558543031000100c0000100000606060606060606060606060606060606060606060606060606060606060606030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000500000007000000080000000000000009000000000000000a0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0000000000000000",
++  "bootstrap_hex": "594e4b5046303032000200800001000006060606060606060606060606060606060606060606060606060606060606060303030303030303030303030303030303030303030303030303030303030303010101010101010101010101010101010202020202020202020202020202020200000000000000040000000000000005",
++  "ack_hex": "594e4b5046413032ff29ff4881beae89cc7d51bfac539d2a1ad787664209434aac5dd738be2da43d",
++  "payload_hex": "000000010102030401bb7061796c6f6164",
++  "fingerprint_hex": "43f078e04319b8f8d0523cf47e6ceb95a5ae3b1cf66df0aafe75d38f2f62f64f",
++  "vectors": [
++    {
++      "magic": "YNKUCS01",
++      "rights": 1,
++      "from_go": true,
++      "hex": "594e4b5543533031000100c000010000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000100000300060400007d010438c00002010000000000000000000000007f00000100000000000000000000000000000000"
++    },
++    {
++      "magic": "YNKUCA01",
++      "rights": 0,
++      "from_go": false,
++      "hex": "594e4b5543413031000100a00000000003030303030303030303030303030303030303030303030303030303030303030101010101010101010101010101010102020202020202020202020202020202000000000000000400000000000000050606060606060606060606060606060606060606060606060606060606060606000000000000000100000000000000010000000000000065000000003b9aca00"
++    },
++    {
++      "magic": "YNKUAQ01",
++      "rights": 0,
++      "from_go": true,
++      "hex": "594e4b5541513031000100a000000000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000002000000000000000100000000000000650000000000000000"
++    },
++    {
++      "magic": "YNKUAC01",
++      "rights": 1,
++      "from_go": false,
++      "hex": "594e4b5541433031000100c00001000003030303030303030303030303030303030303030303030303030303030303030101010101010101010101010101010102020202020202020202020202020202000000000000000400000000000000050606060606060606060606060606060606060606060606060606060606060606000000000000000200000000000000010000000000000001000000000000006604110000c00000007f0000010000000000000000000000000000000000000000"
++    },
++    {
++      "magic": "YNKUPQ01",
++      "rights": 0,
++      "from_go": true,
++      "hex": "594e4b5550513031000100a000000000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000300000000000000010000000000000000"
++    },
++    {
++      "magic": "YNKURP01",
++      "rights": 0,
++      "from_go": false,
++      "hex": "594e4b55525030310001010000000000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000300000000000000040000000000000066110400007d02c000c00002010000000000000000000000007f00000100000000000000000000000000000011000a000043f078e04319b8f8d0523cf47e6ceb95a5ae3b1cf66df0aafe75d38f2f62f64f000000003b9aca000000000000000000"
++    },
++    {
++      "magic": "YNKUCM01",
++      "rights": 0,
++      "from_go": true,
++      "hex": "594e4b55434d30310001010000000000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000300000000000000040000000000000066110400007d02c000c00002010000000000000000000000007f00000100000000000000000000000000000011000a000043f078e04319b8f8d0523cf47e6ceb95a5ae3b1cf66df0aafe75d38f2f62f64f00000000000000090000000000000000"
++    },
++    {
++      "magic": "YNKUMR01",
++      "rights": 0,
++      "from_go": false,
++      "hex": "594e4b554d523031000100c0000000000303030303030303030303030303030303030303030303030303030303030303010101010101010101010101010101010202020202020202020202020202020200000000000000040000000000000005060606060606060606060606060606060606060606060606060606060606060600000000000000010000000000000003000000000000000400000000000000090100000000000000000000003b9aca0000000000000000000000000000000000"
++    },
++    {
++      "magic": "YNKUCQ01",
++      "rights": 0,
++      "from_go": false,
++      "hex": "594e4b5543513031000100a000000000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000200000000000000010001000000000000"
++    },
++    {
++      "magic": "YNKUCR01",
++      "rights": 0,
++      "from_go": true,
++      "hex": "594e4b5543523031000100c0000000000303030303030303030303030303030303030303030303030303030303030303010101010101010101010101010101010202020202020202020202020202020200000000000000040000000000000005060606060606060606060606060606060606060606060606060606060606060600000000000000010000000000000002000000000000000300000000010100000000000000000066000000000000000900000000000000000000000000000000"
++    }
++  ]
++}
+diff --git a/common/yonikbroker/profile-udp-proof-v2-source.json b/common/yonikbroker/profile-udp-proof-v2-source.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-udp-proof-v2-source.json
+@@ -0,0 +1,81 @@
++{
++  "authority": false,
++  "rustParity": false,
++  "contractRef": "21d7c90f6d92c00f4fb368905df40d7ca9923a1e",
++  "launchHex": "594e4b4558543031000100c0000100000606060606060606060606060606060606060606060606060606060606060606030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000500000007000000080000000000000009000000000000000a0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0000000000000000",
++  "bootstrapHex": "594e4b5046303032000200800001000006060606060606060606060606060606060606060606060606060606060606060303030303030303030303030303030303030303030303030303030303030303010101010101010101010101010101010202020202020202020202020202020200000000000000040000000000000005",
++  "ackHex": "594e4b5046413032ff29ff4881beae89cc7d51bfac539d2a1ad787664209434aac5dd738be2da43d",
++  "datagramHex": "00000001c63364070035aabb",
++  "records": [
++    {
++      "magic": "YNKUCS01",
++      "length": 192,
++      "rights": 1,
++      "issuer": false,
++      "wireHex": "594e4b5543533031000100c000010000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000900000300060400007d010438c00002010000000000000000000000007f00000100000000000000000000000000000000"
++    },
++    {
++      "magic": "YNKUCA01",
++      "length": 160,
++      "rights": 0,
++      "issuer": true,
++      "wireHex": "594e4b5543413031000100a00000000003030303030303030303030303030303030303030303030303030303030303030101010101010101010101010101010102020202020202020202020202020202000000000000000400000000000000050606060606060606060606060606060606060606060606060606060606060606000000000000000100000000000000090000000000000011000000003b9aca00"
++    },
++    {
++      "magic": "YNKUAQ01",
++      "length": 160,
++      "rights": 0,
++      "issuer": false,
++      "wireHex": "594e4b5541513031000100a000000000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000900000000000000110000000000000000"
++    },
++    {
++      "magic": "YNKUAC01",
++      "length": 192,
++      "rights": 1,
++      "issuer": true,
++      "wireHex": "594e4b5541433031000100c00001000003030303030303030303030303030303030303030303030303030303030303030101010101010101010101010101010102020202020202020202020202020202000000000000000400000000000000050606060606060606060606060606060606060606060606060606060606060606000000000000000100000000000000090000000000000011000000000000001904110000c00000007f0000010000000000000000000000000000000000000000"
++    },
++    {
++      "magic": "YNKUPQ01",
++      "length": 160,
++      "rights": 0,
++      "issuer": false,
++      "wireHex": "594e4b5550513031000100a000000000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000900000000000000110000000000000000"
++    },
++    {
++      "magic": "YNKURP01",
++      "length": 256,
++      "rights": 0,
++      "issuer": true,
++      "wireHex": "594e4b55525030310001010000000000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000900000000000000110000000000000019110400007d01c000c00002010000000000000000000000007f0000010000000000000000000000000000000c000a0000fa4c5de99a844db72f72bb4736013d22f91e0ce4bae03e936720540c3165b9ea000000003b9aca000000000000000000"
++    },
++    {
++      "magic": "YNKUCM01",
++      "length": 256,
++      "rights": 0,
++      "issuer": false,
++      "wireHex": "594e4b55434d30310001010000000000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000900000000000000110000000000000019110400007d01c000c00002010000000000000000000000007f0000010000000000000000000000000000000c000a0000fa4c5de99a844db72f72bb4736013d22f91e0ce4bae03e936720540c3165b9ea00000000000000030000000000000000"
++    },
++    {
++      "magic": "YNKUMR01",
++      "length": 192,
++      "rights": 0,
++      "issuer": true,
++      "wireHex": "594e4b554d523031000100c0000000000303030303030303030303030303030303030303030303030303030303030303010101010101010101010101010101010202020202020202020202020202020200000000000000040000000000000005060606060606060606060606060606060606060606060606060606060606060600000000000000010000000000000009000000000000001100000000000000190100000000000000000000003b9aca0000000000000000000000000000000000"
++    },
++    {
++      "magic": "YNKUCQ01",
++      "length": 160,
++      "rights": 0,
++      "issuer": true,
++      "wireHex": "594e4b5543513031000100a000000000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000001000000000000000900000000000000110000000000000000"
++    },
++    {
++      "magic": "YNKUCR01",
++      "length": 192,
++      "rights": 0,
++      "issuer": false,
++      "wireHex": "594e4b5543523031000100c0000000000303030303030303030303030303030303030303030303030303030303030303010101010101010101010101010101010202020202020202020202020202020200000000000000040000000000000005060606060606060606060606060606060606060606060606060606060606060600000000000000010000000000000009000000000000000000000000010100000000000000000021000000000000000000000000000000000000000000000000"
++    }
++  ]
++}
+diff --git a/common/yonikbroker/profile_udp_v2_linux_test.go b/common/yonikbroker/profile_udp_v2_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_udp_v2_linux_test.go
+@@ -0,0 +1,668 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	_ "embed"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"sync/atomic"
++	"testing"
++	"time"
++	"unsafe"
++)
++
++//go:embed profile-udp-proof-v2-source.json
++var udpSourceVectors []byte
++
++//go:embed profile-udp-proof-v2-rust.json
++var udpRustVectors []byte
++
++func TestProfileUDPv2ExactRustD79RecordsAckAndWholeDatagramFingerprint(t *testing.T) {
++	var v struct {
++		Launch      string `json:"launch_hex"`
++		Bootstrap   string `json:"bootstrap_hex"`
++		Ack         string `json:"ack_hex"`
++		Payload     string `json:"payload_hex"`
++		Fingerprint string `json:"fingerprint_hex"`
++		Vectors     []struct {
++			Magic, Hex string
++			Rights     int
++			FromGo     bool `json:"from_go"`
++		}
++	}
++	if e := json.Unmarshal(udpRustVectors, &v); e != nil {
++		t.Fatal(e)
++	}
++	decode := func(s string) []byte {
++		b, e := hex.DecodeString(s)
++		if e != nil {
++			t.Fatal(e)
++		}
++		return b
++	}
++	r, e := decodeProfileLaunch(decode(v.Launch))
++	if e != nil {
++		t.Fatal(e)
++	}
++	b, e := profileProofBootstrapV2(r)
++	if e != nil || !bytes.Equal(b[:], decode(v.Bootstrap)) {
++		t.Fatal("PF002 Rust parity", e)
++	}
++	ack := profileProofAck(b)
++	if !bytes.Equal(ack[:], decode(v.Ack)) {
++		t.Fatal("PFA02 Rust hash parity")
++	}
++	if len(v.Vectors) != 10 {
++		t.Fatal("missing record kinds")
++	}
++	for i, row := range v.Vectors {
++		raw := decode(row.Hex)
++		kind, e := profileUDPDecode(r, raw, row.Rights, !row.FromGo)
++		if e != nil || kind != i {
++			t.Fatal(row.Magic, e)
++		}
++		encoded, n, e := profileUDPEncode(r, kind, raw[128:])
++		if e != nil || !bytes.Equal(encoded[:n], raw) {
++			t.Fatal("exact Rust record bytes", row.Magic, e)
++		}
++		cookieOffset := 0
++		switch kind {
++		case 1, 2:
++			cookieOffset = 144
++		case 3, 5, 6:
++			cookieOffset = 152
++		case 9:
++			cookieOffset = 160
++		}
++		if cookieOffset != 0 {
++			max := append([]byte(nil), raw...)
++			be.PutUint64(max[cookieOffset:], ^uint64(0))
++			if _, e = profileUDPDecode(r, max, row.Rights, !row.FromGo); e != nil {
++				t.Fatal("opaque kernel cookie MAX is not counter wrap", row.Magic, e)
++			}
++			clear(max[cookieOffset : cookieOffset+8])
++			if _, e = profileUDPDecode(r, max, row.Rights, !row.FromGo); e == nil {
++				t.Fatal("zero cookie")
++			}
++		}
++		if kind == 5 {
++			hash := profileUDPFingerprint(r, raw, decode(v.Payload))
++			if !bytes.Equal(hash[:], decode(v.Fingerprint)) || !bytes.Equal(hash[:], raw[208:240]) {
++				t.Fatal("whole datagram Rust fingerprint")
++			}
++			if u16(raw, 164) != 32002 || u16(raw, 166) != 49152 || u32(raw, 200) != uint32(len(decode(v.Payload))) {
++				t.Fatal("initiator/relay/length mismatch")
++			}
++			bad := append([]byte(nil), raw...)
++			clear(bad[208:240])
++			if _, e = profileUDPDecode(r, bad, 0, true); e == nil {
++				t.Fatal("zero fingerprint")
++			}
++			bad = append([]byte(nil), raw...)
++			bad[184] = 126
++			if _, e = profileUDPDecode(r, bad, 0, true); e == nil {
++				t.Fatal("foreign relay endpoint")
++			}
++		}
++	}
++}
++
++func TestProfileUDPv2IndependentSourceVectorsNotRuntimeAuthority(t *testing.T) {
++	var v struct {
++		Authority, RustParity bool
++		Launch                string `json:"launchHex"`
++		Bootstrap             string `json:"bootstrapHex"`
++		Ack                   string `json:"ackHex"`
++		Records               []struct {
++			Magic, Wire string
++			Rights      int
++			Issuer      bool
++			WireHex     string `json:"wireHex"`
++		}
++	}
++	if e := json.Unmarshal(udpSourceVectors, &v); e != nil {
++		t.Fatal(e)
++	}
++	if v.Authority || v.RustParity || len(v.Records) != 10 {
++		t.Fatal("source vectors claimed readiness")
++	}
++	decode := func(s string) []byte {
++		b, e := hex.DecodeString(s)
++		if e != nil {
++			t.Fatal(e)
++		}
++		return b
++	}
++	r, e := decodeProfileLaunch(decode(v.Launch))
++	if e != nil {
++		t.Fatal(e)
++	}
++	bootstrap, e := profileProofBootstrapV2(r)
++	if e != nil || !bytes.Equal(bootstrap[:], decode(v.Bootstrap)) {
++		t.Fatal("PF002 Python parity", e)
++	}
++	ack := profileProofAck(bootstrap)
++	if !bytes.Equal(ack[:], decode(v.Ack)) {
++		t.Fatal("PFA02 Python parity")
++	}
++	for i, row := range v.Records {
++		raw := decode(row.WireHex)
++		kind, e := profileUDPDecode(r, raw, row.Rights, row.Issuer)
++		if e != nil || kind != i {
++			t.Fatal(row.Magic, e)
++		}
++		encoded, n, e := profileUDPEncode(r, kind, raw[128:])
++		if e != nil || !bytes.Equal(encoded[:n], raw) {
++			t.Fatal("source bytes mismatch", row.Magic, e)
++		}
++	}
++}
++
++type udpReceiveFake struct {
++	raw                   []byte
++	got                   profileUDPReceiveResult
++	reads, closes, joins  atomic.Int32
++	closeError, joinError error
++	started               chan struct{}
++	block                 chan struct{}
++	closed                chan struct{}
++	ignoreCancel          bool
++}
++
++func (f *udpReceiveFake) Receive(ctx context.Context, b []byte) (profileUDPReceiveResult, error) {
++	f.reads.Add(1)
++	if f.started != nil {
++		close(f.started)
++	}
++	if f.block != nil {
++		if f.ignoreCancel {
++			<-f.block
++		} else {
++			select {
++			case <-f.block:
++			case <-ctx.Done():
++				return profileUDPReceiveResult{}, ctx.Err()
++			}
++		}
++	}
++	copy(b, f.raw)
++	return f.got, nil
++}
++func (f *udpReceiveFake) Close() error {
++	f.closes.Add(1)
++	if f.closed != nil {
++		close(f.closed)
++	}
++	return f.closeError
++}
++func (f *udpReceiveFake) Join() error { f.joins.Add(1); return f.joinError }
++
++func udpStateFixture(t *testing.T) (*flowFixture, *profileUDPAssociation, *udpReceiveFake) {
++	t.Helper()
++	f := newFlowFixture(t, 2)
++	// Явный fake consumed bootstrap; production OS gate PF002 остаётся closed.
++	f.p.proofs.version = 2
++	f.p.proofs.launch = f.p.admission.launch
++	if e := profileInitUDPBudget(f.p); e != nil {
++		t.Fatal(e)
++	}
++	raw := []byte{0, 0, 0, 1, 198, 51, 100, 7, 0, 53, 0xaa, 0xbb}
++	tuple := fakeFlowTuple(17)
++	be.PutUint16(tuple[6:], 49152)
++	receiver := &udpReceiveFake{raw: raw, got: profileUDPReceiveResult{n: len(raw), tuple: tuple, cookie: 3, queueBytes: 65536, bound: profileDestinationValue{family: 4, network: 17, port: 49152, address: "127.0.0.1"}}}
++	r := f.p.admission.launch
++	delivery := udpDelivery(t, r, 1, 3, 2)
++	a, e := profileNewUDPAssociation(f.c, r, f.p.ctx, delivery, func() (profileUDPReceiver, error) { return receiver, nil })
++	if e != nil {
++		t.Fatal(e)
++	}
++	t.Cleanup(func() { a.CloseAndJoin() })
++	return f, a, receiver
++}
++func udpDelivery(t *testing.T, r profileLaunch, id, cookie, control uint64, operation ...uint64) []byte {
++	t.Helper()
++	var tail [64]byte
++	be.PutUint64(tail[:], 1)
++	if len(operation) > 0 {
++		be.PutUint64(tail[:], operation[0])
++	}
++	be.PutUint64(tail[8:], control)
++	be.PutUint64(tail[16:], id)
++	be.PutUint64(tail[24:], cookie)
++	tail[32], tail[33] = 4, 17
++	be.PutUint16(tail[36:], 49152)
++	copy(tail[40:], []byte{127, 0, 0, 1})
++	b, n, e := profileUDPEncode(r, 3, tail[:])
++	if e != nil {
++		t.Fatal(e)
++	}
++	return b[:n]
++}
++func udpPermit(t *testing.T, a *profileUDPAssociation, receiver *udpReceiveFake, packet, permit uint64) []byte {
++	t.Helper()
++	tail := make([]byte, 128)
++	be.PutUint64(tail, a.id)
++	be.PutUint64(tail[8:], packet)
++	be.PutUint64(tail[16:], permit)
++	be.PutUint64(tail[24:], a.cookie)
++	copy(tail[32:], receiver.got.tuple[:])
++	be.PutUint32(tail[72:], uint32(len(receiver.raw)))
++	be.PutUint16(tail[76:], 10)
++	be.PutUint64(tail[112:], uint64(time.Second))
++	tail[80] = 1 // placeholder DATA; ниже заменяется hash actual bytes.
++	b, n, e := profileUDPEncode(a.launch, 5, tail)
++	if e != nil {
++		t.Fatal(e)
++	}
++	hash := profileUDPFingerprint(a.launch, b[:n], receiver.raw)
++	copy(b[208:240], hash[:])
++	return b[:n]
++}
++func udpMatch(t *testing.T, a *profileUDPAssociation, status byte) []byte {
++	t.Helper()
++	tail := make([]byte, 64)
++	be.PutUint64(tail, a.id)
++	be.PutUint64(tail[8:], a.lastPacket)
++	be.PutUint64(tail[16:], a.lastPermit)
++	be.PutUint64(tail[24:], a.openSequence)
++	tail[32] = status
++	if status == 1 {
++		be.PutUint64(tail[40:], uint64(time.Second))
++	}
++	b, n, e := profileUDPEncode(a.launch, 7, tail)
++	if e != nil {
++		t.Fatal(e)
++	}
++	return b[:n]
++}
++
++func TestProfileUDPv2ExclusivePermitMatchDoesNotGrantOrReleasePayload(t *testing.T) {
++	f, a, receiver := udpStateFixture(t)
++	if e := a.ConsumePermit(); e == nil || receiver.reads.Load() != 0 {
++		t.Fatal("read without permit")
++	}
++	if e := a.BeginPeek(f.now.Add(time.Second)); e != nil {
++		t.Fatal(e)
++	}
++	b := udpPermit(t, a, receiver, 1, 1)
++	if e := a.Permit(b); e != nil {
++		t.Fatal(e)
++	}
++	if e := a.ConsumePermit(); e != nil {
++		t.Fatal(e)
++	}
++	if e := a.ConsumePermit(); e == nil || receiver.reads.Load() != 1 {
++		t.Fatal("second consuming reader")
++	}
++	consumed, e := a.Consumed(4)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if kind, e := profileUDPDecode(a.launch, consumed[:], 0, false); e != nil || kind != 6 {
++		t.Fatal("consumed schema", e)
++	}
++	if _, e = a.Consumed(5); e == nil {
++		t.Fatal("consumed receipt reused")
++	}
++	if e = a.Match(udpMatch(t, a, 1)); e != nil {
++		t.Fatal(e)
++	}
++	if e = a.BeginPeek(f.now.Add(time.Second)); e == nil {
++		t.Fatal("new permit while payload waiting GRANT")
++	}
++	if e = a.RetirePayload(); e == nil || a.length != len(receiver.raw) {
++		t.Fatal("Matched treated as grant or terminal denial")
++	}
++	if a.original.address != "198.51.100.7" || a.original.port != 53 || a.original.network != 17 {
++		t.Fatal("original parsed from wrong bytes")
++	}
++	if f.c.highestFlow != 0 || f.c.highestGrant != 0 {
++		t.Fatal("control/Matched promoted to user authority")
++	}
++}
++func TestProfileUDPv2ActualReadMustMatchEveryKernelAndPacketField(t *testing.T) {
++	for _, mutation := range []string{"peer", "flags", "cookie", "bound", "length", "payload", "header", "overflow", "rcvbuf", "gro"} {
++		t.Run(mutation, func(t *testing.T) {
++			f, a, r := udpStateFixture(t)
++			a.BeginPeek(f.now.Add(time.Second))
++			permit := udpPermit(t, a, r, 1, 1)
++			switch mutation {
++			case "peer":
++				r.got.tuple[8] ^= 1
++			case "flags":
++				r.got.flags = 1
++			case "cookie":
++				r.got.cookie++
++			case "bound":
++				r.got.bound.port++
++			case "length":
++				r.got.n--
++			case "payload":
++				r.raw[len(r.raw)-1] ^= 1
++			case "header":
++				r.raw[2] = 1
++			case "overflow":
++				r.got.overflow = 1
++			case "rcvbuf":
++				r.got.queueBytes = 128*1024 + 1
++			case "gro":
++				r.got.gro = true
++			}
++			if e := a.Permit(permit); e != nil {
++				t.Fatal(e)
++			}
++			if e := a.ConsumePermit(); e == nil || a.length != 0 {
++				t.Fatal("mismatched consumed packet accepted")
++			}
++			if e := a.CloseAndJoin(); e == nil || a.phase != profileUDPUnknown || !a.credit {
++				t.Fatal("mismatch lost Unknown custody")
++			}
++		})
++	}
++}
++func TestProfileUDPv2DeniedPayloadMustRetireBeforeNextPermit(t *testing.T) {
++	f, a, r := udpStateFixture(t)
++	a.BeginPeek(f.now.Add(time.Second))
++	a.Permit(udpPermit(t, a, r, 1, 1))
++	if e := a.ConsumePermit(); e != nil {
++		t.Fatal(e)
++	}
++	a.Consumed(3)
++	if e := a.Match(udpMatch(t, a, 2)); e != nil {
++		t.Fatal(e)
++	}
++	if e := a.BeginPeek(f.now.Add(time.Second)); e == nil {
++		t.Fatal("payload reused before retirement")
++	}
++	if e := a.RetirePayload(); e != nil {
++		t.Fatal(e)
++	}
++	if e := a.BeginPeek(f.now.Add(time.Second)); e != nil {
++		t.Fatal(e)
++	}
++	if e := a.Permit(udpPermit(t, a, r, 2, 2)); e != nil {
++		t.Fatal(e)
++	}
++	if entry := f.c.udpBudget.entries[1]; entry.packet != 1 || entry.permit != 1 || entry.runtimeSequence != 3 || !entry.terminal {
++		t.Fatal("retained packet tombstone replaced", entry)
++	}
++	if e := a.Permit(udpPermit(t, a, r, 1, 1)); e == nil {
++		t.Fatal("packet/permit ID replay after retirement")
++	}
++	if e := a.Permit(udpPermit(t, a, r, 3, 3)); e == nil || !f.c.revoked {
++		t.Fatal("replay fell back to fresh permit")
++	}
++}
++
++func TestProfileUDPv2BudgetRequiresConsumedSystemBindingAndEarlyPreflight(t *testing.T) {
++	for _, mode := range []byte{1, 2} {
++		f := newFlowFixture(t, mode)
++		before := f.c.buffered
++		if e := profileInitUDPBudget(f.p); e == nil || f.c.udpBudget != nil || f.c.buffered != before {
++			t.Fatal("legacy/v1 proof initialized v2 ledger")
++		}
++	}
++	f := newFlowFixture(t, 2)
++	f.p.proofs.version = 2
++	f.p.proofs.launch = f.p.admission.launch
++	f.p.proofs.launch.digest[0] ^= 1
++	if e := profileInitUDPBudget(f.p); e == nil {
++		t.Fatal("mixed launch bootstrap")
++	}
++	f.p.proofs.launch = f.p.admission.launch
++	if e := profileInitUDPBudget(f.p); e != nil {
++		t.Fatal(e)
++	}
++	before := f.c.buffered
++	if e := profileInitUDPBudget(f.p); e == nil || f.c.buffered != before {
++		t.Fatal("ledger reset/ID reuse")
++	}
++}
++func TestProfileUDPv2CloseJoinsActualReadAndRetainsFinalUnknown(t *testing.T) {
++	f, a, r := udpStateFixture(t)
++	r.started = make(chan struct{})
++	r.block = make(chan struct{})
++	r.closed = make(chan struct{})
++	r.ignoreCancel = true
++	a.BeginPeek(f.now.Add(time.Second))
++	a.Permit(udpPermit(t, a, r, 1, 1))
++	read := make(chan error, 1)
++	go func() { read <- a.ConsumePermit() }()
++	<-r.started
++	if e := a.ConsumePermit(); e == nil {
++		t.Fatal("parallel receiver allowed")
++	}
++	closing := make(chan error, 1)
++	go func() { closing <- a.CloseAndJoin() }()
++	<-r.closed
++	select {
++	case <-closing:
++		t.Fatal("KnownClosed before actual receiver joined")
++	default:
++	}
++	close(r.block)
++	if e := <-closing; e != nil {
++		t.Fatal(e)
++	}
++	if e := <-read; e == nil {
++		t.Fatal("cancelled read published payload")
++	}
++	if e := a.CloseAndJoin(); e != nil || r.closes.Load() != 1 || r.joins.Load() != 1 || a.credit {
++		t.Fatal("close/join not exactly once", e)
++	}
++	f2, b, r2 := udpStateFixture(t)
++	failure := errors.New("duplicate close unknown")
++	r2.closeError = failure
++	if e := b.CloseAndJoin(); !errors.Is(e, failure) || !b.credit || b.receiver == nil || !f2.c.revoked || f2.p.admission.state != profileUnknown || f2.p.ctx.Err() == nil {
++		t.Fatal("failed close lost custody", e)
++	}
++	if e := b.CloseAndJoin(); !errors.Is(e, failure) || r2.closes.Load() != 1 || b.phase != profileUDPUnknown {
++		t.Fatal("repeat close changed final Unknown", e)
++	}
++}
++func TestProfileUDPv2SharedRuntimeProofCapRetainsEveryTerminalCredit(t *testing.T) {
++	f, a, r := udpStateFixture(t)
++	limit := int(f.c.manifest.caps[7])
++	if limit > 256 {
++		limit = 256
++	}
++	f.c.udpBudget.used = limit - 1
++	if e := a.BeginPeek(f.now.Add(time.Second)); e != nil {
++		t.Fatal(e)
++	}
++	if _, e := f.c.operation(context.Background(), nil, nil, 20, 0, nil); e == nil {
++		t.Fatal("runtime bypassed shared proof tombstone cap")
++	}
++	a.Permit(udpPermit(t, a, r, 1, 1))
++	a.ConsumePermit()
++	a.Consumed(4)
++	a.Match(udpMatch(t, a, 2))
++	a.RetirePayload()
++	if e := a.BeginPeek(f.now.Add(time.Second)); e == nil {
++		t.Fatal("terminal proof credit compacted/reused")
++	}
++	delivery := udpDelivery(t, a.launch, 2, 4, 5, f.c.udpBudget.nextProofOperation+1)
++	allocs := testing.AllocsPerRun(50, func() {
++		calls := 0
++		_, e := profileNewUDPAssociation(f.c, a.launch, f.p.ctx, delivery, func() (profileUDPReceiver, error) { calls++; return r, nil })
++		if e == nil || calls != 0 {
++			t.Fatal("factory effect before cap")
++		}
++	})
++	if allocs != 0 {
++		t.Fatal("overflow allocated", allocs)
++	}
++	g := newFlowFixture(t, 1)
++	g.c.udpBudget = &profileUDPBudget{}
++	op, e := g.c.operation(context.Background(), nil, nil, 20, 0, nil)
++	if e != nil {
++		t.Fatal(e)
++	}
++	op.sequence = 9
++	op.deadline = g.now.Add(time.Second)
++	g.c.tomb(op, false)
++	g.c.finish(op, nil)
++	g.now = g.now.Add(3 * time.Second)
++	g.c.tick()
++	if g.c.tombs[0].sequence != 9 || g.c.udpBudget.used != 1 {
++		t.Fatal("runtime tombstone evicted during v2 invocation")
++	}
++	if unsafe.Sizeof(profileUDPAssociation{})+2*65536 > profileUDPAssociationCredit {
++		t.Fatal("association credit smaller than buffers/metadata")
++	}
++	if unsafe.Sizeof(profileUDPBudget{}) > profileUDPBudgetCredit {
++		t.Fatal("global retained ledger preflight too small")
++	}
++}
++func TestProfileUDPv2DeadlinesReplayAndClosedSOCKSAdmission(t *testing.T) {
++	f, a, r := udpStateFixture(t)
++	a.BeginPeek(f.now.Add(100 * time.Millisecond))
++	b := udpPermit(t, a, r, 1, 1)
++	f.now = f.now.Add(101 * time.Millisecond)
++	if e := a.Permit(b); e == nil || r.reads.Load() != 0 {
++		t.Fatal("late permit extended original deadline")
++	}
++	for _, mode := range []byte{1, 2} {
++		g := newFlowFixture(t, mode)
++		ctx := context.WithValue(g.p.ctx, profileContextKey{}, g.p)
++		if ProfileSOCKSUDPRequiresPrivateControl(ctx) != (mode == 2) {
++			t.Fatal("mode inferred incorrectly")
++		}
++		if ProfileAdmitSOCKSUDPControl(ctx) == nil {
++			t.Fatal("session admitted UDP control")
++		}
++	}
++	if ProfileSOCKSUDPRequiresPrivateControl(context.Background()) {
++		t.Fatal("legacy branch changed")
++	}
++}
++func TestProfileUDPv2SOCKSHeaderCanonicalAndFullFingerprint(t *testing.T) {
++	for _, raw := range [][]byte{{0, 0, 0, 3, 1, 'a', 0, 53}, {0, 0, 0, 4, 0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 53}} {
++		_, header, e := profileUDPSOCKSHeader(raw)
++		if e != nil || header != len(raw) {
++			t.Fatal("valid header", header, e)
++		}
++		bad := append([]byte(nil), raw...)
++		bad[2] = 1
++		if _, _, e = profileUDPSOCKSHeader(bad); e == nil {
++			t.Fatal("fragment reassembly allowed")
++		}
++	}
++	// Exact Rust Destination::read/hostname принимает ASCII upper case.
++	_, _, e := profileUDPSOCKSHeader([]byte{0, 0, 0, 3, 1, 'A', 0, 53})
++	if e != nil {
++		t.Fatal("uppercase canonical hostname", e)
++	}
++	if _, _, e = profileUDPSOCKSHeader([]byte{0, 0, 0, 3, 1, '_', 0, 53}); e == nil {
++		t.Fatal("invalid hostname")
++	}
++	r, _ := proofVector(t)
++	var p [256]byte
++	profileUDPBinding(r, p[:])
++	a := profileUDPFingerprint(r, p[:], []byte{1, 2})
++	b := profileUDPFingerprint(r, p[:], []byte{1, 3})
++	if bytes.Equal(a[:], b[:]) {
++		t.Fatal("payload omitted from fingerprint")
++	}
++}
++
++func TestProfileUDPv2EveryRecordStrictSchemaAndRightsDirection(t *testing.T) {
++	r, _ := proofVector(t)
++	for kind, s := range profileUDPShapes {
++		t.Run(s.magic, func(t *testing.T) {
++			tail := make([]byte, s.length-128)
++			ids := func(offsets ...int) {
++				for _, off := range offsets {
++					be.PutUint64(tail[off:], uint64(off+1))
++				}
++			}
++			switch kind {
++			case 0:
++				ids(0, 8)
++				tail[18] = 3
++				tuple := fakeFlowTuple(6)
++				copy(tail[20:], tuple[:])
++			case 1:
++				ids(0, 8, 16)
++				be.PutUint64(tail[24:], uint64(time.Second))
++			case 2, 4:
++				ids(0, 8, 16)
++			case 3:
++				ids(0, 8, 16, 24)
++				tail[32], tail[33] = 4, 17
++				be.PutUint16(tail[36:], 49152)
++				copy(tail[40:], []byte{127, 0, 0, 1})
++			case 5, 6:
++				ids(0, 8, 16, 24)
++				tuple := fakeFlowTuple(17)
++				copy(tail[32:], tuple[:])
++				be.PutUint32(tail[72:], 12)
++				be.PutUint16(tail[76:], 10)
++				tail[80] = 1
++				be.PutUint64(tail[112:], uint64(time.Second))
++			case 7:
++				ids(0, 8, 16, 24)
++				tail[32] = 1
++				be.PutUint64(tail[40:], uint64(time.Second))
++			case 8:
++				ids(0, 8, 16)
++			case 9:
++				ids(0, 8, 32)
++				tail[28], tail[29] = 1, 1
++			}
++			wire, n, e := profileUDPEncode(r, kind, tail)
++			if e != nil {
++				t.Fatal(e)
++			}
++			if got, e := profileUDPDecode(r, wire[:n], s.rights, s.issuer); e != nil || got != kind {
++				t.Fatal("roundtrip", got, e)
++			}
++			if _, e = profileUDPDecode(r, wire[:n], s.rights+1, s.issuer); e == nil {
++				t.Fatal("extra rights")
++			}
++			if _, e = profileUDPDecode(r, wire[:n], s.rights, !s.issuer); e == nil {
++				t.Fatal("direction confusion")
++			}
++			for _, off := range []int{9, 14, 16, 127} {
++				bad := wire
++				bad[off] ^= 1
++				if _, e = profileUDPDecode(r, bad[:n], s.rights, s.issuer); e == nil {
++					t.Fatal("binding/version/reserved", off)
++				}
++			}
++			for _, value := range []uint64{0, ^uint64(0)} {
++				bad := wire
++				be.PutUint64(bad[128:], value)
++				if _, e = profileUDPDecode(r, bad[:n], s.rights, s.issuer); e == nil {
++					t.Fatal("invalid/wrapped ID")
++				}
++			}
++			if _, e = profileUDPDecode(r, wire[:n-1], s.rights, s.issuer); e == nil {
++				t.Fatal("partial frame")
++			}
++			if a := testing.AllocsPerRun(100, func() { profileUDPDecode(r, wire[:n], s.rights, s.issuer) }); a != 0 {
++				t.Fatal("decoder allocated", a)
++			}
++		})
++	}
++}
++func TestProfileUDPv2AssociationCapacityAndOutstandingFlowsRetainCustody(t *testing.T) {
++	f, a, r := udpStateFixture(t)
++	f.c.udpBudget.active = 8
++	calls := 0
++	if _, e := profileNewUDPAssociation(f.c, a.launch, f.p.ctx, udpDelivery(t, a.launch, 2, 4, 5, f.c.udpBudget.nextProofOperation+1), func() (profileUDPReceiver, error) { calls++; return r, nil }); e == nil || calls != 0 {
++		t.Fatal("association cap effect")
++	}
++	f.c.udpBudget.active = 1
++	if _, e := profileNewUDPAssociation(f.c, a.launch, f.p.ctx, udpDelivery(t, a.launch, 2, 4, a.control, f.c.udpBudget.nextProofOperation+1), func() (profileUDPReceiver, error) { calls++; return r, nil }); e == nil || calls != 0 {
++		t.Fatal("control used for second association")
++	}
++	a.flows = 1
++	if e := a.CloseAndJoin(); e == nil || !a.credit || a.phase != profileUDPUnknown {
++		t.Fatal("pending flows claimed KnownClosed")
++	}
++}
+diff --git a/common/yonikbroker/profile_udp_v2_linux.go b/common/yonikbroker/profile_udp_v2_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_udp_v2_linux.go
+@@ -0,0 +1,619 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"errors"
++	"net/netip"
++	"sync"
++	"time"
++)
++
++// Незамороженная proof-v2 extension. Runtime/ABI260 остаются rights-free.
++var profileUDPShapes = [...]struct {
++	magic          string
++	length, rights int
++	issuer         bool
++}{
++	{"YNKUCS01", 192, 1, false}, {"YNKUCA01", 160, 0, true},
++	{"YNKUAQ01", 160, 0, false}, {"YNKUAC01", 192, 1, true},
++	{"YNKUPQ01", 160, 0, false}, {"YNKURP01", 256, 0, true},
++	{"YNKUCM01", 256, 0, false}, {"YNKUMR01", 192, 0, true},
++	{"YNKUCQ01", 160, 0, true}, {"YNKUCR01", 192, 0, false},
++}
++
++func profileUDPBinding(r profileLaunch, b []byte) {
++	copy(b[16:48], r.digest[:])
++	copy(b[48:64], r.session[:])
++	copy(b[64:80], r.invocation[:])
++	be.PutUint64(b[80:], r.generation)
++	be.PutUint64(b[88:], r.epoch)
++	copy(b[96:128], r.nonce[:])
++}
++func profileUDPId(v uint64) bool        { return v != 0 && v != ^uint64(0) }
++func profileUDPRemaining(v uint64) bool { return v > 0 && v <= uint64(time.Second) }
++func profileUDPv2Tuple(t [40]byte, network byte) bool {
++	return t[0] == network && t[1] == 4 && profileTupleValid(t) && bytes.Equal(t[24:28], []byte{127, 0, 0, 1}) && !bytes.Equal(t[8:12], []byte{255, 255, 255, 255})
++}
++
++// Borrowed view: до проверки exact length/binding/rights ничего не аллоцируется.
++func profileUDPDecode(r profileLaunch, b []byte, rights int, issuer bool) (int, error) {
++	if len(b) < 128 || len(b) > 256 || r.mode < 1 || r.mode > 2 {
++		return -1, errProfile
++	}
++	kind := -1
++	for i, s := range profileUDPShapes {
++		if string(b[:8]) == s.magic {
++			kind = i
++			break
++		}
++	}
++	if kind < 0 {
++		return -1, errProfile
++	}
++	s := profileUDPShapes[kind]
++	var prefix [128]byte
++	profileUDPBinding(r, prefix[:])
++	if len(b) != s.length || rights != s.rights || issuer != s.issuer || u16(b, 8) != 1 || int(u16(b, 10)) != s.length || int(u16(b, 12)) != rights || !zero(b[14:16]) || !bytes.Equal(b[16:128], prefix[16:]) {
++		return -1, errProfile
++	}
++	id := func(off int) bool { return profileUDPId(u64(b, off)) }
++	nz := func(off int) bool { return u64(b, off) != 0 }
++	valid := false
++	switch kind {
++	case 0:
++		var tuple [40]byte
++		copy(tuple[:], b[148:188])
++		valid = id(128) && id(136) && u16(b, 144) < 4 && b[146] == 3 && b[147] == 0 && profileUDPv2Tuple(tuple, 6) && zero(b[188:])
++	case 1:
++		valid = id(128) && id(136) && nz(144) && profileUDPRemaining(u64(b, 152))
++	case 2, 4:
++		valid = id(128) && id(136) && (kind == 2 && nz(144) || kind == 4 && id(144)) && zero(b[152:])
++	case 3:
++		valid = id(128) && id(136) && id(144) && nz(152) && b[160] == 4 && b[161] == 17 && zero(b[162:164]) && u16(b, 164) > 0 && zero(b[166:168]) && bytes.Equal(b[168:172], []byte{127, 0, 0, 1}) && zero(b[172:])
++	case 5, 6:
++		var tuple [40]byte
++		copy(tuple[:], b[160:200])
++		valid = id(128) && id(136) && id(144) && nz(152) && profileUDPv2Tuple(tuple, 17) && u32(b, 200) > 0 && u32(b, 200) <= 65507 && u16(b, 204) >= 8 && u16(b, 204) <= 260 && uint32(u16(b, 204)) <= u32(b, 200) && u16(b, 206) == 0 && !zero(b[208:240]) && zero(b[248:])
++		if kind == 5 {
++			valid = valid && profileUDPRemaining(u64(b, 240))
++		} else {
++			valid = valid && id(240)
++		}
++	case 7:
++		valid = id(128) && id(136) && id(144) && id(152) && b[160] >= 1 && b[160] <= 3 && zero(b[161:168]) && u64(b, 168) <= uint64(time.Second) && zero(b[176:]) && (b[160] != 1 || u64(b, 168) > 0)
++	case 8:
++		valid = id(128) && id(136) && id(144) && zero(b[154:])
++	case 9:
++		valid = id(128) && id(136) && u64(b, 144) != ^uint64(0) && u32(b, 152) <= 256 && (b[156] == 1 || b[156] == 3) && b[157] <= 1 && u16(b, 158) <= 1 && nz(160) && u64(b, 168) != ^uint64(0) && zero(b[176:])
++		if b[156] == 1 {
++			valid = valid && u32(b, 152) == 0 && b[157] == 1 && u16(b, 158) == 0
++		}
++	}
++	if !valid {
++		return -1, errProfile
++	}
++	return kind, nil
++}
++
++func profileUDPEncode(r profileLaunch, kind int, tail []byte) (out [256]byte, n int, err error) {
++	if kind < 0 || kind >= len(profileUDPShapes) {
++		return out, 0, errProfile
++	}
++	s := profileUDPShapes[kind]
++	if len(tail) != s.length-128 {
++		return out, 0, errProfile
++	}
++	copy(out[:8], s.magic)
++	be.PutUint16(out[8:], 1)
++	be.PutUint16(out[10:], uint16(s.length))
++	be.PutUint16(out[12:], uint16(s.rights))
++	profileUDPBinding(r, out[:])
++	copy(out[128:], tail)
++	_, err = profileUDPDecode(r, out[:s.length], s.rights, s.issuer)
++	if err != nil {
++		return out, 0, err
++	}
++	return out, s.length, nil
++}
++
++func profileUDPSOCKSHeader(b []byte) (profileDestinationValue, int, error) {
++	var v profileDestinationValue
++	v.network = 17
++	if len(b) < 8 || len(b) > 65507 || !zero(b[:3]) {
++		return v, 0, errProfile
++	}
++	n := 0
++	switch b[3] {
++	case 1:
++		v.family = 4
++		n = 4
++	case 4:
++		v.family = 6
++		n = 16
++	case 3:
++		v.family = 3
++		n = int(b[4])
++		if n == 0 || n > 253 || len(b) < n+7 || !profileDomain(b[5:5+n]) {
++			return v, 0, errProfile
++		}
++		v.address = string(b[5 : 5+n])
++		if _, e := netip.ParseAddr(v.address); e == nil {
++			return v, 0, errProfile
++		}
++		v.port = u16(b, 5+n)
++		if !v.valid() {
++			return v, 0, errProfile
++		}
++		return v, n + 7, nil
++	default:
++		return v, 0, errProfile
++	}
++	if len(b) < n+6 {
++		return v, 0, errProfile
++	}
++	if v.family == 4 && bytes.Equal(b[4:8], []byte{255, 255, 255, 255}) {
++		return v, 0, errProfile
++	}
++	v, ok := profileDecodedDestination(append([]byte{v.family, 17, b[4+n], b[5+n], 0, byte(n), 0, 0}, b[4:4+n]...))
++	if !ok {
++		return v, 0, errProfile
++	}
++	return v, n + 6, nil
++}
++func profileUDPFingerprint(r profileLaunch, permit []byte, datagram []byte) [32]byte {
++	h := sha256.New()
++	h.Write([]byte("YNK-UDP-PACKET-v1\x00"))
++	var prefix [128]byte
++	profileUDPBinding(r, prefix[:])
++	h.Write(prefix[16:])
++	h.Write(permit[128:200])
++	h.Write(permit[200:204])
++	h.Write(datagram)
++	var result [32]byte
++	copy(result[:], h.Sum(nil))
++	return result
++}
++
++// Общий retained budget proof + runtime, без compaction/eviction/ID reuse.
++type profileUDPBudget struct {
++	unknown                                                                  func()
++	launch                                                                   profileLaunch
++	used, proofPending, active, associations                                 int
++	lastAssociation, lastPacket, lastPermit, lastControl, nextProofOperation uint64
++	controls                                                                 [256]uint64
++	entries                                                                  [256]profileUDPRetainedOperation
++}
++
++const profileUDPBudgetCredit = 32768
++
++// Вызывается только после consumed trusted PF002 и ADMIT, до flow operations.
++// Production пока НЕ вызывает initializer: negotiated v2 gate закрыт.
++func profileInitUDPBudget(p *ProfileRuntime) error {
++	if p == nil || p.cancel == nil || p.flow == nil || p.proofs == nil || p.proofs.version != 2 || p.admission.launch.mode != 2 || p.proofs.launch != p.admission.launch || !p.proofs.live() || !p.flowFresh() {
++		return errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.live() || c.udpBudget != nil || c.operations != 0 || c.highestFlow != 0 || c.highestGrant != 0 || c.lastSent != 0 || c.buffered+c.manifest.memoryCredit+profileUDPBudgetCredit > uint64(c.manifest.caps[4]) {
++		return errProfile
++	}
++	c.buffered += profileUDPBudgetCredit
++	c.udpBudget = &profileUDPBudget{launch: p.admission.launch, unknown: func() { p.mu.Lock(); p.admission.state = profileUnknown; p.mu.Unlock(); p.cancel() }}
++	return nil
++}
++
++type profileUDPRetainedOperation struct {
++	namespace                                                                byte // 1 runtime request, 2 proof operation; не wire enum.
++	terminal                                                                 bool // terminal operation, НЕ доказательство resource KnownClosed.
++	operation, runtimeSequence, association, packet, permit, control, cookie uint64
++}
++
++func (c *profileFlowControl) udpReserveLocked() bool {
++	if c.udpBudget == nil || c.udpBudget.used >= int(c.manifest.caps[7]) || c.udpBudget.used >= 256 || c.operations+c.udpBudget.proofPending >= 64 || c.operations+c.udpBudget.proofPending >= int(c.manifest.caps[3]) {
++		return false
++	}
++	if c.udpBudget.nextProofOperation >= ^uint64(0)-1 {
++		return false
++	}
++	c.udpBudget.nextProofOperation++
++	c.udpBudget.entries[c.udpBudget.used] = profileUDPRetainedOperation{namespace: 2, operation: c.udpBudget.nextProofOperation}
++	c.udpBudget.used++
++	c.udpBudget.proofPending++
++	return true
++}
++
++const profileUDPAssociationCredit = 133120
++
++type profileUDPReceiveResult struct {
++	bound      profileDestinationValue
++	n          int
++	tuple      [40]byte
++	cookie     uint64
++	flags      uint16
++	overflow   uint32
++	queueBytes int
++	gro        bool
++}
++
++// Нет FD/Write/Peek/option API. OS adapter обязан быть source-reviewed отдельно.
++type profileUDPReceiver interface {
++	Receive(context.Context, []byte) (profileUDPReceiveResult, error)
++	Close() error
++	Join() error
++}
++type profileUDPPhase byte
++
++const (
++	profileUDPBound profileUDPPhase = iota
++	profileUDPWaiting
++	profileUDPPermitted
++	profileUDPReading
++	profileUDPHeld
++	profileUDPMatched
++	profileUDPDenied
++	profileUDPClosing
++	profileUDPClosed
++	profileUDPUnknown
++)
++
++type profileUDPAssociation struct {
++	mu                                                        sync.Mutex
++	flow                                                      *profileFlowControl
++	launch                                                    profileLaunch
++	ctx                                                       context.Context
++	cancel                                                    context.CancelFunc
++	receiver                                                  profileUDPReceiver
++	phase                                                     profileUDPPhase
++	id, cookie, control, lastPacket, lastPermit, openSequence uint64
++	deadline                                                  time.Time
++	sent                                                      time.Time
++	consumedSent                                              time.Time
++	permit                                                    [256]byte
++	buffers                                                   [2][]byte
++	length, header                                            int
++	original                                                  profileDestinationValue
++	bound                                                     profileDestinationValue
++	readDone                                                  chan struct{}
++	closeDone                                                 chan struct{}
++	result                                                    error
++	flows                                                     int
++	credit                                                    bool
++	operation                                                 bool
++	operationSlot                                             int
++	closeStarted                                              bool
++}
++
++// Caller резервирует shared physical/FD custody ДО factory; этот consumer пока
++// не подключён к OS delivery. Никакой session credential не вызывает factory.
++func profileNewUDPAssociation(c *profileFlowControl, r profileLaunch, ctx context.Context, delivery []byte, factory func() (profileUDPReceiver, error)) (*profileUDPAssociation, error) {
++	if kind, e := profileUDPDecode(r, delivery, 1, true); e != nil || kind != 3 {
++		return nil, errProfile
++	}
++	id, cookie, control := u64(delivery, 144), u64(delivery, 152), u64(delivery, 136)
++	c.mu.Lock()
++	if ctx == nil || ctx.Err() != nil || !c.live() || c.udpBudget == nil || c.udpBudget.active >= 8 || !profileUDPId(id) || id <= c.udpBudget.lastAssociation || cookie == 0 || !profileUDPId(control) || control <= c.udpBudget.lastControl || factory == nil || c.buffered+c.manifest.memoryCredit+profileUDPAssociationCredit > uint64(c.manifest.caps[4]) {
++		c.mu.Unlock()
++		return nil, errProfile
++	}
++	if r != c.udpBudget.launch {
++		c.mu.Unlock()
++		return nil, errProfile
++	}
++	if u64(delivery, 128) != c.udpBudget.nextProofOperation+1 {
++		c.mu.Unlock()
++		return nil, errProfile
++	}
++	for _, old := range c.udpBudget.controls[:c.udpBudget.associations] {
++		if old == control {
++			c.mu.Unlock()
++			return nil, errProfile
++		}
++	}
++	if !c.udpReserveLocked() {
++		c.mu.Unlock()
++		return nil, errProfile
++	}
++	c.udpBudget.controls[c.udpBudget.associations] = control
++	c.udpBudget.associations++
++	c.udpBudget.lastAssociation = id
++	c.udpBudget.lastControl = control
++	creationSlot := c.udpBudget.used - 1
++	entry := &c.udpBudget.entries[creationSlot]
++	entry.association = id
++	entry.control = control
++	entry.cookie = cookie
++	c.udpBudget.active++
++	c.buffered += profileUDPAssociationCredit
++	c.mu.Unlock()
++	child, cancel := context.WithCancel(ctx)
++	a := &profileUDPAssociation{flow: c, launch: r, ctx: child, cancel: cancel, id: id, cookie: cookie, control: control, credit: true, closeDone: make(chan struct{})}
++	a.bound = profileDestinationValue{family: 4, network: 17, port: u16(delivery, 164), address: "127.0.0.1"}
++	a.buffers[0] = make([]byte, 65536)
++	a.buffers[1] = make([]byte, 65536)
++	var e error
++	a.receiver, e = factory()
++	c.mu.Lock()
++	c.udpBudget.proofPending--
++	c.udpBudget.entries[creationSlot].terminal = true
++	live := c.live()
++	c.mu.Unlock()
++	if e != nil || a.receiver == nil || child.Err() != nil || !live {
++		a.CloseAndJoin()
++		return a, errors.Join(errProfile, e, a.result)
++	}
++	return a, nil
++}
++func (a *profileUDPAssociation) BeginPeek(deadline time.Time) error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.phase != profileUDPBound || a.ctx.Err() != nil {
++		return errProfile
++	}
++	a.flow.mu.Lock()
++	defer a.flow.mu.Unlock()
++	if !a.flow.live() || !a.flow.clock().Before(deadline) || !a.flow.udpReserveLocked() {
++		return errProfile
++	}
++	a.operation = true
++	a.operationSlot = a.flow.udpBudget.used - 1
++	entry := &a.flow.udpBudget.entries[a.operationSlot]
++	entry.association = a.id
++	entry.control = a.control
++	entry.cookie = a.cookie
++	a.deadline = deadline
++	a.sent = a.flow.clock()
++	limit := a.flow.clock().Add(time.Second)
++	if limit.Before(a.deadline) {
++		a.deadline = limit
++	}
++	if a.flow.sessionDeadline.Before(a.deadline) {
++		a.deadline = a.flow.sessionDeadline
++	}
++	if controlDeadline, ok := a.ctx.Deadline(); ok && controlDeadline.Before(a.deadline) {
++		a.deadline = controlDeadline
++	}
++	if !a.flow.clock().Before(a.deadline) {
++		a.flow.udpBudget.proofPending--
++		a.flow.udpBudget.entries[a.operationSlot].terminal = true
++		a.operation = false
++		return errProfile
++	}
++	a.phase = profileUDPWaiting
++	return nil
++}
++func (a *profileUDPAssociation) Permit(b []byte) error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if kind, e := profileUDPDecode(a.launch, b, 0, true); e != nil || kind != 5 || a.phase != profileUDPWaiting || a.ctx.Err() != nil || u64(b, 128) != a.id || u64(b, 152) != a.cookie || u64(b, 136) <= a.lastPacket || u64(b, 144) <= a.lastPermit {
++		return a.rejectLocked()
++	}
++	// remaining отсчитывается от первоначального peek, а не receipt/нового permit.
++	until := a.sent.Add(time.Duration(u64(b, 240)))
++	if until.Before(a.deadline) {
++		a.deadline = until
++	}
++	if !a.flow.clock().Before(a.deadline) {
++		return a.rejectLocked()
++	}
++	a.flow.mu.Lock()
++	if !a.flow.live() || u64(b, 136) <= a.flow.udpBudget.lastPacket || u64(b, 144) <= a.flow.udpBudget.lastPermit {
++		a.flow.mu.Unlock()
++		return a.rejectLocked()
++	}
++	defer a.flow.mu.Unlock()
++	copy(a.permit[:], b)
++	a.lastPacket = u64(b, 136)
++	a.lastPermit = u64(b, 144)
++	a.flow.udpBudget.lastPacket = a.lastPacket
++	a.flow.udpBudget.lastPermit = a.lastPermit
++	entry := &a.flow.udpBudget.entries[a.operationSlot]
++	entry.packet = a.lastPacket
++	entry.permit = a.lastPermit
++	a.phase = profileUDPPermitted
++	return nil
++}
++func (a *profileUDPAssociation) live() bool {
++	a.flow.mu.Lock()
++	defer a.flow.mu.Unlock()
++	return a.flow.live()
++}
++
++// Только под a.mu. Ошибка peer/protocol не разрешает fallback к свежему permit.
++func (a *profileUDPAssociation) rejectLocked() error {
++	if !a.closeStarted {
++		a.result = errProfile
++		a.phase = profileUDPUnknown
++		a.cancel()
++	}
++	a.flow.mu.Lock()
++	a.flow.revoked = true
++	unknown := a.flow.udpBudget.unknown
++	a.flow.mu.Unlock()
++	if unknown != nil {
++		unknown()
++	}
++	return errProfile
++}
++func (a *profileUDPAssociation) ConsumePermit() error {
++	a.mu.Lock()
++	if a.phase != profileUDPPermitted || a.ctx.Err() != nil || !a.flow.clock().Before(a.deadline) || !a.live() {
++		a.mu.Unlock()
++		return errProfile
++	}
++	a.phase = profileUDPReading
++	a.readDone = make(chan struct{})
++	done := a.readDone
++	a.mu.Unlock()
++	defer close(done)
++	ctx, cancel := context.WithDeadline(a.ctx, a.deadline)
++	defer cancel()
++	got, e := a.receiver.Receive(ctx, a.buffers[0][:])
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.phase != profileUDPReading || ctx.Err() != nil || !a.flow.clock().Before(a.deadline) || !a.live() {
++		return errProfile
++	}
++	if e != nil || got.n <= 0 || got.n > 65507 || got.n != int(u32(a.permit[:], 200)) || got.cookie != a.cookie || got.bound != a.bound || got.tuple[1] != 4 || u16(got.tuple[:], 6) != a.bound.port || !bytes.Equal(got.tuple[24:28], []byte{127, 0, 0, 1}) || got.flags != 0 || got.overflow != 0 || got.queueBytes <= 0 || got.queueBytes > 128*1024 || got.gro || !bytes.Equal(got.tuple[:], a.permit[160:200]) {
++		return a.rejectLocked()
++	}
++	v, header, e := profileUDPSOCKSHeader(a.buffers[0][:got.n])
++	fingerprint := profileUDPFingerprint(a.launch, a.permit[:], a.buffers[0][:got.n])
++	if e != nil || header != int(u16(a.permit[:], 204)) || !bytes.Equal(fingerprint[:], a.permit[208:240]) {
++		return a.rejectLocked()
++	}
++	a.original, a.header, a.length = v, header, got.n
++	a.phase = profileUDPHeld
++	return nil
++}
++func (a *profileUDPAssociation) Consumed(openSequence uint64) ([256]byte, error) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	var out [256]byte
++	if a.phase != profileUDPHeld || a.openSequence != 0 || !profileUDPId(openSequence) || a.ctx.Err() != nil || !a.flow.clock().Before(a.deadline) || !a.live() {
++		return out, errProfile
++	}
++	out = a.permit
++	copy(out[:8], "YNKUCM01")
++	be.PutUint64(out[240:], openSequence)
++	a.openSequence = openSequence
++	a.consumedSent = a.flow.clock()
++	a.flow.mu.Lock()
++	a.flow.udpBudget.entries[a.operationSlot].runtimeSequence = openSequence
++	a.flow.mu.Unlock()
++	return out, nil
++}
++func (a *profileUDPAssociation) Match(b []byte) error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if kind, e := profileUDPDecode(a.launch, b, 0, true); e != nil || kind != 7 || a.phase != profileUDPHeld || a.openSequence == 0 || u64(b, 128) != a.id || u64(b, 136) != a.lastPacket || u64(b, 144) != a.lastPermit || u64(b, 152) != a.openSequence || a.ctx.Err() != nil || !a.flow.clock().Before(a.deadline) || !a.live() {
++		return a.rejectLocked()
++	}
++	if b[160] == 2 {
++		a.phase = profileUDPDenied
++		return nil
++	}
++	if b[160] == 3 {
++		return a.rejectLocked()
++	}
++	until := a.consumedSent.Add(time.Duration(u64(b, 168)))
++	if until.Before(a.deadline) {
++		a.deadline = until
++	}
++	if !a.flow.clock().Before(a.deadline) {
++		return a.rejectLocked()
++	}
++	a.phase = profileUDPMatched
++	return nil
++}
++
++// Matched не даёт payload/grant API. Actor bridge должен отдельно доказать
++// private SourceFlow + AUTHORIZE/GRANT и downstream credit; пока forward закрыт.
++func (a *profileUDPAssociation) RetirePayload() error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.phase != profileUDPDenied {
++		return errProfile
++	}
++	clear(a.buffers[0][:])
++	clear(a.buffers[1][:])
++	a.length = 0
++	a.header = 0
++	a.openSequence = 0
++	a.consumedSent = time.Time{}
++	a.flow.mu.Lock()
++	if a.operation {
++		a.flow.udpBudget.proofPending--
++		a.flow.udpBudget.entries[a.operationSlot].terminal = true
++		a.operation = false
++	}
++	a.flow.mu.Unlock()
++	a.phase = profileUDPBound
++	return nil
++}
++func (a *profileUDPAssociation) CloseAndJoin() error {
++	a.mu.Lock()
++	if a.closeStarted {
++		done := a.closeDone
++		a.mu.Unlock()
++		<-done
++		a.mu.Lock()
++		defer a.mu.Unlock()
++		return a.result
++	}
++	a.closeStarted = true
++	prior := a.result
++	a.phase = profileUDPClosing
++	a.cancel()
++	reader := a.readDone
++	a.mu.Unlock()
++	var e error
++	if a.receiver != nil {
++		e = errors.Join(a.receiver.Close(), a.receiver.Join())
++	}
++	if reader != nil {
++		<-reader
++	}
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	a.result = errors.Join(prior, e)
++	clear(a.buffers[0][:])
++	clear(a.buffers[1][:])
++	a.length = 0
++	a.header = 0
++	if a.flows != 0 {
++		a.result = errors.Join(a.result, errProfile)
++	}
++	if a.result != nil {
++		a.phase = profileUDPUnknown
++	} else {
++		a.phase = profileUDPClosed
++	}
++	a.flow.mu.Lock()
++	if a.operation {
++		a.flow.udpBudget.proofPending--
++		a.flow.udpBudget.entries[a.operationSlot].terminal = true
++		a.operation = false
++	}
++	if a.result == nil && a.credit {
++		a.flow.buffered -= profileUDPAssociationCredit
++		a.flow.udpBudget.active--
++		a.credit = false
++	}
++	if a.result != nil {
++		a.flow.revoked = true
++	}
++	unknown := a.flow.udpBudget.unknown
++	a.flow.mu.Unlock()
++	if a.result != nil && unknown != nil {
++		unknown()
++	}
++	if a.result == nil {
++		a.receiver = nil
++		a.buffers = [2][]byte{}
++	}
++	close(a.closeDone)
++	return a.result
++}
++
++// Production caller до native UDP factory. Ни control TCP proof, ни config
++// UdpEnabled не создают association authority. Delivery/actor bridge ещё closed.
++func ProfileSOCKSUDPRequiresPrivateControl(ctx context.Context) bool {
++	p := profileRuntime(ctx)
++	return p != nil && (p.admission.launch.mode == 2 || p.proofs != nil && p.proofs.version == 2)
++}
++func ProfileAdmitSOCKSUDPControl(ctx context.Context) error {
++	p := profileRuntime(ctx)
++	if p == nil || !p.flowFresh() {
++		return errProfile
++	}
++	a, _ := ctx.Value(profileAcceptedKey{}).(*profileAccepted)
++	if a == nil || a.runtime != p || a.provenance != 2 || a.proof == nil || int(a.index) >= len(p.flow.manifest.rows[6]) || p.flow.manifest.rows[6][a.index][0] != 2 {
++		return errProfile
++	}
++	return ErrProfileUnsupported
++}
 diff --git a/common/yonikbroker/profile-system-proof-v1.json b/common/yonikbroker/profile-system-proof-v1.json
 new file mode 100644
 --- /dev/null
@@ -16,7 +1540,7 @@ diff --git a/common/yonikbroker/profile_proof_os_linux.go b/common/yonikbroker/p
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_proof_os_linux.go
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,337 @@
 +//go:build linux
 +
 +package nativehooks
@@ -122,6 +1646,11 @@ new file mode 100644
 +			flags |= unix.MSG_TRUNC
 +		}
 +		packet := profileParseAncillary(body[:n], oob[:control], flags, profileAdoptFD)
++		// V2 codec/state source-only: actor/delivery и parity ещё не готовы.
++		// Никакого ACK, downgrade или System UDP effect до общего review.
++		if n >= 8 && string(body[:8]) == "YNKPF002" {
++			packet.invalid = true
++		}
 +		if e != nil || n == 0 {
 +			packet.invalid = true
 +			return packet, errProfile
@@ -353,7 +1882,7 @@ diff --git a/common/yonikbroker/profile_proof_linux.go b/common/yonikbroker/prof
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_proof_linux.go
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,240 @@
 +//go:build linux
 +
 +package nativehooks
@@ -419,6 +1948,7 @@ new file mode 100644
 +	proofPeerAlive() bool
 +}
 +type profileProofChannel struct {
++	version     uint16
 +	mu          sync.Mutex
 +	launch      profileLaunch
 +	fd          profileProofFD
@@ -466,6 +1996,11 @@ new file mode 100644
 +	c.custody = packet.rights
 +	fail := func() error { return errors.Join(errProfile, c.Close()) }
 +	expected, e2 := profileProofBootstrap(r)
++	version := uint16(1)
++	if len(packet.body) == 128 && string(packet.body[:8]) == "YNKPF002" && u16(packet.body, 8) == 2 {
++		version = 2
++		expected, e2 = profileProofBootstrapV2(r)
++	}
 +	if e != nil || e2 != nil || packet.invalid || packet.count != 1 || packet.rightsMessages != 1 || packet.credentials != 1 || !profileSenderValid(r, packet.pid, packet.uid, 0) || !bytes.Equal(packet.body, expected[:]) || !clock().Before(deadline) || !ch.proofPeerAlive() {
 +		return fail()
 +	}
@@ -477,6 +2012,7 @@ new file mode 100644
 +	if ch.sendBootstrapAck(ack[:]) != nil || !clock().Before(deadline) || !ch.proofPeerAlive() {
 +		return fail()
 +	}
++	c.version = version
 +	return nil
 +}
 +func (c *profileProofChannel) prepare(op *profileOperation) error {
@@ -591,7 +2127,7 @@ diff --git a/common/yonikbroker/profile_proof.go b/common/yonikbroker/profile_pr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_proof.go
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,69 @@
 +package nativehooks
 +
 +import "crypto/sha256"
@@ -614,9 +2150,22 @@ new file mode 100644
 +}
 +func profileProofAck(b [128]byte) (ack [40]byte) {
 +	copy(ack[:], "YNKPFA01")
++	if string(b[:8]) == "YNKPF002" && u16(b[:], 8) == 2 {
++		copy(ack[:], "YNKPFA02")
++	}
 +	h := sha256.Sum256(b[:])
 +	copy(ack[8:], h[:])
 +	return ack
++}
++
++func profileProofBootstrapV2(r profileLaunch) (b [128]byte, err error) {
++	b, err = profileProofBootstrap(r)
++	if err != nil {
++		return b, err
++	}
++	copy(b[:], "YNKPF002")
++	be.PutUint16(b[8:], 2)
++	return b, nil
 +}
 +func profileSocketRecord(r profileLaunch, request, proof uint64, ingress uint16, tuple [40]byte) (b [192]byte, err error) {
 +	if r.mode != 2 || request == 0 || request == ^uint64(0) || proof == 0 || proof == ^uint64(0) || ingress >= 4 || tuple[0] != 6 || !profileProofTuple(tuple) {
@@ -652,7 +2201,7 @@ diff --git a/common/yonikbroker/profile_socket_proof_linux_test.go b/common/yoni
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_socket_proof_linux_test.go
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,553 @@
 +//go:build linux
 +
 +package nativehooks
@@ -796,6 +2345,25 @@ new file mode 100644
 +	if _, e = profileSocketRecord(r, 3, 1, 0, tuple); e == nil {
 +		t.Fatal("Local minted System socket proof")
 +	}
++}
++
++func TestProfileUDPv2BootstrapConsumesExactAuthenticatedVersion(t *testing.T) {
++	r, v := proofVector(t)
++	b := proofBytes(t, v.Bootstrap)
++	copy(b, "YNKPF002")
++	be.PutUint16(b[8:], 2)
++	fd := &proofFakeFD{}
++	io := &proofFakeBootstrap{alive: true, packet: profileProofPacket{body: b, count: 1, rightsMessages: 1, credentials: 1, pid: int32(r.hostPID), uid: 0}}
++	io.packet.rights[0] = fd
++	now := time.Unix(1, 0)
++	channel := &profileProofChannel{}
++	if e := channel.bootstrap(r, io, now.Add(time.Second), func() time.Time { return now }); e != nil {
++		t.Fatal("authenticated PF002 rejected", e)
++	}
++	if len(io.ack) != 40 || string(io.ack[:8]) != "YNKPFA02" {
++		t.Fatal("v2 received v1 ACK")
++	}
++	channel.Close()
 +}
 +func TestProfileProofBootstrapRejectsMismatchAndClosesEveryRight(t *testing.T) {
 +	for _, what := range []string{"valid", "binding", "credentials", "uid", "count", "truncated", "peer", "expired", "type", "ack", "read", "local", "duplicate"} {
@@ -10577,7 +12145,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,881 @@
+@@ -0,0 +1,898 @@
 +//go:build linux
 +
 +package nativehooks
@@ -10686,6 +12254,7 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	udpSlot                                 int
 +	proof                                   uint64
 +	proofSent                               bool
 +	ctx                                     context.Context
@@ -10708,6 +12277,7 @@ new file mode 100644
 +	replied, cancelled                                       bool
 +}
 +type profileFlowControl struct {
++	udpBudget                                      *profileUDPBudget
 +	proofAlive                                     func() bool
 +	prepareProof                                   func(*profileOperation) error
 +	sendProof                                      func(*profileOperation) error
@@ -10754,6 +12324,12 @@ new file mode 100644
 +	if ctx == nil || ctx.Err() != nil || len(body) > 1024 || !c.live() || !c.operationAvailable() {
 +		return nil, errProfile
 +	}
++	slot := -1
++	if c.udpBudget != nil {
++		slot = c.udpBudget.used
++		c.udpBudget.entries[slot] = profileUDPRetainedOperation{namespace: 1}
++		c.udpBudget.used++
++	}
 +	c.operations++
 +	if r != nil {
 +		r.pending++
@@ -10761,9 +12337,12 @@ new file mode 100644
 +	if g != nil {
 +		g.pending++
 +	}
-+	return &profileOperation{ctx: ctx, receipt: r, grant: g, kind: kind, object: object, body: body, done: make(chan struct{})}, nil
++	return &profileOperation{udpSlot: slot, ctx: ctx, receipt: r, grant: g, kind: kind, object: object, body: body, done: make(chan struct{})}, nil
 +}
 +func (c *profileFlowControl) operationAvailable() bool {
++	if c.udpBudget != nil && (c.udpBudget.used >= int(c.manifest.caps[7]) || c.udpBudget.used >= 256 || c.operations+c.udpBudget.proofPending >= int(c.manifest.caps[3]) || c.operations+c.udpBudget.proofPending >= 64) {
++		return false
++	}
 +	if c.operations >= int(c.manifest.caps[3]) || c.operations >= 64 {
 +		return false
 +	}
@@ -10930,6 +12509,9 @@ new file mode 100644
 +		return
 +	}
 +	op.completed = true
++	if c.udpBudget != nil && op.udpSlot >= 0 {
++		c.udpBudget.entries[op.udpSlot].terminal = true
++	}
 +	if op.receipt != nil && op.receipt.openOperation == op {
 +		op.receipt.openOperation = nil
 +	}
@@ -11067,6 +12649,9 @@ new file mode 100644
 +		return e
 +	}
 +	op.sequence = seq
++	if c.udpBudget != nil && op.udpSlot >= 0 {
++		c.udpBudget.entries[op.udpSlot].runtimeSequence = seq
++	}
 +	op.submitted = true
 +	c.pending[slot] = op
 +	if seq > c.lastSent {
@@ -11312,7 +12897,7 @@ new file mode 100644
 +	defer c.mu.Unlock()
 +	now := c.clock()
 +	for i, t := range c.tombs {
-+		if t.sequence != 0 && !now.Before(t.deadline) {
++		if c.udpBudget == nil && t.sequence != 0 && !now.Before(t.deadline) {
 +			c.tombs[i] = profileTombstone{}
 +		}
 +	}
@@ -12387,7 +13972,7 @@ diff --git a/common/yonikbroker/profile_flow_other.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_other.go
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,45 @@
 +//go:build !linux
 +
 +package nativehooks
@@ -12397,6 +13982,9 @@ new file mode 100644
 +	xnet "github.com/xtls/xray-core/common/net"
 +	"github.com/xtls/xray-core/transport"
 +)
++
++func ProfileSOCKSUDPRequiresPrivateControl(context.Context) bool { return false }
++func ProfileAdmitSOCKSUDPControl(context.Context) error          { return ErrProfileUnsupported }
 +
 +// На этих платформах PrepareProfileLaunch отказывает до создания runtime.
 +// Legacy callers сохраняют поведение и не получают profile authority.
@@ -14418,7 +16006,23 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  	"github.com/xtls/xray-core/core"
  	"github.com/xtls/xray-core/features/policy"
  	"github.com/xtls/xray-core/features/routing"
-@@ -142,6 +143,11 @@
+@@ -119,7 +120,14 @@
+ 		Reader: buf.NewReader(conn),
+ 		Buffer: buf.MultiBuffer{buf.FromBytes(firstbyte)},
+ 	}
+-	request, tempUDPConn, err := svrSession.Handshake(reader, conn)
++	var request *protocol.RequestHeader
++	var tempUDPConn *TempUDPConn
++	var err error
++	if nativehooks.ProfileSOCKSUDPRequiresPrivateControl(ctx) {
++		request, err = profileHandshakeBeforeUDPFactory(svrSession, reader, conn, func() error { return nativehooks.ProfileAdmitSOCKSUDPControl(ctx) })
++	} else {
++		request, tempUDPConn, err = svrSession.Handshake(reader, conn)
++	}
+ 	defer common.CloseIfExists(tempUDPConn)
+ 	if err != nil {
+ 		if inbound.Source.IsValid() {
+@@ -142,6 +150,11 @@
  
  	if request.Command == protocol.RequestCommandTCP {
  		dest := request.Destination()
@@ -14430,7 +16034,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  		errors.LogInfo(ctx, "TCP Connect request to ", dest)
  		if inbound.Source.IsValid() {
  			ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
-@@ -155,7 +161,7 @@
+@@ -155,7 +168,7 @@
  			inbound.CanSpliceCopy = 1
  		}
  		if err := dispatcher.DispatchLink(
@@ -14439,7 +16043,63 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  				Reader: reader,
  				Writer: buf.NewWriter(conn),
  			},
-@@ -230,6 +236,7 @@
+@@ -192,6 +205,55 @@
+ 	return nil
+ }
+ 
++// Использует native auth/address/response helpers, но UDP command перехватывает
++// ДО handshake5::ListenSystemPacket. Child port/tempUDPConn не является proof.
++func profileHandshakeBeforeUDPFactory(s *ServerSession, reader io.Reader, writer net.Conn, admit func() error) (*protocol.RequestHeader, error) {
++	var prefix [2]byte
++	if _, e := io.ReadFull(reader, prefix[:]); e != nil {
++		return nil, e
++	}
++	if prefix[0] == socks4Version {
++		return s.handshake4(prefix[1], reader, writer)
++	}
++	if prefix[0] != socks5Version {
++		return nil, nativehooks.ErrProfileUnsupported
++	}
++	username, e := s.auth5(prefix[1], reader, writer)
++	if e != nil {
++		return nil, e
++	}
++	var command [3]byte
++	if _, e = io.ReadFull(reader, command[:]); e != nil {
++		return nil, e
++	}
++	if command[1] == cmdUDPAssociate {
++		if command[0] != 5 || command[2] != 0 || !s.config.UdpEnabled || admit == nil {
++			return nil, nativehooks.ErrProfileUnsupported
++		}
++		e = admit()
++		responseError := writeSocks5Response(writer, statusCmdNotSupport, net.AnyIP, 0)
++		// Control ACK не даёт relay/sourceFlow/FlowGrant. До issuer FD delivery
++		// и consuming actor bridge этот endpoint closed даже при nil error.
++		return nil, goerrors.Join(nativehooks.ErrProfileUnsupported, e, responseError)
++	}
++	if command[1] != cmdTCPConnect && command[1] != cmdTorResolve && command[1] != cmdTorResolvePTR {
++		writeSocks5Response(writer, statusCmdNotSupport, net.AnyIP, 0)
++		return nil, nativehooks.ErrProfileUnsupported
++	}
++	address, port, e := addrParser.ReadAddressPort(nil, reader)
++	if e != nil {
++		return nil, e
++	}
++	request := &protocol.RequestHeader{Command: protocol.RequestCommandTCP, Version: socks5Version, Address: address, Port: port}
++	if username != "" {
++		request.User = &protocol.MemoryUser{Email: username}
++	}
++	if e = writeSocks5Response(writer, statusSuccess, s.address, s.port); e != nil {
++		return nil, e
++	}
++	return request, nil
++}
++
+ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
+ 	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
+ 		payload := packet.Payload
+@@ -230,6 +292,7 @@
  
  	reader := buf.NewPacketReader(conn)
  	var changeRemote sync.Once
@@ -14447,7 +16107,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  	for {
  		mpayload, err := reader.ReadMultiBuffer()
  		if err != nil {
-@@ -245,7 +252,12 @@
+@@ -245,7 +308,12 @@
  				ctx = session.ContextWithInbound(ctx, inbound)
  				errors.LogInfo(ctx, "client UDP connection from ", inbound.Source)
  			}
@@ -14460,7 +16120,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  
  		for _, payload := range mpayload {
  			request, err := DecodeUDPPacket(payload)
-@@ -262,10 +274,14 @@
+@@ -262,10 +330,14 @@
  
  			destination := request.Destination()
  
@@ -14477,7 +16137,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  					From:   inbound.Source,
  					To:     destination,
  					Status: log.AccessAccepted,
-@@ -275,7 +291,7 @@
+@@ -275,7 +347,7 @@
  
  			payload.UDP = &destination
  
