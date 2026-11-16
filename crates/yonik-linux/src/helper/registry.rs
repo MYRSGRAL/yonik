@@ -65,6 +65,69 @@ struct Entry {
     engine: InstalledEngine,
     version: String,
     sha256: String,
+    #[serde(default)]
+    native_profile_producer: Option<ProducerRecord>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProducerRecord {
+    contract: String,
+    version: u32,
+    source_commit: String,
+    source_sha256: String,
+    patch_sha256: String,
+    builder_sha256: String,
+    toolchain_sha256: String,
+    build_inputs_sha256: String,
+    elf_sha256: String,
+}
+// Семантический contract отдельно от artifact pin. Новый DNS patchset должен
+// пройти root source review и обновить allowlist до trusted install.
+const PRODUCER_PATCH: &str = "83863e6f794e8851521b4af64e416811f4acbc08640a6dc6c6400b105383a745";
+#[derive(Clone)]
+pub(crate) struct ImageContract {
+    image: [u8; 32],
+}
+impl ImageContract {
+    pub(crate) fn check(&self, image: [u8; 32]) -> Result<(), RegistryError> {
+        if self.image != image {
+            Err(RegistryError::HashMismatch)
+        } else {
+            Ok(())
+        }
+    }
+}
+impl ProducerRecord {
+    fn validate(&self, image: Sha256) -> Result<ImageContract, RegistryError> {
+        if self.contract != "yonik-xray-profile-udp-v2"
+            || self.version != 1
+            || self.source_commit != "a4a3dff5b20c2faae567b742c172c7b95e75c083"
+            || self.patch_sha256 != PRODUCER_PATCH
+        {
+            return Err(RegistryError::Version);
+        }
+        for value in [
+            &self.source_sha256,
+            &self.builder_sha256,
+            &self.toolchain_sha256,
+            &self.build_inputs_sha256,
+            &self.elf_sha256,
+        ] {
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || value.bytes().all(|b| b == b'0')
+            {
+                return Err(RegistryError::Manifest);
+            }
+        }
+        let actual = Sha256::from_str(&self.elf_sha256).map_err(|_| RegistryError::Manifest)?;
+        if actual.0 != image.0 {
+            return Err(RegistryError::HashMismatch);
+        }
+        Ok(ImageContract { image: image.0 })
+    }
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -101,6 +164,7 @@ pub struct TrustedRegistry {
 struct InstalledEntry {
     engine: InstalledEngine,
     hash: Sha256,
+    producer: Option<ImageContract>,
     cache: Mutex<Option<CachedImage>>,
 }
 
@@ -145,6 +209,26 @@ impl std::fmt::Debug for TrustedRegistry {
     }
 }
 impl TrustedRegistry {
+    pub(crate) fn producer_for_delivery(
+        &self,
+        delivery: &crate::worker::role_handoff::VerifiedExecDelivery,
+        launch: crate::profile_channel::LaunchRecord,
+    ) -> Result<ImageContract, RegistryError> {
+        let actual = delivery
+            .producer_image(launch)
+            .map_err(|_| RegistryError::HashMismatch)?;
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.engine.engine() == Engine::Xray)
+            .ok_or(RegistryError::MissingEngine)?;
+        if entry.hash.0 != actual {
+            return Err(RegistryError::HashMismatch);
+        }
+        let proof = entry.producer.clone().ok_or(RegistryError::MissingEngine)?;
+        proof.check(actual)?;
+        Ok(proof)
+    }
     /// Единственный production-корень: /usr/lib/yonik/engines, владелец root.
     pub fn system() -> Result<Self, RegistryError> {
         let mut directory = File::from(
@@ -189,6 +273,7 @@ impl TrustedRegistry {
             if cached.source == identity {
                 if let Some(image) = cached.image.upgrade() {
                     return BinarySnapshot::from_image(image, entry.hash, engine)
+                        .map(|snapshot| snapshot.with_producer(entry.producer.clone()))
                         .map_err(snapshot_error);
                 }
             }
@@ -202,7 +287,7 @@ impl TrustedRegistry {
             source: identity,
             image: snapshot.weak_image(),
         });
-        Ok(snapshot)
+        Ok(snapshot.with_producer(entry.producer.clone()))
     }
 
     fn load(directory: File, uid: u32) -> Result<Self, RegistryError> {
@@ -219,7 +304,10 @@ impl TrustedRegistry {
         }
         let manifest: Manifest =
             serde_json::from_slice(&bytes).map_err(|_| RegistryError::Manifest)?;
-        if manifest.schema != 1 || manifest.engines.is_empty() || manifest.engines.len() > 2 {
+        if ![1, 2].contains(&manifest.schema)
+            || manifest.engines.is_empty()
+            || manifest.engines.len() > 2
+        {
             return Err(RegistryError::Manifest);
         }
         let mut entries: Vec<InstalledEntry> = Vec::with_capacity(manifest.engines.len());
@@ -232,9 +320,18 @@ impl TrustedRegistry {
                 return Err(RegistryError::Version);
             }
             let hash = Sha256::from_str(&entry.sha256).map_err(|_| RegistryError::Manifest)?;
+            let producer = if let Some(record) = entry.native_profile_producer {
+                if manifest.schema != 2 || engine != Engine::Xray {
+                    return Err(RegistryError::Manifest);
+                }
+                Some(record.validate(hash)?)
+            } else {
+                None
+            };
             entries.push(InstalledEntry {
                 engine: entry.engine,
                 hash,
+                producer,
                 cache: Mutex::new(None),
             });
         }
@@ -302,6 +399,99 @@ fn validate_regular_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn schema2_recognizes_optional_producer_without_legacy_authority() {
+        let parsed = serde_json::from_value::<super::Manifest>(
+            serde_json::json!({"schema":2,"engines":[{"engine":"xray","version":"26.10.31","sha256":"11".repeat(32),"native_profile_producer":null}]}),
+        );
+        assert!(parsed.is_ok());
+    }
+    #[test]
+    fn producer_record_exact_image_launch_and_negative_controls() {
+        let value = serde_json::json!({"contract":"yonik-xray-profile-udp-v2","version":1,"source_commit":"a4a3dff5b20c2faae567b742c172c7b95e75c083","patch_sha256":super::PRODUCER_PATCH,"builder_sha256":"12".repeat(32),"toolchain_sha256":"13".repeat(32),"build_inputs_sha256":"14".repeat(32),"elf_sha256":"11".repeat(32)});
+        let mut value = value;
+        value["source_sha256"] = serde_json::json!("16".repeat(32));
+        let record: super::ProducerRecord = serde_json::from_value(value.clone()).unwrap();
+        let proof = record.validate(crate::host::Sha256([17; 32])).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/xray-profile-channel-v3/system-proof-extension-v1.json"
+        ))
+        .unwrap();
+        let hex = fixture["launch_hex"].as_str().unwrap();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|p| u8::from_str_radix(&hex[p..p + 2], 16).unwrap())
+            .collect();
+        let system = crate::profile_channel::LaunchRecord::decode(
+            &bytes,
+            crate::profile_channel::Mode::System,
+        )
+        .unwrap();
+        for launch in [
+            system,
+            crate::profile_channel::LaunchRecord {
+                mode: crate::profile_channel::Mode::Local,
+                child_pid: 0,
+                child_start: 0,
+                ..system
+            },
+        ] {
+            let mint = |image, config, manifest| {
+                crate::helper::native_profile_channel::VerifiedUdpProducer::mint(
+                    &proof, image, config, manifest, launch,
+                )
+            };
+            let token = mint([17; 32], launch.binding.digest, launch.manifest).unwrap();
+            assert_eq!(token.setup(launch).unwrap().2, 2);
+            assert!(mint([18; 32], launch.binding.digest, launch.manifest).is_err());
+            assert!(mint([17; 32], [18; 32], launch.manifest).is_err());
+            assert!(mint([17; 32], launch.binding.digest, [18; 32]).is_err());
+            let mut wrong = launch;
+            wrong.nonce[0] ^= 1;
+            assert!(token.setup(wrong).is_err());
+        }
+        for (field, replacement) in [
+            ("contract", serde_json::json!("unknown")),
+            ("version", serde_json::json!(2)),
+            ("patch_sha256", serde_json::json!("22".repeat(32))),
+            ("elf_sha256", serde_json::json!("22".repeat(32))),
+            ("builder_sha256", serde_json::json!("00".repeat(32))),
+        ] {
+            let mut bad = value.clone();
+            bad[field] = replacement;
+            let record: super::ProducerRecord = serde_json::from_value(bad).unwrap();
+            assert!(record.validate(crate::host::Sha256([17; 32])).is_err());
+        }
+        let duplicate =
+            serde_json::to_string(&value)
+                .unwrap()
+                .replacen("{", "{\"contract\":\"other\",", 1);
+        assert!(serde_json::from_str::<super::ProducerRecord>(&duplicate).is_err());
+    }
+    #[test]
+    fn protected_record_legacy_modes_owner_and_nofollow_without_snapshot() {
+        let fixture = Fixture::new();
+        assert!(fixture.registry().unwrap().entries[0].producer.is_none());
+        fixture.manifest(&serde_json::json!({"schema":2,"engines":[entry("xray")]}));
+        assert!(fixture.registry().unwrap().entries[0].producer.is_none());
+        let mut installed = entry("xray");
+        installed["native_profile_producer"] = serde_json::json!({"contract":"yonik-xray-profile-udp-v2","version":1,"source_commit":"a4a3dff5b20c2faae567b742c172c7b95e75c083","patch_sha256":super::PRODUCER_PATCH,"builder_sha256":"12".repeat(32),"toolchain_sha256":"13".repeat(32),"build_inputs_sha256":"14".repeat(32),"elf_sha256":installed["sha256"]});
+        installed["native_profile_producer"]["source_sha256"] = serde_json::json!("16".repeat(32));
+        fixture.manifest(&serde_json::json!({"schema":2,"engines":[installed.clone()]}));
+        assert!(fixture.registry().unwrap().entries[0].producer.is_some());
+        fixture.manifest(&serde_json::json!({"schema":1,"engines":[installed]}));
+        assert_eq!(fixture.registry().err(), Some(RegistryError::Manifest));
+        fixture.manifest(&serde_json::json!({"schema":2,"engines":[entry("xray")]}));
+        assert_eq!(
+            TrustedRegistry::for_test(fixture.directory(), fixture.uid().wrapping_add(1)).err(),
+            Some(RegistryError::UnsafeEntry)
+        );
+        fixture.mode("registry.json", 0o666);
+        assert_eq!(fixture.registry().err(), Some(RegistryError::UnsafeEntry));
+        fs::remove_file(fixture.0.join("registry.json")).unwrap();
+        symlink("xray", fixture.0.join("registry.json")).unwrap();
+        assert!(fixture.registry().is_err());
+    }
     use super::{
         BinarySnapshot, DIR_FLAGS, Engine, FILE_FLAGS, File, MAX_MANIFEST, Mode, Read,
         RegistryError, TrustedRegistry, child, directory_metadata, open, regular_metadata,

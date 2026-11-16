@@ -36,6 +36,7 @@ pub use prepared::{
 };
 
 mod registry;
+pub(crate) use registry::ImageContract;
 pub use registry::{RegistryError, TrustedRegistry};
 
 use std::{collections::HashMap, future::Future, time::Duration};

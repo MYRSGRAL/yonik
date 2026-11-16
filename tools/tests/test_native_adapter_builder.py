@@ -231,6 +231,88 @@ class BuilderTests(unittest.TestCase):
             builder.build(self.root, self.output, self.patch_file, "other")
         self.assertFalse(self.commands)
 
+    def test_profile_evidence_refuses_non_compile_only_or_wrong_engine(self) -> None:
+        for engine, compile_only in (("xray", False), ("sing-box", True)):
+            with self.assertRaises(builder.BuildError):
+                builder.build(
+                    self.root,
+                    self.output,
+                    self.patch_file,
+                    engine,
+                    compile_only=compile_only,
+                    experimental_profile=True,
+                )
+        self.assertFalse(self.commands)
+
+    def test_profile_compile_only_emits_record_without_execution_or_install(
+        self,
+    ) -> None:
+        self.source = self.root / "build-source-xray"
+        self.source.mkdir()
+        (self.source / "go.mod").write_text("module fixture\n")
+        (self.source / "go.sum").write_text("fixture\n")
+        self.head = builder.XRAY_COMMIT
+        adapter = builder.DEFAULT_PATCH.parents[2] / "xray" / builder.XRAY_TAG
+        codec = json.loads((adapter / "native-broker-codec.json").read_text())
+        full = json.loads((adapter / "native-full-profile.json").read_text())
+        phase = False
+        original_hash = builder.sha256
+
+        def digest(path: Path) -> str:
+            metadata = full if phase else codec
+            pins = {
+                **{
+                    f"common/yonikbroker/{name}": value
+                    for name, value in metadata["package_files_sha256"].items()
+                },
+                **metadata.get("callsite_files_sha256", {}),
+            }
+            if (
+                path.is_relative_to(self.source)
+                and str(path.relative_to(self.source)) in pins
+            ):
+                return pins[str(path.relative_to(self.source))]
+            return original_hash(path)
+
+        def run(runner: builder.Runner, argv: list[str], cwd: Path) -> str:
+            nonlocal phase
+            if argv[:2] == ["git", "rev-parse"]:
+                self.commands.append(argv)
+                return builder.XRAY_COMMIT + "\n"
+            if argv[:2] == ["git", "apply"] and argv[-1].endswith(
+                "native-full-profile.patch"
+            ):
+                phase = True
+            result = self.fake_run(runner, argv, cwd)
+            if argv[:2] == ["go", "build"]:
+                Path(argv[argv.index("-o") + 1]).write_bytes(
+                    b"\x7fELFsynthetic: never execute"
+                )
+            return result
+
+        with (
+            patch.object(builder, "sha256", side_effect=digest),
+            patch.object(builder.Runner, "run", autospec=True, side_effect=run),
+            patch.object(builder, "toolchain_digest", return_value="15" * 32),
+        ):
+            builder.build(
+                self.root,
+                self.output,
+                self.patch_file,
+                "xray",
+                compile_only=True,
+                experimental_profile=True,
+            )
+        record = json.loads((self.output / "native-profile-producer.json").read_text())
+        self.assertEqual(record["elf_sha256"], original_hash(self.output / "xray"))
+        self.assertEqual(record["patch_sha256"], builder.PROFILE_PATCH)
+        self.assertEqual(
+            record["builder_sha256"], original_hash(Path(builder.__file__))
+        )
+        self.assertFalse(
+            any(argv and argv[0].startswith(str(self.root)) for argv in self.commands)
+        )
+
     def test_unknown_patch_cannot_claim_strict_complete_feature(self) -> None:
         self.patch_file.write_text("unrelated README-only patch")
         with self.assertRaisesRegex(builder.BuildError, "каноническ"):

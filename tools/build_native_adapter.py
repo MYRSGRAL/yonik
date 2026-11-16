@@ -35,6 +35,7 @@ EXTRA_PATCHES = (
 XRAY_URL = "https://github.com/XTLS/Xray-core.git"
 XRAY_TAG = "v26.10.31"
 XRAY_COMMIT = "a4a3dff5b20c2faae567b742c172c7b95e75c083"
+PROFILE_PATCH = "83863e6f794e8851521b4af64e416811f4acbc08640a6dc6c6400b105383a745"
 LOG = logging.getLogger("yonik.native_adapter")
 COMMAND_TIMEOUT = 180
 BUILD_TIMEOUT = 900
@@ -81,6 +82,33 @@ def build_arguments(
 def sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def toolchain_digest(runner: Runner, source: Path) -> str:
+    """Hash actual local driver/compile/link, не строки go version."""
+    executable = shutil.which("go", path=runner.env.get("PATH"))
+    if executable is None:
+        raise BuildError("Local Go toolchain отсутствует")
+    directory = Path(runner.run(["go", "env", "GOTOOLDIR"], source).strip())
+    files = [Path(executable).resolve(), directory / "compile", directory / "link"]
+    return hashlib.sha256(
+        "\n".join(sha256(path) for path in files).encode()
+    ).hexdigest()
+
+
+def source_digest(source: Path) -> str:
+    entries = []
+    for directory, dirs, files in os.walk(source, followlinks=False):
+        dirs[:] = sorted(name for name in dirs if name != ".git")
+        for name in [*dirs, *sorted(files)]:
+            path = Path(directory) / name
+            if path.is_symlink():
+                raise BuildError("Experimental source не допускает symlink")
+            if path.is_file():
+                entries.append((str(path.relative_to(source)), sha256(path)))
+    return hashlib.sha256(
+        json.dumps(entries, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class Runner:
@@ -197,10 +225,13 @@ def build(
     *,
     native_codec: bool = False,
     compile_only: bool = False,
+    experimental_profile: bool = False,
 ) -> Path:
     """Собрать один раз; повторный запуск не сбрасывает частичные результаты."""
     if engine not in {"sing-box", "xray"}:
         raise BuildError("Неизвестное ядро")
+    if experimental_profile and (engine != "xray" or not compile_only):
+        raise BuildError("Experimental profile требует Xray compile-only")
     root = root.resolve()
     output = output.resolve()
     patch = patch.resolve(strict=True)
@@ -227,6 +258,7 @@ def build(
             engine,
             native_codec=native_codec,
             compile_only=compile_only,
+            experimental_profile=experimental_profile,
         )
     finally:
         os.close(descriptor)
@@ -240,6 +272,7 @@ def build_locked(
     *,
     native_codec: bool = False,
     compile_only: bool = False,
+    experimental_profile: bool = False,
 ) -> Path:
     source_url, source_tag, source_commit = (
         (XRAY_URL, XRAY_TAG, XRAY_COMMIT)
@@ -248,12 +281,34 @@ def build_locked(
     )
     source_version = source_tag.removeprefix("v")
     runner = Runner(root)
+    if experimental_profile:
+        runner.env = {
+            key: value
+            for key, value in runner.env.items()
+            if not key.startswith(("GIT_", "LD_", "DYLD_"))
+            and key not in {"ENV", "BASH_ENV"}
+        }
+        runner.env.update(
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_TERMINAL_PROMPT="0",
+            GIT_WORK_TREE=str(root / "build-source-xray"),
+            GIT_CONFIG_COUNT="2",
+            GIT_CONFIG_KEY_0="core.fsmonitor",
+            GIT_CONFIG_VALUE_0="false",
+            GIT_CONFIG_KEY_1="core.hooksPath",
+            GIT_CONFIG_VALUE_1=os.devnull,
+        )
     if compile_only:
         runner.env.update(GOPROXY="off", GOSUMDB="off")
     source = root / f"build-source-{engine}"
     if source.is_symlink():
         raise BuildError(f"Исходник не должен быть symlink: {source}")
     if not source.exists():
+        if experimental_profile:
+            raise BuildError(
+                "Experimental profile требует подготовленный offline source"
+            )
         runner.run(
             [
                 "git",
@@ -298,7 +353,7 @@ def build_locked(
             }
         )
     codec_record = None
-    if native_codec:
+    if native_codec or experimental_profile:
         version = XRAY_TAG if engine == "xray" else SOURCE_TAG
         codec_patch = (
             DEFAULT_PATCH.parents[2] / engine / version / "native-broker-codec.patch"
@@ -345,6 +400,40 @@ def build_locked(
             ),
             "callsite_files_sha256": metadata.get("callsite_files_sha256", {}),
         }
+    profile_metadata = None
+    if experimental_profile:
+        profile_patch = (
+            DEFAULT_PATCH.parents[2] / "xray" / XRAY_TAG / "native-full-profile.patch"
+        )
+        profile_metadata = json.loads(profile_patch.with_suffix(".json").read_text())
+        if (
+            sha256(profile_patch) != PROFILE_PATCH
+            or profile_metadata["patch_sha256"] != PROFILE_PATCH
+            or profile_metadata["source_commit"] != XRAY_COMMIT
+        ):
+            raise BuildError(
+                "Неодобренный full-profile patchset; требуется root source review"
+            )
+        runner.run(["git", "apply", "--check", str(profile_patch)], source)
+        runner.run(["git", "apply", str(profile_patch)], source)
+        for name, expected in {
+            **{
+                f"common/yonikbroker/{name}": value
+                for name, value in profile_metadata["package_files_sha256"].items()
+            },
+            **profile_metadata["callsite_files_sha256"],
+        }.items():
+            if sha256(source / name) != expected:
+                raise BuildError(f"Full-profile source pin mismatch: {name}")
+        if modules != {name: sha256(source / name) for name in modules}:
+            raise BuildError("Full-profile изменил go.mod/go.sum")
+        patch_records.append(
+            {
+                "name": profile_patch.name,
+                "sha256": PROFILE_PATCH,
+                "feature": "experimental_profile",
+            }
+        )
     raw_tags = (
         (source / "release/DEFAULT_BUILD_TAGS_OTHERS").read_text().strip()
         if engine == "sing-box"
@@ -356,6 +445,7 @@ def build_locked(
     ):
         raise BuildError("Некорректные upstream build tags")
     go_version = runner.run(["go", "version"], source).strip()
+    compiler_digest = toolchain_digest(runner, source) if experimental_profile else None
     go_env = json.loads(
         runner.run(["go", "env", "-json", "GOOS", "GOARCH", "GOEXPERIMENT"], source)
     )
@@ -363,6 +453,7 @@ def build_locked(
     if binary.exists() or binary.is_symlink():
         raise BuildError(f"Обнаружен предыдущий бинарник: {binary}")
     args = build_arguments(binary, tags, engine)
+    tree_digest = source_digest(source) if experimental_profile else None
     prebuild = {
         "builder_sha256": sha256(Path(__file__)),
         "engine": engine,
@@ -372,6 +463,8 @@ def build_locked(
         "patches": patch_records,
         "module_sha256": modules,
         "go_version": go_version,
+        "toolchain_sha256": compiler_digest,
+        "source_tree_sha256": tree_digest,
         "go_env": go_env,
         "build_args": args,
         "build_environment": {
@@ -392,11 +485,33 @@ def build_locked(
             raise BuildError("go.mod/go.sum изменились при сборке")
     if any(
         sha256(path) != record["sha256"]
-        for (path, _), record in zip(patches, patch_records, strict=True)
+        for (path, _), record in zip(
+            patches, patch_records[: len(patches)], strict=True
+        )
     ):
         raise BuildError("Патч изменился во время сборки")
     if not binary.is_file() or binary.is_symlink():
         raise BuildError("Go не создал ожидаемый бинарник")
+    if experimental_profile and sha256(profile_patch) != PROFILE_PATCH:
+        raise BuildError("Full-profile patch изменился во время сборки")
+    if experimental_profile and toolchain_digest(runner, source) != compiler_digest:
+        raise BuildError("Local Go toolchain изменился при сборке")
+    if experimental_profile and source_digest(source) != tree_digest:
+        raise BuildError("Full source tree изменился при сборке")
+    if experimental_profile:
+        with binary.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF" or go_env["GOOS"] != "linux":
+                raise BuildError("Producer record требует Linux ELF")
+    if experimental_profile:
+        for name, expected in {
+            **{
+                f"common/yonikbroker/{name}": value
+                for name, value in profile_metadata["package_files_sha256"].items()
+            },
+            **profile_metadata["callsite_files_sha256"],
+        }.items():
+            if sha256(source / name) != expected:
+                raise BuildError(f"Full-profile source изменился при сборке: {name}")
     if not compile_only:
         version = runner.run([str(binary), "version"], source).splitlines()
         if not version or (
@@ -434,6 +549,20 @@ def build_locked(
         "bit_reproducibility_verified": False,
     }
     output.mkdir(parents=True, exist_ok=True)
+    if experimental_profile:
+        record = {
+            "contract": "yonik-xray-profile-udp-v2",
+            "version": 1,
+            "source_commit": head,
+            "source_sha256": tree_digest,
+            "patch_sha256": PROFILE_PATCH,
+            "builder_sha256": prebuild["builder_sha256"],
+            "toolchain_sha256": compiler_digest,
+            "build_inputs_sha256": manifest["prebuild_sha256"],
+            "elf_sha256": manifest["binary_sha256"],
+        }
+        with (output / "native-profile-producer.json").open("x") as stream:
+            stream.write(json.dumps(record, indent=2) + "\n")
     destination = output / engine
     with binary.open("rb") as incoming, destination.open("xb") as outgoing:
         shutil.copyfileobj(incoming, outgoing)
@@ -451,6 +580,11 @@ def build_locked(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", choices=("sing-box", "xray"), default="sing-box")
+    parser.add_argument(
+        "--experimental-profile",
+        action="store_true",
+        help="Compile-only evidence без установки и runtime readiness",
+    )
     parser.add_argument(
         "--compile-only",
         action="store_true",
@@ -479,6 +613,7 @@ def main() -> int:
             options.engine,
             native_codec=options.native_codec,
             compile_only=options.compile_only,
+            experimental_profile=options.experimental_profile,
         )
     except (BuildError, OSError, ValueError) as error:
         LOG.error("Сборка остановлена: %s", error)

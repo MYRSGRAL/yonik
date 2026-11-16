@@ -270,7 +270,7 @@ impl LocalSession {
             self.child = Some(if let Some(launch)=launch.as_mut() {process::spawn_profile(binary,false,Some(launch),None)?}else{process::spawn(binary,false)?});
             // Image/actual child проверены до чувствительного stdin. HELLO
             // ожидается issuer thread после stdin: Go сначала читает config.
-            if let Some(launch)=launch {self.profile=Some(launch.start(self.child.as_ref().ok_or(HostError::State)?,binary)?);}
+            if let Some(launch)=launch {self.profile=Some(launch.start(self.child.as_ref().ok_or(HostError::State)?,binary,&checked.bytes)?);}
             self.readers = Some(process::RuntimeReaders::attach(
                 self.child.as_mut().ok_or(HostError::State)?, binary.engine, self.event_log.clone(),
             )?);

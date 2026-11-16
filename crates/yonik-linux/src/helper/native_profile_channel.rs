@@ -11,7 +11,7 @@ use std::{
 };
 use std::{
     fs::File,
-    io::Read,
+    io::{Read, Write},
     net::SocketAddr,
     os::fd::{AsFd, AsRawFd, OwnedFd},
     os::unix::fs::MetadataExt,
@@ -56,7 +56,8 @@ impl ChannelBudget {
         let decoded = wire::Capsule::decode(capsule.bytes(), digest).map_err(unavailable)?;
         let remaining = decoded.buffer_credit().map_err(unavailable)?;
         let bytes = 8usize * 1024 * 1024
-            - usize::from(system) * (512 + 384 + 128) * 1024
+            - usize::from(system) * (512 + 384) * 1024
+            - 128 * 1024
             - 64 * 1024
             - capsule.bytes().len();
         Ok(Arc::new(Self {
@@ -1072,10 +1073,25 @@ struct KernelUdpOperations {
 }
 /// Не source hash и не child ACK. Production constructor требует attestation
 /// installed builder; такого producer в текущем deployment contract ещё нет.
+#[derive(Clone)]
 pub(crate) struct VerifiedUdpProducer {
     launch: LaunchRecord,
 }
 impl VerifiedUdpProducer {
+    pub(super) fn mint(
+        proof: &super::registry::ImageContract,
+        image: [u8; 32],
+        config: [u8; 32],
+        manifest: [u8; 32],
+        record: LaunchRecord,
+    ) -> Result<Self, ServiceError> {
+        proof.check(image).map_err(unavailable)?;
+        record.encode().map_err(unavailable)?;
+        if config != record.binding.digest || manifest != record.manifest {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(Self { launch: record })
+    }
     fn payload_retired(&self, record: LaunchRecord) -> Result<bool, ServiceError> {
         self.setup(record)?;
         Ok(true)
@@ -2498,7 +2514,7 @@ impl ClosureFence {
 impl ProfileRuntime {
     pub(crate) fn start_local(
         record: LaunchRecord,
-        peer: Arc<Peer>,
+        mut peer: Arc<Peer>,
         prepared: Arc<crate::host::local_profile_channel::Prepared>,
         channel: OwnedFd,
     ) -> Result<Self, ServiceError> {
@@ -2507,7 +2523,14 @@ impl ProfileRuntime {
         }
         // Проверка installed proof выполняется после actual child verification,
         // до HELLO/negotiation; невозможность v2 не превращается в v1 fallback.
-        let _producer = peer.verified_udp_producer(record)?;
+        let producer = peer.verified_udp_producer(record, &prepared.capsule)?;
+        Arc::get_mut(&mut peer)
+            .ok_or(ServiceError::Unavailable)?
+            .proofs = Some(Arc::new(std::sync::Mutex::new(ProofInbox::new()?)));
+        let (proof, go_proof) = channel_pair()?;
+        let handle = tokio::runtime::Handle::current();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let thread_wake = Arc::clone(&wake);
         let stop = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -2518,12 +2541,43 @@ impl ProfileRuntime {
             prepared: Arc::clone(&prepared),
         };
         let issuer = Issuer::new(authority, Arc::clone(&prepared.capsule), record)?;
+        let sideband = SystemChannel::new(
+            rustix::io::fcntl_dupfd_cloexec(&channel, 3).map_err(unavailable)?,
+            proof,
+            Arc::clone(&peer),
+            record,
+            handle,
+            thread_wake,
+            2,
+            producer.clone(),
+            None,
+            Arc::clone(&prepared.capsule),
+            Arc::clone(&issuer.budget),
+        )?;
         let task = std::thread::Builder::new()
             .name("yonik-profile-local".into())
             .spawn(move || {
-                let mut resources = (issuer, channel, prepared);
+                let mut resources = (
+                    issuer,
+                    sideband,
+                    prepared,
+                    channel,
+                    Some(go_proof),
+                    producer,
+                );
                 let _result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    hello(&resources.1, record, peer.pid, peer.uid, &thread_stop)?;
+                    crate::worker::role_handoff::send_proof_bootstrap(
+                        &resources.3,
+                        record,
+                        &resources.5,
+                        resources.4.as_ref().ok_or(ServiceError::Unavailable)?,
+                        peer.pid,
+                        peer.uid,
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                    .map_err(unavailable)?;
+                    resources.4.take();
+                    resources.1.hello(&thread_stop)?;
                     run_issuer(
                         &mut resources.0,
                         &resources.1,
@@ -2535,12 +2589,12 @@ impl ProfileRuntime {
                 }));
                 thread_stop.store(true, Ordering::Release);
                 thread_ready.store(false, Ordering::Release);
-                let _shutdown = rustix::net::shutdown(&resources.1, rustix::net::Shutdown::Both);
+                resources.1.shutdown();
                 Box::new(resources) as Box<dyn Send>
             })
             .map_err(unavailable)?;
         Ok(Self {
-            wake: None,
+            wake: Some(wake),
             stop,
             ready,
             task: Some(task),
@@ -2616,7 +2670,7 @@ impl ProfileRuntime {
                             .ok_or(ServiceError::Unavailable)?,
                     )?;
                     resources.peer = Some(Arc::clone(&peer));
-                    let producer = peer.verified_udp_producer(record)?;
+                    let producer = peer.verified_udp_producer(record, &capsule)?;
                     let (proof, go_proof) = channel_pair()?;
                     let proof_version = crate::worker::role_handoff::send_proof_bootstrap(
                         &resources.channel,
@@ -2657,7 +2711,7 @@ impl ProfileRuntime {
                         thread_wake,
                         proof_version,
                         producer,
-                        owner,
+                        Some(owner),
                         Arc::clone(&capsule),
                         budget,
                     )?);
@@ -2870,32 +2924,6 @@ fn send(socket: &impl AsFd, bytes: &[u8]) -> Result<bool, ServiceError> {
         Ok(sent) if sent == bytes.len() => Ok(true),
         Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => Ok(false),
         _ => Err(ServiceError::Unavailable),
-    }
-}
-fn hello(
-    socket: &OwnedFd,
-    record: LaunchRecord,
-    pid: u32,
-    uid: u32,
-    stop: &AtomicBool,
-) -> Result<(), ServiceError> {
-    let until = Instant::now() + Duration::from_secs(1);
-    let mut bytes = [0; 1153];
-    loop {
-        if stop.load(Ordering::Acquire) || Instant::now() >= until {
-            return Err(ServiceError::Unavailable);
-        }
-        if let Some(n) = receive(socket, pid, uid, &mut bytes)? {
-            let frame = wire::Frame::decode(&bytes[..n], record.binding, record.mode, false)
-                .map_err(unavailable)?;
-            if frame.header.sequence != 1
-                || !matches!(frame.message,wire::Message::Hello{nonce,mode} if nonce==record.nonce && mode==record.mode)
-            {
-                return Err(ServiceError::Unavailable);
-            }
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(1));
     }
 }
 #[allow(clippy::too_many_arguments)] // Header routing и исходный deadline остаются явными.
@@ -3428,18 +3456,18 @@ impl SystemChannel {
         wake: Arc<tokio::sync::Notify>,
         version: u8,
         producer: VerifiedUdpProducer,
-        owner: Arc<OwnerEndpoint>,
+        owner: Option<Arc<OwnerEndpoint>>,
         capsule: Arc<wire::OwnedCapsule>,
         budget: Arc<ChannelBudget>,
     ) -> Result<Self, ServiceError> {
-        if version != 1 && version != 2 {
+        if version != producer.setup(launch)?.2 {
             return Err(ServiceError::Unsupported);
         }
         let udp = if version == 2 {
             let ops = KernelUdpOperations {
                 producer: Arc::new(producer),
                 peer: Arc::clone(&peer),
-                owner: Some(owner),
+                owner,
                 record: launch,
                 capsule: Arc::clone(&capsule),
                 handle: handle.clone(),
@@ -3514,7 +3542,7 @@ impl SystemChannel {
                 )
                 .map_err(unavailable)?;
                 if frame.header.sequence != 1
-                    || !matches!(frame.message,wire::Message::Hello{nonce,mode} if nonce==self.launch.nonce&&mode==Mode::System)
+                    || !matches!(frame.message,wire::Message::Hello{nonce,mode} if nonce==self.launch.nonce&&mode==self.launch.mode)
                 {
                     return Err(ServiceError::Unavailable);
                 }
@@ -3664,6 +3692,33 @@ impl SystemChannel {
         let facts = SocketFacts::capture(&fd)?;
         if !facts.matches(record.tuple, 2) {
             return Err(ServiceError::InvalidRequest);
+        }
+        if self.peer.system_scope.is_none() {
+            let _local_scratch = inbox.slots.fds.reserve(2).map_err(unavailable)?;
+            let independent = self
+                .peer
+                .socket(record.tuple, 2, record.request, record.ingress)?;
+            if independent.facts != facts {
+                return Err(ServiceError::Unavailable);
+            }
+            // Local authority — независимый exact child FD/cookie, не System
+            // namespace claim. Это namespace custody normal Host, не SIOCGSKNS.
+            let namespace = File::open("/proc/thread-self/ns/net")
+                .map_err(unavailable)?
+                .into();
+            inbox.proof_reserved(
+                record,
+                SocketEvidence {
+                    fd,
+                    namespace,
+                    facts,
+                    udp: None,
+                    _fds: fds,
+                },
+                Instant::now(),
+                slot,
+            )?;
+            return Ok(true);
         }
         let namespace = yonik_nsfs::socket_namespace::socket_namespace(&fd)
             .map_err(|_| ServiceError::Unsupported)?;
@@ -4603,6 +4658,10 @@ fn process_parent(pid: u32) -> Result<u32, ServiceError> {
         .ok_or(ServiceError::Unavailable)
 }
 pub(crate) struct Peer {
+    bound_launch: Option<LaunchRecord>,
+    config_hash: [u8; 32],
+    producer: Option<super::registry::ImageContract>,
+    image_hash: [u8; 32],
     system_scope: Option<RuntimeScopeStamp>,
     _config: Option<File>,
     proofs: Option<Arc<std::sync::Mutex<ProofInbox>>>,
@@ -4617,19 +4676,36 @@ pub(crate) struct Peer {
 impl Peer {
     fn verified_udp_producer(
         &self,
-        _record: LaunchRecord,
+        record: LaunchRecord,
+        capsule: &wire::OwnedCapsule,
     ) -> Result<VerifiedUdpProducer, ServiceError> {
-        // Отсутствует producer: trusted installed builder должен связать exact
-        // image/config/manifest/launch с consuming/close contract. Custody из
-        // BinarySnapshot/VerifiedExecDelivery не является этим measurement.
-        Err(ServiceError::Unsupported)
+        self.validate()?;
+        if self.bound_launch != Some(record) {
+            return Err(ServiceError::Unavailable);
+        }
+        let capsule =
+            wire::Capsule::decode(capsule.bytes(), &self.config_hash).map_err(unavailable)?;
+        if capsule.mode != record.mode {
+            return Err(ServiceError::Unavailable);
+        }
+        VerifiedUdpProducer::mint(
+            self.producer.as_ref().ok_or(ServiceError::Unsupported)?,
+            self.image_hash,
+            self.config_hash,
+            capsule.manifest,
+            record,
+        )
     }
     pub(crate) fn local(
         record: LaunchRecord,
         child: &tokio::process::Child,
         binary: &crate::BinarySnapshot,
+        config: &[u8],
     ) -> Result<Arc<Self>, ServiceError> {
         let uid = rustix::process::geteuid().as_raw();
+        if config.is_empty() || config.len() > 65536 {
+            return Err(ServiceError::Unsupported);
+        }
         let pid = child.id().ok_or(ServiceError::Unavailable)?;
         if record.mode != Mode::Local
             || uid == 0
@@ -4640,7 +4716,31 @@ impl Peer {
         {
             return Err(ServiceError::Unsupported);
         }
-        Self::capture(pid, process_start(pid)?, uid, binary.trusted_hash())
+        let mut peer = Self::capture(pid, process_start(pid)?, uid, binary.trusted_hash())?;
+        Arc::get_mut(&mut peer)
+            .ok_or(ServiceError::Unavailable)?
+            .producer = binary.producer();
+        let inner = Arc::get_mut(&mut peer).ok_or(ServiceError::Unavailable)?;
+        inner.bound_launch = Some(record);
+        let mut retained = File::from(
+            rustix::fs::memfd_create(
+                "yonik-local-config",
+                rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+            )
+            .map_err(unavailable)?,
+        );
+        retained.write_all(config).map_err(unavailable)?;
+        rustix::fs::fcntl_add_seals(
+            &retained,
+            rustix::fs::SealFlags::SEAL
+                | rustix::fs::SealFlags::WRITE
+                | rustix::fs::SealFlags::GROW
+                | rustix::fs::SealFlags::SHRINK,
+        )
+        .map_err(unavailable)?;
+        inner.config_hash = Sha256::digest(config).into();
+        inner._config = Some(retained);
+        Ok(peer)
     }
     fn system(
         record: LaunchRecord,
@@ -4662,6 +4762,13 @@ impl Peer {
             .reserve(64 * 1024)
             .map_err(unavailable)?;
         let (image, config) = delivery.files(record).map_err(unavailable)?;
+        let producer = super::registry::TrustedRegistry::system()
+            .map_err(unavailable)?
+            .producer_for_delivery(delivery, record)
+            .map_err(unavailable)?;
+        producer
+            .check(delivery.image_digest())
+            .map_err(unavailable)?;
         let m = image.metadata().map_err(unavailable)?;
         let pidfd = rustix::process::pidfd_open(
             rustix::process::Pid::from_raw(pid as i32).ok_or(ServiceError::Unsupported)?,
@@ -4669,6 +4776,10 @@ impl Peer {
         )
         .map_err(unavailable)?;
         let peer = Arc::new(Self {
+            bound_launch: Some(record),
+            config_hash: delivery.config_digest(),
+            producer: Some(producer),
+            image_hash: delivery.image_digest(),
             system_scope: Some(scope),
             _config: Some(config),
             proofs: Some(Arc::new(std::sync::Mutex::new(ProofInbox::new()?))),
@@ -4734,6 +4845,10 @@ impl Peer {
             return Err(ServiceError::Unsupported);
         }
         let peer = Arc::new(Self {
+            bound_launch: None,
+            config_hash: [0; 32],
+            producer: None,
+            image_hash: expected,
             system_scope: None,
             _config: None,
             proofs: None,
@@ -4789,7 +4904,11 @@ impl Peer {
             return Err(ServiceError::Unsupported);
         }
         self.validate()?;
-        if let Some(proofs) = &self.proofs {
+        if let Some(proofs) = self
+            .proofs
+            .as_ref()
+            .filter(|_| self.system_scope.is_some() || provenance == 3)
+        {
             let evidence = proofs
                 .lock()
                 .map_err(unavailable)?
@@ -5048,6 +5167,30 @@ impl SocketProof {
                 || !self.facts.matches(self.tuple, self.provenance)
             {
                 return Err(ServiceError::Unavailable);
+            }
+            return self.peer.validate();
+        }
+        if self.provenance == 3 {
+            let _local_scratch = self
+                .peer
+                .proofs
+                .as_ref()
+                .ok_or(ServiceError::Unavailable)?
+                .lock()
+                .map_err(unavailable)?
+                .slots
+                .fds
+                .reserve(1)
+                .map_err(unavailable)?;
+            let namespace = self.namespace.as_ref().ok_or(ServiceError::Unsupported)?;
+            let current = File::open("/proc/thread-self/ns/net").map_err(unavailable)?;
+            let a = current.metadata().map_err(unavailable)?;
+            let b = rustix::fs::fstat(namespace).map_err(unavailable)?;
+            if (a.dev(), a.ino()) != (b.st_dev, b.st_ino)
+                || SocketFacts::capture(&self.fd)? != self.facts
+                || !self.facts.matches(self.tuple, 3)
+            {
+                return Err(ServiceError::Unsupported);
             }
             return self.peer.validate();
         }
