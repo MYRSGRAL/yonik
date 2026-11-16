@@ -8,6 +8,71 @@ NumericAuthorize16 из dns-completion-scope.md сохранены. Runtime gate
 
 ## HostsSnapshot tail: единственный layout
 
+### Общий Publish prefix144 и Published48
+
+Ниже exact V2 specification: прежний candidate находился в artifact
+`p4-dns-nextcut-f36/next-cut.md`, не в существующем Rust codec. Переназначать
+bytes0..119 независимо в двух implementations нельзя.
+
+| Offset | Publish поле (BE) |
+| --- | --- |
+| 0 | version u16=2 |
+| 2 | flags u16=0 |
+| 4 | resolverRow u16 |
+| 6 | subjectIndex u16 |
+| 8 | endpointIndex u16 |
+| 10 | qtype u16 |
+| 12 | queryId u64 |
+| 20 | serviceGrantId u64 |
+| 28 | exchangeId u64 |
+| 36 | sourceEpoch u64 |
+| 44 | sourceDigest[32] |
+| 76 | snapshotAssetHash[32] |
+| 108 | questionLen u16 |
+| 110 | requestLen u16 |
+| 112 | responseLen u32 |
+| 116 | reserved u32=0 |
+| 120 | TransportProofId u64 |
+| 128 | proofRevision u64 |
+| 136 | purpose u8: ProviderQuery1/BootstrapDns2/BootstrapHosts3 |
+| 137 | sourceKind u8: DnsWire1/HostsSnapshot2 |
+| 138 | reserved u16=0 |
+| 140 | frontier u16 |
+| 142 | carrier u8 |
+| 143 | reserved u8=0 |
+
+DnsWire tail — original lookup-name bytes[questionLen], затем exact packed DNS
+request[requestLen] и response[responseLen], без padding/trailing bytes. Bounds:
+question1..255, request12..512, response12..32768; body≤33679. Строка без NUL;
+lookup-name bytes не переписывают original hostname. Strict DNS parser проверяет
+один IN question/qtype A1 либо AAAA28 и соответствие request/response, а не только
+размеры. Captured search/alias expansion проверяется по reservation/snapshot;
+произвольное другое имя недопустимо. Query/grant/exchange/proof/revision ненулевые
+и совпадают с issuer-retained records. Source epoch соответствует reservation.
+sourceDigest — exact resolver source digest; Provider без snapshot имеет zero,
+System source ссылается на table11 и его assetHash; у Provider assetHash=zero.
+Resolver/subject относятся к exact DNS reservation и manifest.
+
+ProviderQuery: endpoint/frontier=FFFF, carrier6/17 совпадает с DNS transport
+resolver row; это не разрешение выбрать произвольный application target.
+BootstrapDns: endpoint/subject/frontier/carrier совпадают с physical BootstrapBinding;
+DNS transport protocol отдельно определяется resolver row/TransportProof.
+System source требует нужного manifest role: ApplicationSystemDNS для
+ProviderQuery, PhysicalFirstHopBootstrap для BootstrapDns. HostsSnapshot zero
+rules и отдельный tail заданы ниже. Purpose/sourceKind смешивать нельзя.
+
+Kind41 Published fixed48 BE: version u16@0=2, status u8@2
+(Allow1/Deny2/Unknown3), reserved bytes3..7=0; ProducerRRsetId u64@8,
+exchangeId u64@16, sourceEpoch u64@24, remainingNs u64@32,
+memberCount u16@40=1..256, reserved bytes42..47=0.
+Allow: ProducerRRsetId ненулевой, exchange/source epoch точно соответствуют
+Publish (exchange0 только HostsSnapshot), remaining>0 и не больше absolute
+data/source/session expiry. DNS data lifetime ограничен actual uint32 DNS TTL,
+не первой waiter authority; Host data — observation lease≤1s. Consumer вычитает
+elapsed/RTT. Deny/Unknown: bytes3..47=0. Header.reply обязан совпасть с pending
+Publish sequence. ACK создаёт только base data/source provenance; первый и
+каждый следующий waiter отдельно выполняют WaiterBind53/WaiterBound54.
+
 Publish purpose=3/sourceKind=2 использует этот tail после fixed144; request,
 response lengths и transportProofId/proofRevision строго0. Никакого TTL,
 DNS ID, qtype, resolver peer или DNSBundle вместо snapshot observation.
