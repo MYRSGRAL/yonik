@@ -619,10 +619,8 @@ impl EngineChoice {
 }
 
 pub(crate) fn ensure_engine_available(engine: Engine) -> Result<()> {
-    match engine {
-        Engine::Xray => Ok(()),
-        Engine::SingBox => Err(DesktopError("engine_unavailable")),
-    }
+    crate::system_session::ensure_engine_available(engine)
+        .map_err(|_| DesktopError("engine_unavailable"))
 }
 
 #[cfg(test)]

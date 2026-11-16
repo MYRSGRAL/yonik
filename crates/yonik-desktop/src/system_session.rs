@@ -7,6 +7,13 @@ use yonik_linux::{
     system_client::{ClientError, PreparedOutput, State, SystemClient},
 };
 
+pub(crate) fn ensure_engine_available(engine: Engine) -> Result<(), ClientError> {
+    match engine {
+        Engine::Xray => Ok(()),
+        Engine::SingBox => Err(ClientError::Unsupported),
+    }
+}
+
 /// Ревизии выдаёт GUI host при каждом изменении выбора или источника.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileRevision {
@@ -85,7 +92,7 @@ impl SystemSession {
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<(), ClientError> {
-        super::backend::ensure_engine_available(engine).map_err(|_| ClientError::Unsupported)?;
+        ensure_engine_available(engine)?;
         self.fence(revision)?;
         self.prepared = None;
         // Публичная блокировка не означает активную сессию: admission проверяет helper.
@@ -118,7 +125,7 @@ impl SystemSession {
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<(), ClientError> {
-        super::backend::ensure_engine_available(engine).map_err(|_| ClientError::Unsupported)?;
+        ensure_engine_available(engine)?;
         self.fence(revision)?;
         self.prepared = None;
         let legacy_available = self
