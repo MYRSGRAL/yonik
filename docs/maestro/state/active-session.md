@@ -677,6 +677,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   уже существующий zbus/systemd authenticated-owner pattern и retained service
   facts; reviewed installed unit policy/allowlist остаётся отдельным обязательством.
 
+- R47 SOURCE scoped CLEAN: Numeric USER2dfc539 интегрирован. Live ACKed private
+  waiter/member→independent USER owner proof→durable route→GRANT19, original
+  expiry/post-backend fence/drain/Unknown custody; waiter/source consume до effects.
+  Один effectful attempt, numeric terminal leaf; fallback/refresh Unsupported.
+  Go Publish/Waiter/Numeric consumer и пара ещё не подтверждены. Следующий Rust
+  unit — ProxiedLogical/Append с existing CODEC3 и closed producer pins. Public
+  gates false; generic runtime/full P5 PASS не заявлен.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
