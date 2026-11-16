@@ -1125,8 +1125,9 @@ path ниже. Без него Retire45/46 остаётся Unknown custody repo
 Cancel после live published Physical reservation не выдаёт KnownClosed.
 Wrong/replayed/late SCM закрывает unexpected rights и отзывает context; очищенные
 known-only reservations не отзывают соседний bundle. Append43/44, ProxiedLogical,
-PROBE flow0, loopback StubBind, hostname bootstrap и Publish/Waiter/Numeric
-остаются Unsupported. Public flags/protected allowlist/readiness не меняются.
+PROBE flow0, loopback StubBind, hostname bootstrap и Numeric остаются Unsupported.
+Publish/Waiter реализованы следующим bounded cut ниже.
+Public flags/protected allowlist/readiness не меняются.
 
 ### CODEC3: protected Direct DNS release и consuming receiver close
 
@@ -1173,6 +1174,70 @@ Builder experimental compile-only пишет отдельный
 source/build hashes. Это review evidence, не protected install record; builder
 не устанавливает registry и не утверждает выполнение DNS contract старым patch.
 Для production нужен root-reviewed exact DNS patch pin и trusted install provider.
+
+### USER DirectSocket Publish/Waiter: SOURCE/PURE, без Numeric grant
+
+`native_dns_rrset.rs` подключён к serialized `run_issuer` через DNS dispatch.
+Поддержаны только ProviderQuery/DnsWire, nonloopback numeric DirectSocket,
+USER-backed class3 bundle, provider table5 без System snapshot source. Wire,
+CODEC3 hash и corpus неизменны. Publish40 проверяет exact query/grant/exchange/
+proof/current revision/единственный frozen resource, resolver/subject/carrier,
+epoch/original lookup/options и повторяет independent kernel/backend resource
+fence до публикации. Один proof допускает один Publish, без replay/resurrection.
+
+Transcript не является authority сам по себе. Optional protected record
+`dns_wire` отдельно связывает `direct-dns-bound-request-response-v1`, version1,
+contract_sha256=SHA256(ASCII contract + NUL), schema_sha256=CODEC3 hash с теми же
+source/patch/builder/toolchain/build-input/final-image полями. Constructor
+`VerifiedDnsWireProducer::mint` требует retained image/config/manifest/exact launch
+через existing Peer/registry custody path. `dns_release` этот token не создаёт.
+`DNS_WIRE_REVIEWED_PATCH=None`: production mint закрыт до root-reviewed actual
+producer contract, который подтверждает exact request и complete response от
+этого bound resource/peer/query, без подмены cached/child transcript. Ни builder
+pin, ни protected install record автоматически не обновлены этим cut. Pure
+положительные tests явно инъецируют reviewed record; runtime proof не заявляется.
+
+Parser без allocation: DNS ID/flags/opcode/rcode, один IN A/AAAA question,
+exact lookup/qtype, bounds12..512/12..32768, backward compression pointers с
+depth16, CNAME path≤32, total RR≤512, members≤256. В ANSWER допускаются только
+owners checked CNAME path; A/AAAA только terminal owner/exact qtype/unicast.
+Адреса coalesce в source order, TTL — минимум related CNAME/address TTL;
+TTL0 не создаёт receipt. Дополнительные RR не создают members. EDNS0 без
+неизвестных option payloads проверяет flags/DO/payload; unsupported EDNS options
+дают отказ. UDP response ограничен advertised payload (512 без EDNS); полный
+32768 frame проверяется для TCP. Unknown grammar не становится live fallback.
+
+Published41 выдаёт immutable ProducerRRset DATA, не waiter/grant. Absolute data
+expiry — min(exchange creation + actual DNS TTL, original session/source epoch
+lifetime); conservative exchange timestamp предшествует send и не продлевается
+поздней публикацией/cache hit. Первый owner deadline не превращается в TTL.
+Каждому waiter нужны свой новый bundle/root/private flow и Reserve35 role3;
+contextId0 не создаёт socket/exchange. WaiterBind53 проверяет собственные
+reservation/query/root/source/revision, matching data name/qtype/options/resolver/
+derived route и fresh serial owner/subject. Deadline ограничен original waiter
+reservation/root/Known≤20ms, data и session, повтор ACK его не продлевает.
+Отдельный WaiterReceipt54 не заимствует original flow/grant publisher/соседа.
+
+Cancel request/Producer5/Waiter6/bundle/root отзывает соответствующие dependents
+до ACK; cancel одного waiter/flow сохраняет соседний. Known transport retirement
+не удаляет base DATA; Unknown/global source revoke закрывает дальнейшие операции.
+State/history/memory precredits предшествуют materialization; terminal IDs не
+evict/reuse. Metadata остаётся bounded до invocation teardown, history256 не
+объявляется long-lived throughput readiness.
+
+Runtime scratch теперь допускает Header128+Publish33679. Permanent RX metadata
+reserve256KiB сохранён. Queued payload — owned bounded slice с отдельным debit
+из общего buffer budget ДО allocation/copy; 64 максимальных frames заранее не
+аллоцируются. Drain queue использует тот же budget; aggregate8MiB/pending64/FD64
+не увеличены. Future wakeup пропускает expired authority и использует retained
+cleanup deadline, не превращая cache retention в owner-freshness busy loop.
+
+Numeric42 остаётся Unsupported. Следующий конкретный переход: private live ACKed
+WaiterReceipt/member → exact canonical class1 original/source/scope/branch/path/
+carrier/port и fresh owner → existing durable RouteAuthority installation →
+GRANT19, с grant→waiter ref retirement. Class3 DNS DATA само по себе не повышается
+до USER authority. ProxiedLogical/Append/Hosts/flow0/bootstrap/Stub policy и новый
+System snapshot transcript этим cut не реализованы; public gates false.
 
 ### StubBind: bounded listener observation, не service authority
 

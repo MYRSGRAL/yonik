@@ -10,9 +10,13 @@ use std::{
     time::{Duration, Instant},
 };
 // Максимальный CODEC2 BundleAcquire2164 + Header128 + sentinel byte.
-const RUNTIME_PACKET: usize = 2293;
+const RUNTIME_PACKET: usize = 128 + 33679 + 1;
+// Постоянный RX metadata reserve сохраняется; payload очереди оплачивается по длине.
+const RX_BYTES: usize = 256 * 1024;
 #[path = "native_dns_bundle.rs"]
 mod dns_bundle;
+#[path = "native_dns_rrset.rs"]
+mod dns_rrset;
 #[path = "native_dns_transport.rs"]
 pub(crate) mod dns_transport;
 use std::{
@@ -70,7 +74,7 @@ impl ChannelBudget {
         let remaining = decoded.buffer_credit().map_err(unavailable)?;
         let bytes = 8usize * 1024 * 1024
             - usize::from(system) * (512 + 384) * 1024
-            - 256 * 1024
+            - RX_BYTES
             - 64 * 1024
             - capsule.bytes().len();
         Ok(Arc::new(Self {
@@ -1109,6 +1113,33 @@ pub(crate) struct VerifiedUdpProducer {
 pub(super) struct VerifiedDnsProducer {
     launch: LaunchRecord,
 }
+/// Отдельный audited producer contract: exact request/response actual bound peer.
+/// Consuming-close contract не создаёт этот token.
+pub(super) struct VerifiedDnsWireProducer {
+    launch: LaunchRecord,
+}
+impl VerifiedDnsWireProducer {
+    fn mint(
+        proof: &super::registry::ImageContract,
+        image: [u8; 32],
+        config: [u8; 32],
+        manifest: [u8; 32],
+        launch: LaunchRecord,
+    ) -> Result<Self, ServiceError> {
+        proof.check_dns_wire(image).map_err(unavailable)?;
+        launch.encode().map_err(unavailable)?;
+        if config != launch.binding.digest || manifest != launch.manifest {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(Self { launch })
+    }
+    fn bound(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
+        if self.launch != launch {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
+}
 impl VerifiedDnsProducer {
     fn mint(
         proof: &super::registry::ImageContract,
@@ -1701,6 +1732,8 @@ impl<'a> RoutePlan<'a> {
     }
 }
 struct Issuer<A: Authority> {
+    rrsets: dns_rrset::State,
+    dns_wire: Option<VerifiedDnsWireProducer>,
     dns_release: Option<VerifiedDnsProducer>,
     transport: dns_transport::Transport,
     authority: A,
@@ -1739,6 +1772,8 @@ impl<A: Authority> Issuer<A> {
         let budget = ChannelBudget::new(&capsule, record.mode.required(), &record.binding.digest)?;
         Ok(Self {
             authority,
+            rrsets: dns_rrset::State::new(),
+            dns_wire: None,
             dns_release: None,
             transport: dns_transport::Transport::new(&budget.dynamic)?,
             capsule,
@@ -2249,13 +2284,18 @@ impl<A: Authority> Issuer<A> {
         Ok(())
     }
     fn cancel_request(&mut self, request: u64) -> Result<(), ServiceError> {
+        self.rrsets.cancel_request(request);
         if self.unknown {
             return Err(ServiceError::Unavailable);
         }
-        if self.transport.cancel_request(request).is_err() {
-            self.unknown = true;
-            self.authority.revoke();
-            return Err(ServiceError::Unavailable);
+        match self.transport.cancel_request(request) {
+            Ok(Some(id)) => self.rrsets.cancel_reservation(id),
+            Ok(None) => {}
+            Err(_) => {
+                self.unknown = true;
+                self.authority.revoke();
+                return Err(ServiceError::Unavailable);
+            }
         }
         self.cancel_dns_request(request)?;
         if let Some((id, _)) = self.services.iter().find(|(_, g)| g.request == request) {
@@ -3023,6 +3063,12 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn dns_wire_producer(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<VerifiedDnsWireProducer>, ServiceError> {
+        Ok(None)
+    }
     fn dns_producer(&self, _: LaunchRecord) -> Result<Option<VerifiedDnsProducer>, ServiceError> {
         Ok(None)
     }
@@ -3299,7 +3345,7 @@ impl<T> Rendezvous<T> {
             return Err(ServiceError::Unsupported);
         }
         let credit = super::memory::config_budget()
-            .reserve(256 * 1024)
+            .reserve(RX_BYTES)
             .map_err(unavailable)?;
         let mut incoming = wire::Sequence::new();
         incoming.accept(1).map_err(unavailable)?;
@@ -4032,6 +4078,32 @@ impl SystemChannel {
     }
 }
 impl Channel for SystemChannel {
+    fn dns_wire_producer(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<Option<VerifiedDnsWireProducer>, ServiceError> {
+        self.peer.validate()?;
+        if self.peer.bound_launch != Some(record) {
+            return Err(ServiceError::Unavailable);
+        }
+        let cap = wire::Capsule::decode(self.capsule.bytes(), &self.peer.config_hash)
+            .map_err(unavailable)?;
+        let proof = self
+            .peer
+            .producer
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?;
+        if proof.check_dns_wire(self.peer.image_hash).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(VerifiedDnsWireProducer::mint(
+            proof,
+            self.peer.image_hash,
+            self.peer.config_hash,
+            cap.manifest,
+            record,
+        )?))
+    }
     fn dns_producer(
         &self,
         record: LaunchRecord,
@@ -4284,11 +4356,7 @@ impl Channel for SystemChannel {
                     .sequence
                 };
                 inbox.runtime_reserved(
-                    Queued {
-                        bytes,
-                        length,
-                        sequence,
-                    },
+                    Queued::new(&bytes[..length], sequence, &self.budget.dynamic)?,
                     Instant::now(),
                     slot,
                 )?;
@@ -4436,9 +4504,37 @@ impl Channel for SystemChannel {
     }
 }
 struct Queued {
-    bytes: [u8; RUNTIME_PACKET],
+    bytes: Box<[u8]>,
     length: usize,
     sequence: u64,
+    _payload: super::memory::ByteLease,
+}
+impl Queued {
+    fn new(
+        bytes: &[u8],
+        sequence: u64,
+        budget: &super::memory::ByteBudget,
+    ) -> Result<Self, ServiceError> {
+        if bytes.is_empty() || bytes.len() >= RUNTIME_PACKET {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let credit = budget.reserve(bytes.len() + 16).map_err(unavailable)?;
+        Ok(Self {
+            bytes: bytes.into(),
+            length: bytes.len(),
+            sequence,
+            _payload: credit,
+        })
+    }
+    #[cfg(test)]
+    fn fixture(bytes: &[u8], sequence: u64) -> Self {
+        Self::new(
+            bytes,
+            sequence,
+            &super::memory::ByteBudget::new(8 * 1024 * 1024),
+        )
+        .unwrap()
+    }
 }
 #[derive(Clone, Copy)]
 struct CancelReply {
@@ -4499,11 +4595,11 @@ fn drain_before_publication<A: Authority>(
                     },
                 });
             } else {
-                queued.push_back(Queued {
-                    bytes,
-                    length,
+                queued.push_back(Queued::new(
+                    &bytes[..length],
                     sequence,
-                });
+                    &issuer.budget.dynamic,
+                )?);
             }
             continue;
         }
@@ -4543,11 +4639,11 @@ fn drain_before_publication<A: Authority>(
                 return Err(ServiceError::Unavailable);
             }
         } else {
-            queued.push_back(Queued {
-                bytes,
-                length,
-                sequence: frame.header.sequence,
-            });
+            queued.push_back(Queued::new(
+                &bytes[..length],
+                frame.header.sequence,
+                &issuer.budget.dynamic,
+            )?);
         }
     }
     Err(ServiceError::Busy)
@@ -4690,7 +4786,7 @@ fn run_issuer<A: Authority>(
             socket.processed(ack.request)?;
         }
         let (n, sequenced) = if let Some(pending) = queued.pop_front() {
-            bytes = pending.bytes;
+            bytes[..pending.length].copy_from_slice(&pending.bytes);
             (pending.length, true)
         } else {
             let Some(n) = socket.read(pid, uid, &mut bytes)? else {
@@ -4714,6 +4810,8 @@ fn run_issuer<A: Authority>(
                     .values()
                     .map(|g| g.expires)
                     .chain(issuer.services.values().map(|g| g.expires))
+                    .filter(|until| *until > issuer.authority.now())
+                    .chain(issuer.transport.cleanup_wakeup(issuer.authority.now()))
                     .chain(awaiting.map(|a| a.2))
                     .fold(expires, Instant::min);
                 socket.pause_until(until);
@@ -4801,6 +4899,7 @@ fn run_issuer<A: Authority>(
             awaiting = None;
             if issuer.negotiated.is_none() {
                 issuer.dns_release = socket.dns_producer(issuer.record)?;
+                issuer.dns_wire = socket.dns_wire_producer(issuer.record)?;
                 issuer.negotiated = Some(dns_bundle::negotiate(
                     issuer,
                     socket,

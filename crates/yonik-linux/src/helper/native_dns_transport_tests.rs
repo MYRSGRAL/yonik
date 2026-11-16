@@ -35,8 +35,53 @@ enum Fault {
     ReleaseExpired,
     ReleaseTooLate,
     ReleaseWrongLaunch,
+    Publish,
+    Waiters,
+    WaitersKeep,
+    WaiterWrongSource,
+    WaiterWrongRoot,
+    WaiterCancelQueued,
+    PublishNoAuthority,
+    PublishRevision,
+    PublishQuestion,
+    PublishAddress,
+    PublishCancel,
+    PublishReplay,
+    PublishExpired,
+    PublishLarge,
+    PublishExhausted,
 }
 impl Fault {
+    fn waitering(self) -> bool {
+        matches!(
+            self,
+            Self::Waiters
+                | Self::WaitersKeep
+                | Self::WaiterWrongSource
+                | Self::WaiterWrongRoot
+                | Self::WaiterCancelQueued
+        )
+    }
+    fn publishing(self) -> bool {
+        matches!(
+            self,
+            Self::Publish
+                | Self::Waiters
+                | Self::WaitersKeep
+                | Self::WaiterWrongSource
+                | Self::WaiterWrongRoot
+                | Self::WaiterCancelQueued
+                | Self::PublishNoAuthority
+                | Self::PublishRevision
+                | Self::PublishQuestion
+                | Self::PublishAddress
+                | Self::PublishCancel
+                | Self::PublishReplay
+                | Self::PublishExpired
+                | Self::PublishLarge
+                | Self::PublishExhausted
+        )
+    }
     fn releasing(self) -> bool {
         matches!(
             self,
@@ -73,6 +118,9 @@ struct Driver {
     one_empty: Cell<bool>,
     control_close: Cell<bool>,
     blocked: Cell<bool>,
+    extra_acquires: RefCell<VecDeque<Vec<u8>>>,
+    current_acquire: RefCell<Option<Vec<u8>>>,
+    next_dns: Cell<u64>,
 }
 fn n64(b: &[u8], at: usize) -> u64 {
     u64::from_be_bytes(b[at..at + 8].try_into().unwrap())
@@ -118,6 +166,9 @@ impl Driver {
             one_empty: Cell::new(false),
             control_close: Cell::new(false),
             blocked: Cell::new(false),
+            extra_acquires: Default::default(),
+            current_acquire: Default::default(),
+            next_dns: Cell::new(8),
         };
         if fault == Fault::RetiredRequest {
             input.push_back(dns_packet(
@@ -136,7 +187,9 @@ impl Driver {
         out
     }
     fn reserve(&self, role: u8, parent: u64) -> Vec<u8> {
-        let a = &self.acquire;
+        self.reserve_for(&self.acquire, role, parent, 1)
+    }
+    fn reserve_for(&self, a: &[u8], role: u8, parent: u64, bundle: u64) -> Vec<u8> {
         let base = &a[72..72 + usize::from(n16(a, 48))];
         let name = &a[72 + base.len()..72 + base.len() + usize::from(n16(a, 58))];
         let mut b = vec![0; 96];
@@ -144,7 +197,7 @@ impl Driver {
         b[2] = role;
         for (at, v) in [
             (8, n64(a, 16)),
-            (16, 1),
+            (16, bundle),
             (24, n64(a, 8)),
             (32, n64(base, 0)),
             (40, 1),
@@ -291,8 +344,94 @@ impl Driver {
         }
         self.queue(sequence, Operation::LogicalBind, &logical);
     }
+    fn publish(&self) -> Vec<u8> {
+        let name = b"query.invalid";
+        let mut query = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split(|b| *b == b'.') {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label);
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let mut response = query.clone();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[7] = 1;
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 203, 0, 113, 80]);
+        if self.fault == Fault::PublishLarge {
+            response[11] = 1;
+            let remaining = 32768 - response.len() - 11;
+            response.extend_from_slice(&[0, 0, 16, 0, 1, 0, 0, 0, 0]);
+            response.extend_from_slice(&(remaining as u16).to_be_bytes());
+            response.resize(32768, 0);
+        }
+        let mut b = vec![0; 144];
+        p16(&mut b, 0, 2);
+        p16(&mut b, 6, 0);
+        p16(&mut b, 8, u16::MAX);
+        p16(&mut b, 10, 1);
+        for (at, value) in [(12, 9), (20, 1), (28, 1), (36, 5), (120, 1), (128, 1)] {
+            p64(&mut b, at, value);
+        }
+        p16(&mut b, 108, name.len() as u16);
+        p16(&mut b, 110, query.len() as u16);
+        b[112..116].copy_from_slice(&(response.len() as u32).to_be_bytes());
+        b[136] = 1;
+        b[137] = 1;
+        p16(&mut b, 140, u16::MAX);
+        b[142] = self.peer.protocol;
+        b.extend_from_slice(name);
+        b.extend_from_slice(&query);
+        b.extend_from_slice(&response);
+        match self.fault {
+            Fault::PublishRevision => p64(&mut b, 128, 2),
+            Fault::PublishQuestion => b[144] = b'x',
+            Fault::PublishAddress => {
+                let n = b.len();
+                b[n - 4] = 224;
+            }
+            _ => {}
+        }
+        b
+    }
+    fn next_queue(&self, kind: Operation, body: &[u8]) {
+        let n = self.next_dns.get();
+        self.next_dns.set(n + 1);
+        self.queue(n, kind, body);
+    }
+    fn next_waiter(&self) {
+        if let Some(a) = self.extra_acquires.borrow_mut().pop_front() {
+            self.next_queue(Operation::BundleAcquire, &a);
+            *self.current_acquire.borrow_mut() = Some(a);
+        } else {
+            if self.fault == Fault::WaitersKeep {
+                self.finished.set(true);
+                return;
+            }
+            let mut c = [0; 24];
+            p16(&mut c, 0, 2);
+            c[2] = 6;
+            p64(&mut c, 8, 1);
+            self.next_queue(Operation::Cancel, &c);
+        }
+    }
 }
 impl Channel for Driver {
+    fn dns_wire_producer(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<Option<VerifiedDnsWireProducer>, ServiceError> {
+        if !self.fault.publishing() || self.fault == Fault::PublishNoAuthority {
+            return Ok(None);
+        }
+        let proof = super::super::registry::fake_dns_wire_image([17; 32]);
+        Ok(Some(VerifiedDnsWireProducer::mint(
+            &proof,
+            [17; 32],
+            record.binding.digest,
+            record.manifest,
+            record,
+        )?))
+    }
     fn dns_producer(
         &self,
         record: LaunchRecord,
@@ -448,12 +587,50 @@ impl Channel for Driver {
             return Ok(true);
         }
         match f.record.operation() {
+            Operation::BundleGranted if self.current_acquire.borrow().is_some() => {
+                let a = self.current_acquire.borrow();
+                let body = self.reserve_for(a.as_ref().unwrap(), 3, 0, n64(b, 8));
+                self.next_queue(Operation::Reserve, &body);
+            }
             Operation::BundleGranted => {
                 let mut b = self.reserve(1, 0);
                 if self.fault == Fault::Scope {
                     p16(&mut b, 70, if self.peer.protocol == 17 { 0 } else { 1 });
                 }
                 self.queue(4, Operation::Reserve, &b);
+            }
+            Operation::Reserved if b[60] == 3 => {
+                let a = self.current_acquire.borrow();
+                let a = a.as_ref().unwrap();
+                let base = &a[72..72 + usize::from(n16(a, 48))];
+                let mut body = [0; 64];
+                p16(&mut body, 0, 2);
+                for (at, value) in [
+                    (8, n64(b, 8)),
+                    (16, 1),
+                    (24, n64(a, 8)),
+                    (32, n64(a, 16)),
+                    (40, n64(base, 0)),
+                    (48, 1),
+                    (56, 1_000_000_000),
+                ] {
+                    p64(&mut body, at, value);
+                }
+                if self.fault == Fault::WaiterWrongSource {
+                    p64(&mut body, 40, 1);
+                }
+                if self.fault == Fault::WaiterWrongRoot {
+                    p64(&mut body, 24, 1);
+                }
+                let request = self.next_dns.get();
+                self.next_queue(Operation::WaiterBind, &body);
+                if self.fault == Fault::WaiterCancelQueued {
+                    let mut c = [0; 24];
+                    p16(&mut c, 0, 2);
+                    c[2] = 1;
+                    p64(&mut c, 8, request);
+                    self.next_queue(Operation::Cancel, &c);
+                }
             }
             Operation::Reserved if b[60] == 1 => {
                 if self.reverse {
@@ -518,7 +695,23 @@ impl Channel for Driver {
                 self.logical(6, n64(b, 16));
             }
             Operation::LogicalAck => {
-                if self.fault == Fault::Retire || self.fault.releasing() {
+                if self.fault.publishing() {
+                    if self.fault == Fault::PublishExpired {
+                        self.elapsed.fetch_add(21_000_000, Ordering::AcqRel);
+                    }
+                    if self.fault == Fault::PublishExhausted {
+                        let mut h = self.history.lock().unwrap();
+                        h.limit = h.len;
+                    }
+                    self.queue(7, Operation::Publish, &self.publish());
+                    if self.fault == Fault::PublishCancel {
+                        let mut c = [0; 24];
+                        p16(&mut c, 0, 2);
+                        c[2] = 1;
+                        p64(&mut c, 8, 7);
+                        self.queue(8, Operation::Cancel, &c);
+                    }
+                } else if self.fault == Fault::Retire || self.fault.releasing() {
                     let mut r = [0; 24];
                     p16(&mut r, 0, 2);
                     r[2] = 4;
@@ -546,6 +739,11 @@ impl Channel for Driver {
                     self.finished.set(true);
                 }
             }
+            Operation::Published if self.fault.waitering() => self.next_waiter(),
+            Operation::Published if self.fault == Fault::PublishReplay => {
+                self.queue(8, Operation::Publish, &self.publish())
+            }
+            Operation::WaiterBound if self.fault.waitering() => self.next_waiter(),
             Operation::Retired if self.fault.releasing() => {
                 let mut r = [0; 24];
                 p16(&mut r, 0, 2);
@@ -638,6 +836,195 @@ fn dns_transport_driver_reserve_scm_logical_both_orders_and_exact_pending() {
             assert_eq!(io.history.lock().unwrap().reserved, 0);
         }
     }
+}
+
+#[test]
+fn dns_transport_driver_publish_uses_bound_transport_and_returns_data_only() {
+    let (mut issuer, a) = bundle_fixture(Mode::System, false);
+    let io = Driver::new(&issuer, a, false, Fault::Publish);
+    run(&mut issuer, &io);
+    assert_eq!(statuses(&io).last(), Some(&(41, 1, 7)));
+    assert_eq!(issuer.authority.live.len(), 2);
+    assert!(!issuer.unknown);
+}
+
+fn additional_query(issuer: &mut Issuer<Fake>, first: &[u8], port: u16, query: u64) -> Vec<u8> {
+    let (flow, _) = issuer
+        .open(
+            100 + query,
+            &super::issuer_tests::open(issuer.record.mode, port),
+        )
+        .unwrap();
+    let n = usize::from(n16(first, 48));
+    let old = wire::dns_v2::View::<55>::decode(first)
+        .unwrap()
+        .authorization()
+        .unwrap();
+    let a = wire::Authorize {
+        source_flow: flow,
+        receipt: wire::Receipt {
+            kind: wire::ReceiptKind::None,
+            id: 0,
+        },
+        ..old
+    };
+    let (root, _) = issuer.authorize(200 + query, 0, &a).unwrap();
+    let mut bytes = [0; 1152];
+    let size = wire::Frame::encode(
+        wire::Header {
+            kind: wire::Kind::Authorize,
+            sequence: 1,
+            reply_to: 0,
+            binding: issuer.record.binding,
+            object_id: 0,
+        },
+        &wire::Message::Authorize(a),
+        &mut bytes,
+    )
+    .unwrap();
+    assert_eq!(size - 128, n);
+    let mut body = first.to_vec();
+    p64(&mut body, 8, root);
+    p64(&mut body, 16, query);
+    body[72..72 + n].copy_from_slice(&bytes[128..size]);
+    body
+}
+
+#[test]
+fn dns_transport_driver_publish_two_private_waiters_cancel_one_preserves_sibling() {
+    for mode in [Mode::Local, Mode::System] {
+        let (mut issuer, a) = bundle_fixture(mode, false);
+        let second = additional_query(&mut issuer, &a, 32002, 10);
+        let third = additional_query(&mut issuer, &a, 32003, 11);
+        let io = Driver::new(&issuer, a, false, Fault::Waiters);
+        io.extra_acquires.borrow_mut().extend([second, third]);
+        run(&mut issuer, &io);
+        assert_eq!(statuses(&io).last(), Some(&(48, 1, 14)));
+        assert_eq!(
+            statuses(&io)
+                .iter()
+                .filter(|(kind, status, _)| *kind == 54 && *status == 1)
+                .count(),
+            2
+        );
+        assert_eq!(issuer.rrsets.waiter_flags(), [false, true]);
+        let (owner, data) = issuer.rrsets.data_lifetime().unwrap();
+        assert!(data > owner);
+        issuer.cancel_flow(2).unwrap();
+        assert_eq!(issuer.rrsets.waiter_flags(), [false, true]);
+        assert!(!issuer.unknown);
+    }
+}
+
+#[test]
+fn dns_transport_driver_waiter_crossflow_root_and_queued_cancel_never_authorize() {
+    for fault in [
+        Fault::WaiterWrongSource,
+        Fault::WaiterWrongRoot,
+        Fault::WaiterCancelQueued,
+    ] {
+        let (mut issuer, a) = bundle_fixture(Mode::System, false);
+        let next = additional_query(&mut issuer, &a, 32002, 10);
+        let io = Driver::new(&issuer, a, false, fault);
+        io.extra_acquires.borrow_mut().push_back(next);
+        run(&mut issuer, &io);
+        assert!(
+            !statuses(&io)
+                .iter()
+                .any(|(op, status, _)| *op == 54 && *status == 1)
+        );
+        assert!(issuer.rrsets.waiter_flags().iter().all(|live| !*live));
+        assert!(!issuer.unknown);
+        assert_eq!(issuer.authority.live.len(), 4);
+    }
+}
+
+#[test]
+fn dns_transport_driver_live_waiters_flow_and_reservation_cancel_are_isolated() {
+    for cancel_flow in [false, true] {
+        let (mut issuer, a) = bundle_fixture(Mode::System, false);
+        let next = additional_query(&mut issuer, &a, 32002, 10);
+        let other = additional_query(&mut issuer, &a, 32003, 11);
+        let io = Driver::new(&issuer, a, false, Fault::WaitersKeep);
+        io.extra_acquires.borrow_mut().extend([next, other]);
+        run(&mut issuer, &io);
+        assert_eq!(issuer.rrsets.waiter_flags(), [true, true]);
+        if cancel_flow {
+            issuer.cancel_flow(2).unwrap();
+        } else {
+            issuer.cancel_request(9).unwrap();
+        }
+        assert_eq!(issuer.rrsets.waiter_flags(), [false, true]);
+        assert!(!issuer.unknown);
+    }
+}
+
+#[test]
+fn dns_transport_driver_each_waiter_requires_new_private_root_bundle() {
+    let (mut issuer, a) = bundle_fixture(Mode::System, false);
+    let next = additional_query(&mut issuer, &a, 32002, 10);
+    let io = Driver::new(&issuer, a, false, Fault::WaitersKeep);
+    io.extra_acquires.borrow_mut().extend([next.clone(), next]);
+    run(&mut issuer, &io);
+    assert_eq!(
+        statuses(&io)
+            .iter()
+            .filter(|(op, status, _)| *op == 54 && *status == 1)
+            .count(),
+        1
+    );
+    assert!(!issuer.unknown);
+}
+
+#[test]
+fn dns_transport_driver_waiter_partial_route_cleanup_keeps_unknown_custody() {
+    let (mut issuer, a) = bundle_fixture(Mode::System, false);
+    let next = additional_query(&mut issuer, &a, 32002, 10);
+    let io = Driver::new(&issuer, a, false, Fault::Waiters);
+    io.extra_acquires.borrow_mut().push_back(next);
+    run(&mut issuer, &io);
+    issuer.authority.unknown_release = true;
+    assert!(issuer.cancel_flow(2).is_err());
+    assert!(issuer.unknown);
+    assert_eq!(issuer.authority.live.len(), 4);
+    assert_eq!(io.slots.fds.used(), 2);
+}
+
+#[test]
+fn dns_transport_driver_publish_rejects_untrusted_mismatched_expired_and_replay() {
+    for fault in [
+        Fault::PublishNoAuthority,
+        Fault::PublishRevision,
+        Fault::PublishQuestion,
+        Fault::PublishAddress,
+        Fault::PublishExpired,
+        Fault::PublishExhausted,
+        Fault::PublishCancel,
+        Fault::PublishReplay,
+    ] {
+        let (mut issuer, a) = bundle_fixture(Mode::System, false);
+        let io = Driver::new(&issuer, a, false, fault);
+        run(&mut issuer, &io);
+        let allows = statuses(&io)
+            .iter()
+            .filter(|(kind, status, _)| *kind == 41 && *status == 1)
+            .count();
+        assert_eq!(allows, usize::from(fault == Fault::PublishReplay));
+        if fault == Fault::PublishReplay {
+            assert_eq!(statuses(&io).last(), Some(&(41, 2, 8)));
+        }
+        assert_eq!(io.closed.load(Ordering::Acquire), 0);
+    }
+}
+
+#[test]
+fn dns_transport_driver_publish_full_tcp_frame_is_bounded_without_cap_growth() {
+    let (mut issuer, a) = bundle_fixture_network(Mode::System, false, true);
+    let io = Driver::new(&issuer, a, false, Fault::PublishLarge);
+    assert!(io.publish().len() > 2293);
+    run(&mut issuer, &io);
+    assert_eq!(statuses(&io).last(), Some(&(41, 1, 7)));
+    assert!(!issuer.unknown);
 }
 #[test]
 fn dns_transport_driver_wrong_peer_namespace_source_never_physical_ack() {

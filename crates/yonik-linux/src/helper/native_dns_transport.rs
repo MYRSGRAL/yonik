@@ -298,6 +298,7 @@ pub(super) fn fake_facts(
     }
 }
 struct Reservation {
+    started: Instant,
     binding: Binding,
     role: u8,
     request: u64,
@@ -324,6 +325,7 @@ struct Resource {
     proof: Option<u64>,
 }
 struct DirectProof {
+    published: bool,
     release_acked: bool,
     retired: Option<bool>,
     acked: bool,
@@ -372,6 +374,13 @@ pub(super) struct Transport {
     _memory: ByteLease,
 }
 impl Transport {
+    pub(super) fn cleanup_wakeup(&self, now: Instant) -> Option<Instant> {
+        self.resources
+            .values()
+            .map(|r| r.cleanup_until)
+            .filter(|until| *until > now)
+            .min()
+    }
     #[cfg(test)]
     pub(super) fn counts(&self) -> (usize, usize, usize, usize) {
         (
@@ -468,7 +477,7 @@ impl Transport {
         self.reservations.remove(&id);
         Ok(())
     }
-    pub(super) fn cancel_request(&mut self, request: u64) -> Result<(), ServiceError> {
+    pub(super) fn cancel_request(&mut self, request: u64) -> Result<Option<u64>, ServiceError> {
         let id = self
             .reservations
             .iter()
@@ -477,7 +486,7 @@ impl Transport {
         if let Some(id) = id {
             self.cancel_reservation(id)?;
         }
-        Ok(())
+        Ok(id)
     }
 }
 fn n64(b: &[u8], at: usize) -> u64 {
@@ -541,6 +550,67 @@ impl Reply {
     }
 }
 impl<A: Authority> Issuer<A> {
+    pub(super) fn dns_publish_binding(
+        &mut self,
+        id: u64,
+        revision: u64,
+        exchange: u64,
+    ) -> Result<(Binding, Instant, bool), ServiceError> {
+        let p = self
+            .transport
+            .proofs
+            .get(&id)
+            .ok_or(ServiceError::Unavailable)?;
+        if p.revision != revision || p.exchange != exchange || !p.acked || p.retired.is_some() {
+            return Err(ServiceError::Unavailable);
+        }
+        let (resource, binding, published) = (p.resource, p.binding, p.published);
+        let r = self
+            .transport
+            .resources
+            .get(&resource)
+            .ok_or(ServiceError::Unavailable)?;
+        if !r.acked || r.proof != Some(id) || r.binding != binding || r.exchange != exchange {
+            return Err(ServiceError::Unavailable);
+        }
+        let parent = self
+            .transport
+            .reservations
+            .values()
+            .find(|r| r.role == 1 && r.exchange == exchange)
+            .ok_or(ServiceError::Unavailable)?;
+        let started = parent.started;
+        self.validate_dns_resource(resource)?;
+        Ok((binding, started, published))
+    }
+    pub(super) fn dns_freeze_publish(&mut self, id: u64) -> Result<(), ServiceError> {
+        let p = self
+            .transport
+            .proofs
+            .get_mut(&id)
+            .ok_or(ServiceError::Unavailable)?;
+        if p.published {
+            return Err(ServiceError::InvalidRequest);
+        }
+        p.published = true;
+        Ok(())
+    }
+    pub(super) fn dns_waiter_binding(&self, id: u64) -> Result<Binding, ServiceError> {
+        let r = self
+            .transport
+            .reservations
+            .get(&id)
+            .ok_or(ServiceError::Unavailable)?;
+        if r.role != 3
+            || !r.published
+            || r.pending.is_some()
+            || self.authority.now() >= r.expires
+            || self.direct_dns_binding(r.binding.bundle)? != r.binding
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(r.binding)
+    }
     fn retire_dns(
         &mut self,
         view: View<'_, 45>,
@@ -702,7 +772,7 @@ impl<A: Authority> Issuer<A> {
         }
         let b = view.bytes();
         let binding = self.direct_dns_binding(n64(b, 16))?;
-        if !matches!(b[2], 1 | 2)
+        if !matches!(b[2], 1..=3)
             || b[74] != 1
             || b[75] != 1
             || b[77] != 3
@@ -734,16 +804,21 @@ impl<A: Authority> Issuer<A> {
             .min(session)
             .min(now + Duration::from_nanos(n64(b, 56)));
         let parent = if b[2] == 2 { n64(b, 88) } else { 0 };
-        let exchange = if b[2] == 1 {
+        let exchange = if b[2] != 2 {
             if n16(b, 88) != binding.options
                 || n16(b, 90) != binding.payload
-                || self.transport.seen[..self.transport.seen_count]
-                    .contains(&Some((binding.bundle, binding.query)))
-                || self.transport.seen_count == 256
+                || b[2] == 1
+                    && self.transport.seen[..self.transport.seen_count]
+                        .contains(&Some((binding.bundle, binding.query)))
+                || b[2] == 1 && self.transport.seen_count == 256
             {
                 return Err(ServiceError::InvalidRequest);
             }
-            Self::id(&mut self.transport.next_exchange)?
+            if b[2] == 1 {
+                Self::id(&mut self.transport.next_exchange)?
+            } else {
+                0
+            }
         } else {
             let p = self
                 .transport
@@ -782,6 +857,7 @@ impl<A: Authority> Issuer<A> {
         self.transport.reservations.insert(
             id,
             Reservation {
+                started: now,
                 binding,
                 role: b[2],
                 request,
@@ -807,7 +883,16 @@ impl<A: Authority> Issuer<A> {
             (8, id),
             (16, binding.query),
             (24, binding.bundle),
-            (32, if b[2] == 1 { exchange } else { parent }),
+            (
+                32,
+                if b[2] == 1 {
+                    exchange
+                } else if b[2] == 2 {
+                    parent
+                } else {
+                    0
+                },
+            ),
             (40, binding.epoch),
         ] {
             set64(&mut reply.body, at, value);
@@ -1042,6 +1127,7 @@ impl<A: Authority> Issuer<A> {
         self.transport.proofs.insert(
             proof,
             DirectProof {
+                published: false,
                 release_acked: false,
                 retired: None,
                 acked: false,
@@ -1230,12 +1316,15 @@ pub(super) fn send_reply<A: Authority>(
                     }
                 }
                 Commit::Reserved(id) => {
-                    issuer
+                    let r = issuer
                         .transport
                         .reservations
                         .get_mut(&id)
-                        .ok_or(ServiceError::Unavailable)?
-                        .published = true;
+                        .ok_or(ServiceError::Unavailable)?;
+                    r.published = true;
+                    if r.role == 3 {
+                        r.pending.take();
+                    }
                 }
                 Commit::Physical(id) => {
                     let r = issuer

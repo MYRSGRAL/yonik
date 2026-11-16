@@ -206,6 +206,7 @@ impl<A: Authority> Issuer<A> {
         Ok(())
     }
     pub(super) fn cancel_dns_bundle(&mut self, id: u64) -> Result<(), ServiceError> {
+        self.rrsets.cancel_bundle(id);
         if self.unknown {
             return Err(ServiceError::Unavailable);
         }
@@ -602,6 +603,18 @@ pub(super) fn dispatch<A: Authority>(
     let neg = issuer.negotiated.ok_or(ServiceError::Unavailable)?;
     let frame = decode(bytes, &neg, Direction::Producer)?;
     let reply = frame.header.sequence;
+    if matches!(frame.record, Record::Publish(_) | Record::WaiterBind(_)) {
+        return super::dns_rrset::dispatch(
+            issuer,
+            socket,
+            stop,
+            sequence,
+            reply,
+            frame.record,
+            session,
+            drain,
+        );
+    }
     let session = if let Record::Cancel(view) = frame.record {
         let (target, id) = cancel_fields(view);
         super::dns_transport::cleanup_deadline(issuer, target, id)
@@ -647,7 +660,7 @@ pub(super) fn dispatch<A: Authority>(
             }
             Operation::BundleGranted
         }
-        Record::Cancel(view) if matches!(view.bytes()[2], 1..=4 | 7 | 8) => {
+        Record::Cancel(view) if matches!(view.bytes()[2], 1..=8) => {
             let (target, id) = cancel_fields(view);
             body[2] = if cancel(issuer, reply, target, id).is_ok() {
                 1
@@ -719,7 +732,13 @@ pub(super) fn cancel<A: Authority>(
     match target {
         8 => issuer.cancel_dns_bundle(id),
         1 if id < sequence => issuer.cancel_request(id),
-        2..=4 | 7 => super::dns_transport::cancel(issuer, target, id),
+        2..=4 => super::dns_transport::cancel(issuer, target, id),
+        7 => {
+            super::dns_transport::cancel(issuer, target, id)?;
+            issuer.rrsets.cancel_reservation(id);
+            Ok(())
+        }
+        5 | 6 => issuer.rrsets.cancel(target, id),
         _ => Err(ServiceError::InvalidRequest),
     }
 }

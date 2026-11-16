@@ -1,6 +1,19 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[test]
+fn dns_rrset_queue_credit_precedes_materialization_and_rx_bound_is_fixed() {
+    let budget = super::super::memory::ByteBudget::new(128);
+    assert!(Queued::new(&[0; 129], 1, &budget).is_err());
+    assert_eq!(budget.used(), 0);
+    let packet = Queued::new(&[0; 100], 1, &budget).unwrap();
+    assert_eq!(budget.used(), 116);
+    drop(packet);
+    assert_eq!(budget.used(), 0);
+    assert!(Queued::new(&[0; RUNTIME_PACKET], 1, &budget).is_err());
+    assert_eq!(RX_BYTES, 256 * 1024);
+}
+
 // Весь driver below — in-memory: ни OS endpoint, ни runtime wrappers.
 struct BundleIo {
     record: LaunchRecord,
@@ -990,16 +1003,7 @@ impl Channel for UdpDriver {
                 .unwrap();
                 let now = Instant::now();
                 let mut inbox = self.inbox.lock().unwrap();
-                inbox
-                    .runtime(
-                        Queued {
-                            bytes: raw,
-                            length: n,
-                            sequence: 2,
-                        },
-                        now,
-                    )
-                    .unwrap();
+                inbox.runtime(Queued::fixture(&raw[..n], 2), now).unwrap();
                 let (packet, proof) = udp_packet(self.record, 3, now);
                 if self.proof_first {
                     let slot = inbox.slots.pending.reserve(1).unwrap();
@@ -1111,11 +1115,7 @@ fn canceled_queued_open_discards_ready_proof_without_expiring_neighbor() {
         inbox: std::cell::RefCell::new(inbox),
         packets: std::cell::RefCell::new(VecDeque::from([
             packet,
-            Queued {
-                bytes,
-                length,
-                sequence: 3,
-            },
+            Queued::fixture(&bytes[..length], 3),
         ])),
     };
     let mut incoming = wire::Sequence::new();
@@ -1161,11 +1161,7 @@ fn rendezvous_open(record: LaunchRecord, sequence: u64) -> (Queued, wire::Socket
     )
     .unwrap();
     (
-        Queued {
-            bytes,
-            length,
-            sequence,
-        },
+        Queued::fixture(&bytes[..length], sequence),
         wire::SocketRecord {
             request: sequence,
             proof: sequence,
@@ -1328,14 +1324,7 @@ fn socket_proof_missing_open_can_be_canceled_without_authority_or_resurrection()
     )
     .unwrap();
     inbox
-        .runtime(
-            Queued {
-                bytes,
-                length,
-                sequence: 3,
-            },
-            now,
-        )
+        .runtime(Queued::fixture(&bytes[..length], 3), now)
         .unwrap();
     assert_eq!(inbox.next(record, now).unwrap().unwrap().sequence, 2);
     assert!(inbox.take(2, proof.tuple, proof.ingress).is_err());

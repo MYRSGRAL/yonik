@@ -1,0 +1,944 @@
+//! Immutable DNS DATA и отдельный fresh waiter. Numeric authority здесь нет.
+use super::super::memory::ByteLease;
+use super::dns_transport::Binding;
+use super::{Authority, Channel, Issuer, OwnerReference, ServiceError, unavailable, wire};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
+use wire::dns_v2::{Operation, Record, View};
+
+const MEMBERS: usize = 256;
+const CHAIN: usize = 32;
+const RECORDS: usize = 512;
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Name {
+    bytes: [u8; 253],
+    len: usize,
+}
+impl Name {
+    fn empty() -> Self {
+        Self {
+            bytes: [0; 253],
+            len: 0,
+        }
+    }
+    fn lookup(bytes: &[u8]) -> Result<Self, ServiceError> {
+        let bytes = bytes.strip_suffix(b".").unwrap_or(bytes);
+        if bytes.is_empty() || bytes.len() > 253 {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let mut name = Self::empty();
+        for label in bytes.split(|b| *b == b'.') {
+            name.label(label)?;
+        }
+        Ok(name)
+    }
+    fn label(&mut self, label: &[u8]) -> Result<(), ServiceError> {
+        if label.is_empty()
+            || label.len() > 63
+            || self.len + usize::from(self.len > 0) + label.len() > 253
+            || !label
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_'))
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if self.len > 0 {
+            self.bytes[self.len] = b'.';
+            self.len += 1;
+        }
+        for b in label {
+            self.bytes[self.len] = b.to_ascii_lowercase();
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+fn u16_at(b: &[u8], at: usize) -> Result<u16, ServiceError> {
+    let b = b.get(at..at + 2).ok_or(ServiceError::InvalidRequest)?;
+    Ok(u16::from_be_bytes([b[0], b[1]]))
+}
+fn n16(b: &[u8], at: usize) -> u16 {
+    u16::from_be_bytes([b[at], b[at + 1]])
+}
+fn n64(b: &[u8], at: usize) -> u64 {
+    u64::from_be_bytes(std::array::from_fn(|i| b[at + i]))
+}
+fn put(b: &mut [u8], at: usize, value: u64) {
+    b[at..at + 8].copy_from_slice(&value.to_be_bytes());
+}
+fn name(packet: &[u8], offset: &mut usize) -> Result<Name, ServiceError> {
+    let mut result = Name::empty();
+    let mut pos = *offset;
+    let mut jumped = false;
+    let mut pointers = 0;
+    loop {
+        let first = *packet.get(pos).ok_or(ServiceError::InvalidRequest)?;
+        if first & 0xc0 == 0xc0 {
+            let target = usize::from(u16_at(packet, pos)? & 0x3fff);
+            pointers += 1;
+            if pointers > 16 || target >= pos || target < 12 {
+                return Err(ServiceError::InvalidRequest);
+            }
+            if !jumped {
+                *offset = pos + 2;
+                jumped = true;
+            }
+            pos = target;
+            continue;
+        }
+        if first & 0xc0 != 0 {
+            return Err(ServiceError::InvalidRequest);
+        }
+        pos += 1;
+        if first == 0 {
+            if !jumped {
+                *offset = pos;
+            }
+            return Ok(result);
+        }
+        let end = pos + usize::from(first);
+        result.label(packet.get(pos..end).ok_or(ServiceError::InvalidRequest)?)?;
+        pos = end;
+    }
+}
+struct Rr {
+    owner: Name,
+    kind: u16,
+    class: u16,
+    ttl: u32,
+    start: usize,
+    end: usize,
+}
+fn rr(packet: &[u8], offset: &mut usize) -> Result<Rr, ServiceError> {
+    let owner = name(packet, offset)?;
+    let header = packet
+        .get(*offset..*offset + 10)
+        .ok_or(ServiceError::InvalidRequest)?;
+    let kind = n16(header, 0);
+    let class = n16(header, 2);
+    let ttl = u32::from_be_bytes(header[4..8].try_into().map_err(unavailable)?);
+    let start = *offset + 10;
+    let end = start + usize::from(n16(header, 8));
+    packet.get(start..end).ok_or(ServiceError::InvalidRequest)?;
+    *offset = end;
+    if kind == 1 && end - start != 4 || kind == 28 && end - start != 16 {
+        return Err(ServiceError::InvalidRequest);
+    }
+    if kind == 5 {
+        let mut at = start;
+        name(packet, &mut at)?;
+        if at != end {
+            return Err(ServiceError::InvalidRequest);
+        }
+    }
+    Ok(Rr {
+        owner,
+        kind,
+        class,
+        ttl,
+        start,
+        end,
+    })
+}
+fn question(packet: &[u8], expected: Name, qtype: u16) -> Result<usize, ServiceError> {
+    if packet.len() < 12 || n16(packet, 4) != 1 {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let mut at = 12;
+    if name(packet, &mut at)? != expected
+        || u16_at(packet, at)? != qtype
+        || u16_at(packet, at + 2)? != 1
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    Ok(at + 4)
+}
+fn opt(
+    packet: &[u8],
+    rr: &Rr,
+    payload: u16,
+    options: u16,
+    request: bool,
+) -> Result<(), ServiceError> {
+    if rr.owner.len != 0
+        || rr.kind != 41
+        || !(512..=4096).contains(&rr.class)
+        || request && rr.class != payload
+        || rr.ttl & !0x8000 != 0
+        || (rr.ttl & 0x8000 != 0) != (options & 4 != 0)
+        || rr.start != rr.end
+    {
+        return Err(ServiceError::Unsupported);
+    }
+    packet
+        .get(rr.start..rr.end)
+        .ok_or(ServiceError::InvalidRequest)?;
+    Ok(())
+}
+struct Answer {
+    members: [IpAddr; MEMBERS],
+    count: usize,
+    ttl: u32,
+}
+fn unicast(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_multicast()
+                && ip != Ipv4Addr::BROADCAST
+                && ip.octets()[0] != 0
+                && ip.octets()[0] < 240
+        }
+        IpAddr::V6(ip) => {
+            !ip.is_unspecified() && !ip.is_multicast() && ip.to_ipv4_mapped().is_none()
+        }
+    }
+}
+// Все scratch buffers заранее учтены caller; parser не аллоцирует.
+const SCRATCH: usize =
+    std::mem::size_of::<Answer>() + (CHAIN + 4) * std::mem::size_of::<Name>() + 4096;
+fn parse(
+    request: &[u8],
+    response: &[u8],
+    lookup: &[u8],
+    qtype: u16,
+    options: u16,
+    payload: u16,
+) -> Result<Answer, ServiceError> {
+    if !(12..=512).contains(&request.len())
+        || !(12..=32768).contains(&response.len())
+        || !matches!(qtype, 1 | 28)
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let expected = Name::lookup(lookup)?;
+    let flags = (if options & 1 != 0 { 0x100 } else { 0 })
+        | (if options & 2 != 0 { 0x10 } else { 0 })
+        | (if options & 16 != 0 { 0x20 } else { 0 });
+    if n16(request, 2) != flags
+        || n16(request, 6) != 0
+        || n16(request, 8) != 0
+        || n16(request, 10) != u16::from(options & 8 != 0)
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let mut at = question(request, expected, qtype)?;
+    if options & 8 != 0 {
+        let record = rr(request, &mut at)?;
+        opt(request, &record, payload, options, true)?;
+    }
+    if at != request.len()
+        || request[..2] != response[..2]
+        || n16(response, 2) & 0xf != 0
+        || n16(response, 2) & 0xf800 != 0x8000
+        || n16(response, 2) & 0x0240 != 0
+        || n16(response, 2) & 0x110 != flags & 0x110
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let answer_start = question(response, expected, qtype)?;
+    let answers = usize::from(n16(response, 6));
+    let total = answers + usize::from(n16(response, 8)) + usize::from(n16(response, 10));
+    if answers == 0 || total > RECORDS {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let mut cursor = answer_start;
+    let mut opts = 0;
+    for index in 0..total {
+        let record = rr(response, &mut cursor)?;
+        if record.kind == 41 {
+            opts += 1;
+            if options & 8 == 0 || index < answers + usize::from(n16(response, 8)) || opts > 1 {
+                return Err(ServiceError::InvalidRequest);
+            }
+            opt(response, &record, payload, options, false)?;
+        } else if record.class != 1 {
+            return Err(ServiceError::InvalidRequest);
+        }
+    }
+    if cursor != response.len() {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let mut path = [Name::empty(); CHAIN];
+    let mut depth = 1;
+    path[0] = expected;
+    let mut current = expected;
+    let mut ttl = u32::MAX;
+    loop {
+        let mut next = None;
+        let mut cursor = answer_start;
+        let mut address = false;
+        for _ in 0..answers {
+            let record = rr(response, &mut cursor)?;
+            if record.owner != current {
+                continue;
+            }
+            if matches!(record.kind, 1 | 28) {
+                address = true;
+            }
+            if record.kind == 5 {
+                let mut offset = record.start;
+                let target = name(response, &mut offset)?;
+                if next.is_some_and(|n| n != target) {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                next = Some(target);
+                ttl = ttl.min(record.ttl);
+            }
+        }
+        let Some(next) = next else { break };
+        if address || depth == CHAIN || path[..depth].contains(&next) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        path[depth] = next;
+        depth += 1;
+        current = next;
+    }
+    let mut result = Answer {
+        members: [IpAddr::V4(Ipv4Addr::UNSPECIFIED); MEMBERS],
+        count: 0,
+        ttl,
+    };
+    let mut cursor = answer_start;
+    for _ in 0..answers {
+        let record = rr(response, &mut cursor)?;
+        if !path[..depth].contains(&record.owner) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if matches!(record.kind, 1 | 28) {
+            if record.owner != current || record.kind != qtype {
+                return Err(ServiceError::InvalidRequest);
+            }
+            let bytes = &response[record.start..record.end];
+            let ip = if record.kind == 1 {
+                IpAddr::V4(Ipv4Addr::from(
+                    <[u8; 4]>::try_from(bytes).map_err(unavailable)?,
+                ))
+            } else {
+                IpAddr::V6(Ipv6Addr::from(
+                    <[u8; 16]>::try_from(bytes).map_err(unavailable)?,
+                ))
+            };
+            if !unicast(ip) {
+                return Err(ServiceError::InvalidRequest);
+            }
+            result.ttl = result.ttl.min(record.ttl);
+            if !result.members[..result.count].contains(&ip) {
+                if result.count == MEMBERS {
+                    return Err(ServiceError::Busy);
+                }
+                result.members[result.count] = ip;
+                result.count += 1;
+            }
+        }
+    }
+    if result.count == 0 || result.ttl == 0 {
+        return Err(ServiceError::Unavailable);
+    }
+    Ok(result)
+}
+
+struct Producer {
+    binding: Binding,
+    proof: u64,
+    revision: u64,
+    exchange: u64,
+    request: u64,
+    expires: Instant,
+    answer: Answer,
+    acked: bool,
+    revoked: bool,
+    _memory: ByteLease,
+}
+struct Waiter {
+    binding: Binding,
+    producer: u64,
+    reservation: u64,
+    request: u64,
+    expires: Instant,
+    acked: bool,
+    revoked: bool,
+    _memory: ByteLease,
+}
+pub(super) struct State {
+    producers: BTreeMap<u64, Box<Producer>>,
+    waiters: BTreeMap<u64, Box<Waiter>>,
+    next_producer: u64,
+    next_waiter: u64,
+}
+impl State {
+    #[cfg(test)]
+    pub(super) fn waiter_flags(&self) -> Vec<bool> {
+        self.waiters
+            .values()
+            .map(|w| w.acked && !w.revoked)
+            .collect()
+    }
+    #[cfg(test)]
+    pub(super) fn data_lifetime(&self) -> Option<(Instant, Instant)> {
+        self.producers
+            .values()
+            .next()
+            .map(|p| (p.binding.expires, p.expires))
+    }
+    pub(super) fn new() -> Self {
+        Self {
+            producers: BTreeMap::new(),
+            waiters: BTreeMap::new(),
+            next_producer: 0,
+            next_waiter: 0,
+        }
+    }
+    pub(super) fn cancel_bundle(&mut self, bundle: u64) {
+        for w in self.waiters.values_mut() {
+            if w.binding.bundle == bundle {
+                w.revoked = true;
+            }
+        }
+    }
+    pub(super) fn cancel_reservation(&mut self, reservation: u64) {
+        for waiter in self.waiters.values_mut() {
+            if waiter.reservation == reservation {
+                waiter.revoked = true;
+            }
+        }
+    }
+    pub(super) fn cancel_request(&mut self, request: u64) {
+        for p in self.producers.values_mut() {
+            if p.request == request {
+                p.revoked = true;
+            }
+        }
+        for w in self.waiters.values_mut() {
+            if w.request == request {
+                w.revoked = true;
+            }
+        }
+    }
+    pub(super) fn cancel(&mut self, target: u8, id: u64) -> Result<(), ServiceError> {
+        match target {
+            5 => {
+                let p = self
+                    .producers
+                    .get_mut(&id)
+                    .ok_or(ServiceError::InvalidRequest)?;
+                p.revoked = true;
+                for w in self.waiters.values_mut() {
+                    if w.producer == id {
+                        w.revoked = true;
+                    }
+                }
+            }
+            6 => {
+                self.waiters
+                    .get_mut(&id)
+                    .ok_or(ServiceError::InvalidRequest)?
+                    .revoked = true
+            }
+            _ => return Err(ServiceError::InvalidRequest),
+        }
+        Ok(())
+    }
+}
+fn same_data(a: Binding, b: Binding) -> bool {
+    let (Ok(a_name), Ok(b_name)) = (
+        Name::lookup(a.name.wire().bytes),
+        Name::lookup(b.name.wire().bytes),
+    ) else {
+        return false;
+    };
+    (
+        a.epoch,
+        a.resolver,
+        a.subject,
+        a.scope,
+        a.branch,
+        a.qtype,
+        a.options,
+        a.payload,
+        a.source_revision,
+        a.peer,
+    ) == (
+        b.epoch,
+        b.resolver,
+        b.subject,
+        b.scope,
+        b.branch,
+        b.qtype,
+        b.options,
+        b.payload,
+        b.source_revision,
+        b.peer,
+    ) && a_name == b_name
+}
+impl<A: Authority> Issuer<A> {
+    fn publish_dns(
+        &mut self,
+        v: View<'_, 40>,
+        request: u64,
+        session: Instant,
+    ) -> Result<u64, ServiceError> {
+        self.fence()?;
+        self.dns_wire
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?
+            .bound(self.record)?;
+        let b = v.bytes();
+        if b[136] != 1
+            || b[137] != 1
+            || n16(b, 8) != u16::MAX
+            || n16(b, 140) != u16::MAX
+            || b[44..108].iter().any(|b| *b != 0)
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        self.bundle_history(1)?;
+        let (binding, started, published) =
+            self.dns_publish_binding(n64(b, 120), n64(b, 128), n64(b, 28))?;
+        if published {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let q = usize::from(n16(b, 108));
+        let r = usize::from(n16(b, 110));
+        if binding.peer.protocol == 17
+            && b.len() - 144 - q - r
+                > usize::from(if binding.options & 8 != 0 {
+                    binding.payload
+                } else {
+                    512
+                })
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if n16(b, 4) != binding.resolver
+            || n16(b, 6) != binding.subject
+            || n16(b, 10) != binding.qtype
+            || n64(b, 12) != binding.query
+            || n64(b, 20) != binding.root
+            || n64(b, 36) != binding.epoch
+            || b[142] != binding.peer.protocol
+            || &b[144..144 + q] != binding.name.wire().bytes
+            || self.rrsets.producers.len() >= 64
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        // Только provider row без captured snapshot; System resolver source — следующий cut.
+        if self
+            .capsule()?
+            .resolver_scope(binding.resolver)
+            .map_err(unavailable)?
+            .source
+            != [0; 32]
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        let _scratch = self.budget.dynamic.reserve(SCRATCH).map_err(unavailable)?;
+        let memory = self
+            .budget
+            .dynamic
+            .reserve(std::mem::size_of::<Producer>() + 80)
+            .map_err(unavailable)?;
+        let answer = parse(
+            &b[144 + q..144 + q + r],
+            &b[144 + q + r..],
+            &b[144..144 + q],
+            binding.qtype,
+            binding.options,
+            binding.payload,
+        )?;
+        let expires = started
+            .checked_add(Duration::from_secs(u64::from(answer.ttl)))
+            .ok_or(ServiceError::Unavailable)?
+            .min(session);
+        if self.authority.now() >= expires {
+            return Err(ServiceError::Unavailable);
+        }
+        self.dns_publish_binding(n64(b, 120), n64(b, 128), n64(b, 28))?;
+        let id = Self::id(&mut self.rrsets.next_producer)?;
+        self.dns_freeze_publish(n64(b, 120))?;
+        self.rrsets.producers.insert(
+            id,
+            Box::new(Producer {
+                binding,
+                proof: n64(b, 120),
+                revision: n64(b, 128),
+                exchange: n64(b, 28),
+                request,
+                expires,
+                answer,
+                acked: false,
+                revoked: false,
+                _memory: memory,
+            }),
+        );
+        Ok(id)
+    }
+    fn fresh_waiter(&mut self, binding: Binding) -> Result<Instant, ServiceError> {
+        if self.direct_dns_binding(binding.bundle)? != binding {
+            return Err(ServiceError::Unavailable);
+        }
+        let flow = self
+            .flows
+            .get(&binding.source)
+            .ok_or(ServiceError::Unavailable)?;
+        self.authority.check_ingress(&flow.socket)?;
+        let tuple = flow.tuple;
+        let subject = flow.subject;
+        let proof = self
+            .authority
+            .owner(binding.source, tuple, OwnerReference::NONE)?;
+        if self.authority.subject(&proof, binding.source, tuple)? != subject {
+            return Err(ServiceError::Unavailable);
+        }
+        let expiry = binding
+            .expires
+            .min(self.authority.expiry(&proof).unwrap_or(binding.expires));
+        if self.authority.now() >= expiry {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(expiry)
+    }
+    fn bind_dns_waiter(
+        &mut self,
+        v: View<'_, 53>,
+        request: u64,
+        session: Instant,
+    ) -> Result<u64, ServiceError> {
+        self.fence()?;
+        let b = v.bytes();
+        let reservation = n64(b, 8);
+        let producer = n64(b, 16);
+        let binding = self.dns_waiter_binding(reservation)?;
+        let p = self
+            .rrsets
+            .producers
+            .get(&producer)
+            .ok_or(ServiceError::Unavailable)?;
+        if !p.acked
+            || p.revoked
+            || p.expires <= self.authority.now()
+            || !same_data(binding, p.binding)
+            || binding.bundle == p.binding.bundle
+            || n64(b, 24) != binding.root
+            || n64(b, 32) != binding.query
+            || n64(b, 40) != binding.source
+            || n64(b, 48) != binding.source_revision
+            || self.rrsets.waiters.values().any(|w| {
+                w.reservation == reservation
+                    || w.binding.bundle == binding.bundle
+                    || w.binding.root == binding.root
+            })
+            || self.rrsets.waiters.len() >= 256
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let expires = p
+            .expires
+            .min(session)
+            .min(self.authority.now() + Duration::from_nanos(n64(b, 56)));
+        let memory = self
+            .budget
+            .dynamic
+            .reserve(std::mem::size_of::<Waiter>() + 80)
+            .map_err(unavailable)?;
+        self.bundle_history(1)?;
+        let expires = expires.min(self.fresh_waiter(binding)?);
+        let id = Self::id(&mut self.rrsets.next_waiter)?;
+        self.rrsets.waiters.insert(
+            id,
+            Box::new(Waiter {
+                binding,
+                producer,
+                reservation,
+                request,
+                expires,
+                acked: false,
+                revoked: false,
+                _memory: memory,
+            }),
+        );
+        Ok(id)
+    }
+    fn rrset_reply(
+        &mut self,
+        operation: Operation,
+        id: u64,
+        out: &mut [u8; 64],
+    ) -> Result<Instant, ServiceError> {
+        self.fence()?;
+        if operation == Operation::Published {
+            let p = self
+                .rrsets
+                .producers
+                .get(&id)
+                .ok_or(ServiceError::Unavailable)?;
+            if p.revoked || p.expires <= self.authority.now() {
+                return Err(ServiceError::Unavailable);
+            }
+            if !p.acked {
+                let (proof, revision, exchange, binding) =
+                    (p.proof, p.revision, p.exchange, p.binding);
+                if self.dns_publish_binding(proof, revision, exchange)?.0 != binding {
+                    return Err(ServiceError::Unavailable);
+                }
+            }
+            let p = self
+                .rrsets
+                .producers
+                .get(&id)
+                .ok_or(ServiceError::Unavailable)?;
+            let now = self.authority.now();
+            if now >= p.expires {
+                return Err(ServiceError::Unavailable);
+            }
+            put(out, 8, id);
+            put(out, 16, p.exchange);
+            put(out, 24, p.binding.epoch);
+            put(
+                out,
+                32,
+                (p.expires - now)
+                    .as_nanos()
+                    .min(u128::from(u32::MAX) * 1_000_000_000) as u64,
+            );
+            out[40..42].copy_from_slice(&(p.answer.count as u16).to_be_bytes());
+            Ok(p.expires)
+        } else {
+            let w = self
+                .rrsets
+                .waiters
+                .get(&id)
+                .ok_or(ServiceError::Unavailable)?;
+            let p = self
+                .rrsets
+                .producers
+                .get(&w.producer)
+                .ok_or(ServiceError::Unavailable)?;
+            if w.revoked || p.revoked || self.authority.now() >= w.expires.min(p.expires) {
+                return Err(ServiceError::Unavailable);
+            }
+            let binding = w.binding;
+            let expiry = w.expires.min(p.expires);
+            let (producer, reservation, count) = (w.producer, w.reservation, p.answer.count);
+            if self.dns_waiter_binding(reservation)? != binding {
+                return Err(ServiceError::Unavailable);
+            }
+            let until = self.fresh_waiter(binding)?.min(expiry);
+            let now = self.authority.now();
+            if now >= until {
+                return Err(ServiceError::Unavailable);
+            }
+            put(out, 8, id);
+            put(out, 16, producer);
+            put(out, 24, reservation);
+            put(out, 32, binding.query);
+            put(out, 40, binding.epoch);
+            put(out, 48, (until - now).as_nanos().min(1_000_000_000) as u64);
+            out[56..58].copy_from_slice(&(count as u16).to_be_bytes());
+            out[58] = 1;
+            out[59] = 1;
+            Ok(until)
+        }
+    }
+}
+#[allow(clippy::too_many_arguments)] // Exact pending sequence и original deadline.
+pub(super) fn dispatch<A: Authority>(
+    issuer: &mut Issuer<A>,
+    socket: &impl Channel,
+    stop: &AtomicBool,
+    sequence: u64,
+    request: u64,
+    record: Record<'_>,
+    session: Instant,
+    mut drain: impl FnMut(&mut Issuer<A>) -> Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    let operation = if matches!(record, Record::Publish(_)) {
+        Operation::Published
+    } else {
+        Operation::WaiterBound
+    };
+    let result = if issuer.retired.iter().any(|(n, _)| *n == request) {
+        Err(ServiceError::Unavailable)
+    } else {
+        match record {
+            Record::Publish(v) => issuer.publish_dns(v, request, session),
+            Record::WaiterBind(v) => issuer.bind_dns_waiter(v, request, session),
+            _ => Err(ServiceError::Unsupported),
+        }
+    };
+    if !issuer.unknown {
+        drain(issuer)?;
+    }
+    let mut deadline = session;
+    loop {
+        if stop.load(Ordering::Acquire) || issuer.authority.now() >= deadline {
+            return Err(ServiceError::Unavailable);
+        }
+        let mut body = [0; 64];
+        body[1] = 2;
+        body[2] = if let Ok(id) = result {
+            if issuer.retired.iter().any(|(n, _)| *n == request) {
+                2
+            } else if let Ok(until) = issuer.rrset_reply(operation, id, &mut body) {
+                deadline = deadline.min(until);
+                1
+            } else {
+                body[3..].fill(0);
+                if issuer.unknown { 3 } else { 2 }
+            }
+        } else if issuer.unknown {
+            3
+        } else {
+            2
+        };
+        let length = if operation == Operation::Published {
+            48
+        } else {
+            64
+        };
+        let mut bytes = [0; 192];
+        let frame = wire::dns_v2::DnsFrame {
+            header: wire::dns_v2::Envelope {
+                sequence,
+                reply_to: request,
+                binding: issuer.record.binding,
+            },
+            record: Record::decode(operation, &body[..length]).map_err(unavailable)?,
+        };
+        let n = frame
+            .encode(
+                &issuer.negotiated.ok_or(ServiceError::Unavailable)?,
+                &mut bytes,
+            )
+            .map_err(unavailable)?;
+        if socket.write(&bytes[..n])? {
+            if body[2] == 1 {
+                let id = result?;
+                if operation == Operation::Published {
+                    issuer
+                        .rrsets
+                        .producers
+                        .get_mut(&id)
+                        .ok_or(ServiceError::Unavailable)?
+                        .acked = true;
+                } else {
+                    issuer
+                        .rrsets
+                        .waiters
+                        .get_mut(&id)
+                        .ok_or(ServiceError::Unavailable)?
+                        .acked = true;
+                }
+            }
+            return Ok(());
+        }
+        socket.writable_until(deadline);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn pair() -> (Vec<u8>, Vec<u8>) {
+        let mut q = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(b"\x05query\x07invalid\0\0\x01\0\x01");
+        let mut r = q.clone();
+        r[2] = 0x81;
+        r[3] = 0x80;
+        r[7] = 1;
+        r.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 203, 0, 113, 80]);
+        (q, r)
+    }
+    #[test]
+    fn dns_rrset_parser_exact_question_flags_id_class_and_truncation() {
+        let (q, r) = pair();
+        let a = parse(&q, &r, b"QUERY.invalid.", 1, 1, 0).unwrap();
+        assert_eq!(a.count, 1);
+        assert_eq!(a.ttl, 30);
+        for at in [0, 2, 3, 5, 13, r.len() - 5] {
+            let mut bad = r.clone();
+            bad[at] ^= 1;
+            assert!(parse(&q, &bad, b"query.invalid", 1, 1, 0).is_err());
+        }
+        for end in 0..r.len() {
+            assert!(parse(&q, &r[..end], b"query.invalid", 1, 1, 0).is_err());
+        }
+        assert!(parse(&q, &r, b"other.invalid", 1, 1, 0).is_err());
+        assert!(parse(&q, &vec![0; 32769], b"query.invalid", 1, 1, 0).is_err());
+    }
+    #[test]
+    fn dns_rrset_parser_only_related_unicast_members_and_minimum_ttl() {
+        let (q, r) = pair();
+        for ip in [[0, 0, 0, 0], [224, 0, 0, 1], [255, 255, 255, 255]] {
+            let mut bad = r.clone();
+            let n = bad.len();
+            bad[n - 4..].copy_from_slice(&ip);
+            assert!(parse(&q, &bad, b"query.invalid", 1, 1, 0).is_err());
+        }
+        let mut duplicate = r.clone();
+        duplicate[7] = 2;
+        let mut last = r[q.len()..].to_vec();
+        last[9] = 10;
+        duplicate.extend_from_slice(&last);
+        let a = parse(&q, &duplicate, b"query.invalid", 1, 1, 0).unwrap();
+        assert_eq!((a.count, a.ttl), (1, 10));
+        let mut bad = r.clone();
+        bad[q.len() + 6..q.len() + 10].fill(0);
+        assert!(parse(&q, &bad, b"query.invalid", 1, 1, 0).is_err());
+        let mut bad = r.clone();
+        bad[q.len() + 1] = 31;
+        assert!(parse(&q, &bad, b"query.invalid", 1, 1, 0).is_err());
+    }
+    fn record(out: &mut Vec<u8>, owner: &[u8], kind: u16, ttl: u32, data: &[u8]) {
+        out.extend_from_slice(owner);
+        out.extend_from_slice(&kind.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&ttl.to_be_bytes());
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(data);
+    }
+    #[test]
+    fn dns_rrset_parser_cname_answer_ownership_and_cycle() {
+        let (q, mut r) = pair();
+        r.truncate(q.len());
+        r[7] = 2;
+        let alias = b"\x05alias\x07invalid\0";
+        record(&mut r, &[0xc0, 12], 5, 10, alias);
+        record(&mut r, alias, 1, 60, &[203, 0, 113, 80]);
+        let a = parse(&q, &r, b"query.invalid", 1, 1, 0).unwrap();
+        assert_eq!((a.count, a.ttl), (1, 10));
+        let mut bad = r.clone();
+        bad[q.len() + 12 + 1] = b'x';
+        assert!(parse(&q, &bad, b"query.invalid", 1, 1, 0).is_err());
+        let mut cycle = q.clone();
+        cycle[2] = 0x81;
+        cycle[3] = 0x80;
+        cycle[7] = 1;
+        record(&mut cycle, &[0xc0, 12], 5, 30, &[0xc0, 12]);
+        assert!(parse(&q, &cycle, b"query.invalid", 1, 1, 0).is_err());
+    }
+    #[test]
+    fn dns_rrset_parser_pointer_depth_and_edns_options() {
+        let mut bytes = vec![0; 12];
+        bytes.extend_from_slice(b"\x01a\0");
+        let mut target = 12usize;
+        for _ in 0..17 {
+            let at = bytes.len();
+            bytes.extend_from_slice(&(0xc000 | target as u16).to_be_bytes());
+            target = at;
+        }
+        assert!(name(&bytes, &mut target).is_err());
+        let (mut q, mut r) = pair();
+        q[11] = 1;
+        r[11] = 1;
+        let opt = [0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(&opt);
+        r.extend_from_slice(&opt);
+        assert!(parse(&q, &r, b"query.invalid", 1, 9, 1232).is_ok());
+        assert!(parse(&q, &r, b"query.invalid", 1, 9, 512).is_err());
+    }
+}
