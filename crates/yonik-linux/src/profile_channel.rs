@@ -2535,6 +2535,19 @@ pub(crate) struct SnapshotRef {
     pub bytes: u32,
     pub flags: u32,
 }
+impl SnapshotRef {
+    /// Asset metadata не содержит manifest purpose bits.
+    fn validate(self) -> Result<()> {
+        if self.source == [0; 32]
+            || self.asset == [0; 32]
+            || !(170..=2 * 1024 * 1024).contains(&self.bytes)
+            || self.flags & !1 != 0
+        {
+            return Err(Error::Reference);
+        }
+        Ok(())
+    }
+}
 pub(crate) type AssetReference = (u8, [u8; 32], u64, [u8; 32], u32);
 pub(crate) struct ResolverHost {
     pub alias: String,
@@ -2688,6 +2701,7 @@ pub(crate) fn resolver_name(name: &str, rooted: bool, lowercase: bool) -> Result
 }
 /// Zero-allocation readback; source/hash provenance остаётся отдельным proof.
 pub(crate) fn verify_resolver_asset(bytes: &[u8], reference: SnapshotRef) -> Result<()> {
+    reference.validate()?;
     if bytes.len() != reference.bytes as usize
         || bytes.len() > 2 * 1024 * 1024
         || <[u8; 32]>::from(Sha256::digest(bytes)) != reference.asset
@@ -2951,6 +2965,56 @@ impl OwnedCapsule {
         policy_revision: u64,
         admission_id: u64,
     ) -> Result<Self> {
+        Self::build_graph(
+            intent,
+            plan,
+            snapshot,
+            digest,
+            policy_revision,
+            admission_id,
+            None,
+        )
+    }
+    /// System DATA использует graph единственного retained compiler result.
+    pub(crate) fn build_retained(
+        intent: &yonik_engine::native_profile::ProfileIntent,
+        plan: &yonik_engine::native_profile::OwnedRuntimePlan,
+        snapshot: Option<SnapshotRef>,
+        digest: [u8; 32],
+        policy_revision: u64,
+        admission_id: u64,
+        compiled: &yonik_engine::native_profile::CompiledProfileSystem,
+    ) -> Result<Self> {
+        if !plan.is_system() {
+            return Err(Error::Binding);
+        }
+        let mut hash = HashWriter(Sha256::new());
+        compiled
+            .config()
+            .write_sensitive(&mut hash)
+            .map_err(|_| Error::Bounds)?;
+        if <[u8; 32]>::from(hash.0.finalize()) != digest {
+            return Err(Error::Hash);
+        }
+        Self::build_graph(
+            intent,
+            plan,
+            snapshot,
+            digest,
+            policy_revision,
+            admission_id,
+            Some(compiled.graph()),
+        )
+    }
+    fn build_graph(
+        intent: &yonik_engine::native_profile::ProfileIntent,
+        plan: &yonik_engine::native_profile::OwnedRuntimePlan,
+        snapshot: Option<SnapshotRef>,
+        digest: [u8; 32],
+        policy_revision: u64,
+        admission_id: u64,
+        retained_graph: Option<&yonik_engine::native_profile::ValidatedGraph>,
+    ) -> Result<Self> {
         use yonik_engine::native_profile::{OwnedIngress, ProviderIngressProtocol, WireNetwork};
         // До validate/typed graph/container allocation: один aggregate credit.
         let mut memory = crate::helper::memory::config_budget()
@@ -2959,7 +3023,14 @@ impl OwnedCapsule {
         if digest == [0; 32] || policy_revision == 0 || admission_id == 0 {
             return Err(Error::Binding);
         }
-        let graph = intent.validate().map_err(|_| Error::Schema)?;
+        let owned_graph = if retained_graph.is_none() {
+            Some(intent.validate().map_err(|_| Error::Schema)?)
+        } else {
+            None
+        };
+        let graph = retained_graph
+            .or(owned_graph.as_ref())
+            .ok_or(Error::Reference)?;
         intent
             .validate_ingress_mapping(plan)
             .map_err(|_| Error::Reference)?;
@@ -3105,17 +3176,32 @@ impl OwnedCapsule {
             row.extend_from_slice(&destination_bytes(endpoint.host(), endpoint.port(), p)?);
             t.push(4, row)?;
         }
-        if !graph.egress().system_resolvers().is_empty() {
+        if graph.egress().requires_system_snapshot() {
             let reference = snapshot.ok_or(Error::Reference)?;
             let binding = plan.system_resolver_binding().ok_or(Error::Reference)?;
-            if reference.source != *binding.snapshot_digest() {
+            reference.validate()?;
+            if reference.source != *binding.snapshot_digest()
+                || !(1..=3).contains(&binding.servers().len())
+                || binding.servers().iter().any(|peer| peer.port() != 53)
+            {
                 return Err(Error::Reference);
             }
-            for resolver in graph.egress().system_resolvers() {
+            let mut resolver_subjects: Vec<_> = graph
+                .egress()
+                .system_resolvers()
+                .iter()
+                .map(|r| r.subject())
+                .collect();
+            // Bootstrap transport остаётся direct; app provider routing не меняется.
+            if !graph.egress().physical_bootstrap().is_empty() && !resolver_subjects.contains(&None)
+            {
+                resolver_subjects.push(None);
+            }
+            for resolver_subject in resolver_subjects {
                 for peer in binding.servers() {
                     for p in [6, 17] {
                         let mut row = vec![2, p];
-                        row.extend_from_slice(&subject_index(resolver.subject())?.to_be_bytes());
+                        row.extend_from_slice(&subject_index(resolver_subject)?.to_be_bytes());
                         row.extend_from_slice(&reference.source);
                         row.extend_from_slice(&destination_bytes(
                             &peer.ip().to_string(),
@@ -3131,7 +3217,9 @@ impl OwnedCapsule {
             row.extend_from_slice(&reference.asset);
             row.extend_from_slice(&reference.bytes.to_be_bytes());
             row.extend_from_slice(&[0, 1, 0, 0]);
-            row.extend_from_slice(&reference.flags.to_be_bytes());
+            row.extend_from_slice(
+                &(reference.flags | graph.egress().system_resolver_roles()).to_be_bytes(),
+            );
             t.push(10, row)?;
         } else if snapshot.is_some() {
             return Err(Error::Reference);
@@ -3235,7 +3323,7 @@ impl OwnedCapsule {
         put32(&mut bytes, 72, 60000);
         bytes[76] = mode as u8;
         bytes[77] = u8::from(mode.required());
-        put16(&mut bytes, 78, 3);
+        put16(&mut bytes, 78, 4);
         put64(&mut bytes, 80, policy_revision);
         for (i, cap) in MAX_CAPS.iter().enumerate() {
             put32(&mut bytes, 88 + 4 * i, *cap);
@@ -3266,7 +3354,7 @@ impl OwnedCapsule {
         drop(t);
         drop(remotes);
         drop(indices);
-        drop(graph);
+        drop(owned_graph);
         memory
             .resize(bytes.capacity() + std::mem::size_of::<Self>())
             .map_err(|_| Error::Budget)?;
@@ -3514,7 +3602,11 @@ impl<'a> Capsule<'a> {
         let admission_id = r.u64()?;
         let lease_ms = r.u32()?;
         let mode = Mode::try_from(r.u8()?)?;
-        if r.u8()? != u8::from(mode.required()) || r.u16()? != 3 {
+        if r.u8()? != u8::from(mode.required()) {
+            return Err(Error::Schema);
+        }
+        let mapping = r.u16()?;
+        if ![3, 4].contains(&mapping) {
             return Err(Error::Schema);
         }
         let policy_revision = r.u64()?;
@@ -3807,7 +3899,7 @@ impl Capsule<'_> {
             let asset = r.array::<32>()?;
             let bytes = u64::from(r.u32()?);
             r.take(4)?;
-            let flags = r.u32()?;
+            let flags = r.u32()? & 1;
             let index = assets
                 .iter()
                 .position(|a| *a == (3, asset, bytes, source, flags))
@@ -3886,6 +3978,12 @@ impl Capsule<'_> {
                     if a.query.bytes().any(|b| b.is_ascii_uppercase()) {
                         return Err(Error::Schema);
                     }
+                    if self.body[79] == 4
+                        && t[4].row(a.resolver)?[0] == 2
+                        && t[10].row(0)?[75] & 2 == 0
+                    {
+                        return Err(Error::Reference);
+                    }
                     let destination = self.resolver_peer(a.resolver)?;
                     if destination != a.effective {
                         return Err(Error::Reference);
@@ -3920,7 +4018,25 @@ impl Capsule<'_> {
                     if endpoint.family != 3 {
                         return Err(Error::Reference);
                     }
-                    t[4].row(*resolver)?;
+                    let resolver_row = t[4].row(*resolver)?;
+                    if self.body[79] == 4 {
+                        if *subject == NONE || resolver_row[0] != 2 || t[10].row(0)?[75] & 4 == 0 {
+                            return Err(Error::Reference);
+                        }
+                        let mut physical = false;
+                        for protocol in [6, 17] {
+                            let (scope, mask) = self.subject_scope(*subject, protocol)?;
+                            for branch in 0..2 {
+                                if mask & (1 << branch) != 0 {
+                                    let dial = self.dial_scope(scope, branch)?;
+                                    physical |= dial.action == 1 && dial.endpoint_index == *index;
+                                }
+                            }
+                        }
+                        if !physical {
+                            return Err(Error::Reference);
+                        }
+                    }
                     if *subject != NONE {
                         t[0].row(*subject)?;
                     }
@@ -3934,6 +4050,8 @@ impl Capsule<'_> {
     }
     fn validate_auxiliary(&self) -> Result<()> {
         let t = &self.tables;
+        let mapping = u16::from_be_bytes([self.body[78], self.body[79]]);
+        let mut roles = 0;
         let mut snapshot = None;
         let mut asset_bytes = 0u64;
         let mut assets = [([0u8; 32], 0u64, 0u8); 16];
@@ -3951,8 +4069,14 @@ impl Capsule<'_> {
                 return Err(Error::Schema);
             }
             r.zero(2)?;
-            if r.u32()? & !1 != 0 {
-                return Err(Error::Schema);
+            let flags = r.u32()?;
+            if mapping == 3 {
+                if flags & !1 != 0 {
+                    return Err(Error::Schema);
+                }
+            } else {
+                dns_v2::SnapshotRoleView::decode(mapping, t[10].row(0)?)?;
+                roles = flags & 6;
             }
             r.end()?;
             snapshot = Some(source);
@@ -3960,6 +4084,19 @@ impl Capsule<'_> {
             unique = 1;
             asset_bytes = bytes as u64;
         }
+        let mut physical_hostname = false;
+        for row in t[8].rows() {
+            let scope = scope(row)?;
+            for branch in scope.branches {
+                if branch.action == 1 && self.endpoint(branch.endpoint)?.family == 3 {
+                    physical_hostname = true;
+                }
+            }
+        }
+        if mapping == 4 && (roles & 4 != 0) != physical_hostname {
+            return Err(Error::Reference);
+        }
+        let mut direct_system_rows = 0;
         let mut system_rows = 0;
         for row in t[4].rows() {
             let mut r = Reader::new(row);
@@ -3986,12 +4123,22 @@ impl Capsule<'_> {
                     if snapshot != Some(hash) {
                         return Err(Error::Reference);
                     }
+                    if mapping == 4 {
+                        if dest.family == 3 || dest.port != 53 || roles & 2 == 0 && s != NONE {
+                            return Err(Error::Reference);
+                        }
+                        if s == NONE {
+                            direct_system_rows += 1;
+                        }
+                    }
                     system_rows += 1;
                 }
                 _ => return Err(Error::Schema),
             }
         }
-        if snapshot.is_some() != (system_rows > 0) {
+        if snapshot.is_some() != (system_rows > 0)
+            || mapping == 4 && roles & 4 != 0 && direct_system_rows == 0
+        {
             return Err(Error::Reference);
         }
         let mut resource_keys = [(0u8, ""); 16];
@@ -6182,7 +6329,7 @@ mod tests {
             Some(SnapshotRef {
                 source: [8; 32],
                 asset: [9; 32],
-                bytes: 120,
+                bytes: 170,
                 flags: 0,
             }),
             [3; 32],
@@ -6201,7 +6348,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             built.bytes(),
-            unhex(golden["capsule_hex"].as_str().unwrap())
+            upgrade_mapping3_golden(unhex(golden["capsule_hex"].as_str().unwrap()))
         );
         assert_eq!(f["profile"], golden["profile"]);
     }
@@ -6362,6 +6509,420 @@ mod tests {
             vec!["127.0.0.53:53".parse().unwrap()]
         }
     }
+    #[test]
+    fn capsule_mapping4_bootstrap_only_uses_system_snapshot_without_app_dns() {
+        use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent};
+        let mut f = fixture(true);
+        f["profile"]["graph"]
+            .as_object_mut()
+            .unwrap()
+            .remove("inbounds");
+        f["profile"]["graph"]["dns"] = serde_json::json!({"servers":["192.0.2.53"]});
+        f["profile"]["graph"]["outbounds"][1]["settings"]["vnext"][0]["address"] =
+            serde_json::json!("Edge.invalid");
+        let intent = ProfileIntent::decode(&f["profile"].to_string()).unwrap();
+        let plan = OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap())
+            .unwrap()
+            .bind_system_resolver(&FakeResolver)
+            .unwrap();
+        let built = OwnedCapsule::build(
+            &intent,
+            &plan,
+            Some(SnapshotRef {
+                source: [8; 32],
+                asset: [9; 32],
+                bytes: 170,
+                flags: 0,
+            }),
+            [3; 32],
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(&built.bytes()[78..80], &[0, 4]);
+        let capsule = Capsule::decode(built.bytes(), &[3; 32]).unwrap();
+        assert_eq!(capsule.tables[10].count, 1);
+        let row = capsule.tables[10].row(0).unwrap();
+        assert_eq!(u32::from_be_bytes(row[72..76].try_into().unwrap()), 4);
+        capsule
+            .validate_asset_refs(&[(3, [9; 32], 170, [8; 32], 0)])
+            .unwrap();
+        assert!(capsule.validate_asset_refs(&[]).is_err());
+    }
+    struct CapturedResolverFixture(Vec<std::net::SocketAddr>);
+    impl yonik_engine::native_profile::VerifiedSystemResolver for CapturedResolverFixture {
+        fn snapshot_digest(&self) -> [u8; 32] {
+            [8; 32]
+        }
+        fn servers(&self) -> Vec<std::net::SocketAddr> {
+            self.0.clone()
+        }
+    }
+    fn captured_resolver_fixture(
+        peers: &[&str],
+        absent: bool,
+    ) -> (CapturedResolverFixture, SnapshotRef, Vec<u8>) {
+        let peers: Vec<_> = peers.iter().map(|p| p.parse().unwrap()).collect();
+        let data = ResolverData {
+            source: [8; 32],
+            source_flags: u32::from(absent),
+            nss_hash: [1; 32],
+            hosts_hash: Sha256::digest([]).into(),
+            resolv_hash: [2; 32],
+            order: 2,
+            ndots: 1,
+            attempts: 2,
+            timeout_ms: 5000,
+            flags: 16,
+            hostname: "fixture".into(),
+            search: vec![],
+            peers: peers.clone(),
+            hosts: vec![],
+            _memory: crate::helper::memory::config_budget()
+                .reserve(4096)
+                .unwrap(),
+        };
+        let asset = data.encode().unwrap();
+        let reference = SnapshotRef {
+            source: [8; 32],
+            asset: Sha256::digest(&asset).into(),
+            bytes: asset.len() as u32,
+            flags: u32::from(absent),
+        };
+        verify_resolver_asset(&asset, reference).unwrap();
+        (CapturedResolverFixture(peers), reference, asset)
+    }
+    #[test]
+    fn capsule_mapping4_seven_public_roots_preserve_captured_peers_and_roles() {
+        use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent};
+        let fixtures: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-full-profile-native-schema.json"
+        ))
+        .unwrap();
+        let mut seen_roles = [false; 8];
+        for (index, fixture) in fixtures.iter().enumerate() {
+            let report =
+                yonik_import::import_profiles(serde_json::to_vec(fixture).unwrap()).unwrap();
+            let yonik_import::ProfileEntry::Xray(profile) = &report.entries[0] else {
+                panic!("native fixture")
+            };
+            let intent = ProfileIntent::from_profile(profile).unwrap();
+            let graph = intent.validate().unwrap();
+            let roles = graph.egress().system_resolver_roles();
+            seen_roles[roles as usize] = true;
+            // Duplicate effective peers сохраняются; defaultNS — обе семьи.
+            let peers = if index % 2 == 0 {
+                vec!["192.0.2.53:53", "192.0.2.53:53", "198.51.100.53:53"]
+            } else {
+                vec!["127.0.0.1:53", "[::1]:53"]
+            };
+            let (resolver, reference, asset) = captured_resolver_fixture(&peers, index % 2 == 0);
+            let plan = OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap())
+                .unwrap()
+                .bind_system_resolver(&resolver)
+                .unwrap();
+            let mut before = Vec::new();
+            intent.write_sensitive(&mut before).unwrap();
+            let built = OwnedCapsule::build(
+                &intent,
+                &plan,
+                (roles != 0).then_some(reference),
+                [3; 32],
+                1,
+                1,
+            )
+            .unwrap();
+            let capsule = Capsule::decode(built.bytes(), &[3; 32]).unwrap();
+            if roles == 0 {
+                assert_eq!(capsule.tables[10].count, 0);
+                capsule.validate_asset_refs(&[]).unwrap();
+                assert!(
+                    OwnedCapsule::build(&intent, &plan, Some(reference), [3; 32], 1, 1).is_err()
+                );
+                continue;
+            }
+            let row = capsule.tables[10].row(0).unwrap();
+            assert_eq!(row.len(), 76);
+            assert_eq!(capsule.tables[10].count, 1);
+            assert_eq!(
+                u32::from_be_bytes(row[72..76].try_into().unwrap()),
+                roles | reference.flags
+            );
+            capsule
+                .validate_asset_refs(&[(
+                    3,
+                    reference.asset,
+                    reference.bytes as u64,
+                    reference.source,
+                    reference.flags,
+                )])
+                .unwrap();
+            verify_resolver_asset(&asset, reference).unwrap();
+            let system: Vec<_> = capsule.tables[4].rows().filter(|r| r[0] == 2).collect();
+            assert_eq!(system.len(), peers.len() * 2);
+            for (rows, peer) in system.chunks_exact(2).zip(resolver.0.iter()) {
+                for (row, protocol) in rows.iter().zip([6, 17]) {
+                    assert_eq!(&row[4..36], &[8; 32]);
+                    let expected = destination_bytes(&peer.ip().to_string(), 53, protocol).unwrap();
+                    assert_eq!(&row[36..], expected);
+                }
+            }
+            for requirement in graph.egress().physical_bootstrap() {
+                let subject = graph
+                    .subjects()
+                    .iter()
+                    .position(|s| s == requirement.subject())
+                    .unwrap() as u16;
+                let mut found = false;
+                for input in [6, 17] {
+                    let (scope, mask) = capsule.subject_scope(subject, input).unwrap();
+                    for branch in 0..2 {
+                        if mask & (1 << branch) == 0 {
+                            continue;
+                        }
+                        let dial = capsule.dial_scope(scope, branch).unwrap();
+                        if dial.action == 1
+                            && dial.carrier == protocol(requirement.endpoint().protocol())
+                        {
+                            let endpoint = capsule.endpoint(dial.endpoint_index).unwrap();
+                            assert_eq!(endpoint.bytes, requirement.endpoint().host().as_bytes());
+                            assert_eq!(endpoint.port, requirement.endpoint().port());
+                            found = true;
+                        }
+                    }
+                }
+                assert!(found);
+            }
+            let mut after = Vec::new();
+            intent.write_sensitive(&mut after).unwrap();
+            assert_eq!(before, after);
+        }
+        for roles in [0, 2, 6] {
+            assert!(seen_roles[roles]);
+        }
+    }
+    #[test]
+    fn capsule_mapping4_rejects_role_asset_source_and_legacy_downgrade_mutations() {
+        use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent};
+        let mut f = fixture(true);
+        f["profile"]["graph"]
+            .as_object_mut()
+            .unwrap()
+            .remove("inbounds");
+        f["profile"]["graph"]["dns"] = serde_json::json!({"servers":["192.0.2.53"]});
+        f["profile"]["graph"]["outbounds"][0]["settings"]["servers"][0]["address"] =
+            serde_json::json!("remote.invalid");
+        f["profile"]["graph"]["outbounds"][1]["settings"]["vnext"][0]["address"] =
+            serde_json::json!("leaf.invalid");
+        let intent = ProfileIntent::decode(&f["profile"].to_string()).unwrap();
+        let (resolver, reference, asset) = captured_resolver_fixture(&["192.0.2.53:53"], true);
+        let plan = OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap())
+            .unwrap()
+            .bind_system_resolver(&resolver)
+            .unwrap();
+        let build = |reference| OwnedCapsule::build(&intent, &plan, reference, [3; 32], 1, 1);
+        assert!(build(None).is_err());
+        for bad in [
+            SnapshotRef {
+                source: [7; 32],
+                ..reference
+            },
+            SnapshotRef {
+                asset: [0; 32],
+                ..reference
+            },
+            SnapshotRef {
+                flags: 5,
+                ..reference
+            },
+        ] {
+            assert!(build(Some(bad)).is_err());
+        }
+        let built = build(Some(reference)).unwrap();
+        let bytes = built.bytes();
+        let capsule = Capsule::decode(bytes, &[3; 32]).unwrap();
+        let refs = [(
+            3,
+            reference.asset,
+            reference.bytes as u64,
+            reference.source,
+            1,
+        )];
+        capsule.validate_asset_refs(&refs).unwrap();
+        assert!(
+            capsule
+                .validate_asset_refs(&[(
+                    3,
+                    reference.asset,
+                    reference.bytes as u64,
+                    reference.source,
+                    5
+                )])
+                .is_err()
+        );
+        assert!(
+            capsule
+                .validate_asset_refs(&[(3, [7; 32], reference.bytes as u64, reference.source, 1)])
+                .is_err()
+        );
+        assert!(capsule.validate_asset_refs(&[]).is_err());
+        let mut bad_asset = asset.clone();
+        bad_asset[32] ^= 1;
+        assert!(verify_resolver_asset(&bad_asset, reference).is_err());
+        let snapshot = table_start(bytes, 11) + 12;
+        for flags in [0, 1, 2, 3, 8, 9] {
+            let mut bad = bytes.to_vec();
+            put32(&mut bad, snapshot + 72, flags);
+            rehash(&mut bad);
+            assert!(Capsule::decode(&bad, &[3; 32]).is_err());
+        }
+        let mut legacy = bytes.to_vec();
+        put16(&mut legacy, 78, 3);
+        rehash(&mut legacy);
+        assert!(Capsule::decode(&legacy, &[3; 32]).is_err());
+        for flags in [2, 4, 6] {
+            put32(&mut legacy, snapshot + 72, flags);
+            rehash(&mut legacy);
+            assert!(Capsule::decode(&legacy, &[3; 32]).is_err());
+        }
+
+        let mut bad = bytes.to_vec();
+        bad[snapshot] ^= 1;
+        rehash(&mut bad);
+        assert!(Capsule::decode(&bad, &[3; 32]).is_err());
+        let mut bad = bytes.to_vec();
+        let table = table_start(bytes, 11);
+        put16(&mut bad, table + 2, 2);
+        rehash(&mut bad);
+        assert!(Capsule::decode(&bad, &[3; 32]).is_err());
+        let mut bad = bytes.to_vec();
+        let scope = table_start(bytes, 9) + 12;
+        put16(&mut bad, scope + 8, 65534);
+        rehash(&mut bad);
+        assert!(Capsule::decode(&bad, &[3; 32]).is_err());
+        let system = capsule.tables[4].rows().position(|r| r[0] == 2).unwrap() as u16;
+        let remote = capsule.tables[1]
+            .rows()
+            .position(|r| {
+                Destination::read(&mut Reader::new(r)).unwrap().bytes == b"remote.invalid"
+            })
+            .unwrap() as u16;
+        let leaf = capsule.tables[1]
+            .rows()
+            .position(|r| Destination::read(&mut Reader::new(r)).unwrap().bytes == b"leaf.invalid")
+            .unwrap() as u16;
+        assert!(
+            capsule
+                .validate_request(&Message::Probe {
+                    purpose: 2,
+                    index: remote,
+                    subject: 0,
+                    resolver: system
+                })
+                .is_err()
+        );
+        assert!(
+            capsule
+                .validate_request(&Message::Probe {
+                    purpose: 2,
+                    index: leaf,
+                    subject: 1,
+                    resolver: system
+                })
+                .is_ok()
+        );
+        assert!(
+            capsule
+                .validate_request(&Message::Probe {
+                    purpose: 2,
+                    index: leaf,
+                    subject: NONE,
+                    resolver: system
+                })
+                .is_err()
+        );
+        assert!(
+            capsule
+                .validate_request(&Message::Probe {
+                    purpose: 2,
+                    index: leaf,
+                    subject: 1,
+                    resolver: 0
+                })
+                .is_err()
+        );
+        let application = |resolver| {
+            let peer = capsule.resolver_peer(resolver).unwrap();
+            Message::Authorize(Authorize {
+                source_flow: 1,
+                class: 3,
+                subject: NONE,
+                chain: NONE,
+                transport: NONE,
+                scope: NONE,
+                branch: 0,
+                original: peer,
+                effective: peer,
+                resolver,
+                query: "example.test",
+                receipt: Receipt {
+                    kind: ReceiptKind::None,
+                    id: 0,
+                },
+            })
+        };
+        assert!(capsule.validate_request(&application(system)).is_err());
+        assert!(capsule.validate_request(&application(0)).is_ok());
+        let too_many = CapturedResolverFixture(vec!["192.0.2.53:53".parse().unwrap(); 4]);
+        let plan = OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap())
+            .unwrap()
+            .bind_system_resolver(&too_many)
+            .unwrap();
+        assert!(OwnedCapsule::build(&intent, &plan, Some(reference), [3; 32], 1, 1).is_err());
+    }
+    #[test]
+    fn capsule_mapping4_retains_full_eight_step_physical_frontier_for_both_carriers() {
+        use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent};
+        let outbounds:Vec<_>=(0..8).map(|index| {
+            let mut row=serde_json::json!({"tag":format!("p{index}"),"protocol":"shadowsocks","settings":{"servers":[{"address":format!("p{index}.invalid"),"port":8443,"method":"aes-128-gcm","password":"fixture"}]}});
+            if index<7 {row["proxySettings"]=serde_json::json!({"tag":format!("p{}",index+1),"transportLayer":true});}
+            row
+        }).collect();
+        let wire = serde_json::json!({"version":1,"graph":{"outbounds":outbounds,"dns":{"servers":["192.0.2.53"]}}});
+        let intent = ProfileIntent::decode(&wire.to_string()).unwrap();
+        let (resolver, reference, _asset) = captured_resolver_fixture(&["192.0.2.53:53"], false);
+        let plan = OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap())
+            .unwrap()
+            .bind_system_resolver(&resolver)
+            .unwrap();
+        let built = OwnedCapsule::build(&intent, &plan, Some(reference), [3; 32], 1, 1).unwrap();
+        let capsule = Capsule::decode(built.bytes(), &[3; 32]).unwrap();
+        for carrier in [6, 17] {
+            let (mut scope, _) = capsule.subject_scope(0, carrier).unwrap();
+            for expected_subject in 0..8 {
+                let dial = capsule.dial_scope(scope, 0).unwrap();
+                assert_eq!(dial.subject, expected_subject);
+                assert_eq!(dial.carrier, carrier);
+                if expected_subject < 7 {
+                    assert_eq!(dial.action, 2);
+                    let (next, mask) = dial.next.unwrap();
+                    assert_eq!(mask, 1);
+                    scope = next;
+                } else {
+                    assert_eq!(dial.action, 1);
+                    assert!(dial.next.is_none());
+                    assert_eq!(dial.endpoint.unwrap().bytes, b"p7.invalid");
+                    assert_eq!(
+                        capsule
+                            .bootstrap_query(dial.endpoint_index, 7, 1)
+                            .unwrap()
+                            .bytes,
+                        b"p7.invalid"
+                    );
+                }
+            }
+        }
+    }
     fn golden_build(system: bool) -> OwnedCapsule {
         use yonik_engine::native_profile::{OwnedIngress, OwnedRuntimePlan, ProfileIntent};
         let f = fixture(system);
@@ -6401,7 +6962,7 @@ mod tests {
             system.then_some(SnapshotRef {
                 source: [8; 32],
                 asset: [9; 32],
-                bytes: 120,
+                bytes: 170,
                 flags: 0,
             }),
             [3; 32],
@@ -6416,7 +6977,9 @@ mod tests {
             let f = fixture(system);
             let built = golden_build(system);
             let expected = unhex(f["capsule_hex"].as_str().unwrap());
-            assert_eq!(built.bytes(), expected);
+            assert_eq!(built.bytes(), upgrade_mapping3_golden(expected.clone()));
+            // Exact legacy mapping3 corpus остаётся читаемым без role bits.
+            assert_eq!(&expected[78..80], &[0, 3]);
             let capsule = Capsule::decode(&expected, &[3; 32]).unwrap();
             assert_eq!(capsule.body, expected);
             assert_eq!(capsule.admission_id, 1);
@@ -6442,6 +7005,17 @@ mod tests {
             );
             assert!(Frame::decode(&full, binding(), mode, false).is_err());
         }
+    }
+    fn upgrade_mapping3_golden(mut bytes: Vec<u8>) -> Vec<u8> {
+        put16(&mut bytes, 78, 4);
+        let table = table_start(&bytes, 11);
+        if u16::from_be_bytes([bytes[table + 2], bytes[table + 3]]) == 1 {
+            let row = table + 12;
+            put32(&mut bytes, row + 64, 170);
+            put32(&mut bytes, row + 72, 2);
+        }
+        rehash(&mut bytes);
+        bytes
     }
     fn rehash(bytes: &mut [u8]) {
         let mut hash = Sha256::new();

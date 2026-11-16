@@ -771,6 +771,18 @@ fn sealed_runtime_retains_exact_bytes_and_rejects_forged_binding() {
     let compiled = compile_profile_system(&from_value(&value), &plan).unwrap();
     let mut before = Vec::new();
     compiled.config().write_sensitive(&mut before).unwrap();
+    assert!(
+        crate::profile_channel::OwnedCapsule::build_retained(
+            request.intent(),
+            &plan,
+            None,
+            [0; 32],
+            1,
+            1,
+            &compiled
+        )
+        .is_err()
+    );
     let retained = RetainedSystemProfile::seal(compiled, 7, [3; 32]).unwrap();
     let digest: [u8; 32] = Sha256::digest(&before).into();
     assert_eq!(retained.digest(), &digest);
