@@ -616,7 +616,7 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   effects и actual run_issuer regression seq3→queued4→cancel5(id4). Exact-head
   RED подтвердил Allow после cancel; GREEN11 driver tests последовательно PASS.
   Параллельный suite столкнулся с shared global memory Budget, пределы не менялись.
-  CODEC2/wire неизменны; correction требует узкого SOURCE recheck. PROBE/flow0,
+  CODEC2/wire неизменны; e59af5d прошёл узкий SOURCE recheck R37P2 CLOSED. PROBE/flow0,
   search expansion, transport vertical и resolver service-policy всё ещё закрыты.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
