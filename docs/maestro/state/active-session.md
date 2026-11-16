@@ -644,6 +644,16 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   проверялась исполнением. Следующий шаг — exact producer retirement contract
   по обоим pinned callers без synthetic success или ослабления custody.
 
+- R42 SOURCE scoped CLEAN: CODEC3e372dce и protected DNS release1ed52b1
+  интегрированы. Descriptor schema3 без fallback1/2, corpus SHA256
+  1e597fdc11441209455c5c5ceafe85b4fbcd6a6756dfdae77ea0882149e83e88.
+  Protected record→image/launch→typed release anchor и Proof/Resource consuming
+  retirement реализованы; Unknown удерживает custody, route tickets отдельны.
+  Actual Go factory/Conn ownership review ещё нужен: DNS_REVIEWED_PATCH=None,
+  builder/install authority не расширена. User DirectSocket Publish/Waiter/Numeric
+  issuer — следующий cut, остальные proxy/service/loopback/bootstrap формы ещё
+  Unsupported. OS/runtime не исполнялись, все public gates false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
