@@ -541,6 +541,16 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   cargo clean удалил2.3GiB. Public gates остаются false, native Connect/P6,
   remaining DNS/domain/compaction и runtime acceptance не завершены.
 
+- P6 desktop author продолжает native Connect wiring. Root6491558 добавляет
+  FullProfileMode/full_profile_preflight через существующий закрытый consumer
+  gate и TrustedRegistry::full_profile_snapshot с обязательным producer contract
+  до чтения ELF. Два exact pure tests, linux all-targets clippy/fmt PASS;
+  evidence p6-root-preflight привязан к source/ELF до исполнения, cargo clean
+  удалил2.2GiB. Preflight не выдаёт authority и не заменяет launch checks.
+  DNS next-cut artifact p4-dns-nextcut-f36 определяет classic UDP/TCP DNS→RRset
+  →per-waiter authority→numeric leaf; retained DNS transport proof ещё требует
+  конкретного source contract. Новые DNS-файлы из записки не разрешались к записи.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
