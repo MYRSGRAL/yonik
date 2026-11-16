@@ -496,6 +496,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   порядок восстановления, отказ при stale coordinates и отсутствие native
   promotion подтверждены; generation/owner guards и startup_revalidate сохранены.
   Native Connect/P6/runtime не PASS; установленный e14 не обновлён.
+- Go UDP producer0ea9495 от basebbaa989 завершил SOURCE/PURE milestone:
+  provenance3 OPEN/Match, private grant, guarded downstream/response и UCR.
+  Автор55 broker+4 SOCKS+11 mux pure, Python28+28/fresh pins/gofmt/Ruff PASS;
+  main compile-only, сборка очищена. Пока не интегрирован до R25a authority review.
+  R25b counterpart/lifecycle/accounting SOURCE scoped CLEAN: transfer/retirement,
+  cancel ACK, credits и joins согласованы с Rust pinned producer contract.
+  Это не независимый runtime proof child closure. Readiness gates остаются false,
+  DNS/provider/domain/compaction gaps не закрыты; полного P4/P5 PASS нет.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
