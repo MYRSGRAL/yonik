@@ -126,6 +126,15 @@ system rows запрещены. Отдельного resolverSnapshotHash в ADM
 ADMIT_ACK с Allow по exact manifestHash/admissionId означает, что consumer
 проверил и принял все referenced assets, включая sourceDigest и assetHash
 таблицы11; дополнительных неописанных полей в ACK не появляется.
+
+Предлагаемый DNS_V2 использует mappingVersion4 с тем же tableCount11/row76.
+PhysicalFirstHopBootstrap также является System resolver requirement даже при
+отсутствии localhost в provider DNS app. Table11.sourceFlags: bit0 hosts-absent,
+bit1 ApplicationSystemDNS, bit2 PhysicalFirstHopBootstrap; прочие0. Эти purpose
+bits аутентифицируются manifestHash, System rows table5 сохраняют exact sourceDigest.
+Mapping3 новые bits отвергает; DNS_V2 downgrade в mapping3 запрещён. Bootstrap
+не заменяет app DNS и разрешает только checked physical frontier согласно
+dns-completion-scope.md. Это проект расширения, не разрешение runtime admission.
 Provider resolvers остаются отдельными table5 rows и не заменяются этим asset.
 
 Snapshot asset вместе с DAT входит в existing private asset storage budget:
