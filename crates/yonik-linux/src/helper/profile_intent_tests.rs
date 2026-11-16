@@ -30,6 +30,63 @@ fn failed_source_identity_check_is_sticky_and_never_recaptures_as_fresh() {
 }
 
 #[test]
+fn netgo_snapshot_pinned_nss_vectors_preserve_cgo0_lookup_order() {
+    let corpus: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/xray-profile-channel-v3/resolver-netgo-1.27.1.json"
+    ))
+    .unwrap();
+    for vector in corpus["nss"].as_array().unwrap() {
+        let input = vector["input"].as_str().unwrap();
+        let data = resolver_snapshot_data(input.as_bytes(), b"", None, b"host")
+            .unwrap_or_else(|e| panic!("NSS {input:?}: {e:?}"));
+        assert_eq!(
+            u64::from(data.order),
+            vector["order"].as_u64().unwrap(),
+            "{input:?}"
+        );
+        data.encode().unwrap();
+    }
+    for input in corpus["rejectedNss"].as_array().unwrap() {
+        assert!(
+            resolver_snapshot_data(input.as_str().unwrap().as_bytes(), b"", None, b"host").is_err(),
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn netgo_snapshot_pinned_resolv_vectors_preserve_effective_search_and_options() {
+    let corpus: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/xray-profile-channel-v3/resolver-netgo-1.27.1.json"
+    ))
+    .unwrap();
+    for vector in corpus["resolv"].as_array().unwrap() {
+        let input = vector["input"].as_str().unwrap();
+        let data = resolver_snapshot_data(
+            b"hosts: files dns\n",
+            input.as_bytes(),
+            None,
+            b"host.example.invalid",
+        )
+        .unwrap_or_else(|e| panic!("resolv {input:?}: {e:?}"));
+        assert_eq!(
+            serde_json::to_value(&data.search).unwrap(),
+            vector["search"],
+            "{input:?}"
+        );
+        for (actual, key) in [
+            (u64::from(data.ndots), "ndots"),
+            (u64::from(data.attempts), "attempts"),
+            (u64::from(data.timeout_ms), "timeoutMs"),
+            (u64::from(data.flags), "flags"),
+        ] {
+            assert_eq!(actual, vector[key].as_u64().unwrap(), "{input:?} {key}");
+        }
+        data.encode().unwrap();
+    }
+}
+
+#[test]
 fn netgo_snapshot_matches_independent_binary_golden_and_checks_hash_before_layout() {
     let vector: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../tests/fixtures/xray-profile-channel-v3/resolver-snapshot-v1.json"
@@ -185,7 +242,6 @@ fn netgo_snapshot_rejects_unrepresentable_semantics_before_materialization() {
             order
         );
     }
-    assert!(resolver_snapshot_data(b"hosts: files\nhosts: dns\n", b"", None, b"host").is_err());
     assert!(resolver_snapshot_data(b"hosts: files [oops]\n", b"", None, b"host").is_err());
     assert!(resolver_snapshot_data(b"", b"", None, b"host\n").is_err());
     assert!(resolver_snapshot_data(b"", b"", Some(&vec![0; 1024 * 1024 + 1]), b"host").is_err());
@@ -298,45 +354,147 @@ fn synthetic_dat_checks_category_kind_hash_count_and_nested_records() {
 }
 
 #[test]
-fn resolver_sources_are_exact_and_no_live_fallback_grammar_is_accepted() {
+fn netgo_snapshot_source_epoch_is_exact_and_defaults_are_captured_data() {
     let bytes = b"nameserver 192.0.2.53\nnameserver 2001:db8::53\n";
-    let (servers, digest) = resolver_content(bytes, b"hosts: dns\n").unwrap();
-    assert_eq!(servers.len(), 2);
+    let original = resolver_snapshot_data(b"hosts: dns\n", bytes, None, b"host").unwrap();
+    assert_eq!(original.peers.len(), 2);
     assert_eq!(
-        resolver_content(bytes, b"hosts \t: dns\n").unwrap().0,
-        servers
-    );
-    assert_ne!(
-        resolver_content(bytes, b"# changed\nhosts: dns\n")
+        resolver_snapshot_data(b"hosts \t: dns\n", bytes, None, b"host")
             .unwrap()
-            .1,
-        digest
+            .peers,
+        original.peers
     );
-    assert_ne!(
-        resolver_content(b"nameserver 192.0.2.54\n", b"hosts: dns\n")
-            .unwrap()
-            .1,
-        digest
-    );
-    for nss in [
-        "hosts: files dns",
-        "hosts: resolve dns",
-        "hosts: dns [NOTFOUND=return]",
-        "hosts: dns\nhosts: dns",
-        "hosts : files\nhosts: dns\n",
-        "hosts\t: resolve dns\nhosts: dns\n",
-        "hosts: mdns",
+    for (nss, resolv, hosts, hostname) in [
+        (
+            b"# changed\nhosts: dns\n".as_slice(),
+            bytes.as_slice(),
+            None,
+            b"host".as_slice(),
+        ),
+        (b"hosts: dns\n", b"nameserver 192.0.2.54\n", None, b"host"),
+        (b"hosts: dns\n", bytes, Some(b"".as_slice()), b"host"),
+        (b"hosts: dns\n", bytes, None, b"other"),
     ] {
-        assert!(resolver_content(bytes, nss.as_bytes()).is_err());
+        assert_ne!(
+            resolver_snapshot_data(nss, resolv, hosts, hostname)
+                .unwrap()
+                .source,
+            original.source
+        );
     }
-    for resolv in [
-        "",
-        "nameserver 0.0.0.0",
-        "search example.invalid\nnameserver 192.0.2.53",
-        "options rotate\nnameserver 192.0.2.53",
-        "nameserver 192.0.2.53 extra",
+    let peers = resolver_snapshot_data(b"hosts: files dns", b"nameserver invalid\nnameserver 192.0.2.53 extra\nnameserver ::1\nnameserver 192.0.2.53\nnameserver fe80::1%lo\n", None, b"host").unwrap();
+    assert_eq!(
+        peers.peers,
+        [
+            "192.0.2.53:53".parse().unwrap(),
+            "[::1]:53".parse().unwrap(),
+            "192.0.2.53:53".parse().unwrap()
+        ]
+    );
+    for input in [
+        b"nameserver 0.0.0.0".as_slice(),
+        b"nameserver ff02::1",
+        b"nameserver ::ffff:192.0.2.53",
+        b"options +garbage",
+        b"options ndots:2junk",
+        b"options ndots:+3",
+        b"search a..b",
     ] {
-        assert!(resolver_content(resolv.as_bytes(), b"hosts: dns").is_err());
+        assert!(resolver_snapshot_data(b"hosts: files dns", input, None, b"host").is_err());
+    }
+}
+
+#[test]
+fn netgo_snapshot_hosts_preserve_alias_keys_ip_order_and_skip_no_alias_lines() {
+    let hosts = b"127.0.0.2 Canonical.INVALID Alias\n::1 ALIAS canonical.invalid.\n127.0.0.3 Alias ALIAS # duplicates\n0.0.0.0 Blocked.INVALID\n224.0.0.1 Multicast\nnot-an-ip ignored\nfe80::1%lo\n::ffff:192.0.2.1\n";
+    let data = resolver_snapshot_data(b"hosts: files dns", b"", Some(hosts), b"host").unwrap();
+    assert_eq!(
+        data.hosts
+            .iter()
+            .map(|row| row.alias.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "canonical.invalid.",
+            "alias",
+            "blocked.invalid.",
+            "multicast"
+        ]
+    );
+    assert_eq!(
+        data.hosts[0].addresses,
+        [
+            "127.0.0.2".parse::<IpAddr>().unwrap(),
+            "::1".parse().unwrap()
+        ]
+    );
+    assert_eq!(
+        data.hosts[1].addresses,
+        [
+            "127.0.0.2".parse::<IpAddr>().unwrap(),
+            "::1".parse().unwrap(),
+            "127.0.0.3".parse().unwrap(),
+            "127.0.0.3".parse().unwrap()
+        ]
+    );
+    assert!(data.hosts[2].addresses[0].is_unspecified());
+    assert!(data.hosts[3].addresses[0].is_multicast());
+    data.encode().unwrap();
+    for input in [
+        b"fe80::1%lo alias".as_slice(),
+        b"::ffff:192.0.2.1 alias",
+        b"192.0.2.1 bad..alias",
+        b"192.0.2.1 -bad",
+    ] {
+        assert!(resolver_snapshot_data(b"", b"", Some(input), b"host").is_err());
+    }
+}
+
+#[test]
+fn netgo_snapshot_parser_caps_precede_unrepresentable_materialization() {
+    // Go file.readLine имеет fixed 64KiB buffer. Не интерпретировать строку,
+    // на которой pinned reader остановился бы до последующих sources.
+    for (nss, resolv, hosts) in [
+        (vec![b' '; 65536], vec![], vec![]),
+        (vec![], vec![b' '; 65536], vec![]),
+        (vec![], vec![], vec![b' '; 65536]),
+    ] {
+        assert!(resolver_snapshot_data(&nss, &resolv, Some(&hosts), b"host").is_err());
+    }
+    let mut bounded_comment = vec![b'#'; 65535];
+    bounded_comment.push(b'\n');
+    assert!(
+        resolver_snapshot_data(
+            &bounded_comment,
+            &bounded_comment,
+            Some(&bounded_comment),
+            b"host"
+        )
+        .is_ok()
+    );
+    let nss = format!("hosts: {}", "files ".repeat(64));
+    assert_eq!(
+        resolver_snapshot_data(nss.as_bytes(), b"", None, b"host")
+            .unwrap()
+            .order,
+        1
+    );
+    assert!(resolver_snapshot_data(format!("{nss} dns").as_bytes(), b"", None, b"host").is_err());
+    use std::fmt::Write;
+    let mut aliases = String::new();
+    for i in 0..4097 {
+        writeln!(aliases, "192.0.2.1 host{i}").unwrap();
+    }
+    let last_row = aliases.rfind("192.0.2.1").unwrap();
+    assert_eq!(
+        resolver_snapshot_data(b"", b"", Some(&aliases.as_bytes()[..last_row]), b"host")
+            .unwrap()
+            .hosts
+            .len(),
+        4096
+    );
+    assert!(resolver_snapshot_data(b"", b"", Some(aliases.as_bytes()), b"host").is_err());
+    for source in [vec![b' '; 65537], vec![0xff], b"hosts: files\0dns".to_vec()] {
+        assert!(resolver_snapshot_data(&source, b"", None, b"host").is_err());
     }
 }
 

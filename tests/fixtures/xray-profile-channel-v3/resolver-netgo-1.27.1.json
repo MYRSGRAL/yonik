@@ -1,0 +1,51 @@
+{
+  "sourceTag": "go1.27.1",
+  "sourceBasis": {
+    "net/conf.go": "c2ce5b531decce68f10df916bc353a74c564a388156cb4f2d2ed2b6800571f5a",
+    "net/nss.go": "b93ae402e153706ab688ac75cffc19aa8a097b964d937725d24ef9f7fac791a5",
+    "net/hosts.go": "265d5f3d71175407a3cc49c731d43ded8e90fdb2a67106d3d4ecb0e86955c3eb",
+    "net/dnsconfig_unix.go": "a707636ba4d5c9fab72cf500a0bc9d617385fee6fa21d6a85bf5ef41fb250748"
+  },
+  "nss": [
+    {"input": "hosts: files dns\n", "order": 3},
+    {"input": "hosts: dns files\n", "order": 4},
+    {"input": "hosts: files\n", "order": 1},
+    {"input": "hosts: dns\n", "order": 2},
+    {"input": "# comment\npasswd: files\n", "order": 3},
+    {"input": "hosts: files\nhosts: dns\n", "order": 3},
+    {"input": "hosts: dns\nhosts: files\nhosts:\n", "order": 4},
+    {"input": "hosts: files [] dns # comment\n", "order": 3},
+    {"input": "hosts: files [SUCCESS=continue !UNAVAIL=return] dns\n", "order": 3},
+    {"input": "hosts: dns [notfound=return] files\n", "order": 4},
+    {"input": "hosts: resolve files\n", "order": 4},
+    {"input": "hosts: files resolve\n", "order": 3},
+    {"input": "hosts: mymachines files dns\n", "order": 3},
+    {"input": "hosts: dns mymachines files\n", "order": 4},
+    {"input": "hosts: files mdns4_minimal [NOTFOUND=return] dns mdns4\n", "order": 3},
+    {"input": "hosts: files myhostname\n", "order": 3},
+    {"input": "hosts: files\tdns\n", "order": 2},
+    {"input": "hosts: files\tdns files\n", "order": 4},
+    {"input": "hosts:\t files \t dns\r\n", "order": 3},
+    {"input": "hosts: FILES dns\n", "order": 2}
+  ],
+  "rejectedNss": [
+    "hosts files dns\n",
+    "hosts: files [oops]\n",
+    "hosts: files [SUCCESS=return\n",
+    "hosts: files [SUCCESS=merge]\n",
+    "hosts: files [UNKNOWN=return]\n",
+    "hosts: files[SUCCESS=return] dns\n",
+    "passwd: files [oops]\nhosts: dns\n",
+    "hosts: files [SUCCESS=return] [NOTFOUND=return] dns\n"
+  ],
+  "resolv": [
+    {"input": "domain Example.INVALID extra\n", "search": ["Example.INVALID."], "ndots": 1, "attempts": 2, "timeoutMs": 5000, "flags": 16},
+    {"input": "search old.invalid\ndomain new.invalid\nsearch A.INVALID . B.invalid\n", "search": ["A.INVALID.", "B.invalid."], "ndots": 1, "attempts": 2, "timeoutMs": 5000, "flags": 16},
+    {"input": "domain .\n", "search": ["."], "ndots": 1, "attempts": 2, "timeoutMs": 5000, "flags": 16},
+    {"input": "domain ignored.invalid\nsearch\n", "search": ["example.invalid."], "ndots": 1, "attempts": 2, "timeoutMs": 5000, "flags": 16},
+    {"input": "options ndots:99 attempts:0 timeout:0 rotate single-request tcp trust-ad edns0 no-reload\n", "search": ["example.invalid."], "ndots": 15, "attempts": 1, "timeoutMs": 1000, "flags": 31},
+    {"input": "options ndots:-2 timeout:-3 attempts:-4\n", "search": ["example.invalid."], "ndots": 0, "attempts": 1, "timeoutMs": 1000, "flags": 16},
+    {"input": "options ndots:9999999999999999999999999999999999\n", "search": ["example.invalid."], "ndots": 15, "attempts": 2, "timeoutMs": 5000, "flags": 16},
+    {"input": "options usevc\noptions single-request-reopen\n", "search": ["example.invalid."], "ndots": 1, "attempts": 2, "timeoutMs": 5000, "flags": 22}
+  ]
+}

@@ -129,6 +129,56 @@ sourceDigest v2 различаются. `profile_channel::verify_resolver_asset(
 сначала проверяет exact size/hash, затем zero-allocation bounded readback.
 Independent vector `resolver-snapshot-v1.json` предназначен для Go parity.
 
+Уточнение SOURCE/PURE после root1cc67ed: parser сверён с exact tag
+[`go1.27.1`](https://github.com/golang/go/tree/go1.27.1/src/net), прежде всего
+`conf.go::lookupOrder`, `nss.go::parseNSSConf`, `hosts.go::readHosts`,
+`dnsconfig_unix.go::dnsReadConfig`, `parse.go::{dtoi,file.readLine}` и их тестами.
+SHA256 четырёх основных source files закреплены в независимом корпусе
+`tests/fixtures/xray-profile-channel-v3/resolver-netgo-1.27.1.json`;
+retained upstream sources/tests/VERSION и полный identity manifest находятся
+в evidence `p5-netgo-1cc67ed/source-basis`. Проверенные файлы совпали побайтно
+с локальным Go1.27.2, но именно Go1.27.1 является source basis.
+
+Поддержанный subset — Linux CGO0/netgo с закрытым env-policy1:
+Files/Dns/FilesDns/DnsFiles; повторные `hosts:` дописываются в source order,
+source names case-sensitive. NSS разделяет tokens по literal space: внутренний
+TAB не превращает `files\tdns` в два sources. Known SUCCESS/NOTFOUND/UNAVAIL/
+TRYAGAIN criteria, `!`, return/continue и пустой `[]` разбираются; при CGO0
+actions не меняют order. Unknown identifier source не запускает plugin: по
+`lookupOrder` он становится DNS только без explicit `dns`; при explicit DNS
+он пропускается. Это относится также к resolve/myhostname/mdns, без чтения
+mdns.allow, NSS modules или libc. Malformed grammar любого database отвергается;
+unknown criteria/actions, source punctuation вне identifier/TAB subset и
+приклеенный `[criterion]` остаются typed Resolver error/Unsupported.
+
+Resolv сохраняет search/domain replacement, case/root dot, default search от
+captured hostname, first3 valid peers с duplicates/defaultNS, rotate,
+single-request(-reopen), use-vc/usevc/tcp, trust-ad и EDNS default.
+`no-reload` совместим с immutable snapshot: active revalidation при изменении
+source отзывает context, а не перечитывает resolver live. Numeric decimal
+options сохраняют Go saturation/clamping (ndots<=15, zero/negative attempts и
+timeout ->1); повреждённые numeric suffix/plus, unknown options/directives,
+attempts>5, timeout>30s, search>6, выбранный zone/mapped/non-unicast peer и
+непредставимые ASCII labels дают отказ, без замены следующим peer.
+Строка raw source длиной>=64KiB отвергается до parse reservation: pinned
+`file.readLine` иначе прекратил бы чтение из fixed64KiB buffer. Mandatory source
+open/stat errors остаются Unsupported; defaults допустимы только из captured
+successfully read config, не как fallback на ошибку capture.
+
+Hosts IP lookup сохраняет first-seen lowercase `absDomainName` alias keys,
+coalescing и ordered IP duplicates, включая unspecified/multicast data;
+строка без alias пропускается до parseLiteralIP. Valid zone/mapped IPv6 с alias
+и labels вне frozen asset grammar отвергаются. Wire хранит alias keys и IP,
+не отдельную canonicalName первого имени строки или reverse/PTR mapping:
+эти операции не получают authority из snapshot alias rows и не объявлены
+поддержанными. Limits4096 aliases/16 addresses проверяются до добавления;
+legacy test-only `hosts:dns`/nameserver-only parser удалён, тесты вызывают
+тот же `resolver_snapshot_data`, что и production capture.
+YNKDNS01 bytes/limits, sourceDigest v2/env-policy1, retained source FD/identity,
+bounded root-owned resolv links<=4 и sticky stale не менялись. Старый binary
+golden сохраняется. Это parser/capture SOURCE/PURE milestone; DNS transport,
+stub/bootstrap, libc/NSS compatibility и full P5/runtime readiness не закрыты.
+
 `FullProfileRequest::prepare_system(plan,policy_revision,admission_id,cancel)`
 связывает same intent → source capture → resource/resolver bindings → один
 CompiledProfileSystem → RetainedSystemProfile digest → capsule. Возвращённый
