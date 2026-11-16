@@ -1,9 +1,11 @@
-# Завершение DNS: предложение до implementation scope approval
+# Завершение DNS: разрешённый implementation scope
 
 Цель — сохранить DNS и physical hostname semantics семи профилей, включая
 provider DNS через proxy. Direct-only lane не считается выполнением этой цели.
 Никакой публичный resolver, подмена provider DNS или child-supplied IP не нужны.
-Это проект; runtime readiness и новые исходники этим документом не разрешаются.
+Пользователь разрешил реализацию перечисленных исходников и pure-проверки после
+R31 SOURCE recheck. Runtime readiness, сеть, запуск ядра/служб и установка
+этим разрешением не предоставляются.
 
 ## Bootstrap, разрывающий cold-start цикл
 
@@ -179,7 +181,7 @@ Rust: существующие profile_channel/issuer/profile_intent и tests; �
 `attribution/broker/kernel.rs` только для общего bounded listener parser/dump,
 новый private `helper/resolver_stub.rs` с module declaration; engine native
 graph/validate/intent для bootstrap-only requirement и соответствующие tests.
-Запись новых upstream/helper/kernel исходников требует отдельного разрешения.
+Пользователь отдельно разрешил эти upstream/helper/kernel исходники и tests.
 
 Сначала SOURCE review контракта, затем согласованный bounded wire/codec и goldens,
 Direct/Proxy/StubBind producers, per-waiter cache receipts и numeric leaf handoff.
