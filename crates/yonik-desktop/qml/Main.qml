@@ -60,7 +60,7 @@ ApplicationWindow {
         if (sourceError) return errorText(sourceError)
         if (state.pending) return tr("Импорт ожидает проверки", "Import awaits review")
         if (sourceLoading) return tr("Загрузка подписки…", "Loading subscription…")
-        return state.source_name ? state.source_name + tr(" · серверов: ", " · servers: ") + state.total : ""
+        return state.source_name ? state.source_name + tr(" · профилей: ", " · profiles: ") + state.total : ""
     }
     property bool pasteOnOpen: false
     property bool searchQueued: false
@@ -779,16 +779,16 @@ ApplicationWindow {
                             ScrollBar.vertical: ScrollBar {}
                             delegate: ItemDelegate {
                                 id: profileRow
-                                objectName: "profileSelect_" + modelData.id
+                                objectName: (modelData.kind === "xray" ? "nativeProfile_" : "profileSelect_") + modelData.id
                                 required property var modelData
                                 required property int index
                                 width: ListView.view.width
                                 height: 66
-                                highlighted: window.state.selected_profile === modelData.id
+                                highlighted: modelData.kind !== "xray" && window.state.selected_profile === modelData.id
                                 background: Rectangle { color: profileRow.highlighted ? "#302638" : (profileRow.hovered ? "#242127" : "#191919"); border.color: profileRow.activeFocus ? window.accent : "transparent"; radius: 4 }
-                                enabled: window.state.ready && !window.state.busy
-                                Accessible.name: modelData.name + ", " + modelData.host
-                                onClicked: window.selectProfile(modelData.id)
+                                enabled: window.state.ready && !window.state.busy && modelData.selectable !== false
+                                Accessible.name: modelData.name + ", " + (modelData.kind === "xray" ? window.tr("Полный профиль Xray. Подключение пока недоступно", "Full Xray profile. Connection is not available yet") : modelData.host)
+                                onClicked: if (modelData.kind !== "xray" && modelData.selectable !== false) window.selectProfile(modelData.id)
                                 Keys.onReturnPressed: if (enabled) clicked()
                                 Keys.onEnterPressed: if (enabled) clicked()
                                 contentItem: RowLayout {
@@ -797,10 +797,10 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         spacing: 3
                                         PlainLabel { text: profileRow.modelData.name; Layout.fillWidth: true; elide: Text.ElideRight; maximumLineCount: 1; font.weight: Font.Medium }
-                                        SmallLabel { text: profileRow.modelData.host + ":" + profileRow.modelData.port + " · " + profileRow.modelData.protocol; Layout.fillWidth: true; elide: Text.ElideRight; maximumLineCount: 1 }
+                                        SmallLabel { text: profileRow.modelData.kind === "xray" ? window.tr("Полный профиль Xray · подключение пока недоступно", "Full Xray profile · connection is not available yet") : profileRow.modelData.host + ":" + profileRow.modelData.port + " · " + profileRow.modelData.protocol; Layout.fillWidth: true; elide: Text.ElideRight; maximumLineCount: 1 }
                                     }
                                     SmallLabel { visible: !profileRow.modelData.available; text: window.tr("Недоступен", "Unavailable") }
-                                    SmallLabel { visible: window.state.selected_profile === profileRow.modelData.id; text: window.tr("Выбран", "Selected"); color: window.accent }
+                                    SmallLabel { visible: profileRow.modelData.kind !== "xray" && window.state.selected_profile === profileRow.modelData.id; text: window.tr("Выбран", "Selected"); color: window.accent }
 
                                 }
                             }

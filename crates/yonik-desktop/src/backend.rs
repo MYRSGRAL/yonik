@@ -963,11 +963,41 @@ struct SourceDto {
 struct ProfileDto {
     id: i64,
     name: String,
-    host: String,
-    port: u16,
+    kind: &'static str,
+    host: Option<String>,
+    port: Option<u16>,
     protocol: String,
     favorite: bool,
     available: bool,
+    selectable: bool,
+}
+fn catalog_profile_dto(profile: yonik_linux::CatalogProfile) -> ProfileDto {
+    use yonik_linux::CatalogProfile;
+    match profile {
+        CatalogProfile::Server(profile) => ProfileDto {
+            id: profile.id,
+            name: profile.name,
+            kind: "server",
+            host: Some(profile.host),
+            port: Some(profile.port),
+            protocol: profile.protocol,
+            favorite: profile.favorite,
+            available: profile.available,
+            selectable: profile.available,
+        },
+        CatalogProfile::Xray(profile) => ProfileDto {
+            id: profile.id,
+            name: profile.name,
+            kind: "xray",
+            host: None,
+            port: None,
+            protocol: "xray".into(),
+            favorite: profile.favorite,
+            available: profile.available,
+            // DATA-каталог не подтверждает готовность native consumer/Connect.
+            selectable: false,
+        },
+    }
 }
 #[derive(Serialize)]
 struct PendingDto {
@@ -1074,6 +1104,30 @@ struct SourceChangeAck {
 
 #[cfg(test)]
 mod full_profile_review_tests {
+    #[test]
+    fn native_catalog_row_preserves_name_and_has_no_fake_endpoint_or_selection() {
+        let row = super::catalog_profile_dto(yonik_linux::CatalogProfile::Xray(
+            yonik_linux::NativeSummary {
+                id: 1,
+                source_id: 2,
+                ordinal: 0,
+                name: "Auto <private>".into(),
+                favorite: true,
+                available: true,
+                requires_reselection: false,
+            },
+        ));
+        let json = serde_json::to_value(&row).expect("JSON row");
+        assert_eq!(json["name"], "Auto <private>");
+        assert_eq!(json["kind"], "xray");
+        assert_eq!(json["protocol"], "xray");
+        assert!(json["host"].is_null());
+        assert!(json["port"].is_null());
+        assert!(row.available);
+        assert!(row.favorite);
+        assert!(!row.selectable);
+    }
+
     #[test]
     fn review_counts_full_roots_without_emitting_sensitive_config() {
         let report = yonik_import::import_profiles(
@@ -2131,7 +2185,7 @@ impl Actor {
         self.state.source_name = Some(summary.name);
         let page = self
             .service()
-            .profiles(
+            .catalog(
                 id,
                 ProfileQuery {
                     search: self.state.search.clone(),
@@ -2149,15 +2203,7 @@ impl Actor {
         self.state.profiles = page
             .profiles
             .into_iter()
-            .map(|p| ProfileDto {
-                id: p.id,
-                name: p.name,
-                host: p.host,
-                port: p.port,
-                protocol: p.protocol,
-                favorite: p.favorite,
-                available: p.available,
-            })
+            .map(|(profile, _selection)| catalog_profile_dto(profile))
             .collect();
         // Подтверждение нового snapshot всегда требует повторного выбора.
         if self
