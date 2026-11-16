@@ -725,6 +725,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   issuer typed service roots/HostsPath и captured netgo lookup/search planner DATA.
   Реального startup/network/runtime/установки не было, public gates false.
 
+- R55 SOURCE scoped CLEAN: schema provenance7f0dd8a интегрирован. DNS bool proofs
+  заменены opaque schema/contract/scope/source-review capability; mint/setup/use
+  проверяют image/config/manifest/exact launch/nonce и current schema. Direct3
+  source pins остаются3-only, CODEC4 pin=None; synthetic4 только tests без UDP
+  authority. Это prerequisite typed service roots/HostsPath, сам новый issuer
+  context ещё не реализован. Go Numeric a30d4af ожидает R56 review.
+  Public/runtime gates false; реального startup/установки не было.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
