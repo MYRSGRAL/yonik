@@ -85,6 +85,7 @@ impl SystemSession {
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<(), ClientError> {
+        super::backend::ensure_engine_available(engine).map_err(|_| ClientError::Unsupported)?;
         self.fence(revision)?;
         self.prepared = None;
         // Публичная блокировка не означает активную сессию: admission проверяет helper.
@@ -117,6 +118,7 @@ impl SystemSession {
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<(), ClientError> {
+        super::backend::ensure_engine_available(engine).map_err(|_| ClientError::Unsupported)?;
         self.fence(revision)?;
         self.prepared = None;
         let legacy_available = self

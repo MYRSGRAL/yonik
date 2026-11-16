@@ -575,10 +575,66 @@ enum EngineChoice {
     SingBox,
 }
 impl EngineChoice {
+    fn ensure_available(self) -> Result<()> {
+        ensure_engine_available(self.engine())
+    }
     fn engine(self) -> Engine {
         match self {
             Self::Xray => Engine::Xray,
             Self::SingBox => Engine::SingBox,
+        }
+    }
+}
+
+pub(crate) fn ensure_engine_available(engine: Engine) -> Result<()> {
+    match engine {
+        Engine::Xray => Ok(()),
+        Engine::SingBox => Err(DesktopError("engine_unavailable")),
+    }
+}
+
+#[cfg(test)]
+mod engine_availability_tests {
+    use super::*;
+
+    #[test]
+    fn старое_ядро_читается_но_не_запускается() {
+        let old: EngineChoice = serde_json::from_str("\"sing-box\"").expect("старые настройки");
+        assert_eq!(serde_json::to_string(&old).expect("снимок"), "\"sing-box\"");
+        assert_eq!(
+            old.ensure_available().expect_err("недоступно").0,
+            "engine_unavailable"
+        );
+        assert!(EngineChoice::Xray.ensure_available().is_ok());
+    }
+
+    #[test]
+    fn оба_connect_и_autoconnect_проходят_общий_запрет() {
+        let source = include_str!("backend.rs");
+        let dispatch = source
+            .rsplit("let outcome: SourceResult<()> = match envelope.command {")
+            .next()
+            .expect("dispatch");
+        let guard = dispatch.find("Command::Connect | Command::RoutingApply { .. } if actor.state.engine.ensure_available().is_err()").expect("общий запрет");
+        let system = dispatch.find("command @ (Command::Connect | Command::RoutingApply { .. }) if actor.state.connection_mode == ConnectionMode::System").expect("System Connect");
+        let local = dispatch
+            .find("Command::Connect => {")
+            .expect("Local Connect");
+        assert!(guard < system && guard < local);
+        let startup = include_str!("startup_application.rs");
+        assert!(startup.contains("command: Command::Connect"));
+        assert!(!startup.contains("Operation::PolicyConnect"));
+        assert!(!startup.contains("yonik_engine::compile"));
+        let system = include_str!("system_session.rs");
+        for method in ["pub async fn prepare(", "pub async fn prepare_policy("] {
+            let body = system.split(method).nth(1).expect("prepare API");
+            assert!(
+                body.find("ensure_engine_available(engine)")
+                    .expect("запрет")
+                    < body
+                        .find("self.fence(revision)?")
+                        .expect("до изменения prepared")
+            );
         }
     }
 }
@@ -2115,6 +2171,7 @@ impl Actor {
             self.state.presets.validation_scope = None;
         }
         self.state.can_connect = self.state.ready
+            && self.state.engine.ensure_available().is_ok()
             && self.selected.is_some()
             && !self.state.can_stop
             && !self.state.system_busy
@@ -2825,6 +2882,7 @@ impl Actor {
                 if self.state.can_stop {
                     return Err(DesktopError("busy"));
                 }
+                engine.ensure_available()?;
                 let mut preferences = self.preferences.clone();
                 preferences.engine = match engine {
                     EngineChoice::Xray => "xray",
@@ -5379,6 +5437,10 @@ async fn run(
                             }
                         }
                     }
+                    Command::PresetValidate { request_id, .. } if actor.state.engine.ensure_available().is_err() => {
+                        actor.state.presets.ack = Some(presets::Ack { request_id, error: Some(if preset_job.is_some() { "busy" } else { "engine_unavailable" }) });
+                        Ok(())
+                    }
                     Command::PresetValidate { request_id, expected_revision } => {
                         actor.invalidate_preset();
                         if preset_job.is_some() {
@@ -5441,6 +5503,9 @@ async fn run(
                             system_flight = Some(Flight::start(system_session.take(), operation, system_revision(&actor), envelope.generation, actor.event_log.clone()));
                             actor.state.status = "Unknown"; Ok(())
                         }
+                    }
+                    Command::Connect | Command::RoutingApply { .. } if actor.state.engine.ensure_available().is_err() => {
+                        Err(DesktopError(if actor.state.can_stop || running.is_some() || refreshing.is_some() || system_flight.is_some() || system_stop { "busy" } else { "engine_unavailable" }).into())
                     }
                     Command::Connect if actor.routing_revision.is_none() => Err(DesktopError("routing_storage").into()),
                     Command::Connect if actor.state.routing.policy().is_err() => Err(DesktopError("routing_storage").into()),
@@ -5833,6 +5898,38 @@ mod routing_regressions {
         actor
             .command(serde_json::from_value(value).expect("контракт команды редактора"))
             .await
+    }
+    #[tokio::test]
+    async fn недоступное_ядро_не_меняет_настройки_и_busy_приоритетен() {
+        let (mut actor, lock, path) = fixture().await;
+        let command = || serde_json::json!({"command":"set_engine","engine":"sing-box"});
+        assert_eq!(
+            send(&mut actor, command()).await.expect_err("отказ").0,
+            "engine_unavailable"
+        );
+        assert_eq!(actor.preferences.engine, "xray");
+        assert!(!path.join("preferences.json").exists());
+        actor.state.can_stop = true;
+        assert_eq!(
+            send(&mut actor, command()).await.expect_err("занято").0,
+            "busy"
+        );
+        actor.state.can_stop = false;
+        actor.state.engine = EngineChoice::SingBox;
+        actor.preferences.engine = "sing-box".into();
+        actor.emit();
+        assert!(!actor.state.can_connect);
+        assert_eq!(actor.preferences.engine, "sing-box");
+        send(
+            &mut actor,
+            serde_json::json!({"command":"set_engine","engine":"xray"}),
+        )
+        .await
+        .expect("явный выбор");
+        assert_eq!(actor.preferences.engine, "xray");
+        drop(actor);
+        drop(lock);
+        std::fs::remove_dir_all(path).expect("очистка fixture");
     }
     fn put(id: u64, revision: i64, request: u64, create: bool) -> serde_json::Value {
         serde_json::json!({"command":"edit_routing","expected_revision":revision,"request_id":request,"create":create,"confirm_broad":false,"rule":{"id":id,"enabled":true,"executables":[],"domains":["example.org"],"destinations":[],"action":"proxy"}})

@@ -356,6 +356,7 @@ ApplicationWindow {
             system_unavailable: ["Helper недоступен. Проверьте состояние сети.", "Helper unavailable. Check network state."],
             engine_config: ["Профиль несовместим с выбранным ядром. Проверьте параметры подключения.", "The profile is incompatible with the selected engine. Check connection settings."],
             engine_failed: ["Прокси-ядро не запущено или завершилось с ошибкой. Проверьте профиль и наличие ядра.", "The proxy engine is not running or exited with an error. Check the profile and engine installation."],
+            engine_unavailable: ["Sing-box пока недоступен. Выберите Xray в настройках подключения.", "Sing-box is currently unavailable. Select Xray in connection settings."],
             probe_target_invalid: ["Укажите корректный HTTPS URL (до 2048 символов) и ожидаемый статус 200–299.", "Enter a valid HTTPS URL (up to 2048 characters) and an expected status of 200–299."],
             check_http_status: ["Сайт проверки вернул неожиданный HTTP-статус. Редирект не считается успехом.", "The check endpoint returned an unexpected HTTP status. Redirects are not successful."],
             check_tls: ["Не удалось проверить TLS сайта проверки.", "TLS verification failed for the check endpoint."],
@@ -1081,9 +1082,10 @@ ApplicationWindow {
                 RowLayout {
                     Layout.fillWidth: true
                     PlainLabel { Layout.fillWidth: true; text: window.tr("Ядро", "Engine") }
-                    ComboBox { objectName: "engineChoice"; model: ["xray", "sing-box"]; currentIndex: window.state.engine === "sing-box" ? 1 : 0; enabled: window.editable; onActivated: window.send({command: "set_engine", engine: currentText}); Accessible.name: window.tr("Прокси-ядро", "Proxy engine") }
+                    ComboBox { objectName: "engineChoice"; model: ["xray"]; currentIndex: window.state.engine === "xray" ? 0 : -1; enabled: window.editable; onActivated: window.send({command: "set_engine", engine: currentText}); Accessible.name: window.tr("Прокси-ядро", "Proxy engine") }
                     HelpButton { explanation: window.tr("Обрабатывает подключение к серверу. Меняется после отключения и действует до закрытия приложения.", "Handles the server connection. Change after disconnecting; applies until the app exits.") }
                 }
+                PlainLabel { visible: window.state.engine === "sing-box"; Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Сохранённое ядро Sing-box пока недоступно. Выберите Xray для подключения.", "The saved Sing-box engine is currently unavailable. Select Xray to connect.") }
                 Divider {}
                 RowLayout {
                     Layout.fillWidth: true
