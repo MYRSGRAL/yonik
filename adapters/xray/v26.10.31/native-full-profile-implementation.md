@@ -639,8 +639,79 @@ separately credited downstream payload retirement, exact flow/durable retirement
 GoDuplicateClosed receipt и supervisor Unknown custody. Никакой из этих
 недостающих proofs не заменён TCP owner, metadata cookie или session credential.
 
-Name-policy gap для root: d79 `udp_original` (native_profile_channel.rs:869+)
-использует resolver_name(false,true): lowercase, но `_`/final dot допускаются;
-runtime Destination::read/hostname иначе проверяет hostname. Go пока сохраняет
-runtime Destination constraints; name-policy parity до отдельного source ruling
-не объявляется. Record/ACK/fingerprint byte parity не снимает этот gate.
+Name-policy gap закрыт root correction7f1f5a8139ecd7f06e64b483b44c627ae2f99654.
+Его shared corpus `udp-original-destination-v1.json` перенесён byte-exact в owned
+fixtures и embedded Go test:17cases проверяют packet/runtime grammar и original
+bytes без canonicalization. Дополнительно обнаружен и исправлен Go runtime
+`profileDestinationValue.valid`: IPv4 literal в family3 ранее проходил
+`profileDomain`; теперь IP-as-domain отклоняется, как packet parser и Rust.
+`Example.INVALID` сохраняет uppercase. Corpus/record parity не снимают admission gate.
+
+## UDP v2: actor + issuer FD delivery, source-only
+
+Base792928b; counterpart a2e1a64489b8dd01e0096d413c278c7c39330386.
+Новых wire bytes/layout/enums нет: PF002/PFA02 и10 records d79 неизменны.
+`receiveBootstrap` по-прежнему отвергает PF002 до ACK. Local v2 не negotiates.
+Builder/runtime/issuer/UDP consumer readiness gates остаются false.
+
+Production source chain:
+`socks.Server.processTCP → profileHandshakeWithUDPDelivery →
+ProfileOpenSOCKSUDPControl → profileUDPActor.submit → ProfileRuntime.monitor`.
+Monitor — единственный proof reader/writer: `tick` отправляет UCS с actual
+retained TCP object; `receiveUDPProof` принимает UCA; следующий tick отправляет
+UAQ; UAC проходит exact binding/operation/control/cookie/credentials/rights
+decoder и `profileInspectUDP` до private association publication.
+UCA cookie относится к actual TCP control; UAC cookie — к отдельно созданному
+UDP relay (`native_profile_channel.rs`, Associate → ops.relay → Associated).
+Их равенство не требуется: UAQ сохраняет TCP cookie, inspection сравнивает
+actual delivered UDP SO_COOKIE с UAC. Pure control использует различные cookies.
+Каждый control exchange проходит полностью до начала следующего, поэтому UAQ
+не оказывается позади более нового UCS operation. EAGAIN не пропускает очередь.
+TCP proof v1 сохраняет прежний runtime path; v2 input не смешивается с runtime
+rights-free frames. ACK никогда не является UserSourceFlow или UDP owner proof.
+
+Private actor states: queued0 → ControlSent1 → Acked2 → AssociateSent3 →
+Delivered4; cancel/failure → Retained5. Deadline фиксируется до первого send,
+remaining сужает его с вычетом RTT, queue/ACK не продлевают lifetime.
+Request reservations: три retained history entries (control/associate/будущий
+close), шесть FD slots,133120 bytes и один existing physical pending slot до
+первого I/O. История≤min(caps7,256), requests≤8; ID reuse/eviction отсутствуют.
+Close reservation — private capacity slot, не выдуманный issuer closeID.
+Общий FD ledger включает proof-channel duplicate, accepted TCP duplicates,
+association reservations и16 scratch rights; общий pending≤min(caps3,64).
+Runtime и proof recv резервируют scratch/pending до allocation/SCM receive.
+Ancillary capacity v2 ограничена CmsgSpace(16*4), поэтому отсутствие credentials
+не может материализовать больше16 прав. Unexpected FD закрывается; close error
+удерживает handle/credits и sticky Unknown. Physical pending учитывается тем же
+session cap≤128, что numeric transport factories; отдельного расширения нет.
+
+OS boundary `profileInspectUDP/profileOSUDPReceiver`: actual DGRAM/UDP,
+nonblocking+CLOEXEC, unconnected IPv4 loopback bound endpoint, SO_COOKIE,
+SO_RCVBUF≤128KiB, GRO0/RXQ_OVFL1. Receive только после exclusive ConsumePermit,
+с context/deadline, bounded nonblocking read/poll и проверкой peer/ancillary.
+Нет Write/Peek/raw-FD export; issuer relay не передаётся legacy dispatcher.
+Close закрывает actual duplicate, Join ждёт reader; wrapper скомпилирован,
+никогда не исполнялся. Pure controls используют injected FD/receiver.
+
+SOCKS success branch читает полный authenticated UDP request до control effect;
+ответ содержит только inspected issuer loopback endpoint. Partial request,
+nil/foreign/domain endpoint, naked ACK не дают success. TCP/Local legacy
+handshake bytes сохранены. После success пока только owning TCP lifetime:
+нет Peek/Receive/forward до следующего OPEN/Consumed/GRANT milestone. Revoke
+отменяет private control context и закрывает owning TCP consumer; отмена одной
+ассоциации закрывает/joins только её relay, соседний control остаётся live.
+Поздний UAC отменённого pending request закрывается без inspection/publication;
+повторное late delivery запрещено.
+Authenticated UCQ закрывает/joins только matching relay и удерживает issuer
+closeID в заранее reserved третьем history slot (namespace3). Replay closeID
+отклоняется; ACK/KnownClosed не отправляется до durable retirement producer.
+
+**Остаток этого UDP подключения:** provenance3 OPEN↔Consumed, private original
+receipt и actual AUTHORIZE/GRANT, отдельно credited downstream transfer/retire,
+issuer CloseRequest/GoDuplicateClosed с durable flow retirement. До этого actor
+не отправляет UPQ/UCM/UCR и не публикует KnownClosed. Даже успешный local
+CloseAndJoin оставляет actor history/FD/physical credits retained; Close сообщает
+Unsupported final retirement. EOF/bad packet/session revoke удерживают Unknown
+custody. Это консервативная конечная capacity, не long-lived UDP readiness.
+Root supervisor/rules fences не подменяются child ACK. DNS outer два файла
+по-прежнему не изменены; resolver provenance/provider cache остаются закрытыми.
