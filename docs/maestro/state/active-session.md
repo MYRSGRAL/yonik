@@ -448,6 +448,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   собственный target очищен. Это compile-only подготовка к P6; список/selection/
   Connect и Xray-only controls ещё не переключены, полный P6 не PASS.
 - Установленное приложение по-прежнему e14aeae6c0cd; обновление не выполнено.
+- Desktop catalog adapter a56f179 переключает page на profile-aware catalog:
+  Xray rows имеют исходное имя, kind=xray, host/port=null и selectable=false.
+  QML различает kind при objectName/highlight/selection и показывает причину
+  недоступности Connect; server-only SelectProfile не получает native row.
+  Backend2 named pure tests, all-targets clippy/fmt и QML parser PASS;
+  GUI/Host не запускались. Evidence p6-root-catalog/source3095members соответствует
+  commit, собственный target очищен. Native selection/Connect ещё не подключены;
+  это подготовка UI за закрытым gate, не полный P6 PASS и не установленный fix.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
