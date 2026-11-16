@@ -53,6 +53,28 @@ pub(super) fn number(value: &str) -> Option<u64> {
         .filter(|number| number.to_string() == value)
 }
 impl Actor {
+    pub(super) async fn startup_select_profile(&mut self, profile: ResolvedProfile) -> Result<()> {
+        self.clear_selection();
+        self.state.source_id = Some(profile.profile.source_id);
+        self.page()
+            .await
+            .map_err(|_| DesktopError("startup_binding"))?;
+        if self.catalog_coordinates
+            != Some((
+                profile.profile.source_id,
+                profile.source_generation,
+                profile.snapshot_generation,
+                profile.snapshot_revision,
+            ))
+        {
+            return Err(DesktopError("startup_binding"));
+        }
+        self.state.selected_kind = Some("server");
+        self.state.selected_profile = Some(profile.profile.id);
+        self.state.selected_name = Some(profile.profile.name.clone());
+        self.selected = Some(profile);
+        Ok(())
+    }
     pub(super) fn startup_view(&mut self) {
         self.state.startup.revision = self.preferences.revision.to_string();
         self.state.startup.autostart_into_tray = self.preferences.autostart_into_tray;
@@ -466,16 +488,7 @@ async fn prepare_inner(
     if !matches!(decision, policy::Decision::Connect(_)) || !actor.startup_owner_current() {
         return Err(DesktopError("startup_binding"));
     }
-    actor.state.source_id = Some(profile.profile.source_id);
-    actor.state.source_generation = Some(profile.source_generation);
-    actor.state.revision = profile.snapshot_revision;
-    actor.state.selected_profile = Some(profile.profile.id);
-    actor.state.selected_name = Some(profile.profile.name.clone());
-    actor.selected = Some(profile);
-    actor
-        .page()
-        .await
-        .map_err(|_| DesktopError("startup_binding"))?;
+    actor.startup_select_profile(profile).await?;
     if !current() || !actor.startup_owner_current() {
         return Err(DesktopError("cancelled"));
     }

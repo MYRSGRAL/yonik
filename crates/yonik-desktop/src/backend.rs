@@ -6232,6 +6232,84 @@ mod routing_regressions {
         drop(lock);
         std::fs::remove_dir_all(path).expect("своя fixture");
     }
+    #[tokio::test]
+    async fn startup_сохраняет_server_цель_другого_источника() {
+        let (mut actor, lock, path) = fixture().await;
+        let mut sources = Vec::new();
+        for name in ["Первый", "Целевой"] {
+            actor
+                .source_command(
+                    serde_json::from_value(serde_json::json!({
+                        "command": "add_source", "name": name, "url": "https://example.org/uri",
+                        "local_exception": false, "route": "direct", "hwid_enabled": false
+                    }))
+                    .expect("источник"),
+                )
+                .await
+                .expect("добавить без fetch");
+            let id = actor.state.source_id.expect("источник");
+            actor.routing_repository().commit_snapshot(id, 1, 0, yonik_linux::SnapshotInput {
+                body: format!("vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#{name}").into_bytes(),
+                metadata: b"{}".to_vec(), validators: None,
+            }).await.expect("snapshot");
+            actor.page().await.expect("проекция");
+            sources.push((id, actor.state.profiles[0].id));
+        }
+        let profile = actor
+            .service()
+            .select_profile(sources[1].1, actor.state.revision)
+            .await
+            .expect("проверенная цель");
+        actor.state.source_id = Some(sources[0].0);
+        actor
+            .page()
+            .await
+            .expect("начальная страница первого источника");
+        let expected = (
+            profile.profile.source_id,
+            profile.source_generation,
+            profile.snapshot_generation,
+            profile.snapshot_revision,
+        );
+        actor
+            .startup_select_profile(profile)
+            .await
+            .expect("восстановить цель");
+        assert_eq!(actor.catalog_coordinates, Some(expected));
+        assert_eq!(actor.state.selected_kind, Some("server"));
+        assert_eq!(actor.state.selected_profile, Some(sources[1].1));
+        assert_eq!(
+            actor.selected.as_ref().map(|p| p.profile.id),
+            Some(sources[1].1)
+        );
+        assert!(actor.selected_native.is_none());
+        actor
+            .page()
+            .await
+            .expect("повторная страница тех же координат");
+        assert!(actor.selected.is_some());
+        let stale = actor
+            .service()
+            .select_profile(sources[1].1, actor.state.revision)
+            .await
+            .expect("цель перед обновлением");
+        actor.routing_repository().commit_snapshot(sources[1].0, 1, 1, yonik_linux::SnapshotInput {
+            body: b"vless://00000000-0000-0000-0000-000000000002@example.org:443?security=tls#Updated".to_vec(),
+            metadata: b"{}".to_vec(), validators: None,
+        }).await.expect("смена snapshot");
+        assert_eq!(
+            actor
+                .startup_select_profile(stale)
+                .await
+                .expect_err("устаревшая цель")
+                .0,
+            "startup_binding"
+        );
+        assert!(actor.selected.is_none() && actor.state.selected_kind.is_none());
+        drop(actor);
+        drop(lock);
+        std::fs::remove_dir_all(path).expect("своя fixture");
+    }
     async fn send(actor: &mut Actor, value: serde_json::Value) -> Result<()> {
         actor
             .command(serde_json::from_value(value).expect("контракт команды редактора"))
