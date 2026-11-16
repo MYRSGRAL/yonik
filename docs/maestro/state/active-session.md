@@ -602,9 +602,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   218 body negatives и17 envelope negatives. Семь named pure codec tests,
   no-run, linux+desktop all-targets clippy, fmt/Ruff/packer PASS. Source/compiler/
   ELF evidence r35-codec2 сохранён до исполнения, unchanged после; cargo clean
-  выполнен. Независимый review и Go CODEC-2 parity ещё нужны. Actual bundle issuer
-  не реализован; DATA ACK не является authority. StubBind526e1c ожидает review,
-  protected resolver service-policy producer отсутствует. Runtime не запускался.
+  выполнен. R35 SOURCE scoped CLEAN для a7a9544; Go CODEC-2 parity ещё нужна.
+  Actual bundle issuer не реализован; DATA ACK не является authority.
+- R36 SOURCE scoped CLEAN: StubBind526e1c интегрирован обычным merge5ec2281.
+  Bounded v4/v6 listener census и retained observation не выдают service authority;
+  protected resolver service-policy producer отсутствует, loopback Unsupported.
+  Следующий Rust cut — production BundleAcquire55/BundleGranted56 issuer с
+  отдельными class3 hop permits, renewal/cancel/credits и fake-only regression.
+  Runtime не запускался; full P4/P5 readiness и installed update не заявлены.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
