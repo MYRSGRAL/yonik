@@ -2955,6 +2955,14 @@ struct SidebandCredits {
     fds: super::memory::ByteBudget,
 }
 impl SidebandCredits {
+    fn receive_runtime(
+        &self,
+        receive: impl FnOnce() -> Result<Option<usize>, ServiceError>,
+    ) -> Result<(Option<usize>, super::memory::ByteLease), ServiceError> {
+        // receive закрывает любые доставленные права до возврата/отказа.
+        let (slot, _fds) = self.read_credit(16)?;
+        Ok((receive()?, slot))
+    }
     fn read_credit(
         &self,
         rights: usize,
@@ -3831,10 +3839,11 @@ impl Channel for SystemChannel {
             if inbox.frames.len() >= 64 {
                 return Err(ServiceError::Busy);
             }
-            let (slot, _fds) = inbox.slots.read_credit(0)?;
             let mut bytes = [0; 1153];
-            let frame = Self::ready(&self.runtime, tokio::io::Interest::READABLE, || {
-                receive(&self.runtime, pid, uid, &mut bytes)
+            let (frame, slot) = inbox.slots.receive_runtime(|| {
+                Self::ready(&self.runtime, tokio::io::Interest::READABLE, || {
+                    receive(&self.runtime, pid, uid, &mut bytes)
+                })
             })?;
             if let Some(length) = frame {
                 let decoded = wire::Frame::decode(

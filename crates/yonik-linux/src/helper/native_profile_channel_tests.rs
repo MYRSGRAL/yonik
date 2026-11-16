@@ -2,6 +2,50 @@ use super::*;
 use std::collections::BTreeSet;
 
 #[test]
+fn runtime_receive_reserves_rights_scratch_before_call_and_releases_on_error() {
+    let slots = SidebandCredits::new();
+    let occupied = slots.fds.reserve(49).unwrap();
+    let called = std::cell::Cell::new(false);
+    assert!(
+        slots
+            .receive_runtime(|| {
+                called.set(true);
+                Ok(Some(1))
+            })
+            .is_err()
+    );
+    assert!(
+        !called.get(),
+        "receive недопустим без всех scratch FD credits"
+    );
+    assert_eq!(slots.pending.used(), 0);
+    drop(occupied);
+    let occupied = slots.fds.reserve(48).unwrap();
+    let (frame, pending) = slots
+        .receive_runtime(|| {
+            assert_eq!(slots.fds.used(), 64);
+            assert_eq!(slots.pending.used(), 1);
+            Ok(Some(7))
+        })
+        .unwrap();
+    assert_eq!(frame, Some(7));
+    assert_eq!(slots.fds.used(), 48);
+    assert_eq!(slots.pending.used(), 1);
+    drop(pending);
+    assert!(
+        slots
+            .receive_runtime(|| {
+                assert_eq!(slots.fds.used(), 64);
+                Err(ServiceError::InvalidRequest)
+            })
+            .is_err()
+    );
+    assert_eq!(slots.pending.used(), 0);
+    assert_eq!(slots.fds.used(), 48);
+    drop(occupied);
+}
+
+#[test]
 fn udp_open_waits_for_consumed_before_real_driver_publication() {
     let record = issuer(Mode::System).record;
     let (mut packet, _) = rendezvous_open(record, 2);
