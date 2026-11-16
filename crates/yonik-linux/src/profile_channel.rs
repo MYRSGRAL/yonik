@@ -11,8 +11,730 @@ pub(crate) const PEER_PIDFD_LOCATOR: &str = "YONIK_PROFILE_PEER_PIDFD";
 pub(crate) const ASSET_ROOT_FD_LOCATOR: &str = "YONIK_PROFILE_ASSET_ROOT_FD";
 
 /// DNS_V2 DATA preflight. Проверка bytes не является negotiation/authority.
-mod dns_v2 {
+#[expect(
+    dead_code,
+    reason = "Закрытый DATA codec API; issuer negotiation остаётся следующим milestone"
+)]
+pub(crate) mod dns_v2 {
     use super::{Error, Result};
+    use sha2::{Digest, Sha256};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u16)]
+    pub(crate) enum Operation {
+        Reserve = 35,
+        Reserved = 36,
+        PhysicalAck = 37,
+        LogicalBind = 38,
+        LogicalAck = 39,
+        Publish = 40,
+        Published = 41,
+        NumericAuthorize = 42,
+        Append = 43,
+        AppendAck = 44,
+        Retire = 45,
+        Retired = 46,
+        Cancel = 47,
+        Canceled = 48,
+        PhysicalBind = 52,
+        WaiterBind = 53,
+        WaiterBound = 54,
+    }
+    impl TryFrom<u16> for Operation {
+        type Error = Error;
+        fn try_from(n: u16) -> Result<Self> {
+            Ok(match n {
+                35 => Self::Reserve,
+                36 => Self::Reserved,
+                37 => Self::PhysicalAck,
+                38 => Self::LogicalBind,
+                39 => Self::LogicalAck,
+                40 => Self::Publish,
+                41 => Self::Published,
+                42 => Self::NumericAuthorize,
+                43 => Self::Append,
+                44 => Self::AppendAck,
+                45 => Self::Retire,
+                46 => Self::Retired,
+                47 => Self::Cancel,
+                48 => Self::Canceled,
+                52 => Self::PhysicalBind,
+                53 => Self::WaiterBind,
+                54 => Self::WaiterBound,
+                _ => return Err(Error::Schema),
+            })
+        }
+    }
+    impl Operation {
+        pub(crate) fn is_reply(self) -> bool {
+            matches!(
+                self,
+                Self::Reserved
+                    | Self::PhysicalAck
+                    | Self::LogicalAck
+                    | Self::Published
+                    | Self::AppendAck
+                    | Self::Retired
+                    | Self::Canceled
+                    | Self::WaiterBound
+            )
+        }
+        pub(crate) fn rights(self) -> (usize, usize) {
+            if self == Self::PhysicalBind {
+                (1, 1)
+            } else {
+                (0, 0)
+            }
+        }
+    }
+    macro_rules! ids {
+        ($($name:ident),+) => {$ (
+            #[derive(Clone,Copy,Debug,PartialEq,Eq)]
+            pub(crate) struct $name(std::num::NonZeroU64);
+            impl $name {
+                fn read(n:u64)->Result<Self> {id(n)?;Ok(Self(std::num::NonZeroU64::new(n).ok_or(Error::Reference)?))}
+                pub(crate) fn get(self)->u64 {self.0.get()}
+            }
+        )+};
+    }
+    ids!(
+        ReservationId,
+        PhysicalResourceId,
+        DnsBundleId,
+        ExchangeId,
+        TransportProofId,
+        StubBindId,
+        ProducerRRsetId,
+        WaiterReceiptId,
+        SourceObservationId
+    );
+    ids!(
+        QueryId,
+        ServiceGrantId,
+        SourceFlowId,
+        FlowRevision,
+        ProofRevision,
+        AppendSequence,
+        RequestSequenceId
+    );
+    macro_rules! view_id {
+        ($kind:literal,$method:ident,$id:ident,$at:literal) => {
+            impl View<'_, $kind> {
+                pub(crate) fn $method(self) -> Result<$id> {
+                    $id::read(n64(self.bytes, $at))
+                }
+            }
+        };
+    }
+    view_id!(35, query, QueryId, 8);
+    view_id!(35, bundle, DnsBundleId, 16);
+    view_id!(35, grant, ServiceGrantId, 24);
+    view_id!(35, source_flow, SourceFlowId, 32);
+    view_id!(35, source_revision, FlowRevision, 40);
+    view_id!(36, reservation, ReservationId, 8);
+    view_id!(36, query, QueryId, 16);
+    view_id!(36, bundle, DnsBundleId, 24);
+    view_id!(37, reservation, ReservationId, 8);
+    view_id!(37, query, QueryId, 24);
+    view_id!(37, bundle, DnsBundleId, 32);
+    view_id!(38, reservation, ReservationId, 8);
+    view_id!(38, query, QueryId, 16);
+    view_id!(38, bundle, DnsBundleId, 24);
+    view_id!(38, exchange, ExchangeId, 32);
+    view_id!(38, stub, StubBindId, 40);
+    view_id!(39, exchange, ExchangeId, 8);
+    view_id!(39, query, QueryId, 24);
+    view_id!(39, bundle, DnsBundleId, 32);
+    view_id!(39, revision, ProofRevision, 40);
+    view_id!(40, query, QueryId, 12);
+    view_id!(40, grant, ServiceGrantId, 20);
+    view_id!(40, exchange, ExchangeId, 28);
+    view_id!(40, proof, TransportProofId, 120);
+    view_id!(40, revision, ProofRevision, 128);
+    view_id!(41, exchange, ExchangeId, 16);
+    view_id!(43, exchange, ExchangeId, 8);
+    view_id!(43, proof, TransportProofId, 16);
+    view_id!(43, revision, ProofRevision, 24);
+    view_id!(43, sequence, AppendSequence, 32);
+    view_id!(44, exchange, ExchangeId, 8);
+    view_id!(44, proof, TransportProofId, 16);
+    view_id!(44, sequence, AppendSequence, 24);
+    view_id!(44, revision, ProofRevision, 32);
+    view_id!(52, exchange_reservation, ReservationId, 128);
+    view_id!(52, query, QueryId, 136);
+    view_id!(52, bundle, DnsBundleId, 144);
+    view_id!(52, physical_reservation, ReservationId, 152);
+    view_id!(53, grant, ServiceGrantId, 24);
+    view_id!(53, query, QueryId, 32);
+    view_id!(53, source_flow, SourceFlowId, 40);
+    view_id!(53, source_revision, FlowRevision, 48);
+    view_id!(54, reservation, ReservationId, 24);
+    view_id!(54, query, QueryId, 32);
+    macro_rules! closed_u8 {
+        ($name:ident,$($variant:ident=$n:literal),+) => {
+            #[derive(Clone,Copy,Debug,PartialEq,Eq)]
+            pub(crate) enum $name {$($variant),+}
+            impl TryFrom<u8> for $name {
+                type Error=Error;
+                fn try_from(n:u8)->Result<Self> {match n {$($n=>Ok(Self::$variant),)+_=>Err(Error::Schema)}}
+            }
+        };
+    }
+    closed_u8!(SourceKind, DnsWire = 1, HostsSnapshot = 2);
+    closed_u8!(
+        Purpose,
+        ProviderQuery = 1,
+        BootstrapDns = 2,
+        BootstrapHosts = 3
+    );
+    closed_u8!(NumericUse, LogicalDestination = 1, PhysicalFirstHop = 2);
+    closed_u8!(ParentClass, User = 1, Probe = 2, Dns = 3);
+    closed_u8!(ReservationRole, Exchange = 1, Physical = 2, Waiter = 3);
+    impl View<'_, 35> {
+        pub(crate) fn role(self) -> Result<ReservationRole> {
+            ReservationRole::try_from(self.bytes[2])
+        }
+        pub(crate) fn purpose(self) -> Result<Purpose> {
+            Purpose::try_from(self.bytes[74])
+        }
+        pub(crate) fn source_kind(self) -> Result<SourceKind> {
+            SourceKind::try_from(self.bytes[75])
+        }
+        pub(crate) fn parent_class(self) -> Result<ParentClass> {
+            ParentClass::try_from(self.bytes[77])
+        }
+    }
+    impl View<'_, 40> {
+        pub(crate) fn purpose(self) -> Result<Purpose> {
+            Purpose::try_from(self.bytes[136])
+        }
+        pub(crate) fn source_kind(self) -> Result<SourceKind> {
+            SourceKind::try_from(self.bytes[137])
+        }
+    }
+    impl View<'_, 42> {
+        pub(crate) fn usage(self) -> Result<NumericUse> {
+            NumericUse::try_from(self.bytes[14])
+        }
+        pub(crate) fn parent_class(self) -> Result<ParentClass> {
+            ParentClass::try_from(self.bytes[15])
+        }
+    }
+    impl View<'_, 54> {
+        pub(crate) fn purpose(self) -> Result<Purpose> {
+            Purpose::try_from(self.bytes[59])
+        }
+        pub(crate) fn source_kind(self) -> Result<SourceKind> {
+            SourceKind::try_from(self.bytes[58])
+        }
+    }
+    macro_rules! ack_views {
+        ($($k:literal),+) => {$ (
+            impl View<'_,$k> {pub(crate) fn status(self)->Result<super::Status> {super::Status::try_from(self.bytes[2])}}
+        )+};
+    }
+    ack_views!(36, 37, 39, 41, 44, 46, 48, 54);
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Retirement {
+        Resource(PhysicalResourceId),
+        Proof(TransportProofId, ProofRevision),
+    }
+    impl View<'_, 45> {
+        pub(crate) fn reference(self) -> Result<Retirement> {
+            match self.bytes[2] {
+                3 => Ok(Retirement::Resource(PhysicalResourceId::read(n64(
+                    self.bytes, 8,
+                ))?)),
+                4 => Ok(Retirement::Proof(
+                    TransportProofId::read(n64(self.bytes, 8))?,
+                    ProofRevision::read(n64(self.bytes, 16))?,
+                )),
+                _ => Err(Error::Reference),
+            }
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Cancellation {
+        Request(RequestSequenceId),
+        Exchange(ExchangeId),
+        Resource(PhysicalResourceId),
+        Proof(TransportProofId),
+        Producer(ProducerRRsetId),
+        Waiter(WaiterReceiptId),
+        Reservation(ReservationId),
+    }
+    impl View<'_, 47> {
+        pub(crate) fn reference(self) -> Result<Cancellation> {
+            let n = n64(self.bytes, 8);
+            Ok(match self.bytes[2] {
+                1 => Cancellation::Request(RequestSequenceId::read(n)?),
+                2 => Cancellation::Exchange(ExchangeId::read(n)?),
+                3 => Cancellation::Resource(PhysicalResourceId::read(n)?),
+                4 => Cancellation::Proof(TransportProofId::read(n)?),
+                5 => Cancellation::Producer(ProducerRRsetId::read(n)?),
+                6 => Cancellation::Waiter(WaiterReceiptId::read(n)?),
+                7 => Cancellation::Reservation(ReservationId::read(n)?),
+                _ => return Err(Error::Reference),
+            })
+        }
+    }
+
+    /// Immutable borrowed view: поля проверены до materialization, не authority.
+    #[derive(Clone, Copy)]
+    pub(crate) struct View<'a, const K: u16> {
+        bytes: &'a [u8],
+    }
+    impl<'a, const K: u16> View<'a, K> {
+        pub(crate) fn decode(bytes: &'a [u8]) -> Result<Self> {
+            preflight(K, bytes)?;
+            Ok(Self { bytes })
+        }
+        pub(crate) fn bytes(self) -> &'a [u8] {
+            self.bytes
+        }
+        pub(crate) fn encode(self, out: &mut [u8]) -> Result<usize> {
+            let dst = out.get_mut(..self.bytes.len()).ok_or(Error::Bounds)?;
+            dst.copy_from_slice(self.bytes);
+            Ok(self.bytes.len())
+        }
+    }
+    impl View<'_, 41> {
+        pub(crate) fn producer(self) -> Result<ProducerRRsetId> {
+            ProducerRRsetId::read(n64(self.bytes, 8))
+        }
+    }
+    impl View<'_, 53> {
+        pub(crate) fn reservation(self) -> Result<ReservationId> {
+            ReservationId::read(n64(self.bytes, 8))
+        }
+        pub(crate) fn producer(self) -> Result<ProducerRRsetId> {
+            ProducerRRsetId::read(n64(self.bytes, 16))
+        }
+    }
+    impl View<'_, 54> {
+        pub(crate) fn waiter(self) -> Result<WaiterReceiptId> {
+            WaiterReceiptId::read(n64(self.bytes, 8))
+        }
+        pub(crate) fn producer(self) -> Result<ProducerRRsetId> {
+            ProducerRRsetId::read(n64(self.bytes, 16))
+        }
+    }
+    impl View<'_, 42> {
+        pub(crate) fn waiter(self) -> Result<WaiterReceiptId> {
+            WaiterReceiptId::read(n64(self.bytes, 4))
+        }
+    }
+    impl View<'_, 37> {
+        pub(crate) fn resource(self) -> Result<PhysicalResourceId> {
+            PhysicalResourceId::read(n64(self.bytes, 16))
+        }
+    }
+    impl View<'_, 39> {
+        pub(crate) fn proof(self) -> Result<TransportProofId> {
+            TransportProofId::read(n64(self.bytes, 16))
+        }
+    }
+    impl<'a> View<'a, 40> {
+        pub(crate) fn hosts(self) -> Result<Option<HostsView<'a>>> {
+            if self.bytes[137] == 2 {
+                Ok(Some(HostsView::decode(&self.bytes[144..])?))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+    impl View<'_, 36> {
+        pub(crate) fn observation(self) -> Result<SourceObservationId> {
+            if self.bytes[60] != 3 || n64(self.bytes, 24) != 0 {
+                return Err(Error::Reference);
+            }
+            SourceObservationId::read(n64(self.bytes, 32))
+        }
+        pub(crate) fn exchange(self) -> Result<ExchangeId> {
+            if self.bytes[60] != 1 {
+                return Err(Error::Reference);
+            }
+            ExchangeId::read(n64(self.bytes, 32))
+        }
+        pub(crate) fn parent_exchange_reservation(self) -> Result<ReservationId> {
+            if self.bytes[60] != 2 {
+                return Err(Error::Reference);
+            }
+            ReservationId::read(n64(self.bytes, 32))
+        }
+    }
+    impl<'a> View<'a, 38> {
+        pub(crate) fn resources(self) -> impl Iterator<Item = Result<PhysicalResourceId>> + 'a {
+            self.bytes[64..]
+                .chunks_exact(8)
+                .map(|p| PhysicalResourceId::read(n64(p, 0)))
+        }
+    }
+    impl<'a> View<'a, 43> {
+        pub(crate) fn resources(self) -> impl Iterator<Item = Result<PhysicalResourceId>> + 'a {
+            self.bytes[48..]
+                .chunks_exact(8)
+                .map(|p| PhysicalResourceId::read(n64(p, 0)))
+        }
+    }
+    pub(crate) struct HostsView<'a>(&'a [u8]);
+    pub(crate) struct SnapshotRoleView<'a>(&'a [u8]);
+    impl<'a> SnapshotRoleView<'a> {
+        pub(crate) fn decode(mapping: u16, row: &'a [u8]) -> Result<Self> {
+            if mapping != 4 || row.len() != 76 {
+                return Err(Error::Schema);
+            }
+            let flags = u32::from_be_bytes(row[72..76].try_into().map_err(|_| Error::Bounds)?);
+            let size = u32::from_be_bytes(row[64..68].try_into().map_err(|_| Error::Bounds)?);
+            if flags & !7 != 0
+                || flags & 6 == 0
+                || !(170..=2097152).contains(&size)
+                || row[68..72] != [0, 1, 0, 0]
+                || row[..32].iter().all(|b| *b == 0)
+                || row[32..64].iter().all(|b| *b == 0)
+            {
+                return Err(Error::Reference);
+            }
+            Ok(Self(row))
+        }
+        pub(crate) fn application(&self) -> bool {
+            self.0[75] & 2 != 0
+        }
+        pub(crate) fn bootstrap(&self) -> bool {
+            self.0[75] & 4 != 0
+        }
+        pub(crate) fn asset_reference(&self) -> super::SnapshotRef {
+            let mut source = [0; 32];
+            source.copy_from_slice(&self.0[..32]);
+            let mut asset = [0; 32];
+            asset.copy_from_slice(&self.0[32..64]);
+            super::SnapshotRef {
+                source,
+                asset,
+                bytes: u32::from_be_bytes([self.0[64], self.0[65], self.0[66], self.0[67]]),
+                flags: u32::from(self.0[75] & 1),
+            }
+        }
+    }
+    impl<'a> HostsView<'a> {
+        pub(crate) fn decode(b: &'a [u8]) -> Result<Self> {
+            hosts(b)?;
+            Ok(Self(b))
+        }
+        pub(crate) fn observation(&self) -> Result<SourceObservationId> {
+            SourceObservationId::read(n64(self.0, 88))
+        }
+        pub(crate) fn lookup_key(&self) -> Result<&'a str> {
+            std::str::from_utf8(&self.0[128..128 + usize::from(n16(self.0, 110))])
+                .map_err(|_| Error::Schema)
+        }
+        pub(crate) fn member_indices(&self) -> impl Iterator<Item = u16> + '_ {
+            self.0[128 + usize::from(n16(self.0, 110)) + usize::from(n16(self.0, 112))..]
+                .chunks_exact(2)
+                .map(|b| n16(b, 0))
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub(crate) enum Record<'a> {
+        Reserve(View<'a, 35>),
+        Reserved(View<'a, 36>),
+        PhysicalAck(View<'a, 37>),
+        LogicalBind(View<'a, 38>),
+        LogicalAck(View<'a, 39>),
+        Publish(View<'a, 40>),
+        Published(View<'a, 41>),
+        NumericAuthorize(View<'a, 42>),
+        Append(View<'a, 43>),
+        AppendAck(View<'a, 44>),
+        Retire(View<'a, 45>),
+        Retired(View<'a, 46>),
+        Cancel(View<'a, 47>),
+        Canceled(View<'a, 48>),
+        PhysicalBind(View<'a, 52>),
+        WaiterBind(View<'a, 53>),
+        WaiterBound(View<'a, 54>),
+    }
+    impl<'a> Record<'a> {
+        pub(crate) fn decode(op: Operation, b: &'a [u8]) -> Result<Self> {
+            Ok(match op {
+                Operation::Reserve => Self::Reserve(View::decode(b)?),
+                Operation::Reserved => Self::Reserved(View::decode(b)?),
+                Operation::PhysicalAck => Self::PhysicalAck(View::decode(b)?),
+                Operation::LogicalBind => Self::LogicalBind(View::decode(b)?),
+                Operation::LogicalAck => Self::LogicalAck(View::decode(b)?),
+                Operation::Publish => Self::Publish(View::decode(b)?),
+                Operation::Published => Self::Published(View::decode(b)?),
+                Operation::NumericAuthorize => Self::NumericAuthorize(View::decode(b)?),
+                Operation::Append => Self::Append(View::decode(b)?),
+                Operation::AppendAck => Self::AppendAck(View::decode(b)?),
+                Operation::Retire => Self::Retire(View::decode(b)?),
+                Operation::Retired => Self::Retired(View::decode(b)?),
+                Operation::Cancel => Self::Cancel(View::decode(b)?),
+                Operation::Canceled => Self::Canceled(View::decode(b)?),
+                Operation::PhysicalBind => Self::PhysicalBind(View::decode(b)?),
+                Operation::WaiterBind => Self::WaiterBind(View::decode(b)?),
+                Operation::WaiterBound => Self::WaiterBound(View::decode(b)?),
+            })
+        }
+        pub(crate) fn operation(self) -> Operation {
+            match self {
+                Self::Reserve(_) => Operation::Reserve,
+                Self::Reserved(_) => Operation::Reserved,
+                Self::PhysicalAck(_) => Operation::PhysicalAck,
+                Self::LogicalBind(_) => Operation::LogicalBind,
+                Self::LogicalAck(_) => Operation::LogicalAck,
+                Self::Publish(_) => Operation::Publish,
+                Self::Published(_) => Operation::Published,
+                Self::NumericAuthorize(_) => Operation::NumericAuthorize,
+                Self::Append(_) => Operation::Append,
+                Self::AppendAck(_) => Operation::AppendAck,
+                Self::Retire(_) => Operation::Retire,
+                Self::Retired(_) => Operation::Retired,
+                Self::Cancel(_) => Operation::Cancel,
+                Self::Canceled(_) => Operation::Canceled,
+                Self::PhysicalBind(_) => Operation::PhysicalBind,
+                Self::WaiterBind(_) => Operation::WaiterBind,
+                Self::WaiterBound(_) => Operation::WaiterBound,
+            }
+        }
+        pub(crate) fn bytes(self) -> &'a [u8] {
+            match self {
+                Self::Reserve(v) => v.bytes(),
+                Self::Reserved(v) => v.bytes(),
+                Self::PhysicalAck(v) => v.bytes(),
+                Self::LogicalBind(v) => v.bytes(),
+                Self::LogicalAck(v) => v.bytes(),
+                Self::Publish(v) => v.bytes(),
+                Self::Published(v) => v.bytes(),
+                Self::NumericAuthorize(v) => v.bytes(),
+                Self::Append(v) => v.bytes(),
+                Self::AppendAck(v) => v.bytes(),
+                Self::Retire(v) => v.bytes(),
+                Self::Retired(v) => v.bytes(),
+                Self::Cancel(v) => v.bytes(),
+                Self::Canceled(v) => v.bytes(),
+                Self::PhysicalBind(v) => v.bytes(),
+                Self::WaiterBind(v) => v.bytes(),
+                Self::WaiterBound(v) => v.bytes(),
+            }
+        }
+        pub(crate) fn encode(self, out: &mut [u8]) -> Result<usize> {
+            let b = self.bytes();
+            out.get_mut(..b.len())
+                .ok_or(Error::Bounds)?
+                .copy_from_slice(b);
+            Ok(b.len())
+        }
+        fn source_epoch(self) -> Option<u64> {
+            let b = self.bytes();
+            let at = match self.operation() {
+                Operation::Reserve => 48,
+                Operation::Publish => 36,
+                Operation::PhysicalBind => 88,
+                Operation::Reserved | Operation::PhysicalAck | Operation::WaiterBound
+                    if b[2] == 1 =>
+                {
+                    40
+                }
+                Operation::Published if b[2] == 1 => 24,
+                _ => return None,
+            };
+            Some(n64(b, at))
+        }
+    }
+
+    /// Descriptor/ACK matching token — DATA-only, не installed-image proof.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Negotiated {
+        launch: super::LaunchRecord,
+    }
+    impl Negotiated {
+        pub(crate) fn descriptor(launch: super::LaunchRecord) -> Result<[u8; 272]> {
+            let mut b = [0; 272];
+            b[..8].copy_from_slice(b"DNSNEG02");
+            super::put16(&mut b, 8, 2);
+            super::put16(&mut b, 10, 272);
+            b[16..208].copy_from_slice(&launch.encode()?);
+            b[208..240].copy_from_slice(&Sha256::digest(b"YONIK-DNS-V2-CODEC-1\0"));
+            for (at, n) in [
+                (240, 4),
+                (242, 11),
+                (248, 64),
+                (250, 64),
+                (252, 64),
+                (254, 256),
+                (256, 256),
+            ] {
+                super::put16(&mut b, at, n);
+            }
+            super::put32(&mut b, 244, 8388608);
+            Ok(b)
+        }
+        pub(crate) fn ack(descriptor: &[u8]) -> Result<[u8; 40]> {
+            if descriptor.len() != 272 {
+                return Err(Error::Bounds);
+            }
+            let mode = match &descriptor[16..24] {
+                b"YNKLOC01" => super::Mode::Local,
+                b"YNKEXT01" => super::Mode::System,
+                _ => return Err(Error::Schema),
+            };
+            let launch = super::LaunchRecord::decode(&descriptor[16..208], mode)?;
+            if Self::descriptor(launch)?.as_slice() != descriptor {
+                return Err(Error::Binding);
+            }
+            super::extension_ack(b"DNSACK02", descriptor)
+        }
+        pub(crate) fn accept(
+            descriptor: &[u8],
+            ack: &[u8],
+            launch: super::LaunchRecord,
+            ancillary: [(usize, usize); 2],
+        ) -> Result<Self> {
+            if ancillary != [(0, 0); 2]
+                || Self::descriptor(launch)?.as_slice() != descriptor
+                || Self::ack(descriptor)?.as_slice() != ack
+            {
+                return Err(Error::Binding);
+            }
+            Ok(Self { launch })
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub(crate) struct Envelope {
+        pub sequence: u64,
+        pub reply_to: u64,
+        pub binding: super::Binding,
+    }
+    pub(crate) struct DnsFrame<'a> {
+        pub header: Envelope,
+        pub record: Record<'a>,
+    }
+    /// SCM packet имеет собственный identity envelope192, без runtime Header128.
+    pub(crate) struct PhysicalPacket<'a>(View<'a, 52>);
+    impl<'a> PhysicalPacket<'a> {
+        pub(crate) fn decode(
+            bytes: &'a [u8],
+            neg: &Negotiated,
+            rights: usize,
+            credentials: usize,
+        ) -> Result<Self> {
+            if (rights, credentials) != (1, 1) {
+                return Err(Error::Binding);
+            }
+            let view = View::decode(bytes)?;
+            physical_binding(bytes, neg.launch)?;
+            Ok(Self(view))
+        }
+        pub(crate) fn encode(&self, neg: &Negotiated, out: &mut [u8]) -> Result<usize> {
+            physical_binding(self.0.bytes(), neg.launch)?;
+            self.0.encode(out)
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Direction {
+        Producer,
+        Issuer,
+    }
+    impl<'a> DnsFrame<'a> {
+        pub(crate) fn encode(&self, neg: &Negotiated, out: &mut [u8]) -> Result<usize> {
+            let op = self.record.operation();
+            if op == Operation::PhysicalBind {
+                return Err(Error::Schema);
+            }
+            let total = 128 + self.record.bytes().len();
+            if total > 65536 || out.len() < total {
+                return Err(Error::Bounds);
+            }
+            id(self.header.sequence)?;
+            if op.is_reply() {
+                id(self.header.reply_to)?;
+            }
+            if self
+                .record
+                .source_epoch()
+                .is_some_and(|epoch| epoch != neg.launch.binding.epoch)
+            {
+                return Err(Error::Binding);
+            }
+            if op == Operation::PhysicalBind {
+                physical_binding(self.record.bytes(), neg.launch)?;
+            }
+            if self.header.binding != neg.launch.binding
+                || (self.header.reply_to != 0) != op.is_reply()
+            {
+                return Err(Error::Binding);
+            }
+            let mut h = super::Header {
+                kind: super::Kind::Hello,
+                sequence: self.header.sequence,
+                reply_to: self.header.reply_to,
+                binding: self.header.binding,
+                object_id: 0,
+            }
+            .encode(total - 128)?;
+            super::put16(&mut h, 10, op as u16);
+            out[..128].copy_from_slice(&h);
+            self.record.encode(&mut out[128..total])?;
+            Ok(total)
+        }
+        pub(crate) fn decode(
+            bytes: &'a [u8],
+            neg: &Negotiated,
+            direction: Direction,
+            rights: usize,
+            credentials: usize,
+            reply: Option<u64>,
+        ) -> Result<Self> {
+            if !(128..=65536).contains(&bytes.len()) {
+                return Err(Error::Bounds);
+            }
+            let op = Operation::try_from(n16(bytes, 10))?;
+            if op == Operation::PhysicalBind {
+                return Err(Error::Schema);
+            }
+            let from_issuer = direction == Direction::Issuer;
+            if from_issuer != op.is_reply() || (rights, credentials) != op.rights() {
+                return Err(Error::Binding);
+            }
+            if from_issuer {
+                id(reply.ok_or(Error::Binding)?)?;
+            }
+            let mut raw = [0; 128];
+            raw.copy_from_slice(&bytes[..128]);
+            super::put16(&mut raw, 10, super::Kind::Hello as u16);
+            let h = super::Header::decode(&raw, bytes.len())?;
+            if h.binding != neg.launch.binding
+                || h.object_id != 0
+                || h.sequence == u64::MAX
+                || if from_issuer {
+                    reply.is_none() || reply != Some(h.reply_to) || h.reply_to == 0
+                } else {
+                    reply.is_some() || h.reply_to != 0
+                }
+            {
+                return Err(Error::Binding);
+            }
+            let record = Record::decode(op, &bytes[128..])?;
+            if record
+                .source_epoch()
+                .is_some_and(|epoch| epoch != neg.launch.binding.epoch)
+            {
+                return Err(Error::Binding);
+            }
+            if op == Operation::PhysicalBind {
+                physical_binding(record.bytes(), neg.launch)?;
+            }
+            Ok(Self {
+                header: Envelope {
+                    sequence: h.sequence,
+                    reply_to: h.reply_to,
+                    binding: h.binding,
+                },
+                record,
+            })
+        }
+    }
 
     fn n16(b: &[u8], at: usize) -> u16 {
         u16::from_be_bytes([b[at], b[at + 1]])
@@ -58,10 +780,268 @@ mod dns_v2 {
         }
     }
     pub(super) fn preflight(kind: u16, b: &[u8]) -> Result<()> {
+        Operation::try_from(kind)?;
+        if kind == 52 {
+            return physical(b);
+        }
         if b.len() < 8 || n16(b, 0) != 2 {
             return Err(Error::Schema);
         }
         match kind {
+            35 => {
+                if !(96..=1024).contains(&b.len()) {
+                    return Err(Error::Bounds);
+                }
+                if !matches!(b[2], 1..=3) {
+                    return Err(Error::Schema);
+                }
+                zero(&b[3..8])?;
+                zero(&b[86..88])?;
+                if b[2] != 2 {
+                    zero(&b[92..96])?;
+                }
+                id(n64(b, 8))?;
+                id(n64(b, 48))?;
+                lease(n64(b, 56))?;
+                source(b[75], b[74])?;
+                if !matches!(b[76], 6 | 17)
+                    || !matches!(b[77], 1..=3)
+                    || b[79] > 1
+                    || n16(b, 66) == super::NONE
+                    || n16(b, 70) == super::NONE
+                    || !matches!((b[78], b[74]), (1, 1) | (2, 2 | 3))
+                {
+                    return Err(Error::Reference);
+                }
+                let flow = n64(b, 32);
+                let revision = n64(b, 40);
+                if (flow == 0) != (revision == 0)
+                    || b[77] == 1 && flow == 0
+                    || b[77] == 2 && flow != 0
+                {
+                    return Err(Error::Reference);
+                }
+                if flow != 0 {
+                    id(flow)?;
+                    id(revision)?;
+                }
+                let original = usize::from(n16(b, 80));
+                let query = usize::from(n16(b, 82));
+                let base = usize::from(n16(b, 84));
+                if !(1..=253).contains(&original)
+                    || query > 253
+                    || !(1..=1024).contains(&base)
+                    || 96 + original + query + base != b.len()
+                {
+                    return Err(Error::Bounds);
+                }
+                ascii_name(&b[96..96 + original], false)?;
+                if b[75] == 2 {
+                    if b[2] != 3 || n16(b, 64) != super::NONE || n16(b, 72) != 0 || query != 0 {
+                        return Err(Error::Reference);
+                    }
+                    zero(&b[16..32])?;
+                    zero(&b[88..92])?;
+                } else {
+                    id(n64(b, 16))?;
+                    id(n64(b, 24))?;
+                    if n16(b, 64) == super::NONE || !matches!(n16(b, 72), 1 | 28) || query == 0 {
+                        return Err(Error::Reference);
+                    }
+                    ascii_name(&b[96 + original..96 + original + query], true)?;
+                    if b[2] == 2 {
+                        id(n64(b, 88))?;
+                    } else {
+                        let flags = n16(b, 88);
+                        let payload = n16(b, 90);
+                        if flags & !31 != 0
+                            || if flags & 8 == 0 {
+                                payload != 0 || flags & 4 != 0
+                            } else {
+                                !(512..=4096).contains(&payload)
+                            }
+                        {
+                            return Err(Error::Schema);
+                        }
+                    }
+                }
+                if b[2] != 2 && (b[74] == 1) != (n16(b, 68) == super::NONE) {
+                    return Err(Error::Reference);
+                }
+                canonical_base(b[77], &b[96 + original + query..])
+            }
+            36 | 37 | 39 | 44 | 48 => {
+                let size = match kind {
+                    44 => 56,
+                    48 => 32,
+                    _ => 64,
+                };
+                if b.len() != size {
+                    return Err(Error::Bounds);
+                }
+                if !matches!(b[2], 1..=3) {
+                    return Err(Error::Schema);
+                }
+                if b[2] != 1 {
+                    return zero(&b[3..]);
+                }
+                zero(&b[3..8])?;
+                match kind {
+                    36 => {
+                        for at in [8, 16, 40] {
+                            id(n64(b, at))?;
+                        }
+                        lease(n64(b, 48))?;
+                        let bundle = n64(b, 24);
+                        let context = n64(b, 32);
+                        if !matches!(b[60], 1..=3)
+                            || n16(b, 56) > 64
+                            || n16(b, 58) != 1
+                            || (b[60] == 2) == (n16(b, 56) == 0)
+                        {
+                            return Err(Error::Reference);
+                        }
+                        match b[60] {
+                            1 | 2 => {
+                                id(bundle)?;
+                                id(context)?;
+                            }
+                            _ if bundle == 0 => {
+                                id(context)?;
+                                if n16(b, 56) != 0 {
+                                    return Err(Error::Reference);
+                                }
+                            }
+                            _ => {
+                                id(bundle)?;
+                                if context != 0 || n16(b, 56) != 0 {
+                                    return Err(Error::Reference);
+                                }
+                            }
+                        }
+                        zero(&b[61..64])
+                    }
+                    37 => {
+                        for at in [8, 16, 24, 32, 40] {
+                            id(n64(b, at))?;
+                        }
+                        lease(n64(b, 48))?;
+                        zero(&b[56..64])
+                    }
+                    39 => {
+                        for at in [8, 16, 24, 32] {
+                            id(n64(b, at))?;
+                        }
+                        if n64(b, 40) != 1
+                            || !(1..=64).contains(&n16(b, 56))
+                            || !matches!(b[58], 1 | 2)
+                            || b[58] == 1 && n16(b, 56) != 1
+                        {
+                            return Err(Error::Reference);
+                        }
+                        lease(n64(b, 48))?;
+                        zero(&b[59..64])
+                    }
+                    44 => {
+                        for at in [8, 16, 24, 32] {
+                            id(n64(b, at))?;
+                        }
+                        if n64(b, 32) < 2 || !(1..=64).contains(&n16(b, 48)) {
+                            return Err(Error::Reference);
+                        }
+                        lease(n64(b, 40))?;
+                        zero(&b[50..56])
+                    }
+                    _ => {
+                        id(n64(b, 8))?;
+                        id(n64(b, 16))?;
+                        zero(&b[24..32])
+                    }
+                }
+            }
+            38 | 43 => {
+                let fixed = if kind == 38 { 64 } else { 48 };
+                if b.len() < fixed {
+                    return Err(Error::Bounds);
+                }
+                let count = usize::from(n16(b, 4));
+                if !(1..=64).contains(&count) || b.len() != fixed + 8 * count {
+                    return Err(Error::Bounds);
+                }
+                zero(&b[6..8])?;
+                if kind == 38 {
+                    if !matches!(b[2], 1 | 2) || b[2] == 1 && count != 1 {
+                        return Err(Error::Schema);
+                    }
+                    zero(&b[3..4])?;
+                    for at in [8, 16, 24, 32, 48] {
+                        id(n64(b, at))?;
+                    }
+                    lease(n64(b, 56))?;
+                    if n64(b, 40) != 0 {
+                        id(n64(b, 40))?;
+                    }
+                } else {
+                    zero(&b[2..4])?;
+                    for at in [8, 16, 24, 32] {
+                        id(n64(b, at))?;
+                    }
+                    lease(n64(b, 40))?;
+                }
+                unique_ids(&b[fixed..])
+            }
+            42 => {
+                if !(16..=1063).contains(&b.len()) {
+                    return Err(Error::Bounds);
+                }
+                if n16(b, 2) >= 256 {
+                    return Err(Error::Bounds);
+                }
+                id(n64(b, 4))?;
+                let base = usize::from(n16(b, 12));
+                if !(1..=1024).contains(&base) || 16 + base > b.len() || !matches!(b[14], 1 | 2) {
+                    return Err(Error::Bounds);
+                }
+                canonical_base(b[15], &b[16..16 + base])?;
+                numeric_destination(&b[16 + base..]).map(|_| ())
+            }
+            45 | 47 => {
+                if b.len() != 24 {
+                    return Err(Error::Bounds);
+                }
+                zero(&b[3..8])?;
+                id(n64(b, 8))?;
+                if kind == 45 {
+                    retire_target(b[2], n64(b, 16))
+                } else {
+                    if !matches!(b[2], 1..=7) {
+                        return Err(Error::Schema);
+                    }
+                    zero(&b[18..24])
+                }
+            }
+            46 => {
+                if b.len() != 40 || !matches!(b[2], 1..=3) {
+                    return Err(Error::Bounds);
+                }
+                if b[2] == 2 {
+                    return zero(&b[3..]);
+                }
+                zero(&b[4..8])?;
+                zero(&b[29..32])?;
+                id(n64(b, 8))?;
+                retire_target(b[3], n64(b, 16))?;
+                let pending = n16(b, 24);
+                let duplicates = n16(b, 26);
+                if pending > 64
+                    || duplicates > 64
+                    || b[28] > 1
+                    || b[2] == 1 && (pending != 0 || duplicates != 0 || b[28] != 1)
+                {
+                    return Err(Error::Reference);
+                }
+                Ok(())
+            }
             53 => {
                 if b.len() != 64 {
                     return Err(Error::Bounds);
@@ -72,6 +1052,11 @@ mod dns_v2 {
                 }
                 if (n64(b, 40) == 0) != (n64(b, 48) == 0) {
                     return Err(Error::Reference);
+                }
+                for at in [24, 40, 48] {
+                    if n64(b, at) != 0 {
+                        id(n64(b, at))?;
+                    }
                 }
                 lease(n64(b, 56))
             }
@@ -100,7 +1085,10 @@ mod dns_v2 {
                     zero(&b[60..64])
                 } else {
                     id(n64(b, 24))?;
-                    if n64(b, 32) == 0 || !(1..=256).contains(&n16(b, 40)) {
+                    if n64(b, 32) == 0
+                        || n64(b, 32) > u64::from(u32::MAX) * 1_000_000_000
+                        || !(1..=256).contains(&n16(b, 40))
+                    {
                         return Err(Error::Bounds);
                     }
                     zero(&b[42..48])
@@ -168,6 +1156,20 @@ mod dns_v2 {
                     if b[136] == 1 && (n16(b, 8) != u16::MAX || n16(b, 140) != u16::MAX) {
                         return Err(Error::Reference);
                     }
+                    if n16(b, 4) == super::NONE
+                        || n16(b, 6) == super::NONE
+                        || b[136] == 2 && (n16(b, 8) == super::NONE || n16(b, 140) == super::NONE)
+                    {
+                        return Err(Error::Reference);
+                    }
+                    if b[76..108].iter().all(|v| *v == 0) != b[44..76].iter().all(|v| *v == 0) {
+                        return Err(Error::Binding);
+                    }
+                    if b[136] == 2
+                        && (b[44..76].iter().all(|v| *v == 0) || b[76..108].iter().all(|v| *v == 0))
+                    {
+                        return Err(Error::Binding);
+                    }
                     // Strict DNS/question/RR validation выполняет issuer после
                     // DATA preflight, до receipt/durable numeric admission.
                     Ok(())
@@ -175,6 +1177,127 @@ mod dns_v2 {
             }
             _ => Err(Error::Schema),
         }
+    }
+    fn ascii_name(b: &[u8], lower: bool) -> Result<()> {
+        let name = std::str::from_utf8(b).map_err(|_| Error::Schema)?;
+        super::resolver_name(name, false, lower)
+    }
+    fn unique_ids(b: &[u8]) -> Result<()> {
+        let count = b.len() / 8;
+        let mut ids = [0; 64];
+        if count > 64 || b.len() % 8 != 0 {
+            return Err(Error::Bounds);
+        }
+        for (i, slot) in ids[..count].iter_mut().enumerate() {
+            *slot = n64(b, i * 8);
+            id(*slot)?;
+        }
+        ids[..count].sort_unstable();
+        if ids[..count].windows(2).any(|p| p[0] == p[1]) {
+            return Err(Error::Reference);
+        }
+        Ok(())
+    }
+    fn canonical_base(class: u8, b: &[u8]) -> Result<()> {
+        if b.len() == 8 && matches!(class, 2 | 3) {
+            if !matches!(super::Message::decode(super::Kind::Probe,b)?,super::Message::Probe{purpose,..} if purpose==if class==2 {1}else{2})
+            {
+                return Err(Error::Reference);
+            }
+            Ok(())
+        } else {
+            if !matches!(class, 1 | 3)
+                || !matches!(super::Message::decode(super::Kind::Authorize,b)?,super::Message::Authorize(a) if a.class==class)
+            {
+                return Err(Error::Reference);
+            }
+            Ok(())
+        }
+    }
+    fn numeric_destination(b: &[u8]) -> Result<u8> {
+        if b.len() < 7 || !matches!(b[1], 6 | 17) || n16(b, 2) == 0 {
+            return Err(Error::Schema);
+        }
+        zero(&b[5..7])?;
+        let n = match b[0] {
+            4 => 4,
+            6 => 16,
+            _ => return Err(Error::Schema),
+        };
+        if usize::from(b[4]) != n || b.len() != 7 + n {
+            return Err(Error::Bounds);
+        }
+        match b[0] {
+            4 => {
+                let ip = std::net::Ipv4Addr::from(
+                    <[u8; 4]>::try_from(&b[7..]).map_err(|_| Error::Bounds)?,
+                );
+                if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
+                    return Err(Error::Schema);
+                }
+            }
+            _ => {
+                let ip = std::net::Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&b[7..]).map_err(|_| Error::Bounds)?,
+                );
+                if ip.is_unspecified() || ip.is_multicast() || ip.to_ipv4_mapped().is_some() {
+                    return Err(Error::Schema);
+                }
+            }
+        }
+        Ok(b[1])
+    }
+    fn retire_target(target: u8, revision: u64) -> Result<()> {
+        match target {
+            3 if revision == 0 => Ok(()),
+            4 => id(revision),
+            _ => Err(Error::Reference),
+        }
+    }
+    fn physical(b: &[u8]) -> Result<()> {
+        if b.len() != 192 || &b[..8] != b"DNSPHY02" || n16(b, 8) != 2 || n16(b, 10) != 192 {
+            return Err(Error::Bounds);
+        }
+        zero(&b[12..16])?;
+        zero(&b[167..168])?;
+        for range in [16..48, 48..64, 64..80, 96..128] {
+            if b[range].iter().all(|v| *v == 0) {
+                return Err(Error::Binding);
+            }
+        }
+        for at in [80, 88, 128, 136, 144, 152] {
+            id(n64(b, at))?;
+        }
+        if n16(b, 160) == super::NONE
+            || n16(b, 162) == super::NONE
+            || !matches!(b[166], 1 | 2)
+            || !matches!((b[164], b[165]), (6, 1) | (17, 2 | 3))
+        {
+            return Err(Error::Reference);
+        }
+        let n = match b[168] {
+            4 => 11,
+            6 => 23,
+            _ => return Err(Error::Schema),
+        };
+        if numeric_destination(&b[168..168 + n])? != b[164] {
+            return Err(Error::Binding);
+        }
+        zero(&b[168 + n..192])
+    }
+    fn physical_binding(b: &[u8], launch: super::LaunchRecord) -> Result<()> {
+        let binding = launch.binding;
+        if b[16..48] != binding.digest
+            || b[48..64] != binding.session
+            || b[64..80] != binding.invocation
+            || n64(b, 80) != binding.generation
+            || n64(b, 88) != binding.epoch
+            || b[96..128] != launch.nonce
+            || b[166] != launch.mode as u8
+        {
+            return Err(Error::Binding);
+        }
+        Ok(())
     }
     fn hosts(b: &[u8]) -> Result<()> {
         if !(130..=666).contains(&b.len())
@@ -210,6 +1333,17 @@ mod dns_v2 {
         for (start, length) in [(128, key), (128 + key, original)] {
             let name = std::str::from_utf8(&b[start..start + length]).map_err(|_| Error::Schema)?;
             super::resolver_name(name, false, start == 128)?;
+        }
+        let original_bytes = &b[128 + key..128 + key + original];
+        let rooted = original_bytes.contains(&b'.') && original_bytes.last() != Some(&b'.');
+        if original + usize::from(rooted) != key
+            || !original_bytes
+                .iter()
+                .zip(&b[128..128 + original])
+                .all(|(a, c)| a.to_ascii_lowercase() == *c)
+            || rooted && b[128 + key - 1] != b'.'
+        {
+            return Err(Error::Binding);
         }
         let mut previous = None;
         for pair in b[128 + key + original..].chunks_exact(2) {
@@ -1046,7 +2180,7 @@ impl Header {
         let kind_number = r.u16()?;
         // Legacy Header не выдаёт DNS_V2 negotiation. Новые kinds не могут
         // пройти через старый runtime decoder даже с корректным DATA body.
-        if matches!(kind_number, 40 | 41 | 53 | 54) {
+        if dns_v2::Operation::try_from(kind_number).is_ok() {
             return Err(Error::Schema);
         }
         let kind = Kind::try_from(kind_number)?;
@@ -3765,7 +4899,7 @@ impl<'a> Frame<'a> {
     ) -> Result<Self> {
         if bytes.len() >= HEADER {
             let kind = u16::from_be_bytes([bytes[10], bytes[11]]);
-            if matches!(kind, 40 | 41 | 53 | 54) {
+            if dns_v2::Operation::try_from(kind).is_ok() {
                 dns_v2::preflight(kind, &bytes[HEADER..])?;
                 return Err(Error::Schema);
             }
@@ -3870,6 +5004,343 @@ impl Sequence {
 
 #[cfg(test)]
 mod tests {
+    fn dns_v2_hex(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect()
+    }
+    fn dns_v2_fields(out: &mut [u8], fields: &serde_json::Value) {
+        for f in fields.as_array().unwrap() {
+            let at = f[0].as_u64().unwrap() as usize;
+            let bytes = match f[1].as_str().unwrap() {
+                "hex" => dns_v2_hex(f[2].as_str().unwrap()),
+                "fill" => vec![f[2][0].as_u64().unwrap() as u8; f[2][1].as_u64().unwrap() as usize],
+                "u8" => vec![f[2].as_u64().unwrap() as u8],
+                "u16" => (f[2].as_u64().unwrap() as u16).to_be_bytes().to_vec(),
+                "u32" => (f[2].as_u64().unwrap() as u32).to_be_bytes().to_vec(),
+                "u64" => f[2].as_u64().unwrap().to_be_bytes().to_vec(),
+                _ => panic!("Неизвестный fixture field type"),
+            };
+            out[at..at + bytes.len()].copy_from_slice(&bytes);
+        }
+    }
+    fn dns_v2_corpus() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/dns-v2-canonical.json"
+        ))
+        .unwrap()
+    }
+    #[test]
+    fn dns_v2_canonical_all_operations_roundtrip_stdlib_goldens() {
+        use super::dns_v2::{
+            Direction, DnsFrame, Envelope, Negotiated, Operation, PhysicalPacket, Record,
+        };
+        let corpus = dns_v2_corpus();
+        for (i, v) in corpus["vectors"].as_array().unwrap().iter().enumerate() {
+            let name = v["name"].as_str().unwrap();
+            let kind = v["kind"].as_u64().unwrap() as u16;
+            let op = Operation::try_from(kind).unwrap();
+            let mut body = vec![0; v["size"].as_u64().unwrap() as usize];
+            dns_v2_fields(&mut body, &v["fields"]);
+            if let Some(hex) = v["bodyHex"].as_str() {
+                assert_eq!(body, dns_v2_hex(hex), "{name}");
+            }
+            assert_eq!(
+                super::Sha256::digest(&body).as_slice(),
+                dns_v2_hex(v["bodySha256"].as_str().unwrap()),
+                "{name}"
+            );
+            let record = Record::decode(op, &body).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let mut output = vec![0xaa; body.len() + 8];
+            assert_eq!(record.encode(&mut output).unwrap(), body.len());
+            assert_eq!(&output[..body.len()], body.as_slice());
+            assert_eq!(&output[body.len()..], &[0xaa; 8]);
+            assert!(record.encode(&mut output[..body.len() - 1]).is_err());
+            for len in 0..body.len() {
+                assert!(
+                    Record::decode(op, &body[..len]).is_err(),
+                    "{name} trunc {len}"
+                );
+            }
+            let mut trailing = body.clone();
+            trailing.push(0);
+            assert!(Record::decode(op, &trailing).is_err(), "{name} trailing");
+            let mode = super::Mode::try_from(v["mode"].as_u64().unwrap() as u8).unwrap();
+            let n = &corpus["negotiations"][v["mode"].as_u64().unwrap() as usize - 1];
+            let launch =
+                super::LaunchRecord::decode(&dns_v2_hex(n["launchHex"].as_str().unwrap()), mode)
+                    .unwrap();
+            let descriptor = dns_v2_hex(n["descriptorHex"].as_str().unwrap());
+            let ack = dns_v2_hex(n["ackHex"].as_str().unwrap());
+            let neg = Negotiated::accept(&descriptor, &ack, launch, [(0, 0); 2]).unwrap();
+            if kind == 52 {
+                let proof = PhysicalPacket::decode(&body, &neg, 1, 1).unwrap();
+                let mut packet = vec![0; 192];
+                assert_eq!(proof.encode(&neg, &mut packet).unwrap(), 192);
+                assert_eq!(packet, dns_v2_hex(v["frameHex"].as_str().unwrap()));
+                assert_eq!(
+                    super::Sha256::digest(&packet).as_slice(),
+                    dns_v2_hex(v["frameSha256"].as_str().unwrap())
+                );
+                assert!(PhysicalPacket::decode(&packet, &neg, 0, 0).is_err());
+                assert!(PhysicalPacket::decode(&packet, &neg, 2, 1).is_err());
+                assert!(PhysicalPacket::decode(&packet, &neg, 1, 2).is_err());
+                for len in 0..192 {
+                    assert!(PhysicalPacket::decode(&packet[..len], &neg, 1, 1).is_err());
+                }
+                assert!(super::Frame::decode(&packet, launch.binding, mode, false).is_err());
+                assert!(
+                    DnsFrame {
+                        header: Envelope {
+                            sequence: 1,
+                            reply_to: 0,
+                            binding: launch.binding
+                        },
+                        record
+                    }
+                    .encode(&neg, &mut vec![0; 320])
+                    .is_err()
+                );
+                continue;
+            }
+            let issuer = op.is_reply();
+            let reply = issuer.then_some(9);
+            let frame = DnsFrame {
+                header: Envelope {
+                    sequence: 100 + i as u64,
+                    reply_to: reply.unwrap_or(0),
+                    binding: launch.binding,
+                },
+                record,
+            };
+            let mut packet = vec![0; 128 + body.len()];
+            frame.encode(&neg, &mut packet).unwrap();
+            if let Some(hex) = v["frameHex"].as_str() {
+                assert_eq!(packet, dns_v2_hex(hex), "{name}");
+            }
+            assert_eq!(
+                super::Sha256::digest(&packet).as_slice(),
+                dns_v2_hex(v["frameSha256"].as_str().unwrap()),
+                "{name}"
+            );
+            let direction = if issuer {
+                Direction::Issuer
+            } else {
+                Direction::Producer
+            };
+            let (rights, credentials) = op.rights();
+            let decoded =
+                DnsFrame::decode(&packet, &neg, direction, rights, credentials, reply).unwrap();
+            assert_eq!(decoded.record.operation(), op);
+            assert_eq!(decoded.record.bytes(), body);
+            assert!(
+                super::Frame::decode(&packet, launch.binding, mode, issuer).is_err(),
+                "legacy {name}"
+            );
+            for (at, value) in [
+                (0, 0),
+                (8, 1),
+                (12, 255),
+                (16, 0),
+                (32, 255),
+                (112, 1),
+                (120, 1),
+            ] {
+                let mut bad = packet.clone();
+                bad[at] = value;
+                if bad != packet {
+                    assert!(
+                        DnsFrame::decode(&bad, &neg, direction, rights, credentials, reply)
+                            .is_err(),
+                        "{name} header {at}"
+                    );
+                }
+            }
+            assert!(
+                DnsFrame::decode(&packet, &neg, direction, rights + 1, credentials, reply).is_err()
+            );
+            assert!(
+                DnsFrame::decode(&packet, &neg, direction, rights, credentials + 1, reply).is_err()
+            );
+            if issuer {
+                assert!(
+                    DnsFrame::decode(&packet, &neg, direction, rights, credentials, Some(10))
+                        .is_err()
+                );
+            }
+            if kind == 52 {
+                assert!(DnsFrame::decode(&packet, &neg, direction, 0, 0, reply).is_err());
+            }
+        }
+    }
+    #[test]
+    fn dns_v2_descriptor_exact_binding_ack_rights_and_no_downgrade() {
+        use super::dns_v2::Negotiated;
+        let corpus = dns_v2_corpus();
+        for n in corpus["negotiations"].as_array().unwrap() {
+            let mode = super::Mode::try_from(n["mode"].as_u64().unwrap() as u8).unwrap();
+            let launch =
+                super::LaunchRecord::decode(&dns_v2_hex(n["launchHex"].as_str().unwrap()), mode)
+                    .unwrap();
+            let d = dns_v2_hex(n["descriptorHex"].as_str().unwrap());
+            let ack = dns_v2_hex(n["ackHex"].as_str().unwrap());
+            assert_eq!(Negotiated::descriptor(launch).unwrap().as_slice(), d);
+            assert_eq!(Negotiated::ack(&d).unwrap().as_slice(), ack);
+            for len in 0..d.len() {
+                assert!(Negotiated::ack(&d[..len]).is_err());
+            }
+            for at in [
+                0, 8, 10, 12, 16, 208, 240, 242, 244, 248, 250, 252, 254, 256, 258, 271,
+            ] {
+                let mut bad = d.clone();
+                bad[at] ^= 1;
+                assert!(
+                    Negotiated::accept(&bad, &ack, launch, [(0, 0); 2]).is_err(),
+                    "descriptor {at}"
+                );
+            }
+            for at in 0..40 {
+                let mut bad = ack.clone();
+                bad[at] ^= 1;
+                assert!(Negotiated::accept(&d, &bad, launch, [(0, 0); 2]).is_err());
+            }
+            for a in [
+                [(1, 0), (0, 0)],
+                [(0, 1), (0, 0)],
+                [(0, 0), (1, 0)],
+                [(0, 0), (0, 1)],
+            ] {
+                assert!(Negotiated::accept(&d, &ack, launch, a).is_err());
+            }
+            let mut other = launch;
+            other.manifest[0] ^= 1;
+            assert!(Negotiated::accept(&d, &ack, other, [(0, 0); 2]).is_err());
+            assert!(super::Frame::decode(&d, launch.binding, mode, true).is_err());
+        }
+    }
+    #[test]
+    fn dns_v2_negative_corpus_bounds_reserved_counts_and_typed_namespaces() {
+        use super::dns_v2::{Operation, Record, SnapshotRoleView, View};
+        let corpus = dns_v2_corpus();
+        for rejected in corpus["rejectedBodies"].as_array().unwrap() {
+            let case = corpus["vectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == rejected["case"])
+                .unwrap();
+            let mut body = vec![0; case["size"].as_u64().unwrap() as usize];
+            dns_v2_fields(&mut body, &case["fields"]);
+            dns_v2_fields(&mut body, &rejected["patches"]);
+            body.resize(
+                body.len() + rejected["appendZeroBytes"].as_u64().unwrap() as usize,
+                0,
+            );
+            assert!(
+                Record::decode(
+                    Operation::try_from(case["kind"].as_u64().unwrap() as u16).unwrap(),
+                    &body
+                )
+                .is_err(),
+                "{rejected}"
+            );
+        }
+        for row in corpus["snapshotRows"].as_array().unwrap() {
+            let bytes = dns_v2_hex(row["hex"].as_str().unwrap());
+            let view = SnapshotRoleView::decode(4, &bytes).unwrap();
+            let flags = row["flags"].as_u64().unwrap();
+            assert_eq!(view.application(), flags & 2 != 0);
+            assert_eq!(view.bootstrap(), flags & 4 != 0);
+            assert_eq!(view.asset_reference().flags, u32::from(flags & 1 != 0));
+            assert!(SnapshotRoleView::decode(3, &bytes).is_err());
+            for f in [0, 1, 8, 255] {
+                let mut bad = bytes.clone();
+                bad[75] = f;
+                assert!(SnapshotRoleView::decode(4, &bad).is_err());
+            }
+        }
+        for n in [0, 1, 34, 49, 50, 51, 55, 65535] {
+            assert!(Operation::try_from(n).is_err());
+        }
+        let mut waiter = [0; 64];
+        waiter[1] = 2;
+        for (at, value) in [(8, 72u64), (16, 71), (32, 73), (56, 1000)] {
+            waiter[at..at + 8].copy_from_slice(&value.to_be_bytes());
+        }
+        let producer = View::<53>::decode(&waiter).unwrap().producer().unwrap();
+        assert_eq!(producer.get(), 71);
+        // ProducerRRsetId не имеет implicit conversion в WaiterReceiptId;
+        // отдельный getter выдаёт только typed id из WaiterBound/Numeric.
+        let numeric = corpus["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "numeric-class-1-use-1")
+            .unwrap();
+        let body = dns_v2_hex(numeric["bodyHex"].as_str().unwrap());
+        assert_eq!(
+            View::<42>::decode(&body).unwrap().waiter().unwrap().get(),
+            74
+        );
+    }
+    #[test]
+    fn dns_v2_negative_frames_exact_pending_launch_epoch_and_ancillary() {
+        use super::dns_v2::{Direction, DnsFrame, Negotiated, Operation, PhysicalPacket};
+        let corpus = dns_v2_corpus();
+        let n = &corpus["negotiations"][0];
+        let launch = super::LaunchRecord::decode(
+            &dns_v2_hex(n["launchHex"].as_str().unwrap()),
+            super::Mode::Local,
+        )
+        .unwrap();
+        let neg = Negotiated::accept(
+            &dns_v2_hex(n["descriptorHex"].as_str().unwrap()),
+            &dns_v2_hex(n["ackHex"].as_str().unwrap()),
+            launch,
+            [(0, 0); 2],
+        )
+        .unwrap();
+        for rejected in corpus["rejectedFrames"].as_array().unwrap() {
+            let v = corpus["vectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == rejected["case"])
+                .unwrap();
+            let mut frame = dns_v2_hex(v["frameHex"].as_str().unwrap());
+            dns_v2_fields(&mut frame, &rejected["patches"]);
+            let op = Operation::try_from(v["kind"].as_u64().unwrap() as u16).unwrap();
+            let (r, c) = op.rights();
+            let r = rejected["rights"].as_u64().map_or(r, |n| n as usize);
+            let c = rejected["credentials"].as_u64().map_or(c, |n| n as usize);
+            if op == Operation::PhysicalBind {
+                assert!(
+                    PhysicalPacket::decode(&frame, &neg, r, c).is_err(),
+                    "{rejected}"
+                );
+                continue;
+            }
+            assert!(
+                DnsFrame::decode(
+                    &frame,
+                    &neg,
+                    if op.is_reply() {
+                        Direction::Issuer
+                    } else {
+                        Direction::Producer
+                    },
+                    r,
+                    c,
+                    op.is_reply().then_some(9)
+                )
+                .is_err(),
+                "{rejected}"
+            );
+        }
+    }
     #[test]
     fn dns_v2_hosts_requires_nonzero_snapshot_identity() {
         let mut b = vec![0; 144 + 138];

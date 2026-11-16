@@ -1,5 +1,143 @@
 # DNS_V2: согласованный HostsSnapshot wire tail
 
+## Canonical operation envelope и negotiation
+
+Все integers BE. DATA codec не создаёт authority. Runtime Header128 остаётся YNKCAP01
+version1 с exact launch binding; это не frozen ABI260 role frame. DNS_V2 kinds:
+35 Reserve,36 Reserved,37 PhysicalAck,38 LogicalBind,39 LogicalAck,40 Publish,
+41 Published,42 NumericAuthorize,43 Append,44 AppendAck,45 Retire,46 Retired,
+47 Cancel,48 Canceled,52 PhysicalBind,53 WaiterBind,54 WaiterBound.
+Requests35/38/40/42/43/45/47/53 идут producer→issuer, ACK идут обратно;
+PhysicalBind52 — producer→issuer на proof channel: ровно raw DNSPHY02/192,
+БЕЗ runtime Header128. Число52 — enum/corpus discriminator, не поле этого
+proof packet. Runtime decoder отвергает wrapped Header128+PhysicalBind.
+Runtime rights/credentials0;
+PhysicalBind ровно1 rights+1 credentials. Truncation/лишние rights — отказ;
+закрытие unexpected FD остаётся обязанностью receiver, не borrowed DATA codec.
+objectId=0, sequence ненулевой/nonMAX; request.reply=0, ACK.reply ненулевой и
+сравнивается с exact pending sequence, без публикации на duplicate/late ACK.
+
+Descriptor272: magic DNSNEG02@0, version u16=2@8, length u16=272@10,
+flags u32=0@12; exact encoded LaunchRecord192@16; schemaHash32@208;
+mapping u16=4@240, tables u16=11@242, aggregate u32=8388608@244,
+FD u16=64@248,pending u16=64@250,resources u16=64@252,
+RRmembers u16=256@254,history u16=256@256,reserved14=0@258.
+schemaHash=SHA256 ASCII `YONIK-DNS-V2-CODEC-1` + один NUL byte. После первого
+canonical commit изменение field/offset/семантики требует нового CODEC-N/hash;
+этот identifier нельзя переиспользовать для несовместимого parser.
+ACK40 = ASCII DNSACK02 + SHA256 exact Descriptor272. Descriptor и ACK rights0.
+Codec negotiation token — только DATA matching; issuer обязан независимо
+проверить protected producer/launch/manifest и собственную readiness.
+Missing token, wrong version/schema/mapping/caps/launch/hash → deny, без V1
+fallback. Legacy Frame decoder отвергает весь DNS kind set и descriptor magic.
+
+## Routine bounded records
+
+Common request prefix8: version u16=2@0, flags/reserved bytes2..7=0, кроме
+явно перечисленных fields. Common ACK prefix8: version u16=2@0,status u8@2
+(Allow1/Deny2/Unknown3), bytes3..7=0. Deny/Unknown ACK bytes3..end=0, кроме
+Retired Unknown, где разрешён exact custody report, описанный ниже.
+
+Reserve fixed96 + original/query/base: role u8@2 (Exchange1/Physical2/Waiter3),
+zero bytes3..7; queryId8,bundleId16,serviceGrantId24,
+sourceFlowId32,sourceFlowRevision40,sourceEpoch48,remainingNs56 (все u64);
+resolverRow u16@64,subject66,endpoint68,scope70,qtype72;
+purpose/sourceKind/carrier/parentClass/use/branch u8@74/75/76/77/78/79;
+originalLen/queryLen/baseLen u16@80/82/84,zero u16@86;
+Для Exchange/Waiter: queryOptions u16@88 (RD/CD/DO/EDNS/AD bits0..4),
+udpPayload u16@90,zero u32@92. Для Physical эти8 bytes — nonzero
+parentExchangeReservationId u64@88, options берутся из retained parent.
+Затем exact original bytes, canonical query bytes, canonical base.
+Total≤1024; original1..253,query0..253,base1..1024; все суммы до allocation.
+Network source: query>0,qtype1/28,bundle/grant nonzero,resolver!=FFFF.
+Hosts только role3: purpose3/source2,qtype0,resolverFFFF,
+bundle/grant/queryLen/options/payload0.
+EDNS absent → udpPayload0/DO0; EDNS present → payload512..4096.
+FlowId/revision оба0 либо обаnonzero; parentClass1 требует flow, class2 flow0;
+class3 допускает user-DNS либо service flow0. use1 только purpose1; use2 только
+purpose2/3. Branch0/1, carrier6/17, scope/subject!=FFFF, original immutable.
+Provider endpointFFFF; bootstrap endpoint!=FFFF. В Physical role endpoint/scope/
+carrier — actual physical frontier (Direct DNS может иметь endpointFFFF);
+issuer выводит его из parent bundle/graph, а не принимает индекс как proof.
+Canonical base ниже. Для query существует не больше одного Exchange role;
+Physical reservations и waiter-only reservations ссылаются на собственную
+live authority, не создают новый logical exchange под тем же query.
+
+Reserved64: reservationId8,queryId16,bundleId24,contextId32,
+sourceEpoch40,remainingNs48 u64; physicalCredits u16@56,pendingCredits u16@58,
+role u8@60 (echo Reserve.role),reserved3@61. Allow pendingCredits1;
+Exchange: bundle/context nonzero, contextId=issuer-issued ExchangeId,
+physicalCredits0. Physical: bundle/context nonzero, contextId=exact retained
+parentExchangeReservationId, physicalCredits1..64 (все оплаченные FD credits,
+включая necessary scratch/namespace; capacity не обещает64 resources).
+Waiter network: bundle nonzero/context0/physicalCredits0; Waiter Hosts:
+bundle0/context=SourceObservationId nonzero/physicalCredits0.
+Observation выдаётся issuer только после retained-source revalidation и хранит
+полный binding; Reserve не принимает child observation ID.
+
+PhysicalBind192 — точный R31 DNSPHY02 record. Numeric first-hop Destination
+ниже, zero padding до24. PhysicalAck64: physicalReservationId8,
+PhysicalResourceId16,queryId24,bundleId32,sourceEpoch40,remainingNs48 u64,
+reserved8@56. ACK не разрешает DNS send без LogicalBind ACK. Header.reply
+PhysicalAck совпадает с pending Physical Reserve35.sequence: после Reserved36
+этот pending переходит в waiting-SCM/PhysicalAck, не освобождается и не создаёт
+второй pending slot. PhysicalBind.physicalReservation связывает его с этим
+runtime request без добавления sequence/Header в raw192. Parent exchange
+reservation/query/bundle/epoch/path сверяются независимо. Duplicate Reserved,
+late SCM/ACK и lost/ambiguous ACK не создают новую reservation/retry authority.
+
+LogicalBind64+8N: version u16@0=2,kind u8@2(Direct1/Proxy2),flags0@3,
+count u16@4=1..64,zero u16@6; reservation/query/bundle/exchange/stubBind/
+producerSequence/remainingNs u64@8/16/24/32/40/48/56; ordered distinct
+PhysicalResourceIds@64. Direct count1; Proxy count1..64. stubBind0 только
+nonloopback (проверяет issuer по retained resolver). LogicalAck64:
+exchangeId8,TransportProofId16,queryId24,bundleId32,revision40=1,
+remainingNs48 u64; count u16@56=1..64,kind u8@58=1/2,zero5@59.
+
+Append — точный R31 fixed48+8N. AppendAck56: exchangeId8,TransportProofId16,
+appendSequence24,newRevision32,remainingNs40 u64; totalCount u16@48=1..64,
+reserved6@50. Allow newRevision>=2. Sequence/revision match и union uniqueness
+между revisions проверяет issuer; codec проверяет distinct текущего vector.
+
+Retire24: version u16@0=2,target u8@2(Resource3/Proof4),flags0@3,zero4@4;
+id u64@8,revision u64@16 (Resource0,Proof nonzero). Retired40: version u16=2,
+status u8@2,target u8@3,zero4@4,id8,revision16 u64,pending u16@24,
+duplicates u16@26,joined u8@28,zero3@29,watermark u64@32. Allow требует
+pending=duplicates=0/joined1; Unknown3 допускает counts0..64/joined0/1,
+удерживает custody, не KnownClosed. Deny2 bytes3..39=0. watermark не является
+compaction proof или разрешением reuse IDs; history256 остаётся ограничением.
+
+Cancel24: version u16=2,target u8@2,flags0@3,zero4@4,id u64@8,
+reason u16@16,zero6@18. Targets1RequestSequence/2Exchange/3Resource/4Proof/
+5ProducerRRset/6WaiterReceipt/7Reservation. Cancel reservation отзывает её
+pending observation; отдельного child-issued observation ACK/cancel namespace
+нет. Canceled32: common ACK,id u64@8,watermark u64@16,zero8@24.
+Allow id/watermark nonzero; Deny/Unknown bytes3..31=0. Ownership, cleanup,
+sibling isolation и bounded tombstones проверяются issuer, не codec.
+
+## Canonical base и numeric Destination
+
+NumericAuthorize42 — exact root prefix16, WaiterReceiptId u64@4.
+Reply — existing GRANT19/56 с existing Frame decoder, exact pending42 и
+сохранением parent class/required/fresh owner rules. Новый DNS ACK не добавляется;
+private use/binding остаются в issuer/grant context, не в выдуманном tail GRANT.
+Canonical base по parentClass1:
+existing AUTHORIZE class1; parentClass2: exact PROBE8 purpose1; parentClass3:
+existing AUTHORIZE class3 либо exact PROBE8 purpose2 (service/bootstrap flow0).
+Base type определяется parentClass и length8 для PROBE; arbitrary raw config
+не является base. Codec проверяет syntax, issuer — immutable source/path/class.
+Reserve использует те же canonical base формы.
+
+DNS_V2 numeric Destination — собственная compact encoding (не изменение
+legacy Destination8): family u8@0=4/6,carrier u8@1=6/17,port u16@2 nonzero,
+addressLen u8@4=4/16,reserved u16@5=0,raw address@7. Total11/23 bytes.
+Domains, mapped/unspecified/multicast/broadcast forbidden. Loopback/private
+numeric data не доказывают mandatory route/stub eligibility. PhysicalBind
+дополняет encoding нулями до24. NumericAuthorize total≤1063, no trailing bytes.
+use1 LogicalDestination не принимает Bootstrap; use2 PhysicalFirstHop требует
+полного BootstrapBinding/epoch/member/actual carrier, issuer проверяет их до
+durable install/GRANT. Codec не создаёт grant на основании member/index/hash.
+
 Статус: root принял layout с коррекцией полного retained path вместо chainRows[4].
 Это specification для codec/goldens, не production authority или runtime PASS.
 Нормативные PhysicalBind192, Append48+8N, Publish144 и
@@ -124,6 +262,29 @@ QueryId остаётся ненулевым и точно bound observation; ori
 tail, не в DNS question bytes. Source epoch/digests, subject/endpoint и
 frontier(scopeIndex)/carrier prefix точно совпадают с tail и observation.
 Source authority здесь — snapshot observation, не фиктивный DNS exchange/grant.
+
+Canonical DATA API находится в `profile_channel::dns_v2`: borrowed
+`Record`/`View<K>`, `DnsFrame`, отдельный raw192 `PhysicalPacket`,
+`Negotiated`, `HostsView`, `SnapshotRoleView`; typed IDs не являются grants.
+Encode копирует immutable validated view, не reparses JSON и не аллоцирует.
+`Record::decode` — body syntax; `DnsFrame::decode` дополнительно проверяет
+launch binding, direction, ancillary shape, source epoch и exact pending reply.
+Caller использует existing global direction Sequence и single-owner pending
+operation: проверяет expected ACK kind/duplicated refs, потребляет pending один
+раз и применяет original absolute deadlines/RTT. Статeless DATA decode сам
+не выдаёт cache/waiter/Run authority и не заявляет replay-safe issuer lifecycle.
+Legacy Frame продолжает отвергать все DNS_V2 kinds; actual negotiation/issuer
+plumbing и protected producer checks — следующий milestone, gates false.
+
+Независимый corpus — `tests/fixtures/xray-profile-channel-v3/dns-v2-canonical.json`,
+reproducer `dns-v2-pack.py --check` (Python stdlib field tables, не Rust dump).
+Для больших bounds vectors bytes собираются из offset/type/value tables,
+включая fill(byte,count), и сравниваются с body/frame SHA256. Нормальные vectors
+дополнительно имеют exact hex. u64 в JSON читаются без float64 round-trip
+(например Go Decoder.UseNumber/RawMessage), включая MAX rejection vectors.
+DNS maximum payload проверяет только codec bounds, не валидность RRset/TTL.
+Numeric body1063 — budget bound; largest current existing canonical base815
+даёт854 bytes с compact IPv6. Padding base до1024 не является допустимой base.
 
 SourceObservationId выпускает issuer только после retained-source revalidation
 для exact purpose2 BootstrapBinding/query/options/lookup key и retained row.
