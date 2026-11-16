@@ -245,7 +245,7 @@ diff --git a/common/yonikbroker/profile_udp_actor_linux_test.go b/common/yonikbr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_actor_linux_test.go
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,446 @@
 +//go:build linux
 +
 +package nativehooks
@@ -460,6 +460,61 @@ new file mode 100644
 +		t.Fatal("repeated cleanup")
 +	}
 +}
++
++func TestProfileUDPActorCancelInsideSuccessfulSendRetiresOnlyItsAssociation(t *testing.T) {
++	for _, stage := range []string{"control", "associate"} {
++		t.Run(stage, func(t *testing.T) {
++			f, a, accepted := udpActorFixture(t)
++			ctx, cancel := context.WithCancel(f.p.ctx)
++			defer cancel()
++			r, e := a.submit(ctx, accepted)
++			if e != nil {
++				t.Fatal(e)
++			}
++			wantPhase := byte(1)
++			if stage == "associate" {
++				if e = a.tick(); e != nil {
++					t.Fatal(e)
++				}
++				if e = a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, false, nil), nil }); e != nil {
++					t.Fatal(e)
++				}
++				wantPhase = 3
++			}
++			otherAccepted := *accepted
++			be.PutUint16(otherAccepted.tuple[4:], 32009)
++			next, e := a.submit(f.p.ctx, &otherAccepted)
++			if e != nil {
++				t.Fatal(e)
++			}
++			send := a.send
++			a.send = func(b []byte, fd profileProofFD) error {
++				if e := send(b, fd); e != nil {
++					return e
++				}
++				cancel()
++				return nil
++			}
++			if e = a.tick(); e != nil || a.failed != nil || f.p.ctx.Err() != nil || r.phase != 5 || r.cancelPhase != wantPhase || next.ctx.Err() != nil {
++				t.Fatal("send cancellation escaped association", e)
++			}
++			var fd *proofFakeFD
++			var late profileProofPacket
++			if stage == "associate" {
++				fd = &proofFakeFD{}
++				late = udpActorPacket(t, a, r, true, fd)
++			} else {
++				late = udpActorPacket(t, a, r, false, nil)
++			}
++			if e = a.receive(func() (profileProofPacket, error) { return late, nil }); e != nil || f.p.ctx.Err() != nil || fd != nil && fd.calls != 1 {
++				t.Fatal("late cancelled response lost custody or neighbour", e)
++			}
++			if e = a.tick(); e != nil || next.phase != 1 || next.ctx.Err() != nil || f.p.ctx.Err() != nil {
++				t.Fatal("neighbour cannot progress", e)
++			}
++		})
++	}
++}
 +func TestProfileUDPActorCapsBeforeEffectsAndDeadlineNotRenewed(t *testing.T) {
 +	f, a, accepted := udpActorFixture(t)
 +	f.c.manifest.caps[7] = 2
@@ -637,6 +692,7 @@ new file mode 100644
 +		t.Fatal("close ID replay accepted")
 +	}
 +}
+
 diff --git a/common/yonikbroker/profile_udp_actor_linux.go b/common/yonikbroker/profile_udp_actor_linux.go
 new file mode 100644
 --- /dev/null
@@ -853,14 +909,14 @@ new file mode 100644
 +		if e != nil {
 +			return a.failLocked(e)
 +		}
-+		if r.ctx.Err() != nil || r.accepted.ctx.Err() != nil {
-+			return a.failLocked(errProfile)
-+		}
 +		if r.phase == 0 {
 +			r.sent = p.flow.clock()
 +			r.phase = 1
 +		} else {
 +			r.phase = 3
++		}
++		if r.ctx.Err() != nil || r.accepted.ctx.Err() != nil {
++			a.retireCancelledLocked(r)
 +		}
 +		return nil
 +	}
@@ -1050,6 +1106,7 @@ new file mode 100644
 +		}
 +	}, nil
 +}
+
 diff --git a/common/yonikbroker/profile-udp-original-destination-v1.json b/common/yonikbroker/profile-udp-original-destination-v1.json
 new file mode 100644
 --- /dev/null
