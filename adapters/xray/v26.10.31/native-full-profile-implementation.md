@@ -1182,9 +1182,60 @@ cleanup требуют отдельных exact ACK. Cancel5 base не испо�
 соседнего waiter. Late/failed/Unknown cleanup удерживает custody/credits;
 terminal IDs/requests не reuse/evict. Cache hit не продлевает DATA TTL.
 
-В этом unit IP answer не является numeric transport permission. Numeric42 и
-private USER handoff после outer query release ещё не подключены; hostname
-physical open без соответствующего отдельного numeric/durable grant закрыт.
-R47 Rust Numeric `2dfc539` доступен для следующего unit; его presence не включает
-Go caller или runtime readiness. Pure fake issuer controls не являются image/
-kernel measurement или actual Go/Rust runtime acceptance.
+IP answer сам по себе не является numeric transport permission. Следующий
+ограниченный CODEC3 unit подключает отдельный private USER handoff ниже;
+pure fake issuer controls не являются image/kernel measurement или actual
+Go/Rust runtime acceptance.
+
+### CODEC3: USER Numeric42 после private WaiterReceipt
+
+`Handler.Dispatch` вызывает `ProfilePrepareNumericHandler` до обычного USER
+AUTHORIZE. Native selected route, private original receipt и byte-exact original
+hostname сохраняются. В этом cut допустим только terminal Direct/raw без chain,
+mux, TLS/masks/custom socket policy; неподдерживаемые Direct shapes закрыты до
+DNS/socket effects. Proxy remote-hostname path сохраняет прежний chooser и не
+подменяется локальным DNS. `ProfileNumericRawSettings` проверяет только DATA
+shape, а полномочие выдаёт исключительно проверенный issuer Grant19.
+
+Lookup использует существующий configured DNS ContextClient, provider policy и
+private query context. `LookupIPWithContext` → `ProfileFinishDNSAnswer` проверяет
+весь narrowing по собственным live waiters, выбирает один numeric member и
+посылает Numeric42. Class3-only outer answer теперь закрыт. DATA/TTL, ProducerId,
+service grant и чужой WaiterReceipt не дают USER permission. При любой ошибке
+outer callback возвращает nil/0, даже если callback передал partial result.
+
+Wire остаётся CODEC3: prefix16 с typed WaiterReceiptId@4, canonical class1 base,
+original==effective==неизменённый hostname и отдельный compact numeric prefix7.
+Grant19 проверяется общим mandatory decoder: exact pending/source/revision,
+class1, issuer ID, Local required0/None и System required1/freshKnown≤20ms с
+OwnerReceipt. Вычитается весь RTT; deadline ограничен исходными reservation,
+waiter, DATA TTL, bundle/root observation, session и USER lease. Refresh,
+multidial/fallback и повторное Numeric42 для source не поддерживаются.
+
+До query/RPC оплачиваются32KiB и4 общих pending/history credits; permanent
+RX precredit не debit-ится повторно. До effectful write source становится
+terminal numeric. Отмена внутри send, cancel ACK, late/duplicate Allow и Unknown
+не оживляют grant. Request47/48 и grant Close32/34 имеют разные typed barriers;
+только KnownClosed1 освобождает custody. Waiter cancel ждёт grant retirement,
+соседний query/bundle/physical pool сохраняет собственную authority.
+
+После ACK private context маскирует DNS keys, сохраняет original USER receipt
+и переносит только numeric effective target. `ProfileCheckDial`/logical link
+guard повторяют parent/member/path/expiry/owner checks; `ProfileDialPhysical`
+дополнительно требует тот же private grant и допускает ровно одну factory
+попытку. Pool identity включает source/waiter/member; session не выдаёт grant.
+Factory deadline ограничен USER/Known deadline; поздний cancelled result не
+публикуется, неудачный Close сохраняет sticky Unknown custody R9.
+
+`full-profile-fixtures/numeric-rust-v3.json` получен реальным Rust
+`profile_channel::Frame::encode` и `dns_v2::Record::NumericAuthorize::encode`
+из root2684084 (counterpart2dfc539). Четыре Local/System×source1/2 вектора
+проверяются Go envelope decoder и побайтно сопоставляются с actual42 caller.
+Генератор/selected codec/compiler/ELF/source hashes сохранены в evidence
+`p4-r50numeric-f36`; wire codec unchanged, frozen DATA builders исключены только
+из standalone fixture build. Новый patch требует отдельного root SOURCE review
+и новых protected literal pins: прежний accepted5f digest не обновлялся.
+
+Public gates/allowlists/install не включены. CODEC4, Proxy/Append/Bootstrap/Hosts,
+serviceflow0, loopback proof, Sender TargetStrategy и USER TLS/chain Numeric не
+заявлены готовыми; без соответствующей private authority остаются закрыты.

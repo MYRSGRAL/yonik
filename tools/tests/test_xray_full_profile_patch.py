@@ -12,6 +12,49 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_numeric_user_codec3_rust_vectors_and_private_caller_cut(self) -> None:
+        raw = (ADAPTER / "full-profile-fixtures/numeric-rust-v3.json").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            "67717c93d7a66940858e9c464c14a9dbee32650cb12d08c1cf6706e2bd9b7dc8",
+        )
+        vectors = json.loads(raw)["vectors"]
+        self.assertEqual(len(vectors), 4)
+        for vector in vectors:
+            frame = bytes.fromhex(vector["frameHex"])
+            numeric = bytes.fromhex(vector["numericBodyHex"])
+            self.assertEqual(len(frame), 184)
+            self.assertEqual(struct.unpack_from("!H", frame, 10)[0], 19)
+            self.assertEqual(frame[129:132], bytes((1, vector["system"], 0)))
+            self.assertEqual(struct.unpack_from("!Q", frame, 140)[0], vector["flow"])
+            self.assertEqual(struct.unpack_from("!H", numeric, 0)[0], 2)
+            self.assertEqual(
+                struct.unpack_from("!Q", numeric, 4)[0], 2001 + vector["flow"]
+            )
+            base_length = struct.unpack_from("!H", numeric, 12)[0]
+            self.assertEqual(numeric[14:16], bytes((1, 1)))
+            self.assertEqual(
+                numeric[16 + base_length :],
+                bytes((4, 6, 1, 187, 4, 0, 0, 203, 0, 113, 9)),
+            )
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        added = patch.split(
+            "+++ b/common/yonikbroker/profile-numeric-rust-v3.json\n", 1
+        )[1].split("diff --git ", 1)[0]
+        embedded = (
+            "\n".join(line[1:] for line in added.splitlines() if line.startswith("+"))
+            + "\n"
+        )
+        self.assertEqual(embedded.encode(), raw)
+        for caller in (
+            "nativehooks.ProfilePrepareNumericHandler(ctx, h.tag",
+            "hooks.ProfileFinishDNSAnswer",
+            "ProfileNumericPhysicalAttempt(ctx, dest)",
+            "c.numericAccept(f)",
+            "w.reservationDeadline",
+        ):
+            self.assertTrue(caller in patch, caller)
+
     def test_dns_wire_capture_and_independent_cache_waiters_stay_closed(self) -> None:
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         for anchor in (
@@ -255,7 +298,10 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertIn("next.profileMuxDecision(target)", handler)
         self.assertLess(
             handler.index("nativehooks.ProfilePrepareChain(next, h.profileBranch)"),
-            handler.index("nativehooks.ProfileGuardLink(ctx, link)"),
+            handler.index(
+                "nativehooks.ProfileGuardLink(ctx, link)",
+                handler.index("nativehooks.ProfileAuthorizeHandler(ctx, h.tag"),
+            ),
         )
         self.assertIn("+++ b/app/dns/dns.go", patch)
         self.assertIn("+++ b/app/dns/nameserver.go", patch)

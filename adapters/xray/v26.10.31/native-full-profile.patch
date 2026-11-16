@@ -8007,7 +8007,7 @@ diff --git a/common/yonikbroker/profile_dns_query_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_query_linux.go
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,208 @@
 +//go:build linux
 +
 +package nativehooks
@@ -8187,6 +8187,12 @@ new file mode 100644
 +	defer c.mu.Unlock()
 +	if !q.liveLocked() || !q.ready || len(ips) == 0 || len(ips) > 256 {
 +		return errProfile
++	}
++	// Provider USER answer требует Numeric42 через production result guard.
++	for _, w := range q.waiters {
++		if w != nil {
++			return ErrProfileUnsupported
++		}
 +	}
 +	for _, w := range q.waiters {
 +		if w != nil && !c.dnsWaiterLive(w) {
@@ -11645,7 +11651,7 @@ diff --git a/common/yonikbroker/profile_transport_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux.go
-@@ -0,0 +1,897 @@
+@@ -0,0 +1,919 @@
 +//go:build linux
 +
 +package nativehooks
@@ -12001,6 +12007,14 @@ new file mode 100644
 +		h.Write(path[:])
 +	}
 +	h.Write(g.effective.encode())
++	if n := g.numeric; n != nil {
++		h.Write([]byte("NUMERIC-USER-v1\x00"))
++		be.PutUint64(b[:], n.receipt.id)
++		be.PutUint64(b[8:], n.waiter.id)
++		h.Write(b[:])
++		be.PutUint16(b[:], n.member)
++		h.Write(b[:2])
++	}
 +	h.Write(endpoint.encode())
 +	for hop, depth := g.next, 0; hop != nil; hop, depth = hop.next, depth+1 {
 +		if depth >= 255 || hop.receipt != g.receipt || !hop.prepared {
@@ -12343,6 +12357,20 @@ new file mode 100644
 +	dialCtx, e := pool.Context(ctx)
 +	if e != nil {
 +		return nil, e
++	}
++	if e = ProfileNumericPhysicalAttempt(ctx, dest); e != nil {
++		return nil, e
++	}
++	if g, _ := ctx.Value(profileGrantKey{}).(*profileGrant); g != nil && g.numeric != nil {
++		control.mu.Lock()
++		deadline := g.deadline
++		if control.mode == 2 && g.ownerDeadline.Before(deadline) {
++			deadline = g.ownerDeadline
++		}
++		control.mu.Unlock()
++		var finish context.CancelFunc
++		dialCtx, finish = context.WithDeadline(dialCtx, deadline)
++		defer finish()
 +	}
 +	conn, e := runner(dialCtx)
 +	transferFD = conn != nil
@@ -13364,23 +13392,26 @@ diff --git a/app/proxyman/inbound/worker.go b/app/proxyman/inbound/worker.go
 diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
 --- a/app/proxyman/outbound/handler.go
 +++ b/app/proxyman/outbound/handler.go
-@@ -17,6 +17,7 @@
+@@ -17,7 +17,9 @@
  	"github.com/xtls/xray-core/common/net"
  	"github.com/xtls/xray-core/common/serial"
  	"github.com/xtls/xray-core/common/session"
 +	nativehooks "github.com/xtls/xray-core/common/yonikbroker"
  	"github.com/xtls/xray-core/core"
++	dns_feature "github.com/xtls/xray-core/features/dns"
  	"github.com/xtls/xray-core/features/outbound"
  	"github.com/xtls/xray-core/features/policy"
-@@ -55,6 +56,7 @@
+ 	"github.com/xtls/xray-core/features/stats"
+@@ -55,6 +57,8 @@
  
  // Handler implements outbound.Handler.
  type Handler struct {
++	profileLookup   func(context.Context, string) ([]net.IP, uint32, error)
 +	profileBranch   func(string, net.Destination) (bool, error)
  	tag             string
  	senderSettings  *proxyman.SenderConfig
  	streamSettings  *internet.MemoryStreamConfig
-@@ -67,6 +69,27 @@
+@@ -67,6 +71,27 @@
  	downlinkCounter stats.Counter
  }
  
@@ -13408,10 +13439,17 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  // NewHandler creates a new Handler based on the given configuration.
  func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbound.Handler, error) {
  	v := core.MustFromContext(ctx)
-@@ -75,6 +98,21 @@
+@@ -75,6 +100,28 @@
  		tag:             config.Tag,
  		uplinkCounter:   uplinkCounter,
  		downlinkCounter: downlinkCounter,
++	}
++	h.profileLookup = func(ctx context.Context, name string) ([]net.IP, uint32, error) {
++		client, ok := v.GetFeature(dns_feature.ClientType()).(dns_feature.ContextClient)
++		if !ok {
++			return nil, 0, nativehooks.ErrProfileUnsupported
++		}
++		return client.LookupIPWithContext(ctx, name, dns_feature.IPOption{IPv4Enable: true, IPv6Enable: true})
 +	}
 +	h.profileBranch = func(tag string, target net.Destination) (bool, error) {
 +		manager, ok := v.GetFeature(outbound.ManagerType()).(outbound.Manager)
@@ -13430,7 +13468,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	}
  
  	if config.SenderSettings != nil {
-@@ -175,11 +213,82 @@
+@@ -175,11 +222,100 @@
  }
  
  // Dispatch implements proxy.Outbound.Dispatch.
@@ -13487,6 +13525,24 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
 +			ctx = next
 +			return release, nil
 +		}
++		lookup := h.profileLookup
++		if !internet.ProfileNumericRawSettings(h.streamSettings) {
++			lookup = nil
++		}
++		if next, release, numeric, handled, e := nativehooks.ProfilePrepareNumericHandler(ctx, h.tag, ob.Target, mux, lookup); handled {
++			if e != nil {
++				release()
++				return func() {}, e
++			}
++			ctx = next
++			ob.Target = numeric
++			if numeric.Network == net.Network_UDP && ob.OriginalTarget.Address != nil && ob.OriginalTarget.Address != numeric.Address {
++				link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: numeric.Address, OriginalDest: ob.OriginalTarget.Address}
++				link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: numeric.Address, OriginalDest: ob.OriginalTarget.Address}
++			}
++			nativehooks.ProfileGuardLink(ctx, link)
++			return release, nil
++		}
 +		next, release, e := nativehooks.ProfileAuthorizeHandler(ctx, h.tag, ob.Target, mux)
 +		if e == nil {
 +			e = nativehooks.ProfilePrepareChain(next, h.profileBranch)
@@ -13513,7 +13569,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  		strategy := h.senderSettings.TargetStrategy
  		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
  			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
-@@ -204,38 +313,41 @@
+@@ -204,38 +340,41 @@
  		link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  		link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  	}
@@ -13577,7 +13633,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	err := h.proxy.Process(ctx, link, h)
  	var errC error
  	if err != nil {
-@@ -266,6 +378,9 @@
+@@ -266,6 +405,9 @@
  
  // Dial implements internet.Dialer.
  func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
@@ -14757,7 +14813,7 @@ diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_hooks_linux.go
-@@ -0,0 +1,884 @@
+@@ -0,0 +1,896 @@
 +//go:build linux
 +
 +package nativehooks
@@ -15265,6 +15321,18 @@ new file mode 100644
 +	return context.WithValue(g.ctx, profileGrantKey{}, g), func() { p.flow.mu.Lock(); p.flow.closeGrant(g); p.flow.mu.Unlock() }, nil
 +}
 +func profileEnsureGrant(ctx context.Context, g *profileGrant) error {
++	if g != nil && g.numeric != nil {
++		p := profileRuntime(ctx)
++		if p == nil || g.numeric.runtime != p || ctx.Err() != nil || profileReceiptFrom(ctx) != g.receipt || !p.flowFresh() {
++			return errProfile
++		}
++		p.flow.mu.Lock()
++		defer p.flow.mu.Unlock()
++		if !p.flow.grantLive(g) || p.flow.mode == 2 && !p.flow.clock().Before(g.ownerDeadline) {
++			return errProfile
++		}
++		return nil
++	}
 +	if g != nil && g.class == 2 {
 +		p := profileRuntime(ctx)
 +		if p == nil {
@@ -15646,7 +15714,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,1094 @@
+@@ -0,0 +1,1123 @@
 +//go:build linux
 +
 +package nativehooks
@@ -15722,22 +15790,24 @@ new file mode 100644
 +}
 +
 +type profileReceipt struct {
-+	udp                 *profileUDPFlow
-+	openSequence        uint64
-+	control             *profileFlowControl
-+	ctx                 context.Context
-+	cancel              context.CancelFunc
-+	association         *profileAccepted
-+	original            profileDestinationValue
-+	tuple               [40]byte
-+	id, revision        uint64
-+	slot, index         uint16
-+	provenance          byte
-+	closed, cancelSent  bool
-+	pending, grantCount int
-+	openOperation       *profileOperation
++	numeric                         *profileNumeric
++	udp                             *profileUDPFlow
++	openSequence                    uint64
++	control                         *profileFlowControl
++	ctx                             context.Context
++	cancel                          context.CancelFunc
++	association                     *profileAccepted
++	original                        profileDestinationValue
++	tuple                           [40]byte
++	id, revision                    uint64
++	slot, index                     uint16
++	provenance                      byte
++	closed, cancelSent, numericOnly bool
++	pending, grantCount             int
++	openOperation                   *profileOperation
 +}
 +type profileGrant struct {
++	numeric                             *profileNumeric
 +	dnsOwner                            *profileDNSExchange
 +	next                                *profileGrant
 +	parent                              *profileGrant
@@ -15759,6 +15829,7 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	dnsNumeric                              *profileNumeric
 +	dnsResult                               *profileDNSResultRPC
 +	dnsDirect                               *profileDNSDirectRPC
 +	dns                                     *profileDNSBundleRPC
@@ -15789,6 +15860,8 @@ new file mode 100644
 +	replied, cancelled                                       bool
 +}
 +type profileFlowControl struct {
++	numerics                                       [64]*profileNumeric
++	numericUsed                                    int
 +	dnsResults                                     [64]*profileDNSResultOwner
 +	dnsResultUsed                                  int
 +	dnsRequests                                    [256]*profileOperation
@@ -15837,7 +15910,7 @@ new file mode 100644
 +	return c.live() && r != nil && r.control == c && !r.closed && r.ctx.Err() == nil && (r.association == nil || r.association.ctx.Err() == nil) && c.receipts[r.slot] == r && (r.udp == nil || r.udp.matched.Load())
 +}
 +func (c *profileFlowControl) grantLive(g *profileGrant) bool {
-+	return g != nil && c.live() && (g.receipt == nil && g.purpose != 0 || c.receiptLive(g.receipt)) && !g.closed && g.ctx.Err() == nil && c.grants[g.slot] == g && c.clock().Before(g.deadline)
++	return g != nil && c.live() && (g.receipt == nil && g.purpose != 0 || c.receiptLive(g.receipt)) && !g.closed && g.ctx.Err() == nil && c.grants[g.slot] == g && c.clock().Before(g.deadline) && (g.numeric == nil || c.numericParentLive(g.numeric))
 +}
 +
 +func (c *profileFlowControl) operationLive(op *profileOperation) bool {
@@ -15971,6 +16044,9 @@ new file mode 100644
 +	return c.authorizeLocked(ctx, r, scope, branch, effective, refresh)
 +}
 +func (c *profileFlowControl) authorizeLocked(ctx context.Context, r *profileReceipt, scope uint16, branch byte, effective profileDestinationValue, refresh *profileGrant) (*profileGrant, *profileOperation, error) {
++	if r != nil && (r.numeric != nil || r.numericOnly) {
++		return nil, nil, ErrProfileUnsupported
++	}
 +	if ctx == nil || ctx.Err() != nil {
 +		return nil, nil, errProfile
 +	}
@@ -16050,6 +16126,11 @@ new file mode 100644
 +	}
 +}
 +func (c *profileFlowControl) finish(op *profileOperation, e error) {
++	if op.dnsNumeric != nil {
++		c.numericClose(op.dnsNumeric)
++		c.dnsNotify(op, e)
++		return
++	}
 +	if op.dnsResult != nil {
 +		op.dnsResult.owner.closed = true
 +		c.dnsNotify(op, e)
@@ -16091,6 +16172,10 @@ new file mode 100644
 +func (c *profileFlowControl) abort(op *profileOperation) {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
++	if op.dnsNumeric != nil {
++		c.numericClose(op.dnsNumeric)
++		return
++	}
 +	if op.dnsResult != nil {
 +		op.dnsResult.owner.closed = true
 +		return
@@ -16210,6 +16295,9 @@ new file mode 100644
 +	return c.dispatchLocked(op)
 +}
 +func (c *profileFlowControl) dispatchLocked(op *profileOperation) error {
++	if op.dnsNumeric != nil {
++		return c.numericDispatch(op)
++	}
 +	if op.dnsResult != nil {
 +		return c.dnsResultDispatch(op)
 +	}
@@ -16293,6 +16381,9 @@ new file mode 100644
 +	defer c.mu.Unlock()
 +	if !c.live() {
 +		return errProfile
++	}
++	if handled, err := c.numericAccept(f); handled {
++		return err
 +	}
 +	if profileDNSV2Operation(f.kind) {
 +		if handled, err := c.dnsResultAccept(f); handled {
@@ -16611,6 +16702,12 @@ new file mode 100644
 +	}
 +	for i, g := range c.grants {
 +		if g == nil {
++			continue
++		}
++		if g.numeric != nil {
++			if !c.numericParentLive(g.numeric) || !g.deadline.IsZero() && !now.Before(g.deadline) {
++				c.numericClose(g.numeric)
++			}
 +			continue
 +		}
 +		if g.ctx.Err() != nil || !g.deadline.IsZero() && !now.Before(g.deadline) {
@@ -20042,7 +20139,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	"github.com/xtls/xray-core/features/dns"
  	"github.com/xtls/xray-core/features/outbound"
  	"github.com/xtls/xray-core/transport"
-@@ -35,6 +38,26 @@
+@@ -35,6 +38,29 @@
  
  var transportDialerCache = make(map[string]dialFunc)
  
@@ -20066,10 +20163,13 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
 +	return m.ProtoReflect().Descriptor().FullName() == "xray.transport.internet.tcp.Config" && proto.Size(m) == 0
 +}
 +
++// DATA shape only: этот Numeric cut не меняет TLS/SNI или source socket policy.
++func ProfileNumericRawSettings(s *MemoryStreamConfig) bool { return profileDNSRawSettings(s) }
++
  // RegisterTransportDialer registers a Dialer with given name.
  func RegisterTransportDialer(protocol string, dialer dialFunc) error {
  	if _, found := transportDialerCache[protocol]; found {
-@@ -46,6 +69,15 @@
+@@ -46,6 +72,15 @@
  
  // Dial dials a internet connection towards the given destination.
  func Dial(ctx context.Context, dest net.Destination, streamSettings *MemoryStreamConfig) (stat.Connection, error) {
@@ -20085,7 +20185,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	if dest.Network == net.Network_TCP {
  		if streamSettings == nil {
  			s, err := ToMemoryStreamConfig(nil)
-@@ -56,11 +88,36 @@
+@@ -56,11 +91,36 @@
  		}
  
  		protocol := streamSettings.ProtocolName
@@ -20123,7 +20223,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	}
  
  	if dest.Network == net.Network_UDP {
-@@ -68,7 +125,14 @@
+@@ -68,7 +128,14 @@
  		if udpDialer == nil {
  			return nil, errors.New("UDP dialer not registered")
  		}
@@ -20139,7 +20239,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	}
  
  	return nil, errors.New("unknown network ", dest.Network)
-@@ -108,7 +172,12 @@
+@@ -108,7 +175,12 @@
  	return ips, err
  }
  
@@ -20153,7 +20253,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	errors.LogInfo(ctx, "redirecting request "+dst.String()+" to "+obt)
  	outbounds := session.OutboundsFromContext(ctx)
  	ctx = session.ContextWithOutbounds(ctx, append(outbounds, &session.Outbound{
-@@ -120,7 +189,11 @@
+@@ -120,7 +192,11 @@
  	ur, uw := pipe.New(pipe.OptionsFromContext(ctx)...)
  	dr, dw := pipe.New(pipe.OptionsFromContext(ctx)...)
  
@@ -20166,7 +20266,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	var readerOpt cnc.ConnectionOption
  	if dst.Network == net.Network_TCP {
  		readerOpt = cnc.ConnectionOutputMulti(dr)
-@@ -132,7 +205,7 @@
+@@ -132,7 +208,7 @@
  		readerOpt,
  		cnc.ConnectionOnClose(common.ChainedClosable{uw, dw}),
  	)
@@ -20175,7 +20275,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  }
  
  func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (*net.Destination, error) {
-@@ -224,6 +297,9 @@
+@@ -224,6 +300,9 @@
  
  // DialSystem calls system dialer to create a network connection.
  func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
@@ -20185,7 +20285,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	var src net.Address
  	outbounds := session.OutboundsFromContext(ctx)
  	var outboundName string
-@@ -242,6 +318,9 @@
+@@ -242,6 +321,9 @@
  	if sockopt == nil {
  		return guardedSystemDial(ctx, src, dest, sockopt)
  	}
@@ -20195,7 +20295,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  
  	if newDest, err := checkAddressPortStrategy(ctx, dest, sockopt); err == nil && newDest != nil {
  		errors.LogInfo(ctx, "replace destination with "+newDest.String())
-@@ -275,7 +354,7 @@
+@@ -275,7 +357,7 @@
  		if h == nil {
  			return nil, errors.New("there is no outbound handler for dialerProxy")
  		}
@@ -20344,7 +20444,7 @@ diff --git a/app/dns/dns.go b/app/dns/dns.go
  	return s.lookupIP(s.ctx, domain, option)
  }
  
-@@ -265,11 +268,27 @@
+@@ -265,11 +268,34 @@
  	if s.script != nil {
  		return nil, 0, hooks.ErrDenied
  	}
@@ -20353,14 +20453,14 @@ diff --git a/app/dns/dns.go b/app/dns/dns.go
 -		return nil, 0, guardErr
 -	}
 -	return ips, ttl, err
-+	return profileDNSLookup(ctx, domain, option, s.lookupIP, hooks.ProfileDNSQueryContext, hooks.ProfileCheckDNSAnswer)
++	return profileDNSLookup(ctx, domain, option, s.lookupIP, hooks.ProfileDNSQueryContext, hooks.ProfileCheckDNSAnswer, hooks.ProfileFinishDNSAnswer)
 +}
 +
 +// Инъекция только private функций: production caller всегда использует broker.
 +func profileDNSLookup(ctx context.Context, domain string, option dns.IPOption,
 +	lookup func(context.Context, string, dns.IPOption) ([]net.IP, uint32, error),
 +	begin func(context.Context, string) (context.Context, func(), error),
-+	check func(context.Context, string, []net.IP) error) ([]net.IP, uint32, error) {
++	check func(context.Context, string, []net.IP) error, finish ...func(context.Context, string, []net.IP, uint32) ([]net.IP, uint32, error)) ([]net.IP, uint32, error) {
 +	query, release, err := begin(ctx, domain)
 +	if err != nil {
 +		return nil, 0, err
@@ -20369,6 +20469,13 @@ diff --git a/app/dns/dns.go b/app/dns/dns.go
 +	ips, ttl, err := lookup(query, domain, option)
 +	if err != nil {
 +		return nil, 0, err
++	}
++	if len(finish) > 0 {
++		answer, remaining, err := finish[0](query, domain, ips, ttl)
++		if err != nil {
++			return nil, 0, err
++		}
++		return answer, remaining, nil
 +	}
 +	if err = check(query, domain, ips); err != nil {
 +		return nil, 0, err
@@ -20448,7 +20555,7 @@ diff --git a/app/dns/yonik_outer_test.go b/app/dns/yonik_outer_test.go
 new file mode 100644
 --- /dev/null
 +++ b/app/dns/yonik_outer_test.go
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,141 @@
 +package dns
 +
 +import (
@@ -20461,6 +20568,38 @@ new file mode 100644
 +	"testing"
 +	"time"
 +)
++
++func TestYonikDNSNumericOuterDoesNotReturnBeforeGuardOrOnPartialError(t *testing.T) {
++	entered, allow := make(chan struct{}), make(chan struct{})
++	done := make(chan struct{})
++	var ips []net.IP
++	var ttl uint32
++	var result error
++	begin := func(ctx context.Context, _ string) (context.Context, func(), error) { return ctx, func() {}, nil }
++	lookup := func(context.Context, string, fdns.IPOption) ([]net.IP, uint32, error) {
++		return []net.IP{{203, 0, 113, 9}, {203, 0, 113, 10}}, 60, nil
++	}
++	finish := func(context.Context, string, []net.IP, uint32) ([]net.IP, uint32, error) {
++		close(entered)
++		<-allow
++		return []net.IP{{203, 0, 113, 9}}, 60, errors.New("numeric denied")
++	}
++	go func() {
++		ips, ttl, result = profileDNSLookup(context.Background(), "Original.INVALID", fdns.IPOption{IPv4Enable: true}, lookup, begin, func(context.Context, string, []net.IP) error { return nil }, finish)
++		close(done)
++	}()
++	<-entered
++	select {
++	case <-done:
++		t.Fatal("caller returned before Numeric permission")
++	default:
++	}
++	close(allow)
++	<-done
++	if result == nil || ips != nil || ttl != 0 {
++		t.Fatal("partial result escaped Numeric denial")
++	}
++}
 +
 +// Private injection проверяет реальный outer pipeline без core/network.
 +func TestYonikDNSOuterExactQueryReleaseAndReturn(t *testing.T) {
@@ -31411,7 +31550,7 @@ diff --git a/common/yonikbroker/profile_dns_bundle_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_bundle_linux.go
-@@ -0,0 +1,958 @@
+@@ -0,0 +1,967 @@
 +//go:build linux
 +
 +package nativehooks
@@ -32117,6 +32256,9 @@ new file mode 100644
 +	return errProfile
 +}
 +func (c *profileFlowControl) dnsTick() error {
++	if err := c.numericTick(); err != nil {
++		return err
++	}
 +	if err := c.dnsResultsTick(); err != nil {
 +		return err
 +	}
@@ -32171,6 +32313,7 @@ new file mode 100644
 +}
 +
 +func (c *profileFlowControl) dnsFloor(floor uint64) uint64 {
++	floor = c.numericFloor(floor)
 +	floor = c.dnsResultsFloor(floor)
 +	for _, t := range c.dnsDirect[:c.dnsDirectUsed] {
 +		if t.released {
@@ -32203,6 +32346,11 @@ new file mode 100644
 +func (c *profileFlowControl) dnsCleanupResult() error {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
++	for _, n := range c.numerics[:c.numericUsed] {
++		if !n.released || n.unknown || n.rejectedID != 0 {
++			return ErrProfileCleanupUnknown
++		}
++	}
 +	for _, o := range c.dnsResults[:c.dnsResultUsed] {
 +		if !o.released || o.unknown {
 +			return ErrProfileCleanupUnknown
@@ -32374,7 +32522,7 @@ diff --git a/common/yonikbroker/profile_dns_bundle_linux_test.go b/common/yonikb
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_bundle_linux_test.go
-@@ -0,0 +1,740 @@
+@@ -0,0 +1,751 @@
 +//go:build linux
 +
 +package nativehooks
@@ -32391,16 +32539,23 @@ new file mode 100644
 +)
 +
 +func dnsBundleFixture(t *testing.T, mode byte) (*flowFixture, context.Context, xnet.Destination) {
++	return dnsBundleFixtureWith(t, mode, 6, "user.invalid")
++}
++func dnsBundleFixtureWith(t *testing.T, mode, network byte, original string) (*flowFixture, context.Context, xnet.Destination) {
 +	f := newFlowFixture(t, mode)
 +	f.p.dnsV2 = true
 +	f.c.manifest.mapping = 4
-+	target := profileDestinationValue{family: 4, network: 6, port: 53, address: "192.0.2.53"}
++	target := profileDestinationValue{family: 4, network: network, port: 53, address: "192.0.2.53"}
 +	row := make([]byte, 36)
-+	row[0], row[1] = 1, 6
++	row[0], row[1] = 1, network
 +	be.PutUint16(row[2:], 0)
 +	row = append(row, target.encode()...)
 +	f.c.manifest.rows[4] = [][]byte{row}
-+	receipt := f.admittedReceipt(t, "user.invalid")
++	if network == 17 {
++		subject := f.c.manifest.rows[0][0]
++		be.PutUint16(subject[len(subject)-2:], 1)
++	}
++	receipt := f.admittedReceipt(t, original)
 +	base := context.WithValue(context.WithValue(f.p.ctx, profileContextKey{}, f.p), profileReceiptKey{}, receipt)
 +	query, release, e := ProfileDNSQueryContext(base, "Original.INVALID")
 +	if e != nil {
@@ -32423,7 +32578,11 @@ new file mode 100644
 +	exchange.request, _ = message.Pack()
 +	exchange.ctx = context.WithValue(query, profileDNSExchangeKey{}, exchange)
 +	g.dnsOwner = exchange
-+	return f, exchange.ctx, xnet.TCPDestination(xnet.ParseAddress(target.address), 53)
++	destination := xnet.TCPDestination(xnet.ParseAddress(target.address), 53)
++	if network == 17 {
++		destination.Network = xnet.Network_UDP
++	}
++	return f, exchange.ctx, destination
 +}
 +func dnsBundleReply(op *profileOperation, id, revision uint64) profilePacket {
 +	b := make([]byte, 64)
@@ -33119,7 +33278,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_linux_test.go b/common/yonikb
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux_test.go
-@@ -0,0 +1,1680 @@
+@@ -0,0 +1,1722 @@
 +//go:build linux
 +
 +package nativehooks
@@ -33192,7 +33351,14 @@ new file mode 100644
 +func dnsWirePublishStart(t *testing.T, network byte, modes ...byte) (*dnsDirectHarness, net.Conn, []byte, <-chan *ProfileDNSProducerData, <-chan error) {
 +	t.Helper()
 +	var h *dnsDirectHarness
-+	if len(modes) > 0 && modes[0] == 2 {
++	if len(modes) > 1 && modes[1] == 1 {
++		f, ctx, target := dnsBundleFixtureWith(t, modes[0], network, "Original.INVALID")
++		b, op := dnsAcquirePure(t, f, ctx)
++		if err := f.c.accept(dnsBundleReply(op, 41, 1)); err != nil {
++			t.Fatal(err)
++		}
++		h = dnsDirectStartBundle(t, f, b, target, nil, nil)
++	} else if len(modes) > 0 && modes[0] == 2 {
 +		f, ctx, target := dnsBundleFixture(t, 2)
 +		b, op := dnsAcquirePure(t, f, ctx)
 +		if err := f.c.accept(dnsBundleReply(op, 41, 1)); err != nil {
@@ -33399,8 +33565,8 @@ new file mode 100644
 +				if err != nil || len(ips) != 1 || ttl == 0 {
 +					t.Fatal(err)
 +				}
-+				if err = ProfileCheckDNSAnswer(ctx, "Original.INVALID", ips); err != nil {
-+					t.Fatal(err)
++				if err = ProfileCheckDNSAnswer(ctx, "Original.INVALID", ips); err == nil {
++					t.Fatal("class3-only waiter returned USER answer without Numeric42")
 +				}
 +				if ProfileCheckDNSAnswer(ctx, "Original.INVALID", ips) == nil {
 +					t.Fatal("result replay")
@@ -33729,6 +33895,41 @@ new file mode 100644
 +	size := reflect.TypeFor[ProfileDNSProducerData]().Size() + reflect.TypeFor[profileDNSResultOwner]().Size() + 2*reflect.TypeFor[profileOperation]().Size() + 2*reflect.TypeFor[profileDNSResultRPC]().Size()
 +	if size > 8192 {
 +		t.Fatal("result fixed metadata exceeds retained credit", size)
++	}
++}
++
++func TestProfileDNSNumericUSERCannotReturnClass3OnlyAnswer(t *testing.T) {
++	h, conn, _, data, published := dnsWirePublishStart(t, 6)
++	defer conn.Close()
++	op := h.next(t, 40)
++	if err := h.f.c.accept(dnsWirePublished(op)); err != nil {
++		t.Fatal(err)
++	}
++	d := <-data
++	if err := <-published; err != nil {
++		t.Fatal(err)
++	}
++	h.f.c.nextDNSQuery = h.b.exchange.id
++	ctx, _ := dnsWireWaiter(t, h)
++	done := make(chan error, 1)
++	go func() { done <- ProfileDNSBindWaiter(ctx, d) }()
++	op = h.next(t, 35)
++	if err := h.f.c.accept(dnsWireWaiterReply(op)); err != nil {
++		t.Fatal(err)
++	}
++	op = h.next(t, 53)
++	if err := h.f.c.accept(dnsWireWaiterReply(op)); err != nil {
++		t.Fatal(err)
++	}
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++	ips, _, err := ProfileDNSDataAnswer(ctx, d)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ProfileCheckDNSAnswer(ctx, "Original.INVALID", ips) == nil {
++		t.Fatal("class3-only DATA escaped as USER answer without Numeric42")
 +	}
 +}
 +func TestProfileDNSFactoryPublishedConnDoesNotExposeUnderlyingAlias(t *testing.T) {
@@ -36220,7 +36421,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_other.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_other.go
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,45 @@
 +//go:build !linux
 +
 +package nativehooks
@@ -36255,6 +36456,16 @@ new file mode 100644
 +}
 +func ProfileDNSCacheRecord(context.Context, *ProfileDNSProducerData, []net.IP) (time.Time, error) {
 +	return time.Time{}, ErrProfileUnsupported
++}
++
++func ProfilePrepareNumericHandler(ctx context.Context, _ string, target xnet.Destination, _ bool, _ func(context.Context, string) ([]net.IP, uint32, error)) (context.Context, func(), xnet.Destination, bool, error) {
++	return ctx, func() {}, target, false, nil
++}
++func ProfileFinishDNSAnswer(ctx context.Context, name string, ips []net.IP, ttl uint32) ([]net.IP, uint32, error) {
++	if err := ProfileCheckDNSAnswer(ctx, name, ips); err != nil {
++		return nil, 0, err
++	}
++	return ips, ttl, nil
 +}
 diff --git a/common/yonikbroker/profile_rx_budget_linux_test.go b/common/yonikbroker/profile_rx_budget_linux_test.go
 new file mode 100644
@@ -36629,7 +36840,7 @@ diff --git a/common/yonikbroker/profile_dns_rrset_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_rrset_linux.go
-@@ -0,0 +1,931 @@
+@@ -0,0 +1,935 @@
 +//go:build linux
 +
 +package nativehooks
@@ -36662,6 +36873,7 @@ new file mode 100644
 +	closed, unknown bool
 +}
 +type profileDNSWaiter struct {
++	numeric                       *profileNumeric
 +	owner                         *profileDNSResultOwner
 +	data                          *ProfileDNSProducerData
 +	bundle                        *profileDNSBundle
@@ -37210,6 +37422,9 @@ new file mode 100644
 +		if !o.closed {
 +			continue
 +		}
++		if o.waiter != nil && o.waiter.numeric != nil && !o.waiter.numeric.released {
++			continue
++		}
 +		if o.stage == 0 {
 +			until := c.clock()
 +			if o.data != nil && o.data.id != 0 {
@@ -37560,4 +37775,1183 @@ new file mode 100644
 +		}
 +	}
 +	return true
++}
+diff --git a/common/yonikbroker/profile_dns_numeric_linux.go b/common/yonikbroker/profile_dns_numeric_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_dns_numeric_linux.go
+@@ -0,0 +1,542 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"crypto/sha256"
++	xnet "github.com/xtls/xray-core/common/net"
++	"net"
++	"net/netip"
++	"time"
++)
++
++const profileNumericCredit = 32 * 1024
++const profileNumericPending = 4
++
++type profileNumericKey struct{}
++type profileNumeric struct {
++	native                                                                      profileSelectedRoute
++	bodyDigest                                                                  [32]byte
++	runtime                                                                     *ProfileRuntime
++	ctx                                                                         context.Context
++	cancel                                                                      context.CancelFunc
++	query                                                                       *profileDNSQuery
++	receipt                                                                     *profileReceipt
++	waiter                                                                      *profileDNSWaiter
++	grant                                                                       *profileGrant
++	op                                                                          *profileOperation
++	original, target                                                            profileDestinationValue
++	subject, scope, stream, chain, member                                       uint16
++	branch                                                                      byte
++	revision                                                                    uint64
++	deadline, cleanupDeadline                                                   time.Time
++	attempted, answered, closed, unknown, released, received, physicalAttempted bool
++	cancelSequence, closeSequence, rejectedID                                   uint64
++	cancelAck, closeAck                                                         bool
++}
++
++func (c *profileFlowControl) numericParentLive(n *profileNumeric) bool {
++	if n == nil || n.closed || n.unknown || n.ctx.Err() != nil || !c.receiptLive(n.receipt) || n.receipt.numeric != n || n.receipt.revision != n.revision || n.original != n.receipt.original {
++		return false
++	}
++	if n.waiter != nil && (!c.dnsWaiterLive(n.waiter) || n.waiter.owner.query != n.query || n.waiter.bundle.exchange.query.receipt != n.receipt || n.waiter.bundle.exchange.root.revision != n.revision) {
++		return false
++	}
++	if n.revision != c.manifest.policy || n.native.subject != n.subject || n.native.scope != n.scope || n.native.effective != n.original || int(n.scope) >= len(c.manifest.rows[8]) {
++		return false
++	}
++	s := c.manifest.rows[8][n.scope]
++	if n.branch != 0 || u16(s, 0) != n.subject || s[2] != n.original.network || s[3]&1 == 0 || s[4] != n.original.network || s[5] != n.original.network || s[20] != 3 || u16(s, 12) != n.stream || u16(s, 16) != n.chain || n.chain != 65535 {
++		return false
++	}
++	if n.waiter != nil {
++		w := n.waiter
++		if int(n.member) >= w.data.count || n.target.address != w.data.members[n.member].String() || n.target.port != n.original.port || n.target.network != n.original.network || !n.target.valid() || n.target.family == 3 || n.attempted && w.numeric != n {
++			return false
++		}
++	}
++	if g := n.grant; g != nil && (g.numeric != n || g.receipt != n.receipt || g.class != 1 || g.subject != n.subject || g.scope != n.scope || g.chain != n.chain || g.stream != n.stream || g.branch != n.branch || g.effective != n.target || g.revision != 0 && g.revision != n.revision) {
++		return false
++	}
++	return n.deadline.IsZero() || c.clock().Before(n.deadline)
++}
++func (c *profileFlowControl) numericClose(n *profileNumeric) {
++	if !n.closed {
++		n.closed = true
++		n.cancel()
++		c.closeGrant(n.grant)
++	}
++}
++
++// Private actual USER chooser boundary; metadata не выдаёт grant. DNS callback
++// обязан пройти production outer answer guard, который выполняет единственный42.
++func ProfilePrepareNumericHandler(ctx context.Context, tag string, target xnet.Destination, mux bool, lookup func(context.Context, string) ([]net.IP, uint32, error)) (context.Context, func(), xnet.Destination, bool, error) {
++	noop := func() {}
++	p := profileRuntime(ctx)
++	if p == nil || profileDNSExchangeFrom(ctx) != nil || profileServiceGrant(ctx) != nil || target.Address == nil || !target.Address.Family().IsDomain() {
++		return ctx, noop, target, false, nil
++	}
++	if ctx.Err() != nil || ProfileHandlerEntry(ctx, tag, target) != nil {
++		return ctx, noop, target, true, ErrProfileUnsupported
++	}
++	r := profileReceiptFrom(ctx)
++	v, err := profileValue(target)
++	if err != nil || r == nil || v.family != 3 {
++		return ctx, noop, target, true, errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	route := ctx.Value(profileRouteKey{}).(profileSelectedRoute)
++	row := c.manifest.rows[0][route.subject]
++	offset := len(row) - 4
++	if v.network == 17 {
++		offset += 2
++	}
++	scope := u16(row, offset)
++	if int(scope) >= len(c.manifest.rows[8]) {
++		c.mu.Unlock()
++		return ctx, noop, target, true, errProfile
++	}
++	s := c.manifest.rows[8][scope]
++	branch := 0
++	if mux {
++		branch = 1
++	}
++	if route.chained || s[20+branch] != 3 {
++		c.mu.Unlock()
++		return ctx, noop, target, false, nil
++	}
++	if lookup == nil || mux || v != r.original || route.branches&1 == 0 {
++		c.mu.Unlock()
++		return ctx, noop, target, true, ErrProfileUnsupported
++	}
++	if !c.receiptLive(r) || r.revision != c.manifest.policy || r.numeric != nil || r.numericOnly || route.chained || s[3]&1 == 0 || s[2] != v.network || s[4] != v.network || s[5] != v.network || s[20] != 3 || u16(s, 16) != 65535 || !p.dnsV2 {
++		c.mu.Unlock()
++		return ctx, noop, target, true, ErrProfileUnsupported
++	}
++	if q := profileQueryFrom(ctx); q != nil && (q.runtime != p || q.receipt != r || !q.liveLocked()) {
++		c.mu.Unlock()
++		return ctx, noop, target, true, errProfile
++	}
++	if c.numericUsed >= len(c.numerics) || c.profilePendingUsed()+profileNumericPending > min(64, int(c.manifest.caps[3])) || c.buffered+c.manifest.memoryCredit+profileNumericCredit > uint64(c.manifest.caps[4]) || !c.dnsReserveHistory(profileNumericPending) {
++		c.mu.Unlock()
++		return ctx, noop, target, true, errProfileFlowBusy
++	}
++	c.operations += profileNumericPending
++	c.buffered += profileNumericCredit
++	child, cancel := context.WithCancel(ctx)
++	n := &profileNumeric{runtime: p, ctx: child, cancel: cancel, receipt: r, original: v, subject: route.subject, scope: scope, stream: u16(s, 12), chain: u16(s, 16), revision: r.revision, cleanupDeadline: c.sessionDeadline}
++	n.native = profileSelectedRoute{subject: n.subject, scope: n.scope, branches: 1, effective: n.original}
++	r.numeric = n
++	c.numerics[c.numericUsed] = n
++	c.numericUsed++
++	c.mu.Unlock()
++	query, _, err := ProfileDNSQueryContext(child, v.address)
++	if err != nil {
++		c.mu.Lock()
++		c.numericClose(n)
++		c.mu.Unlock()
++		return ctx, noop, target, true, err
++	}
++	c.mu.Lock()
++	n.query = profileQueryFrom(query)
++	n.query.refs++
++	c.mu.Unlock()
++	query = context.WithValue(query, profileNumericKey{}, n)
++	_, _, err = lookup(query, v.address)
++	c.mu.Lock()
++	valid := err == nil && n.answered && n.grant != nil && c.numericParentLive(n) && c.grantLive(n.grant)
++	if !valid {
++		c.numericClose(n)
++		n.query.closeLocked()
++	}
++	c.mu.Unlock()
++	if !valid {
++		return ctx, noop, target, true, errProfile
++	}
++	// USER handoff не содержит DNS exchange/query key и не меняет original host.
++	next := context.WithValue(n.grant.ctx, profileGrantKey{}, n.grant)
++	next = context.WithValue(next, profileRouteKey{}, profileSelectedRoute{subject: n.subject, scope: n.scope, branches: 1, effective: n.target})
++	release := func() { c.mu.Lock(); c.numericClose(n); n.query.closeLocked(); c.mu.Unlock() }
++	return next, release, profileNumericDestination(n.target), true, nil
++}
++func profileNumericDestination(v profileDestinationValue) xnet.Destination {
++	network := xnet.Network_TCP
++	if v.network == 17 {
++		network = xnet.Network_UDP
++	}
++	return xnet.Destination{Network: network, Address: xnet.ParseAddress(v.address), Port: xnet.Port(v.port)}
++}
++
++// Production outer caller не выпускает USER answer на одном class3 receipt.
++func ProfileFinishDNSAnswer(ctx context.Context, name string, ips []net.IP, ttl uint32) ([]net.IP, uint32, error) {
++	p := profileRuntime(ctx)
++	if p == nil {
++		if err := ProfileCheckDNSAnswer(ctx, name, ips); err != nil {
++			return nil, 0, err
++		}
++		return ips, ttl, nil
++	}
++	n, _ := ctx.Value(profileNumericKey{}).(*profileNumeric)
++	if n == nil {
++		if err := ProfileCheckDNSAnswer(ctx, name, ips); err != nil {
++			return nil, 0, err
++		}
++		return ips, ttl, nil
++	}
++	q := profileQueryFrom(ctx)
++	c := p.flow
++	c.mu.Lock()
++	if n.runtime != p || q != n.query || profileReceiptFrom(ctx) != n.receipt || ctx.Err() != nil || q.name != profileCanonicalQuery(name) || !q.ready || n.attempted || n.answered || !c.numericParentLive(n) || ttl == 0 || len(ips) == 0 || len(ips) > 256 {
++		c.mu.Unlock()
++		return nil, 0, errProfile
++	}
++	// Validate весь returned narrowing, затем выбрать один admitted member.
++	var w *profileDNSWaiter
++	member := -1
++	for _, raw := range ips {
++		ip, ok := netip.AddrFromSlice(raw)
++		if !ok {
++			c.mu.Unlock()
++			return nil, 0, errProfile
++		}
++		ip = ip.Unmap()
++		found := false
++		for _, candidate := range q.waiters {
++			if candidate == nil || !c.dnsWaiterLive(candidate) {
++				continue
++			}
++			for i, value := range candidate.data.members[:candidate.data.count] {
++				if value == ip {
++					found = true
++					if w == nil {
++						w = candidate
++						member = i
++					}
++				}
++			}
++		}
++		if !found {
++			c.mu.Unlock()
++			return nil, 0, errProfile
++		}
++	}
++	if w == nil || w.numeric != nil || w.bundle.exchange.query.receipt != n.receipt || w.bundle.exchange.root.revision != n.revision || q.name != profileCanonicalQuery(n.original.address) {
++		c.mu.Unlock()
++		return nil, 0, errProfile
++	}
++	ip := w.data.members[member]
++	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
++		c.mu.Unlock()
++		return nil, 0, ErrProfileUnsupported
++	}
++	n.waiter = w
++	n.member = uint16(member)
++	n.target = n.original
++	n.target.family = 6
++	if ip.Is4() {
++		n.target.family = 4
++	}
++	n.target.address = ip.String()
++	n.deadline = w.deadline
++	for _, d := range []time.Time{w.reservationDeadline, w.bundle.deadline, w.data.expires, c.sessionDeadline, c.clock().Add(time.Second)} {
++		if d.Before(n.deadline) {
++			n.deadline = d
++		}
++	}
++	root := w.bundle.exchange.root
++	if c.serviceOwnerRequired(root) && root.ownerDeadline.Before(n.deadline) {
++		n.deadline = root.ownerDeadline
++	}
++	slot := -1
++	for i, g := range c.grants {
++		if g == nil && i < int(c.manifest.caps[0]) {
++			slot = i
++			break
++		}
++	}
++	if slot < 0 || !c.numericParentLive(n) {
++		c.mu.Unlock()
++		return nil, 0, errProfileFlowBusy
++	}
++	grantBase := context.WithValue(context.WithValue(n.ctx, profileDNSQueryKey{}, (*profileDNSQuery)(nil)), profileDNSExchangeKey{}, (*profileDNSExchange)(nil))
++	grantCtx, cancel := context.WithCancel(grantBase)
++	g := &profileGrant{numeric: n, class: 1, receipt: n.receipt, ctx: grantCtx, cancel: cancel, effective: n.target, subject: n.subject, scope: n.scope, stream: n.stream, chain: n.chain, branch: n.branch, slot: uint16(slot), prepared: true}
++	n.grant = g
++	c.grants[slot] = g
++	n.receipt.grantCount++
++	base := make([]byte, 20)
++	be.PutUint64(base, n.receipt.id)
++	base[8] = 1
++	be.PutUint16(base[10:], n.subject)
++	be.PutUint16(base[12:], n.chain)
++	be.PutUint16(base[14:], n.stream)
++	be.PutUint16(base[16:], n.scope)
++	base[18] = n.branch
++	base = append(base, n.original.encode()...)
++	base = append(base, n.original.encode()...)
++	base = append(base, 255, 255, 0, 0)
++	base = append(base, make([]byte, 16)...)
++	body := make([]byte, 16)
++	be.PutUint16(body, 2)
++	be.PutUint16(body[2:], n.member)
++	be.PutUint64(body[4:], w.id)
++	be.PutUint16(body[12:], uint16(len(base)))
++	body[14], body[15] = 1, 1
++	body = append(body, base...)
++	// DNS-only compact numeric prefix7, legacy Destination остаётся прежним.
++	dst := make([]byte, 7)
++	dst[0], dst[1] = n.target.family, n.target.network
++	be.PutUint16(dst[2:], n.target.port)
++	a := ip.AsSlice()
++	dst[4] = byte(len(a))
++	body = append(body, dst...)
++	body = append(body, a...)
++	if !profileDNSV2Body(42, body) {
++		c.numericClose(n)
++		c.mu.Unlock()
++		return nil, 0, errProfile
++	}
++	op := &profileOperation{dnsNumeric: n, ctx: ctx, receipt: n.receipt, grant: g, kind: 42, body: body, done: make(chan struct{})}
++	n.bodyDigest = sha256.Sum256(body)
++	n.op = op
++	c.mu.Unlock()
++	if err := p.flowRPC(op); err != nil {
++		return nil, 0, err
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.numericParentLive(n) || !c.grantLive(g) || n.answered {
++		return nil, 0, errProfile
++	}
++	n.answered = true
++	return []net.IP{append(net.IP(nil), ip.AsSlice()...)}, ttl, nil
++}
++
++func (c *profileFlowControl) numericDispatch(op *profileOperation) error {
++	n := op.dnsNumeric
++	if op.submitted || op.completed {
++		return nil
++	}
++	if !c.numericParentLive(n) || n.attempted || n.waiter.numeric != nil || !profileDNSV2Body(42, op.body) || sha256.Sum256(op.body) != n.bodyDigest {
++		c.numericClose(n)
++		c.dnsNotify(op, errProfile)
++		return nil
++	}
++	op.sent = c.clock()
++	op.deadline = n.deadline
++	op.sessionDeadline = c.sessionDeadline
++	if !op.sent.Before(op.deadline) {
++		c.numericClose(n)
++		c.dnsNotify(op, errProfile)
++		return nil
++	}
++	// Irreversible narrowing фиксируется до write, включая uncertain send.
++	n.attempted = true
++	n.receipt.numericOnly = true
++	n.waiter.numeric = n
++	op.submitted = true
++	seq, err := c.write(42, 0, op.body)
++	op.sequence = seq
++	if seq > c.lastSent {
++		c.lastSent = seq
++	}
++	if err != nil || !profileDNSV2ID(seq) {
++		n.unknown = true
++		c.numericClose(n)
++		c.dnsNotify(op, errProfile)
++		return errProfile
++	}
++	return nil
++}
++func (c *profileFlowControl) numericAccept(f profilePacket) (bool, error) {
++	for _, n := range c.numerics[:c.numericUsed] {
++		if f.kind == 48 && n.cancelSequence != 0 && f.reply == n.cancelSequence {
++			if n.cancelAck || !profileDNSV2Body(48, f.body) || f.object != 0 || f.body[2] != 1 || u64(f.body, 8) != n.op.sequence || !c.clock().Before(n.cleanupDeadline) {
++				n.unknown = true
++				return true, errProfile
++			}
++			n.cancelAck = true
++			return true, nil
++		}
++		if f.kind == 34 && n.closeSequence != 0 && f.reply == n.closeSequence {
++			if n.closeAck || !profileCloseACK(f, 3, n.grant.id) || f.body[1] != 1 || !c.clock().Before(n.cleanupDeadline) {
++				n.unknown = true
++				return true, errProfile
++			}
++			n.closeAck = true
++			return true, nil
++		}
++		op := n.op
++		if op == nil || !op.submitted || f.reply != op.sequence {
++			continue
++		}
++		if n.received || n.cancelAck || f.kind != 19 || len(f.body) != 56 {
++			if f.kind == 19 && len(f.body) == 56 && f.body[0] == 1 && f.object != 0 && f.object == u64(f.body, 4) {
++				n.rejectedID = f.object
++			}
++			n.unknown = true
++			c.numericClose(n)
++			return true, errProfile
++		}
++		n.received = true
++		op.body = nil
++		b := f.body
++		if b[0] != 1 {
++			if f.object != 0 || (b[0] != 2 && b[0] != 3) || b[1] != 1 || !zero(b[2:]) {
++				n.unknown = true
++			}
++			if b[0] == 3 {
++				n.unknown = true
++			}
++			c.numericClose(n)
++			c.dnsNotify(op, errProfile)
++			return true, nil
++		}
++		// Общий GRANT19 decoder проверяет mandatory Known/receipt/flow/revision.
++		err := c.publish(op, f)
++		if err != nil {
++			if f.object == u64(b, 4) && f.object != 0 {
++				n.rejectedID = f.object
++			}
++			n.unknown = true
++			c.numericClose(n)
++			c.dnsNotify(op, errProfile)
++			return true, err
++		}
++		g := n.grant
++		if n.deadline.Before(g.deadline) {
++			g.deadline = n.deadline
++		}
++		if c.mode == 2 && n.deadline.Before(g.ownerDeadline) {
++			g.ownerDeadline = n.deadline
++		}
++		if !c.numericParentLive(n) || !c.clock().Before(op.deadline) || !c.grantLive(g) {
++			c.numericClose(n)
++			c.dnsNotify(op, errProfile)
++			return true, nil
++		}
++		c.dnsNotify(op, nil)
++		return true, nil
++	}
++	return false, nil
++}
++func (c *profileFlowControl) numericTick() error {
++	for _, n := range c.numerics[:c.numericUsed] {
++		if n.released || n.unknown {
++			continue
++		}
++		if !c.numericParentLive(n) || n.grant != nil && (n.grant.closed || !n.grant.deadline.IsZero() && !c.clock().Before(n.grant.deadline)) {
++			c.numericClose(n)
++		}
++		if !n.closed {
++			continue
++		}
++		if n.cleanupDeadline == c.sessionDeadline {
++			until := c.clock()
++			if !n.deadline.IsZero() {
++				until = n.deadline
++			}
++			n.cleanupDeadline = until.Add(time.Second)
++			if c.sessionDeadline.Before(n.cleanupDeadline) {
++				n.cleanupDeadline = c.sessionDeadline
++			}
++		}
++		if !c.clock().Before(n.cleanupDeadline) {
++			n.unknown = true
++			continue
++		}
++		if n.op != nil && n.op.submitted && !n.received {
++			c.dnsNotify(n.op, errProfile)
++			if n.cancelSequence == 0 {
++				seq, err := c.dnsCancel(1, n.op.sequence)
++				if err != nil {
++					n.unknown = true
++					return err
++				}
++				n.cancelSequence = seq
++			}
++			if !n.cancelAck || c.clock().Before(n.op.deadline) {
++				continue
++			}
++		}
++		if n.grant != nil && n.grant.id != 0 && !n.closeAck {
++			if n.closeSequence == 0 {
++				body := make([]byte, 12)
++				body[0] = 3
++				be.PutUint64(body[4:], n.grant.id)
++				seq, err := c.write(32, 0, body)
++				if seq > c.lastSent {
++					c.lastSent = seq
++				}
++				n.closeSequence = seq
++				if err != nil || !profileDNSV2ID(seq) {
++					n.unknown = true
++					return errProfile
++				}
++			}
++			continue
++		}
++		if n.query != nil {
++			n.query.closeLocked()
++			n.query.refs--
++			n.query.releaseLocked()
++		}
++		if g := n.grant; g != nil {
++			c.grants[g.slot] = nil
++			n.receipt.grantCount--
++		}
++		n.released = true
++		c.operations -= profileNumericPending
++		c.buffered -= profileNumericCredit - 16*1024
++	}
++	return nil
++}
++func (c *profileFlowControl) numericFloor(floor uint64) uint64 {
++	for _, n := range c.numerics[:c.numericUsed] {
++		if n.released {
++			continue
++		}
++		if op := n.op; op != nil && op.submitted && !n.received && op.sequence < floor {
++			floor = op.sequence
++		}
++		if n.cancelSequence != 0 && !n.cancelAck && n.cancelSequence < floor {
++			floor = n.cancelSequence
++		}
++		if n.closeSequence != 0 && !n.closeAck && n.closeSequence < floor {
++			floor = n.closeSequence
++		}
++	}
++	return floor
++}
++
++func ProfileNumericPhysicalAttempt(ctx context.Context, target xnet.Destination) error {
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if g == nil {
++		if pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); pool != nil {
++			candidate, err := pool.resolve(ctx)
++			if err != nil {
++				return err
++			}
++			if candidate.numeric != nil {
++				return ErrProfileUnsupported
++			}
++		}
++		return nil
++	}
++	if g.numeric == nil {
++		return nil
++	}
++	n := g.numeric
++	c := n.runtime.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	v, err := profileValue(target)
++	physical, _ := ctx.Value(profilePhysicalContextKey{}).(bool)
++	if err != nil || v != n.target || n.physicalAttempted || physical || profileReceiptFrom(ctx) != g.receipt || ctx.Err() != nil || !c.grantLive(g) || c.mode == 2 && !c.clock().Before(g.ownerDeadline) {
++		return ErrProfileUnsupported
++	}
++	n.physicalAttempted = true
++	return nil
++}
+diff --git a/common/yonikbroker/profile_dns_numeric_linux_test.go b/common/yonikbroker/profile_dns_numeric_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_dns_numeric_linux_test.go
+@@ -0,0 +1,593 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	_ "embed"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	xnet "github.com/xtls/xray-core/common/net"
++	"net"
++	"testing"
++	"time"
++)
++
++//go:embed profile-numeric-rust-v3.json
++var profileNumericRustVectors []byte
++
++func numericGolden(t *testing.T, mode byte, flow uint64) (profilePacket, []byte) {
++	t.Helper()
++	var corpus struct {
++		Vectors []struct {
++			System                   bool
++			Flow                     uint64
++			FrameHex, NumericBodyHex string
++		}
++	}
++	if err := json.Unmarshal(profileNumericRustVectors, &corpus); err != nil {
++		t.Fatal(err)
++	}
++	for _, v := range corpus.Vectors {
++		if v.System == (mode == 2) && v.Flow == flow {
++			raw, err := hex.DecodeString(v.FrameHex)
++			if err != nil {
++				t.Fatal(err)
++			}
++			body, err := hex.DecodeString(v.NumericBodyHex)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if len(raw) != 184 || u16(raw, 10) != 19 || !profileDNSV2Body(42, body) {
++				t.Fatal("Rust vector shape")
++			}
++			launch := profileLaunch{mode: mode, generation: 4, epoch: 5}
++			for i := range launch.session {
++				launch.session[i] = 1
++				launch.invocation[i] = 2
++			}
++			for i := range launch.digest {
++				launch.digest[i] = 3
++			}
++			packet, err := launch.decodePacket(raw, u64(raw, 16))
++			if err != nil {
++				t.Fatal("Rust frame Go decode", err)
++			}
++			packet.body = append([]byte(nil), packet.body...)
++			return packet, body
++		}
++	}
++	t.Fatal("missing Rust encoder vector")
++	return profilePacket{}, nil
++}
++
++type numericResult struct {
++	ctx     context.Context
++	release func()
++	target  xnet.Destination
++	handled bool
++	err     error
++}
++type numericHarness struct {
++	wire   *dnsDirectHarness
++	data   *ProfileDNSProducerData
++	source context.Context
++	target xnet.Destination
++	done   chan numericResult
++}
++
++func numericPublished(t *testing.T, mode, network byte) *numericHarness {
++	t.Helper()
++	h, conn, _, data, published := dnsWirePublishStart(t, network, mode, 1)
++	t.Cleanup(func() { _ = conn.Close() })
++	op := h.next(t, 40)
++	if err := h.f.c.accept(dnsWirePublished(op)); err != nil {
++		t.Fatal(err)
++	}
++	d := <-data
++	if err := <-published; err != nil {
++		t.Fatal(err)
++	}
++	h.f.c.nextDNSQuery = h.b.exchange.id
++	r := h.b.exchange.query.receipt
++	ctx, err := ProfileSelectRoute(h.b.exchange.query.ctx, "a", profileNumericDestination(r.original))
++	if err != nil {
++		t.Fatal(err)
++	}
++	return &numericHarness{wire: h, data: d, source: ctx, target: profileNumericDestination(r.original)}
++}
++func (n *numericHarness) launch(t *testing.T, ctx context.Context, target xnet.Destination) {
++	t.Helper()
++	n.done = make(chan numericResult, 1)
++	lookup := func(query context.Context, name string) ([]net.IP, uint32, error) {
++		request, dnsTarget, err := ProfileDNSDataRequest(query, n.data)
++		if err != nil {
++			return nil, 0, err
++		}
++		exchange, release, err := ProfileDNSExchangeContext(query, request, dnsTarget)
++		if err != nil {
++			return nil, 0, err
++		}
++		selected, releasePath, _, err := ProfileDNSPrepareHandler(exchange, "a", dnsTarget, false, nil)
++		if err != nil {
++			release()
++			return nil, 0, err
++		}
++		if err = ProfileDNSBindWaiter(selected, n.data); err != nil {
++			releasePath()
++			release()
++			return nil, 0, err
++		}
++		context.AfterFunc(query, func() { releasePath(); release() })
++		ips, ttl, err := ProfileDNSDataAnswer(selected, n.data)
++		if err != nil {
++			return nil, 0, err
++		}
++		return ProfileFinishDNSAnswer(query, name, ips, ttl)
++	}
++	go func() {
++		ctx, release, dest, handled, err := ProfilePrepareNumericHandler(ctx, "a", target, false, lookup)
++		n.done <- numericResult{ctx, release, dest, handled, err}
++	}()
++}
++func (n *numericHarness) dnsTo42(t *testing.T) *profileOperation {
++	t.Helper()
++	h := n.wire
++	op := h.next(t, 18)
++	if h.f.grantID < h.f.c.highestGrant {
++		h.f.grantID = h.f.c.highestGrant
++	}
++	if err := h.f.c.accept(serviceReply(h.f, op)); err != nil {
++		t.Fatal(err)
++	}
++	op = h.next(t, 55)
++	if err := h.f.c.accept(dnsBundleReply(op, uint64(41+h.f.c.dnsRequestUsed), 1)); err != nil {
++		t.Fatal(err)
++	}
++	op = h.next(t, 35)
++	if op.body[2] != 3 {
++		t.Fatal("not own waiter role")
++	}
++	if err := h.f.c.accept(dnsWireWaiterReply(op)); err != nil {
++		t.Fatal(err)
++	}
++	op = h.next(t, 53)
++	if err := h.f.c.accept(dnsWireWaiterReply(op)); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case op = <-h.f.p.flowQueue:
++		if op.kind != 42 || op.dnsNumeric == nil {
++			t.Fatal("not Numeric42")
++		}
++		return op
++	case result := <-n.done:
++		t.Fatal("caller ended before Numeric42", result.err)
++	case <-time.After(time.Second):
++		t.Fatal("missing Numeric42")
++	}
++	return nil
++}
++func (n *numericHarness) ack(t *testing.T, op *profileOperation) profilePacket {
++	t.Helper()
++	c := n.wire.f.c
++	reply, body := numericGolden(t, c.mode, op.receipt.id)
++	if !bytes.Equal(op.body, body) {
++		t.Fatalf("Go42 differs from Rust encoder\nGo %x\nRust %x", op.body, body)
++	}
++	if err := c.dispatch(op); err != nil {
++		t.Fatal(err)
++	}
++	reply.reply = op.sequence
++	if err := c.accept(reply); err != nil {
++		t.Fatal(err)
++	}
++	return reply
++}
++func (n *numericHarness) result(t *testing.T) numericResult {
++	t.Helper()
++	select {
++	case r := <-n.done:
++		return r
++	case <-time.After(time.Second):
++		t.Fatal("numeric caller not settled")
++	}
++	return numericResult{}
++}
++
++func TestProfileDNSNumericActualCallerRustPairAndPhysicalGuard(t *testing.T) {
++	for _, mode := range []byte{1, 2} {
++		for _, dnsNetwork := range []byte{6, 17} {
++			t.Run(string([]byte{'0' + mode, '0' + dnsNetwork%10}), func(t *testing.T) {
++				n := numericPublished(t, mode, dnsNetwork)
++				n.launch(t, n.source, n.target)
++				op := n.dnsTo42(t)
++				select {
++				case <-n.done:
++					t.Fatal("USER handoff before durable GRANT")
++				default:
++				}
++				if op.receipt.numericOnly {
++					t.Fatal("narrowing happened before effectful send")
++				}
++				plain, _ := op.ctx.Value(profileGrantKey{}).(*profileGrant)
++				if plain != nil {
++					t.Fatal("DNS grant leaked into USER request")
++				}
++				n.ack(t, op)
++				result := n.result(t)
++				if result.err != nil || !result.handled {
++					t.Fatal(result.err)
++				}
++				defer result.release()
++				if result.target.Address.String() != "203.0.113.9" || result.target.Port != 443 || result.target.Network != xnet.Network_TCP {
++					t.Fatal("DNS carrier/port replaced USER carrier")
++				}
++				if profileQueryFrom(result.ctx) != nil || profileDNSExchangeFrom(result.ctx) != nil {
++					t.Fatal("DNS context leaked into USER handoff")
++				}
++				if ProfileCheckDial(result.ctx, result.target, false) != nil || ProfileLogicalGate(result.ctx) != nil {
++					t.Fatal("private USER guard denied")
++				}
++				calls := 0
++				conn, err := ProfileDialPhysical(result.ctx, result.target, func(ctx context.Context) (net.Conn, error) {
++					calls++
++					if ProfilePhysicalGate(ctx) != nil {
++						t.Fatal("factory missing private physical scope")
++					}
++					if _, ok := ctx.Deadline(); !ok {
++						t.Fatal("numeric dial lost original deadline")
++					}
++					return &flowFakeConn{}, nil
++				})
++				if err != nil || conn == nil || calls != 1 {
++					t.Fatal("guarded factory failed", err)
++				}
++				_ = conn.Close()
++				if _, err = ProfileDialPhysical(result.ctx, result.target, func(context.Context) (net.Conn, error) { calls++; return &flowFakeConn{}, nil }); err == nil || calls != 1 {
++					t.Fatal("numeric grant reused for another physical dial")
++				}
++				if _, _, err = ProfileAuthorizeHandler(n.source, "a", n.target, false); !errors.Is(err, ErrProfileUnsupported) {
++					t.Fatal("ordinary AUTHORIZE bypass after narrowing", err)
++				}
++				if _, _, err = n.wire.f.c.authorize(result.ctx, op.receipt, 0, 0, op.grant.effective, op.grant); !errors.Is(err, ErrProfileUnsupported) {
++					t.Fatal("numeric refresh resurrected source", err)
++				}
++				wrong := result.target
++				wrong.Port++
++				if ProfileCheckDial(result.ctx, wrong, false) == nil {
++					t.Fatal("port hijack")
++				}
++				n.wire.f.now = op.grant.deadline
++				if ProfileLogicalGate(result.ctx) == nil {
++					t.Fatal("expired grant reused")
++				}
++			})
++		}
++	}
++}
++
++func TestProfileDNSNumericPrivateSourceAndWireMutationDenied(t *testing.T) {
++	for _, fault := range []string{"host", "member", "ip", "port", "carrier", "scope", "stream", "chain", "source"} {
++		t.Run(fault, func(t *testing.T) {
++			n := numericPublished(t, 1, 6)
++			n.launch(t, n.source, n.target)
++			op := n.dnsTo42(t)
++			at := 16 + int(u16(op.body, 12))
++			switch fault {
++			case "host":
++				op.body[16+20+8] ^= 1
++			case "member":
++				be.PutUint16(op.body[2:], 1)
++			case "ip":
++				op.body[len(op.body)-1] ^= 1
++			case "port":
++				be.PutUint16(op.body[at+2:], 53)
++			case "carrier":
++				op.body[at+1] = 17
++			case "scope":
++				be.PutUint16(op.body[16+16:], 1)
++			case "stream":
++				be.PutUint16(op.body[16+14:], 65535)
++			case "chain":
++				be.PutUint16(op.body[16+12:], 0)
++			case "source":
++				be.PutUint64(op.body[16:], 99)
++			}
++			before := len(n.wire.f.writes)
++			if err := n.wire.f.c.dispatch(op); err != nil {
++				t.Fatal(err)
++			}
++			result := n.result(t)
++			if result.err == nil || len(n.wire.f.writes) != before {
++				t.Fatal("changed request reached issuer")
++			}
++		})
++	}
++}
++
++func TestProfileDNSNumericGrant19ForeignExpiredUnknownAndLate(t *testing.T) {
++	for _, fault := range []string{"flow", "revision", "object", "class", "required", "owner-kind", "owner-none", "owner-expired", "late", "root-expired", "reservation-expired", "cancel", "unknown", "deny", "duplicate"} {
++		t.Run(fault, func(t *testing.T) {
++			n := numericPublished(t, 2, 6)
++			n.launch(t, n.source, n.target)
++			op := n.dnsTo42(t)
++			reply, _ := numericGolden(t, 2, op.receipt.id)
++			if err := n.wire.f.c.dispatch(op); err != nil {
++				t.Fatal(err)
++			}
++			reply.reply = op.sequence
++			switch fault {
++			case "flow":
++				be.PutUint64(reply.body[12:], 2)
++			case "revision":
++				be.PutUint64(reply.body[24:], 2)
++			case "object":
++				reply.object++
++			case "class":
++				reply.body[1] = 3
++			case "required":
++				reply.body[2] = 0
++			case "owner-kind":
++				reply.body[40] = 3
++			case "owner-none":
++				clear(reply.body[32:])
++			case "owner-expired":
++				n.wire.f.now = op.sent.Add(11 * time.Millisecond)
++			case "late":
++				n.wire.f.now = op.deadline
++			case "root-expired":
++				op.dnsNumeric.waiter.bundle.exchange.root.ownerDeadline = n.wire.f.now
++			case "reservation-expired":
++				op.dnsNumeric.waiter.reservationDeadline = n.wire.f.now
++			case "cancel":
++				n.wire.f.c.abort(op)
++			case "unknown", "deny":
++				reply.object = 0
++				clear(reply.body[2:])
++				reply.body[0] = 2
++				if fault == "unknown" {
++					reply.body[0] = 3
++				}
++			}
++			err := n.wire.f.c.accept(reply)
++			if err != nil {
++				n.wire.f.p.cancel()
++			}
++			result := n.result(t)
++			if fault == "duplicate" {
++				if result.err != nil {
++					t.Fatal(result.err)
++				}
++				defer result.release()
++				if n.wire.f.c.accept(reply) == nil {
++					t.Fatal("GRANT replay accepted")
++				}
++				return
++			}
++			if result.err == nil {
++				result.release()
++				t.Fatal("bad USER grant published", fault)
++			}
++			if fault == "unknown" && !op.dnsNumeric.unknown {
++				t.Fatal("Unknown custody lost")
++			}
++		})
++	}
++}
++
++func TestProfileDNSNumericCancelPublicationFenceAndKnownCleanup(t *testing.T) {
++	n := numericPublished(t, 1, 6)
++	n.launch(t, n.source, n.target)
++	op := n.dnsTo42(t)
++	c := n.wire.f.c
++	old := c.write
++	c.write = func(kind uint16, object uint64, b []byte) (uint64, error) {
++		seq, err := old(kind, object, b)
++		if kind == 42 {
++			op.dnsNumeric.cancel()
++		}
++		return seq, err
++	}
++	if err := c.dispatch(op); err != nil {
++		t.Fatal(err)
++	}
++	result := n.result(t)
++	if result.err == nil {
++		t.Fatal("cancel inside successful send published")
++	}
++	if !op.receipt.numericOnly || !op.dnsNumeric.attempted {
++		t.Fatal("sent phase not retained")
++	}
++	reply, _ := numericGolden(t, 1, op.receipt.id)
++	reply.reply = op.sequence
++	if err := c.accept(reply); err != nil {
++		t.Fatal(err)
++	}
++	if err := c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	holder := op.dnsNumeric
++	if holder.closeSequence == 0 || holder.released {
++		t.Fatal("missing own durable grant retirement")
++	}
++	if holder.waiter.owner.cleanupSequence != 0 {
++		t.Fatal("waiter retired before user grant ACK")
++	}
++	ack := profilePacket{kind: 34, reply: holder.closeSequence, body: make([]byte, 12)}
++	ack.body[0], ack.body[1] = 3, 1
++	be.PutUint64(ack.body[4:], holder.grant.id)
++	if err := c.accept(ack); err != nil {
++		t.Fatal(err)
++	}
++	if err := c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	if !holder.released {
++		t.Fatal("known cleanup not released")
++	}
++	before := c.operations
++	if err := c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	if c.operations != before {
++		t.Fatal("numeric credits returned twice")
++	}
++}
++
++func TestProfileDNSNumericCanceledRequestCannotUseLateAllow(t *testing.T) {
++	n := numericPublished(t, 1, 6)
++	n.launch(t, n.source, n.target)
++	op := n.dnsTo42(t)
++	c := n.wire.f.c
++	if err := c.dispatch(op); err != nil {
++		t.Fatal(err)
++	}
++	c.abort(op)
++	if err := c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	if n.result(t).err == nil {
++		t.Fatal("canceled caller succeeded")
++	}
++	holder := op.dnsNumeric
++	if holder.cancelSequence == 0 {
++		t.Fatal("missing request cancel")
++	}
++	if err := c.accept(dnsCancelAck(holder.cancelSequence, op.sequence)); err != nil {
++		t.Fatal(err)
++	}
++	reply, _ := numericGolden(t, 1, op.receipt.id)
++	reply.reply = op.sequence
++	if c.accept(reply) == nil || !holder.unknown || holder.released {
++		t.Fatal("Known cancel resurrected late GRANT")
++	}
++}
++
++func TestProfileDNSNumericLocalBudgetRefusalBeforeLookup(t *testing.T) {
++	for _, fault := range []string{"pending", "memory", "history"} {
++		t.Run(fault, func(t *testing.T) {
++			n := numericPublished(t, 1, 6)
++			c := n.wire.f.c
++			c.mu.Lock()
++			switch fault {
++			case "pending":
++				c.operations = 64
++			case "memory":
++				c.buffered = uint64(c.manifest.caps[4])
++			case "history":
++				c.dnsHistoryUsed = 256
++			}
++			c.mu.Unlock()
++			calls := 0
++			before := len(n.wire.f.writes)
++			_, release, _, handled, err := ProfilePrepareNumericHandler(n.source, "a", n.target, false, func(context.Context, string) ([]net.IP, uint32, error) { calls++; return nil, 0, nil })
++			release()
++			if !handled || !errors.Is(err, errProfileFlowBusy) || calls != 0 || before != len(n.wire.f.writes) || n.wire.f.p.ctx.Err() != nil {
++				t.Fatal("local admission affected lookup/neighbor", err)
++			}
++		})
++	}
++}
++
++func TestProfileDNSNumericTwoPrivateWaitersDoNotShareUserGrant(t *testing.T) {
++	n := numericPublished(t, 1, 6)
++	n.launch(t, n.source, n.target)
++	op := n.dnsTo42(t)
++	n.ack(t, op)
++	first := n.result(t)
++	if first.err != nil {
++		t.Fatal(first.err)
++	}
++	f := n.wire.f
++	r := f.admittedReceipt(t, "Original.INVALID")
++	source := context.WithValue(context.WithValue(f.p.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r)
++	source, err := ProfileSelectRoute(source, "a", n.target)
++	if err != nil {
++		t.Fatal(err)
++	}
++	n.launch(t, source, n.target)
++	op = n.dnsTo42(t)
++	n.ack(t, op)
++	second := n.result(t)
++	if second.err != nil {
++		t.Fatal(second.err)
++	}
++	defer second.release()
++	g1, _ := first.ctx.Value(profileGrantKey{}).(*profileGrant)
++	g2, _ := second.ctx.Value(profileGrantKey{}).(*profileGrant)
++	if g1 == g2 || g1.receipt == g2.receipt || g1.numeric.waiter == g2.numeric.waiter {
++		t.Fatal("borrowed neighbor authority")
++	}
++	foreign := context.WithValue(first.ctx, profileReceiptKey{}, g2.receipt)
++	if ProfileCheckDial(foreign, first.target, false) == nil {
++		t.Fatal("foreign private receipt accepted")
++	}
++	pool1, err := ProfileTransportPool(first.ctx, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pool2, err := ProfileTransportPool(second.ctx, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if pool1 == pool2 {
++		t.Fatal("numeric physical identity shared sources")
++	}
++	first.release()
++	if ProfileLogicalGate(first.ctx) == nil || ProfileLogicalGate(second.ctx) != nil {
++		t.Fatal("cancel killed neighbor or revived old grant")
++	}
++}
++
++func TestProfileDNSNumericReservationDeadlineAndBlockedFactoryCustody(t *testing.T) {
++	for _, failedClose := range []bool{false, true} {
++		t.Run(fmt.Sprint(failedClose), func(t *testing.T) {
++			n := numericPublished(t, 1, 6)
++			n.launch(t, n.source, n.target)
++			op := n.dnsTo42(t)
++			originalDeadline := n.wire.f.now.Add(5 * time.Millisecond)
++			op.dnsNumeric.waiter.reservationDeadline = originalDeadline
++			op.dnsNumeric.deadline = originalDeadline
++			n.ack(t, op)
++			result := n.result(t)
++			if result.err != nil || !op.grant.deadline.Equal(originalDeadline) {
++				t.Fatal("Numeric продлил исходную reservation", result.err)
++			}
++			entered, resume := make(chan struct{}), make(chan struct{})
++			done := make(chan error, 1)
++			bad := &profileErrorConn{}
++			go func() {
++				_, err := ProfileDialPhysical(result.ctx, result.target, func(context.Context) (net.Conn, error) {
++					close(entered)
++					<-resume
++					if failedClose {
++						return bad, nil
++					}
++					return &flowFakeConn{}, nil
++				})
++				done <- err
++			}()
++			<-entered
++			result.release()
++			close(resume)
++			if err := <-done; err == nil {
++				t.Fatal("late factory опубликовал отменённый Numeric")
++			}
++			if ProfileLogicalGate(result.ctx) == nil {
++				t.Fatal("отменённый USER ожил")
++			}
++			if failedClose {
++				if n.wire.f.p.closeTransports() == nil || bad.count != 1 {
++					t.Fatal("Unknown cleanup потерян или повторён")
++				}
++				if n.wire.f.p.closeTransports() == nil || bad.count != 1 {
++					t.Fatal("повторный close превратил Unknown в Known")
++				}
++			}
++		})
++	}
++}
+diff --git a/common/yonikbroker/profile-numeric-rust-v3.json b/common/yonikbroker/profile-numeric-rust-v3.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-numeric-rust-v3.json
+@@ -0,0 +1,29 @@
++{
++  "source": "Rust profile_channel Frame::encode at 2684084",
++  "vectors": [
++    {
++      "system": false,
++      "flow": 1,
++      "frameHex": "594e4b434150303100010013000000b800000000000001f5000000000000002a01010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303000000000000000400000000000000050000000000000065000000000000000001010000000000000000006500000000000000010000000a0000000000000001000000000000000000000000000000000000000000000000",
++      "numericBodyHex": "0002000000000000000007d200580101000000000000000101000000ffff000000000000030601bb001000004f726967696e616c2e494e56414c4944030601bb001000004f726967696e616c2e494e56414c4944ffff000000000000000000000000000000000000040601bb040000cb007109"
++    },
++    {
++      "system": false,
++      "flow": 2,
++      "frameHex": "594e4b434150303100010013000000b800000000000001f6000000000000002a010101010101010101010101010101010202020202020202020202020202020203030303030303030303030303030303030303030303030303030303030303030000000000000004000000000000000500000000000003e900000000000000000101000000000000000003e900000000000000020000000a0000000000000001000000000000000000000000000000000000000000000000",
++      "numericBodyHex": "0002000000000000000007d300580101000000000000000201000000ffff000000000000030601bb001000004f726967696e616c2e494e56414c4944030601bb001000004f726967696e616c2e494e56414c4944ffff000000000000000000000000000000000000040601bb040000cb007109"
++    },
++    {
++      "system": true,
++      "flow": 1,
++      "frameHex": "594e4b434150303100010013000000b800000000000001f5000000000000002a01010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303000000000000000400000000000000050000000000000065000000000000000001010100000000000000006500000000000000010000000a0000000000000001000000000098968002000000000000000000000000000037",
++      "numericBodyHex": "0002000000000000000007d200580101000000000000000101000000ffff000000000000030601bb001000004f726967696e616c2e494e56414c4944030601bb001000004f726967696e616c2e494e56414c4944ffff000000000000000000000000000000000000040601bb040000cb007109"
++    },
++    {
++      "system": true,
++      "flow": 2,
++      "frameHex": "594e4b434150303100010013000000b800000000000001f6000000000000002a010101010101010101010101010101010202020202020202020202020202020203030303030303030303030303030303030303030303030303030303030303030000000000000004000000000000000500000000000003e900000000000000000101010000000000000003e900000000000000020000000a0000000000000001000000000098968002000000000000000000000000000037",
++      "numericBodyHex": "0002000000000000000007d300580101000000000000000201000000ffff000000000000030601bb001000004f726967696e616c2e494e56414c4944030601bb001000004f726967696e616c2e494e56414c4944ffff000000000000000000000000000000000000040601bb040000cb007109"
++    }
++  ]
 +}
