@@ -627,6 +627,69 @@ fn supervisor_custody_requires_worker_closed_then_durable_rules() {
 }
 
 #[test]
+fn typed_producer_setup_matches_pf002_and_never_downgrades_wrong_launch() {
+    for mode in [Mode::Local, Mode::System] {
+        let record = launch(mode);
+        // Synthetic constructor доступен только этому private pure test.
+        let producer = super::VerifiedUdpProducer { launch: record };
+        let (packet, ack, version) = producer.setup(record).unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(packet, wire::udp_v2::bootstrap(record).unwrap());
+        assert_eq!(ack, wire::udp_v2::bootstrap_ack(record).unwrap());
+        assert_ne!(&ack[..8], b"YNKPFA01");
+        assert!(producer.payload_retired(record).unwrap());
+        let receipt = Record::Closed {
+            association: 1,
+            close: 2,
+            last_packet: 3,
+            pending: 0,
+            status: 1,
+            joined: true,
+            duplicates: 0,
+            cookie: 102,
+            retired: 9,
+        };
+        producer.duplicate_closed(record, receipt).unwrap();
+        for bad in [
+            Record::Closed {
+                association: 1,
+                close: 2,
+                last_packet: 3,
+                pending: 0,
+                status: 3,
+                joined: true,
+                duplicates: 0,
+                cookie: 102,
+                retired: 9,
+            },
+            Record::Closed {
+                association: 1,
+                close: 2,
+                last_packet: 3,
+                pending: 0,
+                status: 1,
+                joined: false,
+                duplicates: 1,
+                cookie: 102,
+                retired: 9,
+            },
+        ] {
+            assert!(producer.duplicate_closed(record, bad).is_err());
+        }
+        for field in 0..4 {
+            let mut changed = record;
+            match field {
+                0 => changed.binding.digest[0] ^= 1,
+                1 => changed.manifest[0] ^= 1,
+                2 => changed.nonce[0] ^= 1,
+                _ => changed.binding.generation += 1,
+            };
+            assert!(producer.setup(changed).is_err());
+        }
+    }
+}
+
+#[test]
 fn denied_payload_waits_for_verified_release_and_does_not_touch_waiting_neighbor() {
     let mut i = issuer(Mode::Local, 256);
     let (c, a) = association(&mut i, 1);
