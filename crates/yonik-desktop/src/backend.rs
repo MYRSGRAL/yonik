@@ -990,12 +990,20 @@ struct ReviewRow {
 fn pending_dto(pending: &PendingRefresh, offset: usize) -> Result<PendingDto> {
     report_dto(pending.report(), offset)
 }
-fn report_dto(report: &yonik_import::ImportReport, offset: usize) -> Result<PendingDto> {
-    let total = report.issues.len()
-        + report
-            .servers
+fn report_dto(report: &yonik_import::ProfileImportReport, offset: usize) -> Result<PendingDto> {
+    let servers = || {
+        report
+            .entries
             .iter()
-            .map(|server| server.review_flags().len())
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                yonik_import::ProfileEntry::Server(server) => Some((index, server)),
+                yonik_import::ProfileEntry::Xray(_) => None,
+            })
+    };
+    let total = report.issues.len()
+        + servers()
+            .map(|(_, server)| server.review_flags().len())
             .sum::<usize>();
     if offset > total {
         return Err(DesktopError("invalid_input"));
@@ -1024,36 +1032,33 @@ fn report_dto(report: &yonik_import::ImportReport, offset: usize) -> Result<Pend
             Field::Payload => "payload",
         }),
     });
-    let flags = report
-        .servers
-        .iter()
-        .enumerate()
-        .flat_map(|(index, server)| {
-            server.review_flags().iter().map(move |flag| ReviewRow {
-                kind: "flagged",
-                // Это номер принятого профиля в отчёте, а не строка исходного URI.
-                position: index + 1,
-                code: match flag {
-                    ReviewFlag::UnknownParameter => "unknown_parameter",
-                    ReviewFlag::UnsupportedTransport => "unsupported_transport",
-                    ReviewFlag::UnsupportedSecurity => "unsupported_security",
-                    ReviewFlag::UnsupportedCipher => "unsupported_cipher",
-                    ReviewFlag::UnsupportedOption => "unsupported_option",
-                    ReviewFlag::UnsafeOption => "unsafe_option",
-                    ReviewFlag::LegacyOption => "legacy_option",
-                },
-                field: None,
-            })
-        });
+    let flags = servers().flat_map(|(index, server)| {
+        server.review_flags().iter().map(move |flag| ReviewRow {
+            kind: "flagged",
+            // Это номер принятого профиля в отчёте, а не строка исходного URI.
+            position: index + 1,
+            code: match flag {
+                ReviewFlag::UnknownParameter => "unknown_parameter",
+                ReviewFlag::UnsupportedTransport => "unsupported_transport",
+                ReviewFlag::UnsupportedSecurity => "unsupported_security",
+                ReviewFlag::UnsupportedCipher => "unsupported_cipher",
+                ReviewFlag::UnsupportedOption => "unsupported_option",
+                ReviewFlag::UnsafeOption => "unsafe_option",
+                ReviewFlag::LegacyOption => "legacy_option",
+            },
+            field: None,
+        })
+    });
     Ok(PendingDto {
-        accepted: report.servers.len(),
+        accepted: report.entries.len(),
         rejected: report.issues.len(),
-        flagged: report
-            .servers
-            .iter()
-            .filter(|s| !s.review_flags().is_empty())
+        flagged: servers()
+            .filter(|(_, server)| !server.review_flags().is_empty())
             .count(),
-        native_json: report.native_json.is_some(),
+        native_json: report
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, yonik_import::ProfileEntry::Xray(_))),
         rows: issues.chain(flags).skip(offset).take(100).collect(),
         rows_total: total,
         rows_offset: offset,
@@ -1065,6 +1070,27 @@ struct SourceChangeAck {
     id: i64,
     generation: Option<i64>,
     error: Option<&'static str>,
+}
+
+#[cfg(test)]
+mod full_profile_review_tests {
+    #[test]
+    fn review_counts_full_roots_without_emitting_sensitive_config() {
+        let report = yonik_import::import_profiles(
+            include_bytes!("../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
+        )
+        .expect("семь полных профилей");
+        let dto = super::report_dto(&report, 0).expect("review DTO");
+        assert_eq!(dto.accepted, 7);
+        assert_eq!(dto.rejected, 0);
+        assert!(dto.native_json);
+        assert!(dto.rows.is_empty());
+        assert_eq!(dto.rows_total, 0);
+        assert!(super::report_dto(&report, 1).is_err());
+        let json = serde_json::to_string(&dto).expect("JSON DTO");
+        assert!(!json.contains("outbounds"));
+        assert!(!json.contains("routing"));
+    }
 }
 #[derive(Serialize)]
 struct RoutingAck {
@@ -4332,11 +4358,14 @@ async fn run(
         String,
         watch::Sender<bool>,
         tokio::task::JoinHandle<
-            std::result::Result<yonik_import::ImportReport, crate::local_import::PrepareError>,
+            std::result::Result<
+                yonik_import::ProfileImportReport,
+                crate::local_import::PrepareError,
+            >,
         >,
     );
     let mut local_task: Option<LocalTask> = None;
-    let mut local_pending: Option<(String, yonik_import::ImportReport)> = None;
+    let mut local_pending: Option<(String, yonik_import::ProfileImportReport)> = None;
     let mut batch_running: Option<BatchRunning> = None;
     let mut tcp_running: Option<TcpRunning> = None;
     let mut preset_job: Option<presets::Job> = None;
@@ -5199,7 +5228,7 @@ async fn run(
                         let result = {
                             let (sender, cancel) = Cancellation::new();
                             let mut interruption = control.priority.subscribe();
-                            let operation = actor.service().approve_local_import(name.clone(), report, cancel, actor.format4_backup.clone());
+                            let operation = actor.service().approve_local_profiles(name.clone(), report, cancel, actor.format4_backup.clone());
                             tokio::pin!(operation);
                             tokio::select! {
                                 biased;
