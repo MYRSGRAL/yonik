@@ -1,7 +1,13 @@
 //! DATA-проекция закрытого compiler graph. Не IPC codec и не разрешение запуска.
+#[path = "resolver_snapshot_lookup.rs"]
+mod resolver_snapshot_lookup;
 use crate::{
     Cancellation,
     managed_network::firewall::{BoundTransport, TransportProtocol},
+};
+pub use resolver_snapshot_lookup::{
+    LeaseSource, LookupFamily, LookupStep, NetworkOptions, ResolverLookup, ResolverLookupPlan,
+    SourceIdentity,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -345,6 +351,67 @@ impl PreparedFullProfile {
     }
     pub fn resolver(&self) -> Option<&PinnedResolverSnapshot> {
         self.resolver.as_ref()
+    }
+    /// Только DATA original physical endpoint из единственного retained graph.
+    /// Epoch передаёт owning invocation; issuer независимо сверяет его перед observation.
+    pub fn resolver_lookup_plan(
+        &self,
+        subject: &str,
+        carrier: yonik_engine::native_profile::TransportProtocol,
+        source_epoch: u64,
+        family: LookupFamily,
+        cancel: &Cancellation,
+    ) -> Result<ResolverLookup<'_>, EgressError> {
+        check_cancel(cancel)?;
+        self.resolver_lookup_checked(subject, carrier, source_epoch, family, |profile| {
+            profile.revalidate(cancel)
+        })
+    }
+    fn resolver_lookup_checked(
+        &self,
+        subject: &str,
+        carrier: yonik_engine::native_profile::TransportProtocol,
+        source_epoch: u64,
+        family: LookupFamily,
+        revalidate: impl FnOnce(&Self) -> Result<(), EgressError>,
+    ) -> Result<ResolverLookup<'_>, EgressError> {
+        if source_epoch == 0 || source_epoch == u64::MAX {
+            return Err(EgressError::InvalidBinding);
+        }
+        let graph = self.retained.compiled().graph();
+        if graph
+            .egress()
+            .chains()
+            .iter()
+            .any(|(from, _)| from == subject)
+        {
+            return Err(EgressError::InvalidEndpoint);
+        }
+        let endpoint = graph
+            .egress()
+            .subject_endpoints()
+            .iter()
+            .find(|(tag, endpoint)| tag == subject && endpoint.protocol() == carrier)
+            .map(|(_, endpoint)| endpoint)
+            .ok_or(EgressError::InvalidEndpoint)?;
+        if let Ok(ip) = endpoint.host().parse::<IpAddr>() {
+            return Ok(ResolverLookup::Numeric(ip));
+        }
+        if !graph
+            .egress()
+            .physical_bootstrap()
+            .iter()
+            .any(|r| r.subject() == subject && r.endpoint() == endpoint)
+        {
+            return Err(EgressError::InvalidEndpoint);
+        }
+        revalidate(self)?;
+        let snapshot = self.resolver.as_ref().ok_or(EgressError::Resolver)?;
+        Ok(ResolverLookup::Hostname(snapshot.lookup_data(
+            endpoint.host(),
+            source_epoch,
+            family,
+        )?))
     }
     pub fn capsule_bytes(&self) -> &[u8] {
         self.capsule.bytes()
@@ -1337,6 +1404,27 @@ pub struct PinnedResolverSnapshot {
     _memory: super::memory::ByteLease,
 }
 impl PinnedResolverSnapshot {
+    fn lookup_data<'a>(
+        &'a self,
+        original: &'a str,
+        epoch: u64,
+        family: LookupFamily,
+    ) -> Result<ResolverLookupPlan<'a>, EgressError> {
+        if self.invalid.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(EgressError::Stale);
+        }
+        resolver_snapshot_lookup::plan(
+            resolver_snapshot_lookup::Captured {
+                asset: &self.asset,
+                peers: &self.servers,
+                reference: self.reference(),
+                epoch,
+            },
+            original,
+            family,
+            super::memory::config_budget(),
+        )
+    }
     pub(crate) fn server_endpoints(&self) -> &[SocketAddr] {
         &self.servers
     }
