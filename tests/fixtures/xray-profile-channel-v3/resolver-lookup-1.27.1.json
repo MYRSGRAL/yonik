@@ -1,0 +1,83 @@
+{
+  "sourceTag": "go1.27.1",
+  "sourceBasis": {
+    "net/dnsclient_unix.go": "3640f0133b5f8091607ba3ccb800cb5b94c85b7b00ab690837525a7b11d7d9f2",
+    "net/dnsclient.go": "a73f909dbd747cd43eb1118d820cc6674f7147a263d02683281c658db033f3d3"
+  },
+  "cases": [
+    {
+      "name": "absolute-first-ndots0",
+      "original": "Node",
+      "resolv": "search A.invalid B.invalid\noptions ndots:0\n",
+      "wire": [
+        "Node.",
+        "Node.A.invalid.",
+        "Node.B.invalid."
+      ]
+    },
+    {
+      "name": "search-first-ndots15",
+      "original": "Node.a",
+      "resolv": "search A.invalid B.invalid\noptions ndots:15\n",
+      "wire": [
+        "Node.a.A.invalid.",
+        "Node.a.B.invalid.",
+        "Node.a."
+      ]
+    },
+    {
+      "name": "rooted-no-search",
+      "original": "MiXeD.Example.",
+      "resolv": "search A.invalid\n",
+      "wire": [
+        "MiXeD.Example."
+      ]
+    },
+    {
+      "name": "search0",
+      "original": "Node",
+      "resolv": "",
+      "wire": [
+        "Node."
+      ]
+    },
+    {
+      "name": "search6",
+      "original": "Node",
+      "resolv": "search a b c d e f\n",
+      "wire": [
+        "Node.a.",
+        "Node.b.",
+        "Node.c.",
+        "Node.d.",
+        "Node.e.",
+        "Node.f.",
+        "Node."
+      ]
+    },
+    {
+      "name": "duplicate-sequence",
+      "original": "Node",
+      "resolv": "search A.invalid A.invalid\n",
+      "wire": [
+        "Node.A.invalid.",
+        "Node.A.invalid.",
+        "Node."
+      ]
+    },
+    {
+      "name": "avoid-onion-rooted",
+      "original": "Hidden.ONION.",
+      "resolv": "search A.invalid\n",
+      "wire": []
+    },
+    {
+      "name": "onion-search-retained-go",
+      "original": "Hidden.ONION",
+      "resolv": "search A.invalid\n",
+      "wire": [
+        "Hidden.ONION.A.invalid."
+      ]
+    }
+  ]
+}

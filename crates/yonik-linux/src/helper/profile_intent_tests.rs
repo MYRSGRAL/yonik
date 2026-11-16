@@ -894,3 +894,430 @@ fn tcp_and_udp_are_separate_and_dns_is_not_promoted() {
     );
     assert!(!graph.egress().system_resolvers().is_empty());
 }
+
+fn lookup_fixture(nss: &[u8], resolv: &[u8], hosts: Option<&[u8]>) -> PinnedResolverSnapshot {
+    let data = resolver_snapshot_data(nss, resolv, hosts, b"host").unwrap();
+    let asset = data.encode().unwrap();
+    let memory = super::super::memory::config_budget()
+        .reserve(asset.len() + 512)
+        .unwrap();
+    PinnedResolverSnapshot {
+        sources: std::array::from_fn(|_| ResolverSource {
+            custody: vec![],
+            file: None,
+            bytes: vec![],
+        }),
+        servers: data.peers.clone(),
+        digest: data.source,
+        asset_hash: Sha256::digest(&asset).into(),
+        asset,
+        source_flags: data.source_flags,
+        invalid: std::sync::atomic::AtomicBool::new(false),
+        _memory: memory,
+    }
+}
+#[test]
+fn captured_lookup_files_dns_and_dns_files_keep_original_and_source_members() {
+    for (nss, network_first) in [
+        (b"hosts: files dns\n".as_slice(), false),
+        (b"hosts: dns files\n".as_slice(), true),
+    ] {
+        let snapshot = lookup_fixture(
+            nss,
+            b"search Example.invalid\n",
+            Some(b"192.0.2.1 EDGE\n2001:db8::1 edge\n"),
+        );
+        let plan = snapshot.lookup_data("Edge", 7, LookupFamily::Any).unwrap();
+        assert_eq!(plan.original(), "Edge");
+        assert_eq!(plan.lookup_key(), "edge");
+        assert_eq!(
+            matches!(&plan.steps()[0], LookupStep::Network(_)),
+            network_first
+        );
+        let host = plan
+            .steps()
+            .iter()
+            .find_map(|s| {
+                if let LookupStep::Hosts(h) = s {
+                    Some(h)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(host.row(), 0);
+        assert_eq!(host.alias(), "edge");
+        assert_eq!(
+            host.members().iter().map(|m| m.index).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(plan.identity().source_epoch, 7);
+        assert_eq!(plan.identity().source_digest, snapshot.digest);
+    }
+}
+
+#[test]
+fn captured_lookup_search_vectors_preserve_case_root_ndots_and_duplicate_sequence() {
+    let corpus: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/xray-profile-channel-v3/resolver-lookup-1.27.1.json"
+    ))
+    .unwrap();
+    for case in corpus["cases"].as_array().unwrap() {
+        let snapshot = lookup_fixture(
+            b"hosts: dns\n",
+            case["resolv"].as_str().unwrap().as_bytes(),
+            None,
+        );
+        let plan = snapshot
+            .lookup_data(case["original"].as_str().unwrap(), 7, LookupFamily::Any)
+            .unwrap();
+        let network = plan.steps().iter().find_map(|s| {
+            if let LookupStep::Network(n) = s {
+                Some(n)
+            } else {
+                None
+            }
+        });
+        let actual: Vec<_> = network
+            .map(|n| n.questions().map(|q| q.fqdn()).collect())
+            .unwrap_or_default();
+        let expected: Vec<_> = case["wire"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert_eq!(actual, expected, "{}", case["name"]);
+        if let Some(network) = network {
+            assert_eq!(network.qtypes(), [1, 28]);
+            for q in network.questions() {
+                assert_eq!(
+                    q.canonical(),
+                    q.fqdn().trim_end_matches('.').to_ascii_lowercase()
+                );
+            }
+            if case["name"] == "duplicate-sequence" {
+                assert_eq!(network.unique_question_count(), 2);
+                assert_eq!(network.questions().count(), 3);
+            }
+        }
+    }
+}
+#[test]
+fn captured_lookup_network_options_peers_family_and_hosts_have_no_dns_ttl() {
+    let snapshot=lookup_fixture(b"hosts: dns files\n",b"nameserver 192.0.2.53\nnameserver 192.0.2.53\nnameserver 198.51.100.53\nnameserver 203.0.113.53\noptions rotate single-request use-vc trust-ad attempts:5 timeout:30\n",Some(b"192.0.2.1 Node\n192.0.2.1 node\n2001:db8::1 NODE\n"));
+    for (family, qtypes) in [
+        (LookupFamily::Any, vec![1, 28]),
+        (LookupFamily::Ipv4, vec![1]),
+        (LookupFamily::Ipv6, vec![28]),
+    ] {
+        let plan = snapshot.lookup_data("NoDe", 19, family).unwrap();
+        let LookupStep::Network(network) = &plan.steps()[0] else {
+            panic!("DNS first")
+        };
+        assert_eq!(network.qtypes(), qtypes);
+        assert_eq!(
+            network.peers(),
+            [
+                "192.0.2.53:53".parse().unwrap(),
+                "192.0.2.53:53".parse().unwrap(),
+                "198.51.100.53:53".parse().unwrap()
+            ]
+        );
+        let options = network.options();
+        assert_eq!(
+            (
+                options.query_options,
+                options.udp_payload,
+                options.attempts,
+                options.timeout_ms
+            ),
+            (25, 1232, 5, 30000)
+        );
+        assert!(options.rotate && options.single_request && options.use_tcp);
+        let LookupStep::Hosts(host) = &plan.steps()[1] else {
+            panic!("files fallback")
+        };
+        assert_eq!(host.members().len(), 3);
+        assert_eq!(host.members()[0].address, host.members()[1].address);
+        assert_eq!(
+            host.lease_source(),
+            resolver_snapshot_lookup::LeaseSource::SourceObservationRequired
+        );
+        assert_eq!(host.max_observation_ns(), 1_000_000_000);
+        assert_eq!(plan.identity().asset_hash, snapshot.asset_hash);
+    }
+    let empty = lookup_fixture(b"hosts: dns\n", b"nameserver invalid\n", None);
+    let plan = empty.lookup_data("node", 7, LookupFamily::Any).unwrap();
+    let LookupStep::Network(network) = &plan.steps()[0] else {
+        panic!("DNS")
+    };
+    assert_eq!(
+        network.peers(),
+        ["127.0.0.1:53".parse().unwrap(), "[::1]:53".parse().unwrap()]
+    );
+}
+#[test]
+fn captured_lookup_files_are_original_only_and_missing_hosts_do_not_invent_answers() {
+    let hosts = Some(b"192.0.2.1 node.search.invalid\n192.0.2.2 node\n".as_slice());
+    let snapshot = lookup_fixture(b"hosts: files\n", b"search search.invalid\n", hosts);
+    let plan = snapshot.lookup_data("node.", 7, LookupFamily::Any).unwrap();
+    assert!(plan.steps().is_empty()); // local node и rooted node. — разные hosts keys.
+    let plan = snapshot.lookup_data("node", 7, LookupFamily::Any).unwrap();
+    let LookupStep::Hosts(host) = &plan.steps()[0] else {
+        panic!("files")
+    };
+    assert_eq!(host.row(), 1);
+    assert_eq!(
+        host.members()[0].address,
+        "192.0.2.2".parse::<IpAddr>().unwrap()
+    );
+    let empty = lookup_fixture(b"hosts: files\n", b"", None);
+    assert!(
+        empty
+            .lookup_data("missing", 7, LookupFamily::Any)
+            .unwrap()
+            .steps()
+            .is_empty()
+    );
+    let dns = lookup_fixture(b"hosts: dns\n", b"", hosts);
+    assert!(matches!(
+        dns.lookup_data("node", 7, LookupFamily::Any)
+            .unwrap()
+            .steps()[0],
+        LookupStep::Network(_)
+    ));
+}
+#[test]
+fn captured_lookup_input_caps_budget_source_changes_and_unsupported_shapes_fail_closed() {
+    let mut snapshot = lookup_fixture(b"hosts: dns\n", b"", None);
+    for name in [
+        "",
+        "a..b",
+        "-host",
+        "host-",
+        "12345",
+        "fe80::1%eth0",
+        "привет.invalid",
+    ] {
+        assert!(
+            snapshot.lookup_data(name, 7, LookupFamily::Any).is_err(),
+            "{name}"
+        );
+    }
+    for name in ["a".repeat(64), "a".repeat(254)] {
+        assert!(snapshot.lookup_data(&name, 7, LookupFamily::Any).is_err());
+    }
+    let long = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    let plan = snapshot.lookup_data(&long, 7, LookupFamily::Any).unwrap();
+    let LookupStep::Network(n) = &plan.steps()[0] else {
+        panic!("DNS")
+    };
+    assert_eq!(n.questions().next().unwrap().fqdn().len(), 254);
+    drop(plan);
+    for epoch in [0, u64::MAX] {
+        assert!(matches!(
+            snapshot.lookup_data("node", epoch, LookupFamily::Any),
+            Err(EgressError::InvalidBinding)
+        ));
+    }
+    let budget = super::super::memory::ByteBudget::new(0);
+    assert!(matches!(
+        resolver_snapshot_lookup::plan(
+            resolver_snapshot_lookup::Captured {
+                asset: &snapshot.asset,
+                peers: &snapshot.servers,
+                reference: snapshot.reference(),
+                epoch: 7
+            },
+            "node",
+            LookupFamily::Any,
+            &budget
+        ),
+        Err(EgressError::Budget)
+    ));
+    assert_eq!(budget.used(), 0);
+    snapshot.servers.clear();
+    assert!(matches!(
+        snapshot.lookup_data("node", 7, LookupFamily::Any),
+        Err(EgressError::Stale)
+    ));
+    let mut snapshot = lookup_fixture(b"hosts: dns\n", b"", None);
+    snapshot.asset[152] ^= 1;
+    assert!(matches!(
+        snapshot.lookup_data("node", 7, LookupFamily::Any),
+        Err(EgressError::Stale)
+    ));
+    let snapshot = lookup_fixture(b"hosts: dns\n", b"domain .\n", None);
+    assert!(snapshot.lookup_data("node", 7, LookupFamily::Any).is_err()); // invalid derived question не заменяется другим search.
+    assert!(
+        resolver_snapshot_data(b"hosts: files [SUCCESS=merge] dns\n", b"", None, b"host").is_err()
+    );
+    assert!(
+        resolver_snapshot_data(b"hosts: dns\n", b"options unsupported\n", None, b"host").is_err()
+    );
+}
+fn lookup_prepared(hostname: bool) -> PreparedFullProfile {
+    use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent, compile_profile_system};
+    let mut value = document(1);
+    value["dns"] = json!({"servers":["192.0.2.53"]});
+    if hostname {
+        value["outbounds"][0]["settings"]["servers"][0]["address"] = json!("Edge.invalid");
+    }
+    let intent = ProfileIntent::from_profile(&from_value(&value)).unwrap();
+    let resolver = hostname.then(|| {
+        lookup_fixture(
+            b"hosts: files dns\n",
+            b"",
+            Some(b"192.0.2.9 Edge.invalid\n"),
+        )
+    });
+    let mut plan = OwnedRuntimePlan::new(10808.try_into().unwrap(), 10809.try_into().unwrap())
+        .unwrap()
+        .with_system(
+            yonik_engine::SystemTun::new(1, 1500, 42, vec!["198.18.0.1/30".parse().unwrap()])
+                .unwrap(),
+        );
+    if let Some(snapshot) = &resolver {
+        plan = plan.bind_system_resolver(snapshot).unwrap();
+    }
+    let retained = RetainedSystemProfile::seal(
+        compile_profile_system(&from_value(&value), &plan).unwrap(),
+        7,
+        [3; 32],
+    )
+    .unwrap();
+    let capsule = crate::profile_channel::OwnedCapsule::build_retained(
+        &intent,
+        &plan,
+        resolver.as_ref().map(PinnedResolverSnapshot::reference),
+        *retained.digest(),
+        1,
+        1,
+        retained.compiled(),
+    )
+    .unwrap();
+    PreparedFullProfile {
+        retained,
+        resolver,
+        capsule: std::sync::Arc::new(capsule),
+        kill_switch: true,
+        resources: NativeResourceSet {
+            catalog: None,
+            files: vec![],
+            catalog_digest: [0; 32],
+            invalid: std::sync::atomic::AtomicBool::new(false),
+            _memory: super::super::memory::config_budget().reserve(512).unwrap(),
+        },
+    }
+}
+#[test]
+fn captured_lookup_prepared_resource_uses_one_compiler_original_and_revalidation_entry() {
+    use yonik_engine::native_profile::TransportProtocol as Carrier;
+    let prepared = lookup_prepared(true);
+    let called = std::cell::Cell::new(false);
+    let result = prepared
+        .resolver_lookup_checked("edge-0", Carrier::Tcp, 31, LookupFamily::Any, |_| {
+            called.set(true);
+            Ok(())
+        })
+        .unwrap();
+    assert!(called.get());
+    let ResolverLookup::Hostname(plan) = result else {
+        panic!("hostname")
+    };
+    assert_eq!(plan.original(), "Edge.invalid");
+    assert_eq!(plan.lookup_key(), "edge.invalid.");
+    assert_eq!(plan.identity().source_epoch, 31);
+    assert_eq!(
+        plan.identity().source_digest,
+        prepared.resolver().unwrap().digest
+    );
+    assert!(matches!(
+        prepared.resolver_lookup_checked("edge-0", Carrier::Tcp, 31, LookupFamily::Any, |_| Err(
+            EgressError::Stale
+        )),
+        Err(EgressError::Stale)
+    ));
+    assert!(matches!(
+        prepared.resolver_lookup_checked(
+            "unknown",
+            Carrier::Tcp,
+            31,
+            LookupFamily::Any,
+            |_| panic!("wrong subject не читает sources")
+        ),
+        Err(EgressError::InvalidEndpoint)
+    ));
+    prepared
+        .resolver()
+        .unwrap()
+        .invalid
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(matches!(
+        prepared.resolver_lookup_checked("edge-0", Carrier::Tcp, 31, LookupFamily::Any, |_| Ok(())),
+        Err(EgressError::Stale)
+    ));
+    let numeric = lookup_prepared(false);
+    let (_keep, cancel) = Cancellation::new();
+    assert!(
+        matches!(numeric.resolver_lookup_plan("edge-0",Carrier::Tcp,31,LookupFamily::Any,&cancel).unwrap(),ResolverLookup::Numeric(ip) if ip=="192.0.2.1".parse::<IpAddr>().unwrap())
+    );
+    _keep.send(true).unwrap();
+    assert!(matches!(
+        numeric.resolver_lookup_plan("edge-0", Carrier::Tcp, 31, LookupFamily::Any, &cancel),
+        Err(EgressError::Cancelled)
+    ));
+}
+
+#[test]
+fn captured_lookup_preserves_files_numeric_alias_blocking_and_long_suffix_policy() {
+    let snapshot = lookup_fixture(
+        b"hosts: files dns\n",
+        b"",
+        Some(b"192.0.2.9 12345\n0.0.0.0 blocked.invalid\n"),
+    );
+    for name in ["12345", "blocked.invalid"] {
+        let plan = snapshot.lookup_data(name, 7, LookupFamily::Any).unwrap();
+        assert_eq!(plan.steps().len(), 1);
+        assert!(matches!(plan.steps()[0], LookupStep::Hosts(_)));
+    }
+    let dns_first = lookup_fixture(b"hosts: dns files\n", b"", Some(b"192.0.2.9 12345\n"));
+    assert!(
+        dns_first
+            .lookup_data("12345", 7, LookupFamily::Any)
+            .is_err()
+    );
+    let snapshot = lookup_fixture(b"hosts: dns\n", b"search a.invalid b.invalid\n", None);
+    let long = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    let plan = snapshot.lookup_data(&long, 7, LookupFamily::Any).unwrap();
+    let LookupStep::Network(network) = &plan.steps()[0] else {
+        panic!("DNS")
+    };
+    assert_eq!(network.questions().count(), 1);
+    assert_eq!(network.questions().next().unwrap().canonical(), long);
+    assert!(
+        snapshot
+            .lookup_data(&(long + "."), 7, LookupFamily::Any)
+            .is_err()
+    );
+    assert!(
+        resolver_snapshot_data(b"hosts: dns\n", b"search a b c d e f g\n", None, b"host").is_err()
+    );
+    let mut empty = lookup_fixture(b"hosts: dns\n", b"", None);
+    empty.asset[170..172].fill(0);
+    empty.asset_hash = Sha256::digest(&empty.asset).into();
+    assert!(empty.lookup_data("node", 7, LookupFamily::Any).is_err());
+}
