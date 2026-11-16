@@ -22,7 +22,8 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertTrue(metadata["dispatcher_chain_guards_connected"])
         self.assertTrue(metadata["physical_session_ownership_connected"])
         self.assertTrue(metadata["transport_guards_connected"])
-        self.assertFalse(metadata["pooled_chain_reuse_connected"])
+        self.assertTrue(metadata["pooled_chain_reuse_connected"])
+        self.assertTrue(metadata["pooled_chain_numeric_only"])
         self.assertFalse(metadata["probe_grants_connected"])
         self.assertFalse(metadata["builder_apply_enabled"])
         self.assertFalse(metadata["runtime_hooks_connected"])
@@ -108,6 +109,21 @@ class FullProfilePatchTests(unittest.TestCase):
                 embedded.encode(),
                 (ADAPTER / "full-profile-fixtures" / name).read_bytes(),
             )
+
+    def test_numeric_chain_preflight_is_connected_before_transport_effects(
+        self,
+    ) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        handler = patch.split("+++ b/app/proxyman/outbound/handler.go\n", 1)[1]
+        handler = handler.split("diff --git ", 1)[0]
+        self.assertIn("nativehooks.ProfilePrepareChain(next, h.profileBranch)", handler)
+        self.assertIn("next.profileMuxDecision(target)", handler)
+        self.assertLess(
+            handler.index("nativehooks.ProfilePrepareChain(next, h.profileBranch)"),
+            handler.index("nativehooks.ProfileGuardLink(ctx, link)"),
+        )
+        self.assertNotIn("+++ b/app/dns/dns.go", patch)
+        self.assertNotIn("+++ b/app/dns/nameserver.go", patch)
 
     def test_system_proof_fixture_is_embedded_byte_exact(self) -> None:
         fixture = ADAPTER / "full-profile-fixtures/system-proof-extension-v1.json"

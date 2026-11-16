@@ -6145,7 +6145,7 @@ diff --git a/common/yonikbroker/profile_transport_linux_test.go b/common/yonikbr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux_test.go
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,656 @@
 +//go:build linux
 +
 +package nativehooks
@@ -6215,6 +6215,356 @@ new file mode 100644
 +}
 +
 +type profilePureClose struct{ count atomic.Int32 }
++
++func TestProfilePooledChainNumericSourceCanCreatePool(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	defer f.serve(t)()
++	r := f.admittedReceipt(t, "same.invalid")
++	ctx := context.WithValue(context.WithValue(r.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r)
++	d := xnet.TCPDestination(xnet.DomainAddress("same.invalid"), 443)
++	ctx, e := ProfileSelectRoute(ctx, "a", d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, release, e := ProfileAuthorizeHandler(ctx, "a", d, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	if e = ProfilePrepareChain(ctx, func(tag string, target xnet.Destination) (bool, error) { return false, nil }); e != nil {
++		t.Fatal(e)
++	}
++	if _, e = ProfileTransportPool(ctx, 2); e != nil {
++		t.Fatal("numeric chained transport remains disconnected", e)
++	}
++}
++
++func pooledChainConsumer(t *testing.T, f *flowFixture, choose func(string, xnet.Destination) (bool, error)) context.Context {
++	t.Helper()
++	r := f.admittedReceipt(t, "same.invalid")
++	ctx := context.WithValue(context.WithValue(r.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r)
++	d := xnet.TCPDestination(xnet.DomainAddress("same.invalid"), 443)
++	ctx, e := ProfileSelectRoute(ctx, "a", d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, release, e := ProfileAuthorizeHandler(ctx, "a", d, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	t.Cleanup(release)
++	if e = ProfilePrepareChain(ctx, choose); e != nil {
++		t.Fatal(e)
++	}
++	return ctx
++}
++
++func TestProfilePooledChainPerFlowWireAndPhysicalLifetime(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	defer f.serve(t)()
++	choose := func(tag string, d xnet.Destination) (bool, error) {
++		if tag != "b" || d.Network != xnet.Network_TCP || d.Port != 443 {
++			t.Error("actual hop selector", tag, d)
++		}
++		return false, nil
++	}
++	first, second := pooledChainConsumer(t, f, choose), pooledChainConsumer(t, f, choose)
++	a, b := first.Value(profileGrantKey{}).(*profileGrant), second.Value(profileGrantKey{}).(*profileGrant)
++	if a.receipt == b.receipt || a.next == b.next || a.next.receipt != a.receipt || a.next.scope != 2 {
++		t.Fatal("hop grant shared across source flows")
++	}
++	counts := map[uint64]int{}
++	for _, frame := range f.writes {
++		if frame.kind == 18 {
++			counts[u64(frame.body, 0)]++
++			if frame.body[8] != 1 || u16(frame.body, 10) != u16(f.c.manifest.rows[8][u16(frame.body, 16)], 0) {
++				t.Fatal("AUTHORIZE selectors")
++			}
++		}
++	}
++	if counts[a.receipt.id] != 2 || counts[b.receipt.id] != 2 {
++		t.Fatal("missing per-flow hop AUTHORIZE", counts)
++	}
++	pool, e := ProfileTransportPool(first, 2)
++	if e != nil {
++		t.Fatal(e)
++	}
++	other, e := ProfileTransportPool(second, 2)
++	if e != nil || other != pool {
++		t.Fatal("same immutable path did not share", e)
++	}
++	physical, e := pool.SessionContext()
++	if e != nil {
++		t.Fatal(e)
++	}
++	target := xnet.TCPDestination(xnet.ParseAddress("198.51.100.1"), 443)
++	chained, e := ProfileChain(physical, target, "b")
++	if e != nil {
++		t.Fatal(e)
++	}
++	child, release, e := ProfileAuthorizeHandler(chained, "b", target, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	f.c.mu.Lock()
++	f.c.closeGrant(a.next)
++	f.c.mu.Unlock()
++	if _, e = pool.Context(first); e == nil {
++		t.Fatal("live neighbour replaced cancelled current hop")
++	}
++	if _, e = pool.Context(second); e != nil {
++		t.Fatal("cancel one affected neighbour", e)
++	}
++	if ProfileLogicalGate(child) != nil {
++		t.Fatal("shared physical chain retained first consumer authority")
++	}
++	if _, _, e = ProfileAuthorizeHandler(chained, "b", target, true); e == nil {
++		t.Fatal("actual branch mismatch bypassed preflight")
++	}
++	f.p.cancel()
++	if ProfileLogicalGate(child) == nil {
++		t.Fatal("revoke did not fence shared chain")
++	}
++}
++
++func TestProfilePooledChainExpiryDelayedCallbackAndPrivateFactory(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	defer f.serve(t)()
++	ctx := pooledChainConsumer(t, f, func(string, xnet.Destination) (bool, error) { return false, nil })
++	g := ctx.Value(profileGrantKey{}).(*profileGrant)
++	pool, e := ProfileTransportPool(ctx, 2)
++	if e != nil {
++		t.Fatal(e)
++	}
++	leaf := xnet.TCPDestination(xnet.ParseAddress("198.51.100.2"), 8388)
++	calls := 0
++	sessionOnly := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	if _, e = ProfileDialPhysical(sessionOnly, leaf, func(context.Context) (net.Conn, error) { calls++; return fakeTCPFlowConn(), nil }); e == nil || calls != 0 {
++		t.Fatal("session credential opened physical socket")
++	}
++	f.c.mu.Lock()
++	g.next.deadline = f.now
++	f.c.mu.Unlock()
++	if _, e = pool.Context(ctx); e == nil {
++		t.Fatal("expired hop reused pool")
++	}
++	delayed, cancel := context.WithCancel(ctx)
++	cancel()
++	if _, e = pool.Context(delayed); e == nil {
++		t.Fatal("delayed cancelled callback reused pool")
++	}
++	if ProfileLogicalGate(ctx) == nil {
++		t.Fatal("root grant replaced expired child")
++	}
++}
++
++func TestProfilePooledChainSelectedBranchAndSourceCannotBeSubstituted(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "xhttp-h3")
++	defer f.serve(t)()
++	normal := pooledChainConsumer(t, f, func(string, xnet.Destination) (bool, error) { return false, nil })
++	otherFlow := pooledChainConsumer(t, f, func(string, xnet.Destination) (bool, error) { return false, nil })
++	a, b := normal.Value(profileGrantKey{}).(*profileGrant), otherFlow.Value(profileGrantKey{}).(*profileGrant)
++	pool, e := ProfileTransportPool(normal, 3)
++	if e != nil {
++		t.Fatal(e)
++	}
++	wrongHop := context.WithValue(otherFlow, profileGrantKey{}, b.next)
++	if _, e = pool.Context(wrongHop); e == nil {
++		t.Fatal("cross-chain callback accepted")
++	}
++	physical, e := pool.SessionContext()
++	if e != nil {
++		t.Fatal(e)
++	}
++	target := xnet.UDPDestination(xnet.ParseAddress("198.51.100.1"), 443)
++	chained, e := ProfileChain(physical, target, "b")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if _, _, e = ProfileAuthorizeHandler(chained, "b", target, true); e == nil {
++		t.Fatal("actual mux picker overrode nextBranchMask")
++	}
++	wrong := context.WithValue(normal, profileReceiptKey{}, b.receipt)
++	if _, e = pool.Context(wrong); e == nil {
++		t.Fatal("cross-flow private source accepted")
++	}
++	f.c.mu.Lock()
++	a.next.ownerDeadline = f.now
++	a.next.deadline = f.now
++	f.c.mu.Unlock()
++	if ProfileLogicalGate(normal) == nil || ProfileLogicalGate(otherFlow) != nil {
++		t.Fatal("consumer expiry isolation")
++	}
++}
++
++func TestProfilePooledChainCancelDuringActualSelectorNeverPublishesPool(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	defer f.serve(t)()
++	r := f.admittedReceipt(t, "cancel.invalid")
++	ctx := context.WithValue(context.WithValue(r.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r)
++	d := xnet.TCPDestination(xnet.DomainAddress("cancel.invalid"), 443)
++	ctx, e := ProfileSelectRoute(ctx, "a", d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, release, e := ProfileAuthorizeHandler(ctx, "a", d, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	e = ProfilePrepareChain(ctx, func(string, xnet.Destination) (bool, error) {
++		f.c.mu.Lock()
++		f.c.closeReceipt(r)
++		f.c.mu.Unlock()
++		return false, nil
++	})
++	if e == nil {
++		t.Fatal("cancelled selector published bundle")
++	}
++	if _, e = ProfileTransportPool(ctx, 2); e == nil {
++		t.Fatal("cancelled preparation published pool")
++	}
++}
++
++func TestProfilePooledChainSystemHopNeedsItsOwnFreshOwner(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	defer f.serve(t)()
++	ctx := pooledChainConsumer(t, f, func(string, xnet.Destination) (bool, error) { return false, nil })
++	g := ctx.Value(profileGrantKey{}).(*profileGrant)
++	pool, e := ProfileTransportPool(ctx, 2)
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.mu.Lock()
++	g.next.ownerDeadline = f.now
++	g.next.refresh = &profileOperation{ctx: g.next.ctx, queued: true, done: make(chan struct{}), err: errProfile}
++	close(g.next.refresh.done)
++	f.c.mu.Unlock()
++	if _, e = pool.Context(ctx); e == nil {
++		t.Fatal("fresh root owner replaced stale hop owner")
++	}
++}
++
++func TestProfilePooledChainDomainLeafHasNoAnswerPromotion(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	rows := f.c.manifest.rows
++	rows[1][1] = append((profileDestinationValue{family: 3, network: 6, port: 8388, address: "leaf.invalid"}).encode(), 0, 0, 0, 0)
++	f.installManifest(t, rows)
++	defer f.serve(t)()
++	r := f.admittedReceipt(t, "same.invalid")
++	ctx := context.WithValue(context.WithValue(r.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r)
++	d := xnet.TCPDestination(xnet.DomainAddress("same.invalid"), 443)
++	ctx, e := ProfileSelectRoute(ctx, "a", d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, release, e := ProfileAuthorizeHandler(ctx, "a", d, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	if e = ProfilePrepareChain(ctx, func(string, xnet.Destination) (bool, error) { return false, nil }); !errors.Is(e, ErrProfileUnsupported) {
++		t.Fatal("domain leaf promoted without authenticated endpoint proof", e)
++	}
++	if _, e = ProfileTransportPool(ctx, 2); e == nil {
++		t.Fatal("unproved domain path published pool")
++	}
++}
++
++func TestProfilePooledChainDelayedHopGrantAfterCancelIsDiscarded(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	r := f.admittedReceipt(t, "same.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r), profileGrantKey{}, g)
++	done := make(chan error, 1)
++	go func() {
++		done <- ProfilePrepareChain(ctx, func(string, xnet.Destination) (bool, error) { return false, nil })
++	}()
++	op := <-f.p.flowQueue
++	if op.receipt != r || op.grant.scope != 2 {
++		t.Fatal("wrong delayed hop")
++	}
++	if e := f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	f.c.mu.Lock()
++	f.c.closeReceipt(r)
++	f.c.mu.Unlock()
++	if e := f.c.accept(f.grantReply(op, 2)); e != nil {
++		t.Fatal(e)
++	}
++	if e := <-done; e == nil || op.grant.id != 0 || g.prepared {
++		t.Fatal("late hop grant resurrected cancelled bundle", e)
++	}
++}
++
++func TestProfilePooledChainActualMuxWorkerKeepsOriginalUDP(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	rows := f.c.manifest.rows
++	s := rows[8][1]
++	s[3] = 3
++	s[6], s[7] = 6, 6
++	s[21] = 2
++	be.PutUint16(s[10:], 0)
++	be.PutUint16(s[14:], 0)
++	be.PutUint16(s[18:], 2)
++	edge := flowEdge(1, 2)
++	edge[4] = 1
++	rows[2] = append(rows[2], edge)
++	f.installManifest(t, rows)
++	defer f.serve(t)()
++	d := profileDestinationValue{family: 3, network: 17, port: 53, address: "original.invalid"}
++	base := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	base, e := ProfileAccept(base, fakeTCPFlowConn(), "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	udp := &flowFakeConn{local: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 49152}, remote: &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 32001}}
++	base, e = ProfileAssociateUDP(base, udp)
++	if e != nil {
++		t.Fatal(e)
++	}
++	target := xnet.UDPDestination(xnet.DomainAddress(d.address), 53)
++	ctx, releaseOriginal, e := ProfileOpenOriginal(base, target)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer releaseOriginal()
++	ctx, e = ProfileSelectRoute(ctx, "a", target)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, release, e := ProfileAuthorizeHandler(ctx, "a", target, true)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	if e = ProfilePrepareChain(ctx, func(_ string, next xnet.Destination) (bool, error) {
++		if next.Network != xnet.Network_TCP {
++			t.Error("mux carrier did not become TCP input")
++		}
++		return false, nil
++	}); e != nil {
++		t.Fatal(e)
++	}
++	g := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if g.branch != 1 || g.receipt.original.network != 17 || g.next.scope != 2 || g.next.effective.network != 6 {
++		t.Fatal("mux replaced original UDP or wrong next input")
++	}
++	if _, e = ProfileTransportPool(ctx, 2); e != nil {
++		t.Fatal(e)
++	}
++}
 +
 +func (c *profilePureClose) Close() error { c.count.Add(1); return nil }
 +
@@ -6456,7 +6806,7 @@ diff --git a/common/yonikbroker/profile_transport_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux.go
-@@ -0,0 +1,803 @@
+@@ -0,0 +1,836 @@
 +//go:build linux
 +
 +package nativehooks
@@ -6476,6 +6826,7 @@ new file mode 100644
 +type ProfileCloser = io.Closer
 +type profilePoolContextKey struct{}
 +type profilePathKey struct{}
++type profilePhysicalContextKey struct{}
 +
 +// Key не credential. Создать usable pool может только live private FlowGrant.
 +type ProfilePool struct {
@@ -6771,13 +7122,13 @@ new file mode 100644
 +	row := p.flow.manifest.rows[8][g.scope]
 +	branch := int(g.branch)
 +	endpoint := g.effective
-+	if row[20+branch] == 2 {
++	if row[20+branch] == 2 && !g.prepared {
 +		return key, endpoint, ErrProfileUnsupported
-+	} // Chain reuse требует grants каждого hop.
++	}
 +	if row[20+branch] == 4 {
 +		return key, endpoint, errProfile
 +	}
-+	if row[20+branch] == 1 {
++	if row[20+branch] == 1 || row[20+branch] == 2 {
 +		c := profileCursor{b: p.flow.manifest.rows[1][u16(row, 8+branch*2)]}
 +		h := c.take(8)
 +		a := c.take(int(u16(h, 4)))
@@ -6812,6 +7163,17 @@ new file mode 100644
 +	}
 +	h.Write(g.effective.encode())
 +	h.Write(endpoint.encode())
++	for hop, depth := g.next, 0; hop != nil; hop, depth = hop.next, depth+1 {
++		if depth >= 255 || hop.receipt != g.receipt || !hop.prepared {
++			return key, endpoint, errProfile
++		}
++		be.PutUint16(b[:], hop.scope)
++		be.PutUint16(b[2:], hop.stream)
++		be.PutUint16(b[4:], hop.chain)
++		b[6] = hop.branch
++		h.Write(b[:7])
++		h.Write(hop.effective.encode())
++	}
 +	copy(key[:], h.Sum(nil))
 +	return key, endpoint, nil
 +}
@@ -6824,7 +7186,7 @@ new file mode 100644
 +		if existing.state.runtime != p {
 +			return nil, errProfile
 +		}
-+		g, e := existing.candidate()
++		g, e := existing.resolve(ctx)
 +		if e != nil {
 +			return nil, e
 +		}
@@ -6892,7 +7254,7 @@ new file mode 100644
 +		}
 +	}
 +	c.mu.Unlock()
-+	if chosen == nil || profileEnsureGrant(context.WithValue(chosen.ctx, profileContextKey{}, p.state.runtime), chosen) != nil {
++	if chosen == nil || profileEnsureChain(context.WithValue(chosen.ctx, profileContextKey{}, p.state.runtime), chosen) != nil {
 +		return nil, errProfile
 +	}
 +	return chosen, nil
@@ -6927,7 +7289,7 @@ new file mode 100644
 +	if !live {
 +		return nil, errProfile
 +	}
-+	if _, e := p.candidate(); e != nil {
++	if _, e := p.resolve(callback); e != nil {
 +		return nil, e
 +	}
 +	// Callback cancellation/deadline сохраняются; authority берётся из private
@@ -6939,7 +7301,28 @@ new file mode 100644
 +	if p == nil || p.state == nil || p.state.runtime == nil {
 +		return nil, errProfile
 +	}
-+	return p.Context(p.state.runtime.ctx)
++	return p.Context(context.WithValue(p.state.runtime.ctx, profilePhysicalContextKey{}, true))
++}
++
++// Explicit logical consumer никогда не подменяется живым соседом из pool.
++func (p *ProfilePool) resolve(ctx context.Context) (*profileGrant, error) {
++	if ctx == nil || ctx.Err() != nil {
++		return nil, errProfile
++	}
++	physical, _ := ctx.Value(profilePhysicalContextKey{}).(bool)
++	if !physical {
++		if g, _ := ctx.Value(profileGrantKey{}).(*profileGrant); g != nil {
++			if profileEnsureChain(ctx, g) != nil {
++				return nil, errProfile
++			}
++			key, _, e := profilePoolIdentity(p.state.runtime, g)
++			if e != nil || key != p.key {
++				return nil, errProfile
++			}
++			return g, nil
++		}
++	}
++	return p.candidate()
 +}
 +
 +// Вызывается только под state.mu: копия opaque value не становится capability.
@@ -6994,7 +7377,7 @@ new file mode 100644
 +		return e
 +	}
 +	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
-+	return profileEnsureGrant(ctx, g)
++	return profileEnsureChain(ctx, g)
 +}
 +
 +func ProfileCheckTransport(ctx context.Context, kind byte) error {
@@ -7004,7 +7387,7 @@ new file mode 100644
 +	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
 +	if pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); pool != nil {
 +		var e error
-+		g, e = pool.candidate()
++		g, e = pool.resolve(ctx)
 +		if e != nil {
 +			return e
 +		}
@@ -8000,7 +8383,37 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	"github.com/xtls/xray-core/core"
  	"github.com/xtls/xray-core/features/outbound"
  	"github.com/xtls/xray-core/features/policy"
-@@ -175,11 +176,64 @@
+@@ -55,6 +56,7 @@
+ 
+ // Handler implements outbound.Handler.
+ type Handler struct {
++	profileBranch   func(string, net.Destination) (bool, error)
+ 	tag             string
+ 	senderSettings  *proxyman.SenderConfig
+ 	streamSettings  *internet.MemoryStreamConfig
+@@ -75,6 +77,21 @@
+ 		tag:             config.Tag,
+ 		uplinkCounter:   uplinkCounter,
+ 		downlinkCounter: downlinkCounter,
++	}
++	h.profileBranch = func(tag string, target net.Destination) (bool, error) {
++		manager, ok := v.GetFeature(outbound.ManagerType()).(outbound.Manager)
++		if !ok {
++			return false, nativehooks.ErrProfileUnsupported
++		}
++		next, ok := manager.GetHandler(tag).(*Handler)
++		if !ok {
++			return false, nativehooks.ErrProfileUnsupported
++		}
++		decision := next.profileMuxDecision(target)
++		if decision == profileMuxReject {
++			return false, nativehooks.ErrProfileUnsupported
++		}
++		return decision != profileMuxNormal, nil
+ 	}
+ 
+ 	if config.SenderSettings != nil {
+@@ -175,11 +192,71 @@
  }
  
  // Dispatch implements proxy.Outbound.Dispatch.
@@ -8048,6 +8461,13 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
 +	authorizeProfile := func(mux bool) (func(), error) {
 +		next, release, e := nativehooks.ProfileAuthorizeHandler(ctx, h.tag, ob.Target, mux)
 +		if e == nil {
++			e = nativehooks.ProfilePrepareChain(next, h.profileBranch)
++		}
++		if e != nil {
++			release()
++			return func() {}, e
++		}
++		if e == nil {
 +			ctx = next
 +			nativehooks.ProfileGuardLink(ctx, link)
 +		}
@@ -8065,7 +8485,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  		strategy := h.senderSettings.TargetStrategy
  		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
  			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
-@@ -204,38 +258,41 @@
+@@ -204,38 +281,41 @@
  		link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  		link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  	}
@@ -8129,7 +8549,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	err := h.proxy.Process(ctx, link, h)
  	var errC error
  	if err != nil {
-@@ -266,6 +323,9 @@
+@@ -266,6 +346,9 @@
  
  // Dial implements internet.Dialer.
  func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
@@ -9307,7 +9727,7 @@ diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_hooks_linux.go
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,833 @@
 +//go:build linux
 +
 +package nativehooks
@@ -9765,6 +10185,20 @@ new file mode 100644
 +	if route.chained && scope != route.scope {
 +		return ctx, noop, errProfile
 +	}
++	if ready, _ := ctx.Value(profileGrantKey{}).(*profileGrant); route.chained && ready != nil {
++		if ready.scope != scope || ready.branch != branch || ready.effective != v || profileEnsureChain(ctx, ready) != nil {
++			return ctx, noop, errProfile
++		}
++		if physical, _ := ctx.Value(profilePhysicalContextKey{}).(bool); physical {
++			pool, e := ProfileTransportPool(ctx, 0)
++			if e != nil {
++				return ctx, noop, e
++			}
++			next, e := pool.Context(ctx)
++			return next, noop, e
++		}
++		return ctx, noop, nil
++	}
 +	g, op, e := p.flow.authorize(ctx, profileReceiptFrom(ctx), scope, branch, v, nil)
 +	if e != nil {
 +		return ctx, noop, e
@@ -9829,7 +10263,7 @@ new file mode 100644
 +		if ctx.Err() != nil || pool.state.runtime != p {
 +			return errProfile
 +		}
-+		g, e := pool.candidate()
++		g, e := pool.resolve(ctx)
 +		if e != nil {
 +			return e
 +		}
@@ -9882,6 +10316,16 @@ new file mode 100644
 +	if p == nil {
 +		return ctx, nil
 +	}
++	if pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); pool != nil {
++		g, e := pool.resolve(ctx)
++		if e != nil {
++			return ctx, e
++		}
++		ctx = context.WithValue(ctx, profileGrantKey{}, g)
++		ctx = context.WithValue(ctx, profileReceiptKey{}, g.receipt)
++		ctx = context.WithValue(ctx, profilePathKey{}, g.ctx.Value(profilePathKey{}))
++		ctx = context.WithValue(ctx, profilePoolContextKey{}, (*ProfilePool)(nil))
++	}
 +	if ProfileCheckDial(ctx, target, true) != nil {
 +		return ctx, errProfile
 +	}
@@ -9898,7 +10342,10 @@ new file mode 100644
 +	if !ok || e != nil || u16(next, 0) != subject || next[2] != v.network || u16(edge, 0) != g.scope || edge[4] != g.branch {
 +		return ctx, errProfile
 +	}
-+	ctx = context.WithValue(ctx, profileGrantKey{}, (*profileGrant)(nil))
++	p.flow.mu.Lock()
++	preparedNext := g.next
++	p.flow.mu.Unlock()
++	ctx = context.WithValue(ctx, profileGrantKey{}, preparedNext)
 +	h := sha256.New()
 +	h.Write([]byte("YNKCAP-CHAIN-PATH-v1\x00"))
 +	if path, ok := ctx.Value(profilePathKey{}).([32]byte); ok {
@@ -9917,18 +10364,163 @@ new file mode 100644
 +	return context.WithValue(ctx, profileRouteKey{}, profileSelectedRoute{subject: subject, scope: nextScope, branches: edge[5], effective: v, chained: true}), nil
 +}
 +
++// Native picker сообщает actual mux decision; capsule mask лишь ограничивает его.
++// Каждый hop остаётся отдельным AUTHORIZE class1 того же original receipt.
++func ProfilePrepareChain(ctx context.Context, choose func(string, xnet.Destination) (bool, error)) error {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return nil
++	}
++	root, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if root != nil && root.class == 2 {
++		return nil
++	}
++	if root == nil || root.class != 0 && root.class != 1 {
++		return ErrProfileUnsupported
++	}
++	p.flow.mu.Lock()
++	prepared := root.prepared
++	p.flow.mu.Unlock()
++	if prepared {
++		return profileEnsureChain(ctx, root)
++	}
++	g := root
++	for depth := 0; depth < 256; depth++ {
++		if profileEnsureGrant(ctx, g) != nil {
++			return errProfile
++		}
++		row := p.flow.manifest.rows[8][g.scope]
++		action := row[20+int(g.branch)]
++		if action != 2 {
++			endpoint := g.effective
++			if action == 1 {
++				var ok bool
++				endpoint, ok = profileDecodedDestination(p.flow.manifest.rows[1][u16(row, 8+int(g.branch)*2)])
++				if !ok {
++					return errProfile
++				}
++			}
++			if action == 4 {
++				return errProfile
++			}
++			if endpoint.family == 3 {
++				return ErrProfileUnsupported
++			}
++			p.flow.mu.Lock()
++			for item := root; item != nil; item = item.next {
++				item.prepared = true
++			}
++			p.flow.mu.Unlock()
++			return profileEnsureChain(ctx, root)
++		}
++		if choose == nil || g.chain == 65535 {
++			return ErrProfileUnsupported
++		}
++		edge := p.flow.manifest.rows[2][g.chain]
++		nextScope := u16(edge, 2)
++		subject := u16(p.flow.manifest.rows[8][nextScope], 0)
++		cursor := profileCursor{b: p.flow.manifest.rows[0][subject]}
++		tag := string(cursor.str(160))
++		endpoint, ok := profileDecodedDestination(p.flow.manifest.rows[1][u16(row, 8+int(g.branch)*2)])
++		if !ok {
++			return errProfile
++		}
++		target := xnet.Destination{Network: xnet.Network_TCP, Address: xnet.ParseAddress(endpoint.address), Port: xnet.Port(endpoint.port)}
++		if endpoint.network == 17 {
++			target.Network = xnet.Network_UDP
++		}
++		next, e := ProfileChain(ctx, target, tag)
++		if e != nil {
++			return e
++		}
++		mux, e := choose(tag, target)
++		if e != nil {
++			return e
++		}
++		next, _, e = ProfileAuthorizeHandler(next, tag, target, mux)
++		if e != nil {
++			return e
++		}
++		child := next.Value(profileGrantKey{}).(*profileGrant)
++		p.flow.mu.Lock()
++		g.next = child
++		child.parent = g
++		p.flow.mu.Unlock()
++		g, ctx = child, next
++	}
++	return errProfile
++}
++
++func profileEnsureChain(ctx context.Context, g *profileGrant) error {
++	p := profileRuntime(ctx)
++	if p == nil || g == nil {
++		return errProfile
++	}
++	if source := profileReceiptFrom(ctx); source != nil && source != g.receipt {
++		return errProfile
++	}
++	p.flow.mu.Lock()
++	for depth := 0; g.parent != nil; depth++ {
++		if depth >= 255 || g.parent.next != g || g.parent.receipt != g.receipt {
++			p.flow.mu.Unlock()
++			return errProfile
++		}
++		g = g.parent
++	}
++	p.flow.mu.Unlock()
++	root := g
++	for depth := 0; depth < 256; depth++ {
++		if profileEnsureGrant(ctx, g) != nil {
++			return errProfile
++		}
++		p.flow.mu.Lock()
++		child, prepared := g.next, g.prepared
++		p.flow.mu.Unlock()
++		row := p.flow.manifest.rows[8][g.scope]
++		if row[20+int(g.branch)] != 2 {
++			// RPC каждого hop мог израсходовать freshness предыдущего. Последний
++			// atomic fence проверяет весь bundle после всех ожиданий.
++			p.flow.mu.Lock()
++			defer p.flow.mu.Unlock()
++			for item, depth := root, 0; item != nil; item, depth = item.next, depth+1 {
++				if depth >= 256 || !p.flow.grantLive(item) || p.flow.mode == 2 && item.class != 2 && !p.flow.clock().Before(item.ownerDeadline) {
++					return errProfile
++				}
++			}
++			return nil
++		}
++		if !prepared || child == nil || child.receipt != g.receipt || child.chain == g.chain {
++			return errProfile
++		}
++		edge := p.flow.manifest.rows[2][g.chain]
++		endpoint, ok := profileDecodedDestination(p.flow.manifest.rows[1][u16(row, 8+int(g.branch)*2)])
++		if !ok || child.scope != u16(edge, 2) || edge[5]&(1<<child.branch) == 0 || child.effective != endpoint {
++			return errProfile
++		}
++		g = child
++	}
++	return errProfile
++}
++
 +type profileFlowReader struct {
 +	ctx    context.Context
 +	grant  *profileGrant
 +	reader buf.Reader
 +}
 +
++func profileLinkGate(ctx context.Context, g *profileGrant) error {
++	if physical, _ := ctx.Value(profilePhysicalContextKey{}).(bool); physical {
++		return ProfileLogicalGate(ctx)
++	}
++	return profileEnsureChain(ctx, g)
++}
++
 +func (r *profileFlowReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-+	if profileEnsureGrant(r.ctx, r.grant) != nil {
++	if profileLinkGate(r.ctx, r.grant) != nil {
 +		return nil, errProfile
 +	}
 +	mb, e := r.reader.ReadMultiBuffer()
-+	if profileEnsureGrant(r.ctx, r.grant) != nil {
++	if profileLinkGate(r.ctx, r.grant) != nil {
 +		buf.ReleaseMulti(mb)
 +		return nil, errProfile
 +	}
@@ -9953,7 +10545,7 @@ new file mode 100644
 +}
 +
 +func (w *profileFlowWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-+	if profileEnsureGrant(w.ctx, w.grant) != nil {
++	if profileLinkGate(w.ctx, w.grant) != nil {
 +		buf.ReleaseMulti(mb)
 +		return errProfile
 +	}
@@ -9973,7 +10565,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,878 @@
+@@ -0,0 +1,881 @@
 +//go:build linux
 +
 +package nativehooks
@@ -10062,6 +10654,9 @@ new file mode 100644
 +	openOperation       *profileOperation
 +}
 +type profileGrant struct {
++	next                                *profileGrant
++	parent                              *profileGrant
++	prepared                            bool
 +	class                               byte
 +	purpose, serviceIndex, resolver     uint16
 +	query                               string
@@ -10856,7 +11451,7 @@ diff --git a/common/yonikbroker/profile_flow_linux_test.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux_test.go
-@@ -0,0 +1,918 @@
+@@ -0,0 +1,919 @@
 +//go:build linux
 +
 +package nativehooks
@@ -11254,7 +11849,8 @@ new file mode 100644
 +	if allocations != 0 {
 +		t.Fatal("tombstone overflow allocated", allocations)
 +	}
-+	if unsafe.Sizeof(profileReceipt{}) > 256 || unsafe.Sizeof(profileGrant{}) > 256 || unsafe.Sizeof(profileTombstone{}) > 64 || unsafe.Sizeof(profileOperation{})+1024 > 2048 {
++	// Две private chain links включены в общий fixed metadata preflight.
++	if unsafe.Sizeof(profileReceipt{}) > 256 || unsafe.Sizeof(profileGrant{}) > 272 || unsafe.Sizeof(profileTombstone{}) > 64 || unsafe.Sizeof(profileOperation{})+1024 > 2048 {
 +		t.Fatal("ledger sizing changed")
 +	}
 +}
@@ -11779,7 +12375,7 @@ diff --git a/common/yonikbroker/profile_flow_other.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_other.go
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,42 @@
 +//go:build !linux
 +
 +package nativehooks
@@ -11792,7 +12388,10 @@ new file mode 100644
 +
 +// На этих платформах PrepareProfileLaunch отказывает до создания runtime.
 +// Legacy callers сохраняют поведение и не получают profile authority.
-+func ProfileSession(context.Context) bool                                           { return false }
++func ProfileSession(context.Context) bool { return false }
++func ProfilePrepareChain(context.Context, func(string, xnet.Destination) (bool, error)) error {
++	return nil
++}
 +func CarryProfileSession(_ context.Context, target context.Context) context.Context { return target }
 +func ProfileAccept(ctx context.Context, _ xnet.Conn, _ string) (context.Context, error) {
 +	return ctx, nil
