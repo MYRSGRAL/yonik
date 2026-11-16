@@ -1125,7 +1125,7 @@ path ниже. Без него Retire45/46 остаётся Unknown custody repo
 Cancel после live published Physical reservation не выдаёт KnownClosed.
 Wrong/replayed/late SCM закрывает unexpected rights и отзывает context; очищенные
 known-only reservations не отзывают соседний bundle. Append43/44, ProxiedLogical,
-PROBE flow0, loopback StubBind, hostname bootstrap и Numeric остаются Unsupported.
+PROBE flow0, loopback StubBind и hostname bootstrap остаются Unsupported.
 Publish/Waiter реализованы следующим bounded cut ниже.
 Public flags/protected allowlist/readiness не меняются.
 
@@ -1232,12 +1232,69 @@ reserve256KiB сохранён. Queued payload — owned bounded slice с отд
 не увеличены. Future wakeup пропускает expired authority и использует retained
 cleanup deadline, не превращая cache retention в owner-freshness busy loop.
 
-Numeric42 остаётся Unsupported. Следующий конкретный переход: private live ACKed
-WaiterReceipt/member → exact canonical class1 original/source/scope/branch/path/
-carrier/port и fresh owner → existing durable RouteAuthority installation →
-GRANT19, с grant→waiter ref retirement. Class3 DNS DATA само по себе не повышается
-до USER authority. ProxiedLogical/Append/Hosts/flow0/bootstrap/Stub policy и новый
-System snapshot transcript этим cut не реализованы; public gates false.
+Numeric42 для одного guarded USER Direct consumer реализован следующим cut ниже.
+Class3 DNS DATA само по себе не повышается до USER authority.
+ProxiedLogical/Append/Hosts/flow0/bootstrap/Stub policy и новый System snapshot
+transcript этим cut не реализованы; public gates false.
+
+### USER NumericAuthorize42 → durable GRANT19: один guarded Direct consumer
+
+`dns_bundle::dispatch` направляет Numeric42 в `dns_rrset::dispatch_numeric`
+единственного `run_issuer`. Доступны только parentClass1/use1/ProviderQuery,
+live ACKed private WaiterReceipt и immutable A/AAAA member. Private constructor
+`checked_numeric` проверяет waiter/reservation/DATA/bundle/root/source revision/
+epoch/manifest, точный canonical original hostname и source flow, member address,
+исходные port/protocol и checked native subject/scope/branch/chain/stream.
+Только terminal Freedom Direct без next допускается; DNS transport carrier не
+подменяет original user carrier. Loopback/link-local/ненумерический destination
+не становится user route. Обычный AUTHORIZE18 не получает новый constructor;
+его codec/validation сохранены. Borrowed View42 accessors читают уже validated
+canonical base и compact destination, не создавая authority.
+
+В этом initial subset canonical class1 base сохраняет
+`original==effective==immutable original hostname`; отдельный compact target
+обязан равняться выбранному RRset member с original user port/carrier. Legacy
+rewriting original в IP запрещён. После полного chain-of-checks opaque
+`CheckedNumeric` допускает один собственный numeric user grant. DNS class3 root,
+hop permit, query string, child IP и ProducerRRset сами route authority не дают.
+
+`dns-wire-v2.md:501–506` не задаёт quota/reuse/refresh для нескольких dials или
+fallback member grants. Этот cut консервативно разрешает один effectful Numeric
+attempt на waiter и один terminal numeric leaf на исходный flow. Attempt ID и
+flow narrowing необратимы до teardown; retry после effects, fallback и legacy
+AUTHORIZE refresh этого flow Unsupported. Для следующего dial нужен новый
+private flow/root/bundle/waiter. Расширение multi-dial semantics требует root
+interop решения; новых wire fields/hash здесь нет.
+
+До owner lookup/effects оплачиваются shared history/memory/route credits.
+`Authority::owner` независимо выдаёт fresh user proof и проверяет original
+tuple/subject/receipt; System требует Known≤20ms, Local required=false/fresh0
+без OS attribution. Expiry=min(waiter, original reservation, DATA, DNS root,
+session, target policy≤1s, original user owner proof). Backend не продлевает
+proof: после `Authority::route(Direct(member),userProof,source,tuple)` повторно
+проверяется тот же proof/parent/expiry, без нового lookup для спасения старого.
+Production call идёт через existing `RouteAuthority::check` →
+`ProfileRoutes::check_route` → captured numeric route/durable policy replacement
+и fence. DNS resource ACK не закрывает этот отдельный user route ticket.
+
+Pending grant заранее удерживает собственные ticket/credit custody. Known
+rollback отменяет его ровно один раз; failed/uncertain backend/release/write
+делает Unknown sticky и сохраняет grant/backend journal до supervisor fences.
+Перед каждым send/retry drain обрабатывает queued cancel; late expiry не даёт
+Allow. GRANT19/56 сохраняет class1/source/policy revision и actual receipt
+namespace; Header.reply — exact pending42, objectId — этот user GrantId.
+Caller обязан вычесть RTT; ни GRANT lease, ни queue не обновляют Known deadline.
+
+Grant содержит private waiter/member dependency. Target1 original request,
+Producer5/Waiter6, reservation/bundle/root/source cancel и expiry вызывают durable
+retirement dependent user tickets до Known ACK. Один waiter не отзывает DATA
+или sibling user grant. Terminal attempt/history не reuse/evict; caps остаются
+pending64/FD64/history256/aggregate8MiB и existing route/firewall limits.
+
+Production transcript pin/allowlist остаются прежними/None; factory SOURCE
+eligibility не является installed authority. Positive tests используют только
+injected reviewed record и fake route/owner/capture operations. Core/Host/network/
+OS wrappers не исполнялись, public gates false, runtime acceptance не заявляется.
 
 ### StubBind: bounded listener observation, не service authority
 

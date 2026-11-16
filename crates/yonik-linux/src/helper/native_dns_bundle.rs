@@ -207,6 +207,7 @@ impl<A: Authority> Issuer<A> {
     }
     pub(super) fn cancel_dns_bundle(&mut self, id: u64) -> Result<(), ServiceError> {
         self.rrsets.cancel_bundle(id);
+        self.cancel_numeric_dependents()?;
         if self.unknown {
             return Err(ServiceError::Unavailable);
         }
@@ -603,6 +604,11 @@ pub(super) fn dispatch<A: Authority>(
     let neg = issuer.negotiated.ok_or(ServiceError::Unavailable)?;
     let frame = decode(bytes, &neg, Direction::Producer)?;
     let reply = frame.header.sequence;
+    if let Record::NumericAuthorize(view) = frame.record {
+        return super::dns_rrset::dispatch_numeric(
+            issuer, socket, stop, sequence, reply, view, session, drain,
+        );
+    }
     if matches!(frame.record, Record::Publish(_) | Record::WaiterBind(_)) {
         return super::dns_rrset::dispatch(
             issuer,
@@ -736,9 +742,13 @@ pub(super) fn cancel<A: Authority>(
         7 => {
             super::dns_transport::cancel(issuer, target, id)?;
             issuer.rrsets.cancel_reservation(id);
+            issuer.cancel_numeric_dependents()?;
             Ok(())
         }
-        5 | 6 => issuer.rrsets.cancel(target, id),
+        5 | 6 => {
+            issuer.rrsets.cancel(target, id)?;
+            issuer.cancel_numeric_dependents()
+        }
         _ => Err(ServiceError::InvalidRequest),
     }
 }

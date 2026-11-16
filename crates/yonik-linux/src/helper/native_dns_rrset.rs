@@ -1,7 +1,10 @@
-//! Immutable DNS DATA и отдельный fresh waiter. Numeric authority здесь нет.
+//! Immutable DNS DATA, отдельный fresh waiter и checked USER numeric authority.
 use super::super::memory::ByteLease;
 use super::dns_transport::Binding;
-use super::{Authority, Channel, Issuer, OwnerReference, ServiceError, unavailable, wire};
+use super::{
+    Authority, Channel, Grant, Issuer, OwnerReference, RouteRequest, ServiceError, Target,
+    unavailable, wire,
+};
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -355,6 +358,7 @@ struct Producer {
     _memory: ByteLease,
 }
 struct Waiter {
+    numeric_once: Option<(u64, u64)>,
     binding: Binding,
     producer: u64,
     reservation: u64,
@@ -652,6 +656,7 @@ impl<A: Authority> Issuer<A> {
         self.rrsets.waiters.insert(
             id,
             Box::new(Waiter {
+                numeric_once: None,
                 binding,
                 producer,
                 reservation,
@@ -750,6 +755,457 @@ impl<A: Authority> Issuer<A> {
         }
     }
 }
+/// Только checked_numeric создаёт такой token; caller/class3 DATA не конструкторы.
+struct CheckedNumeric<'a> {
+    base: wire::Authorize<'a>,
+    target: Target,
+    waiter: u64,
+    member: u16,
+    expires: Instant,
+}
+pub(super) struct NumericBinding {
+    waiter: u64,
+    member: u16,
+    _memory: ByteLease,
+}
+impl<A: Authority> Issuer<A> {
+    fn numeric_parent(&self, waiter: u64) -> Result<(Binding, Instant), ServiceError> {
+        self.fence()?;
+        let w = self
+            .rrsets
+            .waiters
+            .get(&waiter)
+            .ok_or(ServiceError::Unavailable)?;
+        let p = self
+            .rrsets
+            .producers
+            .get(&w.producer)
+            .ok_or(ServiceError::Unavailable)?;
+        if !w.acked || w.revoked || !p.acked || p.revoked || !same_data(w.binding, p.binding) {
+            return Err(ServiceError::Unavailable);
+        }
+        let (binding, reservation_expires) = self.dns_waiter_binding(w.reservation)?;
+        let expires = w
+            .expires
+            .min(p.expires)
+            .min(reservation_expires)
+            .min(binding.expires);
+        if binding != w.binding || self.authority.now() >= expires {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok((binding, expires))
+    }
+    fn numeric_member(&self, waiter: u64, index: u16, target: Target) -> Result<(), ServiceError> {
+        let w = self
+            .rrsets
+            .waiters
+            .get(&waiter)
+            .ok_or(ServiceError::Unavailable)?;
+        let p = self
+            .rrsets
+            .producers
+            .get(&w.producer)
+            .ok_or(ServiceError::Unavailable)?;
+        let member = p
+            .answer
+            .members
+            .get(usize::from(index))
+            .filter(|_| usize::from(index) < p.answer.count)
+            .ok_or(ServiceError::InvalidRequest)?;
+        let d = target.wire();
+        let equal = match member {
+            IpAddr::V4(ip) => d.family == 4 && d.bytes == ip.octets(),
+            IpAddr::V6(ip) => d.family == 6 && d.bytes == ip.octets(),
+        };
+        if !equal
+            || !unicast(*member)
+            || member.is_loopback()
+            || matches!(member,IpAddr::V4(ip) if ip.is_link_local())
+            || matches!(member,IpAddr::V6(ip) if ip.is_unicast_link_local())
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        Ok(())
+    }
+    fn checked_numeric<'a>(
+        &self,
+        v: View<'a, 42>,
+        session: Instant,
+    ) -> Result<CheckedNumeric<'a>, ServiceError> {
+        let b = v.bytes();
+        if b[14] != 1 || b[15] != 1 {
+            return Err(ServiceError::Unsupported);
+        }
+        let waiter = v.waiter().map_err(unavailable)?.get();
+        let (binding, expires) = self.numeric_parent(waiter)?;
+        let w = self
+            .rrsets
+            .waiters
+            .get(&waiter)
+            .ok_or(ServiceError::Unavailable)?;
+        if w.numeric_once.is_some() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let base = v.authorization().map_err(unavailable)?;
+        let flow = self
+            .flows
+            .get(&base.source_flow)
+            .ok_or(ServiceError::Unavailable)?;
+        let cap = self.capsule()?;
+        cap.validate_request(&wire::Message::Authorize(base))
+            .map_err(unavailable)?;
+        let original = Target::copy(base.original)?;
+        let target = Target::copy(v.numeric_destination())?;
+        let dial = cap
+            .dial_scope(base.scope, base.branch)
+            .map_err(unavailable)?;
+        if base.class != 1
+            || base.source_flow != binding.source
+            || binding.source_revision != cap.policy_revision
+            || flow.numeric_only
+            || flow.root.is_some()
+            || flow.original != original
+            || original.family != 3
+            || Target::copy(base.effective)? != original
+            || Name::lookup(original.wire().bytes)? != Name::lookup(binding.name.wire().bytes)?
+            || target.protocol != original.protocol
+            || target.port != original.port
+            || dial.input != original.protocol
+            || dial.carrier != original.protocol
+            || dial.action != 3
+            || dial.next.is_some()
+            || dial.subject != base.subject
+            || dial.chain != base.chain
+            || dial.stream != base.transport
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.numeric_member(waiter, n16(b, 2), target)?;
+        Ok(CheckedNumeric {
+            base,
+            target,
+            waiter,
+            member: n16(b, 2),
+            expires: expires
+                .min(session)
+                .min(self.authority.now() + Duration::from_secs(1)),
+        })
+    }
+    fn authorize_numeric(
+        &mut self,
+        request: u64,
+        v: View<'_, 42>,
+        session: Instant,
+    ) -> Result<(u64, A::Proof), ServiceError> {
+        if self.retired.iter().any(|(n, _)| *n == request) {
+            return Err(ServiceError::Unavailable);
+        }
+        let checked = self.checked_numeric(v, session)?;
+        if self.grants.len() + self.services.len() >= self.capsule()?.limits()[0] as usize {
+            return Err(ServiceError::Busy);
+        }
+        let memory = self
+            .budget
+            .dynamic
+            .reserve(std::mem::size_of::<Grant>() + std::mem::size_of::<NumericBinding>() + 96)
+            .map_err(unavailable)?;
+        let query_credit = self.budget.dynamic.reserve(24).map_err(unavailable)?;
+        let routes = self.budget.routes.reserve(1).map_err(unavailable)?;
+        self.bundle_history(1)?;
+        let mut tickets = Vec::with_capacity(1);
+        let a = checked.base;
+        let flow = self
+            .flows
+            .get(&a.source_flow)
+            .ok_or(ServiceError::Unavailable)?;
+        self.authority.check_ingress(&flow.socket)?;
+        let (tuple, subject) = (flow.tuple, flow.subject);
+        let proof = self.authority.owner(
+            a.source_flow,
+            tuple,
+            OwnerReference {
+                kind: a.receipt.kind,
+                id: a.receipt.id,
+            },
+        )?;
+        if self.authority.subject(&proof, a.source_flow, tuple)? != subject {
+            return Err(ServiceError::Unavailable);
+        }
+        let expires = checked
+            .expires
+            .min(self.authority.expiry(&proof).unwrap_or(checked.expires));
+        if expires.saturating_duration_since(self.authority.now()) < Duration::from_millis(1) {
+            return Err(ServiceError::Unavailable);
+        }
+        let id = Self::id(&mut self.next_grant)?;
+        self.rrsets
+            .waiters
+            .get_mut(&checked.waiter)
+            .ok_or(ServiceError::Unavailable)?
+            .numeric_once = Some((request, id));
+        self.flows
+            .get_mut(&a.source_flow)
+            .ok_or(ServiceError::Unavailable)?
+            .numeric_only = true;
+        // Placeholder удерживает custody/credits при uncertain backend effect.
+        self.grants.insert(
+            id,
+            Box::new(Grant {
+                numeric: Some(NumericBinding {
+                    waiter: checked.waiter,
+                    member: checked.member,
+                    _memory: memory,
+                }),
+                source: a.source_flow,
+                subject: a.subject,
+                scope: a.scope,
+                branch: a.branch,
+                chain: a.chain,
+                stream: a.transport,
+                class: 1,
+                effective: checked.target,
+                resolver: u16::MAX,
+                query: "".into(),
+                expires,
+                request,
+                tickets: Box::new([]),
+                next: None,
+                _query_credit: query_credit,
+                _routes: routes,
+            }),
+        );
+        match self.authority.route(
+            RouteRequest::Direct(checked.target.wire()),
+            &proof,
+            a.source_flow,
+            tuple,
+        ) {
+            Ok(Some(ticket)) => tickets.push(ticket),
+            Ok(None) => {}
+            Err(error) => {
+                self.unknown = true;
+                self.authority.revoke();
+                return Err(error);
+            }
+        }
+        self.grants
+            .get_mut(&id)
+            .ok_or(ServiceError::Unavailable)?
+            .tickets = tickets.into_boxed_slice();
+        self.flows
+            .get_mut(&a.source_flow)
+            .ok_or(ServiceError::Unavailable)?
+            .root = Some((a.scope, checked.target));
+        let valid = self.numeric_live(id).and_then(|_| {
+            if self.authority.subject(&proof, a.source_flow, tuple)? != subject
+                || self
+                    .authority
+                    .expiry(&proof)
+                    .is_some_and(|until| self.authority.now() >= until)
+            {
+                return Err(ServiceError::Unavailable);
+            }
+            Ok(())
+        });
+        if let Err(error) = valid {
+            if !self.unknown {
+                self.cancel_grant(id)?;
+            }
+            return Err(error);
+        }
+        Ok((id, proof))
+    }
+    fn numeric_live(&self, id: u64) -> Result<Instant, ServiceError> {
+        let grant = self.grants.get(&id).ok_or(ServiceError::Unavailable)?;
+        let numeric = grant.numeric.as_ref().ok_or(ServiceError::Unavailable)?;
+        let (binding, expires) = self.numeric_parent(numeric.waiter)?;
+        let w = self
+            .rrsets
+            .waiters
+            .get(&numeric.waiter)
+            .ok_or(ServiceError::Unavailable)?;
+        let flow = self
+            .flows
+            .get(&grant.source)
+            .ok_or(ServiceError::Unavailable)?;
+        let cap = self.capsule()?;
+        let dial = cap
+            .dial_scope(grant.scope, grant.branch)
+            .map_err(unavailable)?;
+        if w.numeric_once != Some((grant.request, id))
+            || grant.class != 1
+            || grant.source != binding.source
+            || binding.source_revision != cap.policy_revision
+            || !flow.numeric_only
+            || flow.original.family != 3
+            || flow.root != Some((grant.scope, grant.effective))
+            || Name::lookup(flow.original.wire().bytes)? != Name::lookup(binding.name.wire().bytes)?
+            || grant.effective.protocol != flow.original.protocol
+            || grant.effective.port != flow.original.port
+            || dial.action != 3
+            || dial.next.is_some()
+            || dial.input != flow.original.protocol
+            || dial.carrier != flow.original.protocol
+            || dial.subject != grant.subject
+            || dial.chain != grant.chain
+            || dial.stream != grant.stream
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        self.authority.check_ingress(&flow.socket)?;
+        self.numeric_member(numeric.waiter, numeric.member, grant.effective)?;
+        let until = grant.expires.min(expires);
+        if self.authority.now() >= until {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(until)
+    }
+    pub(super) fn cancel_numeric_dependents(&mut self) -> Result<(), ServiceError> {
+        if self.unknown {
+            return Err(ServiceError::Unavailable);
+        }
+        let mut ids = [0; 4096];
+        let mut count = 0;
+        for (id, grant) in &self.grants {
+            if grant.numeric.is_some() && self.numeric_live(*id).is_err() {
+                *ids.get_mut(count).ok_or(ServiceError::Busy)? = *id;
+                count += 1;
+            }
+        }
+        for id in &ids[..count] {
+            self.cancel_grant(*id)?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Exact sequence, original owner proof/deadline, единый reader.
+pub(super) fn dispatch_numeric<A: Authority>(
+    issuer: &mut Issuer<A>,
+    socket: &impl Channel,
+    stop: &AtomicBool,
+    sequence: u64,
+    request: u64,
+    view: View<'_, 42>,
+    session: Instant,
+    mut drain: impl FnMut(&mut Issuer<A>) -> Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    let response_until = session.min(issuer.authority.now() + Duration::from_secs(1));
+    let outcome = issuer.authorize_numeric(request, view, session);
+    loop {
+        if !issuer.unknown {
+            drain(issuer)?;
+        }
+        let now = issuer.authority.now();
+        let mut live = None;
+        if !stop.load(Ordering::Acquire)
+            && now < response_until
+            && !issuer.retired.iter().any(|(n, _)| *n == request)
+        {
+            if let Ok((id, proof)) = &outcome {
+                if let Ok(until) = issuer.numeric_live(*id) {
+                    let g = issuer.grants.get(id).ok_or(ServiceError::Unavailable)?;
+                    let flow = issuer
+                        .flows
+                        .get(&g.source)
+                        .ok_or(ServiceError::Unavailable)?;
+                    if issuer
+                        .authority
+                        .subject(proof, g.source, flow.tuple)
+                        .is_ok_and(|subject| subject == flow.subject)
+                    {
+                        if let Ok(receipt) = issuer.authority.receipt(proof, g.source, flow.tuple) {
+                            let until = until.min(issuer.authority.expiry(proof).unwrap_or(until));
+                            let now = issuer.authority.now();
+                            let remaining = until.saturating_duration_since(now);
+                            if remaining >= Duration::from_millis(1) {
+                                live = Some((*id, g.source, until, receipt, remaining));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if live.is_none() {
+            if let Ok((id, _)) = &outcome {
+                if issuer.grants.contains_key(id) && !issuer.unknown {
+                    issuer.cancel_grant(*id)?;
+                }
+            }
+            if stop.load(Ordering::Acquire) || issuer.authority.now() >= response_until {
+                return Err(ServiceError::Unavailable);
+            }
+        }
+        let (object, message) = if let Some((id, source, _until, receipt, remaining)) = live {
+            (
+                id,
+                wire::Message::Grant {
+                    status: wire::Status::Allow,
+                    class: 1,
+                    required: issuer.record.mode.required(),
+                    grant: id,
+                    flow: source,
+                    lease: remaining.as_millis().min(1000) as u32,
+                    revision: issuer.capsule()?.policy_revision,
+                    fresh: if issuer.record.mode.required() {
+                        remaining.as_nanos().min(20_000_000) as u64
+                    } else {
+                        0
+                    },
+                    receipt,
+                },
+            )
+        } else {
+            (
+                0,
+                wire::Message::Grant {
+                    status: if issuer.unknown {
+                        wire::Status::Unknown
+                    } else {
+                        wire::Status::Deny
+                    },
+                    class: 1,
+                    required: false,
+                    grant: 0,
+                    flow: 0,
+                    lease: 0,
+                    revision: 0,
+                    fresh: 0,
+                    receipt: wire::Receipt {
+                        kind: wire::ReceiptKind::None,
+                        id: 0,
+                    },
+                },
+            )
+        };
+        let mut bytes = [0; 184];
+        let n = wire::Frame::encode(
+            wire::Header {
+                kind: wire::Kind::Grant,
+                sequence,
+                reply_to: request,
+                binding: issuer.record.binding,
+                object_id: object,
+            },
+            &message,
+            &mut bytes,
+        )
+        .map_err(unavailable)?;
+        match socket.write(&bytes[..n]) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                issuer.unknown = true;
+                issuer.authority.revoke();
+                return Err(error);
+            }
+        }
+        socket.writable_until(live.map_or(response_until, |(_, _, until, _, _)| {
+            until.min(response_until)
+        }));
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Exact pending sequence и original deadline.
 pub(super) fn dispatch<A: Authority>(
     issuer: &mut Issuer<A>,

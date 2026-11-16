@@ -6,6 +6,36 @@ use std::{
 };
 use wire::dns_v2::Operation;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NumericFault {
+    None,
+    Two,
+    Member,
+    Address,
+    Port,
+    Carrier,
+    Name,
+    Source,
+    Waiter,
+    Scope,
+    Receipt,
+    Effective,
+    Class,
+    Use,
+    Replay,
+    Cancel,
+    CancelRequest,
+    CancelProducer,
+    CancelBundle,
+    CancelSource,
+    Expired,
+    ShortReservation,
+    ReservationExpired,
+    SlowWrite,
+    HistoryFull,
+    RouteFull,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
     None,
@@ -38,6 +68,7 @@ enum Fault {
     Publish,
     Waiters,
     WaitersKeep,
+    Numeric,
     WaiterShortReservation,
     WaiterWrongSource,
     WaiterWrongRoot,
@@ -57,6 +88,7 @@ impl Fault {
         matches!(
             self,
             Self::Waiters
+                | Self::Numeric
                 | Self::WaitersKeep
                 | Self::WaiterShortReservation
                 | Self::WaiterWrongSource
@@ -124,6 +156,11 @@ struct Driver {
     extra_acquires: RefCell<VecDeque<Vec<u8>>>,
     current_acquire: RefCell<Option<Vec<u8>>>,
     next_dns: Cell<u64>,
+    user_dial: (u16, u16, u16, u16),
+    numeric_fault: Cell<NumericFault>,
+    current_bundle: Cell<u64>,
+    route_budget: super::super::memory::ByteBudget,
+    pressure: RefCell<Vec<super::super::memory::ByteLease>>,
 }
 fn n64(b: &[u8], at: usize) -> u64 {
     u64::from_be_bytes(b[at..at + 8].try_into().unwrap())
@@ -172,6 +209,21 @@ impl Driver {
             extra_acquires: Default::default(),
             current_acquire: Default::default(),
             next_dns: Cell::new(8),
+            user_dial: (0..512u16)
+                .find_map(|scope| {
+                    issuer
+                        .capsule()
+                        .unwrap()
+                        .dial_scope(scope, 0)
+                        .ok()
+                        .filter(|d| d.input == 6 && d.action == 3 && d.next.is_none())
+                        .map(|d| (scope, d.subject, d.chain, d.stream))
+                })
+                .unwrap_or((u16::MAX, 0, 0, 0)),
+            numeric_fault: Cell::new(NumericFault::None),
+            current_bundle: Cell::new(0),
+            route_budget: issuer.budget.routes.clone(),
+            pressure: Default::default(),
         };
         if fault == Fault::RetiredRequest {
             input.push_back(dns_packet(
@@ -417,6 +469,86 @@ impl Driver {
             self.next_queue(Operation::Cancel, &c);
         }
     }
+    fn numeric(&self, waiter: u64) -> Vec<u8> {
+        let a = self.current_acquire.borrow();
+        let a = a.as_ref().unwrap();
+        let old = wire::dns_v2::View::<55>::decode(a)
+            .unwrap()
+            .authorization()
+            .unwrap();
+        let (scope, subject, chain, transport) = self.user_dial;
+        let mut base = wire::Authorize {
+            class: 1,
+            scope,
+            subject,
+            chain,
+            transport,
+            branch: 0,
+            effective: old.original,
+            resolver: u16::MAX,
+            query: "",
+            ..old
+        };
+        match self.numeric_fault.get() {
+            NumericFault::Source => base.source_flow = 1,
+            NumericFault::Name => {
+                base.original = wire::Destination {
+                    bytes: b"other.invalid",
+                    ..base.original
+                };
+                base.effective = base.original;
+            }
+            NumericFault::Scope => base.scope = n16(a, a.len() - 4),
+            NumericFault::Receipt => {
+                base.receipt = wire::Receipt {
+                    kind: wire::ReceiptKind::FrozenSent,
+                    id: 999,
+                }
+            }
+            NumericFault::Effective => {
+                base.effective = wire::Destination {
+                    family: 4,
+                    bytes: &[203, 0, 113, 81],
+                    ..base.original
+                }
+            }
+            NumericFault::Class => base = old,
+            _ => {}
+        }
+        let mut raw = [0; 1152];
+        let n = wire::Frame::encode(
+            wire::Header {
+                kind: wire::Kind::Authorize,
+                sequence: 1,
+                reply_to: 0,
+                binding: self.record.binding,
+                object_id: 0,
+            },
+            &wire::Message::Authorize(base),
+            &mut raw,
+        )
+        .unwrap();
+        let mut body = vec![0; 16];
+        p16(&mut body, 0, 2);
+        p64(&mut body, 4, waiter);
+        p16(&mut body, 12, (n - 128) as u16);
+        body[14] = 1;
+        body[15] = 1;
+        body.extend_from_slice(&raw[128..n]);
+        let tail = body.len();
+        body.extend_from_slice(&[4, 6, 1, 187, 4, 0, 0, 203, 0, 113, 80]);
+        match self.numeric_fault.get() {
+            NumericFault::Member => p16(&mut body, 2, 1),
+            NumericFault::Waiter => p64(&mut body, 4, 999),
+            NumericFault::Address => body[tail + 10] = 81,
+            NumericFault::Port => p16(&mut body, tail + 2, 444),
+            NumericFault::Carrier => body[tail + 1] = 17,
+            NumericFault::Class => body[15] = 3,
+            NumericFault::Use => body[14] = 2,
+            _ => {}
+        }
+        body
+    }
 }
 impl Channel for Driver {
     fn dns_wire_producer(
@@ -531,6 +663,34 @@ impl Channel for Driver {
         if !dns_bundle::is_dns(bytes) {
             let frame = wire::Frame::decode(bytes, self.record.binding, self.record.mode, true)
                 .map_err(unavailable)?;
+            if let wire::Message::Grant { status, .. } = frame.message {
+                if self.numeric_fault.get() == NumericFault::SlowWrite
+                    && !self.blocked.replace(true)
+                {
+                    self.elapsed.fetch_add(25_000_000, Ordering::AcqRel);
+                    return Ok(false);
+                }
+                self.output.borrow_mut().push(bytes.to_vec());
+                if status == wire::Status::Allow
+                    && self.numeric_fault.get() == NumericFault::Two
+                    && !self.extra_acquires.borrow().is_empty()
+                {
+                    self.next_waiter();
+                } else if status == wire::Status::Allow
+                    && self.numeric_fault.get() == NumericFault::Replay
+                {
+                    let body = self.numeric(1);
+                    self.next_queue(Operation::NumericAuthorize, &body);
+                } else {
+                    self.finished.set(true);
+                }
+                return Ok(true);
+            }
+            if let wire::Message::CloseAck { .. } = frame.message {
+                self.output.borrow_mut().push(bytes.to_vec());
+                self.finished.set(true);
+                return Ok(true);
+            }
             let wire::Message::Admit(raw) = frame.message else {
                 return Err(ServiceError::InvalidRequest);
             };
@@ -591,9 +751,15 @@ impl Channel for Driver {
         }
         match f.record.operation() {
             Operation::BundleGranted if self.current_acquire.borrow().is_some() => {
+                self.current_bundle.set(n64(b, 8));
                 let a = self.current_acquire.borrow();
                 let mut body = self.reserve_for(a.as_ref().unwrap(), 3, 0, n64(b, 8));
-                if self.fault == Fault::WaiterShortReservation {
+                if self.fault == Fault::WaiterShortReservation
+                    || matches!(
+                        self.numeric_fault.get(),
+                        NumericFault::ShortReservation | NumericFault::ReservationExpired
+                    )
+                {
                     p64(&mut body, 56, 5_000_000);
                 }
                 self.next_queue(Operation::Reserve, &body);
@@ -752,6 +918,65 @@ impl Channel for Driver {
             Operation::Published if self.fault == Fault::PublishReplay => {
                 self.queue(8, Operation::Publish, &self.publish())
             }
+            Operation::WaiterBound if self.fault == Fault::Numeric => {
+                match self.numeric_fault.get() {
+                    NumericFault::Expired => {
+                        self.elapsed.fetch_add(21_000_000, Ordering::AcqRel);
+                    }
+                    NumericFault::ReservationExpired => {
+                        self.elapsed.fetch_add(6_000_000, Ordering::AcqRel);
+                    }
+                    NumericFault::HistoryFull => {
+                        let mut h = self.history.lock().unwrap();
+                        h.limit = h.len;
+                    }
+                    NumericFault::RouteFull => self.pressure.borrow_mut().push(
+                        self.route_budget
+                            .reserve(4096 - self.route_budget.used())
+                            .unwrap(),
+                    ),
+                    _ => {}
+                }
+                let request = self.next_dns.get();
+                let body = self.numeric(n64(b, 8));
+                self.next_queue(Operation::NumericAuthorize, &body);
+                let target = match self.numeric_fault.get() {
+                    NumericFault::Cancel => Some((6, n64(b, 8))),
+                    NumericFault::CancelRequest => Some((1, request)),
+                    NumericFault::CancelProducer => Some((5, 1)),
+                    NumericFault::CancelBundle => Some((8, self.current_bundle.get())),
+                    _ => None,
+                };
+                if let Some((target, id)) = target {
+                    let mut c = [0; 24];
+                    p16(&mut c, 0, 2);
+                    c[2] = target;
+                    p64(&mut c, 8, id);
+                    self.next_queue(Operation::Cancel, &c);
+                }
+                if self.numeric_fault.get() == NumericFault::CancelSource {
+                    let seq = self.next_dns.get();
+                    self.next_dns.set(seq + 1);
+                    let mut raw = [0; 184];
+                    let n = wire::Frame::encode(
+                        wire::Header {
+                            kind: wire::Kind::Cancel,
+                            sequence: seq,
+                            reply_to: 0,
+                            binding: self.record.binding,
+                            object_id: 0,
+                        },
+                        &wire::Message::Cancel {
+                            target: 2,
+                            id: 2,
+                            reason: 0,
+                        },
+                        &mut raw,
+                    )
+                    .unwrap();
+                    self.input.borrow_mut().push_back(raw[..n].to_vec());
+                }
+            }
             Operation::WaiterBound if self.fault.waitering() => self.next_waiter(),
             Operation::Retired if self.fault.releasing() => {
                 let mut r = [0; 24];
@@ -791,6 +1016,10 @@ impl Channel for Driver {
         Ok(true)
     }
     fn writable_until(&self, _: Instant) {
+        if self.numeric_fault.get() == NumericFault::SlowWrite {
+            assert!(self.blocked.get());
+            return;
+        }
         assert!(matches!(
             self.fault,
             Fault::ReleaseRetry | Fault::ReleaseRetryResource
@@ -821,7 +1050,13 @@ fn statuses(driver: &Driver) -> Vec<(u16, u8, u64)> {
         .output
         .borrow()
         .iter()
-        .map(|b| (n16(b, 10), b[130], n64(b, 24)))
+        .map(|b| {
+            (
+                n16(b, 10),
+                b[if n16(b, 10) == 19 { 128 } else { 130 }],
+                n64(b, 24),
+            )
+        })
         .collect()
 }
 
@@ -897,6 +1132,271 @@ fn additional_query(issuer: &mut Issuer<Fake>, first: &[u8], port: u16, query: u
     p64(&mut body, 16, query);
     body[72..72 + n].copy_from_slice(&bytes[128..size]);
     body
+}
+
+fn numeric_query(issuer: &mut Issuer<Fake>, first: &[u8], port: u16, query: u64) -> Vec<u8> {
+    let mut open = super::issuer_tests::open(Mode::Local, port);
+    let wire::Message::OpenIngress {
+        ref mut original, ..
+    } = open
+    else {
+        panic!("SOCKS source fixture")
+    };
+    *original = wire::Destination {
+        protocol: 6,
+        family: 3,
+        port: 443,
+        bytes: b"query.invalid",
+    };
+    let (source, _) = issuer.open(100 + query, &open).unwrap();
+    let old = wire::dns_v2::View::<55>::decode(first)
+        .unwrap()
+        .authorization()
+        .unwrap();
+    let a = wire::Authorize {
+        source_flow: source,
+        original: wire::Destination {
+            protocol: 6,
+            family: 3,
+            port: 443,
+            bytes: b"query.invalid",
+        },
+        ..old
+    };
+    let (root, _) = issuer.authorize(200 + query, 0, &a).unwrap();
+    let mut raw = [0; 1152];
+    let n = wire::Frame::encode(
+        wire::Header {
+            kind: wire::Kind::Authorize,
+            sequence: 1,
+            reply_to: 0,
+            binding: issuer.record.binding,
+            object_id: 0,
+        },
+        &wire::Message::Authorize(a),
+        &mut raw,
+    )
+    .unwrap();
+    let mut body = first[..72].to_vec();
+    p64(&mut body, 8, root);
+    p64(&mut body, 16, query);
+    p16(&mut body, 48, (n - 128) as u16);
+    body.extend_from_slice(&raw[128..n]);
+    body.extend_from_slice(&first[72 + usize::from(n16(first, 48))..]);
+    body
+}
+
+#[test]
+fn dns_numeric_driver_full_publish_waiter_to_durable_user_grant() {
+    for mode in [Mode::Local, Mode::System] {
+        let (mut issuer, a) = bundle_fixture(mode, false);
+        let next = numeric_query(&mut issuer, &a, 32002, 10);
+        let io = Driver::new(&issuer, a, false, Fault::Numeric);
+        io.extra_acquires.borrow_mut().push_back(next);
+        run(&mut issuer, &io);
+        assert_eq!(statuses(&io).last(), Some(&(19, 1, 11)));
+        assert!(!issuer.unknown);
+        assert_eq!(issuer.authority.live.len(), 5);
+        let outputs = io.output.borrow();
+        let raw = outputs.last().unwrap();
+        let frame = wire::Frame::decode(raw, issuer.record.binding, mode, true).unwrap();
+        let wire::Message::Grant {
+            class,
+            flow,
+            required,
+            fresh,
+            receipt,
+            lease,
+            ..
+        } = frame.message
+        else {
+            panic!("GRANT19")
+        };
+        assert_eq!((class, flow, required), (1, 2, mode.required()));
+        assert!(lease > 0);
+        if mode.required() {
+            assert!(fresh > 0 && fresh <= 20_000_000);
+            assert_eq!(receipt.kind, wire::ReceiptKind::SidebandOperation);
+        } else {
+            assert_eq!(fresh, 0);
+            assert_eq!(receipt.kind, wire::ReceiptKind::None);
+        }
+        drop(outputs);
+        let body = io.numeric(1);
+        let base = wire::dns_v2::View::<42>::decode(&body)
+            .unwrap()
+            .authorization()
+            .unwrap();
+        assert!(issuer.authorize(50, 0, &base).is_err());
+        assert_eq!(issuer.authority.live.len(), 5);
+    }
+}
+
+fn numeric_fixture(
+    fault: NumericFault,
+    delay: Duration,
+    unknown_release: bool,
+) -> (Issuer<Fake>, Driver) {
+    let (mut issuer, a) = bundle_fixture(Mode::System, false);
+    let next = numeric_query(&mut issuer, &a, 32002, 10);
+    issuer.authority.numeric_delay = delay;
+    issuer.authority.unknown_release = unknown_release;
+    let io = Driver::new(&issuer, a, false, Fault::Numeric);
+    io.numeric_fault.set(fault);
+    io.extra_acquires.borrow_mut().push_back(next);
+    (issuer, io)
+}
+
+#[test]
+fn dns_numeric_driver_invalid_binding_narrowing_and_authority_before_route() {
+    for fault in [
+        NumericFault::Member,
+        NumericFault::Address,
+        NumericFault::Port,
+        NumericFault::Carrier,
+        NumericFault::Name,
+        NumericFault::Source,
+        NumericFault::Waiter,
+        NumericFault::Scope,
+        NumericFault::Receipt,
+        NumericFault::Effective,
+        NumericFault::Class,
+        NumericFault::Use,
+    ] {
+        let (mut issuer, io) = numeric_fixture(fault, Duration::ZERO, false);
+        run(&mut issuer, &io);
+        assert_eq!(statuses(&io).last(), Some(&(19, 2, 11)), "{fault:?}");
+        assert_eq!(issuer.authority.route_count, 4, "{fault:?}");
+        assert_eq!(issuer.authority.live.len(), 4);
+        assert!(!issuer.unknown);
+    }
+}
+
+#[test]
+fn dns_numeric_driver_replay_is_not_reusable_waiter_authority() {
+    let (mut issuer, io) = numeric_fixture(NumericFault::Replay, Duration::ZERO, false);
+    run(&mut issuer, &io);
+    assert_eq!(
+        statuses(&io)
+            .iter()
+            .filter(|(kind, status, _)| *kind == 19 && *status == 1)
+            .count(),
+        1
+    );
+    assert_eq!(statuses(&io).last(), Some(&(19, 2, 12)));
+    assert_eq!(issuer.authority.route_count, 5);
+}
+
+#[test]
+fn dns_numeric_driver_cancel_fences_release_own_ticket_before_denial() {
+    for fault in [
+        NumericFault::Cancel,
+        NumericFault::CancelRequest,
+        NumericFault::CancelProducer,
+        NumericFault::CancelBundle,
+        NumericFault::CancelSource,
+    ] {
+        let (mut issuer, io) = numeric_fixture(fault, Duration::ZERO, false);
+        run(&mut issuer, &io);
+        assert!(
+            !statuses(&io)
+                .iter()
+                .any(|(kind, status, _)| *kind == 19 && *status == 1),
+            "{fault:?}"
+        );
+        assert_eq!(issuer.authority.route_count, 5);
+        assert!(!issuer.authority.live.contains(&5));
+        assert!(!issuer.unknown);
+    }
+}
+
+#[test]
+fn dns_numeric_driver_original_owner_and_reservation_deadlines_survive_backend() {
+    for (fault, delay) in [
+        (NumericFault::None, Duration::from_millis(25)),
+        (NumericFault::ShortReservation, Duration::from_millis(6)),
+        (NumericFault::SlowWrite, Duration::ZERO),
+    ] {
+        let (mut issuer, io) = numeric_fixture(fault, delay, false);
+        run(&mut issuer, &io);
+        assert!(
+            !statuses(&io)
+                .iter()
+                .any(|(kind, status, _)| *kind == 19 && *status == 1),
+            "{fault:?}"
+        );
+        assert_eq!(issuer.authority.route_count, 5);
+        assert!(!issuer.authority.live.contains(&5));
+        assert!(!issuer.unknown);
+    }
+}
+
+#[test]
+fn dns_numeric_driver_expiry_and_caps_reject_before_effect() {
+    for fault in [
+        NumericFault::Expired,
+        NumericFault::ReservationExpired,
+        NumericFault::HistoryFull,
+        NumericFault::RouteFull,
+    ] {
+        let (mut issuer, io) = numeric_fixture(fault, Duration::ZERO, false);
+        run(&mut issuer, &io);
+        assert!(
+            !statuses(&io)
+                .iter()
+                .any(|(kind, status, _)| *kind == 19 && *status == 1)
+        );
+        assert_eq!(issuer.authority.route_count, 4, "{fault:?}");
+    }
+}
+
+#[test]
+fn dns_numeric_driver_partial_durable_cleanup_retains_unknown_ticket_and_credit() {
+    let (mut issuer, io) = numeric_fixture(NumericFault::None, Duration::from_millis(25), true);
+    run(&mut issuer, &io);
+    assert!(
+        !statuses(&io)
+            .iter()
+            .any(|(kind, status, _)| *kind == 19 && *status == 1)
+    );
+    assert!(issuer.unknown);
+    assert!(issuer.authority.live.contains(&5));
+    assert!(issuer.grants.values().any(|g| g.numeric.is_some()));
+    assert_eq!(io.route_budget.used(), 5);
+}
+
+#[test]
+fn dns_numeric_driver_two_cached_waiters_have_independent_user_tickets() {
+    let (mut issuer, a) = bundle_fixture(Mode::System, false);
+    let first = numeric_query(&mut issuer, &a, 32002, 10);
+    let second = numeric_query(&mut issuer, &a, 32003, 11);
+    let io = Driver::new(&issuer, a, false, Fault::Numeric);
+    io.numeric_fault.set(NumericFault::Two);
+    io.extra_acquires.borrow_mut().extend([first, second]);
+    run(&mut issuer, &io);
+    assert_eq!(
+        statuses(&io)
+            .iter()
+            .filter(|(kind, status, _)| *kind == 19 && *status == 1)
+            .count(),
+        2
+    );
+    assert_eq!(issuer.authority.live.len(), 8);
+    dns_bundle::cancel(&mut issuer, 100, 6, 1).unwrap();
+    assert_eq!(issuer.authority.live.len(), 7);
+    assert!(
+        !issuer
+            .grants
+            .values()
+            .any(|g| g.numeric.is_some() && g.source == 2)
+    );
+    assert!(
+        issuer
+            .grants
+            .values()
+            .any(|g| g.numeric.is_some() && g.source == 3)
+    );
+    assert!(!issuer.unknown);
 }
 
 #[test]
