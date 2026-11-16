@@ -716,6 +716,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   CODEC4contract2684084 source-contract-ready R51, canonical implementation
   выполняется отдельно. Logical/bootstrap/Hosts capabilities этим pin не выданы.
 
+- R53 narrow SOURCE CLEAN подтвердил независимые Direct DNS pins53ec5bd и
+  отсутствие install/public authority. R54 SOURCE scoped CLEAN: canonical
+  CODEC4d456727 интегрирован; union55/typed pending56/full HostsPath/no1/2/3
+  fallback, corpus103/311/28+10. Basis86 CODEC3 preimages сохранены.
+  Issuer/Go/producer-record4 пока не адаптированы: Direct source record3 не
+  расширяется автоматически до bootstrap/Hosts. Следующие отдельные units —
+  issuer typed service roots/HostsPath и captured netgo lookup/search planner DATA.
+  Реального startup/network/runtime/установки не было, public gates false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
