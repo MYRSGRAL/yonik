@@ -3080,6 +3080,149 @@ impl Sequence {
 mod tests {
     use super::*;
     #[test]
+    fn r14_system_user_dns_grant_preserves_attribution_and_exact_pending_vectors() {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/system-user-dns-grant-r14.json"
+        ))
+        .unwrap();
+        let bytes = |key: &str| unhex(f[key].as_str().unwrap());
+        // Только consistency vectors для Go pending matcher; не новый Rust
+        // consumer и не authority из DTO. Actual producer проверяется driver test.
+        let pending = |frame: &Frame<'_>, reply| {
+            matches!(
+                frame.message,
+                Message::Grant {
+                    grant: 11,
+                    flow: 7,
+                    revision: 23,
+                    ..
+                }
+            ) && frame.header.reply_to == reply
+                && frame.header.object_id == 11
+        };
+        for (key, reply, kind, id, fresh) in [
+            (
+                "system_user_dns_grant_frame_hex",
+                20,
+                ReceiptKind::SidebandOperation,
+                9,
+                15_000_000,
+            ),
+            (
+                "system_user_dns_frozen_refresh_frame_hex",
+                21,
+                ReceiptKind::FrozenSent,
+                10,
+                5_000_000,
+            ),
+        ] {
+            let wire = bytes(key);
+            let frame = Frame::decode(&wire, binding(), Mode::System, true).unwrap();
+            assert!(pending(&frame, reply));
+            let Message::Grant {
+                class: 3,
+                required: true,
+                receipt,
+                fresh: actual,
+                ..
+            } = frame.message
+            else {
+                panic!("System user DNS потерял attribution")
+            };
+            assert_eq!((receipt.kind, receipt.id, actual), (kind, id, fresh));
+            assert!(actual <= 20_000_000);
+            let mut encoded = [0; 184];
+            let length = Frame::encode(frame.header, &frame.message, &mut encoded).unwrap();
+            assert_eq!(&encoded[..length], wire);
+            assert!(Frame::decode(&wire, binding(), Mode::Local, true).is_err());
+        }
+        for (key, sequence, object) in [
+            ("authorize_frame_hex", 20, 0),
+            ("authorize_refresh_frame_hex", 21, 11),
+        ] {
+            let wire = bytes(key);
+            let frame = Frame::decode(&wire, binding(), Mode::System, false).unwrap();
+            assert_eq!(
+                (frame.header.sequence, frame.header.object_id),
+                (sequence, object)
+            );
+            let Message::Authorize(a) = frame.message else {
+                unreachable!()
+            };
+            assert_eq!((a.source_flow, a.class, a.query), (7, 3, "query.invalid"));
+            assert_eq!((a.receipt.kind, a.receipt.id), (ReceiptKind::None, 0));
+        }
+        for case in f["negative"].as_array().unwrap() {
+            let wire = unhex(case["frame_hex"].as_str().unwrap());
+            let decoded = Frame::decode(&wire, binding(), Mode::System, true);
+            assert_eq!(
+                decoded.is_ok(),
+                case["system_codec_valid"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+            if let Ok(frame) = decoded {
+                assert!(
+                    !pending(&frame, case["expected_reply"].as_u64().unwrap_or(20)),
+                    "{}",
+                    case["name"]
+                );
+            }
+        }
+        for key in [
+            "service_probe_zero_tail_frame_hex",
+            "service_dns_zero_tail_frame_hex",
+        ] {
+            let wire = bytes(key);
+            let frame = Frame::decode(&wire, binding(), Mode::System, true).unwrap();
+            assert!(matches!(
+                frame.message,
+                Message::Grant {
+                    required: false,
+                    flow: 0,
+                    fresh: 0,
+                    receipt: Receipt {
+                        kind: ReceiptKind::None,
+                        id: 0
+                    },
+                    ..
+                }
+            ));
+        }
+        let local = bytes("local_user_dns_zero_tail_frame_hex");
+        assert!(Frame::decode(&local, binding(), Mode::Local, true).is_ok());
+        assert!(Frame::decode(&local, binding(), Mode::System, true).is_err());
+    }
+    #[test]
+    fn r14_proof_bootstrap_ack_is_exact_and_bound_to_record() {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/system-proof-extension-v1.json"
+        ))
+        .unwrap();
+        let launch =
+            LaunchRecord::decode(&unhex(f["launch_hex"].as_str().unwrap()), Mode::System).unwrap();
+        let record = proof_bootstrap(launch).unwrap();
+        let ack = proof_bootstrap_ack(launch).unwrap();
+        assert_eq!(record.len(), 128);
+        assert_eq!(&record[8..16], &[0, 1, 0, 128, 0, 1, 0, 0]);
+        assert_eq!(ack.len(), 40);
+        assert_eq!(&ack[..8], b"YNKPFA01");
+        assert_eq!(&ack[8..], &Sha256::digest(record)[..]);
+        for offset in [16, 48, 80, 96, 112, 120] {
+            let mut changed = record;
+            changed[offset] ^= 1;
+            assert_ne!(&ack[8..], &Sha256::digest(changed)[..]);
+        }
+        assert_ne!(ack.as_slice(), &ack[..39]);
+        let mut extended = ack.to_vec();
+        extended.push(0);
+        assert_ne!(ack.as_slice(), extended);
+        assert_eq!(
+            ack.as_slice(),
+            unhex(f["bootstrap_ack_hex"].as_str().unwrap())
+        );
+    }
+    #[test]
     fn exact_c75a8e9_service_wire_vectors_and_live_probe_refresh() {
         let f: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/xray-profile-channel-v3/go-c75a8e9-service-grants.json"

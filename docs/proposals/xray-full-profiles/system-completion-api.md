@@ -476,47 +476,235 @@ resolved Varlink ResolverPeer из resolver/socket.rs — proof другого U
 проверяется against independently captured/revalidated SessionArtifact route;
 actual socket/RRset consumer guards обязательны и readiness этим не доказана.
 
-## UDP association: минимальный contract для root до изменения wire
+## R14 System user DNS interop: attribution не обнуляется
 
-Текущие anchors: `Peer::socket` запрещает provenance3; `SocketRecord::encode`
-допускает только TCP; `Rendezvous` удерживает exact TCP request evidence;
-`SourceFlow` удерживает TCP SocketHold/cookie и original owner subject. SIOCGSKNS
-доказывает namespace actual UDP FD, но не приложение связи UDP↔TCP control.
-Передача child-created UDP FD с control ID была бы assertion, а не independent
-association proof. Такой constructor не добавлен, UDP остаётся Unsupported.
+Независимый Python struct.pack vector:
+`tests/fixtures/xray-profile-channel-v3/system-user-dns-grant-r14.json`.
+Содержит full AUTHORIZE/GRANT frames, refresh, Local/service controls и negatives.
+Это synthetic DATA без owner authority. Production Rust authorizer не изменён.
 
-Минимальный вариант независимого producer: issuer после fresh Known TCP control
-source создаёт и удерживает **собственный** loopback UDP socket/bound ephemeral
-endpoint в retained namespace и назначает association ID. По existing proof
-channel он доставляет Go owned duplicate; Go не выбирает cookie/namespace/port.
-Ledger связывает socket с retained TCP control source/cookie/subject, session,
-digest/generation, cancellation и KnownClosed custody. Нужен отдельный Local
-normal Host factory; привилегированный Local daemon не требуется.
-Factory независимо сравнивает actual socket namespace с retained stamp до
-доставки FD. Если текущий namespace issuer другой — Unsupported, без setns,
-CAP_SYS_ADMIN или иных новых capabilities.
+GRANT56: status1@0,class3@1,required1@2,reserved0@3,grantId11 u64@4,
+private sourceFlow7 u64@12,lease14ms u32@20,policyRevision23 u64@24,
+ownerFresh15000000ns u64@32,ownerKind2(SidebandOperation)@40,reserved7@41,
+ownerReceiptId9 u64@48. Header128: sequence31,replyTo20,objectId11;
+session[1]*16,invocation[2]*16,digest[3]*32,generation4,epoch5.
 
-Предлагаемые **не реализованные и не принятые** private records, big endian:
+Body56 hex:
 
-- `YNKUAQ01`160/rights0: prefix16(version1,length160,reserved0),binding80@16,
-  nonce32@96,runtimeRequestSequence8@128,controlSourceFlow8@136,
-  expectedControlCookie8@144,reserved8@152. Cookie сравнивается с retained actual
-  TCP proof, а не принимается за него.
-- `YNKUAC01`192/rights1 от issuer: prefix16,binding80@16,nonce32@96,
-  request8@128,controlSource8@136,associationId8@144,actualSocketCookie8@152,
-  family1@160,protocol17@161,reserved2@162,port2@164,reserved2@166,
-  address16@168,reserved8@184. Exactly1 issuer-created socket FD. Frozen runtime
-  frames/locators не меняются; это потребует отдельного versioned proof exchange.
+```text
+01030100000000000000000b00000000000000070000000e00000000000000170000000000e4e1c002000000000000000000000000000009
+```
 
-Для actual UDP flow одного association ACK недостаточно. Issuer должен получить
-kernel datagram peer на retained socket и независимо проверить SOCKS UDP header
-и immutable original destination до выдачи OPEN_INGRESS: bounded MSG_PEEK при
-одном outstanding packet/association, Go не consuming reader до issuer decision.
-Actual initiator UDP tuple получает **свой** fresh serial Known proof ≤20ms;
-TCP proof его не заменяет. Для первого узкого режима требуется совпадение
-retained principal PID/start/executable control и UDP owner. Datagram peer,
-destination/length/fingerprint и cookie должны совпасть у consuming Go read;
-packet IDs/credits monotonic, no wrap/replay, cancel control отзывает association
-и все её UDP flows. Payload не логируется. Shared-reader protocol и exact packet
-proof record ещё требуют root/Go согласования; добавлять по одному child-reported
-port или ACK без consuming match небезопасно. Никаких UDP grants до этой цепочки.
+Refresh сохраняет private flow7/revision23/live grant11, replyTo21;
+lease4ms/fresh5000000ns, ownerKind1(FrozenSent)/id10. Это второй допустимый tagged receipt,
+а не утверждение, что synthetic fixture когда-либо была FrozenSent на transport.
+
+```text
+01030100000000000000000b000000000000000700000004000000000000001700000000004c4b400100000000000000000000000000000a
+```
+
+`required=false/fresh=0/owner=None` допустимы для service flow0 и Local user DNS;
+они НЕ являются System user DNS response. Go R14 publishService correction должен
+разделить эти ветки, сверить private flow/revision/pending reply и live refresh ID.
+Zeroed System owner tail, missing/over20ms freshness, None/unknown owner kind,
+zero owner ID, foreign binding/objectId и truncation отвергаются Rust codec.
+Wrong private flow/revision/pending sequence/refresh ID оставлены wire-valid
+negative vectors: отказ обязателен в pending-consumer correlation, decoder не
+может сам доказать private request authority. Actual Rust producer regression
+`r14_actual_system_user_dns_producer_preserves_private_flow_revision_and_owner_tail`
+берёт flow/revision из INGRESS_REPLY и проверяет System GRANT от run_issuer.
+
+Existing `system-proof-extension-v1.json` остаётся exact PF001/PFA01/SPF01 vector;
+PF001=128/rights1, ACK ровно40 `YNKPFA01`+SHA256 всего bootstrap. Runtime rights0,
+четыре locators и frozen records не менялись. R14 UDP proposal ниже НЕ меняет v1.
+
+## UDP proof v2: конкретный R14 draft для source review, НЕ implementation
+
+Ни один UDP record/decoder/factory из этого раздела не реализован. V1 остаётся
+TCP-only: `SocketRecord::encode` принимает protocol6, `Peer::socket` отказывает
+provenance3. Нельзя послать UDP в старый YNKSPF01 или принять его как TCP proof.
+Изменение wire допускается только после root sourcecheck этого draft и Go caller.
+
+### Согласование версии и точки подключения
+
+Предлагается отдельная версия proof extension: bootstrap `YNKPF002`128,
+version2/length128/rights1/reserved0; оставшиеся nonce/binding поля как PF001.
+ACK ровно40 `YNKPFA02`+SHA256 bootstrap, rights0. V1 ACK не принимается за v2.
+Frozen runtime/ABI260/YNKROLE1/YNKEXT01/YNKLOC01 и четыре locators неизменны;
+runtime frames по-прежнему rights-free. V2 proof channel понимает старый TCP
+YNKSPF01 и явно перечисленные ниже UDP record kinds. Unknown kind/version,
+duplicate/late/replay/wrap/EOF/лишние rights закрывают pending rights и revoke.
+V1 peer не получает UDP capabilities; нет fallback с ошибочного v2 на Allow v1.
+
+System caller: `ProfileRuntime::start_system → send_proof_bootstrap →
+SystemChannel`; negotiate v2 только для готового установленного consumer.
+Local caller: `host/local_profile_channel::Launch::start → start_local`:
+image/actual child verified, bounded stdin delivered, затем bootstrap ACK/HELLO.
+Ожидание ACK до Local stdin запрещено. Local mode исходит из consumed trusted
+YNKLOC01/Host peer; он не System proof и не mode из env. Legacy/check ветка не участвует.
+
+### Границы и credits до effects
+
+- Active associations≤8; общий pending runtime+proof ledger≤64. Все counters
+  ненулевые, monotonic, MAX/wrap запрещены, tombstones до конца invocation.
+- Datagram целиком, включая SOCKS UDP header, ≤65507 bytes. Нет fragmentation
+  reassembly: RSV=0, FRAG=0, ATYP только IPv4/IPv6/domain; порт ненулевой;
+  domain ASCII canonical≤253, header length10/22/7+nameLen (≤260).
+  Несогласованная длина, zero-length/truncation/CTRUNC/unknown ancillary — отказ,
+  packet не forward-ится. Исходный Destination парсит issuer из kernel bytes.
+- На association один Peeked/ReadPermit, один exclusive Go receiver. Go не
+  вызывает recv/peek до ReadPermit; issuer после permit не consuming reader.
+  Cancel/revoke/close ждут join reader. Raw UDP FD не экспортируется к handlers,
+  transport factories или callback. Запрещены recvmsg-конкуренты и socket-option
+  mutation. У Go wrapper только logical receive/close; фактический socket FD
+  двунаправленный, ограничения не выдаются за kernel read-only descriptor.
+- **Один permit не ограничивает kernel queue.** До передачи duplicate factory
+  задаёт SO_RCVBUF и проверяет effective readback≤128KiB, без SO_RCVBUFFORCE;
+  включён overflow observation. Перед peek/permit readback повторяется.
+  UDP_GRO off/readback обязателен; ancillary whitelist — не более
+  одного SO_RXQ_OVFL u32, прочие ancillary отвергаются. Изменение overflow counter
+  либо неизвестная форма metadata не получают consuming success.
+  Очередь ядра может содержать несколько datagrams; каждый проходит отдельный цикл, FIFO
+  head не считается доказанно consumed по одному ACK. Overflow/неизвестная
+  queue/read semantics — Unknown/revoke. SO_RCVBUF — accounting threshold,
+  не строгий packet-count/memory theorem; абсолютная kernel-memory граница
+  этим API не доказана и не включается молча в decoded-metadata preflight.
+- До socket/dup/SCM materialization резервируются association slot, обе стороны
+  FD custody (control TCP+namespace, issuer relay+namespace, Go duplicate,
+  pending rights scratch: шесть descriptor credits на association),
+  один physical socket slot из existing128 и pending slot из existing64.
+  До первого peek/read резервируются **оба** buffers65536 и metadata2048 на
+  association: 133120 bytes; восемь —1064960 bytes. Это часть существующего
+  aggregate8MiB preflight, не дополнительный budget; оставшиеся tables/frames/
+  ledgers/SourceFlows тоже учитываются. До увеличения flow set — отдельный
+  SourceFlow/FD/metadata credit; ≤256 flows/association и existing global caps.
+- Internal deadline каждого packet: min(request receipt+1s, session lease,
+  control lifetime). Никакое ожидание queue, новый permit, ACK или renewal его
+  не продлевает. Owner20ms — отдельный первоначальный expiry свежего lookup;
+  его нельзя продлить packet lease. Control close/session revoke/EOF будят loop.
+  Kernel data readiness обслуживает тот же issuer loop, без owner reader/poll loop.
+
+Если root требует абсолютный hard bound kernel queued datagram count/memory,
+данный SO_RCVBUF механизм его не доказывает: v2 admission остаётся закрытым до
+отдельного проверенного ограничения. Это конкретный review limit, не Allow
+при переполнении. Ни один overflow не превращается в новый allocation/grant.
+
+### Точные предлагаемые records
+
+Все integers big endian. Общий UDP prefix128: magic8@0,recordVersion u16=1@8,
+length u16@10,rights u16@12,reserved0 u16@14,binding80@16
+(digest32/session16/invocation16/generation8/epoch8),nonce32@96.
+Binding/nonce сверяются с retained admitted run/manifest, а не с child assertion.
+Runtime sequence и proof-operation/packet/permit/association IDs — разные namespaces.
+
+| Magic / length / rights / direction | Поля после prefix128 |
+| --- | --- |
+| YNKUCS01 /192/1 G→I | operation8@128,proofId8@136,ownedSocksIngress2@144,command3@146,reserved1@147,initiatorTcpTuple40@148,reserved4@188; actual accepted TCP control FD |
+| YNKUCA01 /160/0 I→G | operation8@128,controlSourceId8@136,actualControlCookie8@144,remainingNs8@152 |
+| YNKUAQ01 /160/0 G→I | operationId8@128,controlSourceFlow8@136,expectedControlCookie8@144,reserved8@152 |
+| YNKUAC01 /192/1 I→G | operation8@128,controlSource8@136,associationId8@144,actualSocketCookie8@152,family1@160,protocol17@161,reserved2@162,port2@164,reserved2@166,address16@168,reserved8@184 |
+| YNKUPQ01 /160/0 G→I | association8@128,operation8@136,controlSource8@144,reserved8@152 |
+| YNKURP01 /256/0 I→G | association8@128,packet8@136,permit8@144,cookie8@152,initiatorTuple40@160,datagramBytes4@200,headerBytes2@204,recvFlags2@206,fingerprint32@208,remainingNs8@240,reserved8@248 |
+| YNKUCM01 /256/0 G→I | те же association/packet/permit/cookie/tuple/length/header/flags/fingerprint offsets; runtimeOpenSequence8@240,reserved8@248 |
+| YNKUMR01 /192/0 I→G | association8@128,packet8@136,permit8@144,runtimeOpenSequence8@152,status1@160,reserved7@161,remainingNs8@168,reserved16@176 |
+| YNKUCQ01 /160/0 I→G | association8@128,closeId8@136,controlSource8@144,reason2@152,reserved6@154 |
+| YNKUCR01 /192/0 G→I | association8@128,closeId8@136,lastPacket8@144,pendingFlowCount4@152,status1@156,readerJoined1@157,goDuplicateCount2@158,originalCookie8@160,retiredRuntimeSequence8@168,reserved16@176 |
+
+YNKUCS01 несёт ровно1 actual TCP FD, YNKUAC01 — ровно1 issuer-created UDP FD;
+остальные records rights0. YNKUCS01 не совместим с YNKSPF01: это отдельный
+control-only admission, не user OPEN с выдуманным wildcard original Destination.
+ControlSourceId выделяется из общего non-reused source ID counter, но находится
+в отдельном typed control ledger без outbound destination; AUTHORIZE не может
+найти его как User SourceFlow. Command3 проверяет source-verified SOCKS handler;
+одно это поле не authority. Actual TCP type/endpoints/cookie/namespace проверяет
+issuer, System получает свой fresh Known control proof. Нельзя заменить UDP
+source attribution этим control proof. Control close/EOF отменяют все association
+permits; сигнал отмены не создаёт Allow. На control допускается одна association.
+Tuple40 остаётся initiator→ingress, TCP orientation не меняется; UDP remote port —
+actual issuer-bound ephemeral port, не owned SOCKS listener1080. Addresses IPv4
+имеют zero tail. recvFlags bits0=TRUNC/1=CTRUNC, прочие0; success требует flags0.
+YNKUMR01 status=Matched1/Deny2/Unknown3; Matched **не GRANT**, его reserved fields
+не содержат sourceFlowId/grantId. YNKUCR01 status=KnownClosed1/Unknown3.
+remainingNs≤1000000000, sender/receiver уменьшают по elapsed/RTT, не обновляют deadline.
+Для close lastPacket=0 допустим только до первого packet; retiredRuntimeSequence —
+watermark, не разрешение переиспользовать IDs. Retry не создаёт новый permit.
+
+Fingerprint32 = SHA256(domain `YNK-UDP-PACKET-v1\0` + binding80 + nonce32 +
+associationId8 + packetId8 + permitId8 + cookie8 + tuple40 + datagramBytes4 +
+**весь datagram**, включая SOCKS header). Hash не логируется и не credential.
+Host считает его из actual MSG_PEEK bytes; Go пересчитывает после actual recvmsg,
+не копирует из permit. Metadata/namespace FD/cookie/child ACK по отдельности не
+доказывают association или ownership.
+
+### Состояния и consuming match до GRANT
+
+1. `admit_control → create(controlSource) → Bound/Delivered`: issuer проверяет retained actual
+   TCP SocketHold/cookie и live control, создаёт **свой** loopback UDP socket,
+   удерживает namespace/FD, назначает association, отдаёт Go duplicate. Child
+   не выбирает port/cookie/namespace. Factory bind — IPv4 127.0.0.1:0;
+   tuple remote — actual port, IPv4 zero tail, без wildcard/dual-stack bind.
+   ATYP IPv6 target не требует IPv6 relay. Это resource delivery, не user authority.
+2. `peek(operation) → Peeked(packet)`: после credits/deadline issuer делает
+   bounded MSG_PEEK, сам получает actual peer/flags, парсит original, сохраняет
+   полный fingerprint и immutable provenance. Пустая queue ждёт readiness до
+   того же deadline. Неустановленная namespace/peer связь даёт Unsupported.
+3. `permit(packet) → ReadPermit`: выдаётся YNKURP01; producer передаёт только
+   один outstanding permit. Go private reader потребляет ровно один datagram,
+   проверяет cookie/bound endpoint/flags/peer/length/header и свой fingerprint.
+   Payload пока остаётся private pending buffer, не dispatcher/outbound.
+4. `consumed(YNKUCM01) + OPEN → ConsumedMatch`: один issuer loop сопоставляет
+   actual-read receipt с retained Peeked tuple/original/bytes/hash и точным
+   runtime OPEN sequence/provenance3. Каналы разные: OPEN before receipt и receipt
+   before OPEN оба bounded pending; send order не считается receive order.
+   Duplicate/foreign/late/mismatch не получает grant. Child receipt допустим
+   только от source-verified exclusive actual-recv producer; echo permit hash
+   или произвольный ACK не consuming proof.
+5. `authorize(matched source, decision) → Grant`: лишь после ConsumedMatch
+   проверяются fresh **UDP** initiator proof, original target, manifest policy,
+   scope/branch/chain и durable numeric route fence. System требует собственного
+   UDP Known observation≤20ms; TCP Known его не заменяет, retained control
+   principal PID/start/executable должен совпасть. Local required=false не
+   получает OS attribution; actual datagram proof независим от TCP, mandatory
+   constraints не обходятся. Если они требуют недоступный proof — Unsupported.
+   INGRESS_REPLY только создаёт private original flow; forwarding требует
+   existing AUTHORIZE/GRANT19. До последнего match/GRANT **никаких forward/send**.
+
+Relay socket — receive-only **logical** ingress resource. Outbound UDP использует
+отдельные D→C→chain checks/FlowGrant и guarded physical factory; нельзя отправлять
+через relay FD или выдать association/control credential за outbound grant.
+SourceFlow связывает association+packet+actual UDP tuple+original, не TCP original.
+
+### API завершения и доказательство закрытия duplicate
+
+Предлагаемые private точки Rust в уже scoped модулях (пока не symbols):
+`AssociationIssuer::create/peek/read_permit/consumed_match/authorize/retire`;
+entrypoint — `SystemChannel/Peer::socket`, parent lifetime — `SourceFlow`;
+Local factory — `host/local_profile_channel`. Go private
+`AssociationReader.ConsumePermit/CloseAndJoin` должен владеть единственным
+duplicate, payload не выходит до match и GRANT. Закрытие выдаёт typed
+`GoDuplicateClosed` только после actual FD.Close success, receiver join,
+pending-buffer retirement и закрытия всех принадлежащих association flows.
+Этот constructor/consumer требует source review/installed-image gate; сам
+YNKUCR01 со словами count0 не является достаточным proof.
+
+`retire` сначала линейно запрещает новые permits/grants, отменяет waiters и все
+SourceFlows/derived DNS/FlowGrants, выполняет existing durable rule retirement,
+затем ждёт matching GoDuplicateClosed и закрывает issuer relay/namespace custody.
+KnownClosed возможен только при: exact binding/closeId/cookie, actual Go duplicate
+closed и reader joined, обе pending очереди пусты, все association flows и route
+refs KnownClosed, issuer close подтверждён. `issuer.close()` сам по себе **не
+отзывает Go duplicate**. Успешный arbitrary child ACK не освобождает FD credits.
+
+Любой close error/timeout/недоказанный duplicate/непустой flow set ⇒ sticky Unknown,
+context revoke, ledger/resources/credits остаются в existing retired runtime/
+supervisor custody. Late ACK не очищает Unknown и не повторяет raw Close. Только
+existing trusted verified unit/cgroup-empty (System) либо exact child reap/pidfd
+death (Local), плюс durable retirement, могут завершить recovery/free. Закрытие
+одной KnownClosed association не закрывает соседние logical flows/physical pools.
+
+System factory независимо сравнивает actual socket→nsfs identity с retained stamp
+через approved SIOCGSKNS. Namespace mismatch — Unsupported, без setns/new caps.
+Local factory работает normal Host без daemon; SIOCGSKNS privilege не предполагается:
+нужен retained own-thread namespace-at-creation proof и source-checked no-setns
+factory. Child namespace FD вместо этого proof не принимается; невозможность
+связать namespace — Unsupported. Ни factory, ни wire v2 до root review не включены.
