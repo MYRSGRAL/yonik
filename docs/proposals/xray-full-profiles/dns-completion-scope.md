@@ -73,7 +73,7 @@ union `BootstrapDns` или `BootstrapHosts`, не произвольный slic
   не выдумывается; source replacement отзывает старые receipts. Это отдельный
   typed source record, не synthetic DNS response/transportProofId.
 
-NumericAuthorize V2 сохраняет prefix16: version u16=2, member u16, rrsetId u64,
+NumericAuthorize V2 сохраняет prefix16: version u16=2, member u16, WaiterReceiptId u64,
 baseLen u16≤1024, use u8, parentClass u8; затем canonical base и numeric Destination
 ≤23 bytes, body≤1063. use=1 LogicalDestination не принимает Bootstrap receipt;
 use=2 PhysicalFirstHop принимает только exact BootstrapBinding. ParentClass

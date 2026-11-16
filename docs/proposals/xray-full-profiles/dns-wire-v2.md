@@ -82,6 +82,63 @@ use1 и повышение service flow0 до user запрещены.
 
 ## Реализация codec
 
+### Producer data и отдельный cache waiter
+
+Для DNS_V2 Kind40 Publish → Kind41 Published возвращает ProducerRRsetId:
+immutable данные/source provenance, НЕ waiter authority. Поле u64@8 прежнего
+Published body48 имеет этот typed смысл. Каждый waiter, включая исходный,
+выполняет Kind53 WaiterBind → Kind54 WaiterBound до использования результата.
+ProducerRRsetId и WaiterReceiptId — разные namespaces даже при равных числах.
+
+DNS Reserve для каждого waiter удерживает canonical question/qtype/options,
+purpose/use, resolver/snapshot/source epoch, exact launch/manifest, source-flow
+и его revision, checked path/frontier/parent class и fresh class3 grant либо
+HostsSnapshot observation. Reservation может быть waiter-only: она не создаёт
+transport/socket и не заимствует исходный query/grant. Cache HIT без новой
+reservation/authority не получает WaiterReceipt.
+
+WaiterBind fixed64 BE: version u16@0=2, flags u16@2=0, zero u32@4;
+waiterReservationId u64@8, ProducerRRsetId u64@16, serviceGrantId u64@24,
+waiterQueryId u64@32, sourceFlowId u64@40, sourceFlowRevision u64@48,
+remainingNs u64@56=1..1000000000. Все reference fields точно совпадают с
+issuer reservation. Для HostsSnapshot serviceGrantId=0, source observation
+проверяется в reservation; у user-derived DNS sourceFlowId/revision ненулевые,
+у service/bootstrap flow0 оба0. У network DNS serviceGrantId ненулевой.
+
+Issuer проверяет base producer provenance/TTL/epoch и совпадение canonical
+question/options/resolver/source kind/purpose/route identity с новой reservation,
+а fresh waiter authority — только по её собственному live query/flow/grant.
+Первый publisher/grant/flow не подставляется второму waiter. System user DNS
+сохраняет required Known≤20ms; bootstrap/flow0 не повышается до user. Успешно
+retired transport может оставить base RRset до absolute expiry, Unknown/revoked
+source — нет. Hosts observation и DNS TTL не продлеваются cache hit/WaiterBind.
+
+WaiterBound fixed64 BE: version u16@0=2, status u8@2
+(Allow1/Deny2/Unknown3), flags u8@3=0, zero u32@4;
+WaiterReceiptId u64@8, ProducerRRsetId u64@16, waiterReservationId u64@24,
+waiterQueryId u64@32, sourceEpoch u64@40, remainingNs u64@48,
+memberCount u16@56=1..256, sourceKind u8@58, purpose u8@59, zero u32@60.
+Allow IDs ненулевые, epoch/source kind/purpose точны; remaining ограничен
+original waiter deadline, base expiry, source observation/session и live grant,
+на consumer дополнительно вычитается elapsed/RTT. Deny/Unknown: bytes4..63=0.
+Header.reply и pending operation связывают ACK с exact WaiterBind sequence;
+неверный/late/duplicate ACK не публикует receipt и не продлевает сроки.
+
+NumericAuthorize V2 поле u64@4 называется WaiterReceiptId, НЕ ProducerRRsetId;
+размер prefix16 не меняется. Проверяются fresh parent class/use/source flow,
+query/resolver/path/frontier/member/epoch и remaining authority. WaiterReceipt
+связан с единственным query result: нельзя перенести его в соседний query,
+заменить source flow или употребить как общий cache grant. Допустимые numeric
+member grants остаются bounded отдельными grants с тем же live parent/binding.
+
+DNS_V2 Cancel target5 — ProducerRRset (лишь owning producer либо issuer epoch
+revocation); target6 — WaiterReceipt (лишь owning waiter). Cancel pending Bind
+использует существующий request-sequence target, а не угадывает ещё не выданный
+receipt ID. Cancel waiter не отзывает base/соседей; cancel/revoke base инвалидирует
+derived receipts. IDs/replay tombstones учитываются в общих budgets. Host source
+observation выпускается только issuer на Hosts Reserve после revalidation,
+не отдельным child ACK. Все Kind53/54/target5/6 запрещены без DNS_V2 negotiation.
+
 Root подтвердил этот исправленный tail. Один canonical codec commit закрепляет message kinds, descriptor/ACK/cancel,
 все positive/negative goldens и no-downgrade. Go не должен независимо выбирать
 другой HostsSnapshot layout. До завершения codec/parity/review production
