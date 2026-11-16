@@ -1008,3 +1008,41 @@ Close, accepted duplicate reservation и трёх UDP reservation predicates. R9
 object/H1/mux lifecycle и R14/UDP proof wire не изменены. Append43/44,
 ProxiedLogical resource set, RRset/Waiter/Numeric и public readiness здесь не
 открываются; outer answer guard продолжает deny без отдельной authority.
+
+## R39: постоянный RX reserve и один serialized reader
+
+Correction base bd1b8cd не считается accepted до отдельного review. До любого
+flow/service/bundle/DNS task/physical owner constructor flow control удерживает
+16 FD,1 pending и66048 bytes RX scratch. При недостаточном manifest budget
+runtime init закрывается до monitor/features. FD debit входит в существующий
+общий profileFDUsed, memory — в buffered; profilePendingUsed добавляет RX ровно
+один раз к operations/tasks/UDP proofPending, без фиктивного history request ID.
+Все shared admission predicates используют эти ledgers; cap64/64/8MiB сохранён.
+
+Source reader audit: openProfileRuntime синхронно выполняет bootstrap, ADMIT и
+DNS negotiation до создания monitor и публикации runtime. После setup только
+monitor вызывает receive; receive вызывает receiveUDPProof/actor.receive либо
+rejectProofInput синхронно, до runtime recvmsg. Нового proof reader goroutine нет.
+Поэтому runtime/proof endpoints используют один exclusive lease постоянного
+scratch; второй одновременно активный lease отвергается до read callback.
+Lease охватывает proof packet processing/FD custody transfer. Runtime frame
+потребляется тем же monitor до следующего receive. Admission owners не получают
+постоянные credits даже между lease-ами. Parallel AF_INET UDP payload receivers
+не принимают SCM_RIGHTS и сохраняют отдельные association buffer/task credits.
+
+reserveDNSInput/reserveUDPInput/actor.receive больше не списывают временно ещё
+16 FD/pending/memory. Успешный lease возвращает лишь exclusive ownership;
+повторный/stale release не затрагивает следующий lease. Failed cleanup оставляет
+lease и RX custody sticky Unknown; cleanup не публикует KnownClosed при active
+lease. EOF/credentials/ancillary/protocol/peer errors не превращаются в Busy или
+успех и сохраняют прежний fail-closed путь. Старый actor reserve16 заменён этим
+же заранее оплаченным shared reserve, не объявлен свободной ёмкостью.
+
+FD47 + новый DNS owner2 теперь локально отклоняется до Reserve35/factory: уже
+удерживаемый scratch16 дал бы65. При предельном допустимом admission ACK36/37/39,
+cancel/retirement читаются без нового budget acquisition. R39 tests покрывают
+границы −1/at/+1 для FD/pending/memory, смешанные DNS/UDP/physical pool owners,
+neighbor isolation, proof/runtime exclusivity, repeated release и Unknown.
+Изменения UDP tests относятся только к accounting assertions; wire, namespace
+proof, R9/H1/mux cleanup и прочие transport features не меняются. Public gates
+по-прежнему false; этот correction не является runtime acceptance.

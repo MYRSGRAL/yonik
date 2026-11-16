@@ -12,6 +12,26 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_rx_scratch_is_permanent_and_shared_readers_use_exclusive_lease(
+        self,
+    ) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "c.initRXBudget()",
+            "const profileRXFD = 16",
+            "const profileRXMemory = 66048",
+            "return p.leaseProfileRX()",
+            "a.runtime.leaseProfileRX()",
+            "c.profilePendingUsed()",
+            "c.rxReserved && !c.dnsScratchUnknown",
+        ):
+            self.assertIn(anchor, patch)
+        actor = patch.split("+++ b/common/yonikbroker/profile_udp_actor_linux.go\n", 1)[
+            1
+        ].split("diff --git ", 1)[0]
+        self.assertNotIn("fdSlots += 16", actor)
+        self.assertNotIn("proofPending++", actor.split("receive(read", 1)[1])
+
     def test_dns_direct_transport_uses_private_actor_and_keeps_public_gates_closed(
         self,
     ) -> None:

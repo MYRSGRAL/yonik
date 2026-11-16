@@ -1709,7 +1709,7 @@ new file mode 100644
 +				if e == nil || factories != 0 || r.association != nil || endpointError == nil || relay.calls != 1 || control.calls != 0 || f.p.admission.state != profileUnknown {
 +					t.Fatal("unbound relay reached factory/SOCKS endpoint or lost custody", e, factories, calls)
 +				}
-+				if tc.closeFailure && (a.rejected[0] != relay || a.fdCredits != 22) {
++				if tc.closeFailure && (a.rejected[0] != relay || a.fdCredits != 6 || f.c.dnsFDUsed != profileRXFD || !f.c.rxLeased || !f.c.dnsScratchUnknown) {
 +					t.Fatal("Unknown FD custody/credit lost")
 +				}
 +			}
@@ -2114,7 +2114,7 @@ diff --git a/common/yonikbroker/profile_udp_actor_linux_test.go b/common/yonikbr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_actor_linux_test.go
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,451 @@
 +//go:build linux
 +
 +package nativehooks
@@ -2247,7 +2247,7 @@ new file mode 100644
 +		t.Fatal("UAQ not emitted")
 +	}
 +	a.inspect = func(fd profileProofFD, b []byte) (profileUDPReceiver, error) {
-+		if a.fdCredits < 22 || a.runtime.flow.buffered < profileUDPBudgetCredit+profileUDPAssociationCredit {
++		if a.fdCredits < 6 || !a.runtime.flow.rxLeased || a.runtime.flow.dnsFDUsed < profileRXFD || a.runtime.flow.buffered < profileRXMemory+profileUDPBudgetCredit+profileUDPAssociationCredit {
 +			t.Fatal("inspection before credits")
 +		}
 +		return &udpActorOwnedReceiver{profileUDPReceiver: receiver, fd: fd}, nil
@@ -2286,20 +2286,23 @@ new file mode 100644
 +	if e != nil {
 +		t.Fatal(e)
 +	}
-+	a.fdCredits = 49
++	lease, err := f.p.leaseProfileRX()
++	if err != nil {
++		t.Fatal(err)
++	}
 +	called := false
 +	if e = a.receive(func() (profileProofPacket, error) { called = true; return profileProofPacket{}, nil }); e == nil || called {
 +		t.Fatal("SCM effect before scratch credit")
 +	}
-+	a.fdCredits = 6
++	lease(true)
 +	fd := &proofFakeFD{result: errProfile}
 +	e = a.receive(func() (profileProofPacket, error) {
-+		if a.fdCredits != 22 {
++		if a.fdCredits != 6 || !f.c.rxLeased || f.c.dnsFDUsed != profileRXFD {
 +			t.Fatal("scratch not reserved")
 +		}
 +		return profileProofPacket{count: 1, rights: [32]profileProofFD{fd}}, nil
 +	})
-+	if e == nil || a.rejected[0] != fd || fd.calls != 1 || a.fdCredits != 22 || f.p.admission.state != profileUnknown {
++	if e == nil || a.rejected[0] != fd || fd.calls != 1 || a.fdCredits != 6 || !f.c.rxLeased || !f.c.dnsScratchUnknown || f.p.admission.state != profileUnknown {
 +		t.Fatal("unknown FD custody lost")
 +	}
 +}
@@ -2507,14 +2510,10 @@ new file mode 100644
 +	duplicates := 0
 +	fd := &proofFakeFD{result: errProfile}
 +	f.p.duplicateAccepted = func(xnet.Conn, [40]byte) (profileProofFD, error) { duplicates++; return fd, nil }
-+	f.c.udpBudget.fdSlots = 64
++	f.c.udpBudget.fdSlots = 47 // runtime1 + permanent RX16 + foreign47 =64.
 +	if _, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e == nil || duplicates != 0 {
 +		t.Fatal("duplicate before shared credit")
 +	}
-+	if _, e := f.p.reserveUDPInput(); e == nil {
-+		t.Fatal("runtime scratch bypassed shared cap")
-+	}
-+	f.c.udpBudget.fdSlots = 48
 +	release, e := f.p.reserveUDPInput()
 +	if e != nil {
 +		t.Fatal(e)
@@ -2523,15 +2522,19 @@ new file mode 100644
 +		t.Fatal("runtime scratch not charged")
 +	}
 +	release(true)
++	if f.c.profileFDUsed() != 64 {
++		t.Fatal("RX returned permanent credit to owners")
++	}
++	f.c.udpBudget.fdSlots = 46 // Один foreign owner подтвердил cleanup.
 +	accepted, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
-+	if e != nil || duplicates != 1 || f.c.udpBudget.fdSlots != 49 {
++	if e != nil || duplicates != 1 || f.c.udpBudget.fdSlots != 47 {
 +		t.Fatal("missing duplicate reservation", e)
 +	}
 +	proof := accepted.Value(profileAcceptedKey{}).(*profileAccepted)
 +	f.c.mu.Lock()
 +	e = proof.closeProofLocked(f.c)
 +	f.c.mu.Unlock()
-+	if e == nil || f.c.udpBudget.fdSlots != 49 || proof.proof != fd {
++	if e == nil || f.c.udpBudget.fdSlots != 47 || proof.proof != fd {
 +		t.Fatal("failed duplicate cleanup released custody")
 +	}
 +}
@@ -2567,7 +2570,7 @@ diff --git a/common/yonikbroker/profile_udp_actor_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_actor_linux.go
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,434 @@
 +//go:build linux
 +
 +package nativehooks
@@ -2667,7 +2670,7 @@ new file mode 100644
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
 +	b := c.udpBudget
-+	if b == nil || !c.live() || c.profileFDUsed()+6 > 64 || b.used+3 > min(int(c.manifest.caps[7]), 256) || c.operations+c.dnsTasksActive+b.proofPending+3 > min(int(c.manifest.caps[3]), 64) || b.nextProofOperation > ^uint64(0)-4 || c.buffered+c.manifest.memoryCredit+profileUDPAssociationCredit > uint64(c.manifest.caps[4]) {
++	if b == nil || !c.live() || c.profileFDUsed()+6 > 64 || b.used+3 > min(int(c.manifest.caps[7]), 256) || c.profilePendingUsed()+3 > min(int(c.manifest.caps[3]), 64) || b.nextProofOperation > ^uint64(0)-4 || c.buffered+c.manifest.memoryCredit+profileUDPAssociationCredit > uint64(c.manifest.caps[4]) {
 +		return nil, errProfileFlowBusy
 +	}
 +	// История control, associate и будущего close резервируется до первого send.
@@ -2821,16 +2824,15 @@ new file mode 100644
 +func (a *profileUDPActor) receive(read func() (profileProofPacket, error)) error {
 +	a.mu.Lock()
 +	defer a.mu.Unlock()
-+	c := a.runtime.flow
-+	c.mu.Lock()
-+	if a.failed != nil || !c.live() || a.fdCredits+16 > 64 || c.profileFDUsed()+16 > 64 || c.operations+c.dnsTasksActive+c.udpBudget.proofPending+1 > min(int(c.manifest.caps[3]), 64) {
-+		c.mu.Unlock()
-+		return errProfileFlowBusy
++	if a.failed != nil {
++		return errProfile
 +	}
-+	a.fdCredits += 16
-+	c.udpBudget.fdSlots += 16
-+	c.udpBudget.proofPending++
-+	c.mu.Unlock()
++	release, err := a.runtime.leaseProfileRX()
++	if err != nil {
++		return err
++	}
++	clean := false
++	defer func() { release(clean) }()
 +	packet, e := read()
 +	if e == nil {
 +		e = a.packetLocked(packet)
@@ -2846,11 +2848,7 @@ new file mode 100644
 +		}
 +		return a.failLocked(e)
 +	}
-+	a.fdCredits -= 16
-+	c.mu.Lock()
-+	c.udpBudget.fdSlots -= 16
-+	c.udpBudget.proofPending--
-+	c.mu.Unlock()
++	clean = true
 +	return nil
 +}
 +
@@ -2996,23 +2994,16 @@ new file mode 100644
 +}
 +
 +func (p *ProfileRuntime) reserveUDPInput() (func(bool), error) {
-+	c := p.flow
-+	c.mu.Lock()
-+	defer c.mu.Unlock()
-+	b := c.udpBudget
-+	if b == nil || !c.live() || c.profileFDUsed()+16 > 64 || c.operations+c.dnsTasksActive+b.proofPending+1 > min(int(c.manifest.caps[3]), 64) {
-+		return nil, errProfileFlowBusy
++	if p.flow == nil {
++		return nil, errProfile
 +	}
-+	b.fdSlots += 16
-+	b.proofPending++
-+	return func(clean bool) {
-+		c.mu.Lock()
-+		defer c.mu.Unlock()
-+		if clean {
-+			b.fdSlots -= 16
-+			b.proofPending--
-+		}
-+	}, nil
++	p.flow.mu.Lock()
++	ready := p.flow.udpBudget != nil
++	p.flow.mu.Unlock()
++	if !ready {
++		return nil, errProfile
++	}
++	return p.leaseProfileRX()
 +}
 diff --git a/common/yonikbroker/profile-udp-original-destination-v1.json b/common/yonikbroker/profile-udp-original-destination-v1.json
 new file mode 100644
@@ -4189,7 +4180,7 @@ new file mode 100644
 +}
 +
 +func (c *profileFlowControl) udpReserveLocked() bool {
-+	if c.udpBudget == nil || c.udpBudget.used >= int(c.manifest.caps[7]) || c.udpBudget.used >= 256 || c.operations+c.dnsTasksActive+c.udpBudget.proofPending >= 64 || c.operations+c.dnsTasksActive+c.udpBudget.proofPending >= int(c.manifest.caps[3]) {
++	if c.udpBudget == nil || c.udpBudget.used >= int(c.manifest.caps[7]) || c.udpBudget.used >= 256 || c.profilePendingUsed() >= min(int(c.manifest.caps[3]), 64) {
 +		return false
 +	}
 +	if c.udpBudget.nextProofOperation >= ^uint64(0)-1 {
@@ -5051,7 +5042,7 @@ new file mode 100644
 +		return
 +	}
 +	release := func(bool) {}
-+	if p.flow != nil && p.dnsV2 {
++	if p.flow != nil {
 +		var e error
 +		release, e = p.reserveDNSInput()
 +		if e != nil {
@@ -15525,7 +15516,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,1073 @@
+@@ -0,0 +1,1076 @@
 +//go:build linux
 +
 +package nativehooks
@@ -15671,6 +15662,7 @@ new file mode 100644
 +	dnsDirect                                      [64]*profileDNSDirect
 +	dnsDirectUsed, dnsFDUsed                       int
 +	dnsScratchUnknown                              bool
++	rxReserved, rxLeased                           bool
 +	physicalFDs                                    int
 +	dnsRequestUsed, dnsHistoryUsed, dnsHopCredits  int
 +	nextDNSQuery                                   uint64
@@ -15701,10 +15693,12 @@ new file mode 100644
 +}
 +
 +func newProfileFlowControl(m profileCapsule, mode byte, clock func() time.Time, write func(uint16, uint64, []byte) (uint64, error), alive func() bool) *profileFlowControl {
-+	return &profileFlowControl{manifest: m, mode: mode, clock: clock, write: write, alive: alive, sessionDeadline: clock().Add(time.Duration(m.lease) * time.Millisecond)}
++	c := &profileFlowControl{manifest: m, mode: mode, clock: clock, write: write, alive: alive, sessionDeadline: clock().Add(time.Duration(m.lease) * time.Millisecond)}
++	c.initRXBudget()
++	return c
 +}
 +func (c *profileFlowControl) live() bool {
-+	return !c.revoked && c.alive != nil && c.alive() && c.clock().Before(c.sessionDeadline) && (c.mode != 2 || c.proofAlive != nil && c.proofAlive())
++	return c.rxReserved && !c.dnsScratchUnknown && !c.revoked && c.alive != nil && c.alive() && c.clock().Before(c.sessionDeadline) && (c.mode != 2 || c.proofAlive != nil && c.proofAlive())
 +}
 +func (c *profileFlowControl) receiptLive(r *profileReceipt) bool {
 +	return c.live() && r != nil && r.control == c && !r.closed && r.ctx.Err() == nil && (r.association == nil || r.association.ctx.Err() == nil) && c.receipts[r.slot] == r && (r.udp == nil || r.udp.matched.Load())
@@ -15758,10 +15752,10 @@ new file mode 100644
 +			return false
 +		}
 +	}
-+	if c.udpBudget != nil && (c.udpBudget.used >= int(c.manifest.caps[7]) || c.udpBudget.used >= 256 || c.operations+c.dnsTasksActive+c.udpBudget.proofPending >= int(c.manifest.caps[3]) || c.operations+c.dnsTasksActive+c.udpBudget.proofPending >= 64) {
++	if c.udpBudget != nil && (c.udpBudget.used >= int(c.manifest.caps[7]) || c.udpBudget.used >= 256) {
 +		return false
 +	}
-+	if c.operations+c.dnsTasksActive >= int(c.manifest.caps[3]) || c.operations+c.dnsTasksActive >= 64 {
++	if c.profilePendingUsed() >= min(int(c.manifest.caps[3]), 64) {
 +		return false
 +	}
 +	// Pending и будущий tombstone резервируются одновременно, до enqueue.
@@ -15978,7 +15972,7 @@ new file mode 100644
 +func (c *profileFlowControl) cancelWire(kind byte, id uint64) (uint64, error) {
 +	slot := -1
 +	if b := c.udpBudget; b != nil {
-+		if b.used >= min(int(c.manifest.caps[7]), 256) || c.operations+c.dnsTasksActive+b.proofPending >= min(int(c.manifest.caps[3]), 64) {
++		if b.used >= min(int(c.manifest.caps[7]), 256) || c.profilePendingUsed() >= min(int(c.manifest.caps[3]), 64) {
 +			return 0, errProfileFlowBusy
 +		}
 +		slot = b.used
@@ -16976,7 +16970,7 @@ new file mode 100644
 +}
 +func TestProfileFlowBudgetPreflightNoAllocation(t *testing.T) {
 +	f := newFlowFixture(t, 1)
-+	f.c.manifest.caps[3] = 1
++	f.c.manifest.caps[3] = 2 // Один OPEN и постоянный RX pending credit.
 +	_, op := f.open(t, context.Background(), "one.invalid")
 +	dest := profileDestinationValue{network: 6, family: 3, address: "other.invalid", port: 443}
 +	tuple := fakeFlowTuple(6)
@@ -17836,7 +17830,7 @@ diff --git a/common/yonikbroker/profile_launch_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux.go
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,765 @@
 +//go:build linux
 +
 +package nativehooks
@@ -17974,7 +17968,7 @@ new file mode 100644
 +				return nil, e
 +			}
 +			controlLimit = unix.CmsgSpace(16 * 4)
-+		} else if p.flow != nil && p.dnsV2 {
++		} else if p.flow != nil {
 +			var e error
 +			release, e = p.reserveDNSInput()
 +			if e != nil {
@@ -18205,6 +18199,9 @@ new file mode 100644
 +		defer p.mu.Unlock()
 +		return !p.closed && p.ctx.Err() == nil && p.admission.state == profileAdmitted && time.Now().Before(p.admission.deadline)
 +	})
++	if !p.flow.rxReserved {
++		return nil, errProfileFlowBusy
++	}
 +	p.flow.reply = p.send
 +	if p.proofs != nil {
 +		p.flow.prepareProof = p.proofs.prepare
@@ -29908,7 +29905,7 @@ diff --git a/common/yonikbroker/profile_dns_tasks_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_tasks_linux.go
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,193 @@
 +//go:build linux
 +
 +package nativehooks
@@ -29952,10 +29949,7 @@ new file mode 100644
 +	c := p.flow
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
-+	pending := c.operations + c.dnsTasksActive
-+	if c.udpBudget != nil {
-+		pending += c.udpBudget.proofPending
-+	}
++	pending := c.profilePendingUsed()
 +	history := c.dnsTasksUsed + c.dnsHistoryUsed
 +	if c.udpBudget != nil {
 +		history = c.udpBudget.used
@@ -31062,7 +31056,7 @@ diff --git a/common/yonikbroker/profile_dns_bundle_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_bundle_linux.go
-@@ -0,0 +1,942 @@
+@@ -0,0 +1,939 @@
 +//go:build linux
 +
 +package nativehooks
@@ -31483,10 +31477,7 @@ new file mode 100644
 +		// metadata оплачены до первого make и issuer effects.
 +		credit = profileDNSBundleBaseCredit + uint64(count)*profileDNSBundleHopCredit
 +	}
-+	total := c.operations + c.dnsTasksActive + pending
-+	if c.udpBudget != nil {
-+		total += c.udpBudget.proofPending
-+	}
++	total := c.profilePendingUsed() + pending
 +	grants := c.dnsHopCredits
 +	for _, g := range c.grants {
 +		if g != nil {
@@ -31843,7 +31834,7 @@ new file mode 100644
 +func (c *profileFlowControl) dnsCleanupResult() error {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
-+	if c.dnsScratchUnknown {
++	if c.dnsScratchUnknown || c.rxLeased {
 +		return ErrProfileCleanupUnknown
 +	}
 +	for _, t := range c.dnsDirect[:c.dnsDirectUsed] {
@@ -33067,7 +33058,7 @@ new file mode 100644
 +	if err := c.tick(); err != nil {
 +		t.Fatal(err)
 +	}
-+	if owner.released || owner.localDone || c.dnsFDUsed != 2 {
++	if owner.released || owner.localDone || c.dnsFDUsed != profileRXFD+2 {
 +		t.Fatal("factory custody released")
 +	}
 +	close(release)
@@ -33093,7 +33084,7 @@ new file mode 100644
 +			if err := h.f.c.tick(); err != nil {
 +				t.Fatal(err)
 +			}
-+			if owner.released || h.f.c.dnsFDUsed != 2 {
++			if owner.released || h.f.c.dnsFDUsed != profileRXFD+2 {
 +				t.Fatal("Unknown released credit")
 +			}
 +		})
@@ -33223,7 +33214,7 @@ new file mode 100644
 +	}
 +	release(true)
 +	release(true)
-+	if f.c.dnsFDUsed != 0 || base != f.c.buffered {
++	if f.c.dnsFDUsed != profileRXFD || base != f.c.buffered {
 +		t.Fatal("scratch released twice")
 +	}
 +	release, err = f.p.reserveDNSInput()
@@ -33431,7 +33422,7 @@ new file mode 100644
 +	if err := h.f.c.tick(); err != nil {
 +		t.Fatal(err)
 +	}
-+	if owner.localDone || owner.released || h.f.c.dnsFDUsed != 2 {
++	if owner.localDone || owner.released || h.f.c.dnsFDUsed != profileRXFD+2 {
 +		t.Fatal("close without join released")
 +	}
 +	close(h.conn.closeRelease)
@@ -33467,7 +33458,7 @@ new file mode 100644
 +	if err := h.f.c.tick(); err != nil {
 +		t.Fatal(err)
 +	}
-+	if !owner.released || owner.unknown || h.f.c.dnsFDUsed != 0 || h.fd.calls != 1 {
++	if !owner.released || owner.unknown || h.f.c.dnsFDUsed != profileRXFD || h.fd.calls != 1 {
 +		t.Fatal("confirmed cleanup not released exactly once")
 +	}
 +	if err := conn.Close(); err != nil || h.conn.closes != 1 {
@@ -33516,7 +33507,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux.go
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,859 @@
 +//go:build linux
 +
 +package nativehooks
@@ -33612,11 +33603,8 @@ new file mode 100644
 +			return nil, ErrProfileUnsupported
 +		}
 +	}
-+	pending := c.operations + c.dnsTasksActive + profileDNSDirectPending
++	pending := c.profilePendingUsed() + profileDNSDirectPending
 +	fds := c.profileFDUsed() + 2
-+	if c.udpBudget != nil {
-+		pending += c.udpBudget.proofPending
-+	}
 +	if !c.dnsBundleLive(b) || ctx.Err() != nil || io.duplicate == nil || io.send == nil || c.dnsDirectUsed >= len(c.dnsDirect) || pending > min(int(c.manifest.caps[3]), 64) || fds > 64 || c.buffered+c.manifest.memoryCredit+profileDNSDirectCredit > uint64(c.manifest.caps[4]) || !c.dnsReserveHistory(profileDNSDirectPending) {
 +		return nil, errProfileFlowBusy
 +	}
@@ -34228,34 +34216,7 @@ new file mode 100644
 +// Unexpected rights закрываются existing rejectRights; failed close сохраняет
 +// scratch custody и не освобождает FD/pending/memory credits.
 +func (p *ProfileRuntime) reserveDNSInput() (func(bool), error) {
-+	c := p.flow
-+	c.mu.Lock()
-+	defer c.mu.Unlock()
-+	fds := c.profileFDUsed() + 16
-+	pending := c.operations + c.dnsTasksActive + 1
-+	if c.udpBudget != nil {
-+		pending += c.udpBudget.proofPending
-+	}
-+	if !c.live() || fds > 64 || pending > min(int(c.manifest.caps[3]), 64) || c.buffered+c.manifest.memoryCredit+65536+512 > uint64(c.manifest.caps[4]) {
-+		return nil, errProfileFlowBusy
-+	}
-+	c.dnsFDUsed += 16
-+	c.operations++
-+	c.buffered += 65536 + 512
-+	var once sync.Once
-+	return func(clean bool) {
-+		once.Do(func() {
-+			c.mu.Lock()
-+			defer c.mu.Unlock()
-+			if clean {
-+				c.dnsFDUsed -= 16
-+				c.operations--
-+				c.buffered -= 65536 + 512
-+			} else {
-+				c.dnsScratchUnknown = true
-+			}
-+		})
-+	}, nil
++	return p.leaseProfileRX()
 +}
 +
 +// Под c.mu: physical factories, retained accepted duplicates, DNS и UDP
@@ -34418,3 +34379,372 @@ new file mode 100644
 +import "context"
 +
 +func ProfileDNSDirectFactory(context.Context) bool { return false }
+diff --git a/common/yonikbroker/profile_rx_budget_linux_test.go b/common/yonikbroker/profile_rx_budget_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_rx_budget_linux_test.go
+@@ -0,0 +1,302 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	xnet "github.com/xtls/xray-core/common/net"
++	"net"
++	"strconv"
++	"testing"
++	"time"
++)
++
++func TestProfileR39FD47AdmissionCannotKillACKReader(t *testing.T) {
++	f, ctx, target := dnsBundleFixture(t, 1)
++	b, op := dnsAcquirePure(t, f, ctx)
++	if err := f.c.accept(dnsBundleReply(op, 41, 1)); err != nil {
++		t.Fatal(err)
++	}
++	// 47 actual/owned FD до нового owner; RX должен быть зарезервирован отдельно.
++	f.c.udpBudget = &profileUDPBudget{fdSlots: 46}
++	f.p.udpActor = &profileUDPActor{runtime: f.p}
++	h := dnsDirectStartBundle(t, f, b, target, nil, nil)
++	select {
++	case admitted := <-f.p.flowQueue:
++		if err := f.c.dispatch(admitted); err != nil {
++			t.Fatal(err)
++		}
++		release, err := f.p.reserveUDPInput()
++		if err != nil {
++			f.p.cancel()
++			f.c.revoke()
++			t.Fatalf("admitted owner starved its ACK RX and revoked neighbor: %v", err)
++		}
++		release(true)
++		t.Fatal("47 FD owner admitted despite permanently required scratch16+owner2")
++	case got := <-h.done:
++		if got.err == nil {
++			t.Fatal("overflow admission succeeded")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("no admission result")
++	}
++	// После локального отказа тот же receive path читает cancel/retirement.
++	for i := 0; i < 2; i++ {
++		release, err := f.p.reserveUDPInput()
++		if err != nil {
++			t.Fatal("cleanup ACK cannot be read", err)
++		}
++		release(true)
++	}
++	if f.p.ctx.Err() != nil || ProfileDNSBundleGuard(dnsUse(b), "a", target, false) != nil {
++		t.Fatal("local rejection killed neighbor")
++	}
++}
++
++func TestProfileR39SharedAdmissionPendingIncludesRX(t *testing.T) {
++	for _, owner := range []string{"flow", "service", "bundle", "task"} {
++		for _, delta := range []int{0, 1} {
++			t.Run(owner+strconv.Itoa(delta), func(t *testing.T) {
++				f, ctx, _ := dnsBundleFixture(t, 1)
++				e := profileDNSExchangeFrom(ctx)
++				cost := 1
++				if owner == "bundle" {
++					cost = 3
++				}
++				f.c.operations = 63 - cost + delta
++				before := f.c.buffered
++				var err error
++				switch owner {
++				case "flow":
++					_, _, err = f.c.open(context.Background(), 0, 2, fakeFlowTuple(6), profileDestinationValue{family: 3, network: 6, address: "next.invalid", port: 443}, nil)
++				case "service":
++					_, _, err = f.c.authorizeDNS(ctx, e.query.receipt, 0, e.root.query)
++				case "bundle":
++					path, targets, count, chooseError := profileDNSChosenPath(&f.c.manifest, "a", e.target, false, nil)
++					if chooseError != nil {
++						t.Fatal(chooseError)
++					}
++					_, _, err = f.c.dnsAcquire(e, path, targets, count, nil)
++				case "task":
++					_, err = ProfileDNSBeginTask(ctx)
++				}
++				if delta == 0 && err != nil {
++					t.Fatal("at bound rejected", err)
++				}
++				if delta == 1 && (err == nil || f.c.buffered != before) {
++					t.Fatal("RX pending spent by " + owner)
++				}
++			})
++		}
++	}
++}
++func TestProfileR39PhysicalPoolSharesPermanentRXFD(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	r := f.admittedReceipt(t, "pool.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileGrantKey{}, g)
++	dest := xnet.TCPDestination(xnet.ParseAddress(g.effective.address), xnet.Port(g.effective.port))
++	f.c.udpBudget = &profileUDPBudget{fdSlots: 46}
++	calls := 0
++	conn, err := ProfileDialPhysical(ctx, dest, func(context.Context) (net.Conn, error) { calls++; return fakeTCPFlowConn(), nil })
++	if err != nil || calls != 1 || f.c.profileFDUsed() != 64 {
++		t.Fatal("pool boundary", err, calls, f.c.profileFDUsed())
++	}
++	lease, err := f.p.reserveDNSInput()
++	if err != nil {
++		t.Fatal("live pool starved RX", err)
++	}
++	lease(true)
++	if _, err = ProfileDialPhysical(ctx, dest, func(context.Context) (net.Conn, error) { calls++; return nil, errProfile }); err == nil || calls != 1 {
++		t.Fatal("pool spent RX FD")
++	}
++	if err = conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err = conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if f.c.physicalFDs != 0 || f.c.profileFDUsed() != 63 || f.c.dnsFDUsed != 16 || f.p.ctx.Err() != nil {
++		t.Fatal("pool cleanup returned scratch/double credit")
++	}
++}
++
++func r39ReadACK(t *testing.T, h *dnsDirectHarness, packet profilePacket) {
++	t.Helper()
++	beforeFD, beforePending, beforeMemory := h.f.c.profileFDUsed(), h.f.c.profilePendingUsed(), h.f.c.buffered
++	release, err := h.f.p.reserveUDPInput()
++	if err != nil {
++		h.f.p.cancel()
++		h.f.c.revoke()
++		t.Fatal("receive budget exhausted after admission", err)
++	}
++	// Injected runtime read доставляет authenticated decoded ACK в реальный actor.
++	if err = h.f.c.accept(packet); err != nil {
++		release(false)
++		t.Fatal(err)
++	}
++	release(true)
++	release(true)
++	if beforeFD != h.f.c.profileFDUsed() || beforePending != h.f.c.profilePendingUsed() || beforeMemory != h.f.c.buffered {
++		t.Fatal("RX double debit/return")
++	}
++}
++func TestProfileR39OwnerBoundaryACKAndRetirement(t *testing.T) {
++	for _, kind := range []string{"fd", "pending", "memory"} {
++		for _, delta := range []int{-1, 0, 1} {
++			t.Run(kind+strconv.Itoa(delta), func(t *testing.T) {
++				f, ctx, target := dnsBundleFixture(t, 1)
++				b, op := dnsAcquirePure(t, f, ctx)
++				if err := f.c.accept(dnsBundleReply(op, 41, 1)); err != nil {
++					t.Fatal(err)
++				}
++				f.c.udpBudget = &profileUDPBudget{fdSlots: 1}
++				f.p.udpActor = &profileUDPActor{runtime: f.p}
++				switch kind {
++				case "fd":
++					f.c.udpBudget.fdSlots = 45 + delta // runtime1 + scratch16 + owner2 + foreign45 =64.
++				case "pending":
++					f.c.operations = 51 + delta // scratch1 + owner12 + foreign51 =64.
++				case "memory":
++					f.c.buffered = uint64(int64(f.c.manifest.caps[4]) - int64(f.c.manifest.memoryCredit) - profileDNSDirectCredit + int64(delta))
++				}
++				h := dnsDirectStartBundle(t, f, b, target, nil, nil)
++				if delta > 0 {
++					got := <-h.done
++					if got.err == nil || got.conn != nil {
++						t.Fatal("over-bound owner admitted")
++					}
++					select {
++					case <-h.factory:
++						t.Fatal("effect after local denial")
++					default:
++					}
++					for i := 0; i < 2; i++ {
++						release, err := f.p.reserveUDPInput()
++						if err != nil {
++							t.Fatal(err)
++						}
++						release(true)
++					}
++					if f.p.ctx.Err() != nil || ProfileDNSBundleGuard(dnsUse(b), "a", target, false) != nil {
++						t.Fatal("local denial revoked neighbor")
++					}
++					return
++				}
++				exchange := h.next(t, 35)
++				r39ReadACK(t, h, *dnsDirectReply(exchange))
++				physical := h.next(t, 35)
++				r39ReadACK(t, h, *dnsDirectReply(physical))
++				proof := h.next(t, 52)
++				<-h.proof
++				r39ReadACK(t, h, *dnsDirectReply(proof))
++				logical := h.next(t, 38)
++				r39ReadACK(t, h, *dnsDirectReply(logical))
++				got := <-h.done
++				if got.err != nil {
++					t.Fatal(got.err)
++				}
++				if err := got.conn.Close(); err != nil {
++					t.Fatal(err)
++				}
++				owner := logical.dnsDirect.owner
++				for step := 0; step < 5; step++ {
++					if err := f.c.tick(); err != nil {
++						t.Fatal(err)
++					}
++					cleanup := owner.requests[owner.used-1]
++					packet := dnsCancelAck(cleanup.sequence, u64(cleanup.body, 8))
++					if cleanup.kind == 45 {
++						body := make([]byte, 40)
++						be.PutUint16(body, 2)
++						body[2], body[3], body[28] = 1, cleanup.body[2], 1
++						be.PutUint64(body[8:], u64(cleanup.body, 8))
++						be.PutUint64(body[16:], u64(cleanup.body, 16))
++						be.PutUint64(body[32:], cleanup.sequence)
++						packet = profilePacket{kind: 46, reply: cleanup.sequence, body: body}
++					}
++					r39ReadACK(t, h, packet)
++				}
++				if err := f.c.tick(); err != nil {
++					t.Fatal(err)
++				}
++				if !owner.released || f.c.dnsFDUsed != profileRXFD || f.p.ctx.Err() != nil {
++					t.Fatal("cleanup lost permanent scratch or neighbor")
++				}
++				if err := got.conn.Close(); err != nil {
++					t.Fatal(err)
++				}
++			})
++		}
++	}
++}
++func TestProfileR39RuntimeProofLeaseExclusiveAndUnknownSticky(t *testing.T) {
++	f, a, accepted := udpActorFixture(t)
++	r, err := a.submit(f.p.ctx, accepted)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = a.tick(); err != nil {
++		t.Fatal(err)
++	}
++	fd, pending, memory := f.c.profileFDUsed(), f.c.profilePendingUsed(), f.c.buffered
++	lease, err := f.p.reserveUDPInput()
++	if err != nil {
++		t.Fatal(err)
++	}
++	called := false
++	if err = a.receive(func() (profileProofPacket, error) { called = true; return udpActorPacket(t, a, r, false, nil), nil }); err == nil || called {
++		t.Fatal("parallel runtime/proof read entered shared scratch")
++	}
++	lease(true)
++	lease(true)
++	if err = a.receive(func() (profileProofPacket, error) {
++		lease(true)
++		lease(false)
++		if !f.c.rxLeased || f.c.dnsScratchUnknown {
++			t.Fatal("stale release changed current lease")
++		}
++		return udpActorPacket(t, a, r, false, nil), nil
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if f.c.profileFDUsed() != fd || f.c.profilePendingUsed() != pending-1 || f.c.buffered != memory {
++		t.Fatal("proof reader debited scratch twice")
++	}
++	lease, err = f.p.reserveUDPInput()
++	if err != nil {
++		t.Fatal(err)
++	}
++	lease(false)
++	lease(true)
++	if _, err = f.p.reserveUDPInput(); err == nil || !f.c.dnsScratchUnknown || !f.c.rxLeased {
++		t.Fatal("Unknown released/reacquired scratch")
++	}
++	if f.c.dnsCleanupResult() == nil {
++		t.Fatal("Unknown became KnownClosed")
++	}
++}
++func TestProfileR39InitPrecedesOwnersAndIsIdempotent(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	fd, pending, memory := f.c.profileFDUsed(), f.c.profilePendingUsed(), f.c.buffered
++	if fd != 17 || pending != 1 || memory != profileRXMemory {
++		t.Fatal("missing pre-admission scratch")
++	}
++	f.c.initRXBudget()
++	if f.c.profileFDUsed() != fd || f.c.profilePendingUsed() != pending || f.c.buffered != memory {
++		t.Fatal("init double debit")
++	}
++	for _, kind := range []string{"pending", "memory"} {
++		m := f.c.manifest
++		if kind == "pending" {
++			m.caps[3] = 0
++		} else {
++			m.caps[4] = uint32(m.memoryCredit + profileRXMemory - 1)
++		}
++		c := newProfileFlowControl(m, 1, f.c.clock, f.c.write, f.c.alive)
++		if c.live() || c.rxReserved || c.buffered != 0 {
++			t.Fatal("undersized manifest activated flow control")
++		}
++	}
++}
+diff --git a/common/yonikbroker/profile_rx_budget_linux.go b/common/yonikbroker/profile_rx_budget_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_rx_budget_linux.go
+@@ -0,0 +1,57 @@
++//go:build linux
++
++package nativehooks
++
++import "sync"
++
++const profileRXFD = 16
++const profileRXMemory = 66048
++
++// Один monitor последовательно читает runtime/proof; payload AF_INET readers
++// имеют собственные association credits и не принимают SCM_RIGHTS.
++// Pending/RX bytes/FD удерживаются с constructor до окончания runtime custody.
++func (c *profileFlowControl) initRXBudget() {
++	if c.rxReserved || c.manifest.caps[3] < 1 || c.manifest.memoryCredit+profileRXMemory > uint64(c.manifest.caps[4]) {
++		return
++	}
++	c.rxReserved = true
++	c.dnsFDUsed += profileRXFD
++	c.buffered += profileRXMemory
++}
++func (c *profileFlowControl) profilePendingUsed() int {
++	used := c.operations + c.dnsTasksActive
++	if c.rxReserved {
++		used++
++	}
++	if c.udpBudget != nil {
++		used += c.udpBudget.proofPending
++	}
++	return used
++}
++
++// Lease не возвращает постоянные credits admission owners. Ошибка cleanup
++// оставляет lease/custody Unknown; repeated release не меняет final result.
++func (p *ProfileRuntime) leaseProfileRX() (func(bool), error) {
++	c := p.flow
++	if c == nil {
++		return nil, errProfile
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.rxReserved || c.rxLeased || c.dnsScratchUnknown || !c.live() {
++		return nil, errProfile
++	}
++	c.rxLeased = true
++	var once sync.Once
++	return func(clean bool) {
++		once.Do(func() {
++			c.mu.Lock()
++			defer c.mu.Unlock()
++			if clean {
++				c.rxLeased = false
++			} else {
++				c.dnsScratchUnknown = true
++			}
++		})
++	}, nil
++}
