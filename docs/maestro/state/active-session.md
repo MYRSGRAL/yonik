@@ -474,6 +474,22 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   preferences tests только COMPILE_ONLY. Evidence r22-root-ui вне TTL,
   собственная сборка очищена. Full P6/runtime/installed PASS не заявлен.
 
+- Go8814df0 UDP actor/issuer FD delivery интегрирован для R23 corrections.
+  R23F1 отмена внутри успешного UCS/UAQ send исправлена rootd0e8644:
+  отправленная phase фиксируется перед локальным retirement; поздний ответ
+  сохраняет FD custody и соседнюю association. RED на actor8814df0 для обеих
+  фаз, GREEN13 actor pure tests, fresh78 pins и Python8+8 PASS. Evidence
+  r23-root-cancel сохранён, собственная сборка очищена. R23F2 проверка namespace
+  relay FD ещё открыта, Go автор продолжает correction. Admission закрыт.
+- Desktop81b3c12 DATA selection/favorites интегрирован для R24 correction.
+  R24 нашёл потерю legacy autoconnect цели другого source при page reload.
+  Rootcc4df74 загружает страницу до восстановления server selection, сверяет
+  полные source/snapshot coordinates и устанавливает selected_kind=server.
+  RED/GREEN с настоящим Actor без Host: другой source сохраняется, stale snapshot
+  отвергается; три pure tests, desktop all-targets clippy/fmt PASS. Evidence
+  r24-root-startup сохранён, cargo clean удалил2.3GiB. Узкий recheck ожидается.
+  Native Connect/P6/runtime не PASS; установленный e14 не обновлён.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
