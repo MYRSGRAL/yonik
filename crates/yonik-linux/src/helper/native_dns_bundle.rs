@@ -538,7 +538,12 @@ pub(super) fn dispatch<A: Authority>(
     body[..2].copy_from_slice(&2u16.to_be_bytes());
     let op = match frame.record {
         Record::BundleAcquire(view) => {
-            match issuer.acquire_bundle(reply, view, session) {
+            let acquired = if issuer.retired.iter().any(|(request, _)| *request == reply) {
+                Err(ServiceError::Unavailable)
+            } else {
+                issuer.acquire_bundle(reply, view, session)
+            };
+            match acquired {
                 Ok(id) => {
                     let bundle = issuer.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
                     body[2] = 1;

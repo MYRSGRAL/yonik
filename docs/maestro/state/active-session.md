@@ -611,6 +611,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   отдельными class3 hop permits, renewal/cancel/credits и fake-only regression.
   Runtime не запускался; full P4/P5 readiness и installed update не заявлены.
 
+- R37 нашёл P2 в user-DNS issuer581a553: queued BundleAcquire мог исполниться
+  после KnownClosed request cancel. Root добавил tombstone fence до acquire
+  effects и actual run_issuer regression seq3→queued4→cancel5(id4). Exact-head
+  RED подтвердил Allow после cancel; GREEN11 driver tests последовательно PASS.
+  Параллельный suite столкнулся с shared global memory Budget, пределы не менялись.
+  CODEC2/wire неизменны; correction требует узкого SOURCE recheck. PROBE/flow0,
+  search expansion, transport vertical и resolver service-policy всё ещё закрыты.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение

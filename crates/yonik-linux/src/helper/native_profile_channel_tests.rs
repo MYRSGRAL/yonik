@@ -564,6 +564,46 @@ fn dns_bundle_driver_blocked_send_cannot_extend_owner_and_renewal_unknown_keeps_
     assert_eq!(issuer.budget.routes.used(), 3);
 }
 #[test]
+fn dns_bundle_driver_canceled_queued_acquire_never_creates_route_authority() {
+    let (mut issuer, b) = bundle_fixture(Mode::System, false);
+    let before = issuer.authority.route_count;
+    let mut cancel = [0; 24];
+    cancel[..2].copy_from_slice(&2u16.to_be_bytes());
+    cancel[2] = 1;
+    cancel[8..16].copy_from_slice(&4u64.to_be_bytes());
+    let mut io = BundleIo::new(
+        issuer.record,
+        vec![
+            dns_packet(issuer.record, 3, wire::dns_v2::Operation::BundleAcquire, &b),
+            dns_packet(issuer.record, 4, wire::dns_v2::Operation::BundleAcquire, &b),
+            dns_packet(issuer.record, 5, wire::dns_v2::Operation::Cancel, &cancel),
+        ],
+    );
+    io.stop_after = 3;
+    assert!(
+        run_issuer(
+            &mut issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    let out = io.output.borrow();
+    assert_eq!(out.len(), 3);
+    assert_eq!(&out[1][24..32], &5u64.to_be_bytes());
+    assert_eq!(out[1][130], 1);
+    assert_eq!(&out[2][24..32], &4u64.to_be_bytes());
+    assert_eq!(
+        out[2][130], 2,
+        "queued acquire must be denied after KnownClosed cancel"
+    );
+    assert_eq!(issuer.dns.count(), 1);
+    assert_eq!(issuer.authority.route_count, before + 1);
+}
+#[test]
 fn dns_bundle_driver_cancel_one_bundle_does_not_cancel_queued_sibling() {
     let (mut issuer, b) = bundle_fixture(Mode::System, false);
     let mut other = b.clone();
