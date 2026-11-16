@@ -1874,31 +1874,48 @@ fn service_bootstrap_requires_owning_endpoint_and_exact_system_snapshot_row() {
         .unwrap()
         .remove("inbounds");
     fixture["profile"]["graph"]["outbounds"][0]["settings"]["servers"][0]["address"] =
-        serde_json::json!("proxy.invalid");
+        serde_json::json!("remote.invalid");
+    fixture["profile"]["graph"]["outbounds"][1]["settings"]["vnext"][0]["address"] =
+        serde_json::json!("physical.invalid");
     fixture["profile"]["graph"]["dns"] = serde_json::json!({"servers":["localhost"]});
     let intent = ProfileIntent::decode(&fixture["profile"].to_string()).unwrap();
     let plan = OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap())
         .unwrap()
         .bind_system_resolver(&Snapshot)
         .unwrap();
+    let asset = wire::ResolverData {
+        source: [8; 32],
+        source_flags: 0,
+        nss_hash: [1; 32],
+        hosts_hash: Sha256::digest([]).into(),
+        resolv_hash: [2; 32],
+        order: 2,
+        ndots: 1,
+        attempts: 2,
+        timeout_ms: 5000,
+        flags: 16,
+        hostname: "fixture".into(),
+        search: vec![],
+        peers: vec!["192.0.2.53:53".parse().unwrap()],
+        hosts: vec![],
+        _memory: super::super::memory::config_budget().reserve(4096).unwrap(),
+    }
+    .encode()
+    .unwrap();
+    let reference = wire::SnapshotRef {
+        source: [8; 32],
+        asset: Sha256::digest(&asset).into(),
+        bytes: asset.len() as u32,
+        flags: 0,
+    };
+    wire::verify_resolver_asset(&asset, reference).unwrap();
     let capsule = Arc::new(
-        wire::OwnedCapsule::build(
-            &intent,
-            &plan,
-            Some(wire::SnapshotRef {
-                source: [8; 32],
-                asset: [9; 32],
-                bytes: 120,
-                flags: 0,
-            }),
-            [3; 32],
-            1,
-            1,
-        )
-        .unwrap(),
+        wire::OwnedCapsule::build(&intent, &plan, Some(reference), [3; 32], 1, 1).unwrap(),
     );
     let decoded = wire::Capsule::decode(capsule.bytes(), &[3; 32]).unwrap();
-    let index = decoded.dial_scope(0, 0).unwrap().endpoint_index;
+    let (scope, mask) = decoded.subject_scope(1, 6).unwrap();
+    let branch = u8::from(mask & 1 == 0);
+    let index = decoded.dial_scope(scope, branch).unwrap().endpoint_index;
     let record = LaunchRecord {
         manifest: decoded.manifest,
         ..issuer(Mode::Local).record
@@ -1908,11 +1925,11 @@ fn service_bootstrap_requires_owning_endpoint_and_exact_system_snapshot_row() {
     let request = wire::Message::Probe {
         purpose: 2,
         index,
-        subject: 0,
+        subject: 1,
         resolver: 0,
     };
     let grant = issuer.service(2, 0, &request).unwrap();
-    assert_eq!(issuer.services[&grant].selector, [2, index, 0, 0]);
+    assert_eq!(issuer.services[&grant].selector, [2, index, 1, 0]);
     assert!(
         issuer
             .service(
@@ -1921,7 +1938,7 @@ fn service_bootstrap_requires_owning_endpoint_and_exact_system_snapshot_row() {
                 &wire::Message::Probe {
                     purpose: 2,
                     index,
-                    subject: 1,
+                    subject: 0,
                     resolver: 0
                 }
             )
@@ -1935,7 +1952,7 @@ fn service_bootstrap_requires_owning_endpoint_and_exact_system_snapshot_row() {
                 &wire::Message::Probe {
                     purpose: 2,
                     index,
-                    subject: 0,
+                    subject: 1,
                     resolver: 1
                 }
             )
@@ -1944,6 +1961,25 @@ fn service_bootstrap_requires_owning_endpoint_and_exact_system_snapshot_row() {
     assert!(issuer.services.contains_key(&grant));
     assert!(issuer.flows.is_empty());
     assert_eq!(issuer.authority.owner_count, 0);
+    drop(issuer);
+    fixture["profile"]["graph"]["outbounds"][0]["settings"]["servers"][0]["address"] =
+        serde_json::json!("192.0.2.1");
+    fixture["profile"]["graph"]["outbounds"][1]["settings"]["vnext"][0]["address"] =
+        serde_json::json!("192.0.2.2");
+    let intent = ProfileIntent::decode(&fixture["profile"].to_string()).unwrap();
+    let capsule = Arc::new(
+        wire::OwnedCapsule::build(&intent, &plan, Some(reference), [3; 32], 1, 1).unwrap(),
+    );
+    let manifest = wire::Capsule::decode(capsule.bytes(), &[3; 32])
+        .unwrap()
+        .manifest;
+    let mut issuer = Issuer::new(
+        Fake::new(Mode::Local),
+        capsule,
+        LaunchRecord { manifest, ..record },
+    )
+    .unwrap();
+    issuer.authority.service_trusted = true;
     let before = issuer.authority.service_routes.len();
     issuer
         .service(

@@ -685,6 +685,16 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   unit — ProxiedLogical/Append с existing CODEC3 и closed producer pins. Public
   gates false; generic runtime/full P5 PASS не заявлен.
 
+- R48 SOURCE scoped CLEAN: mapping4/table1192376af интегрирован. Bootstrap-only
+  DATA build, exact source/peers, checked graph и роли2/4/6 отдельно assetbit0;
+  mapping3 новые role bits отвергает. Legacy issuer bootstrap-тест имел invalid
+  header-only asset120 и ожидание bootstrap для remote chained hostname.
+  Root обновил fixture полным synthetic asset и positivephysical b/negative
+  remote a, разрешённой mux branch из capsule mask, сохранив numeric probe control.
+  Issuer1 + mapping4 tests4, no-run/linux+desktop clippy/fmt PASS; source/compiler/
+  ELF evidence r48-fixture сохранены, cargo clean выполнен. Issuer/bootstrap service
+  flow0/Hosts custody и production authority остаются следующими закрытыми paths.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
