@@ -626,6 +626,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   transport cut параллельно; RRset/Waiter/Numeric и service/loopback остаются
   следующими незавершёнными частями. Protected image allowlist ещё не обновлён.
 
+- R39P2 CLOSED по narrow SOURCE: Go f05dfb4 интегрирован после исправления
+  DirectSocket admission. RX scratch16FD/1pending/66048bytes удерживается до
+  owners; один monitor runtime/proof, exclusive lease, общий cap64/64/8MiB.
+  Author RED/GREEN137pure и DNS14, Python12, compile-only main; самостоятельной
+  runtime-аттестации нет. Baseline allocation test failure сохранён отдельно,
+  вне correction не исправлялся. Rust DirectSocket21cc8b3 ожидает R40 review;
+  actual counterpart parity и legitimate KnownClosed retirement не подтверждены.
+  Forwarding/public gates false; protected builder/image allowlist ещё прежний.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
