@@ -479,8 +479,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   отправленная phase фиксируется перед локальным retirement; поздний ответ
   сохраняет FD custody и соседнюю association. RED на actor8814df0 для обеих
   фаз, GREEN13 actor pure tests, fresh78 pins и Python8+8 PASS. Evidence
-  r23-root-cancel сохранён, собственная сборка очищена. R23F2 проверка namespace
-  relay FD ещё открыта, Go автор продолжает correction. Admission закрыт.
+  r23-root-cancel сохранён, собственная сборка очищена. R23F2 root merge71166ff
+  принимает d33aa5c: actual UDP/TCP control FD сравниваются по kernel
+  SO_NETNS_COOKIE до factory/publication, missing/error/zero/mismatch запрещены.
+  R23 narrow SOURCE CLOSED для F1/F2. Автор45 broker+4 SOCKS pure, fresh pins,
+  Python27+27/gofmt/Ruff PASS; OS wrappers не исполнялись, собственная сборка
+  очищена. Forward/provenance3/private FlowGrant/KnownClosed ещё не завершены.
+  Admission закрыт.
 - Desktop81b3c12 DATA selection/favorites интегрирован для R24 correction.
   R24 нашёл потерю legacy autoconnect цели другого source при page reload.
   Rootcc4df74 загружает страницу до восстановления server selection, сверяет
