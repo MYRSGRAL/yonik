@@ -895,3 +895,38 @@ pregrant correction da1c80b приняты как SOURCE prerequisite. Private p
 sniffing остаётся Unsupported, metadataOnly не даёт чтения payload. Ready gates,
 Local v2 exchange и installed-image acceptance нельзя объявлять завершёнными
 на основании этих Rust synthetic vectors.
+
+### R26: минимальный trusted build/install contract — предложение
+
+Принятая модель допускает proof происхождения exact запускаемого образа через
+доверенный consuming launcher; непрерывное current-image measurement после exec
+не требуется и не заявляется. Hostile same-UID вмешательство и произвольный exec
+вне reviewed producer contract этим механизмом не покрываются.
+
+Предлагается registry schema2 с optional `native_profile_producer` для Xray;
+schema1 сохраняет legacy поведение без producer authority. Bounded typed record
+содержит contract/version, accepted patchset/source digests, builder/toolchain/
+build-input digests и final ELF digest. ELF digest обязан совпадать с entry.sha256
+и actual retained/sealed executable. Unknown/missing contract, неподдержанный
+patchset или mismatch запрещают producer proof. Build record не содержит заранее
+вычисленных session/config/manifest значений.
+
+Builder выпускает evidence после source/pins/build проверки. Authority появляется
+только после установки доверенным поставщиком в existing root-owned
+`/usr/lib/yonik/engines`, с прежними path/NOFOLLOW/ownership/mode guards.
+Пользовательский JSON/env/engine-dir manifest/caller hash этого не заменяют.
+Новая подпись/capability не требуется; фактическая установка сейчас не выполняется.
+
+Registry возвращает opaque image-contract proof вместе с checked snapshot.
+Launcher связывает его с final config digest, manifest и всем LaunchRecord;
+System сверяет VerifiedExecDelivery, Local — actual retained executable и
+consuming child path. Только эта совокупность mint-ит private VerifiedUdpProducer.
+Mismatch не выбирает v1 fallback. Compile-only provenance не является runtime PASS;
+public require_consumer/capabilities/builder readiness остаются закрытыми.
+
+Дополнительные source точки: `helper/registry.rs` (schema/opaque proof),
+`host/binary.rs` (связь image-contract с sealed custody), pure tests и existing
+`tools/build_native_adapter.py`/tests. Два Rust-файла вне completion-scope;
+реализация ожидает разрешения. Negative controls: legacy/no-contract, untrusted
+record, wrong ELF/patch/contract/launch/config/manifest; positive exact-image
+binding проверяется без OS exec.
