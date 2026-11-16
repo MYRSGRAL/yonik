@@ -619,6 +619,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   CODEC2/wire неизменны; e59af5d прошёл узкий SOURCE recheck R37P2 CLOSED. PROBE/flow0,
   search expansion, transport vertical и resolver service-policy всё ещё закрыты.
 
+- R38 SOURCE scoped CLEAN для Go f6b9af3: CODEC-2 bundle consumer интегрирован
+  обычным merge после проверки private class3/query, actual native path/per-hop
+  guards, renewal/credits/cancel/Unknown и corpus86/218/17. User-DNS forwarding
+  по-прежнему закрыт до retained Physical/Logical proof. Go/Rust продолжают
+  transport cut параллельно; RRset/Waiter/Numeric и service/loopback остаются
+  следующими незавершёнными частями. Protected image allowlist ещё не обновлён.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
