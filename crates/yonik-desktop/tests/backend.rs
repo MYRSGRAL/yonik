@@ -385,7 +385,7 @@ fn listen_port_settings_are_strict_and_survive_reload() {
     let port = listener.local_addr().expect("порт").port();
     app.send(json!({"command":"set_listen_port","port":port}));
     app.wait(|v| v["port"] == port);
-    for (index, invalid) in [
+    for invalid in [
         json!({"command":"set_listen_port","port":0}),
         json!({"command":"set_listen_port","port":65536}),
         json!({"command":"set_listen_port","port":-1}),
@@ -397,7 +397,6 @@ fn listen_port_settings_are_strict_and_survive_reload() {
         json!({"command":"set_listen_port","port":12345,"unknown":true}),
     ]
     .into_iter()
-    .enumerate()
     {
         assert_eq!(
             app.host
@@ -407,11 +406,12 @@ fn listen_port_settings_are_strict_and_survive_reload() {
             "invalid_input"
         );
         app.send(json!({"command":"reload"}));
-        // Смена ядра после reload служит FIFO-барьером: случайный сетевой
+        // Отказ выбора ядра после reload служит FIFO-барьером: случайный сетевой
         // snapshot не должен выдаваться за подтверждение обработки reload.
-        let engine = if index % 2 == 0 { "sing-box" } else { "xray" };
-        app.send(json!({"command":"set_engine","engine":engine}));
-        assert_eq!(app.wait(|v| v["engine"] == engine)["port"], port);
+        app.send(json!({"command":"set_engine","engine":"sing-box"}));
+        let rejected = app.wait(|v| v["error"] == "engine_unavailable");
+        assert_eq!(rejected["engine"], "xray");
+        assert_eq!(rejected["port"], port);
     }
     for boundary in [1, 65535] {
         app.send(json!({"command":"set_listen_port","port":boundary}));
@@ -441,7 +441,10 @@ fn next_connect_compiles_with_updated_listen_port() {
     app.wait(|v| v["port"] == 18889);
     app.send(json!({"command":"reload"}));
     app.send(json!({"command":"set_engine","engine":"sing-box"}));
-    assert_eq!(app.wait(|v| v["engine"] == "sing-box")["port"], 18889);
+    assert_eq!(
+        app.wait(|v| v["error"] == "engine_unavailable")["port"],
+        18889
+    );
     app.send(json!({"command":"set_engine","engine":"xray"}));
     app.wait(|v| v["engine"] == "xray");
     // Совпадение loopback endpoint и listener отклоняется реальным compile
@@ -1396,9 +1399,9 @@ fn preferences_reopen_applies_engine_port_probe_and_language() {
     first.wait(|v| v["ready"] == true);
     for (command, field, expected) in [
         (
-            json!({"command":"set_engine","engine":"sing-box"}),
+            json!({"command":"set_engine","engine":"xray"}),
             "engine",
-            json!("sing-box"),
+            json!("xray"),
         ),
         (
             json!({"command":"set_listen_port","port":18889}),
@@ -1437,7 +1440,7 @@ fn preferences_reopen_applies_engine_port_probe_and_language() {
     let mut second = Harness::new(directory.config());
     let state = second.wait(|v| v["ready"] == true);
     assert_eq!(state["proxy_fetch_dns"], "127.0.0.1:5353");
-    assert_eq!(state["engine"], "sing-box");
+    assert_eq!(state["engine"], "xray");
     assert_eq!(state["port"], 18889);
     assert_eq!(state["probe_expected_status"], 200);
     assert_eq!(state["language"], "en");
@@ -1460,7 +1463,7 @@ fn damaged_preferences_notify_and_survive_settings_commands() {
     assert_eq!(state["preferences_warning"], true);
     assert_eq!(state["engine"], "xray");
     app.send(json!({"command":"set_engine","engine":"sing-box"}));
-    let state = app.wait(|v| v["error"] == "preferences_write");
+    let state = app.wait(|v| v["error"] == "engine_unavailable");
     assert_eq!(state["engine"], "xray");
     app.close();
     assert_eq!(fs::read(path).expect("исходник"), b"{");

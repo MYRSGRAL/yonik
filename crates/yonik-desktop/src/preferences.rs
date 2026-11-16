@@ -430,6 +430,9 @@ mod tests {
         p.language = "en".into();
         p.engine = "sing-box".into();
         store.save(&p).expect("сохранение");
+        let original = fs::read(&store.path).expect("исходник");
+        assert_eq!(Store::open(&dir).1.engine, "sing-box");
+        assert_eq!(fs::read(&store.path).expect("после чтения"), original);
         assert_eq!(Store::open(&dir).1.language, "en");
         let mut unknown = serde_json::to_value(&p).expect("JSON");
         unknown["version"] = 99.into();
