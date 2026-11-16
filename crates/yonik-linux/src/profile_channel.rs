@@ -122,7 +122,33 @@ pub(crate) mod dns_v2 {
         AppendSequence,
         RequestSequenceId
     );
-    ids!(BundleRevision);
+    ids!(
+        BundleRevision,
+        ContextRevision,
+        UserDnsRootId,
+        HostsPathContextId,
+        ExportedContextId
+    );
+    pub(crate) const SCHEMA: &[u8] = b"YONIK-DNS-V2-CODEC-4\0";
+    /// DATA selector; наличие индексов не подтверждает graph/source authority.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct BootstrapSelector {
+        pub endpoint: u16,
+        pub subject: u16,
+        pub resolver: Option<u16>,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Root {
+        UserDns(UserDnsRootId),
+        BootstrapService(ServiceGrantId),
+        HostsPath,
+    }
+    /// Namespace определяется pending55, не совпадением численных ID.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum DnsContext {
+        Network(DnsBundleId),
+        HostsPath(HostsPathContextId),
+    }
     macro_rules! view_id {
         ($kind:literal,$method:ident,$id:ident,$at:literal) => {
             impl View<'_, $kind> {
@@ -176,13 +202,43 @@ pub(crate) mod dns_v2 {
     view_id!(53, source_revision, FlowRevision, 48);
     view_id!(54, reservation, ReservationId, 24);
     view_id!(54, query, QueryId, 32);
-    view_id!(55, grant, ServiceGrantId, 8);
     view_id!(55, query, QueryId, 16);
-    view_id!(56, bundle, DnsBundleId, 8);
-    view_id!(56, grant, ServiceGrantId, 16);
     view_id!(56, query, QueryId, 24);
-    view_id!(56, revision, BundleRevision, 56);
+    view_id!(56, revision, ContextRevision, 56);
     impl<'a> View<'a, 55> {
+        pub(crate) fn root(self) -> Result<Root> {
+            if self.base().len() != 8 {
+                Ok(Root::UserDns(UserDnsRootId::read(n64(self.bytes, 8))?))
+            } else if self.selector()?.ok_or(Error::Reference)?.resolver.is_some() {
+                Ok(Root::BootstrapService(ServiceGrantId::read(n64(
+                    self.bytes, 8,
+                ))?))
+            } else {
+                Ok(Root::HostsPath)
+            }
+        }
+        pub(crate) fn selector(self) -> Result<Option<BootstrapSelector>> {
+            if self.base().len() == 8 {
+                Ok(Some(bootstrap_selector(
+                    self.base(),
+                    n16(self.bytes, 60) == super::NONE,
+                )?))
+            } else {
+                Ok(None)
+            }
+        }
+        pub(crate) fn context_renewal(self) -> Result<Option<(DnsContext, ContextRevision)>> {
+            let id = n64(self.bytes, 32);
+            if id == 0 {
+                return Ok(None);
+            }
+            let context = match self.root()? {
+                Root::HostsPath => DnsContext::HostsPath(HostsPathContextId::read(id)?),
+                _ => DnsContext::Network(DnsBundleId::read(id)?),
+            };
+            Ok(Some((context, ContextRevision::read(n64(self.bytes, 64))?)))
+        }
+
         pub(crate) fn authorization(self) -> Result<super::Authorize<'a>> {
             match super::Message::decode(super::Kind::Authorize, self.base())? {
                 super::Message::Authorize(a) => Ok(a),
@@ -190,6 +246,9 @@ pub(crate) mod dns_v2 {
             }
         }
         pub(crate) fn renewal(self) -> Result<Option<(DnsBundleId, BundleRevision)>> {
+            if self.root()? == Root::HostsPath {
+                return Err(Error::Reference);
+            }
             if n64(self.bytes, 32) == 0 {
                 Ok(None)
             } else {
@@ -211,6 +270,36 @@ pub(crate) mod dns_v2 {
             self.bytes[start..]
                 .chunks_exact(4)
                 .map(|row| (n16(row, 0), row[2]))
+        }
+    }
+    impl View<'_, 56> {
+        fn checked_context(self, pending: View<'_, 55>) -> Result<DnsContext> {
+            let b = self.bytes;
+            let p = pending.bytes;
+            let renewal = pending.context_renewal()?;
+            let expected_revision = match renewal {
+                None => 1,
+                Some((_, revision)) => revision
+                    .get()
+                    .checked_add(1)
+                    .filter(|n| *n != u64::MAX)
+                    .ok_or(Error::Reference)?,
+            };
+            if b[2] != 1
+                || n64(b, 16) != n64(p, 8)
+                || n64(b, 24) != n64(p, 16)
+                || n64(b, 32) != n64(p, 24)
+                || n16(b, 48) != n16(p, 50)
+                || n64(b, 56) != expected_revision
+                || n64(b, 40) > n64(p, 40)
+                || renewal.is_some() && n64(b, 8) != n64(p, 32)
+            {
+                return Err(Error::Binding);
+            }
+            match pending.root()? {
+                Root::HostsPath => Ok(DnsContext::HostsPath(HostsPathContextId::read(n64(b, 8))?)),
+                _ => Ok(DnsContext::Network(DnsBundleId::read(n64(b, 8))?)),
+            }
         }
     }
     macro_rules! closed_u8 {
@@ -248,6 +337,13 @@ pub(crate) mod dns_v2 {
         }
     }
     impl<'a> View<'a, 35> {
+        pub(crate) fn bootstrap_selector(self) -> Result<Option<BootstrapSelector>> {
+            if self.bytes[77] != 3 || self.base().len() != 8 {
+                return Ok(None);
+            }
+            Ok(Some(bootstrap_selector(self.base(), self.bytes[75] == 2)?))
+        }
+
         pub(crate) fn original(self) -> &'a [u8] {
             let n = usize::from(n16(self.bytes, 80));
             &self.bytes[96..96 + n]
@@ -269,6 +365,15 @@ pub(crate) mod dns_v2 {
         }
     }
     impl<'a> View<'a, 42> {
+        pub(crate) fn bootstrap_selector(self) -> Result<Option<BootstrapSelector>> {
+            let n = usize::from(n16(self.bytes, 12));
+            if n != 8 || self.bytes[15] != 3 {
+                return Ok(None);
+            }
+            let base = &self.bytes[16..16 + n];
+            Ok(Some(bootstrap_selector(base, n16(base, 6) == super::NONE)?))
+        }
+
         pub(crate) fn authorization(self) -> Result<super::Authorize<'a>> {
             let n = usize::from(n16(self.bytes, 12));
             match super::Message::decode(super::Kind::Authorize, &self.bytes[16..16 + n])? {
@@ -335,6 +440,7 @@ pub(crate) mod dns_v2 {
         Producer(ProducerRRsetId),
         Waiter(WaiterReceiptId),
         Reservation(ReservationId),
+        Context(ExportedContextId),
     }
     impl View<'_, 47> {
         pub(crate) fn reference(self) -> Result<Cancellation> {
@@ -347,6 +453,7 @@ pub(crate) mod dns_v2 {
                 5 => Cancellation::Producer(ProducerRRsetId::read(n)?),
                 6 => Cancellation::Waiter(WaiterReceiptId::read(n)?),
                 7 => Cancellation::Reservation(ReservationId::read(n)?),
+                8 => Cancellation::Context(ExportedContextId::read(n)?),
                 _ => return Err(Error::Reference),
             })
         }
@@ -638,7 +745,7 @@ pub(crate) mod dns_v2 {
             super::put16(&mut b, 8, 2);
             super::put16(&mut b, 10, 272);
             b[16..208].copy_from_slice(&launch.encode()?);
-            b[208..240].copy_from_slice(&Sha256::digest(b"YONIK-DNS-V2-CODEC-3\0"));
+            b[208..240].copy_from_slice(&Sha256::digest(SCHEMA));
             for (at, n) in [
                 (240, 4),
                 (242, 11),
@@ -723,6 +830,26 @@ pub(crate) mod dns_v2 {
         Issuer,
     }
     impl<'a> DnsFrame<'a> {
+        /// Только exact pending DATA. Freshness/RTT/custody проверяет single owner.
+        pub(crate) fn acquired_context(&self, pending: &DnsFrame<'_>) -> Result<DnsContext> {
+            id(self.header.sequence)?;
+            id(pending.header.sequence)?;
+            if self.record.source_epoch() != Some(self.header.binding.epoch)
+                || pending.record.source_epoch() != Some(pending.header.binding.epoch)
+                || self.header.reply_to != pending.header.sequence
+                || self.header.binding != pending.header.binding
+                || pending.header.reply_to != 0
+            {
+                return Err(Error::Binding);
+            }
+            match (self.record, pending.record) {
+                (Record::BundleGranted(reply), Record::BundleAcquire(request)) => {
+                    reply.checked_context(request)
+                }
+                _ => Err(Error::Reference),
+            }
+        }
+
         pub(crate) fn encode(&self, neg: &Negotiated, out: &mut [u8]) -> Result<usize> {
             let op = self.record.operation();
             if op == Operation::PhysicalBind {
@@ -954,7 +1081,25 @@ pub(crate) mod dns_v2 {
                 if b[2] != 2 && (b[74] == 1) != (n16(b, 68) == super::NONE) {
                     return Err(Error::Reference);
                 }
-                canonical_base(b[77], &b[96 + original + query..])
+                let base = &b[96 + original + query..];
+                let hosts = b[75] == 2;
+                if (hosts || b[74] == 2) && (b[77] != 3 || flow != 0 || base.len() != 8) {
+                    return Err(Error::Reference);
+                }
+                canonical_base(b[77], base, hosts)?;
+                if b[77] == 3 && base.len() == 8 {
+                    let selector = bootstrap_selector(base, hosts)?;
+                    if b[78] != 2
+                        || flow != 0
+                        || b[74] != if hosts { 3 } else { 2 }
+                        || selector.endpoint != n16(b, 68)
+                        || selector.subject != n16(b, 66)
+                        || selector.resolver.unwrap_or(super::NONE) != n16(b, 64)
+                    {
+                        return Err(Error::Reference);
+                    }
+                }
+                Ok(())
             }
             36 | 37 | 39 | 44 | 48 => {
                 let size = match kind {
@@ -1088,7 +1233,16 @@ pub(crate) mod dns_v2 {
                 if !(1..=1024).contains(&base) || 16 + base > b.len() || !matches!(b[14], 1 | 2) {
                     return Err(Error::Bounds);
                 }
-                canonical_base(b[15], &b[16..16 + base])?;
+                let canonical = &b[16..16 + base];
+                if b[14] == 2 && (b[15] != 3 || base != 8) {
+                    return Err(Error::Reference);
+                }
+
+                let hosts = base == 8 && b[15] == 3 && n16(canonical, 6) == super::NONE;
+                if base == 8 && b[15] == 3 && b[14] != 2 {
+                    return Err(Error::Reference);
+                }
+                canonical_base(b[15], canonical, hosts)?;
                 numeric_destination(&b[16 + base..]).map(|_| ())
             }
             45 | 47 => {
@@ -1134,7 +1288,7 @@ pub(crate) mod dns_v2 {
                 }
                 zero(&b[2..8])?;
                 zero(&b[62..64])?;
-                for at in [8, 16, 24] {
+                for at in [16, 24] {
                     id(n64(b, at))?;
                 }
                 lease(n64(b, 40))?;
@@ -1152,33 +1306,52 @@ pub(crate) mod dns_v2 {
                     || !(1..=256).contains(&count)
                     || !(1..=253).contains(&original)
                     || 72 + base + original + count * 4 != b.len()
-                    || !matches!(n16(b, 52), 1 | 28)
-                    || n16(b, 60) == super::NONE
                 {
                     return Err(Error::Bounds);
                 }
+                let canonical = &b[72..72 + base];
+                let resolver = n16(b, 60);
+                let hosts = base == 8 && resolver == super::NONE;
+                if base == 8 {
+                    let selector = bootstrap_selector(canonical, hosts)?;
+                    if selector.resolver.unwrap_or(super::NONE) != resolver {
+                        return Err(Error::Reference);
+                    }
+                } else {
+                    canonical_base(3, canonical, false)?;
+                    let super::Message::Authorize(a) =
+                        super::Message::decode(super::Kind::Authorize, canonical)?
+                    else {
+                        return Err(Error::Reference);
+                    };
+                    if a.resolver != resolver {
+                        return Err(Error::Reference);
+                    }
+                }
                 let flags = n16(b, 54);
                 let payload = n16(b, 56);
-                if flags & !31 != 0
-                    || if flags & 8 == 0 {
-                        payload != 0 || flags & 4 != 0
-                    } else {
-                        !(512..=4096).contains(&payload)
+                if hosts {
+                    if n64(b, 8) != 0 || n16(b, 52) != 0 || flags != 0 || payload != 0 {
+                        return Err(Error::Reference);
                     }
-                {
-                    return Err(Error::Schema);
-                }
-                let super::Message::Authorize(a) =
-                    super::Message::decode(super::Kind::Authorize, &b[72..72 + base])?
-                else {
-                    return Err(Error::Reference);
-                };
-                if a.class != 3 || a.resolver != n16(b, 60) {
-                    return Err(Error::Reference);
+                } else {
+                    id(n64(b, 8))?;
+                    if !matches!(n16(b, 52), 1 | 28) || resolver == super::NONE {
+                        return Err(Error::Reference);
+                    }
+                    if flags & !31 != 0
+                        || if flags & 8 == 0 {
+                            payload != 0 || flags & 4 != 0
+                        } else {
+                            !(512..=4096).contains(&payload)
+                        }
+                    {
+                        return Err(Error::Schema);
+                    }
                 }
                 ascii_name(&b[72 + base..72 + base + original], false)?;
                 for row in b[72 + base + original..].chunks_exact(4) {
-                    if n16(row, 0) == super::NONE || row[2] > 1 || row[3] != 0 {
+                    if n16(row, 0) >= 512 || row[2] > 1 || row[3] != 0 {
                         return Err(Error::Reference);
                     }
                 }
@@ -1192,8 +1365,11 @@ pub(crate) mod dns_v2 {
                 if b[2] != 1 {
                     return zero(&b[8..]);
                 }
-                for at in [8, 16, 24, 32, 56] {
+                for at in [8, 24, 32, 56] {
                     id(n64(b, at))?;
+                }
+                if n64(b, 16) != 0 {
+                    id(n64(b, 16))?;
                 }
                 lease(n64(b, 40))?;
                 if !(1..=256).contains(&n16(b, 48)) {
@@ -1360,7 +1536,33 @@ pub(crate) mod dns_v2 {
         }
         Ok(())
     }
-    fn canonical_base(class: u8, b: &[u8]) -> Result<()> {
+    fn bootstrap_selector(b: &[u8], hosts: bool) -> Result<BootstrapSelector> {
+        if b.len() != 8
+            || n16(b, 0) != 2
+            || n16(b, 2) >= 512
+            || n16(b, 4) >= 256
+            || if hosts {
+                n16(b, 6) != super::NONE
+            } else {
+                n16(b, 6) >= 64
+            }
+        {
+            return Err(Error::Reference);
+        }
+        Ok(BootstrapSelector {
+            endpoint: n16(b, 2),
+            subject: n16(b, 4),
+            resolver: (!hosts).then(|| n16(b, 6)),
+        })
+    }
+    fn canonical_base(class: u8, b: &[u8], hosts: bool) -> Result<()> {
+        if b.len() == 8 && class == 3 {
+            bootstrap_selector(b, hosts)?;
+            return Ok(());
+        }
+        if hosts {
+            return Err(Error::Reference);
+        }
         if b.len() == 8 && matches!(class, 2 | 3) {
             if !matches!(super::Message::decode(super::Kind::Probe,b)?,super::Message::Probe{purpose,..} if purpose==if class==2 {1}else{2})
             {
@@ -1368,12 +1570,17 @@ pub(crate) mod dns_v2 {
             }
             Ok(())
         } else {
-            if !matches!(class, 1 | 3)
-                || !matches!(super::Message::decode(super::Kind::Authorize,b)?,super::Message::Authorize(a) if a.class==class)
-            {
+            if !matches!(class, 1 | 3) {
                 return Err(Error::Reference);
             }
-            Ok(())
+            let super::Message::Authorize(a) = super::Message::decode(super::Kind::Authorize, b)?
+            else {
+                return Err(Error::Reference);
+            };
+            if a.class != class {
+                return Err(Error::Reference);
+            }
+            id(a.source_flow)
         }
     }
     fn numeric_destination(b: &[u8]) -> Result<u8> {
@@ -5346,9 +5553,265 @@ mod tests {
     }
     fn dns_v2_corpus() -> serde_json::Value {
         serde_json::from_str(include_str!(
-            "../../../tests/fixtures/xray-profile-channel-v3/dns-v2-canonical.json"
+            "../../../tests/fixtures/xray-profile-channel-v3/dns-v2-codec4.json"
         ))
         .unwrap()
+    }
+    #[test]
+    fn dns_v2_codec4_accepts_closed_service_and_hosts_paths() {
+        for hosts in [false, true] {
+            let mut body = vec![0u8; 85];
+            put16(&mut body, 0, 2);
+            put64(&mut body, 8, if hosts { 0 } else { 13 });
+            put64(&mut body, 16, 11);
+            put64(&mut body, 24, 7);
+            put64(&mut body, 40, 1000);
+            put16(&mut body, 48, 8);
+            put16(&mut body, 50, 1);
+            put16(&mut body, 52, if hosts { 0 } else { 1 });
+            put16(&mut body, 58, 1);
+            put16(&mut body, 60, if hosts { NONE } else { 0 });
+            put16(&mut body, 72, 2);
+            put16(&mut body, 78, if hosts { NONE } else { 0 });
+            body[80] = b'a';
+            assert!(dns_v2::View::<55>::decode(&body).is_ok(), "hosts={hosts}");
+        }
+    }
+    fn dns_v2_case_body(name: &str) -> Vec<u8> {
+        let corpus = dns_v2_corpus();
+        let v = corpus["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == name)
+            .unwrap();
+        let mut body = vec![0; v["size"].as_u64().unwrap() as usize];
+        dns_v2_fields(&mut body, &v["fields"]);
+        body
+    }
+    #[test]
+    fn dns_v2_codec4_preserves_all_86_codec3_body_and_frame_preimages() {
+        let old: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/dns-v2-canonical.json"
+        ))
+        .unwrap();
+        let new = dns_v2_corpus();
+        assert_eq!(old["vectors"].as_array().unwrap().len(), 86);
+        for (before, after) in old["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(new["vectors"].as_array().unwrap())
+        {
+            for key in [
+                "name",
+                "size",
+                "fields",
+                "bodyHex",
+                "frameHex",
+                "bodySha256",
+                "frameSha256",
+            ] {
+                assert_eq!(before[key], after[key], "{} {key}", before["name"]);
+            }
+            assert_eq!(
+                after["accepted"] == false,
+                before["name"] == "reserve-hosts"
+            );
+        }
+        assert_eq!(
+            new["codec3Basis"]["sha256"].as_str().unwrap(),
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(
+                    "../../../tests/fixtures/xray-profile-channel-v3/dns-v2-canonical.json"
+                ))
+            )
+        );
+    }
+    #[test]
+    fn dns_v2_codec4_roots_contexts_and_probe_selectors_do_not_alias_ids() {
+        use dns_v2::{Cancellation, DnsContext, Root, View};
+        let user = dns_v2_case_body("bundle-acquire-initial");
+        let service = dns_v2_case_body("acquire-service-initial");
+        let hosts = dns_v2_case_body("acquire-hosts-initial");
+        let user = View::<55>::decode(&user).unwrap();
+        let service = View::<55>::decode(&service).unwrap();
+        let hosts = View::<55>::decode(&hosts).unwrap();
+        assert!(matches!(user.root().unwrap(),Root::UserDns(id) if id.get()==13));
+        assert!(matches!(service.root().unwrap(),Root::BootstrapService(id) if id.get()==13));
+        assert_ne!(user.root().unwrap(), service.root().unwrap());
+        assert_eq!(hosts.root().unwrap(), Root::HostsPath);
+        assert!(user.selector().unwrap().is_none());
+        assert_eq!(service.selector().unwrap().unwrap().resolver, Some(0));
+        assert_eq!(hosts.selector().unwrap().unwrap().resolver, None);
+        assert!(user.authorization().is_ok());
+        assert!(service.authorization().is_err());
+        assert!(hosts.authorization().is_err());
+        assert!(hosts.renewal().is_err());
+        for label in ["service", "hosts"] {
+            let body = dns_v2_case_body(&format!("acquire-{label}-renew"));
+            let view = View::<55>::decode(&body).unwrap();
+            let (id, revision) = view.context_renewal().unwrap().unwrap();
+            assert_eq!(revision.get(), 1);
+            assert!(matches!(id,DnsContext::HostsPath(id) if id.get()==12) == (label == "hosts"));
+        }
+        let cancel = dns_v2_case_body("cancel-bundle");
+        assert!(
+            matches!(View::<47>::decode(&cancel).unwrap().reference().unwrap(),Cancellation::Context(id) if id.get()==12)
+        );
+        for label in ["service", "hosts"] {
+            let reserve = dns_v2_case_body(&format!("reserve-codec4-{label}"));
+            let numeric = dns_v2_case_body(&format!("numeric-codec4-{label}"));
+            let r = View::<35>::decode(&reserve).unwrap();
+            let n = View::<42>::decode(&numeric).unwrap();
+            assert_eq!(
+                r.bootstrap_selector().unwrap(),
+                n.bootstrap_selector().unwrap()
+            );
+            assert_eq!(
+                n.bootstrap_selector().unwrap().unwrap().resolver.is_none(),
+                label == "hosts"
+            );
+            assert!(n.authorization().is_err());
+            let base = &numeric[16..24];
+            assert_eq!(
+                Message::decode(Kind::Probe, base).is_err(),
+                label == "hosts"
+            );
+            let mut bad = numeric.clone();
+            bad[14] = 1;
+            assert!(View::<42>::decode(&bad).is_err());
+        }
+        // Legacy USER decoder не получает sourceFlow0 через новый DATA codec.
+        let mut authorization = dns_v2_case_body("bundle-acquire-initial")[72..].to_vec();
+        authorization[..8].fill(0);
+        assert!(Message::decode(Kind::Authorize, &authorization).is_err());
+    }
+    #[test]
+    fn dns_v2_codec4_ack_uses_exact_pending_variant_revision_and_frame_identity() {
+        use dns_v2::{DnsContext, DnsFrame, Envelope, Operation, Record};
+        let binding = Binding {
+            epoch: 7,
+            ..binding()
+        };
+        let request_header = Envelope {
+            sequence: 17,
+            reply_to: 0,
+            binding,
+        };
+        let reply_header = Envelope {
+            sequence: 19,
+            reply_to: 17,
+            binding,
+        };
+        let corpus = dns_v2_corpus();
+        for (key, accepted) in [("acquireReplies", true), ("rejectedAcquireReplies", false)] {
+            for pair in corpus[key].as_array().unwrap() {
+                let mut request_body = dns_v2_case_body(pair["request"].as_str().unwrap());
+                if let Some(patches) = pair.get("requestPatches") {
+                    dns_v2_fields(&mut request_body, patches);
+                }
+
+                let mut reply_body = dns_v2_case_body(pair["reply"].as_str().unwrap());
+                if let Some(patches) = pair.get("patches") {
+                    dns_v2_fields(&mut reply_body, patches);
+                }
+                let request = DnsFrame {
+                    header: request_header,
+                    record: Record::decode(Operation::BundleAcquire, &request_body).unwrap(),
+                };
+                let reply = DnsFrame {
+                    header: reply_header,
+                    record: Record::decode(Operation::BundleGranted, &reply_body).unwrap(),
+                };
+                assert_eq!(reply.acquired_context(&request).is_ok(), accepted, "{pair}");
+            }
+        }
+        for label in ["service", "hosts"] {
+            for shape in ["initial", "renew"] {
+                let request_body = dns_v2_case_body(&format!("acquire-{label}-{shape}"));
+                let reply_body = dns_v2_case_body(&format!("granted-{label}-{shape}"));
+                let request = DnsFrame {
+                    header: request_header,
+                    record: Record::decode(Operation::BundleAcquire, &request_body).unwrap(),
+                };
+                let reply = DnsFrame {
+                    header: reply_header,
+                    record: Record::decode(Operation::BundleGranted, &reply_body).unwrap(),
+                };
+                let id = reply.acquired_context(&request).unwrap();
+                assert!(
+                    matches!(id,DnsContext::HostsPath(id) if id.get()==12) == (label == "hosts")
+                );
+                let wrong_sequence = DnsFrame {
+                    header: Envelope {
+                        sequence: 18,
+                        ..request_header
+                    },
+                    record: request.record,
+                };
+                assert!(reply.acquired_context(&wrong_sequence).is_err());
+                let wrong_launch = DnsFrame {
+                    header: Envelope {
+                        binding: Binding {
+                            epoch: 6,
+                            ..binding
+                        },
+                        ..request_header
+                    },
+                    record: request.record,
+                };
+                assert!(reply.acquired_context(&wrong_launch).is_err());
+                for (offset, value) in [
+                    (8, 14),
+                    (16, if label == "hosts" { 13 } else { 0 }),
+                    (24, 12),
+                    (32, 8),
+                    (40, 1001),
+                    (56, 3),
+                ] {
+                    if offset == 8 && shape == "initial" {
+                        continue;
+                    }
+                    let mut bad = reply_body.clone();
+                    put64(&mut bad, offset, value);
+                    let record = Record::decode(Operation::BundleGranted, &bad).unwrap();
+                    assert!(
+                        DnsFrame {
+                            header: reply_header,
+                            record
+                        }
+                        .acquired_context(&request)
+                        .is_err(),
+                        "{label} {shape} {offset}"
+                    );
+                }
+                let mut bad = reply_body.clone();
+                put16(&mut bad, 48, 7);
+                assert!(
+                    DnsFrame {
+                        header: reply_header,
+                        record: Record::decode(Operation::BundleGranted, &bad).unwrap()
+                    }
+                    .acquired_context(&request)
+                    .is_err()
+                );
+            }
+        }
+        let network = dns_v2_case_body("acquire-service-initial");
+        let hosts = dns_v2_case_body("granted-hosts-initial");
+        assert!(
+            DnsFrame {
+                header: reply_header,
+                record: Record::decode(Operation::BundleGranted, &hosts).unwrap()
+            }
+            .acquired_context(&DnsFrame {
+                header: request_header,
+                record: Record::decode(Operation::BundleAcquire, &network).unwrap()
+            })
+            .is_err()
+        );
     }
     #[test]
     fn dns_v2_canonical_all_operations_roundtrip_stdlib_goldens() {
@@ -5370,6 +5833,10 @@ mod tests {
                 dns_v2_hex(v["bodySha256"].as_str().unwrap()),
                 "{name}"
             );
+            if v["accepted"] == false {
+                assert!(Record::decode(op, &body).is_err(), "basis {name}");
+                continue;
+            }
             let record = Record::decode(op, &body).unwrap_or_else(|e| panic!("{name}: {e:?}"));
             let mut output = vec![0xaa; body.len() + 8];
             assert_eq!(record.encode(&mut output).unwrap(), body.len());
@@ -5454,6 +5921,22 @@ mod tests {
             assert_eq!(decoded.record.operation(), op);
             assert_eq!(decoded.record.bytes(), body);
             assert!(
+                DnsFrame::decode(
+                    &packet,
+                    &neg,
+                    if issuer {
+                        Direction::Producer
+                    } else {
+                        Direction::Issuer
+                    },
+                    rights,
+                    credentials,
+                    reply
+                )
+                .is_err()
+            );
+
+            assert!(
                 super::Frame::decode(&packet, launch.binding, mode, issuer).is_err(),
                 "legacy {name}"
             );
@@ -5506,7 +5989,11 @@ mod tests {
             let ack = dns_v2_hex(n["ackHex"].as_str().unwrap());
             assert_eq!(Negotiated::descriptor(launch).unwrap().as_slice(), d);
             assert_eq!(Negotiated::ack(&d).unwrap().as_slice(), ack);
-            for schema in [b"YONIK-DNS-V2-CODEC-1\0", b"YONIK-DNS-V2-CODEC-2\0"] {
+            for schema in [
+                b"YONIK-DNS-V2-CODEC-1\0",
+                b"YONIK-DNS-V2-CODEC-2\0",
+                b"YONIK-DNS-V2-CODEC-3\0",
+            ] {
                 let mut old = d.clone();
                 old[208..240].copy_from_slice(&sha2::Sha256::digest(schema));
                 let mut old_ack = [0; 40];
@@ -5565,7 +6052,9 @@ mod tests {
             dns_v2_fields(&mut body, &case["fields"]);
             let view = View::<55>::decode(&body).unwrap();
             assert_eq!(view.query().unwrap().get(), 11);
-            assert_eq!(view.grant().unwrap().get(), 13);
+            assert!(
+                matches!(view.root().unwrap(),super::dns_v2::Root::UserDns(id) if id.get()==13)
+            );
             assert_eq!(view.renewal().unwrap().is_some(), renewal);
             if let Some((bundle, revision)) = view.renewal().unwrap() {
                 assert_eq!((bundle.get(), revision.get()), (12, 1));
