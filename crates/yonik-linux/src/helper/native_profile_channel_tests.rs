@@ -1340,6 +1340,7 @@ pub(super) struct Proof {
     receipt: wire::Receipt,
 }
 pub(super) struct Fake {
+    pub(super) static_dns_peer: Option<std::net::SocketAddr>,
     pub(super) numeric_delay: Duration,
     pub(super) dns_delay_on: Option<usize>,
     dns_checks: usize,
@@ -1364,6 +1365,7 @@ pub(super) struct Fake {
 impl Fake {
     fn new(mode: Mode) -> Self {
         Self {
+            static_dns_peer: None,
             numeric_delay: Duration::ZERO,
             udp_inbox: None,
             dns_delay_on: None,
@@ -1398,7 +1400,26 @@ impl Authority for Fake {
         if self.dns_delay_on == Some(self.dns_checks) {
             self.elapsed.fetch_add(25_000_000, Ordering::AcqRel);
         }
-        if !ticket.is_some_and(|id| self.live.contains(&id))
+        let allowed = if ticket.is_none() {
+            self.static_dns_peer.is_some_and(|peer| {
+                super::dns_route_socket_matches(
+                    peer.ip(),
+                    peer.port(),
+                    if facts.protocol() == 6 {
+                        crate::TransportProtocol::Tcp
+                    } else {
+                        crate::TransportProtocol::Udp
+                    },
+                    Some("192.0.2.10".parse().unwrap()),
+                    997,
+                    42,
+                    facts,
+                )
+            })
+        } else {
+            ticket.is_some_and(|id| self.live.contains(&id))
+        };
+        if !allowed
             || facts.local().ip() != "192.0.2.10".parse::<std::net::IpAddr>().unwrap()
             || facts.uid() != 997
             || facts.mark() != 42
@@ -1562,6 +1583,9 @@ impl Authority for Fake {
         _: u64,
         _: Tuple,
     ) -> Result<Option<u64>, ServiceError> {
+        if matches!(request, RouteRequest::Static(_)) && self.static_dns_peer.is_some() {
+            return Ok(None);
+        }
         if self.fail_route_at == Some(self.route_count + 1) {
             return Err(ServiceError::Busy);
         }

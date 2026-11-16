@@ -1296,6 +1296,61 @@ eligibility не является installed authority. Positive tests испол
 injected reviewed record и fake route/owner/capture operations. Core/Host/network/
 OS wrappers не исполнялись, public gates false, runtime acceptance не заявляется.
 
+### USER ProxiedLogical + Append: CODEC3 SOURCE/PURE cut
+
+`dns_transport_binding` выводит из всего live checked bundle два разных target:
+logical resolver peer и actual numeric physical frontier. Последний следует
+carrier→nextInput через manifest path; Physical Reserve/SCM сверяет terminal
+scope/subject/branch/endpoint/hop и actual peer/socket/source/netns/route ticket.
+Resolver не подставляется вместо proxy first hop. Hostname physical frontier,
+loopback, peerless UDP, service flow0 и bootstrap здесь Unsupported.
+System `RouteAuthority::dns_socket` принимает typed optional dynamic ticket:
+Some проверяет retained dynamic route, None — только exact captured non-DNS
+static route из SessionArtifact после существующего session/network fence.
+Обе ветки сверяют peer/port/carrier/preferred source/worker UID/socket mark;
+namespace независимо проверяется retained socket evidence. None сам proof не
+создаёт и не означает отсутствие проверки. Local attribution не добавлена.
+
+`run_issuer → dns_bundle::dispatch → logical_dns/append_dns` обслуживает CODEC3
+38/39/43/44. Retained proof — distinct `Direct(resource)` либо
+`Proxied(Box<ProxyResources>)`, ordered union≤64 и private LogicalLineage с exact
+binding/exchange/producerSequence. Direct count1/kind1 сохранён; чужой kind,
+resource/query/bundle/epoch/frontier и direct proof для proxy отвергаются.
+
+Append требует текущую ACKed revision, sequence1 затем строго +1, один pending,
+новые distinct ACKed resources того же immutable binding. Fixed-capacity union
+оплачен до allocation; physical FD/pending/memory/history precredits прежние.
+Все старые/новые kernel facts и весь bundle повторно fence-ятся после backend.
+До ACK resources retained, но новая revision не usable; successful send commit
+меняет revision, original expiry не продлевается. Lost/uncertain ACK удерживает
+custody и запрещает Publish/новый Append. Queued cancel drain предшествует Append
+effects и каждому send/retry. Приём Publish/Append до ACK оставляет request denial
+tombstone: очередь не делает раннее использование допустимым после ACK.
+
+Publish freeze требует exact current ACKed revision/union и отдельный logical
+lineage anchor. После Publish Append запрещён. Strict RRset parser и separate
+waiter/USER Numeric authority сохранены. Proxy Numeric consumer не добавлен.
+Proof retirement проверяет все retained refs/pending/reservations и protected
+consumer joins; receiver не закрывается в Proof фазе. Resource phase consuming
+close каждого socket/ns handle происходит один раз, credits освобождаются после
+его ACK. Общий cleanup deadline=min всех original resource cleanup windows,
+без owner expiry renewal. Partial close/uncertain send — sticky Unknown,
+не повторный raw close и не KnownClosed. Bundle route tickets отдельно.
+
+**Конкретный remaining producer seam:** `Channel::dns_logical_producer` по
+умолчанию возвращает None; `VerifiedDnsLogicalProducer` не имеет production
+constructor. `registry.rs` сейчас знает только direct-dns-bound-request-response-v1
+и direct-dns-consuming-close-join-v1 (`DNS_WIRE_REVIEWED_PATCH=None`). Они не
+mint-ят logical token. Нужен отдельно reviewed protected installed contract,
+связанный existing retained image/config/manifest/exact launch custody, который
+подтверждает actual handler/stream→query/exchange lineage, ordered physical
+union/revisions, plaintext request/response и consuming-close/all-task joins.
+После такого source review его trusted producer подключается к этому Channel
+endpoint; wire/layout менять не требуется. Child ID/FD/hash/ACK и Direct record
+эту authority не заменяют. Ни registry/builder/pins, ни Go здесь не изменены.
+Pure driver inject-ит отдельный logical token только как fake source fact;
+это не installed proof. Public gates и production mint остаются закрыты.
+
 ### StubBind: bounded listener observation, не service authority
 
 `helper/resolver_stub.rs` отделяет retained sampled observation от policy issuer.

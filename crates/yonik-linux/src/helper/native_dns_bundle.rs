@@ -86,29 +86,58 @@ pub(super) fn decode<'a>(
     DnsFrame::decode(bytes, neg, direction, 0, 0, reply).map_err(unavailable)
 }
 impl<A: Authority> Issuer<A> {
-    pub(super) fn direct_dns_binding(
+    pub(super) fn dns_transport_binding(
         &self,
         id: u64,
     ) -> Result<super::dns_transport::Binding, ServiceError> {
         let expires = self.bundle_live(id)?;
         let b = self.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
-        if b.hops.len() != 1 {
-            return Err(ServiceError::Unsupported);
-        }
-        let h = &b.hops[0];
+        let h = b.hops.first().ok_or(ServiceError::Unsupported)?;
+        let physical = b.hops.last().ok_or(ServiceError::Unsupported)?;
         let cap = self.capsule()?;
         let dial = cap.dial_scope(h.scope, h.branch).map_err(unavailable)?;
         let resolver = cap.resolver_scope(b.resolver).map_err(unavailable)?;
         let grant = self.grants.get(&b.root).ok_or(ServiceError::Unavailable)?;
-        if dial.action != 3
-            || dial.next.is_some()
-            || h.carrier != resolver.peer.protocol
-            || resolver.peer.family == 3
-        {
+        if resolver.peer.family == 3 {
             return Err(ServiceError::Unsupported);
         }
         reject_unproved_stub(resolver.peer)?;
+        let proxied = b.hops.len() != 1 || dial.action != 3;
+        // Путь уже checked acquire_bundle; physical target выводится повторно
+        // из manifest, не из child PhysicalBind/логического resolver peer.
+        let mut target = resolver.peer;
+        let mut frontier = u16::MAX;
+        for hop in &b.hops {
+            let d = cap.dial_scope(hop.scope, hop.branch).map_err(unavailable)?;
+            if d.next.is_some() {
+                target = d.endpoint.ok_or(ServiceError::Unsupported)?;
+                frontier = d.endpoint_index;
+            } else {
+                target = match d.action {
+                    1 => {
+                        frontier = d.endpoint_index;
+                        d.endpoint.ok_or(ServiceError::Unsupported)?
+                    }
+                    3 => wire::Destination {
+                        protocol: d.carrier,
+                        ..target
+                    },
+                    _ => return Err(ServiceError::Unsupported),
+                };
+            }
+        }
+        if target.family == 3 || target.protocol != physical.carrier {
+            return Err(ServiceError::Unsupported);
+        }
+        reject_unproved_stub(target)?;
         Ok(super::dns_transport::Binding {
+            proxied,
+            physical_peer: Target::copy(target)?,
+            physical_scope: physical.scope,
+            physical_subject: physical.subject,
+            physical_endpoint: frontier,
+            physical_branch: physical.branch,
+            physical_hop: physical.index,
             bundle: id,
             revision: b.revision,
             root: b.root,
@@ -126,7 +155,7 @@ impl<A: Authority> Issuer<A> {
             base: b.base_hash,
             name: Target::host(&grant.query, 53)?,
             peer: Target::copy(resolver.peer)?,
-            ticket: h.ticket,
+            ticket: physical.ticket,
             expires,
         })
     }
@@ -630,13 +659,16 @@ pub(super) fn dispatch<A: Authority>(
     };
     if matches!(
         frame.record,
-        Record::Reserve(_) | Record::LogicalBind(_) | Record::Retire(_)
+        Record::Reserve(_) | Record::LogicalBind(_) | Record::Append(_) | Record::Retire(_)
     ) {
+        if matches!(frame.record, Record::Append(_)) && !issuer.unknown {
+            drain(issuer)?;
+        }
         let response = super::dns_transport::handle(issuer, socket, reply, frame.record, session)?;
         if !issuer.unknown {
             drain(issuer)?;
         }
-        return super::dns_transport::send_reply(issuer, socket, stop, sequence, response);
+        return super::dns_transport::send_reply(issuer, socket, stop, sequence, response, drain);
     }
     let mut body = [0; 64];
     body[..2].copy_from_slice(&2u16.to_be_bytes());
