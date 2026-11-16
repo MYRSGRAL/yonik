@@ -1076,6 +1076,59 @@ user-DNS source: canonical55 сейчас допускает только AUTHOR
 require_consumer, builder_apply/Connect остаются false; Go runtime parity и
 полный P5/runtime acceptance этим SOURCE/PURE milestone не заявляются.
 
+### DirectSocket DNS transport: Reserve → SCM → LogicalBind (SOURCE/PURE)
+
+`native_dns_transport.rs` подключён к actual serialized `run_issuer` и
+`SystemChannel` (он же Local owner channel). Canonical CODEC2 wire не меняется.
+Поддержанный authority shape: manifest-bound USER-DNS class3 bundle, ровно один
+Freedom Direct hop, nonloopback numeric resolver, TCP либо connected UDP.
+Reserve35 role1 выдаёт отдельные Reservation/Exchange IDs; role2 сверяет parent
+exchange, query/bundle/root/source flow+revision/epoch, original/query/base,
+resolver/options/type, derived subject/scope/branch/carrier. Resource FD не
+становится USER owner proof и не наследует accepted-TCP ingress provenance.
+
+PhysicalBind52 остаётся raw192/FD1/credentials1 на existing proof endpoint.
+Receiver проверяет actual sender и launch binding, владеет полученным FD,
+делает kernel socket type/protocol/local/peer/cookie/inode/UID/SO_MARK checks,
+получает actual socket nsfs FD через существующий SIOCGSKNS wrapper и сравнивает
+с retained namespace stamp. System `ProfileRoutes::dns_socket` независимо
+сверяет actual source address с captured route preferred_source, peer/port,
+carrier/mark/worker UID и повторяет durable backend fence по retained ticket.
+Нет ptrace fallback или новых caps. Local не получает System attribution:
+недоступный SIOCGSKNS остаётся Unsupported, namespace claim от child не принимается.
+
+Raw SCM и runtime reservation проходят bounded rendezvous в обоих arrival orders.
+До совпадения нет PhysicalResourceId/ACK/use. PhysicalAck37 отвечает на исходный
+Physical Reserve sequence; runtime pending35 сохраняется между Reserved36 и37.
+LogicalBind38 Direct/count1 требует уже ACKed resource с тем же exchange/bundle/
+query/path и full freshness. ACK39 создаёт отдельный retained DirectProof,
+revision1, immutable resource membership и producerSequence. Kind2 Proxy и
+guarded peerless UDP не превращаются в Direct proof.
+
+Все pending/FD leases используют общий rendezvous64. Physical reservation заранее
+оплачивает18 FD credits (retained pair + bounded16 scratch); receive отдельно
+получает16 scratch credits до recvmsg, после pairing retained debit уменьшается
+до2. Это консервативный bounded admission, не обещание64 concurrent resources.
+Memory precredits покрывают retained maps/FD facts до materialization; Reservation
+заранее оплачивает собственный и будущий Resource/Proof history entry. Temporary
+history claim удерживается до чтения raw packet, возвращается на WouldBlock,
+commit-ится в общем invocation ledger; history256 не compact/evict/reuse.
+R37 retired-request fence применяется до Reserve effects. Cancel drain учитывает
+уже полученные SCM rights до публикации ACK. Pending ADMIT renewal не разрешает
+PhysicalAck; после slow kernel/backend checks выполняется новый deadline fence,
+Known≤20ms и original reservation expiry не продлеваются.
+
+Retire45/46 реализован только как typed Unknown custody report для существующего
+resource/proof. Source-reviewed Go duplicate-close/join producer для DNS ещё не
+подтверждён: Request45 не является independent closed proof. Поэтому нет
+выдуманного joined1/KnownClosed; FD/namespace, credits, bundle и durable tickets
+удерживаются до existing actual-worker-closed + rules-KnownClosed supervisor
+fence. Cancel после published Physical reservation также не выдаёт KnownClosed.
+Wrong/replayed/late SCM закрывает unexpected rights и отзывает context; очищенные
+known-only reservations не отзывают соседний bundle. Append43/44, ProxiedLogical,
+PROBE flow0, loopback StubBind, hostname bootstrap и Publish/Waiter/Numeric
+остаются Unsupported. Public flags/protected allowlist/readiness не меняются.
+
 ### StubBind: bounded listener observation, не service authority
 
 `helper/resolver_stub.rs` отделяет retained sampled observation от policy issuer.

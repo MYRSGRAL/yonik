@@ -12,7 +12,7 @@ struct BundleIo {
     history: Option<Arc<std::sync::Mutex<InvocationHistory>>>,
     delayed_send: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU64>>>,
 }
-fn dns_neg(record: LaunchRecord) -> wire::dns_v2::Negotiated {
+pub(super) fn dns_neg(record: LaunchRecord) -> wire::dns_v2::Negotiated {
     let d = wire::dns_v2::Negotiated::descriptor(record).unwrap();
     wire::dns_v2::Negotiated::accept(
         &d,
@@ -22,7 +22,7 @@ fn dns_neg(record: LaunchRecord) -> wire::dns_v2::Negotiated {
     )
     .unwrap()
 }
-fn dns_packet(
+pub(super) fn dns_packet(
     record: LaunchRecord,
     sequence: u64,
     kind: wire::dns_v2::Operation,
@@ -129,13 +129,23 @@ impl Channel for BundleIo {
     }
     fn writable_until(&self, _: Instant) {}
 }
-fn bundle_fixture(mode: Mode, chain: bool) -> (Issuer<Fake>, Vec<u8>) {
+pub(super) fn bundle_fixture(mode: Mode, chain: bool) -> (Issuer<Fake>, Vec<u8>) {
+    bundle_fixture_network(mode, chain, false)
+}
+pub(super) fn bundle_fixture_network(
+    mode: Mode,
+    chain: bool,
+    tcp: bool,
+) -> (Issuer<Fake>, Vec<u8>) {
     use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent};
-    let graph = if chain {
+    let mut graph = if chain {
         serde_json::json!({"outbounds":[{"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":"203.0.113.10","port":8388,"method":"aes-128-gcm","password":"fixture"}]},"proxySettings":{"tag":"direct","transportLayer":true}},{"tag":"direct","protocol":"vless","settings":{"vnext":[{"address":"203.0.113.11","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}],"dns":{"tag":"proxy","servers":["192.0.2.53"]}})
     } else {
         serde_json::json!({"outbounds":[{"tag":"direct","protocol":"freedom"}],"dns":{"tag":"direct","servers":["192.0.2.53"]}})
     };
+    if tcp {
+        graph["dns"]["servers"] = serde_json::json!(["tcp://192.0.2.53:53"]);
+    }
     let intent =
         ProfileIntent::decode(&serde_json::json!({"version":1,"graph":graph}).to_string()).unwrap();
     let mut plan =
@@ -1341,18 +1351,20 @@ pub(super) struct Proof {
     receipt: wire::Receipt,
 }
 pub(super) struct Fake {
+    pub(super) dns_delay_on: Option<usize>,
+    dns_checks: usize,
     udp_inbox: Option<Arc<std::sync::Mutex<Rendezvous<u8>>>>,
     service_trusted: bool,
     mode: Mode,
     now: Instant,
-    elapsed: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) elapsed: Arc<std::sync::atomic::AtomicU64>,
     known: bool,
     revoked: AtomicBool,
     owner_count: u64,
-    route_count: u64,
+    pub(super) route_count: u64,
     service_routes: Vec<Target>,
     released: Vec<u64>,
-    live: BTreeSet<u64>,
+    pub(super) live: BTreeSet<u64>,
     route_delay: Duration,
     pub(super) unknown_release: bool,
     release_attempts: usize,
@@ -1363,6 +1375,8 @@ impl Fake {
     fn new(mode: Mode) -> Self {
         Self {
             udp_inbox: None,
+            dns_delay_on: None,
+            dns_checks: 0,
             service_trusted: false,
             mode,
             now: Instant::now(),
@@ -1383,6 +1397,26 @@ impl Fake {
     }
 }
 impl Authority for Fake {
+    fn dns_socket(
+        &mut self,
+        ticket: Option<u64>,
+        facts: &dns_transport::Facts,
+    ) -> Result<(), ServiceError> {
+        self.fence()?;
+        self.dns_checks += 1;
+        if self.dns_delay_on == Some(self.dns_checks) {
+            self.elapsed.fetch_add(25_000_000, Ordering::AcqRel);
+        }
+        if !ticket.is_some_and(|id| self.live.contains(&id))
+            || facts.local().ip() != "192.0.2.10".parse::<std::net::IpAddr>().unwrap()
+            || facts.uid() != 997
+            || facts.mark() != 42
+            || facts.namespace() != (4, 5)
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
     fn service(
         &mut self,
         _: [u8; 32],

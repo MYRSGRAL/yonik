@@ -247,6 +247,19 @@ pub(crate) mod dns_v2 {
             ParentClass::try_from(self.bytes[77])
         }
     }
+    impl<'a> View<'a, 35> {
+        pub(crate) fn original(self) -> &'a [u8] {
+            let n = usize::from(n16(self.bytes, 80));
+            &self.bytes[96..96 + n]
+        }
+        pub(crate) fn query_name(self) -> &'a [u8] {
+            let at = 96 + usize::from(n16(self.bytes, 80));
+            &self.bytes[at..at + usize::from(n16(self.bytes, 82))]
+        }
+        pub(crate) fn base(self) -> &'a [u8] {
+            &self.bytes[96 + usize::from(n16(self.bytes, 80)) + usize::from(n16(self.bytes, 82))..]
+        }
+    }
     impl View<'_, 40> {
         pub(crate) fn purpose(self) -> Result<Purpose> {
             Purpose::try_from(self.bytes[136])
@@ -666,6 +679,9 @@ pub(crate) mod dns_v2 {
     /// SCM packet имеет собственный identity envelope192, без runtime Header128.
     pub(crate) struct PhysicalPacket<'a>(View<'a, 52>);
     impl<'a> PhysicalPacket<'a> {
+        pub(crate) fn view(&self) -> View<'a, 52> {
+            self.0
+        }
         pub(crate) fn decode(
             bytes: &'a [u8],
             neg: &Negotiated,
