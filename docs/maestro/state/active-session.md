@@ -571,6 +571,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   bootstrap requirement ещё требуют расширения разрешённого source scope.
   Rust автор параллельно завершает уже разрешённый netgo snapshot parser.
 
+- Netgo parser5c55a0c интегрирован после R32 SOURCE scoped CLEAN: NSS duplicate
+  source order/case/literal-space/CGO0 fallback, resolv first3/default/search/
+  decimal saturation и hosts aliases/IP order сверены с retained Go1.27.1.
+  Source custody/FD/hash/epoch/YNKDNS01/golden не изменены. Автор10namedpure,
+  no-run/linux+desktop all-targets clippy/fmt PASS; source3101members bound,
+  собственная сборка очищена. R32 не исполнял tests/runtime; крайние vectors
+  saturation/alias count/line buffer остаются отдельными coverage gaps.
+  Full P5/runtime не PASS; DNS completion scope approval всё ещё ожидается.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
