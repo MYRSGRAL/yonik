@@ -551,6 +551,16 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   →per-waiter authority→numeric leaf; retained DNS transport proof ещё требует
   конкретного source contract. Новые DNS-файлы из записки не разрешались к записи.
 
+- Desktop native Connect f14d449 интегрирован после R30 SOURCE scoped CLEAN:
+  opaque re-resolve/CAS и generation/cancel fences, Local trusted snapshot/
+  CheckedConfig/LocalSession и System FullProfileRequest/prepare/apply используют
+  существующий lifecycle. Server flattening/global draft/preset override для
+  native отсутствуют; Stop/recovery и legacy autoconnect refusal сохранены.
+  Автор4pure/all-targets clippy/fmt/Qt parse PASS, сборка очищена; successful
+  native launch и post-Prepare cancellation/bind failure этими тестами не
+  исполнялись. Unapplied artifact остаётся под bounded helper TTL/peer custody.
+  Public admission/can_connect false, full P6/runtime/installed PASS не заявлен.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
