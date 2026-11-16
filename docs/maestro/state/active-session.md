@@ -428,6 +428,27 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
 
 ## Ограничения
 
+Актуализация root 2026-11-16:
+
+- Приняты SOURCE corrections R9 H1/mux custody, R12 cancellation evidence,
+  R14 System USER DNS и R17 physical pool candidate. Root fixes614dfa4/21d7c90
+  имеют RED/GREEN evidence и узкие CLOSED rechecks. Gates остаются false.
+- Rust Local FD/issuer/System TCP proof и Go counterpart интегрированы обычными
+  merge. Compile/pure/source review не означают runtime acceptance.
+- UDP v2 остаётся SOURCE/PURE реализацией в двух author worktree; протокол
+  не допущен к runtime. Draft cebff4f фиксирует buffers до GRANT и общий cap
+  tombstones; безопасная compaction ещё не доказана, long-lived UDP не ready.
+- Дополнение Go scope `app/dns/dns.go`, `app/dns/nameserver.go` и их pure tests
+  запрошено у пользователя и пока НЕ подтверждено. Эти файлы не менять.
+  Независимые разрешённые направления продолжаются.
+- Подготовительный desktop adapter84b45d7 переводит local import/review DTO
+  на ProfileImportReport и approve_local_profiles: один root не flatten-ится.
+  Три named pure tests, desktop no-run/all-targets clippy/fmt PASS; полные3093
+  source members привязаны к commit. Evidence p6-root-import вне TTL,
+  собственный target очищен. Это compile-only подготовка к P6; список/selection/
+  Connect и Xray-only controls ещё не переключены, полный P6 не PASS.
+- Установленное приложение по-прежнему e14aeae6c0cd; обновление не выполнено.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
