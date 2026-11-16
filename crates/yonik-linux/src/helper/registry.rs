@@ -247,6 +247,16 @@ impl TrustedRegistry {
         self.snapshot_for_uid(engine, 0)
     }
 
+    /// Native snapshot требует protected producer contract до чтения image.
+    pub fn full_profile_snapshot(&self) -> Result<BinarySnapshot, RegistryError> {
+        self.entries
+            .iter()
+            .find(|entry| entry.engine.engine() == Engine::Xray)
+            .and_then(|entry| entry.producer.as_ref())
+            .ok_or(RegistryError::MissingEngine)?;
+        self.snapshot(Engine::Xray)
+    }
+
     fn snapshot_for_uid(&self, engine: Engine, uid: u32) -> Result<BinarySnapshot, RegistryError> {
         self.snapshot_with_budget(engine, uid, executable_budget())
     }
@@ -483,6 +493,10 @@ mod tests {
     fn protected_record_legacy_modes_owner_and_nofollow_without_snapshot() {
         let fixture = Fixture::new();
         assert!(fixture.registry().unwrap().entries[0].producer.is_none());
+        assert_eq!(
+            fixture.registry().unwrap().full_profile_snapshot().err(),
+            Some(RegistryError::MissingEngine)
+        );
         fixture.manifest(&serde_json::json!({"schema":2,"engines":[entry("xray")]}));
         assert!(fixture.registry().unwrap().entries[0].producer.is_none());
         let mut installed = entry("xray");

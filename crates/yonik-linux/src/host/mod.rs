@@ -19,6 +19,24 @@ use std::fmt;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullProfileMode {
+    Local,
+    System,
+}
+
+/// Ранний отказ до binary/config/IPC effects; не выдаёт launch authority.
+/// Проверки image, источников и режима при подготовке остаются обязательными.
+pub fn full_profile_preflight(mode: FullProfileMode) -> Result<(), HostError> {
+    match mode {
+        FullProfileMode::Local | FullProfileMode::System => {
+            crate::helper::native_profile_channel::require_consumer()
+                .map(|_| ())
+                .map_err(|_| HostError::Unsupported)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostError {
     InvalidBinary,
     BinaryIo,
@@ -156,6 +174,22 @@ impl Cancellation {
             Err(HostError::Cancelled)
         } else {
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod full_profile_preflight_tests {
+    #[test]
+    fn closed_admission_refuses_both_modes_without_effects() {
+        for mode in [
+            super::FullProfileMode::Local,
+            super::FullProfileMode::System,
+        ] {
+            assert_eq!(
+                super::full_profile_preflight(mode),
+                Err(super::HostError::Unsupported)
+            );
         }
     }
 }
