@@ -41,6 +41,25 @@ COMMAND_TIMEOUT = 180
 BUILD_TIMEOUT = 900
 
 
+def dns_release_candidate(record: dict[str, object]) -> dict[str, object]:
+    """Compile-only запрос review; protected install authority здесь не создаётся."""
+    candidate = dict(record)
+    candidate["dns_release"] = {
+        "contract": "direct-dns-consuming-close-join-v1",
+        "version": 1,
+        "contract_sha256": hashlib.sha256(
+            b"direct-dns-consuming-close-join-v1\0"
+        ).hexdigest(),
+        "schema_sha256": hashlib.sha256(b"YONIK-DNS-V2-CODEC-3\0").hexdigest(),
+    }
+    return {
+        "validation": "COMPILE_ONLY_CANDIDATE",
+        "install_authority": False,
+        "requires_factory_ownership_review": True,
+        "candidate_record": candidate,
+    }
+
+
 class BuildError(RuntimeError):
     """Сборка остановлена; оставленные исходники и логи требуют проверки."""
 
@@ -563,6 +582,8 @@ def build_locked(
         }
         with (output / "native-profile-producer.json").open("x") as stream:
             stream.write(json.dumps(record, indent=2) + "\n")
+        with (output / "native-profile-dns-release-candidate.json").open("x") as stream:
+            stream.write(json.dumps(dns_release_candidate(record), indent=2) + "\n")
     destination = output / engine
     with binary.open("rb") as incoming, destination.open("xb") as outgoing:
         shutil.copyfileobj(incoming, outgoing)

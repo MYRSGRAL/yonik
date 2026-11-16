@@ -80,15 +80,36 @@ struct ProducerRecord {
     toolchain_sha256: String,
     build_inputs_sha256: String,
     elf_sha256: String,
+    #[serde(default)]
+    dns_release: Option<DnsReleaseRecord>,
 }
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DnsReleaseRecord {
+    contract: String,
+    version: u32,
+    contract_sha256: String,
+    schema_sha256: String,
+}
+// Root должен отдельно принять actual factory/Conn ownership и exact patch.
+// Старый UDP pin не является DNS consuming-close/join authority.
+const DNS_REVIEWED_PATCH: Option<&str> = None;
 // Семантический contract отдельно от artifact pin. Новый DNS patchset должен
 // пройти root source review и обновить allowlist до trusted install.
 const PRODUCER_PATCH: &str = "205b5337b8c38c608e4a341885dfe02174b33761e4dfda7724432359e84910c6";
 #[derive(Clone)]
 pub(crate) struct ImageContract {
     image: [u8; 32],
+    dns_release: bool,
 }
 impl ImageContract {
+    pub(crate) fn check_dns(&self, image: [u8; 32]) -> Result<(), RegistryError> {
+        self.check(image)?;
+        if !self.dns_release {
+            return Err(RegistryError::Version);
+        }
+        Ok(())
+    }
     pub(crate) fn check(&self, image: [u8; 32]) -> Result<(), RegistryError> {
         if self.image != image {
             Err(RegistryError::HashMismatch)
@@ -99,6 +120,13 @@ impl ImageContract {
 }
 impl ProducerRecord {
     fn validate(&self, image: Sha256) -> Result<ImageContract, RegistryError> {
+        self.validate_dns_pin(image, DNS_REVIEWED_PATCH)
+    }
+    fn validate_dns_pin(
+        &self,
+        image: Sha256,
+        reviewed_dns: Option<&str>,
+    ) -> Result<ImageContract, RegistryError> {
         if self.contract != "yonik-xray-profile-udp-v2"
             || self.version != 1
             || self.source_commit != "a4a3dff5b20c2faae567b742c172c7b95e75c083"
@@ -126,8 +154,59 @@ impl ProducerRecord {
         if actual.0 != image.0 {
             return Err(RegistryError::HashMismatch);
         }
-        Ok(ImageContract { image: image.0 })
+        let dns_release = if let Some(record) = &self.dns_release {
+            use sha2::Digest;
+            let digest = |value: &[u8]| format!("{:x}", sha2::Sha256::digest(value));
+            if record.contract != "direct-dns-consuming-close-join-v1"
+                || record.version != 1
+                || record.contract_sha256 != digest(b"direct-dns-consuming-close-join-v1\0")
+                || record.schema_sha256 != digest(b"YONIK-DNS-V2-CODEC-3\0")
+            {
+                return Err(RegistryError::Version);
+            }
+            reviewed_dns == Some(self.patch_sha256.as_str())
+        } else {
+            false
+        };
+        Ok(ImageContract {
+            image: image.0,
+            dns_release,
+        })
     }
+}
+
+#[cfg(test)]
+fn fake_dns_record(image: [u8; 32]) -> ProducerRecord {
+    use sha2::Digest;
+    let mut encoded = String::with_capacity(64);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in image {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    let value = serde_json::json!({"contract":"yonik-xray-profile-udp-v2","version":1,
+        "source_commit":"a4a3dff5b20c2faae567b742c172c7b95e75c083",
+        "source_sha256":"16".repeat(32),"patch_sha256":PRODUCER_PATCH,
+        "builder_sha256":"12".repeat(32),"toolchain_sha256":"13".repeat(32),
+        "build_inputs_sha256":"14".repeat(32),"elf_sha256":encoded,
+        "dns_release":{"contract":"direct-dns-consuming-close-join-v1","version":1,
+            "contract_sha256":format!("{:x}",sha2::Sha256::digest(b"direct-dns-consuming-close-join-v1\0")),
+            "schema_sha256":format!("{:x}",sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-3\0"))}});
+    serde_json::from_value(value).unwrap()
+}
+#[cfg(test)]
+pub(crate) fn fake_dns_image(image: [u8; 32]) -> ImageContract {
+    let record = fake_dns_record(image);
+    assert!(
+        record
+            .validate(Sha256(image))
+            .unwrap()
+            .check_dns(image)
+            .is_err()
+    );
+    record
+        .validate_dns_pin(Sha256(image), Some(PRODUCER_PATCH))
+        .unwrap()
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -409,6 +488,41 @@ fn validate_regular_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dns_release_record_schema_contract_image_and_separate_review_pin() {
+        let image = crate::host::Sha256([17; 32]);
+        let mut record = super::fake_dns_record(image.0);
+        assert!(record.validate(image).unwrap().check_dns(image.0).is_err());
+        assert!(
+            record
+                .validate_dns_pin(image, Some(super::PRODUCER_PATCH))
+                .unwrap()
+                .check_dns(image.0)
+                .is_ok()
+        );
+        for field in [0, 1, 2, 3] {
+            let mut bad = record.clone();
+            let dns = bad.dns_release.as_mut().unwrap();
+            match field {
+                0 => dns.contract = "unknown".into(),
+                1 => dns.version = 2,
+                2 => dns.contract_sha256 = "11".repeat(32),
+                _ => dns.schema_sha256 = "11".repeat(32),
+            }
+            assert!(
+                bad.validate_dns_pin(image, Some(super::PRODUCER_PATCH))
+                    .is_err()
+            );
+        }
+        record.dns_release = None;
+        assert!(
+            record
+                .validate_dns_pin(image, Some(super::PRODUCER_PATCH))
+                .unwrap()
+                .check_dns(image.0)
+                .is_err()
+        );
+    }
     #[test]
     fn producer_pin_matches_reviewed_adapter_metadata() {
         let metadata: serde_json::Value = serde_json::from_str(include_str!(

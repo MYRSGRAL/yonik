@@ -52,6 +52,40 @@ pub fn socket_namespace(socket: impl AsFd) -> io::Result<OwnedFd> {
 pub fn profile_socket_mark(socket: impl AsFd) -> io::Result<u32> {
     udp_raw::mark(socket.as_fd())
 }
+/// Consuming close ровно двух retained handles. Даже EINTR не повторяется:
+/// numeric FD после close больше не принадлежит caller. Ошибка означает Unknown.
+pub fn close_profile_socket(socket: OwnedFd, namespace: OwnedFd) -> io::Result<()> {
+    close_pair(socket, namespace, raw::consume_close)
+}
+fn close_pair<T>(
+    socket: T,
+    namespace: T,
+    mut close: impl FnMut(T) -> io::Result<()>,
+) -> io::Result<()> {
+    let first = close(socket);
+    let second = close(namespace);
+    first.and(second)
+}
+
+#[cfg(test)]
+mod consuming_close_tests {
+    #[test]
+    fn consuming_close_pair_never_retries_uncertain_handle_and_consumes_neighbor() {
+        for fail in [None, Some(1), Some(2)] {
+            let mut seen = Vec::new();
+            let result = super::close_pair(1, 2, |fd| {
+                seen.push(fd);
+                if fail == Some(fd) {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(seen, [1, 2]);
+            assert_eq!(result.is_ok(), fail.is_none());
+        }
+    }
+}
 
 /// Только fixed IPv4 UDP profile socket; не general setsockopt/recvmsg API.
 pub struct UdpPeek {
@@ -255,9 +289,18 @@ mod raw {
     use rustix::ioctl::{Ioctl, IoctlOutput, Opcode};
     use std::{
         ffi::c_void,
-        os::fd::{BorrowedFd, FromRawFd, OwnedFd},
+        os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
     };
     struct SocketNamespace;
+    pub(super) fn consume_close(fd: OwnedFd) -> std::io::Result<()> {
+        let raw = fd.into_raw_fd();
+        // SAFETY: owned handle consumed exactly once; no retry even on EINTR.
+        if unsafe { libc::close(raw) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
     // SAFETY: SIOCGSKNS=0x894c, arg=NULL, result — новый kernel-owned FD.
     // Никаких user pointers, setns или caller-provided ioctl numbers.
     unsafe impl Ioctl for SocketNamespace {

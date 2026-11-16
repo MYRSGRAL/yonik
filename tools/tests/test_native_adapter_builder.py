@@ -255,6 +255,7 @@ class BuilderTests(unittest.TestCase):
         adapter = builder.DEFAULT_PATCH.parents[2] / "xray" / builder.XRAY_TAG
         codec = json.loads((adapter / "native-broker-codec.json").read_text())
         full = json.loads((adapter / "native-full-profile.json").read_text())
+        accepted_fixture_pin = full["patch_sha256"]
         phase = False
         original_hash = builder.sha256
 
@@ -294,6 +295,8 @@ class BuilderTests(unittest.TestCase):
             patch.object(builder, "sha256", side_effect=digest),
             patch.object(builder.Runner, "run", autospec=True, side_effect=run),
             patch.object(builder, "toolchain_digest", return_value="15" * 32),
+            # Только fake reviewed pin; production allowlist не следует metadata.
+            patch.object(builder, "PROFILE_PATCH", accepted_fixture_pin),
         ):
             builder.build(
                 self.root,
@@ -305,7 +308,20 @@ class BuilderTests(unittest.TestCase):
             )
         record = json.loads((self.output / "native-profile-producer.json").read_text())
         self.assertEqual(record["elf_sha256"], original_hash(self.output / "xray"))
-        self.assertEqual(record["patch_sha256"], builder.PROFILE_PATCH)
+        self.assertEqual(record["patch_sha256"], accepted_fixture_pin)
+        candidate = json.loads(
+            (self.output / "native-profile-dns-release-candidate.json").read_text()
+        )
+        self.assertFalse(candidate["install_authority"])
+        self.assertTrue(candidate["requires_factory_ownership_review"])
+        self.assertEqual(
+            candidate["candidate_record"]["elf_sha256"], record["elf_sha256"]
+        )
+        self.assertEqual(
+            candidate["candidate_record"]["dns_release"]["schema_sha256"],
+            hashlib.sha256(b"YONIK-DNS-V2-CODEC-3\0").hexdigest(),
+        )
+        self.assertNotIn("dns_release", record)
         self.assertEqual(
             record["builder_sha256"], original_hash(Path(builder.__file__))
         )

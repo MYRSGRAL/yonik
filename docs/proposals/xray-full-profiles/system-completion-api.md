@@ -1118,16 +1118,61 @@ R37 retired-request fence применяется до Reserve effects. Cancel dr
 PhysicalAck; после slow kernel/backend checks выполняется новый deadline fence,
 Known≤20ms и original reservation expiry не продлеваются.
 
-Retire45/46 реализован только как typed Unknown custody report для существующего
-resource/proof. Source-reviewed Go duplicate-close/join producer для DNS ещё не
-подтверждён: Request45 не является independent closed proof. Поэтому нет
-выдуманного joined1/KnownClosed; FD/namespace, credits, bundle и durable tickets
-удерживаются до existing actual-worker-closed + rules-KnownClosed supervisor
-fence. Cancel после published Physical reservation также не выдаёт KnownClosed.
+CODEC3 добавляет отдельный protected DNS producer contract и normal retirement
+path ниже. Без него Retire45/46 остаётся Unknown custody report: Request45 не
+является independent closed proof. FD/namespace, credits, bundle и durable tickets
+удерживаются до existing actual-worker-closed + rules-KnownClosed supervisor fence.
+Cancel после live published Physical reservation не выдаёт KnownClosed.
 Wrong/replayed/late SCM закрывает unexpected rights и отзывает context; очищенные
 known-only reservations не отзывают соседний bundle. Append43/44, ProxiedLogical,
 PROBE flow0, loopback StubBind, hostname bootstrap и Publish/Waiter/Numeric
 остаются Unsupported. Public flags/protected allowlist/readiness не меняются.
+
+### CODEC3: protected Direct DNS release и consuming receiver close
+
+`registry::ProducerRecord` schema2 принимает optional `dns_release` с exact
+contract=`direct-dns-consuming-close-join-v1`, version1,
+contract_sha256=SHA256(ASCII contract + NUL),
+schema_sha256=SHA256(`YONIK-DNS-V2-CODEC-3` + NUL). Остальные source/patch/
+builder/toolchain/build-input/image поля принадлежат тому же protected record.
+Все прежние root-owned/NOFOLLOW/identity/entry hash/sealed image проверки
+сохраняются; optional поле не даёт DNS capability старому UDP record.
+`DNS_REVIEWED_PATCH=None`: actual factory/Conn ownership audit ещё не принят,
+поэтому production `ImageContract::check_dns` закрыт. Digest не добавлен в
+allowlist этим implementation. Fake tests явно инъецируют reviewed pin.
+
+`SystemChannel::dns_producer` (также Local shared channel) сверяет Peer,
+bound LaunchRecord, retained config hash и decoded capsule manifest до CODEC3
+setup ACK. `VerifiedDnsProducer` не является current-image measurement.
+Его private release anchor связывает exact retained proof/resource/bundle/
+query/root/source/revision/epoch/derived path с authenticated launch. Никакой
+child bool/ACK/env или обычный UDP token не заменяет protected DNS contract.
+
+Retire Proof требует ACKed LogicalBind и отсутствие pending reservation reply;
+irreversible release снимает единственный Direct ref. Proof Allow не закрывает
+receiver FD. Resource Retire требует actual sent Proof ACK, отсутствие pending
+bind/reply и прежний binding. Narrow nsfs consuming-close API закрывает owned
+socket и netns ровно по одному разу, без retry raw FD даже при EINTR. Unknown
+поглощает ошибки и сохраняет ledger/custody; числовые FD не переиспользуются.
+Terminal results оплачены existing object/history/memory до effects; повтор
+write(false)/Retire возвращает тот же result, не повторяя release/close.
+FD credits и terminal physical reservation transition commit-ятся только после
+actual Resource ACK send. Затем отдельные cancel physical reservation → parent
+reservation → exchange; tombstones не evict/reuse. Bundle отдельно закрывает
+route tickets/durable firewall; Resource ACK их не освобождает.
+
+Cleanup window фиксируется как исходный physical expiry +1s, ограничивается
+session; он не продлевается RPC/retry. Expired USER grant не разрешает use или
+GRANT, но retained root/bundle obligations доступны cleanup до этого deadline.
+Deadline/uncertain close не выдаёт KnownClosed. Append/Proxy/новые consumers
+этим cut не добавлены; actor владеет ровно одним Direct resource ref.
+
+Builder experimental compile-only пишет отдельный
+`native-profile-dns-release-candidate.json`: envelope `install_authority=false`,
+`requires_factory_ownership_review=true`, candidate record с теми же final ELF/
+source/build hashes. Это review evidence, не protected install record; builder
+не устанавливает registry и не утверждает выполнение DNS contract старым patch.
+Для production нужен root-reviewed exact DNS patch pin и trusted install provider.
 
 ### StubBind: bounded listener observation, не service authority
 

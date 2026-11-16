@@ -258,7 +258,9 @@ impl<A: Authority> Issuer<A> {
         let mut ids = [0; 256];
         let mut n = 0;
         for (id, b) in &self.dns.live {
-            if now >= b.expires || !self.grants.contains_key(&b.root) {
+            if (now >= b.expires || !self.grants.contains_key(&b.root))
+                && !self.transport.holds_root_cleanup(b.root, now)
+            {
                 *ids.get_mut(n).ok_or(ServiceError::Busy)? = *id;
                 n += 1;
             }
@@ -600,6 +602,13 @@ pub(super) fn dispatch<A: Authority>(
     let neg = issuer.negotiated.ok_or(ServiceError::Unavailable)?;
     let frame = decode(bytes, &neg, Direction::Producer)?;
     let reply = frame.header.sequence;
+    let session = if let Record::Cancel(view) = frame.record {
+        let (target, id) = cancel_fields(view);
+        super::dns_transport::cleanup_deadline(issuer, target, id)
+            .map_or(session, |until| session.min(until))
+    } else {
+        session
+    };
     if matches!(
         frame.record,
         Record::Reserve(_) | Record::LogicalBind(_) | Record::Retire(_)

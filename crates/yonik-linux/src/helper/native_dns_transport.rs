@@ -100,8 +100,8 @@ impl Facts {
 }
 enum Handle {
     Kernel {
-        fd: OwnedFd,
-        namespace: OwnedFd,
+        fd: Option<OwnedFd>,
+        namespace: Option<OwnedFd>,
         // Peer владеет inbox: strong Arc здесь создал бы custody cycle.
         peer: std::sync::Weak<Peer>,
     },
@@ -110,12 +110,18 @@ enum Handle {
         state: Arc<std::sync::Mutex<Facts>>,
         valid: Arc<AtomicBool>,
         closed: Arc<std::sync::atomic::AtomicUsize>,
+        consumed: bool,
     },
 }
 impl Drop for Handle {
     fn drop(&mut self) {
         #[cfg(test)]
-        if let Self::Fake { closed, .. } = self {
+        if let Self::Fake {
+            closed,
+            consumed: false,
+            ..
+        } = self
+        {
             closed.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -144,8 +150,8 @@ impl Evidence {
         }
         let out = Self {
             handle: Handle::Kernel {
-                fd,
-                namespace,
+                fd: Some(fd),
+                namespace: Some(namespace),
                 peer: Arc::downgrade(&peer),
             },
             facts,
@@ -162,7 +168,10 @@ impl Evidence {
             } => {
                 let peer = peer.upgrade().ok_or(ServiceError::Unavailable)?;
                 peer.validate()?;
-                Facts::capture(fd, namespace)?
+                Facts::capture(
+                    fd.as_ref().ok_or(ServiceError::Unavailable)?,
+                    namespace.as_ref().ok_or(ServiceError::Unavailable)?,
+                )?
             }
             #[cfg(test)]
             Handle::Fake { state, valid, .. } => {
@@ -176,6 +185,34 @@ impl Evidence {
             return Err(ServiceError::Unavailable);
         }
         Ok(current)
+    }
+    fn consume_close(&mut self) -> Result<(), ServiceError> {
+        match &mut self.handle {
+            Handle::Kernel { fd, namespace, .. } => {
+                // Отсутствующий handle не превращается в повторный raw close.
+                let fd = fd.take().ok_or(ServiceError::Unavailable)?;
+                let ns = namespace.take().ok_or(ServiceError::Unavailable)?;
+                yonik_nsfs::socket_namespace::close_profile_socket(fd, ns).map_err(unavailable)
+            }
+            #[cfg(test)]
+            Handle::Fake {
+                closed,
+                consumed,
+                valid,
+                ..
+            } => {
+                if *consumed {
+                    return Err(ServiceError::Unavailable);
+                }
+                *consumed = true;
+                closed.fetch_add(1, Ordering::AcqRel);
+                if valid.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(ServiceError::Unavailable)
+                }
+            }
+        }
     }
 }
 pub(super) struct Incoming {
@@ -231,6 +268,7 @@ impl Incoming {
                     state: facts,
                     valid,
                     closed,
+                    consumed: false,
                 },
                 facts: snapshot,
             },
@@ -274,6 +312,9 @@ struct Reservation {
     future_history: bool,
 }
 struct Resource {
+    release_acked: bool,
+    retired: Option<bool>,
+    cleanup_until: Instant,
     binding: Binding,
     reservation: u64,
     exchange: u64,
@@ -283,6 +324,9 @@ struct Resource {
     proof: Option<u64>,
 }
 struct DirectProof {
+    release_acked: bool,
+    retired: Option<bool>,
+    acked: bool,
     binding: Binding,
     exchange: u64,
     resource: u64,
@@ -291,7 +335,30 @@ struct DirectProof {
     producer_sequence: u64,
     _memory: ByteLease,
 }
+struct ProducerReleasedDirectDns {
+    proof: u64,
+    resource: u64,
+    binding: Binding,
+    revision: u64,
+}
+impl ProducerReleasedDirectDns {
+    fn release_ref(self, proof: &mut DirectProof) -> Result<(), ServiceError> {
+        if self.proof == 0
+            || self.resource != proof.resource
+            || self.binding != proof.binding
+            || self.revision != proof.revision
+            || !proof.acked
+            || proof.retired.is_some()
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        proof.retired = Some(true);
+        Ok(())
+    }
+}
 pub(super) struct Transport {
+    closed_exchanges: [Option<(u64, Instant)>; 256],
+    closed_count: usize,
     reservations: BTreeMap<u64, Reservation>,
     incoming: BTreeMap<u64, Incoming>,
     resources: BTreeMap<u64, Resource>,
@@ -319,6 +386,8 @@ impl Transport {
             .reserve(std::mem::size_of::<Self>())
             .map_err(unavailable)?;
         Ok(Self {
+            closed_exchanges: [None; 256],
+            closed_count: 0,
             reservations: BTreeMap::new(),
             incoming: BTreeMap::new(),
             resources: BTreeMap::new(),
@@ -339,8 +408,16 @@ impl Transport {
             || self.resources.values().any(|v| v.binding.bundle == bundle)
             || self.incoming.values().any(|v| n64(&v.raw, 144) == bundle)
     }
+    pub(super) fn holds_root_cleanup(&self, root: u64, now: Instant) -> bool {
+        self.resources
+            .values()
+            .any(|r| r.binding.root == root && now < r.cleanup_until)
+    }
     pub(super) fn cancel_bundle(&mut self, bundle: u64) -> Result<(), ServiceError> {
-        if self.resources.values().any(|r| r.binding.bundle == bundle)
+        if self
+            .resources
+            .values()
+            .any(|r| r.binding.bundle == bundle && (r.retired != Some(true) || !r.release_acked))
             || self.incoming.values().any(|v| n64(&v.raw, 144) == bundle)
             || self
                 .reservations
@@ -374,6 +451,18 @@ impl Transport {
             {
                 return Err(ServiceError::Unavailable);
             }
+            if self.closed_count == self.closed_exchanges.len() {
+                return Err(ServiceError::Busy);
+            }
+            let until = self
+                .resources
+                .values()
+                .filter(|resource| resource.exchange == r.exchange)
+                .fold(r.expires + Duration::from_secs(1), |until, resource| {
+                    until.min(resource.cleanup_until)
+                });
+            self.closed_exchanges[self.closed_count] = Some((r.exchange, until));
+            self.closed_count += 1;
             self.reservations.retain(|_, p| p.parent != id);
         }
         self.reservations.remove(&id);
@@ -410,6 +499,8 @@ pub(super) struct Reply {
     commit: Commit,
 }
 enum Commit {
+    ReleasedProof(u64),
+    ClosedResource(u64),
     None,
     Reserved(u64),
     Physical(u64),
@@ -450,6 +541,154 @@ impl Reply {
     }
 }
 impl<A: Authority> Issuer<A> {
+    fn retire_dns(
+        &mut self,
+        view: View<'_, 45>,
+        request: u64,
+        session: Instant,
+    ) -> Result<Reply, ServiceError> {
+        let b = view.bytes();
+        let id = n64(b, 8);
+        let revision = n64(b, 16);
+        let (resource, already) = match b[2] {
+            4 => {
+                let p = self
+                    .transport
+                    .proofs
+                    .get(&id)
+                    .ok_or(ServiceError::Unavailable)?;
+                if revision != p.revision {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                (p.resource, p.retired)
+            }
+            3 if revision == 0 => {
+                let r = self
+                    .transport
+                    .resources
+                    .get(&id)
+                    .ok_or(ServiceError::Unavailable)?;
+                (id, r.retired)
+            }
+            _ => return Err(ServiceError::InvalidRequest),
+        };
+        let r = self
+            .transport
+            .resources
+            .get(&resource)
+            .ok_or(ServiceError::Unavailable)?;
+        let until = r.cleanup_until.min(session);
+        if self.authority.now() >= until {
+            return Err(ServiceError::Unavailable);
+        }
+        let mut reply = Reply::denied(Operation::Retired, request, until);
+        let mut result = already;
+        if result.is_none() && !self.unknown {
+            let anchor = self
+                .dns_release
+                .as_ref()
+                .ok_or(ServiceError::Unsupported)
+                .and_then(|p| p.bound(self.record));
+            if anchor.is_err() {
+                result = Some(false);
+            } else if b[2] == 4 {
+                let p = self
+                    .transport
+                    .proofs
+                    .get(&id)
+                    .ok_or(ServiceError::Unavailable)?;
+                // Direct count1 имеет ровно один retained ref. Новые consumers
+                // появятся отдельным cut: здесь отсутствуют hidden task/alias APIs.
+                let parent = self
+                    .transport
+                    .reservations
+                    .values()
+                    .find(|p| p.role == 1 && p.exchange == r.exchange);
+                let physical = self.transport.reservations.get(&r.reservation);
+                if !p.acked
+                    || !r.acked
+                    || r.retired.is_some()
+                    || r.proof != Some(id)
+                    || p.binding != r.binding
+                    || p.exchange != r.exchange
+                    || parent.is_none_or(|v| v.pending.is_some() || v.binding != r.binding)
+                    || physical.is_none_or(|v| v.pending.is_some() || v.resource != Some(resource))
+                {
+                    return Ok(reply);
+                }
+                let released = ProducerReleasedDirectDns {
+                    proof: id,
+                    resource,
+                    binding: p.binding,
+                    revision,
+                };
+                released.release_ref(
+                    self.transport
+                        .proofs
+                        .get_mut(&id)
+                        .ok_or(ServiceError::Unavailable)?,
+                )?;
+                result = Some(true);
+            } else {
+                if !r.acked
+                    || r.proof
+                        .and_then(|p| self.transport.proofs.get(&p))
+                        .is_none_or(|p| p.retired != Some(true) || !p.release_acked)
+                {
+                    return Ok(reply);
+                }
+                if self.transport.incoming.contains_key(&r.reservation)
+                    || self
+                        .transport
+                        .reservations
+                        .get(&r.reservation)
+                        .is_none_or(|p| p.pending.is_some())
+                {
+                    return Ok(reply);
+                }
+                // Terminal state pre-paid в Resource. Mark Unknown ДО close;
+                // ни retry ACK, ни raw FD после uncertain close не повторяют effect.
+                let r = self
+                    .transport
+                    .resources
+                    .get_mut(&resource)
+                    .ok_or(ServiceError::Unavailable)?;
+                r.retired = Some(false);
+                result = Some(r.incoming.evidence.consume_close().is_ok());
+            }
+        }
+        let success = result == Some(true);
+        if b[2] == 4 {
+            self.transport
+                .proofs
+                .get_mut(&id)
+                .ok_or(ServiceError::Unavailable)?
+                .retired = Some(success);
+        } else {
+            self.transport
+                .resources
+                .get_mut(&id)
+                .ok_or(ServiceError::Unavailable)?
+                .retired = Some(success);
+        }
+        reply.body[2] = if success { 1 } else { 3 };
+        reply.body[3] = b[2];
+        set64(&mut reply.body, 8, id);
+        set64(&mut reply.body, 16, revision);
+        if success {
+            reply.body[28] = 1;
+            reply.commit = if b[2] == 4 {
+                Commit::ReleasedProof(id)
+            } else {
+                Commit::ClosedResource(id)
+            };
+        } else {
+            reply.body[26..28].copy_from_slice(&1u16.to_be_bytes());
+            self.unknown = true;
+            self.authority.revoke();
+        }
+        Ok(reply)
+    }
     fn reserve_dns(
         &mut self,
         view: View<'_, 35>,
@@ -589,7 +828,14 @@ impl<A: Authority> Issuer<A> {
                 .resources
                 .get(&id)
                 .ok_or(ServiceError::Unavailable)?;
-            if self.direct_dns_binding(resource.binding.bundle)? != resource.binding
+            if resource.retired.is_some()
+                || resource.proof.is_some_and(|id| {
+                    self.transport
+                        .proofs
+                        .get(&id)
+                        .is_some_and(|p| p.retired.is_some())
+                })
+                || self.direct_dns_binding(resource.binding.bundle)? != resource.binding
                 || self.authority.now() >= resource.expires
             {
                 return Err(ServiceError::Unavailable);
@@ -695,6 +941,9 @@ impl<A: Authority> Issuer<A> {
         self.transport.resources.insert(
             id,
             Resource {
+                release_acked: false,
+                retired: None,
+                cleanup_until: expires + Duration::from_secs(1),
                 binding,
                 reservation: physical,
                 exchange,
@@ -793,6 +1042,9 @@ impl<A: Authority> Issuer<A> {
         self.transport.proofs.insert(
             proof,
             DirectProof {
+                release_acked: false,
+                retired: None,
+                acked: false,
                 binding,
                 exchange,
                 resource: id,
@@ -863,30 +1115,7 @@ pub(super) fn handle<A: Authority>(
     let result = match record {
         Record::Reserve(v) => issuer.reserve_dns(v, request, socket, session),
         Record::LogicalBind(v) => issuer.logical_dns(v, request, session),
-        Record::Retire(v) => {
-            let b = v.bytes();
-            let id = n64(b, 8);
-            let known = match b[2] {
-                3 => issuer.transport.resources.contains_key(&id),
-                4 => issuer
-                    .transport
-                    .proofs
-                    .get(&id)
-                    .is_some_and(|p| n64(b, 16) == p.revision),
-                _ => false,
-            };
-            let mut reply = Reply::denied(Operation::Retired, request, session);
-            if known {
-                issuer.unknown = true;
-                issuer.authority.revoke();
-                reply.body[2] = 3;
-                reply.body[3] = b[2];
-                set64(&mut reply.body, 8, id);
-                set64(&mut reply.body, 16, n64(b, 16));
-                reply.body[26..28].copy_from_slice(&1u16.to_be_bytes());
-            }
-            Ok(reply)
-        }
+        Record::Retire(v) => issuer.retire_dns(v, request, session),
         _ => Err(ServiceError::Unsupported),
     };
     Ok(result.unwrap_or_else(|_| {
@@ -915,6 +1144,8 @@ pub(super) fn send_reply<A: Authority>(
             Commit::Reserved(id) => !issuer.transport.reservations.contains_key(&id),
             Commit::Physical(id) => !issuer.transport.resources.contains_key(&id),
             Commit::Logical(id) => !issuer.transport.proofs.contains_key(&id),
+            Commit::ReleasedProof(id) => !issuer.transport.proofs.contains_key(&id),
+            Commit::ClosedResource(id) => !issuer.transport.resources.contains_key(&id),
             Commit::None => false,
         };
         if missing || issuer.retired.iter().any(|(id, _)| *id == reply.request) {
@@ -956,7 +1187,7 @@ pub(super) fn send_reply<A: Authority>(
                 48,
                 (reply.expires - checked).as_nanos().min(1_000_000_000) as u64,
             );
-        } else if !issuer.unknown {
+        } else if !issuer.unknown && reply.operation != Operation::Retired {
             issuer.fence()?;
         }
         let mut out = [0; 192];
@@ -972,6 +1203,32 @@ pub(super) fn send_reply<A: Authority>(
         let n = frame.encode(&neg, &mut out).map_err(unavailable)?;
         if socket.write(&out[..n])? {
             match reply.commit {
+                Commit::ReleasedProof(id) => {
+                    issuer
+                        .transport
+                        .proofs
+                        .get_mut(&id)
+                        .ok_or(ServiceError::Unavailable)?
+                        .release_acked = true;
+                }
+                Commit::ClosedResource(id) => {
+                    let r = issuer
+                        .transport
+                        .resources
+                        .get_mut(&id)
+                        .ok_or(ServiceError::Unavailable)?;
+                    if !r.release_acked {
+                        r.incoming._fds.resize(0).map_err(unavailable)?;
+                        r.release_acked = true;
+                        let reservation = issuer
+                            .transport
+                            .reservations
+                            .get_mut(&r.reservation)
+                            .ok_or(ServiceError::Unavailable)?;
+                        reservation.resource = None;
+                        reservation.published = false;
+                    }
+                }
                 Commit::Reserved(id) => {
                     issuer
                         .transport
@@ -999,8 +1256,9 @@ pub(super) fn send_reply<A: Authority>(
                     let p = issuer
                         .transport
                         .proofs
-                        .get(&id)
+                        .get_mut(&id)
                         .ok_or(ServiceError::Unavailable)?;
+                    p.acked = true;
                     let parent = issuer
                         .transport
                         .reservations
@@ -1113,9 +1371,24 @@ pub(super) fn cancel<A: Authority>(
     target: u8,
     id: u64,
 ) -> Result<(), ServiceError> {
+    if cleanup_deadline(issuer, target, id).is_some_and(|until| issuer.authority.now() >= until) {
+        issuer.unknown = true;
+        issuer.authority.revoke();
+        return Err(ServiceError::Unavailable);
+    }
     let result = match target {
         7 => issuer.transport.cancel_reservation(id),
         2 => {
+            if issuer.transport.closed_exchanges[..issuer.transport.closed_count]
+                .iter()
+                .any(|v| {
+                    v.is_some_and(|(exchange, until)| {
+                        exchange == id && issuer.authority.now() < until
+                    })
+                })
+            {
+                return Ok(());
+            }
             let r = issuer
                 .transport
                 .reservations
@@ -1134,4 +1407,34 @@ pub(super) fn cancel<A: Authority>(
         issuer.authority.revoke();
     }
     result
+}
+
+pub(super) fn cleanup_deadline<A: Authority>(
+    issuer: &Issuer<A>,
+    target: u8,
+    id: u64,
+) -> Option<Instant> {
+    let exchange = if target == 7 {
+        issuer.transport.reservations.get(&id).map(|r| r.exchange)
+    } else if target == 2 {
+        Some(id)
+    } else {
+        None
+    }?;
+    issuer
+        .transport
+        .resources
+        .values()
+        .filter(|r| r.exchange == exchange)
+        .map(|r| r.cleanup_until)
+        .chain(
+            issuer.transport.closed_exchanges[..issuer.transport.closed_count]
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .filter(|(e, _)| *e == exchange)
+                        .map(|(_, until)| until)
+                }),
+        )
+        .min()
 }

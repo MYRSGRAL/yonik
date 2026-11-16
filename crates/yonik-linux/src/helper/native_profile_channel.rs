@@ -1104,6 +1104,33 @@ struct KernelUdpOperations {
 pub(crate) struct VerifiedUdpProducer {
     launch: LaunchRecord,
 }
+/// Только protected installed record + retained consuming exec custody.
+/// Это не current-image measurement и не child receipt.
+pub(super) struct VerifiedDnsProducer {
+    launch: LaunchRecord,
+}
+impl VerifiedDnsProducer {
+    fn mint(
+        proof: &super::registry::ImageContract,
+        image: [u8; 32],
+        config: [u8; 32],
+        manifest: [u8; 32],
+        launch: LaunchRecord,
+    ) -> Result<Self, ServiceError> {
+        proof.check_dns(image).map_err(unavailable)?;
+        launch.encode().map_err(unavailable)?;
+        if config != launch.binding.digest || manifest != launch.manifest {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(Self { launch })
+    }
+    fn bound(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
+        if self.launch != launch {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
+}
 impl VerifiedUdpProducer {
     pub(super) fn mint(
         proof: &super::registry::ImageContract,
@@ -1674,6 +1701,7 @@ impl<'a> RoutePlan<'a> {
     }
 }
 struct Issuer<A: Authority> {
+    dns_release: Option<VerifiedDnsProducer>,
     transport: dns_transport::Transport,
     authority: A,
     capsule: Arc<wire::OwnedCapsule>,
@@ -1711,6 +1739,7 @@ impl<A: Authority> Issuer<A> {
         let budget = ChannelBudget::new(&capsule, record.mode.required(), &record.binding.digest)?;
         Ok(Self {
             authority,
+            dns_release: None,
             transport: dns_transport::Transport::new(&budget.dynamic)?,
             capsule,
             record,
@@ -2994,6 +3023,9 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn dns_producer(&self, _: LaunchRecord) -> Result<Option<VerifiedDnsProducer>, ServiceError> {
+        Ok(None)
+    }
     fn dns_slots(&self) -> Result<Arc<SidebandCredits>, ServiceError> {
         Err(ServiceError::Unsupported)
     }
@@ -3551,6 +3583,7 @@ struct DeliveryCredit {
     _slot: super::memory::ByteLease,
 }
 struct SystemChannel {
+    capsule: Arc<wire::OwnedCapsule>,
     budget: Arc<ChannelBudget>,
     runtime: tokio::net::UnixDatagram,
     proof: tokio::net::UnixDatagram,
@@ -3673,6 +3706,7 @@ impl SystemChannel {
         };
         Ok(Self {
             runtime,
+            capsule,
             budget,
             proof,
             peer,
@@ -3998,6 +4032,27 @@ impl SystemChannel {
     }
 }
 impl Channel for SystemChannel {
+    fn dns_producer(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<Option<VerifiedDnsProducer>, ServiceError> {
+        self.peer.validate()?;
+        if self.peer.bound_launch != Some(record) {
+            return Err(ServiceError::Unavailable);
+        }
+        let cap = wire::Capsule::decode(self.capsule.bytes(), &self.peer.config_hash)
+            .map_err(unavailable)?;
+        Ok(Some(VerifiedDnsProducer::mint(
+            self.peer
+                .producer
+                .as_ref()
+                .ok_or(ServiceError::Unsupported)?,
+            self.peer.image_hash,
+            self.peer.config_hash,
+            cap.manifest,
+            record,
+        )?))
+    }
     fn dns_slots(&self) -> Result<Arc<SidebandCredits>, ServiceError> {
         Ok(Arc::clone(
             &self
@@ -4588,7 +4643,19 @@ fn run_issuer<A: Authority>(
         if stop.load(Ordering::Acquire) || now >= expires || awaiting.is_some_and(|a| now >= a.2) {
             return Err(ServiceError::Unavailable);
         }
-        issuer.cancel_matching(|grant| now >= grant.expires)?;
+        let mut expired_user = [0; 4096];
+        let mut expired_count = 0;
+        for (id, grant) in &issuer.grants {
+            if now >= grant.expires && !issuer.transport.holds_root_cleanup(*id, now) {
+                *expired_user
+                    .get_mut(expired_count)
+                    .ok_or(ServiceError::Busy)? = *id;
+                expired_count += 1;
+            }
+        }
+        for id in &expired_user[..expired_count] {
+            issuer.cancel_grant(*id)?;
+        }
         let mut expired = [0; 4096];
         let mut count = 0;
         for (id, grant) in &issuer.services {
@@ -4733,6 +4800,7 @@ fn run_issuer<A: Authority>(
             expires = next_expiry;
             awaiting = None;
             if issuer.negotiated.is_none() {
+                issuer.dns_release = socket.dns_producer(issuer.record)?;
                 issuer.negotiated = Some(dns_bundle::negotiate(
                     issuer,
                     socket,
