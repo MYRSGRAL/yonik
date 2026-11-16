@@ -1807,6 +1807,7 @@ struct Actor {
     callback: Callback,
     selected: Option<ResolvedProfile>,
     selected_native: Option<yonik_linux::ResolvedCatalogProfile>,
+    selected_native_token: Option<yonik_linux::CatalogSelection>,
     catalog_selections: Vec<(CatalogKind, i64, yonik_linux::CatalogSelection)>,
     catalog_coordinates: Option<(i64, i64, i64, i64)>,
     pending: Option<Box<PendingRefresh>>,
@@ -2221,6 +2222,97 @@ impl Actor {
             && self.state.pending.is_none();
         self.state.emit(&self.callback);
     }
+    async fn native_connect_preflight(
+        &self,
+        command: &Command,
+        control: &Control,
+        generation: u64,
+        busy: bool,
+    ) -> SourceResult<yonik_engine::native_profile::ProfileIntent> {
+        if !matches!(command, Command::Connect) {
+            return Err(DesktopError("invalid_input").into());
+        }
+        if busy
+            || self.state.can_stop
+            || self.state.system_busy
+            || self.state.system_recovery_pending
+            || self.state.can_unlock
+        {
+            return Err(DesktopError("busy").into());
+        }
+        if self.pending.is_some() || self.state.pending.is_some() {
+            return Err(DesktopError("review_required").into());
+        }
+        let intent = self.native_connect_intent(control, generation).await?;
+        let mode = match self.state.connection_mode {
+            ConnectionMode::Local => yonik_linux::FullProfileMode::Local,
+            ConnectionMode::System => yonik_linux::FullProfileMode::System,
+        };
+        yonik_linux::full_profile_preflight(mode)
+            .map_err(|_| DesktopError("profile_unavailable"))?;
+        if generation != control.generation.load(Ordering::SeqCst) {
+            return Err(DesktopError("cancelled").into());
+        }
+        Ok(intent)
+    }
+    async fn native_connect_intent(
+        &self,
+        control: &Control,
+        generation: u64,
+    ) -> SourceResult<yonik_engine::native_profile::ProfileIntent> {
+        let current = self
+            .selected_native
+            .as_ref()
+            .ok_or(DesktopError("profile_required"))?;
+        let token = self
+            .selected_native_token
+            .clone()
+            .ok_or(DesktopError("profile_unavailable"))?;
+        let fence = || {
+            if generation != control.generation.load(Ordering::SeqCst) {
+                Err(DesktopError("cancelled"))
+            } else {
+                Ok(())
+            }
+        };
+        fence()?;
+        let profile = self
+            .service()
+            .select_catalog_profile(token)
+            .await
+            .map_err(SourceFailure::subscription)?;
+        fence()?;
+        if (
+            profile.source_id,
+            profile.source_generation,
+            profile.snapshot_generation,
+            profile.snapshot_revision,
+        ) != (
+            current.source_id,
+            current.source_generation,
+            current.snapshot_generation,
+            current.snapshot_revision,
+        ) || Some(profile.source_id) != self.state.source_id
+            || self
+                .service()
+                .schedule_generation(profile.source_id)
+                .await
+                .map_err(SourceFailure::subscription)?
+                != Some(profile.source_generation)
+        {
+            return Err(DesktopError("profile_unavailable").into());
+        }
+        fence()?;
+        match profile.entry {
+            yonik_import::ProfileEntry::Xray(native) => {
+                yonik_engine::native_profile::ProfileIntent::from_profile(&native)
+                    .map_err(|_| DesktopError("engine_config").into())
+            }
+            yonik_import::ProfileEntry::Server(_) => {
+                Err(DesktopError("profile_unavailable").into())
+            }
+        }
+    }
     fn catalog_selection(
         &self,
         kind: CatalogKind,
@@ -2239,6 +2331,7 @@ impl Actor {
     fn clear_selection(&mut self) {
         self.selected = None;
         self.selected_native = None;
+        self.selected_native_token = None;
         self.state.selected_kind = None;
         self.state.selected_catalog_page = None;
         self.invalidate_preset();
@@ -2544,7 +2637,7 @@ impl Actor {
                 self.clear_selection();
                 let profile = self
                     .service()
-                    .select_catalog_profile(selection)
+                    .select_catalog_profile(selection.clone())
                     .await
                     .map_err(SourceFailure::subscription)?;
                 if Some(profile.source_id) != self.state.source_id
@@ -2579,6 +2672,7 @@ impl Actor {
                         self.state.selected_kind = Some("xray");
                         self.state.selected_profile = Some(id);
                         self.selected_native = Some(profile);
+                        self.selected_native_token = Some(selection);
                     }
                     yonik_import::ProfileEntry::Server(_) => {
                         if kind != CatalogKind::Server {
@@ -3471,6 +3565,7 @@ mod settings_tests {
             callback: Arc::new(|_| {}),
             selected: None,
             selected_native: None,
+            selected_native_token: None,
             catalog_selections: Vec::new(),
             catalog_coordinates: None,
             pending: None,
@@ -4133,9 +4228,16 @@ struct TcpRunning {
     task: tokio::task::JoinHandle<std::result::Result<TcpProbeSeriesResult, HostError>>,
 }
 
+enum SessionConfig {
+    Server(yonik_engine::CompiledConfig),
+    FullProfile(
+        yonik_engine::native_profile::ProfileIntent,
+        yonik_engine::native_profile::OwnedRuntimePlan,
+    ),
+}
 #[cfg_attr(feature = "test-support", allow(clippy::too_many_arguments))]
 async fn session(
-    config: yonik_engine::CompiledConfig,
+    config: SessionConfig,
     engine_dir: PathBuf,
     engine: Engine,
     target: ProbeTarget,
@@ -4149,6 +4251,24 @@ async fn session(
     #[cfg(feature = "test-support")] cleanup_fault: Option<Arc<AtomicBool>>,
 ) -> std::result::Result<(), LocalSession> {
     let (updates, event_log, generation) = updates;
+    if cancel.check().is_err() {
+        return Ok(());
+    }
+    if matches!(config, SessionConfig::FullProfile(..))
+        && yonik_linux::full_profile_preflight(yonik_linux::FullProfileMode::Local).is_err()
+    {
+        let _ = updates
+            .send(SessionUpdate {
+                context: None,
+                generation: Some(generation),
+                status: "Error",
+                error: Some("profile_unavailable"),
+                probe_result: None,
+                network_stamp: None,
+            })
+            .await;
+        return Ok(());
+    }
     let Ok(session) = LocalSession::new() else {
         let _ = updates
             .send(SessionUpdate {
@@ -4181,7 +4301,13 @@ async fn session(
         };
         cancel.check().map_err(|_| "cancelled")?;
         let path = engine_dir.join(relative);
+        let native = matches!(config, SessionConfig::FullProfile(..));
         let binary = tokio::task::spawn_blocking(move || {
+            if native {
+                return yonik_linux::helper::TrustedRegistry::system()
+                    .and_then(|registry| registry.full_profile_snapshot())
+                    .map_err(|_| HostError::BinaryHash);
+            }
             BinarySnapshot::load(
                 &path,
                 digest.parse().map_err(|_| HostError::BinaryHash)?,
@@ -4192,8 +4318,10 @@ async fn session(
         .map_err(|_| "engine_missing")?
         .map_err(|_| "engine_missing")?;
         cancel.check().map_err(|_| "cancelled")?;
-        let checked = CheckedConfig::validate(binary, config, &mut cancel)
-            .await
+        let checked = match config {
+            SessionConfig::Server(config) => CheckedConfig::validate(binary, config, &mut cancel).await,
+            SessionConfig::FullProfile(intent, plan) => CheckedConfig::validate_full_profile(binary, intent, plan, &mut cancel).await,
+        }
             .map_err(|e| {
                 if e == HostError::Cancelled {
                     "cancelled"
@@ -4560,6 +4688,7 @@ async fn run(
         callback,
         selected: None,
         selected_native: None,
+        selected_native_token: None,
         catalog_selections: Vec::new(),
         catalog_coordinates: None,
         pending: None,
@@ -4937,7 +5066,7 @@ async fn run(
                         actor.state.routing_ack = Some(RoutingAck { request_id, saved_id: None, error: Some("cancelled") });
                     }
                     let stale = (flight.connecting && system_stop) || flight.generation != control.generation.load(Ordering::SeqCst)
-                        || (flight.connecting && (flight.revision != system_revision(&actor) || flight.routing_revision.is_some_and(|revision| actor.routing_revision != Some(revision) || flight.source_generation != actor.state.source_generation)));
+                        || (flight.connecting && (flight.revision != system_revision(&actor) || flight.source_generation != actor.state.source_generation || flight.routing_revision.is_some_and(|revision| actor.routing_revision != Some(revision))));
                     match result {
                         Ok((session, result)) => {
                             actor.state.system_tun_available = session.as_ref().is_some_and(SystemSession::system_tun_available);
@@ -5488,6 +5617,59 @@ async fn run(
                 }
                 let local_is_file = matches!(&envelope.command, Command::ImportFile { .. });
                 let outcome: SourceResult<()> = match envelope.command {
+                    Command::Connect if actor.selected_native.is_some() => {
+                        if actor.state.can_stop || running.is_some() || refreshing.is_some() || system_flight.is_some() || actor.state.system_busy {
+                            Err(DesktopError("busy").into())
+                        } else if session_generation == u64::MAX {
+                            Err(DesktopError("engine_failed").into())
+                        } else if actor.pending.is_some() || scheduled.review.is_some() {
+                            Err(DesktopError("review_required").into())
+                        } else {
+                            match actor.native_connect_preflight(&Command::Connect, &control, envelope.generation, false).await {
+                                Err(error) => Err(error),
+                                Ok(intent) => {
+                                    let mode = match actor.state.connection_mode { ConnectionMode::System => yonik_linux::FullProfileMode::System, ConnectionMode::Local => yonik_linux::FullProfileMode::Local };
+                                    if yonik_linux::full_profile_preflight(mode).is_err() { Err(DesktopError("profile_unavailable").into()) }
+                                    else if envelope.generation != control.generation.load(Ordering::SeqCst) { Err(DesktopError("cancelled").into()) }
+                                    else if actor.state.connection_mode == ConnectionMode::System {
+                                        let mut selection = [0; 32];
+                                        match getrandom::getrandom(&mut selection).map_err(|_| DesktopError("engine_failed")).and_then(|()| {
+                                            yonik_linux::helper::profile_intent::FullProfileRequest::new(intent, envelope.generation.checked_add(1).ok_or(DesktopError("engine_failed"))?, selection, true).map_err(|_| DesktopError("engine_config"))
+                                        }) {
+                                            Err(error) => Err(error.into()),
+                                            Ok(request) => {
+                                                system_flight = Some(Flight::start(system_session.take(), Operation::FullProfile(Box::new(request)), system_revision(&actor), envelope.generation, actor.event_log.clone()));
+                                                if let Some(flight) = &mut system_flight { flight.source_generation = actor.state.source_generation; }
+                                                actor.state.can_stop = true; system_active = true;
+                                                actor.state.active_name = actor.state.selected_name.clone(); actor.state.active_engine = Some(EngineChoice::Xray);
+                                                actor.state.system_state = "Unknown"; actor.state.status = "Preparing"; Ok(())
+                                            }
+                                        }
+                                    } else {
+                                        match actor.prepare_port().and_then(|()| {
+                                            let port = NonZeroU16::new(actor.state.port).ok_or(DesktopError("invalid_input"))?;
+                                            let probe = available_port(0)?;
+                                            let graph = intent.validate().map_err(|_| DesktopError("engine_config"))?;
+                                            let mut plan = yonik_engine::native_profile::OwnedRuntimePlan::new(port, probe).map_err(|_| DesktopError("engine_config"))?;
+                                            for ingress in graph.ingresses() { plan = plan.map_ingress(ingress.tag(), yonik_engine::native_profile::OwnedIngress::Local).map_err(|_| DesktopError("engine_config"))?; }
+                                            Ok(plan)
+                                        }).and_then(|plan| actor.probe_target().map(|target| (plan, target))) {
+                                            Err(error) => Err(error.into()),
+                                            Ok((plan, target)) => {
+                                                let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, plan.local_port().get()));
+                                                let (cancel, receiver) = Cancellation::new();
+                                                session_generation = session_generation.saturating_add(1); actor.state.error_generation = session_generation;
+                                                let task = tokio::spawn(session(SessionConfig::FullProfile(intent, plan), config.engine_dir.clone(), Engine::Xray, target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
+                                                running = Some(Running { lease: (session_generation, endpoint), cancel, task });
+                                                actor.state.can_stop = true; actor.state.active_name = actor.state.selected_name.clone(); actor.state.active_engine = Some(EngineChoice::Xray);
+                                                actor.state.probe_result = None; actor.state.status = "Preparing"; Ok(())
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     ref command if actor.selected_native.is_some() && command.requires_server_selection() => Err(DesktopError("profile_unavailable").into()),
                     Command::StartupPreferencesSet { request_id, expected_revision, autostart_into_tray, autoconnect } => actor.startup_save(request_id, expected_revision, Some((autostart_into_tray, autoconnect)), &control, envelope.generation).await.map_err(Into::into),
                     Command::AutoconnectTargetSet { request_id, expected_revision } => actor.startup_save(request_id, expected_revision, None, &control, envelope.generation).await.map_err(Into::into),
@@ -5729,7 +5911,7 @@ async fn run(
                                         session_generation = session_generation.saturating_add(1); actor.state.error_generation = session_generation;
                                         #[cfg(feature = "test-support")]
                                         let receiver = if let Some(gate) = config.lifecycle_gate.clone() { receiver.with_lifecycle_gate(gate, session_generation) } else { receiver };
-                                        let task = tokio::spawn(session(compiled, config.engine_dir.clone(), actor.state.engine.engine(), target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
+                                        let task = tokio::spawn(session(SessionConfig::Server(compiled), config.engine_dir.clone(), actor.state.engine.engine(), target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
                                         running = Some(Running { lease: (session_generation, endpoint), cancel, task }); actor.state.can_stop = true;
                                         actor.state.active_name = Some(profile.profile.name.clone()); actor.state.active_engine = Some(actor.state.engine);
                                         actor.state.probe_result = None; actor.state.status = "Preparing"; Ok(())
@@ -5987,6 +6169,7 @@ mod routing_regressions {
                 callback: Arc::new(|_| {}),
                 selected: None,
                 selected_native: None,
+                selected_native_token: None,
                 catalog_selections: Vec::new(),
                 catalog_coordinates: None,
                 pending: None,
@@ -6045,8 +6228,8 @@ mod routing_regressions {
         let failure = actor
             .refresh(91, 17, DesktopFetch::new(&lease, None))
             .await
-            .err()
-            .expect("refresh admission");
+            .map(|_| ())
+            .expect_err("refresh admission");
         actor.state.source_failure(true, failure, 91);
         assert_eq!(
             actor
@@ -6130,6 +6313,123 @@ mod routing_regressions {
         assert!(actor.selected.is_none());
         assert!(actor.selected_native.is_some());
         assert_eq!(actor.state.selected_kind, Some("xray"));
+        let control = Control {
+            generation: AtomicU64::new(0),
+            priority: watch::channel(Priority::default()).0,
+            tcp_priority: watch::channel(0).0,
+            subscription_policy: watch::channel(Default::default()).0,
+            subscription_override: AtomicBool::new(false),
+            subscription_visible: watch::channel(false).0,
+            closed: (Mutex::new(false), Condvar::new()),
+        };
+        for mode in [ConnectionMode::Local, ConnectionMode::System] {
+            actor.state.connection_mode = mode;
+            assert_eq!(
+                actor
+                    .native_connect_preflight(&Command::Connect, &control, 0, false)
+                    .await
+                    .map(|_| ())
+                    .expect_err("закрытый gate до effects")
+                    .key(),
+                "profile_unavailable"
+            );
+            assert_eq!(
+                actor
+                    .native_connect_preflight(&Command::Connect, &control, 0, true)
+                    .await
+                    .map(|_| ())
+                    .expect_err("busy")
+                    .key(),
+                "busy"
+            );
+            control.generation.store(1, Ordering::SeqCst);
+            assert_eq!(
+                actor
+                    .native_connect_preflight(&Command::Connect, &control, 0, false)
+                    .await
+                    .map(|_| ())
+                    .expect_err("cancelled")
+                    .key(),
+                "cancelled"
+            );
+            control.generation.store(0, Ordering::SeqCst);
+            assert!(actor.selected.is_none(), "legacy runner не получает native");
+            assert!(!actor.state.can_stop && !actor.state.system_busy);
+        }
+        actor.state.connection_mode = ConnectionMode::Local;
+        let source = actor.state.source_id.take();
+        assert_eq!(
+            actor
+                .native_connect_preflight(&Command::Connect, &control, 0, false)
+                .await
+                .map(|_| ())
+                .expect_err("смена источника")
+                .key(),
+            "profile_unavailable"
+        );
+        actor.state.source_id = source;
+        actor.state.system_recovery_pending = true;
+        assert_eq!(
+            actor
+                .native_connect_preflight(&Command::Connect, &control, 0, false)
+                .await
+                .map(|_| ())
+                .expect_err("recovery barrier")
+                .key(),
+            "busy"
+        );
+        actor.state.system_recovery_pending = false;
+        let intent = actor
+            .native_connect_intent(&control, 0)
+            .await
+            .expect("полный intent");
+        let request =
+            yonik_linux::helper::profile_intent::FullProfileRequest::new(intent, 1, [47; 32], true)
+                .expect("request без host proofs");
+        let flight = Flight::start(
+            None,
+            Operation::FullProfile(Box::new(request)),
+            system_revision(&actor),
+            0,
+            actor.event_log.clone(),
+        );
+        assert!(flight.connecting && flight.mutating && flight.routing_revision.is_none());
+        let (retained, outcome) = flight.task.await.expect("preflight task");
+        assert!(
+            retained.is_none(),
+            "SystemClient не создаётся при закрытом gate"
+        );
+        assert!(matches!(outcome, Err(ClientError::Unsupported)));
+        let intent = actor
+            .native_connect_intent(&control, 0)
+            .await
+            .expect("local intent");
+        let plan = yonik_engine::native_profile::OwnedRuntimePlan::new(
+            10808.try_into().expect("port"),
+            10809.try_into().expect("probe port"),
+        )
+        .expect("owned plan");
+        let (_cancel, cancellation) = Cancellation::new();
+        let (output, mut events) = mpsc::channel(1);
+        assert!(
+            session(
+                SessionConfig::FullProfile(intent, plan),
+                path.join("nonexistent-engine"),
+                Engine::Xray,
+                actor.probe_target().expect("probe target DATA"),
+                cancellation,
+                (output, actor.event_log.clone(), 0),
+                None,
+                #[cfg(feature = "test-support")]
+                None
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            events.recv().await.expect("закрытый preflight").error,
+            Some("profile_unavailable")
+        );
         actor.emit();
         assert!(!actor.state.can_connect);
         for value in [
@@ -6977,6 +7277,7 @@ fn system_error(error: ClientError) -> &'static str {
 
 /// Одна ограниченная операция. Владение session возвращается даже после отмены RPC.
 pub(crate) enum Operation {
+    FullProfile(Box<yonik_linux::helper::profile_intent::FullProfileRequest>),
     PolicyConnect(
         Box<yonik_import::ServerIntent>,
         Engine,
@@ -7009,7 +7310,10 @@ impl Flight {
         generation: u64,
         log: yonik_linux::event_log::EventLog,
     ) -> Self {
-        let connecting = matches!(operation, Operation::PolicyConnect(..));
+        let connecting = matches!(
+            operation,
+            Operation::PolicyConnect(..) | Operation::FullProfile(..)
+        );
         let routing_revision = match &operation {
             Operation::PolicyConnect(_, _, _, revision) => Some(*revision),
             _ => None,
@@ -7017,6 +7321,12 @@ impl Flight {
         let mutating = !matches!(operation, Operation::State);
         let (cancel, cancellation) = Cancellation::new();
         let task = tokio::spawn(async move {
+            if matches!(operation, Operation::FullProfile(..))
+                && yonik_linux::full_profile_preflight(yonik_linux::FullProfileMode::System)
+                    .is_err()
+            {
+                return (session, Err(ClientError::Unsupported));
+            }
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             let mut session = match session {
                 Some(mut session) => {
@@ -7035,6 +7345,15 @@ impl Flight {
             };
             session.revise(revision);
             let result = match operation {
+                Operation::FullProfile(request) => {
+                    match session
+                        .prepare_full_profile(revision, &request, deadline, cancellation.clone())
+                        .await
+                    {
+                        Ok(()) => session.apply(revision, deadline, cancellation).await,
+                        Err(error) => Err(error),
+                    }
+                }
                 Operation::PolicyConnect(server, engine, policy, _) => {
                     match session
                         .prepare_policy(
