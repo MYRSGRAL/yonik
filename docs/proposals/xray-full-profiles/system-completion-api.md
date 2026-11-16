@@ -504,8 +504,9 @@ lease4ms/fresh5000000ns, ownerKind1(FrozenSent)/id10. Это второй доп
 ```
 
 `required=false/fresh=0/owner=None` допустимы для service flow0 и Local user DNS;
-они НЕ являются System user DNS response. Go R14 publishService correction должен
-разделить эти ветки, сверить private flow/revision/pending reply и live refresh ID.
+они НЕ являются System user DNS response. Go R14 publishService correction
+`fb206733`, сохранённый в `ff5b348`, разделяет эти ветки, сверяет private
+flow/revision/pending reply и live refresh ID; R15/R16 закрыли SOURCE-совместимость.
 Zeroed System owner tail, missing/over20ms freshness, None/unknown owner kind,
 zero owner ID, foreign binding/objectId и truncation отвергаются Rust codec.
 Wrong private flow/revision/pending sequence/refresh ID оставлены wire-valid
@@ -547,6 +548,15 @@ YNKLOC01/Host peer; он не System proof и не mode из env. Legacy/check �
 
 - Active associations≤8; общий pending runtime+proof ledger≤64. Все counters
   ненулевые, monotonic, MAX/wrap запрещены, tombstones до конца invocation.
+  Общий runtime/proof tombstone ledger ограничен min(negotiated caps[7],256)
+  записями на invocation, совместно для всех associations и видов operations.
+  Credit будущего tombstone и его metadata резервируется до socket/packet effect,
+  не после завершения. Повторный переход той же operation не расходует вторую
+  запись. При исчерпании новые effects запрещены; evict/reuse ID не допускаются.
+  Reservation становится retained tombstone при любом terminal outcome;
+  credit освобождается только после KnownClosed всей invocation. Этот bounded
+  draft не обещает неограниченное число datagrams за invocation; безопасная
+  compaction/watermark retirement потребует отдельного контракта до оптимизации.
 - Datagram целиком, включая SOCKS UDP header, ≤65507 bytes. Нет fragmentation
   reassembly: RSV=0, FRAG=0, ATYP только IPv4/IPv6/domain; порт ненулевой;
   domain ASCII canonical≤253, header length10/22/7+nameLen (≤260).
@@ -578,6 +588,13 @@ YNKLOC01/Host peer; он не System proof и не mode из env. Legacy/check �
   aggregate8MiB preflight, не дополнительный budget; оставшиеся tables/frames/
   ledgers/SourceFlows тоже учитываются. До увеличения flow set — отдельный
   SourceFlow/FD/metadata credit; ≤256 flows/association и existing global caps.
+  Эта пара buffers принадлежит ровно одному packet cycle от первого peek
+  до завершения GRANT/отказа и освобождения private payload. ConsumedMatch
+  сам по себе buffers не освобождает. Следующий peek/permit запрещён, пока
+  previous payload не передан в отдельно credited downstream flow после GRANT
+  либо не уничтожен при отказе/cancel. Сохранение payload после передачи требует
+  downstream buffer credit до передачи; association buffers нельзя alias/reuse.
+  Задержанный AUTHORIZE не позволяет начать второй cycle или overwrite buffers.
 - Internal deadline каждого packet: min(request receipt+1s, session lease,
   control lifetime). Никакое ожидание queue, новый permit, ACK или renewal его
   не продлевает. Owner20ms — отдельный первоначальный expiry свежего lookup;
