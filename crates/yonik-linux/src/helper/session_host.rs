@@ -744,29 +744,54 @@ impl crate::helper::native_profile_channel::RouteAuthority for ProfileRoutes {
     fn dns_socket(
         &mut self,
         scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
-        ticket: u64,
+        ticket: Option<u64>,
         facts: &crate::helper::native_profile_channel::dns_transport::Facts,
     ) -> Result<(), ServiceError> {
-        let bound = *self.tickets.get(&ticket).ok_or(ServiceError::Unavailable)?;
+        let bound = ticket
+            .map(|ticket| {
+                self.tickets
+                    .get(&ticket)
+                    .copied()
+                    .ok_or(ServiceError::Unavailable)
+            })
+            .transpose()?;
         let shared = self.backend.upgrade().ok_or(ServiceError::Unavailable)?;
         let mut backend = shared.try_lock().map_err(unavailable)?;
         let runtime = self.runtime.clone();
         let result = runtime.block_on(async {
             let (_keep, mut cancel) = fresh_cancel();
             let artifact = self.fence(&mut backend, scope, &mut cancel).await?;
-            let (route, _) = self.dynamic.get(&bound).ok_or(ServiceError::Unavailable)?;
-            if facts.remote().ip() != route.endpoint
-                || facts.remote().port() != route.port
-                || facts.protocol()
-                    != match route.protocol {
-                        crate::TransportProtocol::Tcp => 6,
-                        crate::TransportProtocol::Udp => 17,
-                    }
-                || route.route.preferred_source != Some(facts.local().ip())
-                || facts.local().port() == 0
-                || facts.mark() != artifact.plan.socket_mark()
-                || facts.uid() != artifact.worker_uid
-            {
+            let route = if let Some(bound) = bound {
+                &self.dynamic.get(&bound).ok_or(ServiceError::Unavailable)?.0
+            } else {
+                // None не authority: только exact retained static first-hop,
+                // повторно проверенный existing session/network fence выше.
+                artifact
+                    .routes
+                    .iter()
+                    .find(|r| {
+                        !r.dns
+                            && crate::helper::native_profile_channel::dns_route_socket_matches(
+                                r.endpoint,
+                                r.port,
+                                r.protocol,
+                                r.route.preferred_source,
+                                artifact.worker_uid,
+                                artifact.plan.socket_mark(),
+                                facts,
+                            )
+                    })
+                    .ok_or(ServiceError::Unavailable)?
+            };
+            if !crate::helper::native_profile_channel::dns_route_socket_matches(
+                route.endpoint,
+                route.port,
+                route.protocol,
+                route.route.preferred_source,
+                artifact.worker_uid,
+                artifact.plan.socket_mark(),
+                facts,
+            ) {
                 return Err(ServiceError::Unavailable);
             }
             scope.validate().map_err(unavailable)
@@ -837,7 +862,6 @@ impl crate::helper::native_profile_channel::RouteAuthority for ProfileRoutes {
         result
     }
 }
-
 /// Системный UID читается из фиксированного локального файла. NSS, shell и
 /// произвольные программы здесь не участвуют; неоднозначная запись запрещена.
 fn worker_uid() -> Result<u32, ServiceError> {

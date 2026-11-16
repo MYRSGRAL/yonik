@@ -5,6 +5,32 @@ use std::{
     sync::{Mutex, atomic::AtomicUsize},
 };
 use wire::dns_v2::Operation;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyFault {
+    None,
+    NoLineage,
+    WrongLaunch,
+    WrongPeer,
+    WrongNamespace,
+    WrongFrontier,
+    LogicalQuery,
+    LogicalBundle,
+    LogicalKind,
+    AppendRevision,
+    AppendSequence,
+    AppendDuplicate,
+    AppendForeign,
+    AppendReplay,
+    AppendCancel,
+    AppendLostAck,
+    AppendSlow,
+    PublishBeforeAck,
+    PhysicalBeforeAck,
+    AppendAfterPublish,
+    Retire,
+    RetirePartial,
+    HistoryFull,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NumericFault {
@@ -38,6 +64,7 @@ enum NumericFault {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
+    Proxy,
     None,
     Peer,
     Namespace,
@@ -97,7 +124,8 @@ impl Fault {
         )
     }
     fn publishing(self) -> bool {
-        self.waitering()
+        self == Self::Proxy
+            || self.waitering()
             || matches!(
                 self,
                 Self::Publish
@@ -133,6 +161,9 @@ impl Fault {
     }
 }
 struct Driver {
+    proxy_fault: Cell<ProxyFault>,
+    physical_peer: Target,
+    physical_path: (u16, u16, u16, u8, u16),
     record: LaunchRecord,
     acquire: Vec<u8>,
     peer: Target,
@@ -176,6 +207,25 @@ fn p16(b: &mut [u8], at: usize, v: u16) {
 }
 impl Driver {
     fn new(issuer: &Issuer<Fake>, acquire: Vec<u8>, reverse: bool, fault: Fault) -> Self {
+        let cap = issuer.capsule().unwrap();
+        let path = wire::dns_v2::View::<55>::decode(&acquire).unwrap();
+        let hops: Vec<_> = path.path().collect();
+        let (scope, branch) = *hops.last().unwrap();
+        let dial = cap.dial_scope(scope, branch).unwrap();
+        let mut endpoint_index = u16::MAX;
+        let mut physical_peer = Target::copy(cap.resolver_peer(0).unwrap()).unwrap();
+        if fault == Fault::Proxy {
+            for (scope, branch) in &hops {
+                let d = cap.dial_scope(*scope, *branch).unwrap();
+                if let Some(endpoint) = d.endpoint {
+                    physical_peer = Target::copy(endpoint).unwrap();
+                    endpoint_index = d.endpoint_index;
+                }
+                if d.next.is_none() {
+                    physical_peer.protocol = d.carrier;
+                }
+            }
+        }
         let mut input = VecDeque::from([dns_packet(
             issuer.record,
             3,
@@ -186,6 +236,15 @@ impl Driver {
             InvocationHistory::new(256, &issuer.budget.dynamic).unwrap(),
         ));
         let out = Self {
+            proxy_fault: Cell::new(ProxyFault::None),
+            physical_peer,
+            physical_path: (
+                scope,
+                dial.subject,
+                endpoint_index,
+                branch,
+                (hops.len() - 1) as u16,
+            ),
             record: issuer.record,
             peer: Target::copy(issuer.capsule().unwrap().resolver_peer(0).unwrap()).unwrap(),
             acquire,
@@ -278,6 +337,23 @@ impl Driver {
         b[76] = self.peer.protocol;
         b[77] = 3;
         b[78] = 1;
+        if self.fault == Fault::Proxy {
+            p16(&mut b, 66, if role == 2 { self.physical_path.1 } else { 0 });
+            p16(
+                &mut b,
+                70,
+                if role == 2 {
+                    self.physical_path.0
+                } else {
+                    n16(a, a.len() - usize::from(n16(a, 50)) * 4)
+                },
+            );
+            if role == 2 {
+                p16(&mut b, 68, self.physical_path.2);
+                b[76] = self.physical_peer.protocol;
+                b[79] = self.physical_path.3;
+            }
+        }
         if role == 2 {
             p64(&mut b, 88, parent);
         } else {
@@ -308,10 +384,25 @@ impl Driver {
         ] {
             p64(&mut b, at, v);
         }
-        b[164] = self.peer.protocol;
-        b[165] = if self.peer.protocol == 6 { 1 } else { 2 };
+        if self.fault == Fault::Proxy {
+            p16(
+                &mut b,
+                162,
+                if self.proxy_fault.get() == ProxyFault::WrongFrontier {
+                    0
+                } else {
+                    self.physical_path.4
+                },
+            );
+        }
+        b[164] = self.physical_peer.protocol;
+        b[165] = if self.physical_peer.protocol == 6 {
+            1
+        } else {
+            2
+        };
         b[166] = self.record.mode as u8;
-        let d = self.peer.wire();
+        let d = self.physical_peer.wire();
         b[168] = d.family;
         b[169] = d.protocol;
         p16(&mut b, 170, d.port);
@@ -320,7 +411,21 @@ impl Driver {
         b
     }
     fn physical(&self, id: u64) -> Result<(), ServiceError> {
-        let peer = if self.fault == Fault::Peer {
+        let peer = if self.proxy_fault.get() == ProxyFault::WrongPeer {
+            "192.0.2.53:53".parse().unwrap()
+        } else if self.fault == Fault::Proxy {
+            endpoint(
+                self.physical_peer.wire().family,
+                {
+                    let mut b = [0; 16];
+                    b[..self.physical_peer.wire().bytes.len()]
+                        .copy_from_slice(self.physical_peer.wire().bytes);
+                    b
+                },
+                self.physical_peer.port,
+            )
+            .unwrap()
+        } else if self.fault == Fault::Peer {
             "203.0.113.99:53".parse().unwrap()
         } else {
             "192.0.2.53:53".parse().unwrap()
@@ -330,17 +435,22 @@ impl Driver {
         } else {
             "192.0.2.10:40001"
         };
-        let ns = if self.fault == Fault::Namespace {
+        let ns = if self.fault == Fault::Namespace
+            || self.proxy_fault.get() == ProxyFault::WrongNamespace
+        {
             (9, 9)
         } else {
             (4, 5)
         };
-        let facts = Arc::new(Mutex::new(dns_transport::fake_facts(
-            source.parse().unwrap(),
-            peer,
-            self.peer.protocol,
-            ns,
-        )));
+        let facts = Arc::new(Mutex::new(
+            dns_transport::fake_facts(
+                source.parse().unwrap(),
+                peer,
+                self.physical_peer.protocol,
+                ns,
+            )
+            .with_cookie(100 + id),
+        ));
         let raw = dns_transport::Incoming::fake(
             self.raw_record(id),
             &dns_neg(self.record),
@@ -370,7 +480,10 @@ impl Driver {
     fn logical(&self, sequence: u64, resource: u64) {
         let mut logical = [0; 72];
         p16(&mut logical, 0, 2);
-        logical[2] = 1;
+        logical[2] = if self.fault == Fault::Proxy { 2 } else { 1 };
+        if self.proxy_fault.get() == ProxyFault::LogicalKind {
+            logical[2] = 1;
+        }
         p16(&mut logical, 4, 1);
         for (at, v) in [
             (8, 1),
@@ -396,6 +509,11 @@ impl Driver {
             (64, resource),
         ] {
             p64(&mut logical, at, v);
+        }
+        match self.proxy_fault.get() {
+            ProxyFault::LogicalQuery => p64(&mut logical, 16, 999),
+            ProxyFault::LogicalBundle => p64(&mut logical, 24, 999),
+            _ => {}
         }
         self.queue(sequence, Operation::LogicalBind, &logical);
     }
@@ -551,6 +669,18 @@ impl Driver {
     }
 }
 impl Channel for Driver {
+    fn dns_logical_producer(
+        &self,
+        mut launch: LaunchRecord,
+    ) -> Result<Option<VerifiedDnsLogicalProducer>, ServiceError> {
+        if self.proxy_fault.get() == ProxyFault::WrongLaunch {
+            launch.nonce[0] ^= 1;
+        }
+        Ok(
+            (self.fault == Fault::Proxy && self.proxy_fault.get() != ProxyFault::NoLineage)
+                .then_some(VerifiedDnsLogicalProducer { launch }),
+        )
+    }
     fn dns_wire_producer(
         &self,
         record: LaunchRecord,
@@ -725,6 +855,48 @@ impl Channel for Driver {
             &dns_neg(self.record),
             wire::dns_v2::Direction::Issuer,
         )?;
+        if self.fault == Fault::Proxy
+            && self.proxy_fault.get() == ProxyFault::PhysicalBeforeAck
+            && f.record.operation() == Operation::PhysicalAck
+            && n64(bytes, 144) == 2
+            && !self.blocked.replace(true)
+        {
+            let mut b = [0; 56];
+            p16(&mut b, 0, 2);
+            p16(&mut b, 4, 1);
+            for (at, v) in [
+                (8, 1),
+                (16, 1),
+                (24, 1),
+                (32, 1),
+                (40, 1_000_000_000),
+                (48, 2),
+            ] {
+                p64(&mut b, at, v);
+            }
+            self.queue(8, Operation::Append, &b);
+            return Ok(false);
+        }
+        if f.record.operation() == Operation::AppendAck
+            && self.fault == Fault::Proxy
+            && bytes[130] == 1
+            && !self.blocked.replace(true)
+        {
+            match self.proxy_fault.get() {
+                ProxyFault::AppendLostAck => return Err(ServiceError::Unavailable),
+                ProxyFault::AppendSlow => {
+                    self.elapsed.fetch_add(25_000_000, Ordering::AcqRel);
+                    return Ok(false);
+                }
+                ProxyFault::PublishBeforeAck => {
+                    let mut b = self.publish();
+                    p64(&mut b, 128, 2);
+                    self.queue(9, Operation::Publish, &b);
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
         if (self.fault == Fault::ReleaseRetry
             || self.fault == Fault::ReleaseRetryResource && bytes[131] == 3)
             && f.record.operation() == Operation::Retired
@@ -849,7 +1021,7 @@ impl Channel for Driver {
                     self.input.borrow_mut().push_back(out[..n].to_vec());
                     return Ok(true);
                 }
-                if !self.reverse {
+                if !self.reverse || self.fault == Fault::Proxy && n64(b, 8) != 2 {
                     self.physical(n64(b, 8))?;
                 }
                 if self.fault == Fault::Duplicate {
@@ -864,12 +1036,54 @@ impl Channel for Driver {
                 }
             }
             Operation::PhysicalAck => {
+                if self.fault == Fault::Proxy && n64(b, 16) == 2 {
+                    if self.proxy_fault.get() == ProxyFault::PhysicalBeforeAck {
+                        return Ok(true);
+                    }
+                    let mut append = [0; 56];
+                    p16(&mut append, 0, 2);
+                    p16(&mut append, 4, 1);
+                    for (at, v) in [
+                        (8, 1),
+                        (16, 1),
+                        (24, 1),
+                        (32, 1),
+                        (40, 1_000_000_000),
+                        (48, 2),
+                    ] {
+                        p64(&mut append, at, v);
+                    }
+                    match self.proxy_fault.get() {
+                        ProxyFault::AppendRevision => p64(&mut append, 24, 2),
+                        ProxyFault::AppendSequence => p64(&mut append, 32, 2),
+                        ProxyFault::AppendDuplicate => p64(&mut append, 48, 1),
+                        ProxyFault::AppendForeign => p64(&mut append, 48, 999),
+                        ProxyFault::HistoryFull => {
+                            let mut h = self.history.lock().unwrap();
+                            h.limit = h.len;
+                        }
+                        _ => {}
+                    }
+                    self.queue(8, Operation::Append, &append);
+                    if self.proxy_fault.get() == ProxyFault::AppendCancel {
+                        let mut b = [0; 24];
+                        p16(&mut b, 0, 2);
+                        b[2] = 1;
+                        p64(&mut b, 8, 8);
+                        self.queue(9, Operation::Cancel, &b);
+                    }
+                    return Ok(true);
+                }
                 if self.fault == Fault::Changed {
                     self.valid.store(false, Ordering::Release);
                 }
                 self.logical(6, n64(b, 16));
             }
             Operation::LogicalAck => {
+                if self.fault == Fault::Proxy {
+                    self.queue(7, Operation::Reserve, &self.reserve(2, 1));
+                    return Ok(true);
+                }
                 if self.fault.publishing() {
                     if self.fault == Fault::PublishExpired {
                         self.elapsed.fetch_add(21_000_000, Ordering::AcqRel);
@@ -915,6 +1129,72 @@ impl Channel for Driver {
                 }
             }
             Operation::Published if self.fault.waitering() => self.next_waiter(),
+            Operation::AppendAck => {
+                if self.proxy_fault.get() == ProxyFault::AppendReplay {
+                    let mut a = [0; 56];
+                    p16(&mut a, 0, 2);
+                    p16(&mut a, 4, 1);
+                    for (at, v) in [
+                        (8, 1),
+                        (16, 1),
+                        (24, 1),
+                        (32, 1),
+                        (40, 1_000_000_000),
+                        (48, 2),
+                    ] {
+                        p64(&mut a, at, v);
+                    }
+                    self.queue(9, Operation::Append, &a);
+                } else if matches!(
+                    self.proxy_fault.get(),
+                    ProxyFault::Retire | ProxyFault::RetirePartial
+                ) {
+                    let mut r = [0; 24];
+                    p16(&mut r, 0, 2);
+                    r[2] = 4;
+                    p64(&mut r, 8, 1);
+                    p64(&mut r, 16, 2);
+                    self.queue(9, Operation::Retire, &r);
+                } else if self.proxy_fault.get() != ProxyFault::PublishBeforeAck {
+                    let mut b = self.publish();
+                    p64(&mut b, 128, 2);
+                    self.queue(9, Operation::Publish, &b);
+                }
+            }
+            Operation::Published if self.proxy_fault.get() == ProxyFault::AppendAfterPublish => {
+                let mut a = [0; 56];
+                p16(&mut a, 0, 2);
+                p16(&mut a, 4, 1);
+                for (at, v) in [
+                    (8, 1),
+                    (16, 1),
+                    (24, 2),
+                    (32, 2),
+                    (40, 1_000_000_000),
+                    (48, 1),
+                ] {
+                    p64(&mut a, at, v);
+                }
+                self.queue(10, Operation::Append, &a);
+            }
+            Operation::Retired if self.fault == Fault::Proxy => {
+                assert_eq!(
+                    self.closed.load(Ordering::Acquire),
+                    if b[3] == 3 { n64(b, 8) as usize } else { 0 }
+                );
+                if b[3] == 3 && n64(b, 8) == 2 {
+                    self.finished.set(true);
+                } else {
+                    let mut r = [0; 24];
+                    p16(&mut r, 0, 2);
+                    r[2] = 3;
+                    p64(&mut r, 8, if b[3] == 4 { 1 } else { 2 });
+                    if b[3] == 3 && self.proxy_fault.get() == ProxyFault::RetirePartial {
+                        self.valid.store(false, Ordering::Release);
+                    }
+                    self.queue(if b[3] == 4 { 10 } else { 11 }, Operation::Retire, &r);
+                }
+            }
             Operation::Published if self.fault == Fault::PublishReplay => {
                 self.queue(8, Operation::Publish, &self.publish())
             }
@@ -1016,6 +1296,17 @@ impl Channel for Driver {
         Ok(true)
     }
     fn writable_until(&self, _: Instant) {
+        if self.fault == Fault::Proxy
+            && matches!(
+                self.proxy_fault.get(),
+                ProxyFault::AppendSlow
+                    | ProxyFault::PublishBeforeAck
+                    | ProxyFault::PhysicalBeforeAck
+            )
+        {
+            assert!(self.blocked.get());
+            return;
+        }
         if self.numeric_fault.get() == NumericFault::SlowWrite {
             assert!(self.blocked.get());
             return;
@@ -1044,6 +1335,209 @@ fn run(issuer: &mut Issuer<Fake>, driver: &Driver) {
         )
         .is_err()
     );
+}
+#[test]
+fn dns_proxy_driver_append_revision_then_publish() {
+    for mode in [Mode::Local, Mode::System] {
+        for reverse in [false, true] {
+            for tcp in [false, true] {
+                let (mut issuer, acquire) = bundle_fixture_network(mode, true, tcp);
+                let driver = Driver::new(&issuer, acquire, reverse, Fault::Proxy);
+                run(&mut issuer, &driver);
+                assert!(
+                    statuses(&driver).contains(&(39, 1, 6)),
+                    "{:?}",
+                    statuses(&driver)
+                );
+                assert!(
+                    statuses(&driver).contains(&(44, 1, 8)),
+                    "{:?}",
+                    statuses(&driver)
+                );
+                assert!(
+                    statuses(&driver).contains(&(41, 1, 9)),
+                    "{:?}",
+                    statuses(&driver)
+                );
+                assert_eq!(
+                    issuer.transport.proof_state(1),
+                    Some((2, 2, 2, true, false, true))
+                );
+                assert!(!issuer.unknown);
+                assert_eq!(driver.created.load(Ordering::Acquire), 2);
+                assert_eq!(driver.slots.fds.used(), 4);
+            }
+        }
+    }
+}
+#[test]
+fn dns_proxy_driver_lineage_manifest_and_actual_first_hop_are_distinct() {
+    for fault in [
+        ProxyFault::NoLineage,
+        ProxyFault::WrongLaunch,
+        ProxyFault::WrongPeer,
+        ProxyFault::WrongNamespace,
+        ProxyFault::WrongFrontier,
+        ProxyFault::LogicalQuery,
+        ProxyFault::LogicalBundle,
+        ProxyFault::LogicalKind,
+    ] {
+        let (mut issuer, a) = bundle_fixture_network(Mode::System, true, true);
+        let io = Driver::new(&issuer, a, false, Fault::Proxy);
+        io.proxy_fault.set(fault);
+        run(&mut issuer, &io);
+        assert!(
+            !statuses(&io)
+                .iter()
+                .any(|(kind, status, _)| *kind == 39 && *status == 1),
+            "{fault:?}"
+        );
+        assert!(issuer.transport.proof_state(1).is_none(), "{fault:?}");
+    }
+}
+#[test]
+fn dns_proxy_driver_append_rejects_revision_sequence_foreign_duplicate_and_caps() {
+    for fault in [
+        ProxyFault::AppendRevision,
+        ProxyFault::AppendSequence,
+        ProxyFault::AppendDuplicate,
+        ProxyFault::AppendForeign,
+        ProxyFault::AppendCancel,
+        ProxyFault::HistoryFull,
+        ProxyFault::PhysicalBeforeAck,
+    ] {
+        let (mut issuer, a) = bundle_fixture_network(Mode::Local, true, true);
+        let io = Driver::new(&issuer, a, false, Fault::Proxy);
+        io.proxy_fault.set(fault);
+        run(&mut issuer, &io);
+        assert!(
+            !statuses(&io)
+                .iter()
+                .any(|(kind, status, _)| *kind == 44 && *status == 1),
+            "{fault:?}"
+        );
+        assert_eq!(
+            issuer.transport.proof_state(1),
+            Some((2, 1, 1, true, false, false)),
+            "{fault:?}"
+        );
+    }
+}
+#[test]
+fn dns_proxy_driver_pending_ack_never_authorizes_early_publication_or_extends_owner() {
+    for fault in [
+        ProxyFault::AppendLostAck,
+        ProxyFault::AppendSlow,
+        ProxyFault::PublishBeforeAck,
+    ] {
+        let (mut issuer, a) = bundle_fixture_network(Mode::System, true, true);
+        let io = Driver::new(&issuer, a, false, Fault::Proxy);
+        io.proxy_fault.set(fault);
+        run(&mut issuer, &io);
+        assert!(
+            !statuses(&io)
+                .iter()
+                .any(|(kind, status, _)| *kind == 41 && *status == 1),
+            "{fault:?}"
+        );
+        if fault == ProxyFault::PublishBeforeAck {
+            assert_eq!(
+                issuer.transport.proof_state(1),
+                Some((2, 2, 2, true, false, false))
+            );
+        } else {
+            assert_eq!(
+                issuer.transport.proof_state(1),
+                Some((2, 2, 1, false, true, false))
+            );
+        }
+        assert_eq!(io.slots.fds.used(), 4);
+        assert_eq!(io.closed.load(Ordering::Acquire), 0);
+        if fault == ProxyFault::AppendLostAck {
+            assert!(issuer.unknown);
+        }
+    }
+}
+#[test]
+fn dns_proxy_driver_replay_and_frozen_publication_cannot_change_union() {
+    for fault in [ProxyFault::AppendReplay, ProxyFault::AppendAfterPublish] {
+        let (mut issuer, a) = bundle_fixture_network(Mode::Local, true, true);
+        let io = Driver::new(&issuer, a, false, Fault::Proxy);
+        io.proxy_fault.set(fault);
+        run(&mut issuer, &io);
+        let state = issuer.transport.proof_state(1).unwrap();
+        assert_eq!((state.0, state.1, state.2), (2, 2, 2));
+        assert_eq!(state.5, fault == ProxyFault::AppendAfterPublish);
+        assert_eq!(
+            statuses(&io)
+                .iter()
+                .filter(|(k, s, _)| *k == 44 && *s == 1)
+                .count(),
+            1
+        );
+    }
+}
+#[test]
+fn dns_proxy_driver_retirement_joins_all_refs_before_consuming_receiver_once() {
+    for fault in [ProxyFault::Retire, ProxyFault::RetirePartial] {
+        let (mut issuer, a) = bundle_fixture_network(Mode::System, true, true);
+        let io = Driver::new(&issuer, a, false, Fault::Proxy);
+        io.proxy_fault.set(fault);
+        run(&mut issuer, &io);
+        assert!(statuses(&io).contains(&(46, 1, 9)));
+        assert!(statuses(&io).contains(&(46, 1, 10)));
+        assert_eq!(io.closed.load(Ordering::Acquire), 2);
+        assert_eq!(issuer.unknown, fault == ProxyFault::RetirePartial);
+        assert_eq!(
+            io.slots.fds.used(),
+            if fault == ProxyFault::Retire { 0 } else { 2 }
+        );
+        if fault == ProxyFault::Retire {
+            let before = issuer.authority.live.len();
+            issuer.cancel_dns_bundle(1).unwrap();
+            assert_eq!(issuer.authority.live.len(), before - 2);
+        }
+    }
+}
+#[test]
+fn dns_proxy_driver_known_bundle_cleanup_preserves_neighbor_source_and_route() {
+    let (mut issuer, a) = bundle_fixture_network(Mode::System, true, true);
+    let (source, _) = issuer
+        .open(52, &issuer_tests::open(Mode::System, 32002))
+        .unwrap();
+    let base = wire::dns_v2::View::<55>::decode(&a)
+        .unwrap()
+        .authorization()
+        .unwrap();
+    let (neighbor, _) = issuer
+        .authorize(
+            53,
+            0,
+            &wire::Authorize {
+                source_flow: source,
+                query: "neighbor.invalid",
+                ..base
+            },
+        )
+        .unwrap();
+    let io = Driver::new(&issuer, a, false, Fault::Proxy);
+    io.proxy_fault.set(ProxyFault::Retire);
+    run(&mut issuer, &io);
+    assert!(!issuer.unknown);
+    issuer.cancel_flow(1).unwrap();
+    assert!(issuer.flows.contains_key(&source));
+    assert!(issuer.grants.contains_key(&neighbor));
+    assert!(!issuer.authority.live.is_empty());
+    assert_eq!(io.closed.load(Ordering::Acquire), 2);
+}
+#[test]
+fn dns_proxy_driver_static_first_hop_needs_captured_route_not_dynamic_ticket() {
+    let (mut issuer, a) = bundle_fixture_network(Mode::System, true, true);
+    issuer.authority.static_dns_peer = Some("203.0.113.11:8443".parse().unwrap());
+    let io = Driver::new(&issuer, a, false, Fault::Proxy);
+    run(&mut issuer, &io);
+    assert!(statuses(&io).contains(&(41, 1, 9)));
+    assert!(!issuer.unknown);
 }
 fn statuses(driver: &Driver) -> Vec<(u16, u8, u64)> {
     driver
@@ -1667,8 +2161,15 @@ fn dns_transport_driver_release_retry_local_system_and_expired_owner_never_reclo
                 Instant::now() + Duration::from_secs(1),
             )
             .unwrap();
-            dns_transport::send_reply(&mut issuer, &io, &AtomicBool::new(false), 100, reply)
-                .unwrap();
+            dns_transport::send_reply(
+                &mut issuer,
+                &io,
+                &AtomicBool::new(false),
+                100,
+                reply,
+                |_| Ok(()),
+            )
+            .unwrap();
             assert_eq!(io.closed.load(Ordering::Acquire), 1);
         }
     }

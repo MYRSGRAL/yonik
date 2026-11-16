@@ -28,11 +28,33 @@ use std::{
     sync::Arc,
 };
 
+/// DATA predicate; authority требует retained route и session fence caller-а.
+pub(super) fn dns_route_socket_matches(
+    endpoint: std::net::IpAddr,
+    port: u16,
+    protocol: crate::TransportProtocol,
+    source: Option<std::net::IpAddr>,
+    uid: u32,
+    mark: u32,
+    facts: &dns_transport::Facts,
+) -> bool {
+    facts.remote().ip() == endpoint
+        && facts.remote().port() == port
+        && facts.protocol()
+            == match protocol {
+                crate::TransportProtocol::Tcp => 6,
+                crate::TransportProtocol::Udp => 17,
+            }
+        && source == Some(facts.local().ip())
+        && facts.local().port() != 0
+        && facts.mark() == mark
+        && facts.uid() == uid
+}
 pub(crate) trait RouteAuthority: Send {
     fn dns_socket(
         &mut self,
         scope: &RuntimeScopeStamp,
-        ticket: u64,
+        ticket: Option<u64>,
         facts: &dns_transport::Facts,
     ) -> Result<(), ServiceError>;
     fn service(
@@ -1119,6 +1141,20 @@ pub(super) struct VerifiedDnsProducer {
 pub(super) struct VerifiedDnsWireProducer {
     launch: LaunchRecord,
 }
+/// Отдельный protected source contract logical handler/stream → exchange →
+/// actual plaintext + consuming-close/join. Direct wire/release не его mint.
+/// Production provider отсутствует до отдельного reviewed installed record.
+pub(super) struct VerifiedDnsLogicalProducer {
+    launch: LaunchRecord,
+}
+impl VerifiedDnsLogicalProducer {
+    fn bound(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
+        if self.launch != launch {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
+}
 impl VerifiedDnsWireProducer {
     fn mint(
         proof: &super::registry::ImageContract,
@@ -1736,6 +1772,7 @@ impl<'a> RoutePlan<'a> {
 struct Issuer<A: Authority> {
     rrsets: dns_rrset::State,
     dns_wire: Option<VerifiedDnsWireProducer>,
+    dns_logical: Option<VerifiedDnsLogicalProducer>,
     dns_release: Option<VerifiedDnsProducer>,
     transport: dns_transport::Transport,
     authority: A,
@@ -1776,6 +1813,7 @@ impl<A: Authority> Issuer<A> {
             authority,
             rrsets: dns_rrset::State::new(),
             dns_wire: None,
+            dns_logical: None,
             dns_release: None,
             transport: dns_transport::Transport::new(&budget.dynamic)?,
             capsule,
@@ -2345,8 +2383,7 @@ impl Authority for SystemAuthority {
         facts: &dns_transport::Facts,
     ) -> Result<(), ServiceError> {
         self.fence()?;
-        self.routes
-            .dns_socket(&self.scope, ticket.ok_or(ServiceError::Unsupported)?, facts)?;
+        self.routes.dns_socket(&self.scope, ticket, facts)?;
         self.fence()
     }
     fn admission_deadline(&self) -> Option<Instant> {
@@ -3071,6 +3108,12 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn dns_logical_producer(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<VerifiedDnsLogicalProducer>, ServiceError> {
+        Ok(None)
+    }
     fn dns_wire_producer(
         &self,
         _: LaunchRecord,
@@ -4603,6 +4646,11 @@ fn drain_before_publication<A: Authority>(
                     },
                 });
             } else {
+                // Полученный до ACK record нельзя сделать позднее допустимым
+                // лишь очередью: фиксируем denial до materialization/effects.
+                if !issuer.transport.ready_at_arrival(f.record) {
+                    issuer.cancel_request(sequence)?;
+                }
                 queued.push_back(Queued::new(
                     &bytes[..length],
                     sequence,
@@ -4909,6 +4957,7 @@ fn run_issuer<A: Authority>(
             if issuer.negotiated.is_none() {
                 issuer.dns_release = socket.dns_producer(issuer.record)?;
                 issuer.dns_wire = socket.dns_wire_producer(issuer.record)?;
+                issuer.dns_logical = socket.dns_logical_producer(issuer.record)?;
                 issuer.negotiated = Some(dns_bundle::negotiate(
                     issuer,
                     socket,

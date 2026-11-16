@@ -487,10 +487,6 @@ impl<A: Authority> Issuer<A> {
         session: Instant,
     ) -> Result<u64, ServiceError> {
         self.fence()?;
-        self.dns_wire
-            .as_ref()
-            .ok_or(ServiceError::Unsupported)?
-            .bound(self.record)?;
         let b = v.bytes();
         if b[136] != 1
             || b[137] != 1
@@ -582,7 +578,7 @@ impl<A: Authority> Issuer<A> {
         Ok(id)
     }
     fn fresh_waiter(&mut self, binding: Binding) -> Result<Instant, ServiceError> {
-        if self.direct_dns_binding(binding.bundle)? != binding {
+        if self.dns_transport_binding(binding.bundle)? != binding {
             return Err(ServiceError::Unavailable);
         }
         let flow = self
