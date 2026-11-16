@@ -39,6 +39,8 @@ pub(crate) mod dns_v2 {
         PhysicalBind = 52,
         WaiterBind = 53,
         WaiterBound = 54,
+        BundleAcquire = 55,
+        BundleGranted = 56,
     }
     impl TryFrom<u16> for Operation {
         type Error = Error;
@@ -61,6 +63,8 @@ pub(crate) mod dns_v2 {
                 52 => Self::PhysicalBind,
                 53 => Self::WaiterBind,
                 54 => Self::WaiterBound,
+                55 => Self::BundleAcquire,
+                56 => Self::BundleGranted,
                 _ => return Err(Error::Schema),
             })
         }
@@ -77,6 +81,7 @@ pub(crate) mod dns_v2 {
                     | Self::Retired
                     | Self::Canceled
                     | Self::WaiterBound
+                    | Self::BundleGranted
             )
         }
         pub(crate) fn rights(self) -> (usize, usize) {
@@ -117,6 +122,7 @@ pub(crate) mod dns_v2 {
         AppendSequence,
         RequestSequenceId
     );
+    ids!(BundleRevision);
     macro_rules! view_id {
         ($kind:literal,$method:ident,$id:ident,$at:literal) => {
             impl View<'_, $kind> {
@@ -170,6 +176,37 @@ pub(crate) mod dns_v2 {
     view_id!(53, source_revision, FlowRevision, 48);
     view_id!(54, reservation, ReservationId, 24);
     view_id!(54, query, QueryId, 32);
+    view_id!(55, grant, ServiceGrantId, 8);
+    view_id!(55, query, QueryId, 16);
+    view_id!(56, bundle, DnsBundleId, 8);
+    view_id!(56, grant, ServiceGrantId, 16);
+    view_id!(56, query, QueryId, 24);
+    view_id!(56, revision, BundleRevision, 56);
+    impl<'a> View<'a, 55> {
+        pub(crate) fn renewal(self) -> Result<Option<(DnsBundleId, BundleRevision)>> {
+            if n64(self.bytes, 32) == 0 {
+                Ok(None)
+            } else {
+                Ok(Some((
+                    DnsBundleId::read(n64(self.bytes, 32))?,
+                    BundleRevision::read(n64(self.bytes, 64))?,
+                )))
+            }
+        }
+        pub(crate) fn base(self) -> &'a [u8] {
+            &self.bytes[72..72 + usize::from(n16(self.bytes, 48))]
+        }
+        pub(crate) fn original(self) -> &'a [u8] {
+            let start = 72 + usize::from(n16(self.bytes, 48));
+            &self.bytes[start..start + usize::from(n16(self.bytes, 58))]
+        }
+        pub(crate) fn path(self) -> impl Iterator<Item = (u16, u8)> + 'a {
+            let start = 72 + usize::from(n16(self.bytes, 48)) + usize::from(n16(self.bytes, 58));
+            self.bytes[start..]
+                .chunks_exact(4)
+                .map(|row| (n16(row, 0), row[2]))
+        }
+    }
     macro_rules! closed_u8 {
         ($name:ident,$($variant:ident=$n:literal),+) => {
             #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -453,6 +490,8 @@ pub(crate) mod dns_v2 {
         PhysicalBind(View<'a, 52>),
         WaiterBind(View<'a, 53>),
         WaiterBound(View<'a, 54>),
+        BundleAcquire(View<'a, 55>),
+        BundleGranted(View<'a, 56>),
     }
     impl<'a> Record<'a> {
         pub(crate) fn decode(op: Operation, b: &'a [u8]) -> Result<Self> {
@@ -474,6 +513,8 @@ pub(crate) mod dns_v2 {
                 Operation::PhysicalBind => Self::PhysicalBind(View::decode(b)?),
                 Operation::WaiterBind => Self::WaiterBind(View::decode(b)?),
                 Operation::WaiterBound => Self::WaiterBound(View::decode(b)?),
+                Operation::BundleAcquire => Self::BundleAcquire(View::decode(b)?),
+                Operation::BundleGranted => Self::BundleGranted(View::decode(b)?),
             })
         }
         pub(crate) fn operation(self) -> Operation {
@@ -495,6 +536,8 @@ pub(crate) mod dns_v2 {
                 Self::PhysicalBind(_) => Operation::PhysicalBind,
                 Self::WaiterBind(_) => Operation::WaiterBind,
                 Self::WaiterBound(_) => Operation::WaiterBound,
+                Self::BundleAcquire(_) => Operation::BundleAcquire,
+                Self::BundleGranted(_) => Operation::BundleGranted,
             }
         }
         pub(crate) fn bytes(self) -> &'a [u8] {
@@ -516,6 +559,8 @@ pub(crate) mod dns_v2 {
                 Self::PhysicalBind(v) => v.bytes(),
                 Self::WaiterBind(v) => v.bytes(),
                 Self::WaiterBound(v) => v.bytes(),
+                Self::BundleAcquire(v) => v.bytes(),
+                Self::BundleGranted(v) => v.bytes(),
             }
         }
         pub(crate) fn encode(self, out: &mut [u8]) -> Result<usize> {
@@ -537,6 +582,8 @@ pub(crate) mod dns_v2 {
                     40
                 }
                 Operation::Published if b[2] == 1 => 24,
+                Operation::BundleAcquire => 24,
+                Operation::BundleGranted if b[2] == 1 => 32,
                 _ => return None,
             };
             Some(n64(b, at))
@@ -555,7 +602,7 @@ pub(crate) mod dns_v2 {
             super::put16(&mut b, 8, 2);
             super::put16(&mut b, 10, 272);
             b[16..208].copy_from_slice(&launch.encode()?);
-            b[208..240].copy_from_slice(&Sha256::digest(b"YONIK-DNS-V2-CODEC-1\0"));
+            b[208..240].copy_from_slice(&Sha256::digest(b"YONIK-DNS-V2-CODEC-2\0"));
             for (at, n) in [
                 (240, 4),
                 (242, 11),
@@ -1014,7 +1061,7 @@ pub(crate) mod dns_v2 {
                 if kind == 45 {
                     retire_target(b[2], n64(b, 16))
                 } else {
-                    if !matches!(b[2], 1..=7) {
+                    if !matches!(b[2], 1..=8) {
                         return Err(Error::Schema);
                     }
                     zero(&b[18..24])
@@ -1041,6 +1088,79 @@ pub(crate) mod dns_v2 {
                     return Err(Error::Reference);
                 }
                 Ok(())
+            }
+            55 => {
+                if !(72..=2164).contains(&b.len()) {
+                    return Err(Error::Bounds);
+                }
+                zero(&b[2..8])?;
+                zero(&b[62..64])?;
+                for at in [8, 16, 24] {
+                    id(n64(b, at))?;
+                }
+                lease(n64(b, 40))?;
+                if (n64(b, 32) == 0) != (n64(b, 64) == 0) {
+                    return Err(Error::Reference);
+                }
+                if n64(b, 32) != 0 {
+                    id(n64(b, 32))?;
+                    id(n64(b, 64))?;
+                }
+                let base = usize::from(n16(b, 48));
+                let count = usize::from(n16(b, 50));
+                let original = usize::from(n16(b, 58));
+                if !(1..=815).contains(&base)
+                    || !(1..=256).contains(&count)
+                    || !(1..=253).contains(&original)
+                    || 72 + base + original + count * 4 != b.len()
+                    || !matches!(n16(b, 52), 1 | 28)
+                    || n16(b, 60) == super::NONE
+                {
+                    return Err(Error::Bounds);
+                }
+                let flags = n16(b, 54);
+                let payload = n16(b, 56);
+                if flags & !31 != 0
+                    || if flags & 8 == 0 {
+                        payload != 0 || flags & 4 != 0
+                    } else {
+                        !(512..=4096).contains(&payload)
+                    }
+                {
+                    return Err(Error::Schema);
+                }
+                let super::Message::Authorize(a) =
+                    super::Message::decode(super::Kind::Authorize, &b[72..72 + base])?
+                else {
+                    return Err(Error::Reference);
+                };
+                if a.class != 3 || a.resolver != n16(b, 60) {
+                    return Err(Error::Reference);
+                }
+                ascii_name(&b[72 + base..72 + base + original], false)?;
+                for row in b[72 + base + original..].chunks_exact(4) {
+                    if n16(row, 0) == super::NONE || row[2] > 1 || row[3] != 0 {
+                        return Err(Error::Reference);
+                    }
+                }
+                Ok(())
+            }
+            56 => {
+                if b.len() != 64 || !matches!(b[2], 1..=3) {
+                    return Err(Error::Bounds);
+                }
+                zero(&b[3..8])?;
+                if b[2] != 1 {
+                    return zero(&b[8..]);
+                }
+                for at in [8, 16, 24, 32, 56] {
+                    id(n64(b, at))?;
+                }
+                lease(n64(b, 40))?;
+                if !(1..=256).contains(&n16(b, 48)) {
+                    return Err(Error::Bounds);
+                }
+                zero(&b[50..56])
             }
             53 => {
                 if b.len() != 64 {
@@ -5192,6 +5312,12 @@ mod tests {
             let ack = dns_v2_hex(n["ackHex"].as_str().unwrap());
             assert_eq!(Negotiated::descriptor(launch).unwrap().as_slice(), d);
             assert_eq!(Negotiated::ack(&d).unwrap().as_slice(), ack);
+            let mut old = d.clone();
+            old[208..240].copy_from_slice(&sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-1\0"));
+            let mut old_ack = [0; 40];
+            old_ack[..8].copy_from_slice(b"DNSACK02");
+            old_ack[8..].copy_from_slice(&sha2::Sha256::digest(&old));
+            assert!(Negotiated::accept(&old, &old_ack, launch, [(0, 0); 2]).is_err());
             for len in 0..d.len() {
                 assert!(Negotiated::ack(&d[..len]).is_err());
             }
@@ -5222,6 +5348,41 @@ mod tests {
             other.manifest[0] ^= 1;
             assert!(Negotiated::accept(&d, &ack, other, [(0, 0); 2]).is_err());
             assert!(super::Frame::decode(&d, launch.binding, mode, true).is_err());
+        }
+    }
+    #[test]
+    fn dns_v2_bundle_views_preserve_actual_choices_and_renewal_identity() {
+        use super::dns_v2::View;
+        let corpus = dns_v2_corpus();
+        for (name, renewal, count) in [
+            ("bundle-acquire-initial", false, 1),
+            ("bundle-acquire-renew", true, 2),
+            ("bundle-acquire-max", false, 256),
+        ] {
+            let case = corpus["vectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == name)
+                .unwrap();
+            let mut body = vec![0; case["size"].as_u64().unwrap() as usize];
+            dns_v2_fields(&mut body, &case["fields"]);
+            let view = View::<55>::decode(&body).unwrap();
+            assert_eq!(view.query().unwrap().get(), 11);
+            assert_eq!(view.grant().unwrap().get(), 13);
+            assert_eq!(view.renewal().unwrap().is_some(), renewal);
+            if let Some((bundle, revision)) = view.renewal().unwrap() {
+                assert_eq!((bundle.get(), revision.get()), (12, 1));
+            }
+            assert_eq!(
+                view.base().len(),
+                usize::from(u16::from_be_bytes([body[48], body[49]]))
+            );
+            assert!(!view.original().is_empty());
+            assert_eq!(
+                view.path().collect::<Vec<_>>(),
+                (0..count).map(|i| (i, (i % 2) as u8)).collect::<Vec<_>>()
+            );
         }
     }
     #[test]
@@ -5265,7 +5426,7 @@ mod tests {
                 assert!(SnapshotRoleView::decode(4, &bad).is_err());
             }
         }
-        for n in [0, 1, 34, 49, 50, 51, 55, 65535] {
+        for n in [0, 1, 34, 49, 50, 51, 57, 65535] {
             assert!(Operation::try_from(n).is_err());
         }
         let mut waiter = [0; 64];

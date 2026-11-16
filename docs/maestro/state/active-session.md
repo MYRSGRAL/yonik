@@ -592,6 +592,20 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   DNS/cache/transport. Internal proxy/dns subject остаётся Unsupported и вне
   текущего ownership. Public gates закрыты; installed e14 не обновлялся.
 
+- R34 SOURCE scoped CLEAN: Go d082c3b интегрирован после проверки strict UDP/TCP
+  parser/cache DATA, DNS→USER denial, task custody/deadlines и post-ADMIT CODEC-1
+  setup. Полный transport/receipt/issuer vertical остаётся закрытым. Новый patch
+  digest ещё не принят в protected image allowlist.
+- Root CODEC-2 добавляет BundleAcquire55/BundleGranted56 и target8 bundle cancel
+  по 4bc87da: DATA typed views, exact epoch/renewal references, новый schema hash
+  без CODEC-1 fallback. Прежние76 vectors побайтно сохранены; corpus86 positive,
+  218 body negatives и17 envelope negatives. Семь named pure codec tests,
+  no-run, linux+desktop all-targets clippy, fmt/Ruff/packer PASS. Source/compiler/
+  ELF evidence r35-codec2 сохранён до исполнения, unchanged после; cargo clean
+  выполнен. Независимый review и Go CODEC-2 parity ещё нужны. Actual bundle issuer
+  не реализован; DATA ACK не является authority. StubBind526e1c ожидает review,
+  protected resolver service-policy producer отсутствует. Runtime не запускался.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение

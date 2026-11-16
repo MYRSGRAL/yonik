@@ -6,8 +6,9 @@
 version1 с exact launch binding; это не frozen ABI260 role frame. DNS_V2 kinds:
 35 Reserve,36 Reserved,37 PhysicalAck,38 LogicalBind,39 LogicalAck,40 Publish,
 41 Published,42 NumericAuthorize,43 Append,44 AppendAck,45 Retire,46 Retired,
-47 Cancel,48 Canceled,52 PhysicalBind,53 WaiterBind,54 WaiterBound.
-Requests35/38/40/42/43/45/47/53 идут producer→issuer, ACK идут обратно;
+47 Cancel,48 Canceled,52 PhysicalBind,53 WaiterBind,54 WaiterBound,
+55 BundleAcquire,56 BundleGranted.
+Requests35/38/40/42/43/45/47/53/55 идут producer→issuer, ACK идут обратно;
 PhysicalBind52 — producer→issuer на proof channel: ровно raw DNSPHY02/192,
 БЕЗ runtime Header128. Число52 — enum/corpus discriminator, не поле этого
 proof packet. Runtime decoder отвергает wrapped Header128+PhysicalBind.
@@ -22,7 +23,7 @@ flags u32=0@12; exact encoded LaunchRecord192@16; schemaHash32@208;
 mapping u16=4@240, tables u16=11@242, aggregate u32=8388608@244,
 FD u16=64@248,pending u16=64@250,resources u16=64@252,
 RRmembers u16=256@254,history u16=256@256,reserved14=0@258.
-schemaHash=SHA256 ASCII `YONIK-DNS-V2-CODEC-1` + один NUL byte. После первого
+schemaHash=SHA256 ASCII `YONIK-DNS-V2-CODEC-2` + один NUL byte. После первого
 canonical commit изменение field/offset/семантики требует нового CODEC-N/hash;
 этот identifier нельзя переиспользовать для несовместимого parser.
 ACK40 = ASCII DNSACK02 + SHA256 exact Descriptor272. Descriptor и ACK rights0.
@@ -44,7 +45,7 @@ issuer отвечает raw ACK40. Оба сообщения без Header128 и
 cancel/revoke или ошибка передачи запрещают запуск monitor и требуют существующий
 cleanup с сохранением Unknown custody; fallback отсутствует.
 
-CODEC-1 проверяет форму DNSBundleId, но ещё не задаёт его issuance. Legacy
+Исторический CODEC-1 проверяет форму DNSBundleId, но не задаёт его issuance. Legacy
 AUTHORIZE18/GRANT19 class3 выдаёт ServiceGrantId, а не полный DNS chain bundle;
 приравнивать эти namespaces либо выпускать bundle на child запрещено. До отдельного
 canonical acquisition/ACK, связывающего issuer-issued bundle с exact query/private
@@ -55,10 +56,11 @@ DATA roundtrip CODEC-1 не подтверждает готовность это
 
 ### CODEC-2: выдача полного class3 bundle
 
-Следующий canonical codec должен использовать schemaHash SHA256 ASCII
+Canonical CODEC-2 использует schemaHash SHA256 ASCII
 `YONIK-DNS-V2-CODEC-2` + NUL, при прежних descriptor/version/ABI. CODEC-1
-не принимает следующие kinds. До реализации CODEC-2/goldens/interop этот раздел
-задаёт контракт реализации, а не разрешение negotiation или network Reserve.
+не принимает следующие kinds. Codec/goldens проверяют только DATA; до реализации
+issuer authority и межъязыковой проверки этот раздел не разрешает negotiation
+или network Reserve в production.
 
 BundleAcquire55 — producer→issuer, обычный Header128/request.reply0/rights0.
 Body fixed72 + canonical class3 base + original name + pathCount*4, максимум2164:

@@ -73,7 +73,7 @@ def descriptor(mode: int) -> bytes:
             field(8, 2, "u16"),
             field(10, 272, "u16"),
             raw(16, launch(mode)),
-            raw(208, hashlib.sha256(b"YONIK-DNS-V2-CODEC-1\0").digest()),
+            raw(208, hashlib.sha256(b"YONIK-DNS-V2-CODEC-2\0").digest()),
             field(240, 4, "u16"),
             field(242, 11, "u16"),
             field(244, 8388608, "u32"),
@@ -167,7 +167,7 @@ def header(kind: int, body: bytes, sequence: int, issuer: bool) -> bytes:
 
 def corpus() -> dict[str, Any]:
     vectors: list[dict[str, Any]] = []
-    issuer_kinds = {36, 37, 39, 41, 44, 46, 48, 54}
+    issuer_kinds = {36, 37, 39, 41, 44, 46, 48, 54, 56}
 
     def add(
         name: str,
@@ -734,6 +734,48 @@ def corpus() -> dict[str, Any]:
             raw(96, original + query + maximum_base),
         ],
     )
+    for label, canonical, original, count, renewal in [
+        ("initial", base(3), b"resolver.invalid", 1, False),
+        ("renew", base(3), b"resolver.invalid", 2, True),
+        ("max", maximum_base, long_name, 256, False),
+    ]:
+        path = b"".join(struct.pack(">HBB", i, i % 2, 0) for i in range(count))
+        request(
+            "bundle-acquire-" + label,
+            55,
+            72 + len(canonical + original + path),
+            [
+                field(8, 13),
+                field(16, 11),
+                field(24, 7),
+                field(32, 12 if renewal else 0),
+                field(40, 1000),
+                field(48, len(canonical), "u16"),
+                field(50, count, "u16"),
+                field(52, 1, "u16"),
+                field(54, 12, "u16"),
+                field(56, 1232, "u16"),
+                field(58, len(original), "u16"),
+                field(64, 1 if renewal else 0),
+                raw(72, canonical + original + path),
+            ],
+        )
+    for label, revision in [("initial", 1), ("renew", 2)]:
+        ack(
+            "bundle-granted-" + label,
+            56,
+            64,
+            [
+                field(8, 12),
+                field(16, 13),
+                field(24, 11),
+                field(32, 7),
+                field(40, 1000),
+                field(48, 1, "u16"),
+                field(56, revision),
+            ],
+        )
+    request("cancel-bundle", 47, 24, [field(2, 8, "u8"), field(8, 12)])
     negotiations = [
         {
             "mode": mode,
@@ -822,16 +864,58 @@ def corpus() -> dict[str, Any]:
     reject("retired-4", field(28, 0, "u8"))
     reject("retired-unknown-custody", field(26, 65, "u16"))
     reject("retire-3", field(16, 1))
-    reject("cancel-1", field(2, 8, "u8"))
+    reject("cancel-1", field(2, 9, "u8"))
     reject("cancel-6", field(4, 1, "u32"))
+    for at in [8, 16, 24]:
+        for value in [0, 18446744073709551615]:
+            reject("bundle-acquire-initial", field(at, value))
+    for at, value in [
+        (48, 816),
+        (50, 0),
+        (50, 257),
+        (52, 15),
+        (54, 32),
+        (56, 4097),
+        (58, 0),
+        (60, 65535),
+        (62, 1),
+    ]:
+        reject("bundle-acquire-initial", field(at, value, "u16"))
+    reject("bundle-acquire-initial", field(40, 1000000001))
+    reject("bundle-acquire-initial", field(32, 12))
+    reject("bundle-acquire-initial", field(64, 1))
+    reject("bundle-acquire-renew", field(32, 0))
+    reject("bundle-acquire-renew", field(64, 0))
+    reject("bundle-acquire-renew", field(64, 18446744073709551615))
+    reject("bundle-acquire-initial", field(72 + 8, 1, "u8"))
+    reject("bundle-acquire-initial", field(60, 1, "u16"))
+    path_at = 72 + len(base(3)) + len(b"resolver.invalid")
+    reject("bundle-acquire-initial", field(path_at, 65535, "u16"))
+    reject("bundle-acquire-initial", field(path_at + 2, 2, "u8"))
+    reject("bundle-acquire-initial", field(path_at + 3, 1, "u8"))
+    reject("bundle-acquire-initial", append=1)
+    for at in [8, 16, 24, 32, 56]:
+        for value in [0, 18446744073709551615]:
+            reject("bundle-granted-initial-allow", field(at, value))
+    reject("bundle-granted-initial-allow", field(40, 1000000001))
+    reject("bundle-granted-initial-allow", field(48, 257, "u16"))
+    reject("bundle-granted-initial-allow", field(50, 1, "u16"))
     return {
-        "contract": "DNS_V2-CODEC-1",
+        "contract": "DNS_V2-CODEC-2",
         "packing": "stdlib struct.pack + explicit offset/type/value tables; no Rust encoder",
         "maximumDnsPayloadIsBoundsOnly": True,
         "negotiations": negotiations,
         "vectors": vectors,
         "rejectedBodies": rejected,
         "rejectedFrames": [
+            {"case": "bundle-acquire-initial", "patches": [field(128 + 24, 8)]},
+            {"case": "bundle-granted-initial-allow", "patches": [field(128 + 32, 8)]},
+            {
+                "case": "bundle-acquire-initial",
+                "patches": [],
+                "rights": 1,
+                "credentials": 0,
+            },
             {"case": "publish-1", "patches": [field(128 + 36, 8)]},
             {"case": "physical-bind-1", "patches": [field(166, 2, "u8")]},
             {"case": "physical-bind-1", "patches": [(16, "fill", [9, 32])]},
