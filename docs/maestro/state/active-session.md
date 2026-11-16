@@ -748,6 +748,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   grant или physical permission. Независимый review остального DATA scope
   новых P1/P2 не выявил; runtime/bootstrap/public gates остаются false.
 
+- R58 SOURCE scoped CLEAN: Go CODEC4 context/setup d7fb7e7 интегрирован.
+  Closed typed root union, exact pending55/56, общий nonreuse context namespace,
+  cancel/renewal/Unknown и no1/2/3 fallback проверены. Capture constructor,
+  Hosts observation и service I/O ещё не подключены; dns4CaptureReviewed=false.
+  Production pins не обновлены; совместный runtime и установленный app не
+  проверялись, readiness/public gates false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
