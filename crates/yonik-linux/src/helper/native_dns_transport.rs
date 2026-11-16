@@ -22,6 +22,8 @@ use wire::dns_v2::{Operation, Record, View};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Binding {
+    pub bootstrap: bool,
+    pub parent_carrier: u8,
     pub proxied: bool,
     pub physical_peer: Target,
     pub physical_scope: u16,
@@ -600,6 +602,7 @@ pub(super) struct Reply {
     commit: Commit,
 }
 enum Commit {
+    Observation(u64),
     ReleasedProof(u64),
     ClosedResource(u64),
     None,
@@ -609,6 +612,29 @@ enum Commit {
     Appended(u64),
 }
 impl Reply {
+    pub(super) fn hosts(
+        request: u64,
+        until: Instant,
+        reservation: u64,
+        observation: u64,
+        query: u64,
+        epoch: u64,
+    ) -> Self {
+        let mut r = Self::denied(Operation::Reserved, request, until);
+        r.body[2] = 1;
+        for (at, v) in [
+            (8, reservation),
+            (16, query),
+            (32, observation),
+            (40, epoch),
+        ] {
+            set64(&mut r.body, at, v);
+        }
+        r.body[58..60].copy_from_slice(&1u16.to_be_bytes());
+        r.body[60] = 3;
+        r.commit = Commit::Observation(observation);
+        r
+    }
     fn denied(operation: Operation, request: u64, until: Instant) -> Self {
         let mut body = [0; 64];
         body[..2].copy_from_slice(&2u16.to_be_bytes());
@@ -645,6 +671,9 @@ impl Reply {
     }
 }
 impl<A: Authority> Issuer<A> {
+    pub(super) fn host_reservation_id(&mut self) -> Result<u64, ServiceError> {
+        Self::id(&mut self.transport.next_reservation)
+    }
     pub(super) fn dns_publish_binding(
         &mut self,
         id: u64,
@@ -656,6 +685,9 @@ impl<A: Authority> Issuer<A> {
             .proofs
             .get(&id)
             .ok_or(ServiceError::Unavailable)?;
+        if p.binding.bootstrap {
+            return Err(ServiceError::Unsupported);
+        }
         if p.revision != revision
             || p.exchange != exchange
             || !p.acked
@@ -778,6 +810,9 @@ impl<A: Authority> Issuer<A> {
             .resources
             .get(&resource)
             .ok_or(ServiceError::Unavailable)?;
+        if r.binding.bootstrap {
+            return Err(ServiceError::Unsupported);
+        }
         let until = if b[2] == 4 {
             let p = self
                 .transport
@@ -955,13 +990,16 @@ impl<A: Authority> Issuer<A> {
             return Err(ServiceError::Unavailable);
         }
         let b = view.bytes();
+        if b[75] == 2 {
+            return self.reserve_hosts(view, request, socket, session);
+        }
         let binding = self.dns_transport_binding(n64(b, 16))?;
         let physical = b[2] == 2;
         if !matches!(b[2], 1..=3)
-            || b[74] != 1
+            || b[74] != if binding.bootstrap { 2 } else { 1 }
             || b[75] != 1
             || b[77] != 3
-            || b[78] != 1
+            || b[78] != if binding.bootstrap { 2 } else { 1 }
             || n64(b, 8) != binding.query
             || n64(b, 24) != binding.root
             || n64(b, 32) != binding.source
@@ -975,7 +1013,7 @@ impl<A: Authority> Issuer<A> {
                     binding.subject
                 }
             || n16(b, 68)
-                != if physical {
+                != if physical || binding.bootstrap {
                     binding.physical_endpoint
                 } else {
                     u16::MAX
@@ -991,7 +1029,7 @@ impl<A: Authority> Issuer<A> {
                 != if physical {
                     binding.physical_peer.protocol
                 } else {
-                    binding.peer.protocol
+                    binding.parent_carrier
                 }
             || b[79]
                 != if physical {
@@ -999,7 +1037,7 @@ impl<A: Authority> Issuer<A> {
                 } else {
                     binding.branch
                 }
-            || view.original() != binding.name.wire().bytes
+            || view.original() != self.dns_reservation_original(binding)?.wire().bytes
             || view.query_name() != binding.name.wire().bytes
             || <[u8; 32]>::from(Sha256::digest(view.base())) != binding.base
         {
@@ -1182,6 +1220,10 @@ impl<A: Authority> Issuer<A> {
         };
         let b = &incoming.raw;
         let binding = reservation.binding;
+        // Source/parent scope не наследует USER consuming wire/close scope.
+        if binding.bootstrap {
+            return Err(ServiceError::Unsupported);
+        }
         let parent = self
             .transport
             .reservations
@@ -1313,6 +1355,9 @@ impl<A: Authority> Issuer<A> {
             return Err(ServiceError::InvalidRequest);
         }
         let binding = p.binding;
+        if binding.bootstrap {
+            return Err(ServiceError::Unsupported);
+        }
         let exchange = p.exchange;
         if (b[2] == 2) != binding.proxied {
             return Err(ServiceError::InvalidRequest);
@@ -1625,6 +1670,7 @@ pub(super) fn send_reply<A: Authority>(
             return Err(ServiceError::Unavailable);
         }
         let missing = match reply.commit {
+            Commit::Observation(id) => issuer.host_observation_live(id).is_err(),
             Commit::Reserved(id) => !issuer.transport.reservations.contains_key(&id),
             Commit::Physical(id) => !issuer.transport.resources.contains_key(&id),
             Commit::Logical(id) | Commit::Appended(id) => {
@@ -1635,6 +1681,9 @@ pub(super) fn send_reply<A: Authority>(
             Commit::None => false,
         };
         if missing || issuer.retired.iter().any(|(id, _)| *id == reply.request) {
+            if let Commit::Observation(id) = reply.commit {
+                issuer.deny_host_observation(id);
+            }
             reply = Reply::denied(reply.operation, reply.request, reply.expires);
         }
         if issuer.unknown && reply.operation != Operation::Retired {
@@ -1691,6 +1740,17 @@ pub(super) fn send_reply<A: Authority>(
                 },
                 (reply.expires - checked).as_nanos().min(1_000_000_000) as u64,
             );
+        } else if let Commit::Observation(id) = reply.commit {
+            let until = issuer.host_observation_live(id)?;
+            let checked = issuer.authority.now();
+            if checked >= until {
+                return Err(ServiceError::Unavailable);
+            }
+            set64(
+                &mut reply.body,
+                48,
+                (until - checked).as_nanos().min(1_000_000_000) as u64,
+            );
         } else if !issuer.unknown && reply.operation != Operation::Retired {
             issuer.fence()?;
         }
@@ -1715,6 +1775,7 @@ pub(super) fn send_reply<A: Authority>(
         };
         if sent {
             match reply.commit {
+                Commit::Observation(id) => issuer.ack_host_observation(id)?,
                 Commit::ReleasedProof(id) => {
                     issuer
                         .transport
@@ -1875,7 +1936,14 @@ pub(super) fn progress<A: Authority>(
         let reply = match issuer.match_dns_physical(*id) {
             Ok(reply) => reply,
             Err(e) => {
-                issuer.transport.incoming.remove(id);
+                let bootstrap = issuer.transport.incoming.get(id).is_some_and(|packet| {
+                    issuer
+                        .dns_transport_binding(n64(&packet.raw, 144))
+                        .is_ok_and(|binding| binding.bootstrap)
+                });
+                if !bootstrap {
+                    issuer.transport.incoming.remove(id);
+                }
                 issuer.unknown = true;
                 issuer.authority.revoke();
                 return Err(e);

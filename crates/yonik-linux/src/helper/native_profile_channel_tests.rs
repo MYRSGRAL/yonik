@@ -80,15 +80,19 @@ fn dns_rrset_queue_credit_precedes_materialization_and_rx_bound_is_fixed() {
 }
 
 // Весь driver below — in-memory: ни OS endpoint, ни runtime wrappers.
-struct BundleIo {
+pub(super) struct BundleIo {
+    pub(super) after_reply: std::cell::RefCell<VecDeque<Vec<Vec<u8>>>>,
+    slots: Arc<SidebandCredits>,
+    credits: std::cell::RefCell<BTreeMap<u64, super::super::memory::ByteLease>>,
+    pub(super) source: Option<Arc<dyn dns_bundle::roots::Source>>,
     record: LaunchRecord,
     input: std::cell::RefCell<VecDeque<Vec<u8>>>,
-    output: std::cell::RefCell<Vec<Vec<u8>>>,
+    pub(super) output: std::cell::RefCell<Vec<Vec<u8>>>,
     descriptor: [u8; 272],
     done: std::cell::Cell<bool>,
-    stop_after: usize,
+    pub(super) stop_after: usize,
     history: Option<Arc<std::sync::Mutex<InvocationHistory>>>,
-    delayed_send: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU64>>>,
+    pub(super) delayed_send: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU64>>>,
 }
 pub(super) fn dns_neg(record: LaunchRecord) -> wire::dns_v2::Negotiated {
     let d = wire::dns_v2::Negotiated::descriptor(record).unwrap();
@@ -119,8 +123,12 @@ pub(super) fn dns_packet(
     bytes[..n].to_vec()
 }
 impl BundleIo {
-    fn new(record: LaunchRecord, requests: Vec<Vec<u8>>) -> Self {
+    pub(super) fn new(record: LaunchRecord, requests: Vec<Vec<u8>>) -> Self {
         Self {
+            source: None,
+            after_reply: Default::default(),
+            slots: SidebandCredits::new(),
+            credits: Default::default(),
             record,
             input: std::cell::RefCell::new(requests.into()),
             output: Default::default(),
@@ -133,6 +141,28 @@ impl BundleIo {
     }
 }
 impl Channel for BundleIo {
+    fn dns_slots(&self) -> Result<Arc<SidebandCredits>, ServiceError> {
+        Ok(self.slots.clone())
+    }
+    fn take_dns_credit(
+        &self,
+        request: u64,
+    ) -> Result<super::super::memory::ByteLease, ServiceError> {
+        self.credits
+            .borrow_mut()
+            .remove(&request)
+            .ok_or(ServiceError::Unavailable)
+    }
+    fn processed(&self, request: u64) -> Result<(), ServiceError> {
+        self.credits.borrow_mut().remove(&request);
+        Ok(())
+    }
+    fn bootstrap_source(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dyn dns_bundle::roots::Source>>, ServiceError> {
+        Ok(self.source.clone())
+    }
     fn history(&self) -> Option<Arc<std::sync::Mutex<InvocationHistory>>> {
         self.history.clone()
     }
@@ -156,6 +186,11 @@ impl Channel for BundleIo {
         out: &mut [u8; RUNTIME_PACKET],
     ) -> Result<Option<usize>, ServiceError> {
         if let Some(b) = self.input.borrow_mut().pop_front() {
+            if self.source.is_some() {
+                let credit = self.slots.pending.reserve(1).map_err(unavailable)?;
+                let sequence = u64::from_be_bytes(b[16..24].try_into().unwrap());
+                self.credits.borrow_mut().insert(sequence, credit);
+            }
             out[..b.len()].copy_from_slice(&b);
             return Ok(Some(b.len()));
         }
@@ -173,11 +208,32 @@ impl Channel for BundleIo {
             }
             dns_bundle::decode(b, &dns_neg(self.record), wire::dns_v2::Direction::Issuer)?;
             self.output.borrow_mut().push(b.to_vec());
+            if let Some(next) = self.after_reply.borrow_mut().pop_front() {
+                self.input.borrow_mut().extend(next);
+            }
             self.done.set(self.output.borrow().len() >= self.stop_after);
             return Ok(true);
         }
         let f = wire::Frame::decode(b, self.record.binding, self.record.mode, true)
             .map_err(unavailable)?;
+        if self.source.is_some()
+            && matches!(
+                f.message,
+                wire::Message::Grant {
+                    class: 3,
+                    flow: 0,
+                    required: false,
+                    ..
+                }
+            )
+        {
+            self.output.borrow_mut().push(b.to_vec());
+            if let Some(next) = self.after_reply.borrow_mut().pop_front() {
+                self.input.borrow_mut().extend(next);
+            }
+            self.done.set(self.output.borrow().len() >= self.stop_after);
+            return Ok(true);
+        }
         let wire::Message::Admit(raw) = f.message else {
             return Err(ServiceError::InvalidRequest);
         };
@@ -1405,31 +1461,33 @@ pub(super) struct Proof {
     receipt: wire::Receipt,
 }
 pub(super) struct Fake {
+    pub(super) owner_forbidden: bool,
     pub(super) static_dns_peer: Option<std::net::SocketAddr>,
     pub(super) numeric_delay: Duration,
     pub(super) dns_delay_on: Option<usize>,
     dns_checks: usize,
     udp_inbox: Option<Arc<std::sync::Mutex<Rendezvous<u8>>>>,
-    service_trusted: bool,
+    pub(super) service_trusted: bool,
     mode: Mode,
     now: Instant,
     pub(super) elapsed: Arc<std::sync::atomic::AtomicU64>,
     known: bool,
     revoked: AtomicBool,
-    owner_count: u64,
+    pub(super) owner_count: u64,
     pub(super) route_count: u64,
     service_routes: Vec<Target>,
     released: Vec<u64>,
     pub(super) live: BTreeSet<u64>,
-    route_delay: Duration,
+    pub(super) route_delay: Duration,
     pub(super) unknown_release: bool,
-    release_attempts: usize,
+    pub(super) release_attempts: usize,
     fail_after_route: bool,
     fail_route_at: Option<u64>,
 }
 impl Fake {
-    fn new(mode: Mode) -> Self {
+    pub(super) fn new(mode: Mode) -> Self {
         Self {
+            owner_forbidden: false,
             static_dns_peer: None,
             numeric_delay: Duration::ZERO,
             udp_inbox: None,
@@ -1580,6 +1638,7 @@ impl Authority for Fake {
         tuple: Tuple,
         reference: OwnerReference,
     ) -> Result<Proof, ServiceError> {
+        assert!(!self.owner_forbidden, "flow0 не вызывает owner lookup");
         self.fence()?;
         if self.mode == Mode::System && !self.known {
             return Err(ServiceError::Unavailable);

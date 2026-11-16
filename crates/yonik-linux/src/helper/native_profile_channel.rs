@@ -1774,6 +1774,7 @@ impl<'a> RoutePlan<'a> {
     }
 }
 struct Issuer<A: Authority> {
+    bootstrap_source: Option<Arc<dyn dns_bundle::roots::Source>>,
     rrsets: dns_rrset::State,
     dns_wire: Option<VerifiedDnsWireProducer>,
     dns_logical: Option<VerifiedDnsLogicalProducer>,
@@ -1813,10 +1814,12 @@ impl<A: Authority> Issuer<A> {
         }
         authority.fence()?;
         let budget = ChannelBudget::new(&capsule, record.mode.required(), &record.binding.digest)?;
+        let dns = dns_bundle::Bundles::new(&budget.dynamic)?;
         Ok(Self {
             authority,
             rrsets: dns_rrset::State::new(),
             dns_wire: None,
+            bootstrap_source: None,
             dns_logical: None,
             dns_release: None,
             transport: dns_transport::Transport::new(&budget.dynamic)?,
@@ -1832,7 +1835,7 @@ impl<A: Authority> Issuer<A> {
             unknown: false,
             budget,
             history: None,
-            dns: dns_bundle::Bundles::new(),
+            dns,
             negotiated: None,
         })
     }
@@ -2268,7 +2271,7 @@ impl<A: Authority> Issuer<A> {
         if self.unknown {
             return Err(ServiceError::Unavailable);
         }
-        self.cancel_dns_root(id)?;
+        self.cancel_dns_root(id, self.services.contains_key(&id))?;
         if let Some(service) = self.services.remove(&id) {
             if let Err(error) = self.release_tickets(&service.tickets) {
                 self.services.insert(id, service);
@@ -3112,6 +3115,12 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn bootstrap_source(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dyn dns_bundle::roots::Source>>, ServiceError> {
+        Ok(None)
+    }
     fn dns_logical_producer(
         &self,
         _: LaunchRecord,
@@ -4660,6 +4669,9 @@ fn drain_before_publication<A: Authority>(
                 if !issuer.transport.ready_at_arrival(f.record) {
                     issuer.cancel_request(sequence)?;
                 }
+                if !issuer.context_ready_at_arrival(f.record) {
+                    issuer.cancel_request(sequence)?;
+                }
                 queued.push_back(Queued::new(
                     &bytes[..length],
                     sequence,
@@ -4878,6 +4890,7 @@ fn run_issuer<A: Authority>(
                     .chain(issuer.services.values().map(|g| g.expires))
                     .filter(|until| *until > issuer.authority.now())
                     .chain(issuer.transport.cleanup_wakeup(issuer.authority.now()))
+                    .chain(issuer.dns.wakeup(issuer.authority.now()))
                     .chain(awaiting.map(|a| a.2))
                     .fold(expires, Instant::min);
                 socket.pause_until(until);
@@ -4966,6 +4979,7 @@ fn run_issuer<A: Authority>(
             if issuer.negotiated.is_none() {
                 issuer.dns_release = socket.dns_producer(issuer.record)?;
                 issuer.dns_wire = socket.dns_wire_producer(issuer.record)?;
+                issuer.bootstrap_source = socket.bootstrap_source(issuer.record)?;
                 issuer.dns_logical = socket.dns_logical_producer(issuer.record)?;
                 issuer.negotiated = Some(dns_bundle::negotiate(
                     issuer,

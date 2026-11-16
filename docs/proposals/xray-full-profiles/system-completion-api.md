@@ -1313,6 +1313,55 @@ synthetic record4 с другим source patch и отдельным review, б�
 это не install approval и не reinterpretation Direct3 record. Bootstrap/Hosts
 root/context реализация остаётся следующим unit, public gates false.
 
+### CODEC4 typed roots и role-dependent reservations: SOURCE/PURE
+
+`dns_bundle::roots` подключён к `run_issuer` через существующие Acquire55,
+BundleGranted56, Reserve35/Reserved36 и Cancel47 target8. Wire/schema/corpus не
+менялись. Registry удерживает discriminated UserDns/BootstrapService/HostsPath,
+единый nonreusing context allocator и оплаченные tombstones до конца invocation.
+Renewal требует exact variant/revision/query/full path, не продлевает исходный
+deadline. ACKed context становится usable только после успешного send56;
+Reserve, полученный до ACK, получает request tombstone при drain.
+
+BootstrapService требует live purpose2 service selector, полный checked native
+parent path и snapshot role4/source/asset/epoch. Новый private
+`Channel::bootstrap_source` возвращает independent retained `roots::Source`:
+`parent(Parent)`, `snapshot(LaunchRecord, SnapshotRef)`, `question(...)`,
+`hosts(...)`. Parent включает typed root, exact launch/query/selector/original и
+все ordered scope/branch rows. Source должен проверять actual live consumer
+parent и held source custody; bytes/hash/child statement этим интерфейсом не
+становятся proof. Default production factory возвращает None. Нет reviewed
+CODEC4 bootstrap/Hosts producer pin; Direct wire/release/logical capability не
+подставляется вместо этого scope. Positive driver tests inject-ят отдельные
+source facts, не install/image attestation.
+
+Network context отдельно удерживает `DirectSystemTransportPermit` только для
+captured numeric nonloopback resolver peer. Backend вызывается как
+`RouteRequest::Dns`, parent proxy/hostname не становится DNS route. Parent carrier
+и DNS transport carrier сохраняются раздельно. Exchange/Physical/Waiter Reserve
+проверяют exact context/root/query/epoch/Probe8/full frontier; flow0 не вызывает
+owner backend и не создаёт USER authority. Permit ticket освобождается отдельно
+от parent hops; uncertain durable release сохраняет context/ticket/credits и
+делает issuer Unknown без повторного release.
+
+HostsPath не создаёт service grant, route, DNS exchange или TTL. Metadata Reserve
+role3 требует один ACKed context по query; после повторной source revalidation
+и independent row/member/key selection выдаётся новый SourceObservationId.
+Observation удерживает full parent path, exact snapshot/original/revision и
+min(source/context/session/request) deadline. Изменение source до публикации
+не выдаёт observation. Request/reservation/context cancel отзывает только свои
+observations и освобождает pending credit; sibling context остаётся живым.
+Все context/observation allocations оплачиваются общими memory/history/pending
+budgets, network permit дополнительно route credit; лимиты не увеличены.
+
+Это законченный roots/reservations cut, не полный bootstrap transport vertical:
+Bootstrap PhysicalBind/LogicalBind/retirement требуют отдельного проверенного
+consuming wire/close producer scope и backend captured-DNS socket validation;
+нынешний USER Direct close/transcript scope для них не используется.
+Bootstrap/Hosts Publish, Waiter/Numeric и actual parent-open conjunction остаются
+следующим unit. Public readiness/Connect/require_consumer и production mint
+по-прежнему закрыты; OS wrappers и runtime acceptance не исполнялись.
+
 `dns_transport_binding` выводит из всего live checked bundle два разных target:
 logical resolver peer и actual numeric physical frontier. Последний следует
 carrier→nextInput через manifest path; Physical Reserve/SCM сверяет terminal
