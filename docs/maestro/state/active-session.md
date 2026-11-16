@@ -460,7 +460,7 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   ждёт завершения bounded parse, публикация отменённого report запрещена.
 - Rust a2e1a64 UDP rendezvous/retirement влит для corrections. R20 нашёл
   runtime recvmsg scratch-precredit gap; root10971be резервирует16 FD до
-  receive, RED/GREEN +28 issuer pure/clippy/fmt PASS, narrow review ожидается.
+  receive, RED/GREEN +28 issuer pure/clippy/fmt PASS; R20 narrow SOURCE CLOSED.
 - Go792928b закрытый UDP receive milestone имеет R19 SOURCE scoped CLEAN,
   влит без открытия admission. Name-policy gap root7f1f5a8 устраняет общей
   Destination grammar без изменения original bytes: 17 shared cases,
