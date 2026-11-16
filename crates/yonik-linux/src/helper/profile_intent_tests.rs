@@ -1218,6 +1218,25 @@ fn lookup_prepared(hostname: bool) -> PreparedFullProfile {
     }
 }
 #[test]
+fn captured_lookup_rejects_failed_final_revalidation() {
+    use yonik_engine::native_profile::TransportProtocol as Carrier;
+    let prepared = lookup_prepared(true);
+    for failure in [EgressError::Stale, EgressError::Cancelled] {
+        let mut calls = 0;
+        let result =
+            prepared.resolver_lookup_checked("edge-0", Carrier::Tcp, 31, LookupFamily::Any, |_| {
+                calls += 1;
+                if calls == 2 { Err(failure) } else { Ok(()) }
+            });
+        assert!(
+            result.is_err(),
+            "План нельзя публиковать после отказа final revalidation"
+        );
+        assert_eq!(calls, 2);
+    }
+}
+
+#[test]
 fn captured_lookup_prepared_resource_uses_one_compiler_original_and_revalidation_entry() {
     use yonik_engine::native_profile::TransportProtocol as Carrier;
     let prepared = lookup_prepared(true);

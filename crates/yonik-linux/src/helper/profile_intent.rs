@@ -373,7 +373,7 @@ impl PreparedFullProfile {
         carrier: yonik_engine::native_profile::TransportProtocol,
         source_epoch: u64,
         family: LookupFamily,
-        revalidate: impl FnOnce(&Self) -> Result<(), EgressError>,
+        mut revalidate: impl FnMut(&Self) -> Result<(), EgressError>,
     ) -> Result<ResolverLookup<'_>, EgressError> {
         if source_epoch == 0 || source_epoch == u64::MAX {
             return Err(EgressError::InvalidBinding);
@@ -407,11 +407,9 @@ impl PreparedFullProfile {
         }
         revalidate(self)?;
         let snapshot = self.resolver.as_ref().ok_or(EgressError::Resolver)?;
-        Ok(ResolverLookup::Hostname(snapshot.lookup_data(
-            endpoint.host(),
-            source_epoch,
-            family,
-        )?))
+        let plan = snapshot.lookup_data(endpoint.host(), source_epoch, family)?;
+        revalidate(self)?;
+        Ok(ResolverLookup::Hostname(plan))
     }
     pub fn capsule_bytes(&self) -> &[u8] {
         self.capsule.bytes()

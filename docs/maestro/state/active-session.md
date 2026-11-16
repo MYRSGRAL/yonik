@@ -741,6 +741,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   временно требует coordinated pin update после следующих reviewed CODEC4 cuts.
   Production mint/Connect/readiness false; общий runtime PASS не заявлен.
 
+- Captured netgo DATA planner d8f4f24 интегрирован с root-коррекцией R57P2:
+  PreparedFullProfile revalidates source/cancellation до и после lookup plan.
+  При отказе финальной проверки DATA не публикуется; deterministic regression
+  покрывает Stale/Cancelled второй проверки. Planner не выдаёт observation,
+  grant или physical permission. Независимый review остального DATA scope
+  новых P1/P2 не выявил; runtime/bootstrap/public gates остаются false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
