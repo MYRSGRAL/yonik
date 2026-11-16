@@ -561,6 +561,16 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   исполнялись. Unapplied artifact остаётся под bounded helper TTL/peer custody.
   Public admission/can_connect false, full P6/runtime/installed PASS не заявлен.
 
+- DNS completion proposal1cc67ed + correction75009d3 получили R31 narrow
+  SOURCE CLOSED для append revisions и bootstrap receipt/manifest bindings.
+  Два прежних design P1 закрыты; арифметика192/48/560/33679/1063 PASS. Это
+  SOURCE/schema contract, не codec/runtime readiness. Следующий cut: bounded
+  HostsSnapshot wire tail/goldens и реализация DirectSocket/ProxiedLogical,
+  StubBind/cache waiter receipts/numeric leaf/physical bootstrap по документу.
+  Шесть новых upstream DNS файлов, listener parser/stub module и engine
+  bootstrap requirement ещё требуют расширения разрешённого source scope.
+  Rust автор параллельно завершает уже разрешённый netgo snapshot parser.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
