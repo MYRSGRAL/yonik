@@ -467,6 +467,12 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   RED/GREEN +29 issuer/21 codec pure/clippy/fmt PASS. Go author получил corpus.
   Это не full UDP consumer и не long-lived readiness. Собственные сборки
   r20-root-fd/r19-root-grammar очищены, evidence вне TTL сохранён.
+- Xray-only desktop975f6ea + root0b0d485 интегрированы: новый выбор/запуски
+  SingBox запрещены, legacy preferences читаются без remap. R22P2 UI Apply
+  исправлен root и narrow SOURCE CLOSED; Stop/recovery сохранены. QML predicate
+  RED/GREEN6cases +6pure/clippy/fmt PASS; legacy Host restore и повреждённые
+  preferences tests только COMPILE_ONLY. Evidence r22-root-ui вне TTL,
+  собственная сборка очищена. Full P6/runtime/installed PASS не заявлен.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
