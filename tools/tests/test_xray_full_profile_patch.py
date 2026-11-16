@@ -16,7 +16,7 @@ class FullProfilePatchTests(unittest.TestCase):
         raw = (ADAPTER / "full-profile-fixtures/dns-v2-canonical.json").read_bytes()
         self.assertEqual(
             hashlib.sha256(raw).hexdigest(),
-            "5703a0f556ec76158d79c196f4896c19b13ff05f44570fadfe2408c961e30ae5",
+            "10d798ffd45f7d250e4c3f38c02b9f394671d1f9ee4871cdcd39b9d042e59359",
         )
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         added = patch.split(
@@ -28,9 +28,13 @@ class FullProfilePatchTests(unittest.TestCase):
         ).encode()
         self.assertEqual(raw, embedded)
         corpus = json.loads(raw)
-        self.assertEqual(len(corpus["vectors"]), 76)
-        self.assertEqual(len(corpus["rejectedBodies"]), 164)
-        self.assertEqual(len(corpus["rejectedFrames"]), 14)
+        self.assertEqual(len(corpus["vectors"]), 86)
+        self.assertEqual(len(corpus["rejectedBodies"]), 218)
+        self.assertEqual(len(corpus["rejectedFrames"]), 17)
+        self.assertIn("YONIK-DNS-V2-CODEC-2", patch)
+        self.assertIn("ProfileDNSPrepareHandler(ctx, h.tag", patch)
+        self.assertIn("c.dnsAccept(f)", patch)
+        self.assertIn("c.dnsTick()", patch)
         self.assertIn("p.negotiateDNSV2(record, initialDeadline)", patch)
         self.assertIn("task.OwnContext(dnsCtx, conn)", patch)
         metadata = json.loads((ADAPTER / "native-full-profile.json").read_text())
