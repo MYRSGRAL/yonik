@@ -19771,3 +19771,220 @@ diff --git a/transport/internet/udp/dispatcher.go b/transport/internet/udp/dispa
  		link:   link,
  		cancel: cancel,
  	}
+diff --git a/app/dns/dns.go b/app/dns/dns.go
+--- a/app/dns/dns.go
++++ b/app/dns/dns.go
+@@ -265,11 +265,27 @@
+ 	if s.script != nil {
+ 		return nil, 0, hooks.ErrDenied
+ 	}
+-	ips, ttl, err := s.lookupIP(ctx, domain, option)
+-	if guardErr := hooks.CheckAfterDNS(ctx); guardErr != nil {
+-		return nil, 0, guardErr
+-	}
+-	return ips, ttl, err
++	return profileDNSLookup(ctx, domain, option, s.lookupIP, hooks.ProfileDNSQueryContext, hooks.ProfileCheckDNSAnswer)
++}
++
++// Инъекция только private функций: production caller всегда использует broker.
++func profileDNSLookup(ctx context.Context, domain string, option dns.IPOption,
++	lookup func(context.Context, string, dns.IPOption) ([]net.IP, uint32, error),
++	begin func(context.Context, string) (context.Context, func(), error),
++	check func(context.Context, string, []net.IP) error) ([]net.IP, uint32, error) {
++	query, release, err := begin(ctx, domain)
++	if err != nil {
++		return nil, 0, err
++	}
++	defer release()
++	ips, ttl, err := lookup(query, domain, option)
++	if err != nil {
++		return nil, 0, err
++	}
++	if err = check(query, domain, ips); err != nil {
++		return nil, 0, err
++	}
++	return ips, ttl, nil
+ }
+ 
+ func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+diff --git a/app/dns/nameserver.go b/app/dns/nameserver.go
+--- a/app/dns/nameserver.go
++++ b/app/dns/nameserver.go
+@@ -11,6 +11,7 @@
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/common/utils"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/dns"
+ 	"github.com/xtls/xray-core/features/routing"
+@@ -167,6 +168,11 @@
+ 
+ // QueryIP sends DNS query to the name server with the client's IP.
+ func (c *Client) QueryIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
++	return c.queryIP(ctx, domain, option, hooks.ProfileResolverRequired(ctx))
++}
++
++// Флаг влияет только на логи; query/result authority принадлежит outer scope.
++func (c *Client) queryIP(ctx context.Context, domain string, option dns.IPOption, owned bool) ([]net.IP, uint32, error) {
+ 	if c.checkSystem {
+ 		supportIPv4, supportIPv6 := utils.CheckRoutes()
+ 		option.IPv4Enable = option.IPv4Enable && supportIPv4
+@@ -195,7 +201,9 @@
+ 
+ 	if c.expectedIPs != nil && !c.actPrior {
+ 		ips, _ = c.expectedIPs.FilterIPs(ips)
+-		errors.LogDebug(context.Background(), "domain ", domain, " expectedIPs ", ips, " matched at server ", c.Name())
++		if !owned {
++			errors.LogDebug(context.Background(), "domain ", domain, " expectedIPs ", ips, " matched at server ", c.Name())
++		}
+ 		if len(ips) == 0 {
+ 			return nil, 0, dns.ErrEmptyResponse
+ 		}
+@@ -203,7 +211,9 @@
+ 
+ 	if c.unexpectedIPs != nil && !c.actUnprior {
+ 		_, ips = c.unexpectedIPs.FilterIPs(ips)
+-		errors.LogDebug(context.Background(), "domain ", domain, " unexpectedIPs ", ips, " matched at server ", c.Name())
++		if !owned {
++			errors.LogDebug(context.Background(), "domain ", domain, " unexpectedIPs ", ips, " matched at server ", c.Name())
++		}
+ 		if len(ips) == 0 {
+ 			return nil, 0, dns.ErrEmptyResponse
+ 		}
+@@ -213,7 +223,9 @@
+ 		ipsNew, _ := c.expectedIPs.FilterIPs(ips)
+ 		if len(ipsNew) > 0 {
+ 			ips = ipsNew
+-			errors.LogDebug(context.Background(), "domain ", domain, " priorIPs ", ips, " matched at server ", c.Name())
++			if !owned {
++				errors.LogDebug(context.Background(), "domain ", domain, " priorIPs ", ips, " matched at server ", c.Name())
++			}
+ 		}
+ 	}
+ 
+@@ -221,7 +233,9 @@
+ 		_, ipsNew := c.unexpectedIPs.FilterIPs(ips)
+ 		if len(ipsNew) > 0 {
+ 			ips = ipsNew
+-			errors.LogDebug(context.Background(), "domain ", domain, " unpriorIPs ", ips, " matched at server ", c.Name())
++			if !owned {
++				errors.LogDebug(context.Background(), "domain ", domain, " unpriorIPs ", ips, " matched at server ", c.Name())
++			}
+ 		}
+ 	}
+ 
+diff --git a/app/dns/yonik_outer_test.go b/app/dns/yonik_outer_test.go
+new file mode 100644
+--- /dev/null
++++ b/app/dns/yonik_outer_test.go
+@@ -0,0 +1,109 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"github.com/xtls/xray-core/common/geodata"
++	"github.com/xtls/xray-core/common/log"
++	"github.com/xtls/xray-core/common/net"
++	fdns "github.com/xtls/xray-core/features/dns"
++	"testing"
++	"time"
++)
++
++// Private injection проверяет реальный outer pipeline без core/network.
++func TestYonikDNSOuterExactQueryReleaseAndReturn(t *testing.T) {
++	for _, mode := range []string{"narrow", "wrong-name", "wrong-ip", "neighbor", "replay", "cancel", "stale", "provider-cache", "lookup-error", "begin-error"} {
++		t.Run(mode, func(t *testing.T) {
++			type key struct{}
++			token := new(int)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			released, looked, checked := 0, 0, 0
++			deny := errors.New("нет authority")
++			begin := func(c context.Context, n string) (context.Context, func(), error) {
++				if n != "Original.INVALID" {
++					t.Fatal("original изменён")
++				}
++				if mode == "begin-error" {
++					return c, func() {}, deny
++				}
++				return context.WithValue(c, key{}, token), func() { released++ }, nil
++			}
++			lookup := func(c context.Context, n string, _ fdns.IPOption) ([]net.IP, uint32, error) {
++				looked++
++				if c.Value(key{}) != token || n != "Original.INVALID" {
++					t.Fatal("query context потерян")
++				}
++				if mode == "lookup-error" {
++					return nil, 0, deny
++				}
++				if mode == "cancel" {
++					cancel()
++				}
++				return []net.IP{net.IP{192, 0, 2, 1}}, 42, nil
++			}
++			check := func(c context.Context, n string, ips []net.IP) error {
++				checked++
++				if c.Value(key{}) != token || n != "Original.INVALID" || len(ips) != 1 {
++					t.Fatal("check не получил exact result")
++				}
++				if mode != "narrow" {
++					return deny
++				}
++				return nil
++			}
++			ips, ttl, e := profileDNSLookup(ctx, "Original.INVALID", fdns.IPOption{IPv4Enable: true}, lookup, begin, check)
++			if mode == "narrow" {
++				if e != nil || len(ips) != 1 || ttl != 42 {
++					t.Fatal("narrowing потерян")
++				}
++			} else if e == nil || ips != nil || ttl != 0 {
++				t.Fatal("непроверенный result вышел")
++			}
++			if mode == "begin-error" {
++				if looked != 0 || released != 0 {
++					t.Fatal("эффект до scope")
++				}
++			} else if released != 1 {
++				t.Fatal("release не exact once")
++			}
++			if mode == "lookup-error" && checked != 0 {
++				t.Fatal("ошибка lookup стала ответом")
++			}
++		})
++	}
++}
++
++type outerLog struct{ messages []string }
++
++func (l *outerLog) Handle(m log.Message) { l.messages = append(l.messages, m.String()) }
++
++type outerMatcher struct{ geodata.IPMatcher }
++
++func (outerMatcher) FilterIPs(ips []net.IP) ([]net.IP, []net.IP) { return ips, ips }
++
++type outerServer struct{}
++
++func (outerServer) Name() string         { return "synthetic" }
++func (outerServer) IsDisableCache() bool { return false }
++func (outerServer) QueryIP(context.Context, string, fdns.IPOption) ([]net.IP, uint32, error) {
++	return []net.IP{net.IP{192, 0, 2, 1}}, 42, nil
++}
++func TestYonikDNSClientOwnedLogsSuppressedLegacyPreserved(t *testing.T) {
++	capture := &outerLog{}
++	log.RegisterHandler(capture)
++	for _, owned := range []bool{false, true} {
++		for _, prior := range []bool{false, true} {
++			capture.messages = nil
++			c := &Client{server: outerServer{}, timeoutMs: time.Second, ipOption: &fdns.IPOption{IPv4Enable: true}, expectedIPs: outerMatcher{}, unexpectedIPs: outerMatcher{}, actPrior: prior, actUnprior: prior}
++			ips, _, e := c.queryIP(context.Background(), "Private.INVALID", fdns.IPOption{IPv4Enable: true}, owned)
++			if e != nil || len(ips) != 1 {
++				t.Fatal("фильтрация изменилась", e)
++			}
++			if owned && len(capture.messages) != 0 || !owned && len(capture.messages) != 2 {
++				t.Fatal("граница логов нарушена", owned, prior, capture.messages)
++			}
++		}
++	}
++}

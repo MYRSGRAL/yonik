@@ -45,7 +45,7 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertTrue(metadata["probe_service_consumer_connected"])
         self.assertTrue(metadata["snapshot_query_engine_connected"])
         self.assertTrue(metadata["observatory_probe_hook_connected"])
-        self.assertFalse(metadata["exact_dns_outer_caller_connected"])
+        self.assertTrue(metadata["exact_dns_outer_caller_connected"])
         self.assertFalse(metadata["physical_resolver_proof_connected"])
         self.assertIsNone(metadata["native_protocol"])
 
@@ -67,6 +67,9 @@ class FullProfilePatchTests(unittest.TestCase):
                     "app/observatory/yonik_profile_service_test.go",
                     "main/yonik_profile_test.go",
                     "app/dns/nameserver_local.go",
+                    "app/dns/dns.go",
+                    "app/dns/nameserver.go",
+                    "app/dns/yonik_outer_test.go",
                     "features/dns/localdns/client.go",
                     "features/dns/localdns/yonik_context_test.go",
                     "common/yonikbroker/routing.go",
@@ -134,8 +137,8 @@ class FullProfilePatchTests(unittest.TestCase):
             handler.index("nativehooks.ProfilePrepareChain(next, h.profileBranch)"),
             handler.index("nativehooks.ProfileGuardLink(ctx, link)"),
         )
-        self.assertNotIn("+++ b/app/dns/dns.go", patch)
-        self.assertNotIn("+++ b/app/dns/nameserver.go", patch)
+        self.assertIn("+++ b/app/dns/dns.go", patch)
+        self.assertIn("+++ b/app/dns/nameserver.go", patch)
 
     def test_udp_v2_source_and_rust_vectors_stay_closed_and_byte_exact(self) -> None:
         metadata = json.loads((ADAPTER / "native-full-profile.json").read_text())
@@ -202,8 +205,10 @@ class FullProfilePatchTests(unittest.TestCase):
             "TestProfileUDPProducerDelayedSendBlocksKnownCloseAndUncertainIsSticky",
             patch,
         )
-        self.assertNotIn("+++ b/app/dns/dns.go", patch)
-        self.assertNotIn("+++ b/app/dns/nameserver.go", patch)
+        self.assertIn(
+            "hooks.ProfileDNSQueryContext, hooks.ProfileCheckDNSAnswer", patch
+        )
+        self.assertIn("if !owned", patch)
 
     def test_system_proof_fixture_is_embedded_byte_exact(self) -> None:
         fixture = ADAPTER / "full-profile-fixtures/system-proof-extension-v1.json"
