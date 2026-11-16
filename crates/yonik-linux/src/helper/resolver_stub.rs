@@ -1,6 +1,9 @@
 //! Независимый sampled listener proof. Не FlowGrant/OS attribution и не pin
 //! удалённого listener. Без защищённого service-policy issuer путь закрыт.
 
+#[path = "resolver_policy.rs"]
+mod resolver_policy;
+
 use crate::attribution::broker::kernel::{Listener, ListenerSet};
 use std::net::{IpAddr, SocketAddr};
 
@@ -91,8 +94,32 @@ mod observation {
     }
     /// Оpaque independent evidence, не DTO из IPC. Production producer этого
     /// stamp должен закрепить reviewed service policy, manager owner и held FDs.
-    struct UnitEvidence {
+    pub(super) struct UnitEvidence {
         unit: Unit,
+    }
+    impl UnitEvidence {
+        pub(super) fn from_policy(policy: super::resolver_policy::VerifiedPolicy) -> Self {
+            let f = policy.into_facts();
+            Self {
+                unit: Unit {
+                    manager: f.manager,
+                    invocation: f.invocation,
+                    policy: f.contract,
+                    uid: f.uid,
+                    cgroup: f.cgroup.1,
+                    cgroup_identity: f.cgroup,
+                    namespace: f.namespace,
+                    source_epoch: f.epoch,
+                    view: if f.system_view {
+                        View::System
+                    } else {
+                        View::Local
+                    },
+                    delegated: false,
+                    socket_activated: false,
+                },
+            }
+        }
     }
     trait Source {
         type Handles;
@@ -219,6 +246,7 @@ mod observation {
         // Held cgroup/netns + temporary diag socket/netns FD, one shared pending;
         // Source обязан debit existing invocation ledger до любых effects.
         let held = source.reserve(4, 1, MAX_BYTES)?;
+        source.revalidate_handles(&held)?;
         let before = source.unit(&held)?.unit;
         checked_unit(&before)?;
         if before.view != context.view
