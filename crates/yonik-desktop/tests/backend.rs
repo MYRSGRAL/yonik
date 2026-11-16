@@ -1437,10 +1437,20 @@ fn preferences_reopen_applies_engine_port_probe_and_language() {
         assert_eq!(state["proxy_fetch_dns"], "127.0.0.1:5353");
     }
     first.close();
+    // Имитируем сохранённую старой версией настройку, не обходя новый UI guard.
+    let preference_path = directory.0.join("preferences.json");
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&preference_path).expect("настройки"))
+        .expect("legacy JSON");
+    legacy["engine"] = json!("sing-box");
+    fs::write(
+        &preference_path,
+        serde_json::to_vec(&legacy).expect("legacy JSON"),
+    )
+    .expect("legacy fixture");
     let mut second = Harness::new(directory.config());
     let state = second.wait(|v| v["ready"] == true);
     assert_eq!(state["proxy_fetch_dns"], "127.0.0.1:5353");
-    assert_eq!(state["engine"], "xray");
+    assert_eq!(state["engine"], "sing-box");
     assert_eq!(state["port"], 18889);
     assert_eq!(state["probe_expected_status"], 200);
     assert_eq!(state["language"], "en");
@@ -1450,6 +1460,7 @@ fn preferences_reopen_applies_engine_port_probe_and_language() {
     second.close();
     let raw = fs::read_to_string(directory.0.join("preferences.json")).expect("настройки");
     assert!(raw.contains("\"port\":null"));
+    assert!(raw.contains("\"engine\":\"sing-box\""));
 }
 
 #[test]
@@ -1464,6 +1475,9 @@ fn damaged_preferences_notify_and_survive_settings_commands() {
     assert_eq!(state["engine"], "xray");
     app.send(json!({"command":"set_engine","engine":"sing-box"}));
     let state = app.wait(|v| v["error"] == "engine_unavailable");
+    assert_eq!(state["engine"], "xray");
+    app.send(json!({"command":"set_engine","engine":"xray"}));
+    let state = app.wait(|v| v["error"] == "preferences_write");
     assert_eq!(state["engine"], "xray");
     app.close();
     assert_eq!(fs::read(path).expect("исходник"), b"{");
