@@ -12,6 +12,40 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_codec4_contexts_have_separate_schema_and_closed_capture_gate(self) -> None:
+        raw = (ADAPTER / "full-profile-fixtures/dns-v2-codec4.json").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            "fe4ad88a6f519ee00051b7a02192c04e7a795ff869dd3ff3ebc2f6cffebf06a5",
+        )
+        corpus = json.loads(raw)
+        self.assertEqual(len(corpus["vectors"]), 103)
+        self.assertEqual(len(corpus["rejectedBodies"]), 311)
+        self.assertEqual(len(corpus["rejectedFrames"]), 28)
+        self.assertEqual(len(corpus["rejectedAcquireReplies"]), 10)
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        added = patch.split("+++ b/common/yonikbroker/profile-dns-v2-codec4.json\n", 1)[
+            1
+        ]
+        added = added.split("diff --git ", 1)[0]
+        embedded = (
+            "\n".join(line[1:] for line in added.splitlines() if line.startswith("+"))
+            + "\n"
+        )
+        self.assertEqual(raw, embedded.encode())
+        for anchor in (
+            "YONIK-DNS-V2-CODEC-4",
+            "func ProfileDNSAcquirePhysicalContext(",
+            "c.dnsContext4Dispatch(op)",
+            "c.dnsContext4Accept(f)",
+            "c.dnsContext4Tick()",
+            "c.dnsClaimContextIdentity(b.identity, id)",
+        ):
+            self.assertTrue(anchor in patch, anchor)
+        launch = patch.split("+++ b/common/yonikbroker/profile_launch_linux.go\n", 1)[1]
+        launch = launch.split("diff --git ", 1)[0]
+        self.assertNotIn("dns4CaptureReviewed = true", launch)
+
     def test_numeric_user_codec3_rust_vectors_and_private_caller_cut(self) -> None:
         raw = (ADAPTER / "full-profile-fixtures/numeric-rust-v3.json").read_bytes()
         self.assertEqual(
