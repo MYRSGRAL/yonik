@@ -1,3 +1,1576 @@
+diff --git a/common/yonikbroker/profile_udp_producer_linux_test.go b/common/yonikbroker/profile_udp_producer_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_udp_producer_linux_test.go
+@@ -0,0 +1,719 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/buf"
++	xnet "github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/transport"
++)
++
++func TestProfileUDPConsumingProducerTransfersOnlyMatchedUserGrant(t *testing.T) {
++	f, a, receiver := udpStateFixture(t)
++	if e := a.BeginPeek(f.now.Add(time.Second)); e != nil {
++		t.Fatal(e)
++	}
++	if e := a.Permit(udpPermit(t, a, receiver, 1, 1)); e != nil {
++		t.Fatal(e)
++	}
++	if e := a.ConsumePermit(); e != nil {
++		t.Fatal(e)
++	}
++	producer := &profileUDPProducer{association: a}
++	if e := producer.transfer(f.p.ctx, nil); e == nil {
++		t.Fatal("pre-Match payload released")
++	}
++	accepted := &profileAccepted{runtime: f.p, ctx: f.p.ctx, index: 0, provenance: 3, tuple: receiver.got.tuple}
++	r, op, e := f.c.open(f.p.ctx, 0, 3, receiver.got.tuple, a.original, accepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	if _, e = a.Consumed(op.sequence); e != nil {
++		t.Fatal(e)
++	}
++	if e = a.Match(udpMatch(t, a, 1)); e != nil {
++		t.Fatal(e)
++	}
++	producer.current = &profileUDPFlow{producer: producer, receipt: r, ctx: f.p.ctx, cancel: func() {}, tuple: r.tuple, original: r.original, payload: append([]byte(nil), a.buffers[0][a.header:a.length]...), credit: true}
++	r.udp = producer.current
++	r.udp.matched.Store(true)
++	if e = producer.transfer(f.p.ctx, nil); e == nil {
++		t.Fatal("Match became FlowGrant")
++	}
++	if e = f.c.accept(f.ingressReply(op)); e != nil {
++		t.Fatal(e)
++	}
++	g, authorize, e := f.c.authorize(f.p.ctx, r, 1, 0, a.original, nil)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(authorize); e != nil {
++		t.Fatal(e)
++	}
++	if e = producer.transfer(f.p.ctx, g); e == nil {
++		t.Fatal("AUTHORIZE became grant")
++	}
++	if e = f.c.accept(f.grantReply(authorize, 2)); e != nil {
++		t.Fatal(e)
++	}
++	ctx := context.WithValue(context.WithValue(context.WithValue(f.p.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r), profileGrantKey{}, g)
++	if e = producer.transfer(ctx, g); e != nil {
++		t.Fatal("actual matched UDP class1 GRANT cannot transfer", e)
++	}
++}
++
++type udpProducerFixture struct {
++	f            *flowFixture
++	actor        *profileUDPActor
++	producer     *profileUDPProducer
++	control      *ProfileUDPControl
++	receiver     *udpReceiveFake
++	controlEOF   chan struct{}
++	releaseFlow  chan struct{}
++	flowDone     chan struct{}
++	forwarded    chan []byte
++	replies      chan []byte
++	proofs       [][]byte
++	sends        atomic.Int32
++	responseWait chan struct{}
++	acked        map[uint64]bool
++}
++
++func newUDPProducerFixture(t *testing.T, sourcePort uint16) *udpProducerFixture {
++	t.Helper()
++	f, actor, accepted := udpActorFixture(t)
++	f.p.udpActor = actor
++	r, e := actor.submit(f.p.ctx, accepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	receiver := &udpReceiveFake{raw: []byte{0, 0, 0, 1, 198, 51, 100, 7, 0, 53, 0xaa, 0xbb}}
++	udpActorDeliver(t, actor, r, receiver)
++	receiver.got = profileUDPReceiveResult{n: len(receiver.raw), tuple: fakeFlowTuple(17), cookie: r.association.cookie, bound: r.association.bound, queueBytes: 65536}
++	be.PutUint16(receiver.got.tuple[4:], sourcePort)
++	be.PutUint16(receiver.got.tuple[6:], r.association.bound.port)
++	x := &udpProducerFixture{f: f, actor: actor, controlEOF: make(chan struct{}), releaseFlow: make(chan struct{}), flowDone: make(chan struct{}), forwarded: make(chan []byte, 1), replies: make(chan []byte, 1), receiver: receiver}
++	x.acked = make(map[uint64]bool)
++	oldSend := actor.send
++	actor.send = func(b []byte, fd profileProofFD) error {
++		if e := oldSend(b, fd); e != nil {
++			return e
++		}
++		x.proofs = append(x.proofs, append([]byte(nil), b...))
++		return nil
++	}
++	r.association.reply = func(ctx context.Context, b []byte, tuple [40]byte, gate func() error) error {
++		if tuple != receiver.got.tuple {
++			t.Error("response selected caller/TCP tuple")
++			return errProfile
++		}
++		if e := gate(); e != nil {
++			return e
++		}
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		x.sends.Add(1)
++		x.replies <- append([]byte(nil), b...)
++		return nil
++	}
++	x.control = &ProfileUDPControl{actor: actor, request: r, cancel: r.cancel, stop: func() bool { return true }}
++	x.producer, e = x.control.startProducer(func(ctx context.Context, target xnet.Destination, link *transport.Link) error {
++		defer close(x.flowDone)
++		if e := ProfileDispatchEntry(ctx, target); e != nil {
++			return e
++		}
++		ctx, e := ProfileSelectRoute(ctx, "a", target)
++		if e != nil {
++			return e
++		}
++		if ProfileCheckDial(ctx, target, true) == nil {
++			t.Error("original receipt became physical grant")
++			return errProfile
++		}
++		ctx, release, e := ProfileAuthorizeHandler(ctx, "a", target, false)
++		if e != nil {
++			return e
++		}
++		defer release()
++		if e = ProfilePrepareChain(ctx, func(string, xnet.Destination) (bool, error) { return false, nil }); e != nil {
++			return e
++		}
++		ProfileGuardLink(ctx, link)
++		if e = ProfileLogicalGate(ctx); e != nil {
++			return e
++		}
++		mb, e := link.Reader.ReadMultiBuffer()
++		if e != nil {
++			return e
++		}
++		var actual []byte
++		for _, b := range mb {
++			actual = append(actual, b.Bytes()...)
++		}
++		buf.ReleaseMulti(mb)
++		x.forwarded <- actual
++		if x.responseWait != nil {
++			select {
++			case <-x.responseWait:
++			case <-ctx.Done():
++				return ctx.Err()
++			}
++		}
++		if e = link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("answer"))}); e != nil {
++			return e
++		}
++		select {
++		case <-x.releaseFlow:
++		case <-ctx.Done():
++		}
++		if closer, ok := link.Reader.(io.Closer); ok {
++			if e = closer.Close(); e != nil {
++				return e
++			}
++		}
++		if closer, ok := link.Writer.(io.Closer); ok {
++			if e = closer.Close(); e != nil {
++				return e
++			}
++		}
++		return nil
++	}, func() error {
++		select {
++		case <-x.controlEOF:
++		case <-r.ctx.Done():
++		}
++		return nil
++	})
++	if e != nil {
++		t.Fatal(e)
++	}
++	t.Cleanup(func() { r.cancel(); f.p.cancel() })
++	return x
++}
++
++func (x *udpProducerFixture) consume(t *testing.T, replyBeforeMatch bool) *profileOperation {
++	t.Helper()
++	if e := x.actor.producerTick(); e != nil {
++		t.Fatal(e)
++	}
++	if len(x.proofs) != 1 || string(x.proofs[0][:8]) != "YNKUPQ01" || x.receiver.reads.Load() != 0 {
++		t.Fatal("Peek/ReadPermit order")
++	}
++	permit := udpPermit(t, x.producer.association, x.receiver, 1, 1)
++	packet := profileProofPacket{body: permit, credentials: 1, pid: 7}
++	if e := x.actor.receive(func() (profileProofPacket, error) { return packet, nil }); e != nil {
++		t.Fatal(e)
++	}
++	e := <-x.producer.readDone
++	x.producer.readDone <- e
++	if e = x.actor.producerTick(); e != nil {
++		t.Fatal(e)
++	}
++	u := x.producer.current
++	if u == nil || u.receipt.provenance != 3 || u.receipt.tuple != x.receiver.got.tuple || u.receipt.original != x.producer.association.original {
++		t.Fatal("OPEN lost immutable provenance")
++	}
++	if e = x.actor.producerTick(); e != nil {
++		t.Fatal(e)
++	}
++	if len(x.proofs) != 2 || string(x.proofs[1][:8]) != "YNKUCM01" || u64(x.proofs[1], 240) != u.open.sequence {
++		t.Fatal("Consumed not bound to actual OPEN")
++	}
++	if e := u.reply(buf.FromBytes([]byte("early"))); e == nil {
++		t.Fatal("response before Match/GRANT")
++	}
++	if replyBeforeMatch {
++		if e = x.f.c.accept(x.f.ingressReply(u.open)); e != nil {
++			t.Fatal(e)
++		}
++		if _, _, e = x.f.c.authorize(x.f.p.ctx, u.receipt, 1, 0, u.original, nil); e == nil {
++			t.Fatal("private original published before Match")
++		}
++		if e = x.actor.producerTick(); e != nil {
++			t.Fatal(e)
++		}
++		select {
++		case <-x.forwarded:
++			t.Fatal("payload before Match")
++		default:
++		}
++	}
++	packet.body = udpMatch(t, x.producer.association, 1)
++	if e = x.actor.receive(func() (profileProofPacket, error) { return packet, nil }); e != nil {
++		t.Fatal(e)
++	}
++	if !replyBeforeMatch {
++		if e = x.f.c.accept(x.f.ingressReply(u.open)); e != nil {
++			t.Fatal(e)
++		}
++	}
++	if e = x.actor.producerTick(); e != nil {
++		t.Fatal(e)
++	}
++	op := <-x.f.p.flowQueue
++	if op.kind != 18 || op.receipt != u.receipt || op.receipt.tuple != x.receiver.got.tuple {
++		t.Fatal("AUTHORIZE borrowed source")
++	}
++	if e = x.f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	select {
++	case <-x.forwarded:
++		t.Fatal("payload before GRANT")
++	default:
++	}
++	if x.sends.Load() != 0 || x.producer.association.phase != profileUDPMatched {
++		t.Fatal("premature response/retirement")
++	}
++	return op
++}
++
++func (x *udpProducerFixture) finishFlow(t *testing.T) {
++	t.Helper()
++	u := x.producer.flows[0]
++	u.cancel()
++	close(x.releaseFlow)
++	<-x.flowDone
++	// runFlow завершает owned dispatch task после actual callback return.
++	<-u.done
++	if e := x.f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	x.ackCancels(t)
++}
++func (x *udpProducerFixture) ackCancels(t *testing.T) {
++	t.Helper()
++	for _, frame := range x.f.writes {
++		if frame.kind != 32 || x.acked[frame.sequence] {
++			continue
++		}
++		body := make([]byte, 12)
++		body[0] = frame.body[0]
++		body[1] = 1
++		copy(body[4:], frame.body[4:])
++		if e := x.f.c.accept(profilePacket{kind: 34, reply: frame.sequence, body: body}); e != nil {
++			t.Fatal(e)
++		}
++		x.acked[frame.sequence] = true
++	}
++}
++
++func TestProfileUDPProducerActualRuntimeAndGuardedDownstreamCaller(t *testing.T) {
++	for _, early := range []bool{true, false} {
++		t.Run(map[bool]string{true: "runtime-before-match", false: "match-before-runtime"}[early], func(t *testing.T) {
++			x := newUDPProducerFixture(t, 32002)
++			op := x.consume(t, early)
++			if e := x.f.c.accept(x.f.grantReply(op, 2)); e != nil {
++				t.Fatal(e)
++			}
++			if got := <-x.forwarded; !bytes.Equal(got, []byte{0xaa, 0xbb}) {
++				t.Fatal("wrong request", got)
++			}
++			if got := <-x.replies; !bytes.Equal(got, []byte{0, 0, 0, 1, 198, 51, 100, 7, 0, 53, 'a', 'n', 's', 'w', 'e', 'r'}) {
++				t.Fatal("wrong response frame", got)
++			}
++			if e := x.actor.producerTick(); e != nil {
++				t.Fatal(e)
++			}
++			if x.producer.current != nil || x.producer.association.phase != profileUDPBound || x.producer.flows[0].response == nil {
++				t.Fatal("response ownership released with request")
++			}
++			x.finishFlow(t)
++			close(x.controlEOF)
++			e := <-x.producer.controlDone
++			x.producer.controlDone <- e
++			var tail [32]byte
++			be.PutUint64(tail[:], x.producer.association.id)
++			be.PutUint64(tail[8:], 99)
++			be.PutUint64(tail[16:], x.producer.association.control)
++			b, n, e := profileUDPEncode(x.producer.association.launch, 8, tail[:])
++			if e != nil {
++				t.Fatal(e)
++			}
++			packet := profileProofPacket{body: b[:n], credentials: 1, pid: 7}
++			if e = x.actor.receive(func() (profileProofPacket, error) { return packet, nil }); e != nil {
++				t.Fatal(e)
++			}
++			if e = x.actor.producerTick(); e != nil {
++				t.Fatal(e)
++			}
++			if !x.producer.finished || x.receiver.closes.Load() != 1 || x.receiver.joins.Load() != 1 || x.producer.request.err != nil || string(x.proofs[len(x.proofs)-1][:8]) != "YNKUCR01" {
++				t.Fatal("missing joined KnownClosed", x.producer.finished, x.proofs)
++			}
++		})
++	}
++}
++
++func TestProfileUDPResponseTransportNoRetryAfterUncertainAndCancelBeforeWrite(t *testing.T) {
++	tuple := fakeFlowTuple(17)
++	be.PutUint16(tuple[6:], 49152)
++	if e := profileSendUDPResponse(context.Background(), []byte("response"), tuple, func() error { return nil }, profileUDPResponseOps{validate: func() error { return nil }, wait: func(context.Context) error { t.Fatal("uncertain retry"); return nil }, send: func([]byte, [40]byte) (int, error) { return 1, context.Canceled }}); !errors.Is(e, errProfileUDPResponseUncertain) {
++		t.Fatal("partial cancel lost Unknown custody", e)
++	}
++	for _, partial := range []bool{false, true} {
++		ctx, cancel := context.WithCancel(context.Background())
++		calls, waits := 0, 0
++		e := profileSendUDPResponse(ctx, []byte("response"), tuple, func() error { return ctx.Err() }, profileUDPResponseOps{
++			validate: func() error { return nil }, wait: func(context.Context) error { waits++; cancel(); return nil },
++			send: func([]byte, [40]byte) (int, error) {
++				calls++
++				if partial {
++					return 2, errProfileProofBusy
++				}
++				return 0, errProfileProofBusy
++			},
++		})
++		if e == nil || calls != 1 || partial && waits != 0 || !partial && waits != 1 {
++			t.Fatal("cancel/partial retried", e, calls, waits)
++		}
++		cancel()
++	}
++	if e := profileSendUDPResponse(context.Background(), []byte("response"), tuple, func() error { return nil }, profileUDPResponseOps{validate: func() error { return errors.New("foreign namespace") }, wait: func(context.Context) error { t.Fatal("wait before namespace proof"); return nil }, send: func([]byte, [40]byte) (int, error) { t.Fatal("send before namespace proof"); return 0, nil }}); e == nil {
++		t.Fatal("namespace bypass")
++	}
++}
++
++func TestProfileUDPResponseSinkExactReceiptTupleEndpointAndFreshOwner(t *testing.T) {
++	for _, port := range []uint16{32002, 43017} {
++		t.Run(fmt.Sprint(port), func(t *testing.T) {
++			x := newUDPProducerFixture(t, port)
++			x.responseWait = make(chan struct{})
++			op := x.consume(t, true)
++			if e := x.f.c.accept(x.f.grantReply(op, 2)); e != nil {
++				t.Fatal(e)
++			}
++			<-x.forwarded
++			u := x.producer.flows[0]
++			if u16(u.tuple[:], 4) == u16(x.producer.request.accepted.tuple[:], 4) {
++				t.Fatal("UDP borrowed TCP port")
++			}
++			originalTuple, cookie, revision, receipt, class := u.tuple, u.cookie, u.grant.revision, u.grant.receipt, u.grant.class
++			other := *receipt
++			for _, mutation := range []string{"receipt", "tuple", "cookie", "revision", "probe", "dns", "endpoint", "hostname"} {
++				b := buf.FromBytes([]byte("response"))
++				switch mutation {
++				case "receipt":
++					u.grant.receipt = &other
++				case "tuple":
++					be.PutUint16(u.tuple[4:], 32001)
++				case "cookie":
++					u.cookie++
++				case "revision":
++					u.grant.revision++
++				case "probe":
++					u.grant.class = 2
++				case "dns":
++					u.grant.class = 3
++				case "endpoint":
++					wrong := xnet.UDPDestination(xnet.ParseAddress("203.0.113.8"), 53)
++					b.UDP = &wrong
++				case "hostname":
++					wrong := xnet.UDPDestination(xnet.ParseAddress("response.invalid"), 53)
++					b.UDP = &wrong
++				}
++				if e := u.reply(b); e == nil || x.sends.Load() != 0 {
++					t.Fatal("response escaped immutable binding", mutation, e)
++				}
++				u.tuple, u.cookie, u.grant.revision, u.grant.receipt, u.grant.class = originalTuple, cookie, revision, receipt, class
++			}
++			// Expired owner proof требует actual refresh до send, новый lease не proof.
++			x.f.now = x.f.now.Add(25 * time.Millisecond)
++			done := make(chan error, 1)
++			go func() { done <- u.reply(buf.FromBytes([]byte("response"))) }()
++			refresh := <-x.f.p.flowQueue
++			if refresh.object != u.grant.id || refresh.receipt != u.receipt || x.sends.Load() != 0 {
++				t.Fatal("owner expiry bypassed")
++			}
++			if e := x.f.c.dispatch(refresh); e != nil {
++				t.Fatal(e)
++			}
++			bad := x.f.grantReply(refresh, 2)
++			be.PutUint64(bad.body[32:], 0)
++			if e := x.f.c.accept(bad); e != nil {
++				t.Fatal(e)
++			}
++			if e := <-done; e == nil || x.sends.Load() != 0 {
++				t.Fatal("Unknown owner became response grant")
++			}
++			x.finishFlow(t)
++		})
++	}
++}
++
++func TestProfileUDPProducerCancelLateGrantAndDenialDoNotForward(t *testing.T) {
++	for _, late := range []bool{false, true} {
++		t.Run(map[bool]string{false: "typed-denial", true: "cancel-late-grant"}[late], func(t *testing.T) {
++			x := newUDPProducerFixture(t, 32002)
++			op := x.consume(t, false)
++			u := x.producer.current
++			if late {
++				u.cancel()
++			} else {
++				if e := x.f.c.accept(profilePacket{kind: 22, reply: op.sequence, body: []byte{2, 2, 0, 0, 0, 0, 0, 0}}); e != nil {
++					t.Fatal(e)
++				}
++			}
++			<-x.flowDone
++			<-u.done
++			if e := x.f.c.tick(); e != nil {
++				t.Fatal(e)
++			}
++			if late {
++				if e := x.f.c.accept(x.f.grantReply(op, 2)); e != nil {
++					t.Fatal(e)
++				}
++			}
++			x.ackCancels(t)
++			if e := x.actor.producerTick(); e != nil {
++				t.Fatal(e)
++			}
++			if x.producer.current != nil || x.producer.association.phase != profileUDPBound || x.f.p.ctx.Err() != nil || x.sends.Load() != 0 {
++				t.Fatal("deny/cancel escaped flow or payload was forwarded")
++			}
++			select {
++			case <-x.forwarded:
++				t.Fatal("late grant forwarded payload")
++			default:
++			}
++		})
++	}
++}
++
++func TestProfileUDPProducerCreditsAndActualReadMismatchBeforeOPEN(t *testing.T) {
++	for _, mutation := range []string{"payload", "cookie", "peer", "flags", "history-cap"} {
++		t.Run(mutation, func(t *testing.T) {
++			x := newUDPProducerFixture(t, 32002)
++			if mutation == "history-cap" {
++				x.f.c.udpBudget.used = int(x.f.c.manifest.caps[7])
++				if e := x.actor.producerTick(); e == nil {
++					t.Fatal("overflow allowed")
++				}
++				if len(x.proofs) != 0 || x.receiver.reads.Load() != 0 {
++					t.Fatal("credit after effects")
++				}
++				return
++			}
++			if e := x.actor.producerTick(); e != nil {
++				t.Fatal(e)
++			}
++			permit := udpPermit(t, x.producer.association, x.receiver, 1, 1)
++			switch mutation {
++			case "payload":
++				x.receiver.raw[len(x.receiver.raw)-1] ^= 1
++			case "cookie":
++				x.receiver.got.cookie++
++			case "peer":
++				x.receiver.got.tuple[5]++
++			case "flags":
++				x.receiver.got.flags = 1
++			}
++			if e := x.actor.receive(func() (profileProofPacket, error) {
++				return profileProofPacket{body: permit, credentials: 1, pid: 7}, nil
++			}); e != nil {
++				t.Fatal(e)
++			}
++			e := <-x.producer.readDone
++			x.producer.readDone <- e
++			_ = x.actor.producerTick()
++			if len(x.f.writes) != 0 || x.sends.Load() != 0 || x.f.p.admission.state != profileUnknown {
++				t.Fatal("mismatch published authority")
++			}
++		})
++	}
++}
++
++func TestProfileUDPProducerDelayedSendBlocksKnownCloseAndUncertainIsSticky(t *testing.T) {
++	for _, uncertain := range []bool{false, true} {
++		t.Run(map[bool]string{false: "delayed-completion", true: "uncertain-send"}[uncertain], func(t *testing.T) {
++			x := newUDPProducerFixture(t, 32002)
++			x.responseWait = make(chan struct{})
++			op := x.consume(t, false)
++			if e := x.f.c.accept(x.f.grantReply(op, 2)); e != nil {
++				t.Fatal(e)
++			}
++			<-x.forwarded
++			u := x.producer.flows[0]
++			entered, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
++			x.producer.association.reply = func(ctx context.Context, _ []byte, _ [40]byte, gate func() error) error {
++				if e := gate(); e != nil {
++					return e
++				}
++				close(entered)
++				<-release
++				if uncertain {
++					return errProfileUDPResponseUncertain
++				}
++				return nil
++			}
++			go func() { done <- u.reply(buf.FromBytes([]byte("response"))) }()
++			<-entered
++			x.producer.request.cancel()
++			var tail [32]byte
++			be.PutUint64(tail[:], x.producer.association.id)
++			be.PutUint64(tail[8:], 99)
++			be.PutUint64(tail[16:], x.producer.association.control)
++			b, n, e := profileUDPEncode(x.producer.association.launch, 8, tail[:])
++			if e != nil {
++				t.Fatal(e)
++			}
++			if e = x.actor.receive(func() (profileProofPacket, error) {
++				return profileProofPacket{body: b[:n], credentials: 1, pid: 7}, nil
++			}); e != nil {
++				t.Fatal(e)
++			}
++			if e = x.actor.producerTick(); e != nil {
++				t.Fatal(e)
++			}
++			if x.producer.finished {
++				t.Fatal("KnownClosed before send task joined")
++			}
++			close(release)
++			e = <-done
++			if uncertain {
++				if e == nil || u.result == nil || x.f.p.admission.state != profileUnknown {
++					t.Fatal("uncertain effect lost custody")
++				}
++				<-u.done
++				if !x.producer.controlJoined {
++					controlError := <-x.producer.controlDone
++					x.producer.controlDone <- controlError
++				}
++				if e = x.actor.producerTick(); e == nil {
++					t.Fatal("uncertain cleanup became known")
++				}
++				if x.producer.finished || !u.credit || u.response == nil {
++					t.Fatal("Unknown released response custody")
++				}
++				return
++			}
++			if e != nil {
++				t.Fatal(e)
++			}
++			<-u.done
++			if e = x.f.c.tick(); e != nil {
++				t.Fatal(e)
++			}
++			x.ackCancels(t)
++			if !x.producer.controlJoined {
++				controlError := <-x.producer.controlDone
++				x.producer.controlDone <- controlError
++			}
++			if e = x.actor.producerTick(); e != nil {
++				t.Fatal(e)
++			}
++			if !x.producer.finished || x.receiver.closes.Load() != 1 || x.receiver.joins.Load() != 1 {
++				t.Fatal("joined close failed")
++			}
++			if e = x.control.Close(); e != nil {
++				t.Fatal(e)
++			}
++			if e = x.control.Close(); e != nil {
++				t.Fatal("repeated close changed final result", e)
++			}
++		})
++	}
++}
++
++func TestProfileUDPProducerLatePermitCannotReadAndFailureNotifiesWithoutKnownClose(t *testing.T) {
++	x := newUDPProducerFixture(t, 32002)
++	if e := x.actor.producerTick(); e != nil {
++		t.Fatal(e)
++	}
++	permit := udpPermit(t, x.producer.association, x.receiver, 1, 1)
++	x.producer.request.cancel()
++	if e := x.actor.producerTick(); e != nil {
++		t.Fatal(e)
++	}
++	if e := x.actor.receive(func() (profileProofPacket, error) {
++		return profileProofPacket{body: permit, credentials: 1, pid: 7}, nil
++	}); e != nil {
++		t.Fatal(e)
++	}
++	if x.receiver.reads.Load() != 0 || len(x.f.writes) != 0 || x.producer.finished {
++		t.Fatal("late permit created effects or KnownClosed")
++	}
++	if e := x.actor.receive(func() (profileProofPacket, error) {
++		return profileProofPacket{body: permit, credentials: 1, pid: 7}, nil
++	}); e == nil {
++		t.Fatal("late replay accepted")
++	}
++	select {
++	case <-x.producer.request.closed:
++	default:
++		t.Fatal("failed managed caller stranded")
++	}
++	if x.producer.finished || x.producer.result == nil || x.f.p.admission.state != profileUnknown {
++		t.Fatal("failure lost Unknown custody")
++	}
++}
++
++func TestProfileUDPProducerLogicalTaskJoinAndCreditBeforeEffects(t *testing.T) {
++	for _, failed := range []bool{false, true} {
++		t.Run(fmt.Sprint(failed), func(t *testing.T) {
++			x := newUDPProducerFixture(t, 32002)
++			x.responseWait = make(chan struct{})
++			op := x.consume(t, false)
++			if e := x.f.c.accept(x.f.grantReply(op, 2)); e != nil {
++				t.Fatal(e)
++			}
++			<-x.forwarded
++			u := x.producer.flows[0]
++			before := x.f.c.buffered
++			finish, e := ProfileBeginLogicalTask(u.grantContext)
++			if e != nil {
++				t.Fatal(e)
++			}
++			if x.f.c.buffered != before+4096 {
++				t.Fatal("task credit missing")
++			}
++			u.cancel()
++			<-x.flowDone
++			select {
++			case <-u.done:
++				t.Fatal("task not joined before completion")
++			default:
++			}
++			var cleanup error
++			if failed {
++				cleanup = errors.New("unknown task cleanup")
++			}
++			finish(cleanup)
++			finish(nil)
++			<-u.done
++			if failed {
++				if u.result == nil || x.f.c.buffered < before+4096 {
++					t.Fatal("Unknown task lost custody")
++				}
++			} else if u.result != nil {
++				t.Fatal(u.result)
++			}
++			if _, e = ProfileBeginLogicalTask(u.grantContext); e == nil {
++				t.Fatal("closed flow registered new task")
++			}
++		})
++	}
++}
++
++func TestProfileUDPProducerUnknownRuntimeDenialRetainsCustody(t *testing.T) {
++	x := newUDPProducerFixture(t, 32002)
++	op := x.consume(t, false)
++	if e := x.f.c.accept(profilePacket{kind: 22, reply: op.sequence, body: []byte{3, 2, 0, 0, 0, 0, 0, 0}}); e == nil {
++		t.Fatal("Rust Unknown denial became known flow retirement")
++	}
++	if op.denied || !x.producer.current.credit || x.producer.finished {
++		t.Fatal("Unknown custody released")
++	}
++}
+diff --git a/common/yonikbroker/profile_udp_producer_linux.go b/common/yonikbroker/profile_udp_producer_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_udp_producer_linux.go
+@@ -0,0 +1,844 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"io"
++	"net/netip"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/xtls/xray-core/common/buf"
++	xnet "github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/transport"
++)
++
++// Private producer использует только verified consuming association. Public
++// caller не может передать tuple, original destination или mint grant.
++const profileUDPProducerCredit = 8192
++const profileUDPDownstreamCredit = 65536*3 + 32768 + 8192
++
++type profileUDPProducer struct {
++	association                          *profileUDPAssociation
++	runtime                              *ProfileRuntime
++	request                              *profileUDPControlRequest
++	dispatch                             func(context.Context, xnet.Destination, *transport.Link) error
++	flows                                [256]*profileUDPFlow
++	count                                int
++	current                              *profileUDPFlow
++	readDone                             chan error
++	reading, stopping, durable, finished bool
++	closeID                              uint64
++	closeError, result                   error
++	consumed                             [256]byte
++	consumedPending                      bool
++	peek                                 [256]byte
++	peekLength                           int
++	peekPending                          bool
++	controlDone                          chan error
++	controlJoined                        bool
++	closingDeadline                      time.Time
++	retiredRuntime                       uint64
++	latePermit, lateMatch                bool
++	notified                             bool
++}
++
++type profileUDPFlow struct {
++	mu                                 sync.Mutex
++	producer                           *profileUDPProducer
++	receipt                            *profileReceipt
++	open                               *profileOperation
++	ctx                                context.Context
++	cancel                             context.CancelFunc
++	grant                              *profileGrant
++	grantContext                       context.Context
++	tuple                              [40]byte
++	original, target                   profileDestinationValue
++	packet, permit, sequence           uint64
++	deadline                           time.Time
++	payload, response                  []byte
++	read, transferred, closed, retired bool
++	tasks                              int
++	result                             error
++	dispatchError                      error
++	done                               chan struct{}
++	doneClosed                         bool
++	credit                             bool
++	cookie                             uint64
++	matched                            atomic.Bool
++}
++
++func (c *ProfileUDPControl) Serve(dispatch func(context.Context, xnet.Destination, *transport.Link) error, control func() error) error {
++	if _, e := c.startProducer(dispatch, control); e != nil {
++		return e
++	}
++	<-c.request.closed
++	c.actor.mu.Lock()
++	defer c.actor.mu.Unlock()
++	if c.request.producer.finished {
++		return c.request.producer.result
++	}
++	return c.request.err
++}
++func (c *ProfileUDPControl) startProducer(dispatch func(context.Context, xnet.Destination, *transport.Link) error, control func() error) (*profileUDPProducer, error) {
++	if c == nil || c.actor == nil || dispatch == nil || control == nil {
++		return nil, errProfile
++	}
++	a := c.actor
++	a.mu.Lock()
++	r := c.request
++	if r == nil || r.phase != 4 || r.association == nil || r.ctx.Err() != nil || r.producer != nil {
++		a.mu.Unlock()
++		return nil, errProfile
++	}
++	f := a.runtime.flow
++	f.mu.Lock()
++	if !f.live() || f.buffered+f.manifest.memoryCredit+profileUDPProducerCredit > uint64(f.manifest.caps[4]) {
++		f.mu.Unlock()
++		a.mu.Unlock()
++		return nil, errProfileFlowBusy
++	}
++	f.buffered += profileUDPProducerCredit
++	f.mu.Unlock()
++	p := &profileUDPProducer{association: r.association, runtime: a.runtime, request: r, dispatch: dispatch, readDone: make(chan error, 1), controlDone: make(chan error, 1)}
++	r.producer = p
++	// Managed lifetime: legacy actor не закрывает receiver раньше producer joins.
++	// Phase5 сохраняет custody, но не является UCR/KnownClosed.
++	r.phase = 5
++	go func() { e := control(); r.cancel(); p.controlDone <- e }()
++	a.mu.Unlock()
++	return p, nil
++}
++
++func (p *profileUDPProducer) transfer(ctx context.Context, g *profileGrant) error {
++	a := p.association
++	if a == nil || g == nil || g.receipt == nil || g.receipt.provenance != 3 || g.id == 0 || g.class == 2 || g.class == 3 || profileReceiptFrom(ctx) != g.receipt || profileLinkGate(ctx, g) != nil {
++		return errProfile
++	}
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.phase != profileUDPMatched || a.ctx.Err() != nil || g.receipt.original != a.original || g.receipt.tuple != a.permitTuple() || g.receipt.openSequence != a.openSequence || !a.flow.clock().Before(a.deadline) {
++		return errProfile
++	}
++	u := g.receipt.udp
++	if u == nil || u.producer != p || u.receipt != g.receipt || !u.credit || !bytes.Equal(u.payload, a.buffers[0][a.header:a.length]) {
++		return errProfile
++	}
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	if u.closed || u.ctx.Err() != nil || u.transferred || u.original != a.original || u.tuple != a.permitTuple() {
++		return errProfile
++	}
++	u.grant = g
++	u.grantContext = ctx
++	u.target = g.effective
++	if u.target.family == 3 || u.target.network != 17 {
++		return ErrProfileUnsupported
++	}
++	u.transferred = true
++	clear(a.buffers[0])
++	clear(a.buffers[1])
++	a.length = 0
++	a.header = 0
++	a.openSequence = 0
++	a.consumedSent = time.Time{}
++	a.flow.mu.Lock()
++	if a.operation {
++		a.flow.udpBudget.entries[a.operationSlot].terminal = true
++		a.flow.udpBudget.proofPending--
++		a.operation = false
++	}
++	a.flow.mu.Unlock()
++	a.phase = profileUDPBound
++	return nil
++}
++func (a *profileUDPAssociation) permitTuple() (t [40]byte) { copy(t[:], a.permit[160:200]); return }
++
++// Вызывается только существующим monitor, до legacy tick и runtime dispatch.
++func (a *profileUDPActor) producerTick() error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.failed != nil {
++		return a.failed
++	}
++	for _, r := range a.requests {
++		if r != nil && r.producer != nil {
++			if e := r.producer.tick(); e != nil {
++				return a.failLocked(e)
++			}
++		}
++	}
++	return nil
++}
++func (p *profileUDPProducer) tick() error {
++	if p.finished {
++		return nil
++	}
++	r, a, c := p.request, p.association, p.runtime.flow
++	if r.ctx.Err() != nil || p.runtime.ctx.Err() != nil {
++		p.beginClose()
++	}
++	if p.stopping {
++		return p.closeProgress()
++	}
++	for i, u := range p.flows[:p.count] {
++		if u == nil || u == p.current || !u.mu.TryLock() {
++			continue
++		}
++		ready := u.closed && u.tasks == 0
++		result := u.result
++		u.mu.Unlock()
++		if result != nil {
++			return result
++		}
++		if ready && p.flowRetired(u) {
++			p.retireFlow(i, u)
++		}
++	}
++	if p.current != nil {
++		u := p.current
++		if p.consumedPending {
++			e := p.runtime.udpActor.send(p.consumed[:], nil)
++			if e == errProfileProofBusy {
++				return nil
++			}
++			if e != nil {
++				return e
++			}
++			p.consumedPending = false
++		}
++		c.mu.Lock()
++		complete, failed := u.open.completed, u.open.err
++		c.mu.Unlock()
++		a.mu.Lock()
++		phase := a.phase
++		expired := !c.clock().Before(a.deadline)
++		a.mu.Unlock()
++		if failed != nil || phase == profileUDPDenied {
++			u.cancel()
++			u.mu.Lock()
++			u.closed = true
++			u.mu.Unlock()
++		}
++		if !u.mu.TryLock() {
++			return nil
++		}
++		transferred := u.transferred
++		tasks := u.tasks
++		closed := u.closed
++		u.mu.Unlock()
++		if closed && !transferred && tasks == 0 && (phase == profileUDPMatched || phase == profileUDPDenied) {
++			c.mu.Lock()
++			c.closeReceipt(u.receipt)
++			c.mu.Unlock()
++			if !p.flowRetired(u) {
++				return nil
++			}
++			a.mu.Lock()
++			if a.phase == profileUDPMatched {
++				a.phase = profileUDPDenied
++			}
++			a.mu.Unlock()
++			if e := a.RetirePayload(); e != nil {
++				return e
++			}
++			p.current = nil
++			for i, v := range p.flows[:p.count] {
++				if v == u {
++					p.retireFlow(i, u)
++					break
++				}
++			}
++			return nil
++		}
++		if !transferred && expired {
++			return errProfileTimeout
++		}
++		if complete && phase == profileUDPMatched && tasks == 0 && !closed {
++			u.mu.Lock()
++			u.tasks++
++			u.mu.Unlock()
++			go p.runFlow(u)
++		}
++		if transferred {
++			p.current = nil
++		}
++		return nil
++	}
++	if p.reading {
++		select {
++		case e := <-p.readDone:
++			p.reading = false
++			if e != nil {
++				return e
++			}
++			return p.openConsumed()
++		default:
++			return nil
++		}
++	}
++	a.mu.Lock()
++	phase := a.phase
++	a.mu.Unlock()
++	if phase == profileUDPBound {
++		if e := a.BeginPeek(c.clock().Add(time.Second)); e != nil {
++			return e
++		}
++		var tail [32]byte
++		be.PutUint64(tail[:], a.id)
++		c.mu.Lock()
++		operation := c.udpBudget.entries[a.operationSlot].operation
++		c.mu.Unlock()
++		be.PutUint64(tail[8:], operation)
++		be.PutUint64(tail[16:], a.control)
++		b, n, e := profileUDPEncode(a.launch, 4, tail[:])
++		if e != nil {
++			return e
++		}
++		p.peek = b
++		p.peekLength = n
++		p.peekPending = true
++	}
++	if p.peekPending {
++		e := p.runtime.udpActor.send(p.peek[:p.peekLength], nil)
++		if e == errProfileProofBusy {
++			return nil
++		}
++		if e != nil {
++			return e
++		}
++		p.peekPending = false
++	}
++	return nil
++}
++
++func (p *profileUDPProducer) packet(kind int, b []byte) error {
++	if p.stopping && kind != 8 {
++		if kind == 5 {
++			return p.retireLatePermit(b)
++		}
++		if kind == 7 && !p.lateMatch && !p.consumedPending && p.current != nil && u64(b, 136) == p.current.packet && u64(b, 144) == p.current.permit && u64(b, 152) == p.current.sequence && b[160] != 3 {
++			p.lateMatch = true
++			return nil
++		}
++		return errProfile
++	}
++	switch kind {
++	case 5:
++		if p.reading || p.current != nil || p.peekPending {
++			return errProfile
++		}
++		if e := p.association.Permit(b); e != nil {
++			return e
++		}
++		p.reading = true
++		go func() { p.readDone <- p.association.ConsumePermit() }()
++		return nil
++	case 7:
++		if p.consumedPending || p.current == nil {
++			return errProfile
++		}
++		if e := p.association.Match(b); e != nil {
++			return e
++		}
++		p.association.mu.Lock()
++		matched := p.association.phase == profileUDPMatched
++		p.association.mu.Unlock()
++		if matched && p.current != nil {
++			p.current.matched.Store(true)
++		}
++		return nil
++	case 8:
++		if p.closeID != 0 || u64(b, 128) != p.association.id || u64(b, 144) != p.association.control {
++			return errProfile
++		}
++		id := u64(b, 136)
++		for _, r := range p.runtime.udpActor.requests {
++			if r != nil && r.issuerClose == id {
++				return errProfile
++			}
++		}
++		p.request.issuerClose = id
++		c := p.runtime.flow
++		c.mu.Lock()
++		entry := &c.udpBudget.entries[p.request.slot+2]
++		entry.namespace = 3
++		entry.operation = id
++		c.mu.Unlock()
++		p.closeID = u64(b, 136)
++		p.durable = true
++		p.beginClose()
++		return nil
++	}
++	return errProfile
++}
++
++// Closing-only DATA ledger: никакого Read/OPEN/authority из late permit.
++// KnownClosed всё ещё требует actual duplicate close, joins и durable UCQ.
++func (p *profileUDPProducer) retireLatePermit(b []byte) error {
++	a := p.association
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if p.latePermit || p.peekPending || p.reading || p.current != nil || a.phase != profileUDPWaiting || !a.operation || u64(b, 152) != a.cookie || u64(b, 136) <= a.lastPacket || u64(b, 144) <= a.lastPermit || u16(b, 166) != a.bound.port {
++		return errProfile
++	}
++	c := p.runtime.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if u64(b, 136) <= c.udpBudget.lastPacket || u64(b, 144) <= c.udpBudget.lastPermit {
++		return errProfile
++	}
++	p.latePermit = true
++	a.lastPacket = u64(b, 136)
++	a.lastPermit = u64(b, 144)
++	c.udpBudget.lastPacket = a.lastPacket
++	c.udpBudget.lastPermit = a.lastPermit
++	entry := &c.udpBudget.entries[a.operationSlot]
++	entry.packet = a.lastPacket
++	entry.permit = a.lastPermit
++	return nil
++}
++
++func (p *profileUDPProducer) openConsumed() error {
++	a, c := p.association, p.runtime.flow
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.phase != profileUDPHeld || a.original.family == 3 || !c.clock().Before(a.deadline) {
++		return ErrProfileUnsupported
++	}
++	c.mu.Lock()
++	if !c.live() || p.count >= 256 || p.count >= int(c.manifest.caps[6]) || c.buffered+c.manifest.memoryCredit+profileUDPDownstreamCredit > uint64(c.manifest.caps[4]) {
++		c.mu.Unlock()
++		return errProfileFlowBusy
++	}
++	c.buffered += profileUDPDownstreamCredit
++	c.mu.Unlock()
++	ctx, cancel := context.WithCancel(p.request.ctx)
++	accepted := &profileAccepted{runtime: p.runtime, ctx: ctx, index: p.request.accepted.index, provenance: 3, tuple: a.permitTuple()}
++	r, op, e := c.open(ctx, accepted.index, 3, accepted.tuple, a.original, accepted)
++	if e != nil {
++		cancel()
++		c.mu.Lock()
++		c.buffered -= profileUDPDownstreamCredit
++		c.mu.Unlock()
++		return e
++	}
++	u := &profileUDPFlow{producer: p, ctx: ctx, cancel: cancel, tuple: accepted.tuple, original: a.original, cookie: a.cookie, packet: a.lastPacket, permit: a.lastPermit, deadline: a.deadline, payload: append([]byte(nil), a.buffers[0][a.header:a.length]...), response: make([]byte, 65536), done: make(chan struct{}), credit: true}
++	u.receipt, u.open = r, op
++	r.udp = u
++	op.fixedDeadline = u.deadline
++	c.mu.Lock()
++	if op.udpSlot >= 0 {
++		entry := &c.udpBudget.entries[op.udpSlot]
++		entry.association = a.id
++		entry.packet = a.lastPacket
++		entry.permit = a.lastPermit
++		entry.control = a.control
++		entry.cookie = a.cookie
++	}
++	c.mu.Unlock()
++	p.flows[p.count] = u
++	p.count++
++	p.current = u
++	a.flows++
++	// open() не читает association mutex; release перед Consumed после seq.
++	a.mu.Unlock()
++	e = c.dispatch(op)
++	if e == nil {
++		u.sequence = op.sequence
++		p.consumed, e = a.Consumed(op.sequence)
++		p.consumedPending = e == nil
++	}
++	a.mu.Lock()
++	return e
++}
++
++func (p *profileUDPProducer) runFlow(u *profileUDPFlow) {
++	defer func() {
++		u.mu.Lock()
++		u.tasks--
++		if u.tasks == 0 {
++			u.closed = true
++			u.cancel()
++			if u.done != nil && !u.doneClosed {
++				u.doneClosed = true
++				close(u.done)
++			}
++		}
++		u.mu.Unlock()
++	}()
++	ctx := context.WithValue(context.WithValue(u.ctx, profileContextKey{}, p.runtime), profileReceiptKey{}, u.receipt)
++	target := xnet.UDPDestination(xnet.ParseAddress(u.original.address), xnet.Port(u.original.port))
++	e := p.dispatch(ctx, target, &transport.Link{Reader: &profileUDPPayloadReader{flow: u}, Writer: &profileUDPResponseWriter{flow: u}})
++	u.mu.Lock()
++	u.dispatchError = e
++	u.mu.Unlock()
++}
++
++type profileUDPPayloadReader struct{ flow *profileUDPFlow }
++
++func (r *profileUDPPayloadReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
++	u := r.flow
++	u.mu.Lock()
++	if u.closed || u.ctx.Err() != nil {
++		u.mu.Unlock()
++		return nil, io.EOF
++	}
++	if !u.read {
++		u.read = true
++		b := buf.FromBytes(u.payload)
++		u.mu.Unlock()
++		return buf.MultiBuffer{b}, nil
++	}
++	u.mu.Unlock()
++	<-u.ctx.Done()
++	return nil, io.EOF
++}
++func (r *profileUDPPayloadReader) ReadMultiBufferTimeout(time.Duration) (buf.MultiBuffer, error) {
++	return r.ReadMultiBuffer()
++}
++func (r *profileUDPPayloadReader) Close() error          { r.flow.cancel(); return nil }
++func (r *profileUDPPayloadReader) ProfileCleanup() error { return r.Close() }
++
++type profileUDPResponseWriter struct{ flow *profileUDPFlow }
++
++func (w *profileUDPResponseWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	defer buf.ReleaseMulti(mb)
++	for _, b := range mb {
++		if e := w.flow.reply(b); e != nil {
++			return e
++		}
++	}
++	return nil
++}
++func (w *profileUDPResponseWriter) Close() error          { w.flow.cancel(); return nil }
++func (w *profileUDPResponseWriter) ProfileCleanup() error { return w.Close() }
++
++func (u *profileUDPFlow) reply(b *buf.Buffer) error {
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	if !u.transferred || !u.credit || u.closed || u.ctx.Err() != nil || u.grant == nil || u.grant.receipt != u.receipt || u.receipt.provenance != 3 || u.grant.class == 2 || u.grant.class == 3 || u.receipt.tuple != u.tuple || u.receipt.original != u.original || u.receipt.revision != u.grant.revision || u.cookie != u.producer.association.cookie || u.receipt.control != u.producer.association.flow || u.target != u.grant.effective || profileReceiptFrom(u.grantContext) != u.receipt {
++		return errProfile
++	}
++	if b == nil {
++		return errProfile
++	}
++	if b.UDP != nil {
++		v, e := profileValue(*b.UDP)
++		if e != nil || v != u.target {
++			return errProfile
++		}
++	}
++	target := u.target
++	if target.family == 3 || target.network != 17 || !target.valid() {
++		return ErrProfileUnsupported
++	}
++	address, e := profileNumericAddress(target)
++	if e != nil {
++		return e
++	}
++	header := 6 + len(address)
++	if int(b.Len())+header > 65507 {
++		return errProfile
++	}
++	gate := func() error {
++		if u.ctx.Err() != nil || u.grant.receipt != u.receipt {
++			return errProfile
++		}
++		return profileLinkGate(u.grantContext, u.grant)
++	}
++	if e = gate(); e != nil {
++		return e
++	}
++	frame := u.response[:header+int(b.Len())]
++	clear(frame[:header])
++	frame[3] = 1
++	if target.family == 6 {
++		frame[3] = 4
++	}
++	copy(frame[4:], address)
++	be.PutUint16(frame[4+len(address):], target.port)
++	copy(frame[header:], b.Bytes())
++	ctx, cancel := context.WithTimeout(u.ctx, time.Second)
++	defer cancel()
++	send := u.producer.association.reply
++	if send == nil {
++		return ErrProfileUnsupported
++	}
++	e = send(ctx, frame, u.tuple, gate)
++	if e != nil {
++		if errors.Is(e, errProfileUDPResponseUncertain) || errors.Is(e, errProfileUDPNamespace) {
++			u.result = errors.Join(u.result, e)
++			if runtime := u.producer.runtime; runtime != nil {
++				runtime.mu.Lock()
++				runtime.admission.state = profileUnknown
++				runtime.mu.Unlock()
++				runtime.cancel()
++			}
++		}
++		u.cancel()
++	}
++	if u.result == nil {
++		clear(frame)
++	}
++	return e
++}
++func (p *profileUDPProducer) beginClose() {
++	if p.stopping {
++		return
++	}
++	p.stopping = true
++	p.closingDeadline = p.runtime.flow.clock().Add(time.Second)
++	p.request.cancel()
++	for _, u := range p.flows[:p.count] {
++		if u == nil {
++			continue
++		}
++		u.cancel()
++		p.runtime.flow.mu.Lock()
++		p.runtime.flow.closeReceipt(u.receipt)
++		p.runtime.flow.mu.Unlock()
++	}
++	// Close actual duplicate до ожидания reader/send; receiver.Close идемпотентен.
++	if p.association.receiver != nil {
++		p.closeError = errors.Join(p.closeError, p.association.receiver.Close())
++	}
++}
++func (p *profileUDPProducer) closeProgress() error {
++	c := p.runtime.flow
++	if !c.clock().Before(p.closingDeadline) {
++		return errors.Join(errProfileTimeout, p.closeError)
++	}
++	if p.reading {
++		select {
++		case <-p.readDone:
++			p.reading = false
++		default:
++			return nil
++		}
++	}
++	if !p.controlJoined {
++		select {
++		case <-p.controlDone:
++			p.controlJoined = true
++		default:
++			return nil
++		}
++	}
++	for _, u := range p.flows[:p.count] {
++		if u == nil {
++			continue
++		}
++		if !u.mu.TryLock() {
++			return nil
++		}
++		tasks := u.tasks
++		result := u.result
++		u.mu.Unlock()
++		if tasks != 0 {
++			return nil
++		}
++		if result != nil {
++			return result
++		}
++		if !p.flowRetired(u) {
++			return nil
++		}
++	}
++	if !p.durable {
++		return nil
++	}
++	c.mu.Lock()
++	for _, entry := range c.udpBudget.entries[:c.udpBudget.used] {
++		if entry.namespace == 1 && entry.association == p.association.id && entry.closeKind != 0 && (!entry.terminal || entry.closeStatus != 1) {
++			c.mu.Unlock()
++			return nil
++		}
++	}
++	c.mu.Unlock()
++	if p.closeError != nil {
++		return p.closeError
++	}
++	c.mu.Lock()
++	live := c.live()
++	c.mu.Unlock()
++	if p.runtime.ctx.Err() != nil || !live {
++		return errProfile
++	}
++	p.association.mu.Lock()
++	p.association.flows = 0
++	p.association.mu.Unlock()
++	if e := p.association.CloseAndJoin(); e != nil {
++		return e
++	}
++	var tail [64]byte
++	be.PutUint64(tail[:], p.association.id)
++	be.PutUint64(tail[8:], p.closeID)
++	be.PutUint64(tail[16:], p.association.lastPacket)
++	tail[28] = 1
++	tail[29] = 1
++	be.PutUint64(tail[32:], p.association.cookie)
++	be.PutUint64(tail[40:], p.retiredRuntime)
++	for _, u := range p.flows[:p.count] {
++		if u == nil {
++			continue
++		}
++		if u.sequence > u64(tail[:], 40) {
++			be.PutUint64(tail[40:], u.sequence)
++		}
++	}
++	b, n, e := profileUDPEncode(p.association.launch, 9, tail[:])
++	if e != nil {
++		return e
++	}
++	e = p.runtime.udpActor.send(b[:n], nil)
++	if e == errProfileProofBusy {
++		return nil
++	}
++	if e != nil {
++		return e
++	}
++	for i, u := range p.flows[:p.count] {
++		if u != nil {
++			p.retireFlow(i, u)
++		}
++	}
++	p.finished = true
++	p.request.err = nil
++	p.notified = true
++	close(p.request.closed)
++	return nil
++}
++func (p *profileUDPProducer) flowRetired(u *profileUDPFlow) bool {
++	c := p.runtime.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !u.open.completed || u.receipt.pending != 0 || u.receipt.grantCount != 0 {
++		return false
++	}
++	if u.receipt.id == 0 && u.open.denied {
++		return true
++	}
++	kind, id := byte(2), u.receipt.id
++	if id == 0 {
++		if !u.open.submitted {
++			return true
++		}
++		kind, id = 1, u.open.sequence
++	}
++	for _, entry := range c.udpBudget.entries[:c.udpBudget.used] {
++		if entry.closeKind == kind && entry.objectID == id {
++			return entry.terminal && entry.closeStatus == 1
++		}
++	}
++	return false
++}
++
++func (p *profileUDPProducer) retireFlow(i int, u *profileUDPFlow) {
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	if !u.credit {
++		return
++	}
++	clear(u.payload)
++	clear(u.response)
++	u.payload = nil
++	u.response = nil
++	u.credit = false
++	u.retired = true
++	c := p.runtime.flow
++	c.mu.Lock()
++	c.buffered -= profileUDPDownstreamCredit
++	c.mu.Unlock()
++	p.association.mu.Lock()
++	if p.association.flows > 0 {
++		p.association.flows--
++	}
++	p.association.mu.Unlock()
++	p.flows[i] = nil
++	if u.sequence > p.retiredRuntime {
++		p.retiredRuntime = u.sequence
++	}
++}
++
++func (c *profileFlowControl) udpCloseACK(f profilePacket, kind byte, id uint64) error {
++	if c.udpBudget == nil {
++		return nil
++	}
++	for i := 0; i < c.udpBudget.used; i++ {
++		e := &c.udpBudget.entries[i]
++		if e.namespace == 1 && e.runtimeSequence == f.reply && e.closeKind == kind && e.objectID == id {
++			if e.terminal {
++				return errProfile
++			}
++			e.closeStatus = f.body[1]
++			e.terminal = true
++			if e.closeStatus == 1 {
++				c.udpBudget.proofPending--
++				return nil
++			}
++			return errProfile
++		}
++	}
++	return errProfile
++}
++
++// Task credit и registration предшествуют actual mux input goroutine.
++func ProfileBeginLogicalTask(ctx context.Context) (func(error), error) {
++	r := profileReceiptFrom(ctx)
++	if r == nil || r.udp == nil {
++		return func(error) {}, nil
++	}
++	u := r.udp
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	if u.closed || u.ctx.Err() != nil {
++		return nil, errProfile
++	}
++	c := r.control
++	c.mu.Lock()
++	if !c.receiptLive(r) || c.buffered+c.manifest.memoryCredit+4096 > uint64(c.manifest.caps[4]) {
++		c.mu.Unlock()
++		return nil, errProfileFlowBusy
++	}
++	c.buffered += 4096
++	c.mu.Unlock()
++	u.tasks++
++	var once sync.Once
++	return func(e error) {
++		once.Do(func() {
++			u.mu.Lock()
++			defer u.mu.Unlock()
++			u.tasks--
++			if e != nil {
++				u.result = errors.Join(u.result, e)
++			} else {
++				c.mu.Lock()
++				c.buffered -= 4096
++				c.mu.Unlock()
++			}
++			if u.tasks == 0 {
++				u.closed = true
++				u.cancel()
++				if u.done != nil && !u.doneClosed {
++					u.doneClosed = true
++					close(u.done)
++				}
++			}
++		})
++	}, nil
++}
++func profileNumericAddress(v profileDestinationValue) ([]byte, error) {
++	if v.family == 3 || !v.valid() {
++		return nil, ErrProfileUnsupported
++	}
++	a, e := netip.ParseAddr(v.address)
++	if e != nil {
++		return nil, e
++	}
++	return a.AsSlice(), nil
++}
 diff --git a/common/yonikbroker/profile_udp_namespace_linux_test.go b/common/yonikbroker/profile_udp_namespace_linux_test.go
 new file mode 100644
 --- /dev/null
@@ -137,7 +1710,7 @@ diff --git a/common/yonikbroker/profile_udp_os_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_os_linux.go
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,360 @@
 +//go:build linux
 +
 +package nativehooks
@@ -182,6 +1755,7 @@ new file mode 100644
 +
 +// Только consuming duplicate; нет Write/FD getter/Peek/child factory API.
 +type profileOSUDPReceiver struct {
++	namespace       func() error
 +	mu              sync.Mutex
 +	fd              profileProofFD
 +	bound           profileDestinationValue
@@ -189,6 +1763,99 @@ new file mode 100644
 +	closed, reading bool
 +	result          error
 +	readers         sync.WaitGroup
++}
++
++type profileUDPResponseOps struct {
++	validate func() error
++	wait     func(context.Context) error
++	send     func([]byte, [40]byte) (int, error)
++}
++
++var errProfileUDPResponseUncertain = errors.New("profile UDP response effect unknown")
++var errProfileUDPNamespace = errors.New("profile UDP namespace proof unavailable")
++
++// Retry допустим только для доказанного no-effect EAGAIN sentinel.
++func profileSendUDPResponse(ctx context.Context, frame []byte, tuple [40]byte, gate func() error, ops profileUDPResponseOps) error {
++	if ctx == nil || gate == nil || ops.validate == nil || ops.wait == nil || ops.send == nil || len(frame) > 65507 || !profileUDPv2Tuple(tuple, 17) {
++		return errProfile
++	}
++	for {
++		if e := ctx.Err(); e != nil {
++			return e
++		}
++		if e := gate(); e != nil {
++			return e
++		}
++		if e := ops.validate(); e != nil {
++			return errors.Join(errProfileUDPNamespace, e)
++		}
++		n, e := ops.send(frame, tuple)
++		if e == errProfileProofBusy && n == 0 {
++			if e = ops.wait(ctx); e != nil {
++				return e
++			}
++			continue
++		}
++		if n == 0 && (errors.Is(e, context.Canceled) || errors.Is(e, context.DeadlineExceeded) || e == errProfileProofCancelled) {
++			return e
++		}
++		if e != nil || n != len(frame) {
++			return errors.Join(errProfileUDPResponseUncertain, e)
++		}
++		return nil
++	}
++}
++func (r *profileOSUDPReceiver) sendResponse(ctx context.Context, frame []byte, tuple [40]byte, gate func() error) error {
++	r.mu.Lock()
++	if r.closed {
++		r.mu.Unlock()
++		return errProfile
++	}
++	r.readers.Add(1)
++	r.mu.Unlock()
++	defer r.readers.Done()
++	validate := func() error {
++		if r.namespace == nil || r.namespace() != nil {
++			return ErrProfileUnsupported
++		}
++		return r.fd.withFD(r.inspect)
++	}
++	return profileSendUDPResponse(ctx, frame, tuple, gate, profileUDPResponseOps{
++		validate: validate,
++		wait: func(ctx context.Context) error {
++			return r.fd.withFD(func(n int) error {
++				if ctx.Err() != nil {
++					return ctx.Err()
++				}
++				fds := [1]unix.PollFd{{Fd: int32(n), Events: unix.POLLOUT}}
++				_, e := unix.Poll(fds[:], 20)
++				if e != nil || fds[0].Revents & ^int16(unix.POLLOUT) != 0 {
++					return errProfile
++				}
++				return ctx.Err()
++			})
++		},
++		send: func(b []byte, t [40]byte) (size int, err error) {
++			err = r.fd.withFD(func(n int) error {
++				if e := ctx.Err(); e != nil {
++					return e
++				}
++				if gate() != nil {
++					return errProfileProofCancelled
++				}
++				var address [4]byte
++				copy(address[:], t[8:12])
++				var e error
++				size, e = unix.SendmsgN(n, b, nil, &unix.SockaddrInet4{Addr: address, Port: int(u16(t[:], 4))}, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++				if (e == unix.EAGAIN || e == unix.EWOULDBLOCK) && size <= 0 {
++					size = 0
++					return errProfileProofBusy
++				}
++				return e
++			})
++			return
++		},
++	})
 +}
 +
 +func profileInspectUDP(fd profileProofFD, delivery []byte) (profileUDPReceiver, error) {
@@ -861,7 +2528,7 @@ diff --git a/common/yonikbroker/profile_udp_actor_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_actor_linux.go
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,446 @@
 +//go:build linux
 +
 +package nativehooks
@@ -876,6 +2543,7 @@ new file mode 100644
 +// Единственный consumer proof-v2 — существующий runtime monitor. Submit не
 +// выполняет I/O; actor methods вызываются только его goroutine.
 +type profileUDPControlRequest struct {
++	producer                                              *profileUDPProducer
 +	ctx                                                   context.Context
 +	cancel                                                context.CancelFunc
 +	accepted                                              *profileAccepted
@@ -1000,6 +2668,11 @@ new file mode 100644
 +			close(r.done)
 +		}
 +		r.err = a.failed
++		if r.producer != nil && !r.producer.notified {
++			r.producer.result = a.failed
++			r.producer.notified = true
++			close(r.closed)
++		}
 +		if r.phase != 5 {
 +			close(r.closed)
 +		}
@@ -1151,6 +2824,13 @@ new file mode 100644
 +	if e != nil {
 +		return e
 +	}
++	if kind == 5 || kind == 7 || kind == 8 {
++		for _, r := range a.requests {
++			if r != nil && r.producer != nil && r.association != nil && u64(packet.body, 128) == r.association.id {
++				return r.producer.packet(kind, packet.body)
++			}
++		}
++	}
 +	for _, r := range a.requests {
 +		if r == nil {
 +			continue
@@ -1207,6 +2887,13 @@ new file mode 100644
 +				return errProfile
 +			}
 +			r.phase = 2
++			p.flow.mu.Lock()
++			entry := &p.flow.udpBudget.entries[r.slot]
++			if !entry.terminal {
++				entry.terminal = true
++				p.flow.udpBudget.proofPending--
++			}
++			p.flow.mu.Unlock()
 +			return nil
 +		}
 +		if kind == 3 && r.phase == 3 && u64(b, 128) == r.associate && u64(b, 136) == r.control && packet.rights[0] != nil && a.inspect != nil {
@@ -1224,6 +2911,14 @@ new file mode 100644
 +			receiver, inspectError = a.inspect(packet.rights[0], b)
 +			if inspectError != nil || receiver == nil {
 +				return errors.Join(errProfile, inspectError)
++			}
++			if owned, ok := receiver.(*profileOSUDPReceiver); ok {
++				owned.namespace = func() error {
++					p.flow.mu.Lock()
++					control := r.accepted.proof
++					p.flow.mu.Unlock()
++					return profileKernelSocketNamespace(control, owned.fd)
++				}
 +			}
 +			// Ownership передаётся только после exact FD inspection. Constructor
 +			// уже владеет prepaid buffer/history reservation, в том числе при error.
@@ -2233,7 +3928,7 @@ diff --git a/common/yonikbroker/profile_udp_v2_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_v2_linux.go
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,742 @@
 +//go:build linux
 +
 +package nativehooks
@@ -2447,6 +4142,8 @@ new file mode 100644
 +}
 +
 +type profileUDPRetainedOperation struct {
++	closeKind, closeStatus                                                   byte
++	objectID                                                                 uint64
 +	namespace                                                                byte // 1 runtime request, 2 proof operation, 3 issuer close; не wire enum.
 +	terminal                                                                 bool // terminal operation, НЕ доказательство resource KnownClosed.
 +	operation, runtimeSequence, association, packet, permit, control, cookie uint64
@@ -2485,6 +4182,17 @@ new file mode 100644
 +	Close() error
 +	Join() error
 +}
++type profileUDPReceiverCustody struct {
++	profileUDPReceiver
++	once   sync.Once
++	result error
++}
++
++func (r *profileUDPReceiverCustody) Close() error {
++	r.once.Do(func() { r.result = r.profileUDPReceiver.Close() })
++	return r.result
++}
++
 +type profileUDPPhase byte
 +
 +const (
@@ -2501,6 +4209,7 @@ new file mode 100644
 +)
 +
 +type profileUDPAssociation struct {
++	reply                                                     func(context.Context, []byte, [40]byte, func() error) error
 +	mu                                                        sync.Mutex
 +	flow                                                      *profileFlowControl
 +	launch                                                    profileLaunch
@@ -2588,6 +4297,12 @@ new file mode 100644
 +	a.buffers[1] = make([]byte, 65536)
 +	var e error
 +	a.receiver, e = factory()
++	if owned, ok := a.receiver.(*profileOSUDPReceiver); ok {
++		a.reply = owned.sendResponse
++	}
++	if a.receiver != nil {
++		a.receiver = &profileUDPReceiverCustody{profileUDPReceiver: a.receiver}
++	}
 +	c.mu.Lock()
 +	c.udpBudget.proofPending--
 +	c.udpBudget.entries[creationSlot].terminal = true
@@ -2946,6 +4661,12 @@ new file mode 100644
 +	<-c.request.closed
 +	c.actor.mu.Lock()
 +	defer c.actor.mu.Unlock()
++	if p := c.request.producer; p != nil {
++		if p.finished {
++			return p.result
++		}
++		return c.request.err
++	}
 +	// Нет durable-flow retirement counterpart в этом atomic milestone.
 +	// Даже успешный local CloseAndJoin не становится KnownClosed/UCR.
 +	return errors.Join(ErrProfileUnsupported, c.request.err)
@@ -10962,7 +12683,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
  	sessionManager *SessionManager
  	link           transport.Link
  	done           *done.Instance
-@@ -181,6 +282,198 @@
+@@ -181,6 +282,203 @@
  	strategy       ClientStrategy
  }
  
@@ -11079,15 +12800,20 @@ diff --git a/common/mux/client.go b/common/mux/client.go
 +	return s
 +}
 +func (m *ClientWorker) startManagedInput(ctx context.Context, session *Session) bool {
++	logicalDone, e := hooks.ProfileBeginLogicalTask(ctx)
++	if e != nil {
++		return false
++	}
 +	s := m.managed
 +	s.mu.Lock()
 +	if s.closing {
 +		s.mu.Unlock()
++		logicalDone(nil)
 +		return false
 +	}
 +	s.inputs.Add(1)
 +	s.mu.Unlock()
-+	go func() { defer s.inputs.Done(); fetchInput(ctx, session, m.link.Writer) }()
++	go func() { defer logicalDone(nil); defer s.inputs.Done(); fetchInput(ctx, session, m.link.Writer) }()
 +	return true
 +}
 +func (m *ClientWorker) finishManagedCleanup() {
@@ -11161,7 +12887,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
  var (
  	muxCoolAddress = net.DomainAddress("v1.mux.cool")
  	muxCoolPort    = net.Port(9527)
-@@ -188,6 +481,13 @@
+@@ -188,6 +486,13 @@
  
  // NewClientWorker creates a new mux.Client.
  func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
@@ -11175,7 +12901,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
  	c := &ClientWorker{
  		sessionManager: NewSessionManager(),
  		link:           stream,
-@@ -196,8 +496,16 @@
+@@ -196,8 +501,16 @@
  		strategy:       s,
  	}
  
@@ -11194,7 +12920,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
  
  	return c, nil
  }
-@@ -219,8 +527,15 @@
+@@ -219,8 +532,15 @@
  	return m.done.Wait()
  }
  
@@ -11211,7 +12937,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
  }
  
  func (m *ClientWorker) monitor() {
-@@ -231,9 +546,13 @@
+@@ -231,9 +551,13 @@
  		checkCount := m.sessionManager.Count()
  		select {
  		case <-m.done.Wait():
@@ -11228,7 +12954,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
  			return
  		case <-m.timer.C:
  			if m.sessionManager.CloseIfNoSessionAndIdle(checkSize, checkCount) {
-@@ -309,16 +628,41 @@
+@@ -309,16 +633,41 @@
  }
  
  func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool {
@@ -11272,7 +12998,7 @@ diff --git a/common/mux/client.go b/common/mux/client.go
  	if _, ok := link.Reader.(*pipe.Reader); !ok {
  		select {
  		case <-ctx.Done():
-@@ -378,9 +722,7 @@
+@@ -378,9 +727,7 @@
  }
  
  func (m *ClientWorker) fetchOutput() {
@@ -12739,7 +14465,7 @@ diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_hooks_linux.go
-@@ -0,0 +1,841 @@
+@@ -0,0 +1,856 @@
 +//go:build linux
 +
 +package nativehooks
@@ -13578,6 +15304,21 @@ new file mode 100644
 +		return
 +	}
 +	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if g != nil && g.receipt != nil && g.receipt.udp != nil && g.parent == nil {
++		u := g.receipt.udp
++		u.mu.Lock()
++		bound := u.transferred
++		root := u.grant
++		u.mu.Unlock()
++		if !bound || root != g {
++			if e := u.producer.transfer(ctx, g); e != nil {
++				u.cancel()
++				g.receipt.control.mu.Lock()
++				g.receipt.control.closeReceipt(g.receipt)
++				g.receipt.control.mu.Unlock()
++			}
++		}
++	}
 +	link.Reader = &profileFlowReader{ctx, g, link.Reader}
 +	link.Writer = &profileFlowWriter{ctx, g, link.Writer}
 +}
@@ -13585,7 +15326,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,899 @@
+@@ -0,0 +1,995 @@
 +//go:build linux
 +
 +package nativehooks
@@ -13661,6 +15402,8 @@ new file mode 100644
 +}
 +
 +type profileReceipt struct {
++	udp                 *profileUDPFlow
++	openSequence        uint64
 +	control             *profileFlowControl
 +	ctx                 context.Context
 +	cancel              context.CancelFunc
@@ -13695,6 +15438,8 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	denied                                  bool
++	fixedDeadline                           time.Time
 +	udpSlot                                 int
 +	proof                                   uint64
 +	proofSent                               bool
@@ -13711,6 +15456,8 @@ new file mode 100644
 +	cancelled, completed, submitted, queued bool
 +}
 +type profileTombstone struct {
++	association                                              uint64
++	closeStatus                                              byte
 +	sequence, cancelSequence, objectCancelSequence, objectID uint64
 +	deadline                                                 time.Time
 +	kind                                                     uint16
@@ -13749,13 +15496,17 @@ new file mode 100644
 +	return !c.revoked && c.alive != nil && c.alive() && c.clock().Before(c.sessionDeadline) && (c.mode != 2 || c.proofAlive != nil && c.proofAlive())
 +}
 +func (c *profileFlowControl) receiptLive(r *profileReceipt) bool {
-+	return c.live() && r != nil && r.control == c && !r.closed && r.ctx.Err() == nil && (r.association == nil || r.association.ctx.Err() == nil) && c.receipts[r.slot] == r
++	return c.live() && r != nil && r.control == c && !r.closed && r.ctx.Err() == nil && (r.association == nil || r.association.ctx.Err() == nil) && c.receipts[r.slot] == r && (r.udp == nil || r.udp.matched.Load())
 +}
 +func (c *profileFlowControl) grantLive(g *profileGrant) bool {
 +	return g != nil && c.live() && (g.receipt == nil && g.purpose != 0 || c.receiptLive(g.receipt)) && !g.closed && g.ctx.Err() == nil && c.grants[g.slot] == g && c.clock().Before(g.deadline)
 +}
 +
 +func (c *profileFlowControl) operationLive(op *profileOperation) bool {
++	if op.kind == 16 && op.receipt != nil && op.receipt.udp != nil {
++		r := op.receipt
++		return c.live() && !r.closed && r.ctx.Err() == nil && c.receipts[r.slot] == r && r.association != nil && r.association.ctx.Err() == nil
++	}
 +	if op.receipt != nil {
 +		return c.receiptLive(op.receipt)
 +	}
@@ -13778,7 +15529,11 @@ new file mode 100644
 +	if g != nil {
 +		g.pending++
 +	}
-+	return &profileOperation{udpSlot: slot, ctx: ctx, receipt: r, grant: g, kind: kind, object: object, body: body, done: make(chan struct{})}, nil
++	op := &profileOperation{udpSlot: slot, ctx: ctx, receipt: r, grant: g, kind: kind, object: object, body: body, done: make(chan struct{})}
++	if r != nil && r.udp != nil && kind == 18 && object == 0 {
++		op.fixedDeadline = r.udp.deadline
++	}
++	return op, nil
 +}
 +func (c *profileFlowControl) operationAvailable() bool {
 +	if c.udpBudget != nil && (c.udpBudget.used >= int(c.manifest.caps[7]) || c.udpBudget.used >= 256 || c.operations+c.udpBudget.proofPending >= int(c.manifest.caps[3]) || c.operations+c.udpBudget.proofPending >= 64) {
@@ -13980,10 +15735,41 @@ new file mode 100644
 +	}
 +}
 +func (c *profileFlowControl) cancelWire(kind byte, id uint64) (uint64, error) {
++	slot := -1
++	if b := c.udpBudget; b != nil {
++		if b.used >= min(int(c.manifest.caps[7]), 256) || c.operations+b.proofPending >= min(int(c.manifest.caps[3]), 64) {
++			return 0, errProfileFlowBusy
++		}
++		slot = b.used
++		b.entries[slot] = profileUDPRetainedOperation{namespace: 1, closeKind: kind, objectID: id}
++		for _, r := range c.receipts {
++			if r != nil && r.udp != nil && kind == 2 && r.id == id {
++				b.entries[slot].association = r.udp.producer.association.id
++				break
++			}
++		}
++		for _, g := range c.grants {
++			if g != nil && g.receipt != nil && g.receipt.udp != nil && kind == 3 && g.id == id {
++				b.entries[slot].association = g.receipt.udp.producer.association.id
++				break
++			}
++		}
++		for _, op := range c.pending {
++			if op != nil && op.receipt != nil && op.receipt.udp != nil && kind == 1 && op.sequence == id {
++				b.entries[slot].association = op.receipt.udp.producer.association.id
++				break
++			}
++		}
++		b.used++
++		b.proofPending++
++	}
 +	body := make([]byte, 12)
 +	body[0] = kind
 +	be.PutUint64(body[4:], id)
 +	seq, e := c.write(32, 0, body)
++	if slot >= 0 {
++		c.udpBudget.entries[slot].runtimeSequence = seq
++	}
 +	if seq > c.lastSent {
 +		c.lastSent = seq
 +	}
@@ -14018,12 +15804,22 @@ new file mode 100644
 +	for i, t := range c.tombs {
 +		if t.sequence == 0 {
 +			entry := profileTombstone{sequence: op.sequence, deadline: op.deadline.Add(time.Second), kind: op.kind, replied: !cancelled, cancelled: cancelled}
++			if op.receipt != nil && op.receipt.udp != nil {
++				entry.association = op.receipt.udp.producer.association.id
++			}
 +			if cancelled {
 +				seq, e := c.cancel(1, op.sequence)
 +				if e != nil {
 +					return e
 +				}
 +				entry.cancelSequence = seq
++				if c.udpBudget != nil {
++					for j := 0; j < c.udpBudget.used; j++ {
++						if c.udpBudget.entries[j].runtimeSequence == seq {
++							c.udpBudget.entries[j].association = entry.association
++						}
++					}
++				}
 +			}
 +			c.tombs[i] = entry
 +			return nil
@@ -14084,12 +15880,18 @@ new file mode 100644
 +	if deadline, ok := op.ctx.Deadline(); ok && deadline.Before(op.deadline) {
 +		op.deadline = deadline
 +	}
++	if !op.fixedDeadline.IsZero() && op.fixedDeadline.Before(op.deadline) {
++		op.deadline = op.fixedDeadline
++	}
 +	seq, e := c.write(op.kind, op.object, op.body)
 +	if e != nil {
 +		c.finish(op, e)
 +		return e
 +	}
 +	op.sequence = seq
++	if op.kind == 16 {
++		op.receipt.openSequence = seq
++	}
 +	if c.udpBudget != nil && op.udpSlot >= 0 {
 +		c.udpBudget.entries[op.udpSlot].runtimeSequence = seq
 +	}
@@ -14149,6 +15951,24 @@ new file mode 100644
 +		if op == nil || op.sequence != f.reply {
 +			continue
 +		}
++		if f.kind == 22 && op.receipt != nil && op.receipt.udp != nil {
++			// Rust Status::Deny=2 — known refusal; Unknown=3 сохраняет custody.
++			if f.object != 0 || len(f.body) != 8 || f.body[0] != 2 || !zero(f.body[2:]) {
++				return errProfile
++			}
++			c.pending[i] = nil
++			op.denied = true
++			if op.kind == 16 {
++				c.closeReceipt(op.receipt)
++			} else {
++				c.closeGrant(op.grant)
++			}
++			if e := c.tomb(op, false); e != nil {
++				return e
++			}
++			c.finish(op, errProfile)
++			return nil
++		}
 +		expected := uint16(19)
 +		if op.kind == 16 {
 +			expected = 17
@@ -14193,7 +16013,11 @@ new file mode 100644
 +				if !profileCloseACK(f, t.targetKind, t.objectID) {
 +					return errProfile
 +				}
++				if e := c.udpCloseACK(f, t.targetKind, t.objectID); e != nil {
++					return e
++				}
 +				c.tombs[i].replied = true
++				c.tombs[i].closeStatus = f.body[1]
 +				return nil
 +			}
 +			if !t.cancelled || t.replied {
@@ -14209,12 +16033,18 @@ new file mode 100644
 +			if !profileCloseACK(f, 1, t.sequence) {
 +				return errProfile
 +			}
++			if e := c.udpCloseACK(f, 1, t.sequence); e != nil {
++				return e
++			}
 +			c.tombs[i].cancelSequence = 0
 +			return nil
 +		}
 +		if t.objectCancelSequence != 0 && t.objectCancelSequence == f.reply {
 +			if !profileCloseACK(f, t.targetKind, t.objectID) {
 +				return errProfile
++			}
++			if e := c.udpCloseACK(f, t.targetKind, t.objectID); e != nil {
++				return e
 +			}
 +			c.tombs[i].objectCancelSequence = 0
 +			return nil
@@ -14260,6 +16090,13 @@ new file mode 100644
 +		for i, t := range c.tombs {
 +			if t.sequence == f.reply {
 +				c.tombs[i].objectCancelSequence = seq
++				if c.udpBudget != nil {
++					for j := 0; j < c.udpBudget.used; j++ {
++						if c.udpBudget.entries[j].runtimeSequence == seq {
++							c.udpBudget.entries[j].association = t.association
++						}
++					}
++				}
 +				c.tombs[i].targetKind = target
 +				c.tombs[i].objectID = id
 +				c.tombs[i].replied = true
@@ -15413,7 +17250,7 @@ diff --git a/common/yonikbroker/profile_flow_other.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_other.go
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,61 @@
 +//go:build !linux
 +
 +package nativehooks
@@ -15438,6 +17275,10 @@ new file mode 100644
 +	return xnet.Destination{}, ErrProfileUnsupported
 +}
 +func (*ProfileUDPControl) Close() error { return ErrProfileUnsupported }
++func (*ProfileUDPControl) Serve(func(context.Context, xnet.Destination, *transport.Link) error, func() error) error {
++	return ErrProfileUnsupported
++}
++func ProfileBeginLogicalTask(context.Context) (func(error), error) { return func(error) {}, nil }
 +
 +// На этих платформах PrepareProfileLaunch отказывает до создания runtime.
 +// Legacy callers сохраняют поведение и не получают profile authority.
@@ -15718,7 +17559,7 @@ diff --git a/common/yonikbroker/profile_launch_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux.go
-@@ -0,0 +1,720 @@
+@@ -0,0 +1,723 @@
 +//go:build linux
 +
 +package nativehooks
@@ -16146,6 +17987,9 @@ new file mode 100644
 +	var renewRequest uint64
 +	var renewSent, renewDeadline time.Time
 +	for {
++		if p.udpActor != nil && p.udpActor.producerTick() != nil {
++			return
++		}
 +		if p.udpActor != nil && p.udpActor.tick() != nil {
 +			return
 +		}
@@ -17543,7 +19387,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  				Reader: reader,
  				Writer: buf.NewWriter(conn),
  			},
-@@ -166,6 +190,18 @@
+@@ -166,6 +190,25 @@
  	}
  
  	if request.Command == protocol.RequestCommandUDP {
@@ -17554,15 +19398,22 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
 +				}
 +			})
 +			defer stop()
-+			// Issuer relay custody не экспортируется в legacy UDP dispatcher.
-+			// До OPEN/Consumed + private GRANT bridge нет Peek/Receive/forward.
-+			_, e := io.Copy(buf.DiscardBytes, conn)
-+			return goerrors.Join(e, privateUDP.Close())
++			// Private consuming producer использует native routing/handler guards;
++			// relay FD никогда не попадает в legacy packet dispatcher.
++			e := privateUDP.Serve(dispatcher.DispatchLink, func() error {
++				var one [1]byte
++				n, _ := conn.Read(one[:])
++				if n != 0 {
++					return nativehooks.ErrProfileUnsupported
++				}
++				return nil
++			})
++			return e
 +		}
  		if tempUDPConn == nil {
  			return errors.New("UDP associate with listen port failed")
  		}
-@@ -192,6 +228,76 @@
+@@ -192,6 +235,76 @@
  	return nil
  }
  
@@ -17639,7 +19490,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
  	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
  		payload := packet.Payload
-@@ -230,6 +336,7 @@
+@@ -230,6 +343,7 @@
  
  	reader := buf.NewPacketReader(conn)
  	var changeRemote sync.Once
@@ -17647,7 +19498,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  	for {
  		mpayload, err := reader.ReadMultiBuffer()
  		if err != nil {
-@@ -245,7 +352,12 @@
+@@ -245,7 +359,12 @@
  				ctx = session.ContextWithInbound(ctx, inbound)
  				errors.LogInfo(ctx, "client UDP connection from ", inbound.Source)
  			}
@@ -17660,7 +19511,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  
  		for _, payload := range mpayload {
  			request, err := DecodeUDPPacket(payload)
-@@ -262,10 +374,14 @@
+@@ -262,10 +381,14 @@
  
  			destination := request.Destination()
  
@@ -17677,7 +19528,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  					From:   inbound.Source,
  					To:     destination,
  					Status: log.AccessAccepted,
-@@ -275,7 +391,7 @@
+@@ -275,7 +398,7 @@
  
  			payload.UDP = &destination
  

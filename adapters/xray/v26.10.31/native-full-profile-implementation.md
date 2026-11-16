@@ -755,3 +755,60 @@ opaque nonzero MAX и failed FD close retaining Unknown custody. Denial прои
 Existing type/protocol/flags/cookie/loopback/queue/GRO/overflow inspection остаётся.
 OS getter/receiver не исполнялись; runtime/kernel compatibility здесь не PASS.
 Wire, frozen ABI260, capabilities/dependencies и все readiness gates прежние false.
+
+## UDP consuming producer и private duplex response (SOURCE/PURE)
+
+Base `bbaa9896d8f7e9f0ef9972bfd52cdee806b744a8`, включая утверждённый
+контракт обратного SOCKS response. Runtime bootstrap/admission gates закрыты.
+Новых record/selector/ACK нет: d79/a2e десять records и runtime v3 сохраняются.
+
+`proxy/socks/server.go` после verified delivery/success вызывает
+`ProfileUDPControl.Serve(dispatcher.DispatchLink, controlRead)`.
+Single existing monitor вызывает `profileUDPActor.producerTick`; только этот
+actor пишет UPQ/UCM/UCR и читает proof replies. Receive начинается лишь после
+exact URP, через прежний exclusive `ConsumePermit`. Actual UDP tuple, original
+SOCKS bytes/fingerprint/cookie остаются immutable. `openConsumed` создаёт private
+provenance3 receipt и OPEN, связывая его sequence с UCM. Оба порядка OPEN/Match
+разрешены; AUTHORIZE невозможен до обоих подтверждений. Match не является GRANT.
+
+Настоящий `dispatcher.DispatchLink` выбирает native handler/branch, existing
+`ProfileAuthorizeHandler` и `ProfilePrepareChain` получают class1 logical bundle.
+`ProfileGuardLink` только после полного bundle передаёт request в отдельную
+credited downstream copy. Numeric effective UDP endpoint обязателен. Затем новый
+Peek допустим, но response buffer прежнего flow остаётся отдельно retained.
+Hostname/child resolver answer/Probe/DNS grant не создают user authority.
+
+Private response writer привязан к тому же receipt, bundle/revision и checked
+numeric target. `payload.UDP` обязан совпасть с target. SOCKS FRAG0 кодируется
+внутри sink; actual recipient — UDP initiator tuple receipt, никогда TCP tuple.
+OS wrapper использует nonblocking send на том же retained duplicate и повторяет
+namespace/type/cookie/queue checks и logical grant gate перед syscall/writable
+retry. Только EAGAIN с нулём bytes повторяется; partial/uncertain send сохраняет
+Unknown custody. FD/WriteTo/адресный API не экспортируются.
+
+До allocation резервируются producer8192 и downstream237568 bytes на flow
+(request/response/sniffer buffers и overhead) в общем8MiB budget; mux logical
+input task дополнительно4096 до goroutine. Flow count и retained runtime/proof
+history ограничены прежним общим cap≤256. Slot/ID не переиспользуются и не evict.
+Новый Peek не освобождает response/task credits. Это конечная capacity,
+не long-lived readiness. Managed mux constructor/monitor cleanup и R9 H1/broker
+semantics сохранены; добавлена только registration per-logical input task.
+
+Close запрещает новые sends, отменяет собственные receipts/tasks, закрывает
+actual duplicate и ждёт receive/control/downstream/send joins. Runtime cancel
+entries сохраняют association ID и typed Known ACK в общем retained ledger.
+UCR statusKnown+joined публикуется только после durable UCQ, всех собственных
+runtime cancellation ACK, actual CloseAndJoin и отсутствия cleanup error.
+Late Permit после cancel только фиксирует monotonic history без Receive/OPEN;
+late Match не публикует authority. Unknown ACK/error/revoke/uncertain cleanup
+не освобождают custody и не превращаются в KnownClosed при повторном Close.
+Child UCR не заменяет Rust supervisor/worker/rules fences.
+
+Pure controls используют реальные broker/runtime/handler guards с fake issuer,
+receiver и dispatch link: оба OPEN/Match порядка, pre-match/pre-grant refusal,
+две разные UDP initiator ports, foreign receipt/tuple/cookie/revision/endpoint,
+expired owner refresh→Unknown, late grant/cancel/typed denial, read mismatch,
+history exhaustion, delayed send blocking KnownClosed, uncertain send и
+logical task joins. OS wrappers и main не исполнялись. Producer/consumer
+counterpart SOURCE review и интеграция остаются обязательны перед opening gates.
+DNS outer два файла, provider cache/resolver-peer provenance не изменены.
