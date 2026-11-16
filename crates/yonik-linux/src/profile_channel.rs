@@ -10,6 +10,542 @@ pub(crate) const LAUNCH_FD_LOCATOR: &str = "YONIK_PROFILE_LAUNCH_FD";
 pub(crate) const PEER_PIDFD_LOCATOR: &str = "YONIK_PROFILE_PEER_PIDFD";
 pub(crate) const ASSET_ROOT_FD_LOCATOR: &str = "YONIK_PROFILE_ASSET_ROOT_FD";
 
+/// Private proof v2 DATA codec. Сам по себе не создаёт admission/FlowGrant.
+pub(crate) mod udp_v2 {
+    use super::{
+        Error, LaunchRecord, Reader, Result, Tuple, Writer, boolean, extension_ack, put16, put32,
+        put64,
+    };
+    use sha2::{Digest, Sha256};
+    pub(crate) const MAX_DATAGRAM: usize = 65507;
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Packet {
+        pub association: u64,
+        pub packet: u64,
+        pub permit: u64,
+        pub cookie: u64,
+        pub tuple: Tuple,
+        pub bytes: u32,
+        pub header: u16,
+        pub flags: u16,
+        pub fingerprint: [u8; 32],
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Record {
+        Control {
+            operation: u64,
+            proof: u64,
+            ingress: u16,
+            tuple: Tuple,
+        },
+        ControlAck {
+            operation: u64,
+            control: u64,
+            cookie: u64,
+            remaining: u64,
+        },
+        Associate {
+            operation: u64,
+            control: u64,
+            cookie: u64,
+        },
+        Associated {
+            operation: u64,
+            control: u64,
+            association: u64,
+            cookie: u64,
+            port: u16,
+        },
+        Peek {
+            association: u64,
+            operation: u64,
+            control: u64,
+        },
+        Permit {
+            packet: Packet,
+            remaining: u64,
+        },
+        Consumed {
+            packet: Packet,
+            sequence: u64,
+        },
+        Matched {
+            association: u64,
+            packet: u64,
+            permit: u64,
+            sequence: u64,
+            status: u8,
+            remaining: u64,
+        },
+        Close {
+            association: u64,
+            close: u64,
+            control: u64,
+            reason: u16,
+        },
+        Closed {
+            association: u64,
+            close: u64,
+            last_packet: u64,
+            pending: u32,
+            status: u8,
+            joined: bool,
+            duplicates: u16,
+            cookie: u64,
+            retired: u64,
+        },
+    }
+    pub(crate) struct Encoded {
+        pub bytes: [u8; 256],
+        pub length: usize,
+        pub rights: usize,
+        pub from_go: bool,
+    }
+    fn id(n: u64) -> Result<()> {
+        if n == 0 || n == u64::MAX {
+            Err(Error::Bounds)
+        } else {
+            Ok(())
+        }
+    }
+    fn nz(n: u64) -> Result<()> {
+        if n == 0 { Err(Error::Bounds) } else { Ok(()) }
+    }
+    fn lease(n: u64) -> Result<()> {
+        if n == 0 || n > 1_000_000_000 {
+            Err(Error::Bounds)
+        } else {
+            Ok(())
+        }
+    }
+    fn u16_at(b: &[u8], p: usize) -> u16 {
+        u16::from_be_bytes([b[p], b[p + 1]])
+    }
+    fn u32_at(b: &[u8], p: usize) -> u32 {
+        // Private fixed offsets после exact-size preflight.
+        u32::from_be_bytes([b[p], b[p + 1], b[p + 2], b[p + 3]])
+    }
+    fn u64_at(b: &[u8], p: usize) -> u64 {
+        u64::from_be_bytes([
+            b[p],
+            b[p + 1],
+            b[p + 2],
+            b[p + 3],
+            b[p + 4],
+            b[p + 5],
+            b[p + 6],
+            b[p + 7],
+        ])
+    }
+    pub(crate) fn bootstrap(launch: LaunchRecord) -> Result<[u8; 128]> {
+        let raw = launch.encode()?;
+        let mut out = [0; 128];
+        out[..8].copy_from_slice(b"YNKPF002");
+        put16(&mut out, 8, 2);
+        put16(&mut out, 10, 128);
+        put16(&mut out, 12, 1);
+        out[16..].copy_from_slice(&raw[16..128]);
+        Ok(out)
+    }
+    pub(crate) fn bootstrap_ack(launch: LaunchRecord) -> Result<[u8; 40]> {
+        extension_ack(b"YNKPFA02", &bootstrap(launch)?)
+    }
+    impl Packet {
+        fn validate(self) -> Result<()> {
+            for n in [self.association, self.packet, self.permit] {
+                id(n)?;
+            }
+            nz(self.cookie)?;
+            self.tuple.owner_flow()?;
+            if self.tuple.protocol != 17
+                || self.tuple.family != 4
+                || self.tuple.remote[..4] != [127, 0, 0, 1]
+                || self.bytes as usize > MAX_DATAGRAM
+                || self.header as u32 > self.bytes
+                || !(8..=260).contains(&self.header)
+                || self.flags != 0
+                || self.fingerprint == [0; 32]
+            {
+                return Err(Error::Schema);
+            }
+            Ok(())
+        }
+        fn write(self, out: &mut [u8; 256]) -> Result<()> {
+            self.validate()?;
+            for (offset, n) in [
+                (128, self.association),
+                (136, self.packet),
+                (144, self.permit),
+                (152, self.cookie),
+            ] {
+                put64(out, offset, n);
+            }
+            self.tuple.write(&mut Writer {
+                bytes: &mut out[160..200],
+                position: 0,
+            })?;
+            put32(out, 200, self.bytes);
+            put16(out, 204, self.header);
+            put16(out, 206, self.flags);
+            out[208..240].copy_from_slice(&self.fingerprint);
+            Ok(())
+        }
+        fn read(b: &[u8]) -> Result<Self> {
+            Ok(Self {
+                association: u64_at(b, 128),
+                packet: u64_at(b, 136),
+                permit: u64_at(b, 144),
+                cookie: u64_at(b, 152),
+                tuple: Tuple::read(&mut Reader::new(&b[160..200]))?,
+                bytes: u32_at(b, 200),
+                header: u16_at(b, 204),
+                flags: u16_at(b, 206),
+                fingerprint: b[208..240].try_into().map_err(|_| Error::Bounds)?,
+            })
+        }
+    }
+    impl Record {
+        pub(crate) fn encode(self, launch: LaunchRecord) -> Result<Encoded> {
+            launch.encode()?;
+            let (magic, length, rights, from_go) = match self {
+                Self::Control { .. } => (b"YNKUCS01", 192, 1, true),
+                Self::ControlAck { .. } => (b"YNKUCA01", 160, 0, false),
+                Self::Associate { .. } => (b"YNKUAQ01", 160, 0, true),
+                Self::Associated { .. } => (b"YNKUAC01", 192, 1, false),
+                Self::Peek { .. } => (b"YNKUPQ01", 160, 0, true),
+                Self::Permit { .. } => (b"YNKURP01", 256, 0, false),
+                Self::Consumed { .. } => (b"YNKUCM01", 256, 0, true),
+                Self::Matched { .. } => (b"YNKUMR01", 192, 0, false),
+                Self::Close { .. } => (b"YNKUCQ01", 160, 0, false),
+                Self::Closed { .. } => (b"YNKUCR01", 192, 0, true),
+            };
+            let mut out = [0; 256];
+            out[..8].copy_from_slice(magic);
+            put16(&mut out, 8, 1);
+            put16(&mut out, 10, length as u16);
+            put16(&mut out, 12, rights as u16);
+            let b = launch.binding;
+            out[16..48].copy_from_slice(&b.digest);
+            out[48..64].copy_from_slice(&b.session);
+            out[64..80].copy_from_slice(&b.invocation);
+            put64(&mut out, 80, b.generation);
+            put64(&mut out, 88, b.epoch);
+            out[96..128].copy_from_slice(&launch.nonce);
+            match self {
+                Self::Control {
+                    operation,
+                    proof,
+                    ingress,
+                    tuple,
+                } => {
+                    id(operation)?;
+                    id(proof)?;
+                    tuple.owner_flow()?;
+                    if ingress >= 4
+                        || tuple.protocol != 6
+                        || tuple.family != 4
+                        || tuple.remote[..4] != [127, 0, 0, 1]
+                    {
+                        return Err(Error::Schema);
+                    }
+                    put64(&mut out, 128, operation);
+                    put64(&mut out, 136, proof);
+                    put16(&mut out, 144, ingress);
+                    out[146] = 3;
+                    tuple.write(&mut Writer {
+                        bytes: &mut out[148..188],
+                        position: 0,
+                    })?;
+                }
+                Self::ControlAck {
+                    operation,
+                    control,
+                    cookie,
+                    remaining,
+                } => {
+                    id(operation)?;
+                    id(control)?;
+                    nz(cookie)?;
+                    lease(remaining)?;
+                    put64(&mut out, 128, operation);
+                    put64(&mut out, 136, control);
+                    put64(&mut out, 144, cookie);
+                    put64(&mut out, 152, remaining);
+                }
+                Self::Associate {
+                    operation,
+                    control,
+                    cookie,
+                } => {
+                    id(operation)?;
+                    id(control)?;
+                    nz(cookie)?;
+                    put64(&mut out, 128, operation);
+                    put64(&mut out, 136, control);
+                    put64(&mut out, 144, cookie);
+                }
+                Self::Associated {
+                    operation,
+                    control,
+                    association,
+                    cookie,
+                    port,
+                } => {
+                    for n in [operation, control, association] {
+                        id(n)?;
+                    }
+                    nz(cookie)?;
+                    if port == 0 {
+                        return Err(Error::Bounds);
+                    }
+                    put64(&mut out, 128, operation);
+                    put64(&mut out, 136, control);
+                    put64(&mut out, 144, association);
+                    put64(&mut out, 152, cookie);
+                    out[160] = 4;
+                    out[161] = 17;
+                    put16(&mut out, 164, port);
+                    out[168..172].copy_from_slice(&[127, 0, 0, 1]);
+                }
+                Self::Peek {
+                    association,
+                    operation,
+                    control,
+                } => {
+                    for n in [association, operation, control] {
+                        id(n)?;
+                    }
+                    put64(&mut out, 128, association);
+                    put64(&mut out, 136, operation);
+                    put64(&mut out, 144, control);
+                }
+                Self::Permit { packet, remaining } => {
+                    packet.write(&mut out)?;
+                    lease(remaining)?;
+                    put64(&mut out, 240, remaining);
+                }
+                Self::Consumed { packet, sequence } => {
+                    packet.write(&mut out)?;
+                    id(sequence)?;
+                    put64(&mut out, 240, sequence);
+                }
+                Self::Matched {
+                    association,
+                    packet,
+                    permit,
+                    sequence,
+                    status,
+                    remaining,
+                } => {
+                    for n in [association, packet, permit, sequence] {
+                        id(n)?;
+                    }
+                    if !(1..=3).contains(&status)
+                        || remaining > 1_000_000_000
+                        || status == 1 && remaining == 0
+                    {
+                        return Err(Error::Schema);
+                    }
+                    put64(&mut out, 128, association);
+                    put64(&mut out, 136, packet);
+                    put64(&mut out, 144, permit);
+                    put64(&mut out, 152, sequence);
+                    out[160] = status;
+                    put64(&mut out, 168, remaining);
+                }
+                Self::Close {
+                    association,
+                    close,
+                    control,
+                    reason,
+                } => {
+                    for n in [association, close, control] {
+                        id(n)?;
+                    }
+                    put64(&mut out, 128, association);
+                    put64(&mut out, 136, close);
+                    put64(&mut out, 144, control);
+                    put16(&mut out, 152, reason);
+                }
+                Self::Closed {
+                    association,
+                    close,
+                    last_packet,
+                    pending,
+                    status,
+                    joined,
+                    duplicates,
+                    cookie,
+                    retired,
+                } => {
+                    id(association)?;
+                    id(close)?;
+                    nz(cookie)?;
+                    if last_packet == u64::MAX
+                        || retired == u64::MAX
+                        || pending > 256
+                        || duplicates > 1
+                        || ![1, 3].contains(&status)
+                        || status == 1 && (pending != 0 || !joined || duplicates != 0)
+                    {
+                        return Err(Error::Schema);
+                    }
+                    put64(&mut out, 128, association);
+                    put64(&mut out, 136, close);
+                    put64(&mut out, 144, last_packet);
+                    put32(&mut out, 152, pending);
+                    out[156] = status;
+                    out[157] = u8::from(joined);
+                    put16(&mut out, 158, duplicates);
+                    put64(&mut out, 160, cookie);
+                    put64(&mut out, 168, retired);
+                }
+            }
+            Ok(Encoded {
+                bytes: out,
+                length,
+                rights,
+                from_go,
+            })
+        }
+        pub(crate) fn decode(
+            bytes: &[u8],
+            launch: LaunchRecord,
+            from_go: bool,
+            rights: usize,
+        ) -> Result<Self> {
+            // Length/direction/rights preflight перед разбором fields/материализацией.
+            if !(128..=256).contains(&bytes.len()) {
+                return Err(Error::Bounds);
+            }
+            let (length, required, toward) = match &bytes[..8] {
+                b"YNKUCS01" => (192, 1, true),
+                b"YNKUCA01" => (160, 0, false),
+                b"YNKUAQ01" => (160, 0, true),
+                b"YNKUAC01" => (192, 1, false),
+                b"YNKUPQ01" => (160, 0, true),
+                b"YNKURP01" => (256, 0, false),
+                b"YNKUCM01" => (256, 0, true),
+                b"YNKUMR01" => (192, 0, false),
+                b"YNKUCQ01" => (160, 0, false),
+                b"YNKUCR01" => (192, 0, true),
+                _ => return Err(Error::Schema),
+            };
+            if bytes.len() != length || rights != required || from_go != toward {
+                return Err(Error::Bounds);
+            }
+            let a = u64_at(bytes, 128);
+            let b = u64_at(bytes, 136);
+            let c = u64_at(bytes, 144);
+            let record = match &bytes[..8] {
+                b"YNKUCS01" => Self::Control {
+                    operation: a,
+                    proof: b,
+                    ingress: u16_at(bytes, 144),
+                    tuple: Tuple::read(&mut Reader::new(&bytes[148..188]))?,
+                },
+                b"YNKUCA01" => Self::ControlAck {
+                    operation: a,
+                    control: b,
+                    cookie: c,
+                    remaining: u64_at(bytes, 152),
+                },
+                b"YNKUAQ01" => Self::Associate {
+                    operation: a,
+                    control: b,
+                    cookie: c,
+                },
+                b"YNKUAC01" => Self::Associated {
+                    operation: a,
+                    control: b,
+                    association: c,
+                    cookie: u64_at(bytes, 152),
+                    port: u16_at(bytes, 164),
+                },
+                b"YNKUPQ01" => Self::Peek {
+                    association: a,
+                    operation: b,
+                    control: c,
+                },
+                b"YNKURP01" => Self::Permit {
+                    packet: Packet::read(bytes)?,
+                    remaining: u64_at(bytes, 240),
+                },
+                b"YNKUCM01" => Self::Consumed {
+                    packet: Packet::read(bytes)?,
+                    sequence: u64_at(bytes, 240),
+                },
+                b"YNKUMR01" => Self::Matched {
+                    association: a,
+                    packet: b,
+                    permit: c,
+                    sequence: u64_at(bytes, 152),
+                    status: bytes[160],
+                    remaining: u64_at(bytes, 168),
+                },
+                b"YNKUCQ01" => Self::Close {
+                    association: a,
+                    close: b,
+                    control: c,
+                    reason: u16_at(bytes, 152),
+                },
+                b"YNKUCR01" => Self::Closed {
+                    association: a,
+                    close: b,
+                    last_packet: c,
+                    pending: u32_at(bytes, 152),
+                    status: bytes[156],
+                    joined: boolean(bytes[157])?,
+                    duplicates: u16_at(bytes, 158),
+                    cookie: u64_at(bytes, 160),
+                    retired: u64_at(bytes, 168),
+                },
+                _ => return Err(Error::Schema),
+            };
+            let encoded = record.encode(launch)?;
+            if bytes != &encoded.bytes[..encoded.length] {
+                return Err(Error::Binding);
+            }
+            Ok(record)
+        }
+    }
+    pub(crate) fn fingerprint(
+        launch: LaunchRecord,
+        packet: Packet,
+        payload: &[u8],
+    ) -> Result<[u8; 32]> {
+        if payload.len() != packet.bytes as usize || payload.len() > MAX_DATAGRAM {
+            return Err(Error::Bounds);
+        }
+        let mut h = Sha256::new();
+        h.update(b"YNK-UDP-PACKET-v1\0");
+        let b = launch.binding;
+        h.update(b.digest);
+        h.update(b.session);
+        h.update(b.invocation);
+        h.update(b.generation.to_be_bytes());
+        h.update(b.epoch.to_be_bytes());
+        h.update(launch.nonce);
+        for n in [
+            packet.association,
+            packet.packet,
+            packet.permit,
+            packet.cookie,
+        ] {
+            h.update(n.to_be_bytes());
+        }
+        let mut tuple = [0; 40];
+        packet.tuple.write(&mut Writer {
+            bytes: &mut tuple,
+            position: 0,
+        })?;
+        h.update(tuple);
+        h.update(packet.bytes.to_be_bytes());
+        h.update(payload);
+        Ok(h.finalize().into())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ExecDelivery {
     pub launch: LaunchRecord,
@@ -1297,6 +1833,20 @@ pub(crate) struct ResolverScope<'a> {
     pub scope: Option<(u16, u8)>,
 }
 impl<'a> Capsule<'a> {
+    pub(crate) fn validate_udp_control(&self, index: u16, tuple: Tuple) -> Result<()> {
+        let row = self.tables[6].row(index)?;
+        if row[0] != 2
+            || row[1] & 1 == 0
+            || tuple.protocol != 6
+            || tuple.family != 4
+            || tuple.remote[..4] != [127, 0, 0, 1]
+            || tuple.remote_port != u16::from_be_bytes([row[2], row[3]])
+        {
+            return Err(Error::Reference);
+        }
+        tuple.owner_flow()?;
+        Ok(())
+    }
     pub(crate) fn subject_scope(&self, index: u16, protocol: u8) -> Result<(u16, u8)> {
         let subject = subject(self.tables[0].row(index)?)?;
         let index = match protocol {
@@ -3079,6 +3629,63 @@ impl Sequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn udp_v2_independent_exact_vectors_and_preflight() {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/udp-proof-v2.json"
+        ))
+        .unwrap();
+        let launch =
+            LaunchRecord::decode(&unhex(f["launch_hex"].as_str().unwrap()), Mode::System).unwrap();
+        assert_eq!(
+            udp_v2::bootstrap(launch).unwrap().as_slice(),
+            unhex(f["bootstrap_hex"].as_str().unwrap())
+        );
+        assert_eq!(
+            udp_v2::bootstrap_ack(launch).unwrap().as_slice(),
+            unhex(f["ack_hex"].as_str().unwrap())
+        );
+        assert_ne!(
+            udp_v2::bootstrap_ack(launch).unwrap(),
+            proof_bootstrap_ack(launch).unwrap()
+        );
+        for vector in f["vectors"].as_array().unwrap() {
+            let raw = unhex(vector["hex"].as_str().unwrap());
+            let rights = vector["rights"].as_u64().unwrap() as usize;
+            let from_go = vector["from_go"].as_bool().unwrap();
+            let record = udp_v2::Record::decode(&raw, launch, from_go, rights).unwrap();
+            let encoded = record.encode(launch).unwrap();
+            assert_eq!(&encoded.bytes[..encoded.length], raw);
+            assert_eq!(encoded.rights, rights);
+            assert_eq!(encoded.from_go, from_go);
+            for n in 0..raw.len() {
+                assert!(udp_v2::Record::decode(&raw[..n], launch, from_go, rights).is_err());
+            }
+            for offset in [8, 10, 12, 14, 16, 48, 64, 80, 88, 96] {
+                let mut bad = raw.clone();
+                bad[offset] ^= 128;
+                assert!(udp_v2::Record::decode(&bad, launch, from_go, rights).is_err());
+            }
+            assert!(udp_v2::Record::decode(&raw, launch, !from_go, rights).is_err());
+            assert!(udp_v2::Record::decode(&raw, launch, from_go, rights + 1).is_err());
+            if let udp_v2::Record::Permit { packet, .. } = record {
+                let payload = unhex(f["payload_hex"].as_str().unwrap());
+                assert_eq!(
+                    udp_v2::fingerprint(launch, packet, &payload).unwrap(),
+                    packet.fingerprint
+                );
+                let mut changed = payload.clone();
+                changed[10] ^= 1;
+                assert_ne!(
+                    udp_v2::fingerprint(launch, packet, &changed).unwrap(),
+                    packet.fingerprint
+                );
+                assert!(
+                    udp_v2::fingerprint(launch, packet, &payload[..payload.len() - 1]).is_err()
+                );
+            }
+        }
+    }
     #[test]
     fn r14_system_user_dns_grant_preserves_attribution_and_exact_pending_vectors() {
         let f: serde_json::Value = serde_json::from_str(include_str!(

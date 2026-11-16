@@ -48,6 +48,201 @@ impl Ops<BorrowedFd<'_>> for Kernel {
 pub fn socket_namespace(socket: impl AsFd) -> io::Result<OwnedFd> {
     checked(&Kernel, &socket.as_fd())
 }
+
+/// Только fixed IPv4 UDP profile socket; не general setsockopt/recvmsg API.
+pub struct UdpPeek {
+    pub bytes: usize,
+    pub address: [u8; 4],
+    pub port: u16,
+    pub flags: u16,
+    pub overflow: u32,
+}
+pub fn prepare_profile_udp(socket: impl AsFd) -> io::Result<()> {
+    udp_raw::prepare(socket.as_fd())
+}
+pub fn inspect_profile_udp(socket: impl AsFd) -> io::Result<()> {
+    udp_raw::inspect(socket.as_fd())
+}
+pub fn peek_profile_udp(
+    socket: impl AsFd,
+    buffer: &mut [u8; 65536],
+) -> io::Result<Option<UdpPeek>> {
+    udp_raw::peek(socket.as_fd(), buffer)
+}
+fn udp_ancillary(bytes: &[u8]) -> io::Result<u32> {
+    let width = std::mem::size_of::<usize>();
+    let header = width + 8;
+    let mut offset = 0;
+    let mut found = None;
+    while offset < bytes.len() {
+        let rest = &bytes[offset..];
+        if rest.len() < header {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let mut native = [0; std::mem::size_of::<usize>()];
+        native.copy_from_slice(&rest[..width]);
+        let length = usize::from_ne_bytes(native);
+        let mut number = [0; 4];
+        number.copy_from_slice(&rest[width..width + 4]);
+        let level = i32::from_ne_bytes(number);
+        number.copy_from_slice(&rest[width + 4..header]);
+        let kind = i32::from_ne_bytes(number);
+        if length != header + 4
+            || length > rest.len()
+            || level != libc::SOL_SOCKET
+            || kind != libc::SO_RXQ_OVFL
+            || found.is_some()
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        number.copy_from_slice(&rest[header..length]);
+        found = Some(u32::from_ne_bytes(number));
+        let end = offset + length;
+        if end == bytes.len() {
+            break;
+        }
+        offset = (end + width - 1) & !(width - 1);
+        if offset > bytes.len() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+    }
+    Ok(found.unwrap_or(0))
+}
+#[allow(unsafe_code)]
+mod udp_raw {
+    use super::{UdpPeek, io, udp_ancillary};
+    use std::os::fd::{AsRawFd, BorrowedFd};
+    fn option(fd: BorrowedFd<'_>, level: i32, name: i32) -> io::Result<i32> {
+        let mut value = 0i32;
+        let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+        // SAFETY: fixed int option, writable int/length живут до возврата syscall.
+        let result = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                level,
+                name,
+                (&mut value as *mut i32).cast(),
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if length as usize != std::mem::size_of::<i32>() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(value)
+    }
+    fn set(fd: BorrowedFd<'_>, level: i32, name: i32, value: i32) -> io::Result<()> {
+        // SAFETY: private fixed options, readonly int; generic API не экспортируется.
+        if unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                level,
+                name,
+                (&value as *const i32).cast(),
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    fn socket(fd: BorrowedFd<'_>) -> io::Result<()> {
+        if option(fd, libc::SOL_SOCKET, libc::SO_TYPE)? != libc::SOCK_DGRAM
+            || option(fd, libc::SOL_SOCKET, libc::SO_DOMAIN)? != libc::AF_INET
+            || option(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL)? != libc::IPPROTO_UDP
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(())
+    }
+    pub(super) fn prepare(fd: BorrowedFd<'_>) -> io::Result<()> {
+        socket(fd)?;
+        set(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, 65536)?;
+        set(fd, libc::SOL_SOCKET, libc::SO_RXQ_OVFL, 1)?;
+        set(fd, libc::IPPROTO_UDP, libc::UDP_GRO, 0)?;
+        inspect(fd)
+    }
+    pub(super) fn inspect(fd: BorrowedFd<'_>) -> io::Result<()> {
+        socket(fd)?;
+        if !(65536..=131072).contains(&option(fd, libc::SOL_SOCKET, libc::SO_RCVBUF)?)
+            || option(fd, libc::SOL_SOCKET, libc::SO_RXQ_OVFL)? != 1
+            || option(fd, libc::IPPROTO_UDP, libc::UDP_GRO)? != 0
+        {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        Ok(())
+    }
+    pub(super) fn peek(
+        fd: BorrowedFd<'_>,
+        buffer: &mut [u8; 65536],
+    ) -> io::Result<Option<UdpPeek>> {
+        inspect(fd)?;
+        let mut address = libc::sockaddr_in {
+            sin_family: 0,
+            sin_port: 0,
+            sin_addr: libc::in_addr { s_addr: 0 },
+            sin_zero: [0; 8],
+        };
+        let mut ancillary = [0usize; 16];
+        let mut iov = libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: buffer.len(),
+        };
+        // SAFETY: zero — корректное начальное состояние msghdr; все используемые
+        // pointers/lengths устанавливаются ниже и живут до завершения syscall.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_name = (&mut address as *mut libc::sockaddr_in).cast();
+        message.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = ancillary.as_mut_ptr().cast();
+        message.msg_controllen = std::mem::size_of_val(&ancillary);
+        // SAFETY: fixed IPv4 UDP-only peek, valid bounded buffers, no FD reception
+        // (SCM_RIGHTS существует только для AF_UNIX, который socket() отвергает).
+        let count = unsafe {
+            libc::recvmsg(
+                fd.as_raw_fd(),
+                &mut message,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+            )
+        };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            return if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        if message.msg_namelen as usize != std::mem::size_of::<libc::sockaddr_in>()
+            || address.sin_family as i32 != libc::AF_INET
+            || message.msg_controllen > std::mem::size_of_val(&ancillary)
+            || message.msg_flags & !(libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // SAFETY: kernel-written initialized ancillary bytes внутри aligned array;
+        // length отдельно проверена. Parser не следует pointers из control data.
+        let control = unsafe {
+            std::slice::from_raw_parts(ancillary.as_ptr().cast::<u8>(), message.msg_controllen)
+        };
+        let overflow = udp_ancillary(control)?;
+        Ok(Some(UdpPeek {
+            bytes: count as usize,
+            address: address.sin_addr.s_addr.to_ne_bytes(),
+            port: u16::from_be(address.sin_port),
+            flags: u16::from(message.msg_flags & libc::MSG_TRUNC != 0)
+                | (u16::from(message.msg_flags & libc::MSG_CTRUNC != 0) << 1),
+            overflow,
+        }))
+    }
+}
 #[allow(unsafe_code)]
 mod raw {
     use rustix::ioctl::{Ioctl, IoctlOutput, Opcode};
@@ -82,6 +277,27 @@ mod raw {
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+    #[test]
+    fn udp_v2_ancillary_whitelist_bounds_duplicates_and_overflow() {
+        assert_eq!(udp_ancillary(&[]).unwrap(), 0);
+        let width = std::mem::size_of::<usize>();
+        let header = width + 8;
+        let mut c = (header + 4).to_ne_bytes().to_vec();
+        c.extend_from_slice(&libc::SOL_SOCKET.to_ne_bytes());
+        c.extend_from_slice(&libc::SO_RXQ_OVFL.to_ne_bytes());
+        c.extend_from_slice(&3u32.to_ne_bytes());
+        assert_eq!(udp_ancillary(&c).unwrap(), 3);
+        for n in 1..c.len() {
+            assert!(udp_ancillary(&c[..n]).is_err());
+        }
+        let mut bad = c.clone();
+        bad[width + 4] ^= 1;
+        assert!(udp_ancillary(&bad).is_err());
+        let mut twice = c.clone();
+        twice.resize((c.len() + width - 1) & !(width - 1), 0);
+        twice.extend_from_slice(&c);
+        assert!(udp_ancillary(&twice).is_err());
+    }
     struct Handle(Rc<Cell<usize>>);
     impl Drop for Handle {
         fn drop(&mut self) {

@@ -210,6 +210,1076 @@ struct SourceFlow<I> {
     root: Option<(u16, Target)>,
     request: u64,
 }
+/// Общая bounded история v2. Runtime/proof IDs никогда не alias друг друга.
+struct InvocationHistory {
+    entries: [Option<(u8, u64)>; 256],
+    len: usize,
+    limit: usize,
+    last_operation: u64,
+    next_source: u64,
+    _credit: super::memory::ByteLease,
+}
+struct UdpControl<C> {
+    value: C,
+    tuple: Tuple,
+    cookie: u64,
+    principal: Option<Subject>,
+    association: Option<u64>,
+    _credit: super::memory::ByteLease,
+}
+struct UdpRelay<R> {
+    value: R,
+    control: u64,
+    cookie: u64,
+    port: u16,
+    cycle: Option<UdpCycle>,
+    buffer: Box<[u8; 65536]>,
+    closing: Option<u64>,
+    close_deadline: Option<Instant>,
+    reserved_close: u64,
+    last_packet: u64,
+    flows: BTreeMap<u64, super::memory::ByteLease>,
+    _credit: super::memory::ByteLease,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UdpStage {
+    Waiting,
+    Permitted,
+    Matched,
+    Granted,
+}
+struct UdpCycle {
+    packet: wire::udp_v2::Packet,
+    original: Option<Target>,
+    sequence: u64,
+    source: u64,
+    grant: u64,
+    stage: UdpStage,
+    deadline: Instant,
+}
+struct KernelDatagram {
+    peer: SocketAddr,
+    bytes: usize,
+    flags: u16,
+}
+trait UdpOperations {
+    type Control;
+    type Relay;
+    type Transfer;
+    fn ready(&self) -> Result<(), ServiceError>;
+    fn fence(&self) -> Result<(), ServiceError>;
+    fn control(
+        &mut self,
+        fd: Self::Transfer,
+        tuple: Tuple,
+        ingress: u16,
+        source: u64,
+    ) -> Result<(Self::Control, u64, Option<Subject>), ServiceError>;
+    fn alive(&self, control: &Self::Control) -> Result<(), ServiceError>;
+    fn relay(&mut self, control: &Self::Control) -> Result<(Self::Relay, u64, u16), ServiceError>;
+    fn duplicate(&mut self, relay: &Self::Relay) -> Result<Self::Transfer, ServiceError>;
+    fn peek(
+        &mut self,
+        relay: &Self::Relay,
+        out: &mut [u8; 65536],
+    ) -> Result<Option<KernelDatagram>, ServiceError>;
+    fn consumed(
+        &self,
+        relay: &Self::Relay,
+        packet: wire::udp_v2::Packet,
+    ) -> Result<(), ServiceError>;
+    fn owner(
+        &mut self,
+        source: u64,
+        tuple: Tuple,
+    ) -> Result<(Option<Subject>, Option<Instant>), ServiceError>;
+    fn payload_retired(&self, association: u64, packet: u64) -> Result<bool, ServiceError>;
+    fn duplicate_closed(
+        &self,
+        relay: &Self::Relay,
+        record: wire::udp_v2::Record,
+    ) -> Result<(), ServiceError>;
+    fn revoke(&self);
+}
+struct UdpResponse<T> {
+    record: wire::udp_v2::Record,
+    fd: Option<T>,
+}
+struct AssociationIssuer<O: UdpOperations> {
+    ops: O,
+    launch: LaunchRecord,
+    history: Arc<std::sync::Mutex<InvocationHistory>>,
+    budget: super::memory::ByteBudget,
+    controls: BTreeMap<u64, UdpControl<O::Control>>,
+    relays: BTreeMap<u64, UdpRelay<O::Relay>>,
+    next: u64,
+    last_control_proof: u64,
+    unknown: bool,
+}
+impl<O: UdpOperations> AssociationIssuer<O> {
+    fn new(
+        ops: O,
+        launch: LaunchRecord,
+        limit: u32,
+        budget: super::memory::ByteBudget,
+    ) -> Result<Self, ServiceError> {
+        let history = Arc::new(std::sync::Mutex::new(InvocationHistory::new(
+            limit, &budget,
+        )?));
+        Ok(Self {
+            ops,
+            launch,
+            history,
+            budget,
+            controls: BTreeMap::new(),
+            relays: BTreeMap::new(),
+            next: 0,
+            last_control_proof: 0,
+            unknown: false,
+        })
+    }
+    fn id(&mut self) -> Result<u64, ServiceError> {
+        self.next = self
+            .next
+            .checked_add(1)
+            .filter(|id| *id != u64::MAX)
+            .ok_or(ServiceError::Unavailable)?;
+        Ok(self.next)
+    }
+    fn check(&self) -> Result<(), ServiceError> {
+        if self.unknown {
+            return Err(ServiceError::Unavailable);
+        }
+        self.ops.fence()?;
+        self.ops.ready()
+    }
+    fn handle(
+        &mut self,
+        record: wire::udp_v2::Record,
+        fd: Option<O::Transfer>,
+        now: Instant,
+        until: Instant,
+    ) -> Result<Option<UdpResponse<O::Transfer>>, ServiceError> {
+        self.check()?;
+        if now >= until {
+            return Err(ServiceError::Unavailable);
+        }
+        let shape = record.encode(self.launch).map_err(unavailable)?;
+        if !shape.from_go || shape.rights != usize::from(fd.is_some()) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let result = self.handle_inner(record, fd, now, until.min(now + Duration::from_secs(1)));
+        if result.is_err() && !matches!(result, Err(ServiceError::Busy)) {
+            self.fail();
+        }
+        result
+    }
+    fn handle_inner(
+        &mut self,
+        record: wire::udp_v2::Record,
+        fd: Option<O::Transfer>,
+        now: Instant,
+        until: Instant,
+    ) -> Result<Option<UdpResponse<O::Transfer>>, ServiceError> {
+        use wire::udp_v2::Record as R;
+        let reply = match record {
+            R::Control {
+                operation,
+                proof,
+                ingress,
+                tuple,
+            } => {
+                if proof <= self.last_control_proof {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                if self.controls.len() >= 8 {
+                    return Err(ServiceError::Busy);
+                }
+                self.history
+                    .lock()
+                    .map_err(unavailable)?
+                    .operation(operation)?;
+                let credit = self.budget.reserve(2048).map_err(unavailable)?;
+                let source = self.history.lock().map_err(unavailable)?.source()?;
+                let (value, cookie, principal) = self.ops.control(
+                    fd.ok_or(ServiceError::InvalidRequest)?,
+                    tuple,
+                    ingress,
+                    source,
+                )?;
+                if self.launch.mode.required() != principal.is_some()
+                    || self.controls.values().any(|c| c.cookie == cookie)
+                {
+                    return Err(ServiceError::Unavailable);
+                }
+                self.last_control_proof = proof;
+                self.controls.insert(
+                    source,
+                    UdpControl {
+                        value,
+                        tuple,
+                        cookie,
+                        principal,
+                        association: None,
+                        _credit: credit,
+                    },
+                );
+                R::ControlAck {
+                    operation,
+                    control: source,
+                    cookie,
+                    remaining: Self::remaining(until, now)?,
+                }
+            }
+            R::Associate {
+                operation,
+                control,
+                cookie,
+            } => {
+                if fd.is_some() || self.relays.len() >= 8 {
+                    return Err(ServiceError::Busy);
+                }
+                self.history
+                    .lock()
+                    .map_err(unavailable)?
+                    .operation(operation)?;
+                let c = self
+                    .controls
+                    .get(&control)
+                    .ok_or(ServiceError::InvalidRequest)?;
+                if c.association.is_some() || c.cookie != cookie {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                self.ops.alive(&c.value)?;
+                let credit = self.budget.reserve(133120).map_err(unavailable)?;
+                let association = self.id()?;
+                let reserved_close = self.id()?;
+                self.history
+                    .lock()
+                    .map_err(unavailable)?
+                    .reserve(3, reserved_close)?;
+                let c = self
+                    .controls
+                    .get(&control)
+                    .ok_or(ServiceError::Unavailable)?;
+                let buffer = Box::new([0; 65536]);
+                let (value, cookie, port) = self.ops.relay(&c.value)?;
+                let duplicate = self.ops.duplicate(&value)?;
+                self.relays.insert(
+                    association,
+                    UdpRelay {
+                        value,
+                        control,
+                        cookie,
+                        port,
+                        cycle: None,
+                        buffer,
+                        closing: None,
+                        close_deadline: None,
+                        reserved_close,
+                        last_packet: 0,
+                        flows: BTreeMap::new(),
+                        _credit: credit,
+                    },
+                );
+                self.controls
+                    .get_mut(&control)
+                    .ok_or(ServiceError::Unavailable)?
+                    .association = Some(association);
+                return Ok(Some(UdpResponse {
+                    record: R::Associated {
+                        operation,
+                        control,
+                        association,
+                        cookie,
+                        port,
+                    },
+                    fd: Some(duplicate),
+                }));
+            }
+            R::Peek {
+                association,
+                operation,
+                control,
+            } => {
+                if fd.is_some() {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let relay = self
+                    .relays
+                    .get(&association)
+                    .ok_or(ServiceError::InvalidRequest)?;
+                if relay.control != control || relay.closing.is_some() {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                if let Some(cycle) = &relay.cycle {
+                    if cycle.stage != UdpStage::Granted
+                        || !self.ops.payload_retired(association, cycle.packet.packet)?
+                    {
+                        return Err(ServiceError::Busy);
+                    }
+                }
+                self.history
+                    .lock()
+                    .map_err(unavailable)?
+                    .operation(operation)?;
+                self.ops.alive(
+                    &self
+                        .controls
+                        .get(&control)
+                        .ok_or(ServiceError::Unavailable)?
+                        .value,
+                )?;
+                let packet = self.id()?;
+                let permit = self.id()?;
+                let relay = self
+                    .relays
+                    .get_mut(&association)
+                    .ok_or(ServiceError::Unavailable)?;
+                relay.cycle = Some(UdpCycle {
+                    packet: wire::udp_v2::Packet {
+                        association,
+                        packet,
+                        permit,
+                        cookie: relay.cookie,
+                        tuple: Tuple {
+                            protocol: 17,
+                            family: 4,
+                            local_port: 1,
+                            remote_port: relay.port,
+                            local: [0; 16],
+                            remote: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        },
+                        bytes: 0,
+                        header: 0,
+                        flags: 0,
+                        fingerprint: [0; 32],
+                    },
+                    original: None,
+                    sequence: 0,
+                    source: 0,
+                    grant: 0,
+                    stage: UdpStage::Waiting,
+                    deadline: until,
+                });
+                return self.progress(association, now);
+            }
+            R::Consumed { packet, sequence } => {
+                if fd.is_some() {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let relay = self
+                    .relays
+                    .get_mut(&packet.association)
+                    .ok_or(ServiceError::InvalidRequest)?;
+                let cycle = relay.cycle.as_mut().ok_or(ServiceError::InvalidRequest)?;
+                if relay.closing.is_some()
+                    || cycle.stage != UdpStage::Permitted
+                    || cycle.packet != packet
+                    || now >= cycle.deadline
+                {
+                    return Err(ServiceError::Unavailable);
+                }
+                self.history
+                    .lock()
+                    .map_err(unavailable)?
+                    .runtime(sequence)?;
+                self.ops.consumed(&relay.value, packet)?;
+                cycle.sequence = sequence;
+                cycle.stage = UdpStage::Matched;
+                R::Matched {
+                    association: packet.association,
+                    packet: packet.packet,
+                    permit: packet.permit,
+                    sequence,
+                    status: 1,
+                    remaining: Self::remaining(cycle.deadline, now)?,
+                }
+            }
+            R::Closed {
+                association,
+                close,
+                last_packet,
+                pending,
+                status,
+                joined,
+                duplicates,
+                cookie,
+                ..
+            } => {
+                if fd.is_some() {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let relay = self
+                    .relays
+                    .get(&association)
+                    .ok_or(ServiceError::InvalidRequest)?;
+                if relay.closing != Some(close)
+                    || relay.last_packet != last_packet
+                    || relay.cookie != cookie
+                    || status != 1
+                    || !joined
+                    || pending != 0
+                    || duplicates != 0
+                    || !relay.flows.is_empty()
+                {
+                    return Err(ServiceError::Unavailable);
+                }
+                self.ops.duplicate_closed(&relay.value, record)?;
+                let relay = self
+                    .relays
+                    .remove(&association)
+                    .ok_or(ServiceError::Unavailable)?;
+                self.controls.remove(&relay.control);
+                drop(relay);
+                return Ok(None);
+            }
+            _ => return Err(ServiceError::InvalidRequest),
+        };
+        Ok(Some(UdpResponse {
+            record: reply,
+            fd: None,
+        }))
+    }
+    fn remaining(until: Instant, now: Instant) -> Result<u64, ServiceError> {
+        let ns = until
+            .saturating_duration_since(now)
+            .as_nanos()
+            .min(1_000_000_000) as u64;
+        if ns == 0 {
+            Err(ServiceError::Unavailable)
+        } else {
+            Ok(ns)
+        }
+    }
+    fn progress(
+        &mut self,
+        association: u64,
+        now: Instant,
+    ) -> Result<Option<UdpResponse<O::Transfer>>, ServiceError> {
+        let result = self.progress_inner(association, now);
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    fn fail(&mut self) {
+        if !self.unknown {
+            self.unknown = true;
+            self.ops.revoke();
+        }
+    }
+    fn tick(&mut self, now: Instant) -> Result<(), ServiceError> {
+        let result = (|| {
+            self.check()?;
+            for relay in self.relays.values() {
+                if relay.close_deadline.is_some_and(|until| now >= until)
+                    || relay.closing.is_none()
+                        && relay.cycle.as_ref().is_some_and(|c| now >= c.deadline)
+                {
+                    return Err(ServiceError::Unavailable);
+                }
+            }
+            for control in self.controls.values() {
+                self.ops.alive(&control.value)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    fn progress_inner(
+        &mut self,
+        association: u64,
+        now: Instant,
+    ) -> Result<Option<UdpResponse<O::Transfer>>, ServiceError> {
+        self.check()?;
+        let relay = self
+            .relays
+            .get_mut(&association)
+            .ok_or(ServiceError::InvalidRequest)?;
+        let cycle = relay.cycle.as_mut().ok_or(ServiceError::InvalidRequest)?;
+        if cycle.stage != UdpStage::Waiting {
+            return Ok(None);
+        }
+        if now >= cycle.deadline {
+            return Err(ServiceError::Unavailable);
+        }
+        let Some(datagram) = self.ops.peek(&relay.value, &mut relay.buffer)? else {
+            return Ok(None);
+        };
+        if datagram.flags != 0 || datagram.bytes > wire::udp_v2::MAX_DATAGRAM {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let (original, header) = udp_original(&relay.buffer[..datagram.bytes])?;
+        let SocketAddr::V4(peer) = datagram.peer else {
+            return Err(ServiceError::Unsupported);
+        };
+        cycle.packet.tuple.local[..4].copy_from_slice(&peer.ip().octets());
+        cycle.packet.tuple.local_port = peer.port();
+        cycle.packet.bytes = datagram.bytes as u32;
+        cycle.packet.header = header;
+        cycle.packet.fingerprint =
+            wire::udp_v2::fingerprint(self.launch, cycle.packet, &relay.buffer[..datagram.bytes])
+                .map_err(unavailable)?;
+        cycle.original = Some(original);
+        cycle.stage = UdpStage::Permitted;
+        relay.last_packet = cycle.packet.packet;
+        Ok(Some(UdpResponse {
+            record: wire::udp_v2::Record::Permit {
+                packet: cycle.packet,
+                remaining: Self::remaining(cycle.deadline, now)?,
+            },
+            fd: None,
+        }))
+    }
+    fn bind_source(
+        &mut self,
+        sequence: u64,
+        source: u64,
+        tuple: Tuple,
+        original: wire::Destination<'_>,
+        now: Instant,
+    ) -> Result<(), ServiceError> {
+        self.check()?;
+        let (_, relay) = self
+            .relays
+            .iter_mut()
+            .find(|(_, r)| r.cycle.as_ref().is_some_and(|c| c.sequence == sequence))
+            .ok_or(ServiceError::Unavailable)?;
+        let cycle = relay.cycle.as_mut().ok_or(ServiceError::Unavailable)?;
+        if cycle.stage != UdpStage::Matched
+            || (cycle.source != 0 && cycle.source != source)
+            || now >= cycle.deadline
+            || cycle.packet.tuple != tuple
+            || cycle.original != Some(Target::copy(original)?)
+            || relay.flows.len() >= 256
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        self.history
+            .lock()
+            .map_err(unavailable)?
+            .runtime(sequence)?;
+        // BTree refs отдельно от fixed pair metadata. Retry не резервирует
+        // второй slot; credit предшествует owner lookup и allocation node.
+        let flow_credit = if relay.flows.contains_key(&source) {
+            None
+        } else {
+            Some(self.budget.reserve(128).map_err(unavailable)?)
+        };
+        let control = self
+            .controls
+            .get(&relay.control)
+            .ok_or(ServiceError::Unavailable)?;
+        self.ops.alive(&control.value)?;
+        if tuple.local != control.tuple.local {
+            return Err(ServiceError::Unavailable);
+        }
+        let (principal, expiry) = self.ops.owner(source, tuple)?;
+        if self.launch.mode.required()
+            && (principal
+                .zip(control.principal)
+                .is_none_or(|(udp, tcp)| !same_principal(udp, tcp))
+                || expiry
+                    .is_none_or(|until| until <= now || until > now + Duration::from_millis(20)))
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        cycle.source = source;
+        if let Some(credit) = flow_credit {
+            relay.flows.insert(source, credit);
+        }
+        Ok(())
+    }
+    fn check_grant(&mut self, source: u64, now: Instant) -> Result<(), ServiceError> {
+        let Some(relay) = self.relays.values().find(|r| r.flows.contains_key(&source)) else {
+            return Ok(());
+        };
+        self.check()?;
+        let cycle = relay.cycle.as_ref().ok_or(ServiceError::Unavailable)?;
+        if cycle.source != source || cycle.stage != UdpStage::Matched || now >= cycle.deadline {
+            return Err(ServiceError::Unavailable);
+        }
+        let control = self
+            .controls
+            .get(&relay.control)
+            .ok_or(ServiceError::Unavailable)?;
+        self.ops.alive(&control.value)?;
+        let (principal, expiry) = self.ops.owner(source, cycle.packet.tuple)?;
+        if self.launch.mode.required()
+            && (principal
+                .zip(control.principal)
+                .is_none_or(|(a, b)| !same_principal(a, b))
+                || expiry
+                    .is_none_or(|until| until <= now || until > now + Duration::from_millis(20)))
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
+    fn granted(&mut self, source: u64, grant: u64) {
+        for relay in self.relays.values_mut() {
+            if let Some(c) = &mut relay.cycle {
+                if c.source == source && c.stage == UdpStage::Matched {
+                    c.stage = UdpStage::Granted;
+                    c.grant = grant;
+                }
+            }
+        }
+    }
+    fn retire(
+        &mut self,
+        association: u64,
+        now: Instant,
+    ) -> Result<UdpResponse<O::Transfer>, ServiceError> {
+        self.check()?;
+        let relay = self
+            .relays
+            .get_mut(&association)
+            .ok_or(ServiceError::InvalidRequest)?;
+        if relay.closing.is_some() {
+            return Err(ServiceError::Unavailable);
+        }
+        let close = relay.reserved_close;
+        relay.closing = Some(close);
+        relay.close_deadline = Some(now + Duration::from_secs(1));
+        Ok(UdpResponse {
+            record: wire::udp_v2::Record::Close {
+                association,
+                close,
+                control: relay.control,
+                reason: 1,
+            },
+            fd: None,
+        })
+    }
+    fn cancel_flow(&mut self, source: u64) {
+        for relay in self.relays.values_mut() {
+            relay.flows.remove(&source);
+        }
+    }
+}
+fn same_principal(a: Subject, b: Subject) -> bool {
+    (a.pid, a.start, a.executable, a.epoch, a.path)
+        == (b.pid, b.start, b.executable, b.epoch, b.path)
+}
+fn udp_original(bytes: &[u8]) -> Result<(Target, u16), ServiceError> {
+    if bytes.len() < 4 || bytes[..3] != [0, 0, 0] {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let (family, start, length) = match bytes[3] {
+        1 => (4, 4, 4),
+        4 => (6, 4, 16),
+        3 => {
+            let n = *bytes.get(4).ok_or(ServiceError::InvalidRequest)? as usize;
+            if n == 0 || n > 253 {
+                return Err(ServiceError::InvalidRequest);
+            }
+            (3, 5, n)
+        }
+        _ => return Err(ServiceError::InvalidRequest),
+    };
+    let end = start + length;
+    let address = bytes.get(start..end).ok_or(ServiceError::InvalidRequest)?;
+    let port = bytes
+        .get(end..end + 2)
+        .ok_or(ServiceError::InvalidRequest)?;
+    let port = u16::from_be_bytes([port[0], port[1]]);
+    if port == 0
+        || family == 3
+            && wire::resolver_name(
+                std::str::from_utf8(address).map_err(unavailable)?,
+                false,
+                true,
+            )
+            .is_err()
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    Ok((
+        Target::copy(wire::Destination {
+            family,
+            protocol: 17,
+            port,
+            bytes: address,
+        })?,
+        (end + 2) as u16,
+    ))
+}
+struct KernelControl {
+    socket: tokio::net::TcpStream,
+    namespace: Option<OwnedFd>,
+    number: Option<i32>,
+    facts: SocketFacts,
+    source: u64,
+    tuple: Tuple,
+}
+struct KernelRelay {
+    fd: tokio::net::UdpSocket,
+    namespace: OwnedFd,
+    cookie: u64,
+    port: u16,
+}
+struct KernelUdpOperations {
+    peer: Arc<Peer>,
+    owner: Option<Arc<OwnerEndpoint>>,
+    record: LaunchRecord,
+    capsule: Arc<wire::OwnedCapsule>,
+    handle: tokio::runtime::Handle,
+}
+/// Gate именно consuming producer/duplicate-close source proof, не env flag.
+/// Runtime admission v2 этим milestone не разрешён.
+fn udp_v2_consumer_ready() -> Result<(), ServiceError> {
+    Err(ServiceError::Unsupported)
+}
+pub(crate) fn profile_proof_setup(
+    record: LaunchRecord,
+) -> Result<([u8; 128], [u8; 40], u8), ServiceError> {
+    if udp_v2_consumer_ready().is_ok() {
+        Ok((
+            wire::udp_v2::bootstrap(record).map_err(unavailable)?,
+            wire::udp_v2::bootstrap_ack(record).map_err(unavailable)?,
+            2,
+        ))
+    } else {
+        Ok((
+            wire::proof_bootstrap(record).map_err(unavailable)?,
+            wire::proof_bootstrap_ack(record).map_err(unavailable)?,
+            1,
+        ))
+    }
+}
+impl KernelUdpOperations {
+    fn observe(
+        &self,
+        source: u64,
+        tuple: Tuple,
+    ) -> Result<(Option<Subject>, Option<Instant>), ServiceError> {
+        self.peer.validate()?;
+        match (&self.owner, &self.peer.system_scope) {
+            (Some(owner), Some(scope)) => {
+                let flow = tuple.owner_flow().map_err(unavailable)?;
+                let proof = owner
+                    .lookup(
+                        source,
+                        flow,
+                        OwnerReference::NONE,
+                        Instant::now() + Duration::from_millis(20),
+                    )
+                    .map_err(unavailable)?;
+                let subject = Subject::checked(&proof, scope, source, flow)?;
+                Ok((Some(subject), Some(proof.original_expiry())))
+            }
+            (None, None) => Ok((None, None)),
+            _ => Err(ServiceError::Unavailable),
+        }
+    }
+    fn relay_valid(&self, relay: &KernelRelay) -> Result<(), ServiceError> {
+        self.peer.validate()?;
+        yonik_nsfs::socket_namespace::inspect_profile_udp(&relay.fd).map_err(unavailable)?;
+        let facts = SocketFacts::capture(&relay.fd)?;
+        if facts.cookie != relay.cookie
+            || facts.local != SocketAddr::from(([127, 0, 0, 1], relay.port))
+            || facts.remote.is_some()
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        if let Some(scope) = &self.peer.system_scope {
+            let current =
+                yonik_nsfs::socket_namespace::socket_namespace(&relay.fd).map_err(unavailable)?;
+            for fd in [&current, &relay.namespace] {
+                let s = rustix::fs::fstat(fd).map_err(unavailable)?;
+                if (s.st_dev, s.st_ino) != scope.lookup_binding().2.namespace() {
+                    return Err(ServiceError::Unsupported);
+                }
+            }
+        } else {
+            let current = File::open("/proc/thread-self/ns/net").map_err(unavailable)?;
+            let a = rustix::fs::fstat(&current).map_err(unavailable)?;
+            let b = rustix::fs::fstat(&relay.namespace).map_err(unavailable)?;
+            if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino) {
+                return Err(ServiceError::Unsupported);
+            }
+        }
+        Ok(())
+    }
+}
+impl UdpOperations for KernelUdpOperations {
+    type Control = KernelControl;
+    type Relay = KernelRelay;
+    type Transfer = OwnedFd;
+    fn ready(&self) -> Result<(), ServiceError> {
+        udp_v2_consumer_ready()
+    }
+    fn fence(&self) -> Result<(), ServiceError> {
+        self.peer.validate()
+    }
+    fn control(
+        &mut self,
+        fd: OwnedFd,
+        tuple: Tuple,
+        ingress: u16,
+        source: u64,
+    ) -> Result<(KernelControl, u64, Option<Subject>), ServiceError> {
+        self.ready()?;
+        wire::Capsule::decode(self.capsule.bytes(), &self.record.binding.digest)
+            .map_err(unavailable)?
+            .validate_udp_control(ingress, tuple)
+            .map_err(unavailable)?;
+        let facts = SocketFacts::capture(&fd)?;
+        if !facts.matches(tuple, 2) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let proof = if let Some(scope) = &self.peer.system_scope {
+            let namespace =
+                yonik_nsfs::socket_namespace::socket_namespace(&fd).map_err(unavailable)?;
+            let s = rustix::fs::fstat(&namespace).map_err(unavailable)?;
+            if (s.st_dev, s.st_ino) != scope.lookup_binding().2.namespace() {
+                return Err(ServiceError::Unsupported);
+            }
+            SocketProof {
+                peer: Arc::clone(&self.peer),
+                fd,
+                number: None,
+                namespace: Some(namespace),
+                facts,
+                tuple,
+                provenance: 2,
+            }
+        } else {
+            let independent = self.peer.socket(tuple, 2, 0, ingress)?;
+            if independent.facts != facts {
+                return Err(ServiceError::Unavailable);
+            }
+            drop(fd);
+            independent
+        };
+        proof.validate()?;
+        let (principal, _) = self.observe(source, tuple)?;
+        let cookie = proof.facts.cookie;
+        let SocketProof {
+            fd,
+            namespace,
+            number,
+            facts,
+            ..
+        } = proof;
+        let flags = rustix::fs::fcntl_getfl(&fd).map_err(unavailable)?;
+        rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK).map_err(unavailable)?;
+        let socket = {
+            let _enter = self.handle.enter();
+            tokio::net::TcpStream::from_std(std::net::TcpStream::from(fd)).map_err(unavailable)?
+        };
+        Ok((
+            KernelControl {
+                socket,
+                namespace,
+                number,
+                facts,
+                source,
+                tuple,
+            },
+            cookie,
+            principal,
+        ))
+    }
+    fn alive(&self, control: &KernelControl) -> Result<(), ServiceError> {
+        self.peer.validate()?;
+        if SocketFacts::capture(&control.socket)? != control.facts
+            || !control.facts.matches(control.tuple, 2)
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        if let Some(scope) = &self.peer.system_scope {
+            let namespace = yonik_nsfs::socket_namespace::socket_namespace(&control.socket)
+                .map_err(unavailable)?;
+            for fd in [Some(&namespace), control.namespace.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                let s = rustix::fs::fstat(fd).map_err(unavailable)?;
+                if (s.st_dev, s.st_ino) != scope.lookup_binding().2.namespace() {
+                    return Err(ServiceError::Unavailable);
+                }
+            }
+        } else {
+            let fd = rustix::process::pidfd_getfd(
+                &self.peer.pidfd,
+                control.number.ok_or(ServiceError::Unsupported)?,
+                rustix::process::PidfdGetfdFlags::empty(),
+            )
+            .map_err(unavailable)?;
+            if SocketFacts::capture(&fd)? != control.facts {
+                return Err(ServiceError::Unavailable);
+            }
+        }
+        let mut one = [0];
+        match control.socket.try_io(tokio::io::Interest::READABLE, || {
+            match rustix::net::recv(
+                &control.socket,
+                &mut one,
+                rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
+            ) {
+                Err(rustix::io::Errno::AGAIN) => Err(std::io::ErrorKind::WouldBlock.into()),
+                _ => Ok(()),
+            }
+        }) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            _ => Err(ServiceError::Unavailable),
+        }
+    }
+    fn relay(&mut self, control: &KernelControl) -> Result<(KernelRelay, u64, u16), ServiceError> {
+        self.ready()?;
+        self.alive(control)?;
+        let _fresh = self.observe(control.source, control.tuple)?;
+        let (fd, namespace) = if self.record.mode == Mode::Local {
+            crate::host::local_profile_channel::create_udp_relay().map_err(unavailable)?
+        } else {
+            let fd = rustix::net::socket_with(
+                rustix::net::AddressFamily::INET,
+                rustix::net::SocketType::DGRAM,
+                rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+                Some(rustix::net::ipproto::UDP),
+            )
+            .map_err(unavailable)?;
+            rustix::net::bind(
+                &fd,
+                &std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+            )
+            .map_err(unavailable)?;
+            yonik_nsfs::socket_namespace::prepare_profile_udp(&fd).map_err(unavailable)?;
+            let namespace =
+                yonik_nsfs::socket_namespace::socket_namespace(&fd).map_err(unavailable)?;
+            (fd, namespace)
+        };
+        let facts = SocketFacts::capture(&fd)?;
+        let port = facts.local.port();
+        let cookie = facts.cookie;
+        let fd = {
+            let _enter = self.handle.enter();
+            tokio::net::UdpSocket::from_std(std::net::UdpSocket::from(fd)).map_err(unavailable)?
+        };
+        let relay = KernelRelay {
+            fd,
+            namespace,
+            cookie,
+            port,
+        };
+        self.relay_valid(&relay)?;
+        Ok((relay, cookie, port))
+    }
+    fn duplicate(&mut self, relay: &KernelRelay) -> Result<OwnedFd, ServiceError> {
+        self.relay_valid(relay)?;
+        rustix::io::fcntl_dupfd_cloexec(&relay.fd, 3).map_err(unavailable)
+    }
+    fn peek(
+        &mut self,
+        relay: &KernelRelay,
+        out: &mut [u8; 65536],
+    ) -> Result<Option<KernelDatagram>, ServiceError> {
+        self.relay_valid(relay)?;
+        let peek = match relay.fd.try_io(tokio::io::Interest::READABLE, || {
+            yonik_nsfs::socket_namespace::peek_profile_udp(&relay.fd, out)?
+                .ok_or_else(|| std::io::ErrorKind::WouldBlock.into())
+        }) {
+            Ok(p) => Some(p),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+            Err(e) => return Err(unavailable(e)),
+        };
+        peek.map(|p| {
+            if p.overflow != 0 {
+                Err(ServiceError::Unavailable)
+            } else {
+                Ok(KernelDatagram {
+                    peer: SocketAddr::from((p.address, p.port)),
+                    bytes: p.bytes,
+                    flags: p.flags,
+                })
+            }
+        })
+        .transpose()
+    }
+    fn consumed(&self, relay: &KernelRelay, _: wire::udp_v2::Packet) -> Result<(), ServiceError> {
+        self.ready()?;
+        self.relay_valid(relay)
+    }
+    fn owner(
+        &mut self,
+        source: u64,
+        tuple: Tuple,
+    ) -> Result<(Option<Subject>, Option<Instant>), ServiceError> {
+        self.observe(source, tuple)
+    }
+    fn payload_retired(&self, _: u64, _: u64) -> Result<bool, ServiceError> {
+        self.ready()?;
+        Err(ServiceError::Unsupported)
+    }
+    fn duplicate_closed(
+        &self,
+        relay: &KernelRelay,
+        _: wire::udp_v2::Record,
+    ) -> Result<(), ServiceError> {
+        self.ready()?;
+        self.relay_valid(relay)?;
+        Err(ServiceError::Unsupported)
+    }
+    fn revoke(&self) {
+        if let Some(scope) = &self.peer.system_scope {
+            scope.revoke();
+        }
+    }
+}
+impl InvocationHistory {
+    fn new(limit: u32, budget: &super::memory::ByteBudget) -> Result<Self, ServiceError> {
+        let credit = budget
+            .reserve(std::mem::size_of::<Self>())
+            .map_err(unavailable)?;
+        Ok(Self {
+            entries: [None; 256],
+            len: 0,
+            limit: (limit as usize).min(256),
+            last_operation: 0,
+            next_source: 0,
+            _credit: credit,
+        })
+    }
+    fn runtime(&mut self, id: u64) -> Result<(), ServiceError> {
+        self.reserve(1, id)
+    }
+    fn reserve(&mut self, kind: u8, id: u64) -> Result<(), ServiceError> {
+        if id == 0 || id == u64::MAX {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if self.entries[..self.len].contains(&Some((kind, id))) {
+            return Ok(());
+        }
+        if self.len >= self.limit {
+            return Err(ServiceError::Busy);
+        }
+        self.entries[self.len] = Some((kind, id));
+        self.len += 1;
+        Ok(())
+    }
+    fn operation(&mut self, id: u64) -> Result<(), ServiceError> {
+        if id <= self.last_operation {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.reserve(2, id)?;
+        self.last_operation = id;
+        Ok(())
+    }
+    fn source(&mut self) -> Result<u64, ServiceError> {
+        self.next_source = self
+            .next_source
+            .checked_add(1)
+            .filter(|id| *id != u64::MAX)
+            .ok_or(ServiceError::Unavailable)?;
+        Ok(self.next_source)
+    }
+}
 struct Grant {
     source: u64,
     subject: u16,
@@ -328,6 +1398,7 @@ struct Issuer<A: Authority> {
     next_grant: u64,
     unknown: bool,
     budget: Arc<ChannelBudget>,
+    history: Option<Arc<std::sync::Mutex<InvocationHistory>>>,
 }
 impl<A: Authority> Issuer<A> {
     fn new(
@@ -360,6 +1431,7 @@ impl<A: Authority> Issuer<A> {
             next_grant: 0,
             unknown: false,
             budget,
+            history: None,
         })
     }
     fn capsule(&self) -> Result<wire::Capsule<'_>, ServiceError> {
@@ -402,7 +1474,13 @@ impl<A: Authority> Issuer<A> {
         let socket = self
             .authority
             .ingress(request, &capsule, message, &self.budget)?;
-        let source = Self::id(&mut self.next_flow)?;
+        let source = if let Some(history) = &self.history {
+            let source = history.lock().map_err(unavailable)?.source()?;
+            self.next_flow = source;
+            source
+        } else {
+            Self::id(&mut self.next_flow)?
+        };
         let proof = self.authority.owner(source, *tuple, OwnerReference::NONE)?;
         let subject = self.authority.subject(&proof, source, *tuple)?;
         if self.authority.mode().required() != subject.is_some() {
@@ -858,7 +1936,7 @@ struct SocketHold {
 }
 struct SystemAuthority {
     scope: RuntimeScopeStamp,
-    owner: OwnerEndpoint,
+    owner: Arc<OwnerEndpoint>,
     peer: Arc<Peer>,
     routes: Box<dyn RouteAuthority>,
 }
@@ -1251,7 +2329,7 @@ impl ProfileRuntime {
                     )?;
                     resources.peer = Some(Arc::clone(&peer));
                     let (proof, go_proof) = channel_pair()?;
-                    crate::worker::role_handoff::send_proof_bootstrap(
+                    let proof_version = crate::worker::role_handoff::send_proof_bootstrap(
                         &resources.channel,
                         record,
                         &go_proof,
@@ -1264,6 +2342,21 @@ impl ProfileRuntime {
                     )
                     .map_err(unavailable)?;
                     drop(go_proof);
+                    let owner = Arc::new(resources.owner.take().ok_or(ServiceError::Unavailable)?);
+                    let authority = SystemAuthority {
+                        scope: resources.scope.fork_lookup(),
+                        owner: Arc::clone(&owner),
+                        peer: Arc::clone(&peer),
+                        routes: resources.routes.take().ok_or(ServiceError::Unavailable)?,
+                    };
+                    resources.issuer = Some(Issuer::new(authority, Arc::clone(&capsule), record)?);
+                    let budget = Arc::clone(
+                        &resources
+                            .issuer
+                            .as_ref()
+                            .ok_or(ServiceError::Unavailable)?
+                            .budget,
+                    );
                     resources.proof_channel = Some(SystemChannel::new(
                         rustix::io::fcntl_dupfd_cloexec(&resources.channel, 3)
                             .map_err(unavailable)?,
@@ -1272,19 +2365,16 @@ impl ProfileRuntime {
                         record,
                         handle,
                         thread_wake,
+                        proof_version,
+                        owner,
+                        Arc::clone(&capsule),
+                        budget,
                     )?);
                     resources
                         .proof_channel
                         .as_ref()
                         .ok_or(ServiceError::Unavailable)?
                         .hello(&thread_stop)?;
-                    let authority = SystemAuthority {
-                        scope: resources.scope.fork_lookup(),
-                        owner: resources.owner.take().ok_or(ServiceError::Unavailable)?,
-                        peer,
-                        routes: resources.routes.take().ok_or(ServiceError::Unavailable)?,
-                    };
-                    resources.issuer = Some(Issuer::new(authority, capsule, record)?);
                     run_issuer(
                         resources.issuer.as_mut().ok_or(ServiceError::Unavailable)?,
                         resources
@@ -1425,6 +2515,9 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn history(&self) -> Option<Arc<std::sync::Mutex<InvocationHistory>>> {
+        None
+    }
     fn discard_ingress(&self, _request: u64) -> Result<(), ServiceError> {
         Ok(())
     }
@@ -1741,8 +2834,58 @@ struct SystemChannel {
     handle: tokio::runtime::Handle,
     wake: Arc<tokio::sync::Notify>,
     failed: std::cell::Cell<bool>,
+    udp: Option<std::cell::RefCell<AssociationIssuer<KernelUdpOperations>>>,
 }
 impl SystemChannel {
+    fn send_udp(&self, response: UdpResponse<OwnedFd>) -> Result<(), ServiceError> {
+        let encoded = response.record.encode(self.launch).map_err(unavailable)?;
+        if encoded.from_go || encoded.rights != usize::from(response.fd.is_some()) {
+            return Err(ServiceError::Unavailable);
+        }
+        let mut storage = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = rustix::net::SendAncillaryBuffer::new(&mut storage);
+        let fd = response.fd.as_ref().map(AsFd::as_fd);
+        let rights = fd.as_slice();
+        if !rights.is_empty() && !control.push(rustix::net::SendAncillaryMessage::ScmRights(rights))
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        match rustix::net::sendmsg(
+            &self.proof,
+            &[std::io::IoSlice::new(&encoded.bytes[..encoded.length])],
+            &mut control,
+            rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL,
+        ) {
+            Ok(n) if n == encoded.length => Ok(()),
+            _ => Err(ServiceError::Unavailable),
+        }
+    }
+    fn progress_udp(&self) -> Result<(), ServiceError> {
+        let Some(udp) = &self.udp else {
+            return Ok(());
+        };
+        let mut udp = udp.borrow_mut();
+        udp.tick(Instant::now())?;
+        let mut pending = [0; 8];
+        let mut count = 0;
+        for (id, relay) in &udp.relays {
+            if relay
+                .cycle
+                .as_ref()
+                .is_some_and(|c| c.stage == UdpStage::Waiting)
+            {
+                pending[count] = *id;
+                count += 1;
+            }
+        }
+        for id in &pending[..count] {
+            if let Some(response) = udp.progress(*id, Instant::now())? {
+                self.send_udp(response)?;
+            }
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)] // Exact bound endpoint/resources одного owner loop.
     fn new(
         runtime: OwnedFd,
         proof: OwnedFd,
@@ -1750,7 +2893,30 @@ impl SystemChannel {
         launch: LaunchRecord,
         handle: tokio::runtime::Handle,
         wake: Arc<tokio::sync::Notify>,
+        version: u8,
+        owner: Arc<OwnerEndpoint>,
+        capsule: Arc<wire::OwnedCapsule>,
+        budget: Arc<ChannelBudget>,
     ) -> Result<Self, ServiceError> {
+        let udp = if version == 2 {
+            let ops = KernelUdpOperations {
+                peer: Arc::clone(&peer),
+                owner: Some(owner),
+                record: launch,
+                capsule: Arc::clone(&capsule),
+                handle: handle.clone(),
+            };
+            Some(std::cell::RefCell::new(AssociationIssuer::new(
+                ops,
+                launch,
+                wire::Capsule::decode(capsule.bytes(), &launch.binding.digest)
+                    .map_err(unavailable)?
+                    .limits()[7],
+                budget.dynamic.clone(),
+            )?))
+        } else {
+            None
+        };
         for fd in [&runtime, &proof] {
             let flags = rustix::fs::fcntl_getfl(fd).map_err(unavailable)?;
             rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)
@@ -1773,6 +2939,7 @@ impl SystemChannel {
             handle,
             wake,
             failed: std::cell::Cell::new(false),
+            udp,
         })
     }
     fn shutdown(&self) {
@@ -1816,7 +2983,7 @@ impl SystemChannel {
         use rustix::net::{
             self, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
         };
-        let mut bytes = [0; 193];
+        let mut bytes = [0; 257];
         let mut control = [std::mem::MaybeUninit::uninit();
             rustix::cmsg_space!(ScmRights(16), ScmCredentials(1))];
         let mut ancillary = RecvAncillaryBuffer::new(&mut control);
@@ -1858,13 +3025,36 @@ impl SystemChannel {
         }
         let c = credentials.ok_or(ServiceError::Unavailable)?;
         if bad
-            || msg.bytes != 192
+            || msg.bytes < 128
+            || msg.bytes > 256
             || msg
                 .flags
                 .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
             || c.pid.as_raw_pid() as u32 != self.peer.pid
             || c.uid.as_raw() != self.peer.uid
         {
+            return Err(ServiceError::Unavailable);
+        }
+        if &bytes[..8] != b"YNKSPF01" {
+            let udp = self.udp.as_ref().ok_or(ServiceError::Unsupported)?;
+            let record = wire::udp_v2::Record::decode(
+                &bytes[..msg.bytes],
+                self.launch,
+                true,
+                usize::from(socket.is_some()),
+            )
+            .map_err(unavailable)?;
+            if let Some(response) = udp.borrow_mut().handle(
+                record,
+                socket,
+                Instant::now(),
+                Instant::now() + Duration::from_secs(1),
+            )? {
+                self.send_udp(response)?;
+            }
+            return Ok(true);
+        }
+        if msg.bytes != 192 {
             return Err(ServiceError::Unavailable);
         }
         let fd = socket.ok_or(ServiceError::Unavailable)?;
@@ -1898,6 +3088,16 @@ impl SystemChannel {
         Ok(true)
     }
     fn wait(&self, until: Instant, writable: bool) {
+        let until = self.udp.as_ref().map_or(until, |udp| {
+            udp.borrow()
+                .relays
+                .values()
+                .filter_map(|r| {
+                    r.close_deadline
+                        .or_else(|| r.cycle.as_ref().map(|c| c.deadline))
+                })
+                .fold(until, Instant::min)
+        });
         let until = self
             .peer
             .proofs
@@ -1906,7 +3106,20 @@ impl SystemChannel {
             .unwrap_or(until);
         let result=self.handle.block_on(async {
             if writable {tokio::select!{biased; _=self.wake.notified()=>Ok(()),_=tokio::time::sleep_until(until.into())=>Ok(()),ready=self.runtime.writable()=>ready}}
-            else {tokio::select!{biased;_=self.wake.notified()=>Ok(()),_=tokio::time::sleep_until(until.into())=>Ok(()),ready=self.runtime.readable()=>ready,ready=self.proof.readable()=>ready}}
+            else {tokio::select!{biased;_=self.wake.notified()=>Ok(()),_=tokio::time::sleep_until(until.into())=>Ok(()),ready=self.runtime.readable()=>ready,ready=self.proof.readable()=>ready,ready=futures_util::future::poll_fn(|cx| {
+                if let Some(udp)=&self.udp {
+                    let udp=udp.borrow();
+                    for control in udp.controls.values() {
+                        if let std::task::Poll::Ready(result)=control.value.socket.poll_read_ready(cx){return std::task::Poll::Ready(result);}
+                    }
+                    for relay in udp.relays.values() {
+                        if relay.cycle.as_ref().is_some_and(|c|c.stage==UdpStage::Waiting) {
+                            if let std::task::Poll::Ready(result)=relay.value.fd.poll_recv_ready(cx){return std::task::Poll::Ready(result);}
+                        }
+                    }
+                }
+                std::task::Poll::Pending
+            })=>ready}}
         });
         if result.is_err() {
             self.failed.set(true);
@@ -1929,6 +3142,11 @@ impl SystemChannel {
     }
 }
 impl Channel for SystemChannel {
+    fn history(&self) -> Option<Arc<std::sync::Mutex<InvocationHistory>>> {
+        self.udp
+            .as_ref()
+            .map(|udp| Arc::clone(&udp.borrow().history))
+    }
     fn discard_ingress(&self, request: u64) -> Result<(), ServiceError> {
         self.peer
             .proofs
@@ -1949,6 +3167,7 @@ impl Channel for SystemChannel {
             return Err(ServiceError::Unavailable);
         }
         self.peer.validate()?;
+        self.progress_udp()?;
         let mut inbox = self
             .peer
             .proofs
@@ -2003,10 +3222,86 @@ impl Channel for SystemChannel {
         Err(ServiceError::Busy)
     }
     fn write(&self, bytes: &[u8]) -> Result<bool, ServiceError> {
-        Self::ready(&self.runtime, tokio::io::Interest::WRITABLE, || {
+        let frame = wire::Frame::decode(bytes, self.launch.binding, self.launch.mode, true)
+            .map_err(unavailable)?;
+        // Все authority checks предшествуют публикации ответа. Повтор после
+        // WouldBlock сохраняет source ID и исходный deadline.
+        if let (
+            Some(udp),
+            wire::Message::IngressReply {
+                status: wire::Status::Allow,
+                flow,
+                ..
+            },
+        ) = (&self.udp, &frame.message)
+        {
+            let mut udp = udp.borrow_mut();
+            let origin = udp.relays.values().find_map(|r| {
+                r.cycle
+                    .as_ref()
+                    .filter(|c| c.sequence == frame.header.reply_to)
+                    .and_then(|c| c.original.map(|o| (c.packet.tuple, o)))
+            });
+            if let Some((tuple, original)) = origin {
+                udp.bind_source(
+                    frame.header.reply_to,
+                    *flow,
+                    tuple,
+                    original.wire(),
+                    Instant::now(),
+                )?;
+            }
+        }
+        if let (Some(udp), wire::Message::CloseAck { target: 2, id, .. }) =
+            (&self.udp, &frame.message)
+        {
+            // Child close report не доказывает уничтожение duplicate. Пока
+            // independent consuming/closure endpoint закрыт, Known не публикуется.
+            if udp
+                .borrow()
+                .controls
+                .get(id)
+                .is_some_and(|c| c.association.is_some())
+            {
+                return Err(ServiceError::Unavailable);
+            }
+        }
+        if let (Some(udp), wire::Message::Grant { class: 1, flow, .. }) =
+            (&self.udp, &frame.message)
+        {
+            udp.borrow_mut().check_grant(*flow, Instant::now())?;
+        }
+        let sent = Self::ready(&self.runtime, tokio::io::Interest::WRITABLE, || {
             send(&self.runtime, bytes).map(|sent| sent.then_some(()))
         })
-        .map(|sent| sent.is_some())
+        .map(|sent| sent.is_some())?;
+        if sent {
+            if let Some(udp) = &self.udp {
+                let mut udp = udp.borrow_mut();
+                match frame.message {
+                    wire::Message::Grant {
+                        class: 1,
+                        flow,
+                        grant,
+                        ..
+                    } => udp.granted(flow, grant),
+                    wire::Message::CloseAck { target: 2, id, .. } => {
+                        if udp.controls.contains_key(&id) {
+                            if let Some(association) =
+                                udp.controls.get(&id).and_then(|c| c.association)
+                            {
+                                let response = udp.retire(association, Instant::now())?;
+                                self.send_udp(response)?;
+                            }
+                        } else {
+                            udp.cancel_flow(id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(sent)
     }
     fn pause_until(&self, until: Instant) {
         self.wait(until, false);
@@ -2055,6 +3350,12 @@ fn drain_before_publication<A: Authority>(
         incoming
             .accept(frame.header.sequence)
             .map_err(unavailable)?;
+        if let Some(history) = &issuer.history {
+            history
+                .lock()
+                .map_err(unavailable)?
+                .runtime(frame.header.sequence)?;
+        }
         if let wire::Message::Cancel { target, id, .. } = frame.message {
             if target == 1 && id < frame.header.sequence {
                 socket.discard_ingress(id)?;
@@ -2108,6 +3409,7 @@ fn run_issuer<A: Authority>(
     stop: &AtomicBool,
     ready: &AtomicBool,
 ) -> Result<(), ServiceError> {
+    issuer.history = socket.history();
     let mut incoming = wire::Sequence::new();
     incoming.accept(1).map_err(unavailable)?;
     let mut outgoing = 1u64;
@@ -2218,6 +3520,9 @@ fn run_issuer<A: Authority>(
             .filter(|v| *v != u64::MAX)
             .ok_or(ServiceError::Unavailable)?;
         let reply = frame.header.sequence;
+        if let Some(history) = &issuer.history {
+            history.lock().map_err(unavailable)?.runtime(reply)?;
+        }
         if issuer.retired.iter().any(|(id, _)| *id == reply) {
             socket.discard_ingress(reply)?;
             send_message(
@@ -2846,7 +4151,7 @@ fn endpoint(family: u8, address: [u8; 16], port: u16) -> Result<SocketAddr, Serv
     }
 }
 impl SocketFacts {
-    fn capture(fd: &OwnedFd) -> Result<Self, ServiceError> {
+    fn capture(fd: &impl AsFd) -> Result<Self, ServiceError> {
         use rustix::net::{self, sockopt};
         let protocol = match sockopt::socket_type(fd).map_err(unavailable)? {
             net::SocketType::STREAM => 6,
@@ -2864,11 +4169,13 @@ impl SocketFacts {
         }
         let local = SocketAddr::try_from(net::getsockname(fd).map_err(unavailable)?)
             .map_err(unavailable)?;
-        let remote = net::getpeername(fd)
-            .map_err(unavailable)?
-            .map(SocketAddr::try_from)
-            .transpose()
-            .map_err(unavailable)?;
+        let remote = match net::getpeername(fd) {
+            Err(rustix::io::Errno::NOTCONN) if protocol == 17 => None,
+            other => other.map_err(unavailable)?,
+        }
+        .map(SocketAddr::try_from)
+        .transpose()
+        .map_err(unavailable)?;
         let cookie = sockopt::socket_cookie(fd).map_err(unavailable)?;
         let inode = rustix::fs::fstat(fd).map_err(unavailable)?.st_ino;
         Ok(Self {
@@ -2955,6 +4262,9 @@ impl SocketProof {
 #[cfg(test)]
 #[path = "native_profile_channel_tests.rs"]
 mod issuer_tests;
+#[cfg(test)]
+#[path = "native_profile_udp_tests.rs"]
+mod udp_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
