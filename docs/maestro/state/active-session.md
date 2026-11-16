@@ -658,8 +658,9 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   reservation deadline. Root возвращает binding вместе с deadline, включает
   его в минимум waiter state и повторно перед ACK. Actual driver RED короткого
   Reserve5ms→Bind через3ms с большим remaining воспроизведён; GREEN28 serial
-  transport driver tests PASS. CODEC3/schema неизменны, correction ждёт narrow
-  recheck. Numeric42→durable USER GRANT ещё не реализован; production transcript
+  transport driver tests PASS, no-run/clippy/fmt и cleanup завершены. R43P2
+  CLOSED по narrow SOURCE recheck a40e1d5. CODEC3/schema неизменны.
+  Numeric42→durable USER GRANT ещё не реализован; production transcript
   pin DNS_WIRE_REVIEWED_PATCH=None, public gates закрыты.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
