@@ -48,6 +48,10 @@ impl Ops<BorrowedFd<'_>> for Kernel {
 pub fn socket_namespace(socket: impl AsFd) -> io::Result<OwnedFd> {
     checked(&Kernel, &socket.as_fd())
 }
+/// Только чтение SO_MARK actual profile socket; не general getsockopt API.
+pub fn profile_socket_mark(socket: impl AsFd) -> io::Result<u32> {
+    udp_raw::mark(socket.as_fd())
+}
 
 /// Только fixed IPv4 UDP profile socket; не general setsockopt/recvmsg API.
 pub struct UdpPeek {
@@ -132,6 +136,9 @@ mod udp_raw {
             return Err(io::ErrorKind::InvalidData.into());
         }
         Ok(value)
+    }
+    pub(super) fn mark(fd: BorrowedFd<'_>) -> io::Result<u32> {
+        Ok(option(fd, libc::SOL_SOCKET, libc::SO_MARK)? as u32)
     }
     fn set(fd: BorrowedFd<'_>, level: i32, name: i32, value: i32) -> io::Result<()> {
         // SAFETY: private fixed options, readonly int; generic API не экспортируется.

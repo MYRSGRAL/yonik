@@ -13,6 +13,8 @@ use std::{
 const RUNTIME_PACKET: usize = 2293;
 #[path = "native_dns_bundle.rs"]
 mod dns_bundle;
+#[path = "native_dns_transport.rs"]
+pub(crate) mod dns_transport;
 use std::{
     fs::File,
     io::{Read, Write},
@@ -23,6 +25,12 @@ use std::{
 };
 
 pub(crate) trait RouteAuthority: Send {
+    fn dns_socket(
+        &mut self,
+        scope: &RuntimeScopeStamp,
+        ticket: u64,
+        facts: &dns_transport::Facts,
+    ) -> Result<(), ServiceError>;
     fn service(
         &mut self,
         scope: &RuntimeScopeStamp,
@@ -165,6 +173,9 @@ impl Subject {
     }
 }
 trait Authority: Send {
+    fn dns_socket(&mut self, _: Option<u64>, _: &dns_transport::Facts) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported)
+    }
     fn admission_deadline(&self) -> Option<Instant> {
         None
     }
@@ -238,6 +249,7 @@ struct SourceFlow<I> {
 }
 /// Общая bounded история v2. Runtime/proof IDs никогда не alias друг друга.
 struct InvocationHistory {
+    reserved: usize,
     entries: [Option<(u8, u64)>; 256],
     len: usize,
     limit: usize,
@@ -1474,6 +1486,7 @@ impl InvocationHistory {
             .map_err(unavailable)?;
         Ok(Self {
             entries: [None; 256],
+            reserved: 0,
             len: 0,
             limit: (limit as usize).min(256),
             last_operation: 0,
@@ -1491,7 +1504,7 @@ impl InvocationHistory {
         if self.entries[..self.len].contains(&Some((kind, id))) {
             return Ok(());
         }
-        if self.len >= self.limit {
+        if self.len + self.reserved >= self.limit {
             return Err(ServiceError::Busy);
         }
         self.entries[self.len] = Some((kind, id));
@@ -1513,6 +1526,41 @@ impl InvocationHistory {
             .filter(|id| *id != u64::MAX)
             .ok_or(ServiceError::Unavailable)?;
         Ok(self.next_source)
+    }
+}
+struct HistoryCredit {
+    history: Arc<std::sync::Mutex<InvocationHistory>>,
+    live: bool,
+}
+impl HistoryCredit {
+    fn claim(history: Arc<std::sync::Mutex<InvocationHistory>>) -> Result<Self, ServiceError> {
+        {
+            let mut h = history.lock().map_err(unavailable)?;
+            if h.len + h.reserved >= h.limit {
+                return Err(ServiceError::Busy);
+            }
+            h.reserved += 1;
+        }
+        Ok(Self {
+            history,
+            live: true,
+        })
+    }
+    fn commit(mut self, kind: u8, id: u64) -> Result<(), ServiceError> {
+        let mut h = self.history.lock().map_err(unavailable)?;
+        h.reserved -= 1;
+        self.live = false;
+        h.reserve(kind, id)
+    }
+}
+impl Drop for HistoryCredit {
+    fn drop(&mut self) {
+        if self.live {
+            // Poison сохраняет debit; дальнейшие history операции fail closed.
+            if let Ok(mut h) = self.history.lock() {
+                h.reserved -= 1;
+            }
+        }
     }
 }
 struct Grant {
@@ -1626,6 +1674,7 @@ impl<'a> RoutePlan<'a> {
     }
 }
 struct Issuer<A: Authority> {
+    transport: dns_transport::Transport,
     authority: A,
     capsule: Arc<wire::OwnedCapsule>,
     record: LaunchRecord,
@@ -1662,6 +1711,7 @@ impl<A: Authority> Issuer<A> {
         let budget = ChannelBudget::new(&capsule, record.mode.required(), &record.binding.digest)?;
         Ok(Self {
             authority,
+            transport: dns_transport::Transport::new(&budget.dynamic)?,
             capsule,
             record,
             flows: BTreeMap::new(),
@@ -2173,6 +2223,11 @@ impl<A: Authority> Issuer<A> {
         if self.unknown {
             return Err(ServiceError::Unavailable);
         }
+        if self.transport.cancel_request(request).is_err() {
+            self.unknown = true;
+            self.authority.revoke();
+            return Err(ServiceError::Unavailable);
+        }
         self.cancel_dns_request(request)?;
         if let Some((id, _)) = self.services.iter().find(|(_, g)| g.request == request) {
             let id = *id;
@@ -2207,6 +2262,16 @@ struct SystemAuthority {
     routes: Box<dyn RouteAuthority>,
 }
 impl Authority for SystemAuthority {
+    fn dns_socket(
+        &mut self,
+        ticket: Option<u64>,
+        facts: &dns_transport::Facts,
+    ) -> Result<(), ServiceError> {
+        self.fence()?;
+        self.routes
+            .dns_socket(&self.scope, ticket.ok_or(ServiceError::Unsupported)?, facts)?;
+        self.fence()
+    }
     fn admission_deadline(&self) -> Option<Instant> {
         Some(self.scope.admission_deadline())
     }
@@ -2374,6 +2439,17 @@ struct LocalAuthority {
     prepared: Arc<crate::host::local_profile_channel::Prepared>,
 }
 impl Authority for LocalAuthority {
+    fn dns_socket(
+        &mut self,
+        ticket: Option<u64>,
+        facts: &dns_transport::Facts,
+    ) -> Result<(), ServiceError> {
+        self.fence()?;
+        if ticket.is_some() || facts.mark() != 0 {
+            return Err(ServiceError::Unsupported);
+        }
+        Ok(())
+    }
     fn admission_deadline(&self) -> Option<Instant> {
         Some(self.deadline)
     }
@@ -2918,6 +2994,15 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn dns_slots(&self) -> Result<Arc<SidebandCredits>, ServiceError> {
+        Err(ServiceError::Unsupported)
+    }
+    fn take_dns(&self) -> Result<Option<dns_transport::Incoming>, ServiceError> {
+        Ok(None)
+    }
+    fn take_dns_credit(&self, _: u64) -> Result<super::memory::ByteLease, ServiceError> {
+        Err(ServiceError::Unsupported)
+    }
     fn setup_read(
         &self,
         pid: u32,
@@ -3132,6 +3217,7 @@ struct WaitingFrame {
     canceled: bool,
 }
 struct Rendezvous<T> {
+    dns_physical: VecDeque<dns_transport::Incoming>,
     dns: Option<wire::dns_v2::Negotiated>,
     pending: BTreeMap<u64, Waiting<T>>,
     ready: BTreeMap<u64, Waiting<T>>,
@@ -3187,6 +3273,7 @@ impl<T> Rendezvous<T> {
         incoming.accept(1).map_err(unavailable)?;
         Ok(Self {
             dns: None,
+            dns_physical: VecDeque::new(),
             pending: BTreeMap::new(),
             ready: BTreeMap::new(),
             udp_pending: BTreeMap::new(),
@@ -3464,6 +3551,7 @@ struct DeliveryCredit {
     _slot: super::memory::ByteLease,
 }
 struct SystemChannel {
+    budget: Arc<ChannelBudget>,
     runtime: tokio::net::UnixDatagram,
     proof: tokio::net::UnixDatagram,
     peer: Arc<Peer>,
@@ -3585,6 +3673,7 @@ impl SystemChannel {
         };
         Ok(Self {
             runtime,
+            budget,
             proof,
             peer,
             launch,
@@ -3635,6 +3724,8 @@ impl SystemChannel {
             self, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
         };
         inbox.proof_capacity()?;
+        let history_credit = self.history().map(HistoryCredit::claim).transpose()?;
+        let dns_memory = self.budget.dynamic.reserve(2048).map_err(unavailable)?;
         let (slot, mut fds) = inbox.slots.read_credit(16)?;
         let mut bytes = [0; 257];
         let mut control = [std::mem::MaybeUninit::uninit();
@@ -3688,6 +3779,37 @@ impl SystemChannel {
         {
             return Err(ServiceError::Unavailable);
         }
+        if &bytes[..8] == b"DNSPHY02" {
+            if msg.bytes != 192 {
+                return Err(ServiceError::Unavailable);
+            }
+            let packet = wire::dns_v2::PhysicalPacket::decode(
+                &bytes[..192],
+                inbox.dns.as_ref().ok_or(ServiceError::Unavailable)?,
+                usize::from(socket.is_some()),
+                1,
+            )
+            .map_err(unavailable)?;
+            let mut raw = [0; 192];
+            raw.copy_from_slice(packet.view().bytes());
+            let evidence = dns_transport::Evidence::capture(
+                socket.ok_or(ServiceError::Unavailable)?,
+                Arc::clone(&self.peer),
+            )?;
+            fds.resize(2).map_err(unavailable)?;
+            inbox
+                .dns_physical
+                .push_back(dns_transport::Incoming::captured(
+                    raw,
+                    evidence,
+                    slot,
+                    fds,
+                    dns_memory,
+                    history_credit,
+                ));
+            return Ok(true);
+        }
+        drop(history_credit);
         if &bytes[..8] != b"YNKSPF01" {
             let udp = self.udp.as_ref().ok_or(ServiceError::Unsupported)?;
             let record = wire::udp_v2::Record::decode(
@@ -3876,6 +3998,42 @@ impl SystemChannel {
     }
 }
 impl Channel for SystemChannel {
+    fn dns_slots(&self) -> Result<Arc<SidebandCredits>, ServiceError> {
+        Ok(Arc::clone(
+            &self
+                .peer
+                .proofs
+                .as_ref()
+                .ok_or(ServiceError::Unavailable)?
+                .lock()
+                .map_err(unavailable)?
+                .slots,
+        ))
+    }
+    fn take_dns(&self) -> Result<Option<dns_transport::Incoming>, ServiceError> {
+        Ok(self
+            .peer
+            .proofs
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .lock()
+            .map_err(unavailable)?
+            .dns_physical
+            .pop_front())
+    }
+    fn take_dns_credit(&self, sequence: u64) -> Result<super::memory::ByteLease, ServiceError> {
+        Ok(self
+            .peer
+            .proofs
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .lock()
+            .map_err(unavailable)?
+            .delivered
+            .remove(&sequence)
+            .ok_or(ServiceError::Unavailable)?
+            ._slot)
+    }
     fn setup_read(
         &self,
         pid: u32,
@@ -4246,12 +4404,15 @@ fn drain_before_publication<A: Authority>(
     acks: &mut VecDeque<CancelReply>,
 ) -> Result<(), ServiceError> {
     for _ in 0..64 {
+        dns_transport::ingest(issuer, socket)?;
         socket.maintain(&mut |id| issuer.cancel_flow(id))?;
         if queued.len() + acks.len() >= 64 {
             return Err(ServiceError::Busy);
         }
         let mut bytes = [0; RUNTIME_PACKET];
-        let Some(length) = socket.read(pid, uid, &mut bytes)? else {
+        let next = socket.read(pid, uid, &mut bytes)?;
+        dns_transport::ingest(issuer, socket)?;
+        let Some(length) = next else {
             return Ok(());
         };
         if dns_bundle::is_dns(&bytes[..length]) {
@@ -4412,6 +4573,7 @@ fn run_issuer<A: Authority>(
     let mut queued = VecDeque::<Queued>::with_capacity(64);
     let mut acks = VecDeque::<CancelReply>::with_capacity(64);
     loop {
+        dns_transport::ingest(issuer, socket)?;
         socket.maintain(&mut |id| issuer.cancel_flow(id))?;
         issuer.fence()?;
         let now = issuer.authority.now();
@@ -4439,11 +4601,47 @@ fn run_issuer<A: Authority>(
             issuer.cancel_grant(*id)?;
         }
         issuer.expire_dns()?;
+        if awaiting.is_none() {
+            dns_transport::progress(issuer, socket, stop, &mut outgoing, |issuer| {
+                drain_before_publication(
+                    issuer,
+                    socket,
+                    pid,
+                    uid,
+                    &mut incoming,
+                    &mut queued,
+                    &mut acks,
+                )
+            })?;
+        }
+        while let Some(ack) = acks.pop_front() {
+            outgoing = outgoing
+                .checked_add(1)
+                .filter(|n| *n != u64::MAX)
+                .ok_or(ServiceError::Unavailable)?;
+            send_cancel_reply(issuer, socket, stop, outgoing, ack, expires)?;
+            socket.processed(ack.request)?;
+        }
         let (n, sequenced) = if let Some(pending) = queued.pop_front() {
             bytes = pending.bytes;
             (pending.length, true)
         } else {
             let Some(n) = socket.read(pid, uid, &mut bytes)? else {
+                if awaiting.is_none()
+                    && dns_transport::progress(issuer, socket, stop, &mut outgoing, |issuer| {
+                        drain_before_publication(
+                            issuer,
+                            socket,
+                            pid,
+                            uid,
+                            &mut incoming,
+                            &mut queued,
+                            &mut acks,
+                        )
+                    })?
+                {
+                    continue;
+                }
                 let until = issuer
                     .grants
                     .values()
@@ -5495,6 +5693,9 @@ impl SocketProof {
     }
 }
 
+#[cfg(test)]
+#[path = "native_dns_transport_tests.rs"]
+mod dns_transport_tests;
 #[cfg(test)]
 #[path = "native_profile_channel_tests.rs"]
 mod issuer_tests;

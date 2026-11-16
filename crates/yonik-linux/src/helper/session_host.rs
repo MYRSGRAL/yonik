@@ -741,6 +741,44 @@ impl ProfileRoutes {
     }
 }
 impl crate::helper::native_profile_channel::RouteAuthority for ProfileRoutes {
+    fn dns_socket(
+        &mut self,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        ticket: u64,
+        facts: &crate::helper::native_profile_channel::dns_transport::Facts,
+    ) -> Result<(), ServiceError> {
+        let bound = *self.tickets.get(&ticket).ok_or(ServiceError::Unavailable)?;
+        let shared = self.backend.upgrade().ok_or(ServiceError::Unavailable)?;
+        let mut backend = shared.try_lock().map_err(unavailable)?;
+        let runtime = self.runtime.clone();
+        let result = runtime.block_on(async {
+            let (_keep, mut cancel) = fresh_cancel();
+            let artifact = self.fence(&mut backend, scope, &mut cancel).await?;
+            let (route, _) = self.dynamic.get(&bound).ok_or(ServiceError::Unavailable)?;
+            if facts.remote().ip() != route.endpoint
+                || facts.remote().port() != route.port
+                || facts.protocol()
+                    != match route.protocol {
+                        crate::TransportProtocol::Tcp => 6,
+                        crate::TransportProtocol::Udp => 17,
+                    }
+                || route.route.preferred_source != Some(facts.local().ip())
+                || facts.local().port() == 0
+                || facts.mark() != artifact.plan.socket_mark()
+                || facts.uid() != artifact.worker_uid
+            {
+                return Err(ServiceError::Unavailable);
+            }
+            scope.validate().map_err(unavailable)
+        });
+        if result.is_err() {
+            self.unknown = true;
+            scope.revoke();
+            backend.native_owner.revoke();
+            backend.worker_uncertain = true;
+        }
+        result
+    }
     fn check(
         &mut self,
         scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,

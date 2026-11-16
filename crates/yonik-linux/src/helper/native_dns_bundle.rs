@@ -35,6 +35,11 @@ struct DnsHopPermit {
     ticket: Option<u64>,
 }
 struct Bundle {
+    base_hash: [u8; 32],
+    qtype: u16,
+    options: u16,
+    payload: u16,
+    resolver: u16,
     root: u64,
     query: u64,
     request: u64,
@@ -81,6 +86,50 @@ pub(super) fn decode<'a>(
     DnsFrame::decode(bytes, neg, direction, 0, 0, reply).map_err(unavailable)
 }
 impl<A: Authority> Issuer<A> {
+    pub(super) fn direct_dns_binding(
+        &self,
+        id: u64,
+    ) -> Result<super::dns_transport::Binding, ServiceError> {
+        let expires = self.bundle_live(id)?;
+        let b = self.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
+        if b.hops.len() != 1 {
+            return Err(ServiceError::Unsupported);
+        }
+        let h = &b.hops[0];
+        let cap = self.capsule()?;
+        let dial = cap.dial_scope(h.scope, h.branch).map_err(unavailable)?;
+        let resolver = cap.resolver_scope(b.resolver).map_err(unavailable)?;
+        let grant = self.grants.get(&b.root).ok_or(ServiceError::Unavailable)?;
+        if dial.action != 3
+            || dial.next.is_some()
+            || h.carrier != resolver.peer.protocol
+            || resolver.peer.family == 3
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        reject_unproved_stub(resolver.peer)?;
+        Ok(super::dns_transport::Binding {
+            bundle: id,
+            revision: b.revision,
+            root: b.root,
+            query: b.query,
+            epoch: self.record.binding.epoch,
+            source: grant.source,
+            source_revision: cap.policy_revision,
+            resolver: b.resolver,
+            subject: h.subject,
+            scope: h.scope,
+            branch: h.branch,
+            qtype: b.qtype,
+            options: b.options,
+            payload: b.payload,
+            base: b.base_hash,
+            name: Target::host(&grant.query, 53)?,
+            peer: Target::copy(resolver.peer)?,
+            ticket: h.ticket,
+            expires,
+        })
+    }
     // Не извлекаем authority из номера row: manifest/path independently checked.
     fn bundle_root(
         &mut self,
@@ -160,6 +209,11 @@ impl<A: Authority> Issuer<A> {
         if self.unknown {
             return Err(ServiceError::Unavailable);
         }
+        if self.transport.cancel_bundle(id).is_err() {
+            self.unknown = true;
+            self.authority.revoke();
+            return Err(ServiceError::Unavailable);
+        }
         let Some(mut bundle) = self.dns.live.remove(&id) else {
             return if id > self.dns.next {
                 Err(ServiceError::InvalidRequest)
@@ -214,7 +268,7 @@ impl<A: Authority> Issuer<A> {
         }
         Ok(())
     }
-    fn bundle_history(&mut self, count: usize) -> Result<(), ServiceError> {
+    pub(super) fn bundle_history(&mut self, count: usize) -> Result<(), ServiceError> {
         let limit = (self.capsule()?.limits()[7] as usize).min(256);
         if self
             .dns
@@ -227,7 +281,11 @@ impl<A: Authority> Issuer<A> {
         if let Some(history) = &self.history {
             // Отдельные kind/id namespaces, без eviction/reuse.
             let mut h = history.lock().map_err(unavailable)?;
-            if h.len.checked_add(count).is_none_or(|n| n > h.limit) {
+            if h.len
+                .checked_add(h.reserved)
+                .and_then(|n| n.checked_add(count))
+                .is_none_or(|n| n > h.limit)
+            {
                 return Err(ServiceError::Busy);
             }
             for i in 0..count {
@@ -258,6 +316,9 @@ impl<A: Authority> Issuer<A> {
         let count = usize::from(u16_at(b, 50));
         let (id, revision) = if let Some((id, expected)) = view.renewal().map_err(unavailable)? {
             let id = id.get();
+            if self.transport.references(id) {
+                return Err(ServiceError::Unsupported);
+            }
             let old = self.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
             if old.revision != expected.get()
                 || old.fingerprint != fingerprint
@@ -373,6 +434,11 @@ impl<A: Authority> Issuer<A> {
         self.dns.live.insert(
             id,
             Box::new(Bundle {
+                base_hash: Sha256::digest(view.base()).into(),
+                qtype: u16_at(b, 52),
+                options: u16_at(b, 54),
+                payload: u16_at(b, 56),
+                resolver: u16_at(b, 60),
                 root,
                 query,
                 request,
@@ -441,7 +507,7 @@ impl<A: Authority> Issuer<A> {
         retired?;
         Ok(id)
     }
-    fn bundle_live(&self, id: u64) -> Result<Instant, ServiceError> {
+    pub(super) fn bundle_live(&self, id: u64) -> Result<Instant, ServiceError> {
         self.fence()?;
         let b = self.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
         let g = self.grants.get(&b.root).ok_or(ServiceError::Unavailable)?;
@@ -534,6 +600,16 @@ pub(super) fn dispatch<A: Authority>(
     let neg = issuer.negotiated.ok_or(ServiceError::Unavailable)?;
     let frame = decode(bytes, &neg, Direction::Producer)?;
     let reply = frame.header.sequence;
+    if matches!(
+        frame.record,
+        Record::Reserve(_) | Record::LogicalBind(_) | Record::Retire(_)
+    ) {
+        let response = super::dns_transport::handle(issuer, socket, reply, frame.record, session)?;
+        if !issuer.unknown {
+            drain(issuer)?;
+        }
+        return super::dns_transport::send_reply(issuer, socket, stop, sequence, response);
+    }
     let mut body = [0; 64];
     body[..2].copy_from_slice(&2u16.to_be_bytes());
     let op = match frame.record {
@@ -562,7 +638,7 @@ pub(super) fn dispatch<A: Authority>(
             }
             Operation::BundleGranted
         }
-        Record::Cancel(view) if matches!(view.bytes()[2], 1 | 8) => {
+        Record::Cancel(view) if matches!(view.bytes()[2], 1..=4 | 7 | 8) => {
             let (target, id) = cancel_fields(view);
             body[2] = if cancel(issuer, reply, target, id).is_ok() {
                 1
@@ -634,6 +710,7 @@ pub(super) fn cancel<A: Authority>(
     match target {
         8 => issuer.cancel_dns_bundle(id),
         1 if id < sequence => issuer.cancel_request(id),
+        2..=4 | 7 => super::dns_transport::cancel(issuer, target, id),
         _ => Err(ServiceError::InvalidRequest),
     }
 }
