@@ -445,6 +445,17 @@ enum Command {
         id: i64,
         revision: i64,
     },
+    SelectCatalog {
+        kind: CatalogKind,
+        id: i64,
+        page: u64,
+    },
+    CatalogFavorite {
+        kind: CatalogKind,
+        id: i64,
+        page: u64,
+        value: bool,
+    },
     StartupPreferencesSet {
         request_id: String,
         expected_revision: String,
@@ -494,6 +505,16 @@ enum Command {
     Shutdown,
 }
 impl Command {
+    fn requires_server_selection(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect
+                | Self::RoutingApply { .. }
+                | Self::CheckTcp
+                | Self::AutoconnectTargetSet { .. }
+                | Self::StartupPreferencesSet { .. }
+        )
+    }
     fn preset_request_id(&self) -> Option<u64> {
         match self {
             Self::PresetPrepare { request_id, .. }
@@ -524,6 +545,8 @@ impl Command {
                 | Self::RoutingDefault { .. }
                 | Self::RoutingDelete { .. }
                 | Self::SelectProfile { .. }
+                | Self::SelectCatalog { .. }
+                | Self::CatalogFavorite { .. }
                 | Self::SelectSource { .. }
                 | Self::Refresh
                 | Self::Reload
@@ -558,9 +581,18 @@ impl Command {
                 | Self::Query { .. }
                 | Self::Favorite { .. }
                 | Self::SelectProfile { .. }
+                | Self::SelectCatalog { .. }
+                | Self::CatalogFavorite { .. }
         )
     }
 }
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum CatalogKind {
+    Server,
+    Xray,
+}
+
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Route {
@@ -988,6 +1020,9 @@ fn validate(command: &Command) -> Result<()> {
         | Command::DeleteSource { id }
         | Command::CancelRefresh { id, .. } => *id > 0,
         Command::SelectProfile { id, revision } => *id > 0 && *revision > 0,
+        Command::SelectCatalog { id, page, .. } | Command::CatalogFavorite { id, page, .. } => {
+            *id > 0 && *page > 0 && *page <= 9_007_199_254_740_991
+        }
         Command::StartupPreferencesSet {
             request_id,
             expected_revision,
@@ -1050,8 +1085,8 @@ fn catalog_profile_dto(profile: yonik_linux::CatalogProfile) -> ProfileDto {
             protocol: "xray".into(),
             favorite: profile.favorite,
             available: profile.available,
-            // DATA-каталог не подтверждает готовность native consumer/Connect.
-            selectable: false,
+            // Выбор DATA не разрешает запуск native consumer.
+            selectable: profile.available,
         },
     }
 }
@@ -1181,7 +1216,7 @@ mod full_profile_review_tests {
         assert!(json["port"].is_null());
         assert!(row.available);
         assert!(row.favorite);
-        assert!(!row.selectable);
+        assert!(row.selectable);
     }
 
     #[test]
@@ -1276,6 +1311,9 @@ struct Snapshot {
     system_tun_available: bool,
     status: &'static str,
     selected_profile: Option<i64>,
+    selected_kind: Option<&'static str>,
+    selected_catalog_page: Option<u64>,
+    catalog_page: u64,
     selected_name: Option<String>,
     engine: EngineChoice,
     port: u16,
@@ -1361,6 +1399,9 @@ impl Snapshot {
             system_tun_available: false,
             status: "Disconnected",
             selected_profile: None,
+            selected_kind: None,
+            selected_catalog_page: None,
+            catalog_page: 0,
             selected_name: None,
             engine: EngineChoice::Xray,
             port: 0,
@@ -1767,6 +1808,9 @@ struct Actor {
     state: Snapshot,
     callback: Callback,
     selected: Option<ResolvedProfile>,
+    selected_native: Option<yonik_linux::ResolvedCatalogProfile>,
+    catalog_selections: Vec<(CatalogKind, i64, yonik_linux::CatalogSelection)>,
+    catalog_coordinates: Option<(i64, i64, i64, i64)>,
     pending: Option<Box<PendingRefresh>>,
     automatic_port: bool,
     probe_url: Zeroizing<String>,
@@ -2179,8 +2223,27 @@ impl Actor {
             && self.state.pending.is_none();
         self.state.emit(&self.callback);
     }
+    fn catalog_selection(
+        &self,
+        kind: CatalogKind,
+        id: i64,
+        page: u64,
+    ) -> SourceResult<yonik_linux::CatalogSelection> {
+        if page != self.state.catalog_page {
+            return Err(DesktopError("profile_unavailable").into());
+        }
+        self.catalog_selections
+            .iter()
+            .find(|(k, i, _)| *k == kind && *i == id)
+            .map(|(_, _, selection)| selection.clone())
+            .ok_or_else(|| DesktopError("profile_unavailable").into())
+    }
     fn clear_selection(&mut self) {
         self.selected = None;
+        self.selected_native = None;
+        self.state.selected_kind = None;
+        self.state.selected_catalog_page = None;
+        self.invalidate_preset();
         self.state.selected_profile = None;
         self.state.selected_name = None;
         self.state.tcp_result = None;
@@ -2213,6 +2276,13 @@ impl Actor {
         Ok(())
     }
     async fn page(&mut self) -> SourceResult<()> {
+        self.catalog_selections.clear();
+        self.state.catalog_page = self
+            .state
+            .catalog_page
+            .checked_add(1)
+            .filter(|v| *v <= 9_007_199_254_740_991)
+            .ok_or(DesktopError("profile_unavailable"))?;
         self.state.source_generation = None;
         self.state.profiles.clear();
         self.state.total = 0;
@@ -2255,13 +2325,38 @@ impl Actor {
             )
             .await
             .map_err(SourceFailure::subscription)?;
+        let coordinates = (
+            id,
+            page.source_generation,
+            page.snapshot_generation,
+            page.snapshot_revision,
+        );
+        if self
+            .service()
+            .schedule_generation(id)
+            .await
+            .map_err(SourceFailure::subscription)?
+            != Some(page.source_generation)
+        {
+            self.clear_selection();
+            return Err(DesktopError("profile_unavailable").into());
+        }
+        if self.catalog_coordinates != Some(coordinates) {
+            self.clear_selection();
+        }
+        self.catalog_coordinates = Some(coordinates);
         self.state.total = page.total;
         self.state.revision = page.snapshot_revision;
-        self.state.profiles = page
-            .profiles
-            .into_iter()
-            .map(|(profile, _selection)| catalog_profile_dto(profile))
-            .collect();
+        for (profile, selection) in page.profiles {
+            let row = catalog_profile_dto(profile);
+            let kind = if row.kind == "xray" {
+                CatalogKind::Xray
+            } else {
+                CatalogKind::Server
+            };
+            self.catalog_selections.push((kind, row.id, selection));
+            self.state.profiles.push(row);
+        }
         // Подтверждение нового snapshot всегда требует повторного выбора.
         if self
             .selected
@@ -2273,6 +2368,9 @@ impl Actor {
         Ok(())
     }
     async fn source_command(&mut self, command: Command) -> SourceResult<()> {
+        if self.selected_native.is_some() && command.requires_server_selection() {
+            return Err(DesktopError("profile_unavailable").into());
+        }
         match command {
             Command::Reload => self.reload().await,
             Command::SourcePage { offset } => {
@@ -2443,6 +2541,86 @@ impl Actor {
                 self.state.offset = offset;
                 self.page().await
             }
+            Command::SelectCatalog { kind, id, page } => {
+                let selection = self.catalog_selection(kind, id, page)?;
+                self.clear_selection();
+                let profile = self
+                    .service()
+                    .select_catalog_profile(selection)
+                    .await
+                    .map_err(SourceFailure::subscription)?;
+                if Some(profile.source_id) != self.state.source_id
+                    || self.catalog_coordinates
+                        != Some((
+                            profile.source_id,
+                            profile.source_generation,
+                            profile.snapshot_generation,
+                            profile.snapshot_revision,
+                        ))
+                    || self
+                        .service()
+                        .schedule_generation(profile.source_id)
+                        .await
+                        .map_err(SourceFailure::subscription)?
+                        != Some(profile.source_generation)
+                {
+                    return Err(DesktopError("profile_unavailable").into());
+                }
+                self.state.selected_catalog_page = Some(page);
+                match &profile.entry {
+                    yonik_import::ProfileEntry::Xray(_) => {
+                        if kind != CatalogKind::Xray {
+                            return Err(DesktopError("profile_unavailable").into());
+                        }
+                        self.state.selected_name = self
+                            .state
+                            .profiles
+                            .iter()
+                            .find(|row| row.id == id && row.kind == "xray")
+                            .map(|row| row.name.clone());
+                        self.state.selected_kind = Some("xray");
+                        self.state.selected_profile = Some(id);
+                        self.selected_native = Some(profile);
+                    }
+                    yonik_import::ProfileEntry::Server(_) => {
+                        if kind != CatalogKind::Server {
+                            return Err(DesktopError("profile_unavailable").into());
+                        }
+                        let legacy = self
+                            .service()
+                            .select_profile(id, profile.snapshot_revision)
+                            .await
+                            .map_err(SourceFailure::selection)?;
+                        if self
+                            .service()
+                            .schedule_generation(profile.source_id)
+                            .await
+                            .map_err(SourceFailure::subscription)?
+                            != Some(profile.source_generation)
+                        {
+                            return Err(DesktopError("profile_unavailable").into());
+                        }
+                        self.state.selected_name = Some(legacy.profile.name.clone());
+                        self.state.selected_kind = Some("server");
+                        self.state.selected_profile = Some(id);
+                        self.selected = Some(legacy);
+                    }
+                }
+                Ok(())
+            }
+            Command::CatalogFavorite {
+                kind,
+                id,
+                page,
+                value,
+            } => {
+                let selection = self.catalog_selection(kind, id, page)?;
+                self.service()
+                    .set_catalog_favorite(selection, value)
+                    .await
+                    .map_err(SourceFailure::subscription)?;
+                self.page().await
+            }
             Command::Favorite { id, value } => {
                 self.service()
                     .set_favorite(id, value)
@@ -2461,9 +2639,8 @@ impl Actor {
                 {
                     return Err(DesktopError("profile_unavailable").into());
                 }
-                if self.state.selected_profile != Some(id) {
-                    self.state.tcp_result = None;
-                }
+                self.clear_selection();
+                self.state.selected_kind = Some("server");
                 self.state.selected_profile = Some(id);
                 self.state.selected_name = Some(profile.profile.name.clone());
                 self.selected = Some(profile);
@@ -3295,6 +3472,9 @@ mod settings_tests {
             state: Snapshot::new(true),
             callback: Arc::new(|_| {}),
             selected: None,
+            selected_native: None,
+            catalog_selections: Vec::new(),
+            catalog_coordinates: None,
             pending: None,
             automatic_port: true,
             probe_url: Zeroizing::new(DEFAULT_PROBE_URL.into()),
@@ -4381,6 +4561,9 @@ async fn run(
         state,
         callback,
         selected: None,
+        selected_native: None,
+        catalog_selections: Vec::new(),
+        catalog_coordinates: None,
         pending: None,
         automatic_port,
         probe_url,
@@ -5300,13 +5483,14 @@ async fn run(
                 actor.state.command_generation = envelope.generation;
                 actor.state.begin_command(&envelope.command);
                 let manual_review_completion = if scheduled.review.is_none() && matches!(envelope.command, Command::ApproveRefresh | Command::DiscardRefresh) { actor.pending.as_ref().map(|pending| pending.identity()) } else { None };
-                if matches!(envelope.command, Command::SelectProfile { .. } | Command::SelectSource { .. } | Command::Reload | Command::ApproveRefresh) {
+                if matches!(envelope.command, Command::SelectProfile { .. } | Command::SelectCatalog { .. } | Command::SelectSource { .. } | Command::Reload | Command::ApproveRefresh) {
                     if let Some(flight) = system_flight.as_ref().filter(|flight| flight.connecting) {
                         flight.cancel.send_replace(true); system_stop = true;
                     }
                 }
                 let local_is_file = matches!(&envelope.command, Command::ImportFile { .. });
                 let outcome: SourceResult<()> = match envelope.command {
+                    ref command if actor.selected_native.is_some() && command.requires_server_selection() => Err(DesktopError("profile_unavailable").into()),
                     Command::StartupPreferencesSet { request_id, expected_revision, autostart_into_tray, autoconnect } => actor.startup_save(request_id, expected_revision, Some((autostart_into_tray, autoconnect)), &control, envelope.generation).await.map_err(Into::into),
                     Command::AutoconnectTargetSet { request_id, expected_revision } => actor.startup_save(request_id, expected_revision, None, &control, envelope.generation).await.map_err(Into::into),
                     Command::ImportText { name, text } | Command::ImportFile { name, path: text } => {
@@ -5568,7 +5752,7 @@ async fn run(
                         } else { actor.source_command(command).await }
                     }
                 };
-                if envelope.generation != control.generation.load(Ordering::SeqCst) { continue; }
+                if envelope.generation != control.generation.load(Ordering::SeqCst) { actor.clear_selection(); continue; }
                 let command_context = outcome.as_ref().err().and_then(|failure| {
                     context_request_id.and_then(|id| actor.state.error_contexts.matching(Slot::RoutingAck, Some(failure.key()), Some(id)))
                         .or_else(|| actor.state.error_contexts.matching(Slot::Error, Some(failure.key()), None))
@@ -5716,7 +5900,7 @@ async fn run(
     } else {
         true
     };
-    actor.selected = None;
+    actor.clear_selection();
     let service_closed = if let Some(service) = actor.service.take() {
         service.close().await.is_ok()
     } else {
@@ -5804,6 +5988,9 @@ mod routing_regressions {
                 state: Snapshot::new(true),
                 callback: Arc::new(|_| {}),
                 selected: None,
+                selected_native: None,
+                catalog_selections: Vec::new(),
+                catalog_coordinates: None,
                 pending: None,
                 automatic_port: true,
                 probe_url: Zeroizing::new(DEFAULT_PROBE_URL.into()),
@@ -5893,6 +6080,157 @@ mod routing_regressions {
         drop(actor);
         drop(lock);
         std::fs::remove_dir_all(path).expect("очистка своей fixture");
+    }
+    #[tokio::test]
+    async fn p6_native_data_selection_is_closed_and_revision_bound() {
+        let (mut actor, lock, path) = fixture().await;
+        let original = include_bytes!("../../../tests/fixtures/xray-full-profile-seven.json");
+        actor.source_command(serde_json::from_value(serde_json::json!({"command":"add_source","name":"Полные профили","url":"https://example.org/native","local_exception":false,"route":"direct","hwid_enabled":false})).expect("источник")).await.expect("создать источник без fetch");
+        let native_source = actor.state.source_id.expect("источник");
+        actor
+            .routing_repository()
+            .commit_snapshot(
+                native_source,
+                1,
+                0,
+                yonik_linux::SnapshotInput {
+                    body: original.to_vec(),
+                    metadata: b"{}".to_vec(),
+                    validators: None,
+                },
+            )
+            .await
+            .expect("DATA snapshot");
+        actor.reload().await.expect("каталог");
+        assert_eq!(actor.state.profiles.len(), 7);
+        assert_eq!(actor.catalog_selections.len(), 7);
+        let id = actor.state.profiles[0].id;
+        let page = actor.state.catalog_page;
+        for row in &actor.state.profiles {
+            assert_eq!(row.kind, "xray");
+            assert!(row.host.is_none() && row.port.is_none() && row.selectable);
+        }
+        assert!(
+            actor
+                .catalog_selection(CatalogKind::Server, id, page)
+                .is_err()
+        );
+        assert!(
+            actor
+                .catalog_selection(CatalogKind::Xray, id, page + 1)
+                .is_err()
+        );
+        let routing = serde_json::to_value(&actor.state.routing).expect("draft");
+        actor
+            .source_command(Command::SelectCatalog {
+                kind: CatalogKind::Xray,
+                id,
+                page,
+            })
+            .await
+            .expect("выбор DATA");
+        assert!(actor.selected.is_none());
+        assert!(actor.selected_native.is_some());
+        assert_eq!(actor.state.selected_kind, Some("xray"));
+        actor.emit();
+        assert!(!actor.state.can_connect);
+        for value in [
+            serde_json::json!({"command":"connect"}),
+            serde_json::json!({"command":"check_tcp"}),
+            serde_json::json!({"command":"routing_apply","expected_revision":1,"request_id":1,"source_generation":1,"snapshot_revision":1,"selected_profile_id":id}),
+            serde_json::json!({"command":"autoconnect_target_set","request_id":"1","expected_revision":"0"}),
+        ] {
+            let failure = actor
+                .source_command(serde_json::from_value(value).expect("команда"))
+                .await
+                .expect_err("native Run закрыт");
+            assert_eq!(failure.key(), "profile_unavailable");
+        }
+        assert_eq!(
+            serde_json::to_value(&actor.state.routing).expect("draft"),
+            routing
+        );
+        let dto = serde_json::to_string(&actor.state.profiles).expect("DTO");
+        assert!(!dto.contains("outbounds"));
+        actor
+            .source_command(Command::CatalogFavorite {
+                kind: CatalogKind::Xray,
+                id,
+                page,
+                value: true,
+            })
+            .await
+            .expect("CAS favorite");
+        assert!(
+            actor
+                .state
+                .profiles
+                .iter()
+                .any(|row| row.id == id && row.favorite)
+        );
+        assert!(
+            actor
+                .catalog_selection(CatalogKind::Xray, id, page)
+                .is_err()
+        );
+        actor.source_command(serde_json::from_value(serde_json::json!({"command":"add_source","name":"URI","url":"https://example.org/uri","local_exception":false,"route":"direct","hwid_enabled":false})).expect("источник")).await.expect("URI source");
+        let uri_source = actor.state.source_id.expect("URI");
+        actor.routing_repository().commit_snapshot(uri_source, 1, 0, yonik_linux::SnapshotInput { body: b"vless://00000000-0000-0000-0000-000000000001@example.org:443?security=tls#URI".to_vec(), metadata: b"{}".to_vec(), validators: None }).await.expect("URI snapshot");
+        actor.sources().await.expect("источники");
+        actor.state.source_id = actor
+            .state
+            .sources
+            .iter()
+            .find(|source| source.name == "URI")
+            .map(|source| source.id);
+        actor.page().await.expect("server page");
+        assert!(actor.selected_native.is_none());
+        let server_id = actor.state.profiles[0].id;
+        assert_eq!(server_id, id, "пространства ID независимы");
+        let server_page = actor.state.catalog_page;
+        actor
+            .source_command(Command::SelectCatalog {
+                kind: CatalogKind::Server,
+                id: server_id,
+                page: server_page,
+            })
+            .await
+            .expect("URI selection");
+        assert!(actor.selected.is_some() && actor.selected_native.is_none());
+        assert_eq!(actor.state.selected_kind, Some("server"));
+        actor
+            .source_command(Command::CatalogFavorite {
+                kind: CatalogKind::Server,
+                id: server_id,
+                page: server_page,
+                value: true,
+            })
+            .await
+            .expect("server favorite CAS");
+        assert!(actor.state.profiles[0].favorite);
+        let stale_page = actor.state.catalog_page;
+        actor.routing_repository().commit_snapshot(uri_source, 1, 1, yonik_linux::SnapshotInput {
+            body: b"vless://00000000-0000-0000-0000-000000000002@example.org:443?security=tls#Changed".to_vec(),
+            metadata: b"{}".to_vec(), validators: None,
+        }).await.expect("новая revision");
+        assert!(
+            actor
+                .source_command(Command::CatalogFavorite {
+                    kind: CatalogKind::Server,
+                    id: server_id,
+                    page: stale_page,
+                    value: false
+                })
+                .await
+                .is_err()
+        );
+        actor.page().await.expect("новый snapshot");
+        assert!(actor.selected.is_none() && actor.selected_native.is_none());
+        actor.clear_selection();
+        assert!(actor.selected_native.is_none() && actor.selected.is_none());
+        drop(actor);
+        drop(lock);
+        std::fs::remove_dir_all(path).expect("своя fixture");
     }
     async fn send(actor: &mut Actor, value: serde_json::Value) -> Result<()> {
         actor
