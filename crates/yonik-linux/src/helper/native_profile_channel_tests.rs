@@ -1340,6 +1340,7 @@ pub(super) struct Proof {
     receipt: wire::Receipt,
 }
 pub(super) struct Fake {
+    pub(super) numeric_delay: Duration,
     pub(super) dns_delay_on: Option<usize>,
     dns_checks: usize,
     udp_inbox: Option<Arc<std::sync::Mutex<Rendezvous<u8>>>>,
@@ -1363,6 +1364,7 @@ pub(super) struct Fake {
 impl Fake {
     fn new(mode: Mode) -> Self {
         Self {
+            numeric_delay: Duration::ZERO,
             udp_inbox: None,
             dns_delay_on: None,
             dns_checks: 0,
@@ -1555,7 +1557,7 @@ impl Authority for Fake {
     }
     fn route(
         &mut self,
-        _: RouteRequest<'_>,
+        request: RouteRequest<'_>,
         _: &Proof,
         _: u64,
         _: Tuple,
@@ -1566,6 +1568,9 @@ impl Authority for Fake {
         self.route_count += 1;
         self.live.insert(self.route_count);
         self.now += self.route_delay;
+        if matches!(request,RouteRequest::Direct(d) if d.port==443) {
+            self.now += self.numeric_delay;
+        }
         if self.fail_after_route {
             self.known = false;
         }

@@ -244,6 +244,7 @@ trait Authority: Send {
     fn cancel_source(&mut self, source: u64) -> Result<(), ServiceError>;
 }
 struct SourceFlow<I> {
+    numeric_only: bool,
     tuple: Tuple,
     original: Target,
     subject: Option<Subject>,
@@ -1622,6 +1623,7 @@ impl Drop for HistoryCredit {
     }
 }
 struct Grant {
+    numeric: Option<dns_rrset::NumericBinding>,
     source: u64,
     subject: u16,
     scope: u16,
@@ -1850,6 +1852,7 @@ impl<A: Authority> Issuer<A> {
         self.flows.insert(
             source,
             Box::new(SourceFlow {
+                numeric_only: false,
                 tuple: *tuple,
                 original: Target::copy(*original)?,
                 subject,
@@ -1886,6 +1889,9 @@ impl<A: Authority> Issuer<A> {
             .flows
             .get(&a.source_flow)
             .ok_or(ServiceError::Unavailable)?;
+        if source.numeric_only {
+            return Err(ServiceError::Unsupported);
+        }
         if source.original != Target::copy(a.original)? {
             return Err(ServiceError::InvalidRequest);
         }
@@ -2013,6 +2019,7 @@ impl<A: Authority> Issuer<A> {
                 .and_then(|d| d.next.map(|(s, m)| (s, m, d.endpoint_index)));
             self.fence()?;
             let entry = Grant {
+                numeric: None,
                 source: a.source_flow,
                 subject: a.subject,
                 scope: a.scope,
@@ -2297,6 +2304,7 @@ impl<A: Authority> Issuer<A> {
                 return Err(ServiceError::Unavailable);
             }
         }
+        self.cancel_numeric_dependents()?;
         self.cancel_dns_request(request)?;
         if let Some((id, _)) = self.services.iter().find(|(_, g)| g.request == request) {
             let id = *id;
@@ -4764,6 +4772,7 @@ fn run_issuer<A: Authority>(
             issuer.cancel_grant(*id)?;
         }
         issuer.expire_dns()?;
+        issuer.cancel_numeric_dependents()?;
         if awaiting.is_none() {
             dns_transport::progress(issuer, socket, stop, &mut outgoing, |issuer| {
                 drain_before_publication(

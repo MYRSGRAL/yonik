@@ -268,7 +268,24 @@ pub(crate) mod dns_v2 {
             SourceKind::try_from(self.bytes[137])
         }
     }
-    impl View<'_, 42> {
+    impl<'a> View<'a, 42> {
+        pub(crate) fn authorization(self) -> Result<super::Authorize<'a>> {
+            let n = usize::from(n16(self.bytes, 12));
+            match super::Message::decode(super::Kind::Authorize, &self.bytes[16..16 + n])? {
+                super::Message::Authorize(a) => Ok(a),
+                _ => Err(Error::Reference),
+            }
+        }
+        pub(crate) fn numeric_destination(self) -> super::Destination<'a> {
+            let at = 16 + usize::from(n16(self.bytes, 12));
+            let b = &self.bytes[at..];
+            super::Destination {
+                family: b[0],
+                protocol: b[1],
+                port: n16(b, 2),
+                bytes: &b[7..],
+            }
+        }
         pub(crate) fn usage(self) -> Result<NumericUse> {
             NumericUse::try_from(self.bytes[14])
         }
