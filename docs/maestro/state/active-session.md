@@ -456,6 +456,17 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   GUI/Host не запускались. Evidence p6-root-catalog/source3095members соответствует
   commit, собственный target очищен. Native selection/Connect ещё не подключены;
   это подготовка UI за закрытым gate, не полный P6 PASS и не установленный fix.
+- R21 SOURCE review desktop import/catalog adapters не нашёл P1/P2; отмена
+  ждёт завершения bounded parse, публикация отменённого report запрещена.
+- Rust a2e1a64 UDP rendezvous/retirement влит для corrections. R20 нашёл
+  runtime recvmsg scratch-precredit gap; root10971be резервирует16 FD до
+  receive, RED/GREEN +28 issuer pure/clippy/fmt PASS, narrow review ожидается.
+- Go792928b закрытый UDP receive milestone имеет R19 SOURCE scoped CLEAN,
+  влит без открытия admission. Name-policy gap root7f1f5a8 устраняет общей
+  Destination grammar без изменения original bytes: 17 shared cases,
+  RED/GREEN +29 issuer/21 codec pure/clippy/fmt PASS. Go author получил corpus.
+  Это не full UDP consumer и не long-lived readiness. Собственные сборки
+  r20-root-fd/r19-root-grammar очищены, evidence вне TTL сохранён.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
