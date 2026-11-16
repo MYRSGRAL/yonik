@@ -1023,6 +1023,59 @@ schema2 entry вместе с exact ELF. Текущий patch pin — reviewed U
 prerequisite, не обещание полной DNS/P4/P5 semantics или production-ready ELF.
 Public require_consumer/capabilities/builder_apply_enabled/Connect остаются false.
 
+### CODEC2 BundleAcquire production dispatch (SOURCE/PURE)
+
+`native_profile_channel::run_issuer` после exact ADMIT_ACK выполняет raw
+Descriptor272/ACK40 через тот же owner endpoint, до ready. System сохраняет
+`RuntimeScopeStamp::admission_deadline`; Local фиксирует deadline до setup.
+HELLO/ADMIT/descriptor не продлевают его. SystemChannel читает setup напрямую
+до rendezvous; после ACK retained `Negotiated` разрешает только bounded DNS
+frames с exact launch/epoch. CODEC1, wrong launch/schema и unnegotiated DNS
+отклоняются без fallback. Existing sender credential transport checks и запрет
+unexpected rights сохраняются; DATA token не заменяет verified producer/Peer.
+
+`helper/native_dns_bundle.rs` вызывается actual serialized dispatch для55/47,
+возвращает56/48 с exact pending sequence. Bundle ID имеет отдельный issuer
+counter/map; совпадение числа с ServiceGrant ID не связывает namespaces.
+Root — live retained user-DNS class3 grant, exact private flow/original,
+resolver/query/manifest/epoch. Начальный original DNS name пока принимается
+только при exact совпадении с retained query: search expansion не выдумывается.
+По ordered scope/branch issuer выводит subject/stream/chain/endpoint/carrier;
+первый scope принадлежит resolver row, next input равен previous carrier,
+mask и terminal leaf проверяются полностью. Physical domain leaf и resolver
+без доказанного subject scope остаются Unsupported.
+
+Каждый private `DnsHopPermit(bundle,index)` удерживает deadline и отдельный
+route ticket, когда backend создаёт exception. Existing RouteAuthority →
+ProfileRoutes проверяет свежий Known proof, captured routes и durable journal;
+Chain не создаёт physical exception. Numeric Direct использует actual carrier,
+а не logical input. Общий route-reference ledger4096 (existing ProfileRoutes
+ticket bound) охватывает user/service grants и DNS bundles; unique firewall
+exceptions по-прежнему ограничены durable aggregate cap128. Fixed path scratch,
+memory/history и route credits резервируются
+до installation; pending остаётся в общем runtime/proof rendezvous до reply.
+Размер receive buffer2293 покрывает max BundleAcquire2164+Header128+sentinel;
+legacy body limits не меняются. Дополнительный queue storage вычитается из
+8MiB credit с учётом уже включённых preflight reservations, без двойного debit.
+
+Initial revision1 и renewal exact revision сохраняют root/query/base/options/
+original/path; expired/canceled bundle не возрождается. Serialized actor имеет
+только один исполняемый renewal. ACK ограничен minimum root/session/owner и
+request deadlines; retry send уменьшает remainingNs. Grant/root/ingress и
+retained hop bindings проверяются перед publication. System user Known≤20ms
+не продлевается ACK/новым bundle. Target8 и request cancel проходят общий drain
+до Allow; root/flow cancellation отзывает dependent bundles. Tickets очищаются
+по одному: успешно retired больше не освобождаются повторно; failure сохраняет
+bundle, предыдущую renewal revision и credits в sticky Unknown custody.
+
+Не закрыто этим cut: DNS network Reserve/Bind/Publish/Waiter/Numeric transport
+vertical и protected StubBind policy. PROBE purpose2 flow0 не превращается в
+user-DNS source: canonical55 сейчас допускает только AUTHORIZE class3 base,
+а этот legacy decoder требует sourceFlowId>0. Для такого service acquisition
+нужен отдельный согласованный contract, не fake flow/alias. Public readiness,
+require_consumer, builder_apply/Connect остаются false; Go runtime parity и
+полный P5/runtime acceptance этим SOURCE/PURE milestone не заявляются.
+
 ### StubBind: bounded listener observation, не service authority
 
 `helper/resolver_stub.rs` отделяет retained sampled observation от policy issuer.

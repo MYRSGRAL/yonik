@@ -183,6 +183,12 @@ pub(crate) mod dns_v2 {
     view_id!(56, query, QueryId, 24);
     view_id!(56, revision, BundleRevision, 56);
     impl<'a> View<'a, 55> {
+        pub(crate) fn authorization(self) -> Result<super::Authorize<'a>> {
+            match super::Message::decode(super::Kind::Authorize, self.base())? {
+                super::Message::Authorize(a) => Ok(a),
+                _ => Err(Error::Reference),
+            }
+        }
         pub(crate) fn renewal(self) -> Result<Option<(DnsBundleId, BundleRevision)>> {
             if n64(self.bytes, 32) == 0 {
                 Ok(None)
@@ -3287,6 +3293,10 @@ pub(crate) struct Capsule<'a> {
     pub policy_revision: u64,
 }
 pub(crate) struct DialScope<'a> {
+    pub subject: u16,
+    pub carrier: u8,
+    pub stream: u16,
+    pub chain: u16,
     pub input: u8,
     pub action: u8,
     pub endpoint: Option<Destination<'a>>,
@@ -3442,6 +3452,10 @@ impl<'a> Capsule<'a> {
             Some((c.next, c.mask))
         };
         Ok(DialScope {
+            subject: scope.subject,
+            carrier: b.carrier,
+            stream: b.stream,
+            chain: b.chain,
             input: scope.input,
             action: b.action,
             endpoint,

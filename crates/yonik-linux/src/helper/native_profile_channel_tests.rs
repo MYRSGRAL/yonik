@@ -1,6 +1,612 @@
 use super::*;
 use std::collections::BTreeSet;
 
+// Весь driver below — in-memory: ни OS endpoint, ни runtime wrappers.
+struct BundleIo {
+    record: LaunchRecord,
+    input: std::cell::RefCell<VecDeque<Vec<u8>>>,
+    output: std::cell::RefCell<Vec<Vec<u8>>>,
+    descriptor: [u8; 272],
+    done: std::cell::Cell<bool>,
+    stop_after: usize,
+    history: Option<Arc<std::sync::Mutex<InvocationHistory>>>,
+    delayed_send: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU64>>>,
+}
+fn dns_neg(record: LaunchRecord) -> wire::dns_v2::Negotiated {
+    let d = wire::dns_v2::Negotiated::descriptor(record).unwrap();
+    wire::dns_v2::Negotiated::accept(
+        &d,
+        &wire::dns_v2::Negotiated::ack(&d).unwrap(),
+        record,
+        [(0, 0); 2],
+    )
+    .unwrap()
+}
+fn dns_packet(
+    record: LaunchRecord,
+    sequence: u64,
+    kind: wire::dns_v2::Operation,
+    body: &[u8],
+) -> Vec<u8> {
+    let frame = wire::dns_v2::DnsFrame {
+        header: wire::dns_v2::Envelope {
+            sequence,
+            reply_to: 0,
+            binding: record.binding,
+        },
+        record: wire::dns_v2::Record::decode(kind, body).unwrap(),
+    };
+    let mut bytes = [0; RUNTIME_PACKET];
+    let n = frame.encode(&dns_neg(record), &mut bytes).unwrap();
+    bytes[..n].to_vec()
+}
+impl BundleIo {
+    fn new(record: LaunchRecord, requests: Vec<Vec<u8>>) -> Self {
+        Self {
+            record,
+            input: std::cell::RefCell::new(requests.into()),
+            output: Default::default(),
+            descriptor: wire::dns_v2::Negotiated::descriptor(record).unwrap(),
+            done: Default::default(),
+            stop_after: 1,
+            history: None,
+            delayed_send: Default::default(),
+        }
+    }
+}
+impl Channel for BundleIo {
+    fn history(&self) -> Option<Arc<std::sync::Mutex<InvocationHistory>>> {
+        self.history.clone()
+    }
+    fn setup_read(
+        &self,
+        _: u32,
+        _: u32,
+        out: &mut [u8; RUNTIME_PACKET],
+    ) -> Result<Option<usize>, ServiceError> {
+        out[..272].copy_from_slice(&self.descriptor);
+        Ok(Some(272))
+    }
+    fn setup_write(&self, b: &[u8]) -> Result<bool, ServiceError> {
+        assert_eq!(b, wire::dns_v2::Negotiated::ack(&self.descriptor).unwrap());
+        Ok(true)
+    }
+    fn read(
+        &self,
+        _: u32,
+        _: u32,
+        out: &mut [u8; RUNTIME_PACKET],
+    ) -> Result<Option<usize>, ServiceError> {
+        if let Some(b) = self.input.borrow_mut().pop_front() {
+            out[..b.len()].copy_from_slice(&b);
+            return Ok(Some(b.len()));
+        }
+        if self.done.get() {
+            Err(ServiceError::Unavailable)
+        } else {
+            Ok(None)
+        }
+    }
+    fn write(&self, b: &[u8]) -> Result<bool, ServiceError> {
+        if dns_bundle::is_dns(b) {
+            if let Some(elapsed) = self.delayed_send.borrow_mut().take() {
+                elapsed.fetch_add(25_000_000, Ordering::AcqRel);
+                return Ok(false);
+            }
+            dns_bundle::decode(b, &dns_neg(self.record), wire::dns_v2::Direction::Issuer)?;
+            self.output.borrow_mut().push(b.to_vec());
+            self.done.set(self.output.borrow().len() >= self.stop_after);
+            return Ok(true);
+        }
+        let f = wire::Frame::decode(b, self.record.binding, self.record.mode, true)
+            .map_err(unavailable)?;
+        let wire::Message::Admit(raw) = f.message else {
+            return Err(ServiceError::InvalidRequest);
+        };
+        let cap = wire::Capsule::decode(raw, &self.record.binding.digest).map_err(unavailable)?;
+        let mut ack = [0; RUNTIME_PACKET];
+        let n = wire::Frame::encode(
+            wire::Header {
+                kind: wire::Kind::AdmitAck,
+                sequence: 2,
+                reply_to: f.header.sequence,
+                binding: self.record.binding,
+                object_id: 0,
+            },
+            &wire::Message::AdmitAck {
+                manifest: cap.manifest,
+                admission: cap.admission_id,
+                status: wire::Status::Allow,
+            },
+            &mut ack,
+        )
+        .map_err(unavailable)?;
+        self.input.borrow_mut().push_front(ack[..n].to_vec());
+        Ok(true)
+    }
+    fn pause_until(&self, _: Instant) {
+        panic!("pure BundleIo не ожидает OS");
+    }
+    fn writable_until(&self, _: Instant) {}
+}
+fn bundle_fixture(mode: Mode, chain: bool) -> (Issuer<Fake>, Vec<u8>) {
+    use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent};
+    let graph = if chain {
+        serde_json::json!({"outbounds":[{"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":"203.0.113.10","port":8388,"method":"aes-128-gcm","password":"fixture"}]},"proxySettings":{"tag":"direct","transportLayer":true}},{"tag":"direct","protocol":"vless","settings":{"vnext":[{"address":"203.0.113.11","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}],"dns":{"tag":"proxy","servers":["192.0.2.53"]}})
+    } else {
+        serde_json::json!({"outbounds":[{"tag":"direct","protocol":"freedom"}],"dns":{"tag":"direct","servers":["192.0.2.53"]}})
+    };
+    let intent =
+        ProfileIntent::decode(&serde_json::json!({"version":1,"graph":graph}).to_string()).unwrap();
+    let mut plan =
+        OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap()).unwrap();
+    if mode.required() {
+        plan = plan.with_system(
+            yonik_engine::SystemTun::new(
+                1,
+                1500,
+                42,
+                vec![
+                    yonik_engine::SystemTunAddress::new("198.18.0.1".parse().unwrap(), 30).unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+    }
+    let capsule = Arc::new(wire::OwnedCapsule::build(&intent, &plan, None, [3; 32], 1, 1).unwrap());
+    let cap = wire::Capsule::decode(capsule.bytes(), &[3; 32]).unwrap();
+    let record = LaunchRecord {
+        manifest: cap.manifest,
+        ..issuer(mode).record
+    };
+    let mut issuer = Issuer::new(Fake::new(mode), capsule, record).unwrap();
+    let (flow, _) = issuer.open(50, &open(mode, 32001)).unwrap();
+    let peer = Target::copy(issuer.capsule().unwrap().resolver_peer(0).unwrap()).unwrap();
+    let a = wire::Authorize {
+        source_flow: flow,
+        class: 3,
+        subject: u16::MAX,
+        chain: u16::MAX,
+        transport: u16::MAX,
+        scope: u16::MAX,
+        branch: 0,
+        original: original(),
+        effective: peer.wire(),
+        resolver: 0,
+        query: "query.invalid",
+        receipt: wire::Receipt {
+            kind: wire::ReceiptKind::None,
+            id: 0,
+        },
+    };
+    let (root, _) = issuer.authorize(51, 0, &a).unwrap();
+    let mut encoded = [0; 1152];
+    let size = wire::Frame::encode(
+        wire::Header {
+            kind: wire::Kind::Authorize,
+            sequence: 51,
+            reply_to: 0,
+            binding: record.binding,
+            object_id: 0,
+        },
+        &wire::Message::Authorize(a),
+        &mut encoded,
+    )
+    .unwrap();
+    let base = &encoded[128..size];
+    let n = base.len();
+    let cap = issuer.capsule().unwrap();
+    let (mut scope, _) = cap.resolver_scope(0).unwrap().scope.unwrap();
+    let mut path = Vec::new();
+    loop {
+        path.extend_from_slice(&scope.to_be_bytes());
+        path.extend_from_slice(&[0, 0]);
+        let d = cap.dial_scope(scope, 0).unwrap();
+        if let Some((next, _)) = d.next {
+            scope = next;
+        } else {
+            break;
+        }
+    }
+    let mut b = vec![0; 72];
+    b[..2].copy_from_slice(&2u16.to_be_bytes());
+    for (at, v) in [(8, root), (16, 9), (24, 5), (40, 1_000_000_000)] {
+        b[at..at + 8].copy_from_slice(&v.to_be_bytes());
+    }
+    for (at, v) in [
+        (48, n as u16),
+        (50, (path.len() / 4) as u16),
+        (52, 1),
+        (54, 1),
+        (58, 13),
+    ] {
+        b[at..at + 2].copy_from_slice(&v.to_be_bytes());
+    }
+    b.extend_from_slice(&base[..n]);
+    b.extend_from_slice(b"query.invalid");
+    b.extend_from_slice(&path);
+    wire::dns_v2::View::<55>::decode(&b).unwrap();
+    (issuer, b)
+}
+fn bundle_run(issuer: &mut Issuer<Fake>, body: &[u8]) -> Vec<Vec<u8>> {
+    let io = BundleIo::new(
+        issuer.record,
+        vec![dns_packet(
+            issuer.record,
+            3,
+            wire::dns_v2::Operation::BundleAcquire,
+            body,
+        )],
+    );
+    let ready = AtomicBool::new(false);
+    let result = run_issuer(issuer, &io, 8, 997, &AtomicBool::new(false), &ready);
+    assert!(result.is_err());
+    assert!(
+        ready.load(Ordering::Acquire),
+        "issuer before ready: {result:?}"
+    );
+    io.output.into_inner()
+}
+fn allowed_bundle(output: &[Vec<u8>]) -> bool {
+    output.first().is_some_and(|b| b[130] == 1)
+}
+#[test]
+fn dns_bundle_driver_local_system_exact_path_and_cancel_isolation() {
+    for mode in [Mode::Local, Mode::System] {
+        let (mut issuer, b) = bundle_fixture(mode, true);
+        let before = issuer.authority.live.len();
+        let out = bundle_run(&mut issuer, &b);
+        assert!(allowed_bundle(&out));
+        assert_eq!(issuer.dns.count(), 1);
+        let id = u64::from_be_bytes(out[0][136..144].try_into().unwrap());
+        issuer.cancel_dns_bundle(id).unwrap();
+        assert_eq!(issuer.authority.live.len(), before);
+        assert_eq!(issuer.dns.count(), 0);
+        assert!(issuer.cancel_dns_bundle(id).is_ok());
+        let out = bundle_run(&mut issuer, &b);
+        assert!(allowed_bundle(&out));
+        let neighbor = u64::from_be_bytes(out[0][136..144].try_into().unwrap());
+        assert_ne!(id, neighbor);
+        issuer.cancel_dns_bundle(id).unwrap();
+        assert_eq!(issuer.dns.count(), 1);
+        issuer.cancel_dns_bundle(neighbor).unwrap();
+    }
+}
+#[test]
+fn dns_bundle_driver_wrong_scope_branch_root_query_and_epoch_before_effects() {
+    for change in 0..6 {
+        let (mut issuer, mut b) = bundle_fixture(Mode::System, true);
+        let before = issuer.authority.route_count;
+        let last = b.len() - 4;
+        match change {
+            0 => b[last..last + 2].copy_from_slice(&0u16.to_be_bytes()),
+            1 => b[last + 2] = 1,
+            2 => b[8..16].copy_from_slice(&999u64.to_be_bytes()),
+            3 => {
+                let at = 72 + u16::from_be_bytes([b[48], b[49]]) as usize;
+                b[at] = b'x';
+            }
+            4 => b[72..80].copy_from_slice(&999u64.to_be_bytes()),
+            _ => issuer.authority.known = false,
+        }
+        let out = bundle_run(&mut issuer, &b);
+        assert!(!allowed_bundle(&out));
+        assert_eq!(issuer.authority.route_count, before);
+        assert_eq!(issuer.dns.count(), 0);
+    }
+}
+#[test]
+fn dns_bundle_driver_stale_fence_partial_failure_and_unknown_custody() {
+    for unknown in [false, true] {
+        let (mut issuer, b) = bundle_fixture(Mode::System, true);
+        let before = issuer.authority.route_count;
+        issuer.authority.fail_route_at = Some(before + 2);
+        issuer.authority.unknown_release = unknown;
+        let out = bundle_run(&mut issuer, &b);
+        assert!(!allowed_bundle(&out));
+        assert_eq!(issuer.dns.count(), usize::from(unknown));
+        assert_eq!(issuer.unknown, unknown);
+        if unknown {
+            let attempts = issuer.authority.release_attempts;
+            assert!(issuer.cancel_dns_bundle(1).is_err());
+            assert_eq!(attempts, issuer.authority.release_attempts);
+        }
+    }
+    let (mut issuer, b) = bundle_fixture(Mode::System, true);
+    issuer.authority.route_delay = Duration::from_millis(11);
+    assert!(!allowed_bundle(&bundle_run(&mut issuer, &b)));
+    assert_eq!(issuer.dns.count(), 0);
+}
+#[test]
+fn dns_bundle_driver_renewal_revision_caps_and_no_resurrection() {
+    let (mut issuer, mut b) = bundle_fixture(Mode::Local, false);
+    let out = bundle_run(&mut issuer, &b);
+    assert!(allowed_bundle(&out));
+    let id = u64::from_be_bytes(out[0][136..144].try_into().unwrap());
+    b[32..40].copy_from_slice(&id.to_be_bytes());
+    b[64..72].copy_from_slice(&1u64.to_be_bytes());
+    let out = bundle_run(&mut issuer, &b);
+    assert!(allowed_bundle(&out));
+    assert_eq!(&out[0][184..192], &2u64.to_be_bytes());
+    let before = issuer.authority.route_count;
+    assert!(!allowed_bundle(&bundle_run(&mut issuer, &b)));
+    assert_eq!(before, issuer.authority.route_count);
+    issuer.cancel_dns_bundle(id).unwrap();
+    b[64..72].copy_from_slice(&2u64.to_be_bytes());
+    assert!(!allowed_bundle(&bundle_run(&mut issuer, &b)));
+    let (mut issuer, b) = bundle_fixture(Mode::Local, false);
+    let held = issuer.budget.routes.reserve(4095).unwrap();
+    let before = issuer.authority.route_count;
+    assert!(!allowed_bundle(&bundle_run(&mut issuer, &b)));
+    assert_eq!(before, issuer.authority.route_count);
+    drop(held);
+}
+#[test]
+fn dns_bundle_driver_descriptor_codecone_or_wrong_launch_never_ready() {
+    let (issuer, _) = bundle_fixture(Mode::Local, false);
+    let io = BundleIo::new(issuer.record, vec![]);
+    assert!(
+        dns_bundle::negotiate(
+            &issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            issuer.authority.now() + Duration::from_secs(1)
+        )
+        .is_ok()
+    );
+    for at in [16, 208, 240, 248] {
+        let (mut issuer, b) = bundle_fixture(Mode::Local, false);
+        let mut io = BundleIo::new(
+            issuer.record,
+            vec![dns_packet(
+                issuer.record,
+                3,
+                wire::dns_v2::Operation::BundleAcquire,
+                &b,
+            )],
+        );
+        io.descriptor[at] ^= 1;
+        let ready = AtomicBool::new(false);
+        assert!(run_issuer(&mut issuer, &io, 8, 997, &AtomicBool::new(false), &ready).is_err());
+        assert!(!ready.load(Ordering::Acquire));
+        assert!(io.output.borrow().is_empty());
+    }
+}
+#[test]
+fn dns_bundle_driver_queued_cancel_is_drained_before_allow_and_neighbor_survives() {
+    for target in [1, 8] {
+        let (mut issuer, b) = bundle_fixture(Mode::System, false);
+        let mut cancel = [0; 24];
+        cancel[..2].copy_from_slice(&2u16.to_be_bytes());
+        cancel[2] = target;
+        cancel[8..16].copy_from_slice(&(if target == 1 { 3u64 } else { 1u64 }).to_be_bytes());
+        let io = BundleIo::new(
+            issuer.record,
+            vec![
+                dns_packet(issuer.record, 3, wire::dns_v2::Operation::BundleAcquire, &b),
+                dns_packet(issuer.record, 4, wire::dns_v2::Operation::Cancel, &cancel),
+            ],
+        );
+        assert!(
+            run_issuer(
+                &mut issuer,
+                &io,
+                8,
+                997,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        let out = io.output.borrow();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0][130], 2);
+        assert_eq!(out[1][130], 1);
+        assert_eq!(&out[0][24..32], &3u64.to_be_bytes());
+        assert_eq!(&out[1][24..32], &4u64.to_be_bytes());
+        assert_eq!(issuer.dns.count(), 0);
+        assert_eq!(issuer.flows.len(), 1);
+        assert_eq!(issuer.grants.len(), 1);
+        assert_eq!(issuer.authority.live.len(), 1);
+    }
+}
+#[test]
+fn dns_bundle_driver_one_stream_initial_renewal_and_history_exhaustion() {
+    let (mut issuer, b) = bundle_fixture(Mode::System, false);
+    let mut renewal = b.clone();
+    renewal[32..40].copy_from_slice(&1u64.to_be_bytes());
+    renewal[64..72].copy_from_slice(&1u64.to_be_bytes());
+    let mut io = BundleIo::new(
+        issuer.record,
+        vec![
+            dns_packet(issuer.record, 3, wire::dns_v2::Operation::BundleAcquire, &b),
+            dns_packet(
+                issuer.record,
+                4,
+                wire::dns_v2::Operation::BundleAcquire,
+                &renewal,
+            ),
+        ],
+    );
+    io.stop_after = 2;
+    assert!(
+        run_issuer(
+            &mut issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    let out = io.output.borrow();
+    assert_eq!(out.len(), 2);
+    assert!(out.iter().all(|b| b[130] == 1));
+    assert_eq!(&out[1][184..192], &2u64.to_be_bytes());
+    assert_eq!(issuer.dns.count(), 1);
+    let (mut issuer, b) = bundle_fixture(Mode::System, false);
+    let before = issuer.authority.route_count;
+    let mut io = BundleIo::new(
+        issuer.record,
+        vec![dns_packet(
+            issuer.record,
+            3,
+            wire::dns_v2::Operation::BundleAcquire,
+            &b,
+        )],
+    );
+    io.history = Some(Arc::new(std::sync::Mutex::new(
+        InvocationHistory::new(2, &issuer.budget.dynamic).unwrap(),
+    )));
+    assert!(
+        run_issuer(
+            &mut issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    assert!(!allowed_bundle(&io.output.borrow()));
+    assert_eq!(before, issuer.authority.route_count);
+}
+#[test]
+fn dns_bundle_driver_expired_setup_and_wrong_epoch_fail_without_fallback() {
+    let (issuer, _) = bundle_fixture(Mode::System, false);
+    let mut io = BundleIo::new(issuer.record, vec![]);
+    io.descriptor[208..240].copy_from_slice(&Sha256::digest(b"YONIK-DNS-V2-CODEC-1\0"));
+    assert!(
+        dns_bundle::negotiate(
+            &issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            issuer.authority.now() + Duration::from_secs(1)
+        )
+        .is_err()
+    );
+    let io = BundleIo::new(issuer.record, vec![]);
+    assert!(
+        dns_bundle::negotiate(
+            &issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            issuer.authority.now()
+        )
+        .is_err()
+    );
+    let (mut issuer, b) = bundle_fixture(Mode::System, false);
+    let before = issuer.authority.route_count;
+    let mut packet = dns_packet(issuer.record, 3, wire::dns_v2::Operation::BundleAcquire, &b);
+    packet[128 + 31] ^= 1;
+    let io = BundleIo::new(issuer.record, vec![packet]);
+    assert!(
+        run_issuer(
+            &mut issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    assert!(io.output.borrow().is_empty());
+    assert_eq!(before, issuer.authority.route_count);
+}
+#[test]
+fn dns_bundle_driver_blocked_send_cannot_extend_owner_and_renewal_unknown_keeps_credits() {
+    let (mut issuer, b) = bundle_fixture(Mode::System, false);
+    let io = BundleIo::new(
+        issuer.record,
+        vec![dns_packet(
+            issuer.record,
+            3,
+            wire::dns_v2::Operation::BundleAcquire,
+            &b,
+        )],
+    );
+    *io.delayed_send.borrow_mut() = Some(Arc::clone(&issuer.authority.elapsed));
+    assert!(
+        run_issuer(
+            &mut issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    assert!(!allowed_bundle(&io.output.borrow()));
+    assert_eq!(issuer.dns.count(), 0);
+    let (mut issuer, mut b) = bundle_fixture(Mode::Local, false);
+    assert!(allowed_bundle(&bundle_run(&mut issuer, &b)));
+    b[32..40].copy_from_slice(&1u64.to_be_bytes());
+    b[64..72].copy_from_slice(&1u64.to_be_bytes());
+    issuer.authority.unknown_release = true;
+    let out = bundle_run(&mut issuer, &b);
+    assert_eq!(out[0][130], 3);
+    assert!(issuer.unknown);
+    assert_eq!(issuer.dns.count(), 1);
+    assert_eq!(issuer.budget.routes.used(), 3);
+    let attempts = issuer.authority.release_attempts;
+    assert!(issuer.cancel_dns_bundle(1).is_err());
+    assert_eq!(attempts, issuer.authority.release_attempts);
+    assert_eq!(issuer.budget.routes.used(), 3);
+}
+#[test]
+fn dns_bundle_driver_cancel_one_bundle_does_not_cancel_queued_sibling() {
+    let (mut issuer, b) = bundle_fixture(Mode::System, false);
+    let mut other = b.clone();
+    other[16..24].copy_from_slice(&10u64.to_be_bytes());
+    let mut cancel = [0; 24];
+    cancel[..2].copy_from_slice(&2u16.to_be_bytes());
+    cancel[2] = 8;
+    cancel[8..16].copy_from_slice(&1u64.to_be_bytes());
+    let mut io = BundleIo::new(
+        issuer.record,
+        vec![
+            dns_packet(issuer.record, 3, wire::dns_v2::Operation::BundleAcquire, &b),
+            dns_packet(
+                issuer.record,
+                4,
+                wire::dns_v2::Operation::BundleAcquire,
+                &other,
+            ),
+            dns_packet(issuer.record, 5, wire::dns_v2::Operation::Cancel, &cancel),
+        ],
+    );
+    io.stop_after = 3;
+    assert!(
+        run_issuer(
+            &mut issuer,
+            &io,
+            8,
+            997,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    let out = io.output.borrow();
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0][130], 2);
+    assert_eq!(out[1][130], 1);
+    assert_eq!(out[2][130], 1);
+    assert_eq!(&out[2][136..144], &2u64.to_be_bytes());
+    assert_eq!(issuer.dns.count(), 1);
+    assert_eq!(issuer.authority.live.len(), 2);
+}
+
 #[test]
 fn udp_packet_and_runtime_open_share_immutable_original_name_grammar() {
     #[derive(serde::Deserialize)]
@@ -44,7 +650,7 @@ fn udp_packet_and_runtime_open_share_immutable_original_name_grammar() {
                 bytes: b"valid.invalid",
             },
         };
-        let mut bytes = [0; 1153];
+        let mut bytes = [0; RUNTIME_PACKET];
         let header = wire::Header {
             kind: wire::Kind::OpenIngress,
             sequence: 2,
@@ -260,11 +866,36 @@ struct UdpDriver {
     finished: std::cell::Cell<bool>,
 }
 impl Channel for UdpDriver {
+    fn setup_read(
+        &self,
+        _: u32,
+        _: u32,
+        out: &mut [u8; RUNTIME_PACKET],
+    ) -> Result<Option<usize>, ServiceError> {
+        let d = wire::dns_v2::Negotiated::descriptor(self.record).map_err(unavailable)?;
+        out[..272].copy_from_slice(&d);
+        Ok(Some(272))
+    }
+    fn setup_write(&self, b: &[u8]) -> Result<bool, ServiceError> {
+        assert_eq!(
+            b,
+            wire::dns_v2::Negotiated::ack(
+                &wire::dns_v2::Negotiated::descriptor(self.record).unwrap()
+            )
+            .unwrap()
+        );
+        Ok(true)
+    }
     fn processed(&self, sequence: u64) -> Result<(), ServiceError> {
         self.inbox.lock().map_err(unavailable)?.processed(sequence);
         Ok(())
     }
-    fn read(&self, _: u32, _: u32, out: &mut [u8; 1153]) -> Result<Option<usize>, ServiceError> {
+    fn read(
+        &self,
+        _: u32,
+        _: u32,
+        out: &mut [u8; RUNTIME_PACKET],
+    ) -> Result<Option<usize>, ServiceError> {
         let mut inbox = self.inbox.lock().map_err(unavailable)?;
         if let Some(packet) = inbox.next(self.record, Instant::now())? {
             out[..packet.length].copy_from_slice(&packet.bytes[..packet.length]);
@@ -290,7 +921,7 @@ impl Channel for UdpDriver {
         match frame.message {
             wire::Message::Admit(body) => {
                 let capsule = wire::Capsule::decode(body, &self.record.binding.digest).unwrap();
-                let mut raw = [0; 1153];
+                let mut raw = [0; RUNTIME_PACKET];
                 let n = wire::Frame::encode(
                     wire::Header {
                         kind: wire::Kind::AdmitAck,
@@ -383,7 +1014,12 @@ impl Channel for CancelProofIo {
         self.inbox.borrow_mut().discard(request);
         Ok(())
     }
-    fn read(&self, _: u32, _: u32, out: &mut [u8; 1153]) -> Result<Option<usize>, ServiceError> {
+    fn read(
+        &self,
+        _: u32,
+        _: u32,
+        out: &mut [u8; RUNTIME_PACKET],
+    ) -> Result<Option<usize>, ServiceError> {
         Ok(self.packets.borrow_mut().pop_front().map(|packet| {
             out[..packet.length].copy_from_slice(&packet.bytes[..packet.length]);
             packet.length
@@ -404,7 +1040,7 @@ fn canceled_queued_open_discards_ready_proof_without_expiring_neighbor() {
     inbox.proof(proof, 42, now).unwrap();
     inbox.runtime(packet, now).unwrap();
     let packet = inbox.next(issuer.record, now).unwrap().unwrap();
-    let mut bytes = [0; 1153];
+    let mut bytes = [0; RUNTIME_PACKET];
     let length = wire::Frame::encode(
         wire::Header {
             kind: wire::Kind::Cancel,
@@ -461,7 +1097,7 @@ fn rendezvous_open(record: LaunchRecord, sequence: u64) -> (Queued, wire::Socket
     let wire::Message::OpenIngress { tuple, ingress, .. } = message else {
         unreachable!()
     };
-    let mut bytes = [0; 1153];
+    let mut bytes = [0; RUNTIME_PACKET];
     let length = wire::Frame::encode(
         wire::Header {
             kind: wire::Kind::OpenIngress,
@@ -624,7 +1260,7 @@ fn socket_proof_missing_open_can_be_canceled_without_authority_or_resurrection()
     let mut inbox = Rendezvous::<u8>::new().unwrap();
     inbox.runtime(packet, now).unwrap();
     assert!(inbox.next(record, now).unwrap().is_none());
-    let mut bytes = [0; 1153];
+    let mut bytes = [0; RUNTIME_PACKET];
     let length = wire::Frame::encode(
         wire::Header {
             kind: wire::Kind::Cancel,
@@ -681,6 +1317,7 @@ pub(super) struct Fake {
     pub(super) unknown_release: bool,
     release_attempts: usize,
     fail_after_route: bool,
+    fail_route_at: Option<u64>,
 }
 impl Fake {
     fn new(mode: Mode) -> Self {
@@ -701,6 +1338,7 @@ impl Fake {
             unknown_release: false,
             release_attempts: 0,
             fail_after_route: false,
+            fail_route_at: None,
         }
     }
 }
@@ -859,6 +1497,9 @@ impl Authority for Fake {
         _: u64,
         _: Tuple,
     ) -> Result<Option<u64>, ServiceError> {
+        if self.fail_route_at == Some(self.route_count + 1) {
+            return Err(ServiceError::Busy);
+        }
         self.route_count += 1;
         self.live.insert(self.route_count);
         self.now += self.route_delay;
@@ -1390,7 +2031,7 @@ impl FakeIo {
         kind: wire::Kind,
         message: wire::Message<'_>,
     ) {
-        let mut bytes = [0; 1153];
+        let mut bytes = [0; RUNTIME_PACKET];
         let length = wire::Frame::encode(
             wire::Header {
                 kind,
@@ -1407,11 +2048,31 @@ impl FakeIo {
     }
 }
 impl Channel for FakeIo {
+    fn setup_read(
+        &self,
+        _: u32,
+        _: u32,
+        out: &mut [u8; RUNTIME_PACKET],
+    ) -> Result<Option<usize>, ServiceError> {
+        let d = wire::dns_v2::Negotiated::descriptor(self.record).map_err(unavailable)?;
+        out[..272].copy_from_slice(&d);
+        Ok(Some(272))
+    }
+    fn setup_write(&self, b: &[u8]) -> Result<bool, ServiceError> {
+        assert_eq!(
+            b,
+            wire::dns_v2::Negotiated::ack(
+                &wire::dns_v2::Negotiated::descriptor(self.record).unwrap()
+            )
+            .unwrap()
+        );
+        Ok(true)
+    }
     fn read(
         &self,
         pid: u32,
         uid: u32,
-        out: &mut [u8; 1153],
+        out: &mut [u8; RUNTIME_PACKET],
     ) -> Result<Option<usize>, ServiceError> {
         assert_eq!((pid, uid), (8, 997));
         let mut state = self.state.borrow_mut();
@@ -1783,7 +2444,12 @@ struct Backpressure {
     sent: std::cell::RefCell<Vec<u8>>,
 }
 impl Channel for Backpressure {
-    fn read(&self, _: u32, _: u32, _: &mut [u8; 1153]) -> Result<Option<usize>, ServiceError> {
+    fn read(
+        &self,
+        _: u32,
+        _: u32,
+        _: &mut [u8; RUNTIME_PACKET],
+    ) -> Result<Option<usize>, ServiceError> {
         panic!("send не читает канал");
     }
     fn write(&self, bytes: &[u8]) -> Result<bool, ServiceError> {

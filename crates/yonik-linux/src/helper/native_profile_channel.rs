@@ -9,6 +9,10 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+// Максимальный CODEC2 BundleAcquire2164 + Header128 + sentinel byte.
+const RUNTIME_PACKET: usize = 2293;
+#[path = "native_dns_bundle.rs"]
+mod dns_bundle;
 use std::{
     fs::File,
     io::{Read, Write},
@@ -46,6 +50,7 @@ pub(crate) enum RouteRequest<'a> {
 struct ChannelBudget {
     _memory: super::memory::ByteLease,
     dynamic: super::memory::ByteBudget,
+    routes: super::memory::ByteBudget,
 }
 impl ChannelBudget {
     fn new(
@@ -57,14 +62,21 @@ impl ChannelBudget {
         let remaining = decoded.buffer_credit().map_err(unavailable)?;
         let bytes = 8usize * 1024 * 1024
             - usize::from(system) * (512 + 384) * 1024
-            - 128 * 1024
+            - 256 * 1024
             - 64 * 1024
             - capsule.bytes().len();
         Ok(Arc::new(Self {
             _memory: super::memory::config_budget()
                 .reserve(bytes)
                 .map_err(unavailable)?,
-            dynamic: super::memory::ByteBudget::new(remaining),
+            dynamic: super::memory::ByteBudget::new(
+                remaining
+                    .checked_sub(128 * 1024)
+                    .ok_or(ServiceError::Busy)?,
+            ),
+            // Ref/ticket cap существующего ProfileRoutes; unique exceptions
+            // по-прежнему ограничивает durable PublicBlockPolicy cap128.
+            routes: super::memory::ByteBudget::new(4096),
         }))
     }
 }
@@ -153,6 +165,9 @@ impl Subject {
     }
 }
 trait Authority: Send {
+    fn admission_deadline(&self) -> Option<Instant> {
+        None
+    }
     fn bind_ingress(
         &self,
         _: &Self::Ingress,
@@ -1516,6 +1531,7 @@ struct Grant {
     tickets: Box<[u64]>,
     next: Option<(u16, u8, u16)>,
     _query_credit: super::memory::ByteLease,
+    _routes: super::memory::ByteLease,
 }
 struct ServiceGrant {
     selector: [u16; 4],
@@ -1524,6 +1540,7 @@ struct ServiceGrant {
     expires: Instant,
     tickets: Box<[u64]>,
     _credit: super::memory::ByteLease,
+    _routes: super::memory::ByteLease,
 }
 /// Fixed scratch до allocation/effects. Chain remote не становится exception.
 struct RoutePlan<'a> {
@@ -1579,7 +1596,10 @@ impl<'a> RoutePlan<'a> {
                         remaining,
                     )?;
                 }
-                3 if target.family != 3 => self.push(RouteRequest::Direct(target))?,
+                3 if target.family != 3 => self.push(RouteRequest::Direct(wire::Destination {
+                    protocol: dial.carrier,
+                    ..target
+                }))?,
                 4 => {}
                 _ => return Err(ServiceError::Unsupported),
             }
@@ -1619,6 +1639,8 @@ struct Issuer<A: Authority> {
     unknown: bool,
     budget: Arc<ChannelBudget>,
     history: Option<Arc<std::sync::Mutex<InvocationHistory>>>,
+    dns: dns_bundle::Bundles,
+    negotiated: Option<wire::dns_v2::Negotiated>,
 }
 impl<A: Authority> Issuer<A> {
     fn new(
@@ -1652,6 +1674,8 @@ impl<A: Authority> Issuer<A> {
             unknown: false,
             budget,
             history: None,
+            dns: dns_bundle::Bundles::new(),
+            negotiated: None,
         })
     }
     fn capsule(&self) -> Result<wire::Capsule<'_>, ServiceError> {
@@ -1828,6 +1852,11 @@ impl<A: Authority> Issuer<A> {
             .dynamic
             .reserve(((a.query.len() + 15) & !15) + routes.len * 24)
             .map_err(unavailable)?;
+        let route_credit = self
+            .budget
+            .routes
+            .reserve(routes.len)
+            .map_err(unavailable)?;
         let mut tickets = Vec::with_capacity(routes.len);
         for route in routes.items[..routes.len].iter().flatten() {
             match self.authority.route(*route, &proof, a.source_flow, tuple) {
@@ -1885,6 +1914,7 @@ impl<A: Authority> Issuer<A> {
                 tickets: tickets.clone().into_boxed_slice(),
                 next,
                 _query_credit: query_credit,
+                _routes: route_credit,
             };
             if refresh == 0 {
                 if let Some((scope, mask, endpoint)) = next {
@@ -2028,6 +2058,11 @@ impl<A: Authority> Issuer<A> {
             .dynamic
             .reserve(std::mem::size_of::<ServiceGrant>() + 80 + routes.len * 16)
             .map_err(unavailable)?;
+        let route_credit = self
+            .budget
+            .routes
+            .reserve(routes.len)
+            .map_err(unavailable)?;
         let mut tickets = Vec::with_capacity(routes.len);
         for route in routes.items[..routes.len].iter().flatten() {
             match self.authority.service(capsule.manifest, *route) {
@@ -2058,6 +2093,7 @@ impl<A: Authority> Issuer<A> {
                 expires: started + Duration::from_secs(1),
                 tickets: tickets.into_boxed_slice(),
                 _credit: credit,
+                _routes: route_credit,
             }),
         );
         if let Some(old) = old {
@@ -2069,6 +2105,7 @@ impl<A: Authority> Issuer<A> {
         if self.unknown {
             return Err(ServiceError::Unavailable);
         }
+        self.cancel_dns_root(id)?;
         if let Some(service) = self.services.remove(&id) {
             if let Err(error) = self.release_tickets(&service.tickets) {
                 self.services.insert(id, service);
@@ -2136,6 +2173,7 @@ impl<A: Authority> Issuer<A> {
         if self.unknown {
             return Err(ServiceError::Unavailable);
         }
+        self.cancel_dns_request(request)?;
         if let Some((id, _)) = self.services.iter().find(|(_, g)| g.request == request) {
             let id = *id;
             return self.cancel_grant(id);
@@ -2169,6 +2207,9 @@ struct SystemAuthority {
     routes: Box<dyn RouteAuthority>,
 }
 impl Authority for SystemAuthority {
+    fn admission_deadline(&self) -> Option<Instant> {
+        Some(self.scope.admission_deadline())
+    }
     fn bind_ingress(
         &self,
         ingress: &Self::Ingress,
@@ -2327,11 +2368,15 @@ impl Authority for SystemAuthority {
     }
 }
 struct LocalAuthority {
+    deadline: Instant,
     peer: Arc<Peer>,
     revoked: Arc<AtomicBool>,
     prepared: Arc<crate::host::local_profile_channel::Prepared>,
 }
 impl Authority for LocalAuthority {
+    fn admission_deadline(&self) -> Option<Instant> {
+        Some(self.deadline)
+    }
     fn bind_ingress(
         &self,
         ingress: &Self::Ingress,
@@ -2518,6 +2563,7 @@ impl ProfileRuntime {
         prepared: Arc<crate::host::local_profile_channel::Prepared>,
         channel: OwnedFd,
     ) -> Result<Self, ServiceError> {
+        let deadline = Instant::now() + Duration::from_secs(1);
         if record.mode != Mode::Local {
             return Err(ServiceError::Unsupported);
         }
@@ -2536,6 +2582,7 @@ impl ProfileRuntime {
         let thread_stop = Arc::clone(&stop);
         let thread_ready = Arc::clone(&ready);
         let authority = LocalAuthority {
+            deadline,
             peer: Arc::clone(&peer),
             revoked: Arc::clone(&stop),
             prepared: Arc::clone(&prepared),
@@ -2577,7 +2624,7 @@ impl ProfileRuntime {
                     )
                     .map_err(unavailable)?;
                     resources.4.take();
-                    resources.1.hello(&thread_stop)?;
+                    resources.1.hello(&thread_stop, deadline)?;
                     run_issuer(
                         &mut resources.0,
                         &resources.1,
@@ -2719,7 +2766,7 @@ impl ProfileRuntime {
                         .proof_channel
                         .as_ref()
                         .ok_or(ServiceError::Unavailable)?
-                        .hello(&thread_stop)?;
+                        .hello(&thread_stop, resources.scope.admission_deadline())?;
                     run_issuer(
                         resources.issuer.as_mut().ok_or(ServiceError::Unavailable)?,
                         resources
@@ -2824,7 +2871,7 @@ fn receive(
     socket: &impl AsFd,
     pid: u32,
     uid: u32,
-    out: &mut [u8; 1153],
+    out: &mut [u8; RUNTIME_PACKET],
 ) -> Result<Option<usize>, ServiceError> {
     use rustix::net::{self, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
     let mut control =
@@ -2859,7 +2906,7 @@ fn receive(
     let c = credentials.ok_or(ServiceError::Unavailable)?;
     if bad
         || msg.bytes == 0
-        || msg.bytes > 1152
+        || msg.bytes >= RUNTIME_PACKET
         || msg
             .flags
             .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
@@ -2871,6 +2918,20 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn setup_read(
+        &self,
+        pid: u32,
+        uid: u32,
+        out: &mut [u8; RUNTIME_PACKET],
+    ) -> Result<Option<usize>, ServiceError> {
+        self.read(pid, uid, out)
+    }
+    fn setup_write(&self, bytes: &[u8]) -> Result<bool, ServiceError> {
+        self.write(bytes)
+    }
+    fn dns_committed(&self, _: wire::dns_v2::Negotiated) -> Result<(), ServiceError> {
+        Ok(())
+    }
     fn processed(&self, _: u64) -> Result<(), ServiceError> {
         Ok(())
     }
@@ -2889,8 +2950,12 @@ trait Channel {
     fn discard_ingress(&self, _request: u64) -> Result<(), ServiceError> {
         Ok(())
     }
-    fn read(&self, pid: u32, uid: u32, out: &mut [u8; 1153])
-    -> Result<Option<usize>, ServiceError>;
+    fn read(
+        &self,
+        pid: u32,
+        uid: u32,
+        out: &mut [u8; RUNTIME_PACKET],
+    ) -> Result<Option<usize>, ServiceError>;
     fn write(&self, bytes: &[u8]) -> Result<bool, ServiceError>;
     fn pause(&self) {
         std::thread::sleep(Duration::from_millis(1));
@@ -2907,7 +2972,7 @@ impl Channel for OwnedFd {
         &self,
         pid: u32,
         uid: u32,
-        out: &mut [u8; 1153],
+        out: &mut [u8; RUNTIME_PACKET],
     ) -> Result<Option<usize>, ServiceError> {
         receive(self, pid, uid, out)
     }
@@ -3067,6 +3132,7 @@ struct WaitingFrame {
     canceled: bool,
 }
 struct Rendezvous<T> {
+    dns: Option<wire::dns_v2::Negotiated>,
     pending: BTreeMap<u64, Waiting<T>>,
     ready: BTreeMap<u64, Waiting<T>>,
     udp_pending: BTreeMap<u64, WaitingUdp<T>>,
@@ -3115,11 +3181,12 @@ impl<T> Rendezvous<T> {
             return Err(ServiceError::Unsupported);
         }
         let credit = super::memory::config_budget()
-            .reserve(128 * 1024)
+            .reserve(256 * 1024)
             .map_err(unavailable)?;
         let mut incoming = wire::Sequence::new();
         incoming.accept(1).map_err(unavailable)?;
         Ok(Self {
+            dns: None,
             pending: BTreeMap::new(),
             ready: BTreeMap::new(),
             udp_pending: BTreeMap::new(),
@@ -3260,6 +3327,15 @@ impl<T> Rendezvous<T> {
         let Some(front) = self.frames.front() else {
             return Ok(None);
         };
+        if dns_bundle::is_dns(&front.packet.bytes[..front.packet.length]) {
+            let frame = dns_bundle::decode(
+                &front.packet.bytes[..front.packet.length],
+                self.dns.as_ref().ok_or(ServiceError::Unavailable)?,
+                wire::dns_v2::Direction::Producer,
+            )?;
+            self.last_delivered = frame.header.sequence;
+            return self.deliver(None);
+        }
         let frame = wire::Frame::decode(
             &front.packet.bytes[..front.packet.length],
             launch.binding,
@@ -3523,9 +3599,8 @@ impl SystemChannel {
             let _result = rustix::net::shutdown(fd, rustix::net::Shutdown::Both);
         }
     }
-    fn hello(&self, stop: &AtomicBool) -> Result<(), ServiceError> {
-        let until = Instant::now() + Duration::from_secs(1);
-        let mut bytes = [0; 1153];
+    fn hello(&self, stop: &AtomicBool, until: Instant) -> Result<(), ServiceError> {
+        let mut bytes = [0; RUNTIME_PACKET];
         loop {
             if stop.load(Ordering::Acquire) || Instant::now() >= until {
                 return Err(ServiceError::Unavailable);
@@ -3801,6 +3876,51 @@ impl SystemChannel {
     }
 }
 impl Channel for SystemChannel {
+    fn setup_read(
+        &self,
+        pid: u32,
+        uid: u32,
+        out: &mut [u8; RUNTIME_PACKET],
+    ) -> Result<Option<usize>, ServiceError> {
+        self.peer.validate()?;
+        let slots = Arc::clone(
+            &self
+                .peer
+                .proofs
+                .as_ref()
+                .ok_or(ServiceError::Unavailable)?
+                .lock()
+                .map_err(unavailable)?
+                .slots,
+        );
+        let (packet, _slot) = slots.receive_runtime(|| {
+            Self::ready(&self.runtime, tokio::io::Interest::READABLE, || {
+                receive(&self.runtime, pid, uid, out)
+            })
+        })?;
+        Ok(packet)
+    }
+    fn setup_write(&self, bytes: &[u8]) -> Result<bool, ServiceError> {
+        self.peer.validate()?;
+        Self::ready(&self.runtime, tokio::io::Interest::WRITABLE, || {
+            send(&self.runtime, bytes).map(|sent| sent.then_some(()))
+        })
+        .map(|v| v.is_some())
+    }
+    fn dns_committed(&self, neg: wire::dns_v2::Negotiated) -> Result<(), ServiceError> {
+        let mut inbox = self
+            .peer
+            .proofs
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .lock()
+            .map_err(unavailable)?;
+        if inbox.dns.is_some() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        inbox.dns = Some(neg);
+        Ok(())
+    }
     fn processed(&self, sequence: u64) -> Result<(), ServiceError> {
         self.peer
             .proofs
@@ -3896,7 +4016,7 @@ impl Channel for SystemChannel {
         &self,
         pid: u32,
         uid: u32,
-        out: &mut [u8; 1153],
+        out: &mut [u8; RUNTIME_PACKET],
     ) -> Result<Option<usize>, ServiceError> {
         if self.failed.get() {
             return Err(ServiceError::Unavailable);
@@ -3924,21 +4044,32 @@ impl Channel for SystemChannel {
             if inbox.frames.len() >= 64 {
                 return Err(ServiceError::Busy);
             }
-            let mut bytes = [0; 1153];
+            let mut bytes = [0; RUNTIME_PACKET];
             let (frame, slot) = inbox.slots.receive_runtime(|| {
                 Self::ready(&self.runtime, tokio::io::Interest::READABLE, || {
                     receive(&self.runtime, pid, uid, &mut bytes)
                 })
             })?;
             if let Some(length) = frame {
-                let decoded = wire::Frame::decode(
-                    &bytes[..length],
-                    self.launch.binding,
-                    self.launch.mode,
-                    false,
-                )
-                .map_err(unavailable)?;
-                let sequence = decoded.header.sequence;
+                let sequence = if dns_bundle::is_dns(&bytes[..length]) {
+                    dns_bundle::decode(
+                        &bytes[..length],
+                        inbox.dns.as_ref().ok_or(ServiceError::Unavailable)?,
+                        wire::dns_v2::Direction::Producer,
+                    )?
+                    .header
+                    .sequence
+                } else {
+                    wire::Frame::decode(
+                        &bytes[..length],
+                        self.launch.binding,
+                        self.launch.mode,
+                        false,
+                    )
+                    .map_err(unavailable)?
+                    .header
+                    .sequence
+                };
                 inbox.runtime_reserved(
                     Queued {
                         bytes,
@@ -3960,6 +4091,22 @@ impl Channel for SystemChannel {
         Err(ServiceError::Busy)
     }
     fn write(&self, bytes: &[u8]) -> Result<bool, ServiceError> {
+        if dns_bundle::is_dns(bytes) {
+            let inbox = self
+                .peer
+                .proofs
+                .as_ref()
+                .ok_or(ServiceError::Unavailable)?
+                .lock()
+                .map_err(unavailable)?;
+            dns_bundle::decode(
+                bytes,
+                inbox.dns.as_ref().ok_or(ServiceError::Unavailable)?,
+                wire::dns_v2::Direction::Issuer,
+            )?;
+            drop(inbox);
+            return self.setup_write(bytes);
+        }
         let frame = wire::Frame::decode(bytes, self.launch.binding, self.launch.mode, true)
             .map_err(unavailable)?;
         // Все authority checks предшествуют публикации ответа. Повтор после
@@ -4076,12 +4223,13 @@ impl Channel for SystemChannel {
     }
 }
 struct Queued {
-    bytes: [u8; 1153],
+    bytes: [u8; RUNTIME_PACKET],
     length: usize,
     sequence: u64,
 }
 #[derive(Clone, Copy)]
 struct CancelReply {
+    dns: bool,
     request: u64,
     target: u8,
     id: u64,
@@ -4102,10 +4250,47 @@ fn drain_before_publication<A: Authority>(
         if queued.len() + acks.len() >= 64 {
             return Err(ServiceError::Busy);
         }
-        let mut bytes = [0; 1153];
+        let mut bytes = [0; RUNTIME_PACKET];
         let Some(length) = socket.read(pid, uid, &mut bytes)? else {
             return Ok(());
         };
+        if dns_bundle::is_dns(&bytes[..length]) {
+            let f = dns_bundle::decode(
+                &bytes[..length],
+                issuer
+                    .negotiated
+                    .as_ref()
+                    .ok_or(ServiceError::Unavailable)?,
+                wire::dns_v2::Direction::Producer,
+            )?;
+            let sequence = f.header.sequence;
+            incoming.accept(sequence).map_err(unavailable)?;
+            if let Some(history) = &issuer.history {
+                history.lock().map_err(unavailable)?.runtime(sequence)?;
+            }
+            if let wire::dns_v2::Record::Cancel(v) = f.record {
+                let (target, id) = dns_bundle::cancel_fields(v);
+                let result = dns_bundle::cancel(issuer, sequence, target, id);
+                acks.push_back(CancelReply {
+                    dns: true,
+                    request: sequence,
+                    target,
+                    id,
+                    status: if result.is_ok() {
+                        wire::CloseStatus::KnownClosed
+                    } else {
+                        wire::CloseStatus::Unknown
+                    },
+                });
+            } else {
+                queued.push_back(Queued {
+                    bytes,
+                    length,
+                    sequence,
+                });
+            }
+            continue;
+        }
         let frame = wire::Frame::decode(
             &bytes[..length],
             issuer.record.binding,
@@ -4128,6 +4313,7 @@ fn drain_before_publication<A: Authority>(
             }
             let result = cancel_with_channel(issuer, socket, frame.header.sequence, target, id);
             acks.push_back(CancelReply {
+                dns: false,
                 request: frame.header.sequence,
                 target,
                 id,
@@ -4198,7 +4384,10 @@ fn run_issuer<A: Authority>(
     let mut awaiting = Some((
         outgoing,
         admission,
-        issuer.authority.now() + Duration::from_secs(1),
+        issuer
+            .authority
+            .admission_deadline()
+            .unwrap_or(issuer.authority.now() + Duration::from_secs(1)),
         expires,
     ));
     send_message(
@@ -4211,7 +4400,15 @@ fn run_issuer<A: Authority>(
         &wire::Message::Admit(issuer.capsule.bytes()),
         awaiting.ok_or(ServiceError::Unavailable)?.2,
     )?;
-    let mut bytes = [0; 1153];
+    let mut bytes = [0; RUNTIME_PACKET];
+    // MemoryPreflight уже включает caps[3]*2048 для этой очереди.
+    // CODEC2 debit-ит только дополнительный storage, без двойного reservation.
+    let existing = (issuer.capsule()?.limits()[3] as usize) * 2048;
+    let _queue_credit = issuer
+        .budget
+        .dynamic
+        .reserve((64 * std::mem::size_of::<Queued>()).saturating_sub(existing))
+        .map_err(unavailable)?;
     let mut queued = VecDeque::<Queued>::with_capacity(64);
     let mut acks = VecDeque::<CancelReply>::with_capacity(64);
     loop {
@@ -4241,6 +4438,7 @@ fn run_issuer<A: Authority>(
         for id in &expired[..count] {
             issuer.cancel_grant(*id)?;
         }
+        issuer.expire_dns()?;
         let (n, sequenced) = if let Some(pending) = queued.pop_front() {
             bytes = pending.bytes;
             (pending.length, true)
@@ -4258,6 +4456,54 @@ fn run_issuer<A: Authority>(
             };
             (n, false)
         };
+        if dns_bundle::is_dns(&bytes[..n]) {
+            if awaiting.is_some() {
+                return Err(ServiceError::Unavailable);
+            }
+            let neg = issuer.negotiated.ok_or(ServiceError::Unavailable)?;
+            let request = dns_bundle::decode(&bytes[..n], &neg, wire::dns_v2::Direction::Producer)?
+                .header
+                .sequence;
+            if !sequenced {
+                incoming.accept(request).map_err(unavailable)?;
+            }
+            if let Some(history) = &issuer.history {
+                history.lock().map_err(unavailable)?.runtime(request)?;
+            }
+            outgoing = outgoing
+                .checked_add(1)
+                .filter(|v| *v != u64::MAX)
+                .ok_or(ServiceError::Unavailable)?;
+            dns_bundle::dispatch(
+                issuer,
+                socket,
+                stop,
+                outgoing,
+                &bytes[..n],
+                expires,
+                |issuer| {
+                    drain_before_publication(
+                        issuer,
+                        socket,
+                        pid,
+                        uid,
+                        &mut incoming,
+                        &mut queued,
+                        &mut acks,
+                    )
+                },
+            )?;
+            socket.processed(request)?;
+            while let Some(ack) = acks.pop_front() {
+                outgoing = outgoing
+                    .checked_add(1)
+                    .filter(|v| *v != u64::MAX)
+                    .ok_or(ServiceError::Unavailable)?;
+                send_cancel_reply(issuer, socket, stop, outgoing, ack, expires)?;
+                socket.processed(ack.request)?;
+            }
+            continue;
+        }
         let frame = wire::Frame::decode(
             &bytes[..n],
             issuer.record.binding,
@@ -4276,7 +4522,7 @@ fn run_issuer<A: Authority>(
             status,
         } = frame.message
         {
-            let Some((sent, expected, _, next_expiry)) = awaiting else {
+            let Some((sent, expected, setup_until, next_expiry)) = awaiting else {
                 return Err(ServiceError::InvalidRequest);
             };
             if frame.header.reply_to != sent
@@ -4288,6 +4534,16 @@ fn run_issuer<A: Authority>(
             }
             expires = next_expiry;
             awaiting = None;
+            if issuer.negotiated.is_none() {
+                issuer.negotiated = Some(dns_bundle::negotiate(
+                    issuer,
+                    socket,
+                    pid,
+                    uid,
+                    stop,
+                    setup_until,
+                )?);
+            }
             ready.store(true, Ordering::Release);
             socket.processed(frame.header.sequence)?;
             continue;
@@ -4584,23 +4840,45 @@ fn run_issuer<A: Authority>(
         socket.processed(reply)?;
         while let Some(ack) = acks.pop_front() {
             outgoing = outgoing.checked_add(1).ok_or(ServiceError::Unavailable)?;
-            send_message(
-                issuer,
-                socket,
-                stop,
-                outgoing,
-                ack.request,
-                0,
-                &wire::Message::CloseAck {
-                    target: ack.target,
-                    status: ack.status,
-                    id: ack.id,
-                },
-                expires.min(Instant::now() + Duration::from_secs(1)),
-            )?;
+            send_cancel_reply(issuer, socket, stop, outgoing, ack, expires)?;
             socket.processed(ack.request)?;
         }
     }
+}
+fn send_cancel_reply<A: Authority>(
+    issuer: &Issuer<A>,
+    socket: &impl Channel,
+    stop: &AtomicBool,
+    sequence: u64,
+    ack: CancelReply,
+    expires: Instant,
+) -> Result<(), ServiceError> {
+    if ack.dns {
+        return dns_bundle::send_canceled(
+            issuer,
+            socket,
+            stop,
+            sequence,
+            ack.request,
+            ack.id,
+            ack.status,
+            expires,
+        );
+    }
+    send_message(
+        issuer,
+        socket,
+        stop,
+        sequence,
+        ack.request,
+        0,
+        &wire::Message::CloseAck {
+            target: ack.target,
+            status: ack.status,
+            id: ack.id,
+        },
+        expires.min(issuer.authority.now() + Duration::from_secs(1)),
+    )
 }
 pub(super) fn reject_unproved_stub(peer: wire::Destination<'_>) -> Result<(), ServiceError> {
     let address = match peer.family {
