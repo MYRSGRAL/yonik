@@ -715,3 +715,43 @@ Unsupported final retirement. EOF/bad packet/session revoke удерживают
 custody. Это консервативная конечная capacity, не long-lived UDP readiness.
 Root supervisor/rules fences не подменяются child ACK. DNS outer два файла
 по-прежнему не изменены; resolver provenance/provider cache остаются закрытыми.
+
+## R23F2: kernel namespace binding перед UAC publication
+
+Base — root correction d0e8644e12d263336a371666bf6cc06ead9da7d6.
+R23F1 `tick/retireCancelledLocked` и regression function сохранены byte-exact.
+Новый обязательный `profileUDPActor.namespace` вызывается в matching UAC branch
+до `inspect` и `profileNewUDPAssociationReserved`. Production launch связывает
+его с `profileKernelSocketNamespace`; nil callback закрывает delivery.
+Actual anchor — тот же retained accepted TCP control FD, который передан в UCS;
+snapshot handle берётся под flow mutex. Второй handle — actual received UAC FD.
+Оба читаются только через private `withFD`, без export raw integer/namespace FD.
+
+Первичный pinned contract: Linux6.12,
+`adc218676eef25575469234709c2d87185ca223a`:
+
+- [sk_getsockopt, SO_NETNS_COOKIE](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/net/core/sock.c#L1951)
+  возвращает namespace cookie socket с exact u64 length, без capability check
+  в этой option branch. Это отдельное значение от SO_COOKIE.
+- [setup_net](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/net/core/net_namespace.c#L322)
+  назначает cookie при создании namespace через общий generator;
+  [struct net](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/include/net/net_namespace.h#L156)
+  хранит его как written-once property.
+- [do_sock_getsockopt](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/net/socket.c#L2234)
+  сохраняет security/BPF policy boundary. Ошибка API/LSM/seccomp/unsupported
+  приводит к typed Unsupported; capabilities не расширяются.
+
+`profileRequireSameSocketNamespace` требует два live handles, kernel reader,
+два ненулевых значения и их равенство. Значения не приходят из UAC/JSON/env,
+не кэшируются как session credential и не сравниваются с current thread netns.
+SIOCGSKNS/proc/setns не используются. Guard доказывает равенство namespace
+двух actual sockets относительно уже trusted control/listener scope; он не
+заменяет Rust nsfs/stamp verification, user attribution или UDP FlowGrant.
+
+Pure injected reader controls: mismatch при неизменном valid UAC cookie,
+missing callback/reader/control/relay, zero/error/closed handle, matching success,
+opaque nonzero MAX и failed FD close retaining Unknown custody. Denial происходит
+до receiver factory/association/Endpoint, поэтому SOCKS success недоступен.
+Existing type/protocol/flags/cookie/loopback/queue/GRO/overflow inspection остаётся.
+OS getter/receiver не исполнялись; runtime/kernel compatibility здесь не PASS.
+Wire, frozen ABI260, capabilities/dependencies и все readiness gates прежние false.
