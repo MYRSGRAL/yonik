@@ -26,6 +26,21 @@ pub(crate) struct CaptureCredits {
     _bytes: super::memory::ByteLease,
 }
 impl CaptureCredits {
+    #[allow(dead_code, reason = "Production path закрыт до approved installation")]
+    fn reserve_policy_shared(
+        fds: &super::memory::ByteBudget,
+        pending: &super::memory::ByteBudget,
+        bytes: &super::memory::ByteBudget,
+    ) -> Result<Self> {
+        let fds = fds.reserve(128).map_err(|_| Error::Budget)?;
+        let pending = pending.reserve(1).map_err(|_| Error::Budget)?;
+        let bytes = bytes.reserve(65536).map_err(|_| Error::Budget)?;
+        Ok(Self {
+            _fds: fds,
+            _pending: pending,
+            _bytes: bytes,
+        })
+    }
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "Нет легитимного StubBind policy producer")
@@ -59,7 +74,7 @@ pub(super) fn require_protected_policy(peer: SocketAddr, protocol: u8) -> Result
 // private DATA/observation API. Factory ниже не принимает child metadata.
 #[expect(
     dead_code,
-    reason = "Protected resolver service-policy producer отсутствует; наблюдения не открывают issuer gate"
+    reason = "Reviewed resolver installation отсутствует; наблюдения не открывают issuer gate"
 )]
 mod observation {
     use super::*;
@@ -328,8 +343,8 @@ mod observation {
     }
 
     /// Concrete compile-only kernel producer переиспользует retained nsfs FD,
-    /// не proc scan/PID attribution. Manager/policy source отсутствует, поэтому
-    /// эта observation НЕ получает production factory/Allow constructor.
+    /// не proc scan/PID attribution. Production actor ниже удерживает manager/policy source;
+    /// до approved installation observation не открывает public Allow gate.
     #[expect(
         clippy::too_many_arguments,
         reason = "Закрытый compile-only seam удержанных FD и одного credited запроса"
@@ -371,6 +386,109 @@ mod observation {
             credit,
         )
         .map_err(|_| Error::Incomplete)
+    }
+
+    /// Один bounded production actor, holding source/credits даже после ошибки.
+    struct ProtectedCapture {
+        source: super::resolver_policy::production::Producer,
+        unit: Unit,
+        listener: Listener,
+        endpoint: SocketAddr,
+        protocol: u8,
+        expires: Instant,
+        poisoned: bool,
+    }
+    impl ProtectedCapture {
+        async fn capture(
+            budgets: (
+                &super::super::memory::ByteBudget,
+                &super::super::memory::ByteBudget,
+                &super::super::memory::ByteBudget,
+            ),
+            endpoint: SocketAddr,
+            protocol: u8,
+            context: Context,
+            expires: Instant,
+            cancel: &AtomicBool,
+        ) -> Result<Self> {
+            let (fds, pending, bytes) = budgets;
+            let deadline = expires.min(Instant::now() + std::time::Duration::from_nanos(FRESH_NS));
+            let mut source = super::resolver_policy::production::Producer::open(
+                fds, pending, bytes, deadline, cancel,
+            )
+            .await?;
+            let before = UnitEvidence::from_policy(source.verified(cancel).await?).unit;
+            if before.view != context.view
+                || before.namespace != context.namespace
+                || before.source_epoch != context.source_epoch
+            {
+                return Err(Error::Untrusted);
+            }
+            let (netns, cgroup, credit) = source.files();
+            let set = kernel_sample(
+                netns,
+                cgroup,
+                &before,
+                protocol,
+                endpoint.port(),
+                deadline,
+                cancel,
+                credit,
+            )?;
+            let listener = select(&set, &before, endpoint, protocol)?;
+            let after = UnitEvidence::from_policy(source.verified(cancel).await?).unit;
+            if before != after || Instant::now() >= deadline {
+                return Err(Error::Stale);
+            }
+            Ok(Self {
+                source,
+                unit: before,
+                listener,
+                endpoint,
+                protocol,
+                expires: deadline,
+                poisoned: false,
+            })
+        }
+        async fn revalidate(&mut self, cancel: &AtomicBool) -> Result<()> {
+            if self.poisoned {
+                return Err(Error::Stale);
+            }
+            let result = self.revalidate_inner(cancel).await;
+            if result.is_err() {
+                self.poisoned = true;
+            }
+            result
+        }
+        async fn revalidate_inner(&mut self, cancel: &AtomicBool) -> Result<()> {
+            // Исходное 20ms окно и expiry никогда не продлеваются.
+            if Instant::now() >= self.expires {
+                return Err(Error::Stale);
+            }
+            if UnitEvidence::from_policy(self.source.verified(cancel).await?).unit != self.unit {
+                return Err(Error::Stale);
+            }
+            let (netns, cgroup, credit) = self.source.files();
+            let set = kernel_sample(
+                netns,
+                cgroup,
+                &self.unit,
+                self.protocol,
+                self.endpoint.port(),
+                self.expires,
+                cancel,
+                credit,
+            )?;
+            if select(&set, &self.unit, self.endpoint, self.protocol)? != self.listener {
+                return Err(Error::Stale);
+            }
+            if UnitEvidence::from_policy(self.source.verified(cancel).await?).unit != self.unit
+                || Instant::now() >= self.expires
+            {
+                return Err(Error::Stale);
+            }
+            Ok(())
+        }
     }
 
     #[cfg(test)]
