@@ -1,6 +1,256 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[test]
+fn udp_open_waits_for_consumed_before_real_driver_publication() {
+    let record = issuer(Mode::System).record;
+    let (mut packet, _) = rendezvous_open(record, 2);
+    let mut message = open(Mode::Local, 32001);
+    let wire::Message::OpenIngress {
+        ref mut provenance,
+        ref mut tuple,
+        ref mut original,
+        ..
+    } = message
+    else {
+        unreachable!()
+    };
+    *provenance = 3;
+    tuple.protocol = 17;
+    tuple.remote_port = 49152;
+    original.protocol = 17;
+    packet.length = wire::Frame::encode(
+        wire::Header {
+            kind: wire::Kind::OpenIngress,
+            sequence: 2,
+            reply_to: 0,
+            binding: record.binding,
+            object_id: 0,
+        },
+        &message,
+        &mut packet.bytes,
+    )
+    .unwrap();
+    let mut inbox = Rendezvous::<u8>::new().unwrap();
+    let now = Instant::now();
+    inbox.runtime(packet, now).unwrap();
+    assert!(inbox.next(record, now).unwrap().is_none());
+}
+
+fn udp_packet(record: LaunchRecord, sequence: u64, now: Instant) -> (Queued, UdpIngressRecord) {
+    let (mut packet, _) = rendezvous_open(record, sequence);
+    let mut message = open(Mode::Local, 32001);
+    let wire::Message::OpenIngress {
+        ref mut provenance,
+        ref mut tuple,
+        ref mut original,
+        ..
+    } = message
+    else {
+        unreachable!()
+    };
+    *provenance = 3;
+    tuple.protocol = 17;
+    tuple.remote_port = 49152;
+    original.protocol = 17;
+    let udp = UdpIngressRecord {
+        sequence,
+        ingress: 0,
+        packet: wire::udp_v2::Packet {
+            association: 1,
+            packet: 3,
+            permit: 4,
+            cookie: 102,
+            tuple: *tuple,
+            bytes: 11,
+            header: 10,
+            flags: 0,
+            fingerprint: [7; 32],
+        },
+        original: Target::copy(*original).unwrap(),
+        expires: now + Duration::from_secs(1),
+    };
+    packet.length = wire::Frame::encode(
+        wire::Header {
+            kind: wire::Kind::OpenIngress,
+            sequence,
+            reply_to: 0,
+            binding: record.binding,
+            object_id: 0,
+        },
+        &message,
+        &mut packet.bytes,
+    )
+    .unwrap();
+    (packet, udp)
+}
+#[test]
+fn udp_rendezvous_both_orders_cancel_and_shared_credits() {
+    let record = issuer(Mode::System).record;
+    let now = Instant::now();
+    for proof_first in [true, false] {
+        let mut inbox = Rendezvous::new().unwrap();
+        let (packet, proof) = udp_packet(record, 2, now);
+        if proof_first {
+            let slot = inbox.slots.pending.reserve(1).unwrap();
+            inbox.udp_proof(proof, 42u8, slot, now).unwrap();
+        }
+        inbox.runtime(packet, now).unwrap();
+        if !proof_first {
+            assert!(inbox.next(record, now).unwrap().is_none());
+            let slot = inbox.slots.pending.reserve(1).unwrap();
+            inbox.udp_proof(proof, 42u8, slot, now).unwrap();
+        }
+        assert_eq!(inbox.next(record, now).unwrap().unwrap().sequence, 2);
+        assert_eq!(inbox.take(2, proof.packet.tuple, 0).unwrap(), 42);
+        inbox.processed(2);
+        assert_eq!(inbox.slots.pending.used(), 0);
+        let slot = inbox.slots.pending.reserve(1).unwrap();
+        assert!(inbox.udp_proof(proof, 43, slot, now).is_err());
+    }
+    let mut inbox = Rendezvous::new().unwrap();
+    let (packet, proof) = udp_packet(record, 2, now);
+    let slot = inbox.slots.pending.reserve(1).unwrap();
+    inbox.udp_proof(proof, 42u8, slot, now).unwrap();
+    inbox.runtime(packet, now).unwrap();
+    inbox.discard_association(1);
+    assert_eq!(inbox.next(record, now).unwrap().unwrap().sequence, 2);
+    assert!(inbox.take(2, proof.packet.tuple, 0).is_err());
+    inbox.processed(2);
+    assert_eq!(inbox.slots.pending.used(), 0);
+    let slots = SidebandCredits::new();
+    let held = slots.pending.reserve(64).unwrap();
+    assert!(slots.read_credit(16).is_err());
+    assert_eq!(slots.fds.used(), 0);
+    drop(held);
+    let held = slots.fds.reserve(64).unwrap();
+    assert!(slots.read_credit(16).is_err());
+    assert_eq!(slots.pending.used(), 0);
+    drop(held);
+}
+struct UdpDriver {
+    inbox: Arc<std::sync::Mutex<Rendezvous<u8>>>,
+    record: LaunchRecord,
+    proof_first: bool,
+    delayed: std::cell::RefCell<Option<UdpIngressRecord>>,
+    allowed: std::cell::Cell<usize>,
+    finished: std::cell::Cell<bool>,
+}
+impl Channel for UdpDriver {
+    fn processed(&self, sequence: u64) -> Result<(), ServiceError> {
+        self.inbox.lock().map_err(unavailable)?.processed(sequence);
+        Ok(())
+    }
+    fn read(&self, _: u32, _: u32, out: &mut [u8; 1153]) -> Result<Option<usize>, ServiceError> {
+        let mut inbox = self.inbox.lock().map_err(unavailable)?;
+        if let Some(packet) = inbox.next(self.record, Instant::now())? {
+            out[..packet.length].copy_from_slice(&packet.bytes[..packet.length]);
+            return Ok(Some(packet.length));
+        }
+        if let Some(proof) = self.delayed.borrow_mut().take() {
+            let slot = inbox.slots.pending.reserve(1).map_err(unavailable)?;
+            inbox.udp_proof(proof, 42, slot, Instant::now())?;
+            return Ok(None);
+        }
+        if self.finished.get() {
+            Err(ServiceError::Unavailable)
+        } else {
+            Ok(None)
+        }
+    }
+    fn discard_ingress(&self, id: u64) -> Result<(), ServiceError> {
+        self.inbox.lock().map_err(unavailable)?.discard(id);
+        Ok(())
+    }
+    fn write(&self, bytes: &[u8]) -> Result<bool, ServiceError> {
+        let frame = wire::Frame::decode(bytes, self.record.binding, Mode::System, true).unwrap();
+        match frame.message {
+            wire::Message::Admit(body) => {
+                let capsule = wire::Capsule::decode(body, &self.record.binding.digest).unwrap();
+                let mut raw = [0; 1153];
+                let n = wire::Frame::encode(
+                    wire::Header {
+                        kind: wire::Kind::AdmitAck,
+                        sequence: 2,
+                        reply_to: frame.header.sequence,
+                        binding: self.record.binding,
+                        object_id: 0,
+                    },
+                    &wire::Message::AdmitAck {
+                        manifest: capsule.manifest,
+                        admission: capsule.admission_id,
+                        status: wire::Status::Allow,
+                    },
+                    &mut raw,
+                )
+                .unwrap();
+                let now = Instant::now();
+                let mut inbox = self.inbox.lock().unwrap();
+                inbox
+                    .runtime(
+                        Queued {
+                            bytes: raw,
+                            length: n,
+                            sequence: 2,
+                        },
+                        now,
+                    )
+                    .unwrap();
+                let (packet, proof) = udp_packet(self.record, 3, now);
+                if self.proof_first {
+                    let slot = inbox.slots.pending.reserve(1).unwrap();
+                    inbox.udp_proof(proof, 42, slot, now).unwrap();
+                } else {
+                    *self.delayed.borrow_mut() = Some(proof);
+                }
+                inbox.runtime(packet, now).unwrap();
+            }
+            wire::Message::IngressReply {
+                status: wire::Status::Allow,
+                ..
+            } => {
+                self.allowed.set(self.allowed.get() + 1);
+                self.finished.set(true);
+            }
+            wire::Message::Deny { .. } => self.finished.set(true),
+            wire::Message::Grant { .. } => panic!("Без AUTHORIZE нельзя выдать GRANT"),
+            _ => {}
+        }
+        Ok(true)
+    }
+    fn pause(&self) {}
+}
+#[test]
+fn real_issuer_loop_udp_open_consumed_both_orders_publish_one_private_flow() {
+    for proof_first in [false, true] {
+        let mut issuer = issuer(Mode::System);
+        let inbox = Arc::new(std::sync::Mutex::new(Rendezvous::new().unwrap()));
+        issuer.authority.udp_inbox = Some(Arc::clone(&inbox));
+        let driver = UdpDriver {
+            inbox,
+            record: issuer.record,
+            proof_first,
+            delayed: std::cell::RefCell::new(None),
+            allowed: std::cell::Cell::new(0),
+            finished: std::cell::Cell::new(false),
+        };
+        assert!(
+            run_issuer(
+                &mut issuer,
+                &driver,
+                8,
+                997,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert_eq!(driver.allowed.get(), 1);
+        assert_eq!(issuer.flows.len(), 1);
+        assert!(issuer.grants.is_empty());
+    }
+}
+
 struct CancelProofIo {
     inbox: std::cell::RefCell<Rendezvous<u8>>,
     packets: std::cell::RefCell<VecDeque<Queued>>,
@@ -76,6 +326,8 @@ fn canceled_queued_open_discards_ready_proof_without_expiring_neighbor() {
     assert_eq!(queued.len(), 1);
     assert!(issuer.retired.iter().any(|(id, _)| *id == 2));
     let mut inbox = io.inbox.borrow_mut();
+    // Retired main-loop skip завершает delivered credit отдельно от proof.
+    inbox.processed(2);
     inbox.check(now + Duration::from_secs(2)).unwrap();
     assert!(inbox.proof(proof, 43, now).is_err());
     assert!(issuer.flows.contains_key(&neighbor));
@@ -282,14 +534,15 @@ fn socket_proof_missing_open_can_be_canceled_without_authority_or_resurrection()
     assert!(inbox.proof(proof, 1, now).is_err());
 }
 #[derive(Clone)]
-struct Proof {
+pub(super) struct Proof {
     source: u64,
     tuple: Tuple,
     subject: Option<Subject>,
     expiry: Instant,
     receipt: wire::Receipt,
 }
-struct Fake {
+pub(super) struct Fake {
+    udp_inbox: Option<Arc<std::sync::Mutex<Rendezvous<u8>>>>,
     service_trusted: bool,
     mode: Mode,
     now: Instant,
@@ -302,13 +555,14 @@ struct Fake {
     released: Vec<u64>,
     live: BTreeSet<u64>,
     route_delay: Duration,
-    unknown_release: bool,
+    pub(super) unknown_release: bool,
     release_attempts: usize,
     fail_after_route: bool,
 }
 impl Fake {
     fn new(mode: Mode) -> Self {
         Self {
+            udp_inbox: None,
             service_trusted: false,
             mode,
             now: Instant::now(),
@@ -368,11 +622,41 @@ impl Authority for Fake {
     }
     fn ingress(
         &mut self,
-        _request: u64,
+        request: u64,
         capsule: &wire::Capsule<'_>,
         message: &wire::Message<'_>,
         _: &Arc<ChannelBudget>,
     ) -> Result<(), ServiceError> {
+        if let (
+            Some(inbox),
+            wire::Message::OpenIngress {
+                provenance: 3,
+                tuple,
+                ingress,
+                ..
+            },
+        ) = (&self.udp_inbox, message)
+        {
+            capsule
+                .validate_udp_control(
+                    *ingress,
+                    Tuple {
+                        protocol: 6,
+                        remote_port: 1080,
+                        ..*tuple
+                    },
+                )
+                .map_err(unavailable)?;
+            if inbox
+                .lock()
+                .map_err(unavailable)?
+                .take(request, *tuple, *ingress)?
+                != 42
+            {
+                return Err(ServiceError::Unavailable);
+            }
+            return Ok(());
+        }
         capsule.validate_request(message).map_err(unavailable)
     }
     fn check_ingress(&self, _: &()) -> Result<(), ServiceError> {
@@ -473,7 +757,7 @@ impl Authority for Fake {
         Ok(())
     }
 }
-fn issuer(mode: Mode) -> Issuer<Fake> {
+pub(super) fn issuer(mode: Mode) -> Issuer<Fake> {
     issuer_profile(mode, false)
 }
 fn issuer_profile(mode: Mode, service: bool) -> Issuer<Fake> {
@@ -531,7 +815,7 @@ fn original() -> wire::Destination<'static> {
         bytes: &[203, 0, 113, 9],
     }
 }
-fn open(mode: Mode, port: u16) -> wire::Message<'static> {
+pub(super) fn open(mode: Mode, port: u16) -> wire::Message<'static> {
     let mut local = [0; 16];
     local[..4].copy_from_slice(&[192, 0, 2, 1]);
     let mut remote = [0; 16];
@@ -554,7 +838,7 @@ fn open(mode: Mode, port: u16) -> wire::Message<'static> {
         original: original(),
     }
 }
-fn authorize(source: u64) -> wire::Authorize<'static> {
+pub(super) fn authorize(source: u64) -> wire::Authorize<'static> {
     wire::Authorize {
         source_flow: source,
         class: 1,

@@ -2257,7 +2257,7 @@ impl Capsule<'_> {
             return Err(Error::Reference);
         }
         proof
-            .validate_association(*tuple)
+            .validate_association(*tuple, *original)
             .map_err(|_| Error::Binding)
     }
     pub(crate) fn validate_asset_refs(&self, assets: &[AssetReference]) -> Result<()> {

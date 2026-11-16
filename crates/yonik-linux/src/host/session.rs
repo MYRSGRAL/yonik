@@ -394,7 +394,7 @@ impl LocalSession {
         self.log(crate::event_log::EventCode::CleanupConfirmed);
         self.child = None;
         if let Some(mut profile) = self.profile.take() {
-            profile.confirmed_closed();
+            profile.confirmed_closed().map_err(|_| HostError::Cleanup)?;
         }
         self.binary = None;
         self.port = None;
