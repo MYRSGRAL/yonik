@@ -12,6 +12,24 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_dns_factory_is_consuming_private_fd_not_arbitrary_conn(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        direct = patch.split(
+            "+++ b/common/yonikbroker/profile_dns_direct_linux.go\n", 1
+        )[1].split("diff --git ", 1)[0]
+        self.assertNotIn("syscall.Conn", direct)
+        self.assertNotIn("os.NewFile(", direct)
+        self.assertNotIn("\n+\tnet.Conn\n", direct)
+        for anchor in (
+            "func profileDNSCreateOwnedSocket(",
+            "closeRaw: unix.Close",
+            "c.dnsDirectReleasedForBundle(b)",
+            "t.cleanupDeadline.Before(op.deadline)",
+            "hooks.ProfileDialDNSDirect(ctx, dest)",
+            "profileDNSRawSettings(streamSettings)",
+        ):
+            self.assertIn(anchor, patch)
+
     def test_rx_scratch_is_permanent_and_shared_readers_use_exclusive_lease(
         self,
     ) -> None:
@@ -37,11 +55,11 @@ class FullProfilePatchTests(unittest.TestCase):
     ) -> None:
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         for caller in (
-            "return profileDNSDialDirect(ctx, dest, runner)",
+            "return hooks.ProfileDialDNSDirect(ctx, dest)",
             "return c.dnsDirectDispatch(op)",
             "c.dnsDirectAccept(f)",
             "p.reserveDNSInput()",
-            "hooks.ProfileDNSDirectFactory(ctx)",
+            "hooks.ProfileDNSDirectRequired(ctx)",
             "profileKernelSocketNamespace(source.proof, fd)",
             "op.sequence = op.dnsDirect.request.sequence",
             "op.sent = op.dnsDirect.request.sent",
@@ -61,7 +79,7 @@ class FullProfilePatchTests(unittest.TestCase):
         raw = (ADAPTER / "full-profile-fixtures/dns-v2-canonical.json").read_bytes()
         self.assertEqual(
             hashlib.sha256(raw).hexdigest(),
-            "10d798ffd45f7d250e4c3f38c02b9f394671d1f9ee4871cdcd39b9d042e59359",
+            "1e597fdc11441209455c5c5ceafe85b4fbcd6a6756dfdae77ea0882149e83e88",
         )
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         added = patch.split(
@@ -76,7 +94,7 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertEqual(len(corpus["vectors"]), 86)
         self.assertEqual(len(corpus["rejectedBodies"]), 218)
         self.assertEqual(len(corpus["rejectedFrames"]), 17)
-        self.assertIn("YONIK-DNS-V2-CODEC-2", patch)
+        self.assertIn("YONIK-DNS-V2-CODEC-3", patch)
         self.assertIn("ProfileDNSPrepareHandler(ctx, h.tag", patch)
         self.assertIn("c.dnsAccept(f)", patch)
         self.assertIn("c.dnsTick()", patch)
