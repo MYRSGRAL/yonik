@@ -44,9 +44,11 @@ ApplicationWindow {
     property string settingsSection: ""
     property double maintenanceRequestSequence: 0
     property bool reducedMotion: false
+    property var desiredProfileKind: null
+    property var desiredProfilePage: null
     property var desiredProfileId: null
     property var desiredSourceId: null
-    readonly property bool selectionConfirmed: (desiredProfileId === null || state.selected_profile === desiredProfileId)
+    readonly property bool selectionConfirmed: (desiredProfileId === null || state.selected_profile === desiredProfileId && state.selected_kind === desiredProfileKind && state.selected_catalog_page === desiredProfilePage)
         && (desiredSourceId === null || state.source_id === desiredSourceId)
     property bool sourceOptions: false
     property bool localImportActive: false
@@ -85,9 +87,11 @@ ApplicationWindow {
         desiredProfileId = null
         send({command: "select_source", id: id})
     }
-    function selectProfile(id) {
+    function selectProfile(id, kind) {
         desiredProfileId = id
-        send({command: "select_profile", id: id, revision: state.revision})
+        desiredProfileKind = kind
+        desiredProfilePage = state.catalog_page
+        send({command: "select_catalog", kind: kind, id: id, page: state.catalog_page})
     }
     function openSettings() {
         settingsOrigin = page
@@ -116,7 +120,7 @@ ApplicationWindow {
 
     function tr(ru, en) { return language === "ru" ? ru : en }
     function send(command) {
-        const sourceCommands = ["import_text", "import_file", "cancel_local_import", "import_source", "refresh", "cancel_refresh", "rename_source", "delete_source", "set_source_hwid", "select_source", "source_page", "approve_refresh", "discard_refresh", "review_page", "query", "select_profile"]
+        const sourceCommands = ["import_text", "import_file", "cancel_local_import", "import_source", "refresh", "cancel_refresh", "rename_source", "delete_source", "set_source_hwid", "select_source", "source_page", "approve_refresh", "discard_refresh", "review_page", "query", "select_profile", "select_catalog", "catalog_favorite"]
         commandContext = sourceCommands.indexOf(command.command) >= 0 ? "source" : "connection"
         if (!state.closed) backend.dispatch(JSON.stringify(command))
     }
@@ -196,7 +200,7 @@ ApplicationWindow {
                 searchDelay.stop()
             }
             if (desiredSourceId === next.source_id) desiredSourceId = null
-            if (desiredProfileId === next.selected_profile) desiredProfileId = null
+            if (desiredProfileId === next.selected_profile && desiredProfileKind === next.selected_kind && desiredProfilePage === next.selected_catalog_page) desiredProfileId = null
             if (next.language) language = next.language
             state = next
             if (next.startup && next.startup.request_id === startupPending && next.startup.save !== "pending") startupPending = ""
@@ -785,11 +789,18 @@ ApplicationWindow {
                                 required property int index
                                 width: ListView.view.width
                                 height: 66
-                                highlighted: modelData.kind !== "xray" && window.state.selected_profile === modelData.id
+                                highlighted: window.state.selected_kind === modelData.kind && window.state.selected_profile === modelData.id
                                 background: Rectangle { color: profileRow.highlighted ? "#302638" : (profileRow.hovered ? "#242127" : "#191919"); border.color: profileRow.activeFocus ? window.accent : "transparent"; radius: 4 }
-                                enabled: window.state.ready && !window.state.busy && modelData.selectable !== false
+                                enabled: window.state.ready && !window.state.busy
                                 Accessible.name: modelData.name + ", " + (modelData.kind === "xray" ? window.tr("Полный профиль Xray. Подключение пока недоступно", "Full Xray profile. Connection is not available yet") : modelData.host)
-                                onClicked: if (modelData.kind !== "xray" && modelData.selectable !== false) window.selectProfile(modelData.id)
+                                onClicked: if (modelData.selectable !== false) window.selectProfile(modelData.id, modelData.kind)
+                                ToolButton {
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: profileRow.modelData.favorite ? "★" : "☆"
+                                    enabled: window.state.ready && !window.state.busy
+                                    onClicked: window.send({command: "catalog_favorite", kind: profileRow.modelData.kind, id: profileRow.modelData.id, page: window.state.catalog_page, value: !profileRow.modelData.favorite})
+                                }
                                 Keys.onReturnPressed: if (enabled) clicked()
                                 Keys.onEnterPressed: if (enabled) clicked()
                                 contentItem: RowLayout {
@@ -801,7 +812,7 @@ ApplicationWindow {
                                         SmallLabel { text: profileRow.modelData.kind === "xray" ? window.tr("Полный профиль Xray · подключение пока недоступно", "Full Xray profile · connection is not available yet") : profileRow.modelData.host + ":" + profileRow.modelData.port + " · " + profileRow.modelData.protocol; Layout.fillWidth: true; elide: Text.ElideRight; maximumLineCount: 1 }
                                     }
                                     SmallLabel { visible: !profileRow.modelData.available; text: window.tr("Недоступен", "Unavailable") }
-                                    SmallLabel { visible: profileRow.modelData.kind !== "xray" && window.state.selected_profile === profileRow.modelData.id; text: window.tr("Выбран", "Selected"); color: window.accent }
+                                    SmallLabel { visible: window.state.selected_kind === profileRow.modelData.kind && window.state.selected_profile === profileRow.modelData.id; text: window.tr("Выбран", "Selected"); color: window.accent }
 
                                 }
                             }
@@ -888,7 +899,7 @@ ApplicationWindow {
             ColumnLayout {
                 id: editor
                 objectName: "routingEditor"
-                enabled: window.state.ready && !window.state.closed && !window.routingPending
+                enabled: window.state.selected_kind !== "xray" && window.state.ready && !window.state.closed && !window.routingPending
                 property double catalogExpectedId: 0
                 property bool catalogRequestLimit: false
                 readonly property var displayedCatalog: catalogExpectedId > 0 && window.state.routing_catalog && window.state.routing_catalog.request_id === catalogExpectedId ? window.state.routing_catalog : null
@@ -1065,7 +1076,7 @@ ApplicationWindow {
                 ActionButton {
                     objectName: "routingApplyButton"
                     text: window.tr("Применить к сети", "Apply to network")
-                    enabled: window.state.ready && !window.state.busy && !window.routingPending && window.state.engine === "xray" && window.state.connection_mode === "system" && window.state.system_tun_available && !window.state.system_busy && !window.state.can_stop && !window.state.system_recovery_pending && !!window.state.selected_profile && window.state.source_generation !== null
+                    enabled: window.state.selected_kind !== "xray" && window.state.ready && !window.state.busy && !window.routingPending && window.state.engine === "xray" && window.state.connection_mode === "system" && window.state.system_tun_available && !window.state.system_busy && !window.state.can_stop && !window.state.system_recovery_pending && !!window.state.selected_profile && window.state.source_generation !== null
                     onClicked: window.sendRouting({command: "routing_apply", source_generation: window.state.source_generation, snapshot_revision: window.state.revision, selected_profile_id: window.state.selected_profile})
                 }
                 SmallLabel { Layout.fillWidth: true; text: window.tr("Применение требует свежего подтверждения helper. TunnelStarting и VerifiedRules не подтверждают подключение или атрибуцию приложений.", "Apply requires fresh helper capabilities. TunnelStarting and VerifiedRules do not confirm connectivity or application attribution.") }
@@ -1082,10 +1093,12 @@ ApplicationWindow {
                 RowLayout {
                     Layout.fillWidth: true
                     PlainLabel { Layout.fillWidth: true; text: window.tr("Ядро", "Engine") }
-                    ComboBox { objectName: "engineChoice"; model: ["xray"]; currentIndex: window.state.engine === "xray" ? 0 : -1; enabled: window.editable; onActivated: window.send({command: "set_engine", engine: currentText}); Accessible.name: window.tr("Прокси-ядро", "Proxy engine") }
+                    PlainLabel { visible: window.state.selected_kind === "xray"; text: "Xray · Full Xray" }
+                    ComboBox { visible: window.state.selected_kind !== "xray"; objectName: "engineChoice"; model: ["xray"]; currentIndex: window.state.engine === "xray" ? 0 : -1; enabled: window.state.selected_kind !== "xray" && window.editable; onActivated: window.send({command: "set_engine", engine: currentText}); Accessible.name: window.tr("Прокси-ядро", "Proxy engine") }
                     HelpButton { explanation: window.tr("Обрабатывает подключение к серверу. Меняется после отключения и действует до закрытия приложения.", "Handles the server connection. Change after disconnecting; applies until the app exits.") }
                 }
                 PlainLabel { visible: window.state.engine === "sing-box"; Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Сохранённое ядро Sing-box пока недоступно. Выберите Xray для подключения.", "The saved Sing-box engine is currently unavailable. Select Xray to connect.") }
+                PlainLabel { visible: window.state.selected_kind === "xray"; text: "Full Xray · " + window.tr("Подключение пока недоступно. Настройки профиля доступны только для чтения.", "Connection is not available yet. Profile settings are read-only.") }
                 Divider {}
                 RowLayout {
                     Layout.fillWidth: true
@@ -1094,7 +1107,7 @@ ApplicationWindow {
                         objectName: "connectionModeChoice"
                         model: [window.tr("Локальный SOCKS5", "Local SOCKS5"), window.tr("Системное подключение", "System connection")]
                         currentIndex: window.state.connection_mode === "system" ? 1 : 0
-                        enabled: window.editable && !window.state.can_unlock
+                        enabled: window.state.selected_kind !== "xray" && window.editable && !window.state.can_unlock
                         onActivated: window.send({command: "set_connection_mode", mode: currentIndex === 1 ? "system" : "local"})
                     }
                     HelpButton { explanation: window.tr("Локальный SOCKS настраивается в нужном приложении. Системный режим требует capability и разрешения helper. Подтверждение правил ещё не подтверждает доступ через туннель.", "Configure local SOCKS in your application. System mode requires helper capability and authorization. Verified rules do not confirm tunnel connectivity.") }
@@ -1103,8 +1116,8 @@ ApplicationWindow {
                 PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Укажите IP:порт или [IPv6]:порт DNS-over-TCP сервера. Он используется через активное SOCKS-подключение только для обновлений подписок в режиме Proxy. Пустое значение запрещает DNS для доменных адресов. Настройки DNS ОС и ядра не меняются. Изменение доступно после отключения.", "Enter IP:port or [IPv6]:port of a DNS-over-TCP server. Subscription updates in Proxy mode use it through the active SOCKS connection. Empty disables domain DNS. OS and core DNS settings are unchanged. Disconnect before editing.") }
                 RowLayout {
                     Layout.fillWidth: true
-                    TextField { id: proxyFetchDns; objectName: "proxyFetchDns"; Layout.fillWidth: true; maximumLength: 128; text: window.state.proxy_fetch_dns || ""; enabled: window.editable && !window.state.can_stop; Accessible.name: window.tr("DNS обновлений Proxy", "Proxy update DNS") }
-                    ActionButton { objectName: "saveProxyFetchDns"; text: window.tr("Сохранить", "Save"); enabled: window.editable && !window.state.can_stop; onClicked: window.send({command: "set_proxy_fetch_dns", upstream: proxyFetchDns.text}) }
+                    TextField { id: proxyFetchDns; objectName: "proxyFetchDns"; Layout.fillWidth: true; maximumLength: 128; text: window.state.proxy_fetch_dns || ""; enabled: window.state.selected_kind !== "xray" && window.editable && !window.state.can_stop; Accessible.name: window.tr("DNS обновлений Proxy", "Proxy update DNS") }
+                    ActionButton { objectName: "saveProxyFetchDns"; text: window.tr("Сохранить", "Save"); enabled: window.state.selected_kind !== "xray" && window.editable && !window.state.can_stop; onClicked: window.send({command: "set_proxy_fetch_dns", upstream: proxyFetchDns.text}) }
                 }
                 PlainLabel { visible: window.state.connection_mode === "system"; text: window.tr("Состояние helper: ", "Helper state: ") + (window.state.system_state || "Unknown") }
                 ActionButton { objectName: "systemStateButton"; visible: window.state.connection_mode === "system"; enabled: !window.state.system_busy; text: window.tr("Проверить состояние", "Check state"); onClicked: window.send({command: "system_state"}) }
@@ -1147,7 +1160,7 @@ ApplicationWindow {
                 ActionButton {
                     objectName: "confirmStartupTarget"
                     text: window.tr("Подтвердить текущую цель", "Confirm current target")
-                    enabled: window.state.ready && !!window.state.selected_profile && !window.state.ephemeral && !window.startupPending && !window.state.preferences_warning
+                    enabled: window.state.selected_kind !== "xray" && window.state.ready && !!window.state.selected_profile && !window.state.ephemeral && !window.startupPending && !window.state.preferences_warning
                     onClicked: window.saveStartup(true, false, false)
                 }
                 PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Подтверждается текущий выбранный профиль, ядро, режим и ревизия маршрутизации. Сохранение не начинает соединение. Обычный запуск остаётся видимым; без готового трея окно всегда видно.", "Confirms the currently selected profile, core, mode and routing revision. Saving does not connect. Normal launches stay visible; without a ready tray the window remains visible.") }
@@ -1257,7 +1270,7 @@ ApplicationWindow {
                                 ActionButton {
                                     objectName: "tcpCheckButton"
                                     text: window.tr("Проверить TCP", "Check TCP")
-                                    enabled: window.state.ready && window.state.selected_profile !== null && !window.state.busy && !window.state.tcp_busy
+                                    enabled: window.state.selected_kind !== "xray" && window.state.ready && window.state.selected_profile !== null && !window.state.busy && !window.state.tcp_busy
                                     onClicked: window.send({command: "check_tcp"})
                                 }
                                 ActionButton {
