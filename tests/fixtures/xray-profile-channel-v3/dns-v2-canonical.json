@@ -6245,6 +6245,28 @@
       "appendZeroBytes": 0
     },
     {
+      "case": "published-dns-allow",
+      "patches": [
+        [
+          16,
+          "u64",
+          18446744073709551615
+        ]
+      ],
+      "appendZeroBytes": 0
+    },
+    {
+      "case": "published-hosts-allow",
+      "patches": [
+        [
+          16,
+          "u64",
+          18446744073709551615
+        ]
+      ],
+      "appendZeroBytes": 0
+    },
+    {
       "case": "waiter-bind-user",
       "patches": [
         [

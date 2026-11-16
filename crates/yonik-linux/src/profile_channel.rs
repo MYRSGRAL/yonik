@@ -1084,6 +1084,9 @@ pub(crate) mod dns_v2 {
                     source(b[58], b[59])?;
                     zero(&b[60..64])
                 } else {
+                    if n64(b, 16) != 0 {
+                        id(n64(b, 16))?;
+                    }
                     id(n64(b, 24))?;
                     if n64(b, 32) == 0
                         || n64(b, 32) > u64::from(u32::MAX) * 1_000_000_000

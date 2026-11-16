@@ -803,6 +803,8 @@ def corpus() -> dict[str, Any]:
     reject("publish-hosts-max", field(144 + 664, 0, "u16"))
     reject("published-dns-allow", field(40, 257, "u16"))
     reject("published-dns-allow", field(32, 0))
+    reject("published-dns-allow", field(16, 18446744073709551615))
+    reject("published-hosts-allow", field(16, 18446744073709551615))
     reject("waiter-bind-user", field(48, 0))
     reject("waiter-bind-hosts", field(40, 1))
     reject("waiter-bind-user", field(56, 1000000001))

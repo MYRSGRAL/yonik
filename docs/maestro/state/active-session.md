@@ -578,7 +578,19 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   no-run/linux+desktop all-targets clippy/fmt PASS; source3101members bound,
   собственная сборка очищена. R32 не исполнял tests/runtime; крайние vectors
   saturation/alias count/line buffer остаются отдельными coverage gaps.
-  Full P5/runtime не PASS; DNS completion scope approval всё ещё ожидается.
+  Full P5/runtime не PASS. Последующее разрешение DNS completion scope закреплено
+  в e940df9; прежняя запись об ожидании approval более не актуальна.
+
+- R33: canonical DNS_V2 2aac421 интегрирован fast-forward после SOURCE scoped
+  CLEAN относительно 607af3a. Descriptor/codec/corpus — DATA, не issuer authority.
+  Root независимо подтвердил исходный corpus SHA и packer --check; Go byte parity
+  ещё проверяется. Небольшой gap Published.exchangeId=MAX исправлен root с
+  отдельными DNS/Hosts negatives, сохраняя Hosts exchange0. Два named codec
+  pure-теста, no-run, linux+desktop all-targets clippy, fmt/Ruff/packer PASS;
+  evidence r33-root-fix сохранён вне TTL, cargo clean выполнен. Следующий Rust cut —
+  независимый StubBind listener proof и bounded parser; Go продолжает classic
+  DNS/cache/transport. Internal proxy/dns subject остаётся Unsupported и вне
+  текущего ownership. Public gates закрыты; installed e14 не обновлялся.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
