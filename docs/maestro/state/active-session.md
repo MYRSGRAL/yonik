@@ -487,7 +487,9 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   полные source/snapshot coordinates и устанавливает selected_kind=server.
   RED/GREEN с настоящим Actor без Host: другой source сохраняется, stale snapshot
   отвергается; три pure tests, desktop all-targets clippy/fmt PASS. Evidence
-  r24-root-startup сохранён, cargo clean удалил2.3GiB. Узкий recheck ожидается.
+  r24-root-startup сохранён, cargo clean удалил2.3GiB. R24 narrow SOURCE CLOSED:
+  порядок восстановления, отказ при stale coordinates и отсутствие native
+  promotion подтверждены; generation/owner guards и startup_revalidate сохранены.
   Native Connect/P6/runtime не PASS; установленный e14 не обновлён.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
