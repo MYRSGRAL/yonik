@@ -33,9 +33,12 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertTrue(metadata["udp_v2_codec_source"])
         self.assertTrue(metadata["udp_v2_private_state_source"])
         self.assertTrue(metadata["udp_v2_socks_guard_connected"])
-        self.assertFalse(metadata["udp_v2_actor_delivery_connected"])
+        self.assertTrue(metadata["udp_v2_actor_delivery_connected"])
         self.assertFalse(metadata["udp_v2_consumer_ready"])
-        self.assertFalse(metadata["udp_v2_name_policy_parity"])
+        self.assertTrue(metadata["udp_v2_name_policy_parity"])
+        self.assertTrue(metadata["udp_v2_receive_os_source"])
+        self.assertFalse(metadata["udp_v2_runtime_flow_handoff_connected"])
+        self.assertFalse(metadata["udp_v2_close_receipt_connected"])
         self.assertTrue(metadata["dns_service_consumer_connected"])
         self.assertTrue(metadata["probe_service_consumer_connected"])
         self.assertTrue(metadata["snapshot_query_engine_connected"])
@@ -142,6 +145,10 @@ class FullProfilePatchTests(unittest.TestCase):
         for fixture, member in (
             ("udp-proof-v2-source-vectors.json", "profile-udp-proof-v2-source.json"),
             ("udp-proof-v2-rust-d79a26f.json", "profile-udp-proof-v2-rust.json"),
+            (
+                "udp-original-destination-v1.json",
+                "profile-udp-original-destination-v1.json",
+            ),
         ):
             raw = (ADAPTER / "full-profile-fixtures" / fixture).read_bytes()
             added = patch.split(f"+++ b/common/yonikbroker/{member}\n", 1)[1]
@@ -166,10 +173,15 @@ class FullProfilePatchTests(unittest.TestCase):
             b"YNKPFA02" + hashlib.sha256(bootstrap).digest(),
         )
         self.assertEqual(len(rust["vectors"]), 10)
-        self.assertIn(
-            "profileHandshakeBeforeUDPFactory(svrSession, reader, conn", patch
-        )
+        self.assertIn("profileHandshakeWithUDPDelivery(svrSession, reader, conn", patch)
         self.assertIn('string(body[:8]) == "YNKPF002"', patch)
+        self.assertIn("p.udpActor.receive(func() (profileProofPacket, error)", patch)
+        self.assertIn("privateUDP.Endpoint()", patch)
+        self.assertIn("p.udpActor.tick()", patch)
+        self.assertEqual(
+            metadata["udp_v2_original_grammar_head"],
+            "7f1f5a8139ecd7f06e64b483b44c627ae2f99654",
+        )
 
     def test_system_proof_fixture_is_embedded_byte_exact(self) -> None:
         fixture = ADAPTER / "full-profile-fixtures/system-proof-extension-v1.json"

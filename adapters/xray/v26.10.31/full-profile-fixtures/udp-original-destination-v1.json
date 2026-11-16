@@ -1,0 +1,19 @@
+[
+  {"name":"Example.INVALID","allowed":true},
+  {"name":"a-b.example","allowed":true},
+  {"name":"localhost","allowed":true},
+  {"name":"123","allowed":true},
+  {"name":"xn--e1afmkfd.xn--p1ai","allowed":true},
+  {"name":"_srv.example","allowed":false},
+  {"name":"example.invalid.","allowed":false},
+  {"name":".","allowed":false},
+  {"name":"192.0.2.1","allowed":false},
+  {"name":"2001:db8::1","allowed":false},
+  {"name":"[2001:db8::1]","allowed":false},
+  {"name":"","allowed":false},
+  {"name":"a..example","allowed":false},
+  {"name":"-a.example","allowed":false},
+  {"name":"a-.example","allowed":false},
+  {"name":"пример.рф","allowed":false},
+  {"name":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example","allowed":false}
+]

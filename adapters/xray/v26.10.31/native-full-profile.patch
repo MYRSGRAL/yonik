@@ -1,8 +1,1084 @@
+diff --git a/common/yonikbroker/profile_udp_os_linux.go b/common/yonikbroker/profile_udp_os_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_udp_os_linux.go
+@@ -0,0 +1,238 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"encoding/binary"
++	"errors"
++	"sync"
++	"time"
++
++	"golang.org/x/sys/unix"
++)
++
++// Только consuming duplicate; нет Write/FD getter/Peek/child factory API.
++type profileOSUDPReceiver struct {
++	mu              sync.Mutex
++	fd              profileProofFD
++	bound           profileDestinationValue
++	cookie          uint64
++	closed, reading bool
++	result          error
++	readers         sync.WaitGroup
++}
++
++func profileInspectUDP(fd profileProofFD, delivery []byte) (profileUDPReceiver, error) {
++	r := &profileOSUDPReceiver{fd: fd, bound: profileDestinationValue{family: 4, network: 17, address: "127.0.0.1", port: u16(delivery, 164)}, cookie: u64(delivery, 152)}
++	e := fd.withFD(func(n int) error {
++		kind, e := unix.GetsockoptInt(n, unix.SOL_SOCKET, unix.SO_TYPE)
++		if e != nil || kind != unix.SOCK_DGRAM {
++			return errProfile
++		}
++		proto, e := unix.GetsockoptInt(n, unix.SOL_SOCKET, unix.SO_PROTOCOL)
++		if e != nil || proto != unix.IPPROTO_UDP {
++			return errProfile
++		}
++		flags, e := unix.FcntlInt(uintptr(n), unix.F_GETFD, 0)
++		if e != nil || flags&unix.FD_CLOEXEC == 0 {
++			return errProfile
++		}
++		flags, e = unix.FcntlInt(uintptr(n), unix.F_GETFL, 0)
++		if e != nil || flags&unix.O_NONBLOCK == 0 {
++			return errProfile
++		}
++		_, e = unix.Getpeername(n)
++		if e != unix.ENOTCONN {
++			return errProfile
++		}
++		return r.inspect(n)
++	})
++	if e != nil {
++		return nil, e
++	}
++	return r, nil
++}
++func (r *profileOSUDPReceiver) inspect(n int) error {
++	cookie, e := unix.GetsockoptUint64(n, unix.SOL_SOCKET, unix.SO_COOKIE)
++	if e != nil || cookie != r.cookie {
++		return errProfile
++	}
++	sa, e := unix.Getsockname(n)
++	v, ok := sa.(*unix.SockaddrInet4)
++	if e != nil || !ok || v.Addr != [4]byte{127, 0, 0, 1} || v.Port != int(r.bound.port) {
++		return errProfile
++	}
++	queue, e := unix.GetsockoptInt(n, unix.SOL_SOCKET, unix.SO_RCVBUF)
++	if e != nil || queue < 1 || queue > 128*1024 {
++		return errProfile
++	}
++	gro, e := unix.GetsockoptInt(n, unix.IPPROTO_UDP, unix.UDP_GRO)
++	if e != nil || gro != 0 {
++		return errProfile
++	}
++	overflow, e := unix.GetsockoptInt(n, unix.SOL_SOCKET, unix.SO_RXQ_OVFL)
++	if e != nil || overflow != 1 {
++		return errProfile
++	}
++	return nil
++}
++func (r *profileOSUDPReceiver) Receive(ctx context.Context, b []byte) (out profileUDPReceiveResult, err error) {
++	r.mu.Lock()
++	if r.closed || r.reading || ctx == nil || len(b) != 65536 {
++		r.mu.Unlock()
++		return out, errProfile
++	}
++	r.reading = true
++	r.readers.Add(1)
++	r.mu.Unlock()
++	defer func() { r.mu.Lock(); r.reading = false; r.mu.Unlock(); r.readers.Done() }()
++	for ctx.Err() == nil {
++		ready := false
++		err = r.fd.withFD(func(n int) error {
++			if e := r.inspect(n); e != nil {
++				return e
++			}
++			fds := [1]unix.PollFd{{Fd: int32(n), Events: unix.POLLIN}}
++			wait := 20
++			if d, ok := ctx.Deadline(); ok {
++				left := time.Until(d)
++				if left <= 0 {
++					return context.DeadlineExceeded
++				}
++				if left < 20*time.Millisecond {
++					wait = int((left + time.Millisecond - 1) / time.Millisecond)
++				}
++			}
++			count, e := unix.Poll(fds[:], wait)
++			if e == unix.EINTR {
++				return nil
++			}
++			if e != nil || fds[0].Revents & ^int16(unix.POLLIN) != 0 {
++				return errProfile
++			}
++			if count == 0 {
++				return nil
++			}
++			if ctx.Err() != nil {
++				return ctx.Err()
++			}
++			var oob [64]byte
++			size, control, flags, from, e := unix.Recvmsg(n, b, oob[:], unix.MSG_DONTWAIT|unix.MSG_TRUNC)
++			if e == unix.EAGAIN || e == unix.EWOULDBLOCK {
++				return nil
++			}
++			if e != nil || size <= 0 || size > 65507 || flags != 0 {
++				return errProfile
++			}
++			peer, ok := from.(*unix.SockaddrInet4)
++			if !ok || peer.Port <= 0 {
++				return errProfile
++			}
++			out.n = size
++			out.cookie = r.cookie
++			out.bound = r.bound
++			out.tuple[0], out.tuple[1] = 17, 4
++			be.PutUint16(out.tuple[4:], uint16(peer.Port))
++			be.PutUint16(out.tuple[6:], r.bound.port)
++			copy(out.tuple[8:12], peer.Addr[:])
++			copy(out.tuple[24:28], []byte{127, 0, 0, 1})
++			seen := false
++			for rest := oob[:control]; len(rest) > 0; {
++				h, data, next, e := unix.ParseOneSocketControlMessage(rest)
++				if e != nil || seen || h.Level != unix.SOL_SOCKET || h.Type != unix.SO_RXQ_OVFL || len(data) != 4 {
++					return errProfile
++				}
++				out.overflow = binary.NativeEndian.Uint32(data)
++				seen = true
++				rest = next
++			}
++			out.queueBytes, e = unix.GetsockoptInt(n, unix.SOL_SOCKET, unix.SO_RCVBUF)
++			if e != nil {
++				return e
++			}
++			if e = r.inspect(n); e != nil {
++				return e
++			}
++			ready = true
++			return nil
++		})
++		if err != nil || ready {
++			return out, err
++		}
++	}
++	return out, ctx.Err()
++}
++func (r *profileOSUDPReceiver) Close() error {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if !r.closed {
++		r.closed = true
++		r.result = r.fd.Close()
++	}
++	return r.result
++}
++func (r *profileOSUDPReceiver) Join() error {
++	r.mu.Lock()
++	closed := r.closed
++	r.mu.Unlock()
++	if !closed {
++		return errProfile
++	}
++	r.readers.Wait()
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.result
++}
++
++func (p *ProfileRuntime) sendUDPProof(body []byte, fd profileProofFD) error {
++	return p.proofs.fd.withFD(func(channel int) error {
++		send := func(rights []byte) error {
++			if p.peerAlive() != nil {
++				return errProfile
++			}
++			n, e := unix.SendmsgN(channel, body, rights, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++			if e == unix.EAGAIN || e == unix.EWOULDBLOCK {
++				return errProfileProofBusy
++			}
++			if e != nil || n != len(body) {
++				return errProfile
++			}
++			return nil
++		}
++		if fd == nil {
++			return send(nil)
++		}
++		return fd.withFD(func(n int) error {
++			actual, e := profileSocketTuple(n)
++			if e != nil || len(body) != 192 || string(body[:8]) != "YNKUCS01" || string(actual[:]) != string(body[148:188]) {
++				return errProfile
++			}
++			return send(unix.UnixRights(n))
++		})
++	})
++}
++func (p *ProfileRuntime) receiveUDPProof() error {
++	return p.udpActor.receive(func() (profileProofPacket, error) {
++		var packet profileProofPacket
++		e := p.proofs.fd.withFD(func(n int) error {
++			var body [256]byte
++			var oob [128]byte
++			// Даже без credentials kernel не может materialize >16 rights.
++			nread, control, flags, _, e := unix.Recvmsg(n, body[:], oob[:unix.CmsgSpace(16*4)], unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
++			if nread < 0 {
++				nread = 0
++			}
++			if nread > len(body) {
++				nread = len(body)
++				flags |= unix.MSG_TRUNC
++			}
++			packet = profileParseAncillary(body[:nread], oob[:control], flags, profileAdoptFD)
++			if e != nil || nread == 0 || p.peerAlive() != nil {
++				return errors.Join(errProfile, e)
++			}
++			return nil
++		})
++		return packet, e
++	})
++}
+diff --git a/common/yonikbroker/profile_udp_actor_linux_test.go b/common/yonikbroker/profile_udp_actor_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_udp_actor_linux_test.go
+@@ -0,0 +1,391 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	_ "embed"
++	"encoding/json"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"testing"
++	"time"
++)
++
++func TestProfileUDPActorConsumedV2QueuesWithoutControlEffects(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	f.p.proofs.version = 2
++	f.p.proofs.launch = f.p.admission.launch
++	if e := profileInitUDPBudget(f.p); e != nil {
++		t.Fatal(e)
++	}
++	a := &profileUDPActor{runtime: f.p}
++	accepted := &profileAccepted{runtime: f.p, ctx: f.p.ctx, provenance: 2, proof: &flowProofFD{}, tuple: fakeFlowTuple(6)}
++	r, e := a.submit(context.Background(), accepted)
++	if e != nil || r == nil {
++		t.Fatal("consumed private v2 не ставит control request в actor", e)
++	}
++	if len(f.writes) != 0 {
++		t.Fatal("submit выполнил runtime I/O")
++	}
++}
++
++//go:embed profile-udp-original-destination-v1.json
++var udpOriginalGrammar []byte
++
++func TestProfileUDPOriginalGrammar7F1RuntimeAndPacketPreserveBytes(t *testing.T) {
++	var cases []struct {
++		Name    string
++		Allowed bool
++	}
++	if e := json.Unmarshal(udpOriginalGrammar, &cases); e != nil || len(cases) != 17 {
++		t.Fatal(e)
++	}
++	for _, c := range cases {
++		t.Run(c.Name, func(t *testing.T) {
++			raw := append([]byte{0, 0, 0, 3, byte(len(c.Name))}, []byte(c.Name)...)
++			raw = append(raw, 1, 187, 0xaa)
++			before := append([]byte(nil), raw...)
++			v, n, e := profileUDPSOCKSHeader(raw)
++			if (e == nil) != c.Allowed {
++				t.Fatal("packet grammar", e)
++			}
++			d := profileDestinationValue{family: 3, network: 17, address: c.Name, port: 443}
++			if d.valid() != c.Allowed {
++				t.Fatal("runtime Destination grammar mismatch", d)
++			}
++			if !bytes.Equal(raw, before) || c.Allowed && (v.address != c.Name || n != 7+len(c.Name) || string(d.encode()[8:]) != c.Name) {
++				t.Fatal("original bytes canonicalized")
++			}
++		})
++	}
++}
++
++func udpActorFixture(t *testing.T) (*flowFixture, *profileUDPActor, *profileAccepted) {
++	f := newFlowFixture(t, 2)
++	f.p.admission.launch.hostPID = 7
++	f.p.proofs.version = 2
++	f.p.proofs.launch = f.p.admission.launch
++	if e := profileInitUDPBudget(f.p); e != nil {
++		t.Fatal(e)
++	}
++	a := &profileUDPActor{runtime: f.p}
++	accepted := &profileAccepted{runtime: f.p, ctx: f.p.ctx, provenance: 2, proof: &flowProofFD{}, tuple: fakeFlowTuple(6)}
++	a.send = func(b []byte, fd profileProofFD) error {
++		rights := 0
++		if fd != nil {
++			rights = 1
++		}
++		if _, e := profileUDPDecode(f.p.admission.launch, b, rights, false); e != nil {
++			t.Fatal(e)
++		}
++		return nil
++	}
++	return f, a, accepted
++}
++func udpActorPacket(t *testing.T, a *profileUDPActor, r *profileUDPControlRequest, delivery bool, fd profileProofFD) profileProofPacket {
++	t.Helper()
++	var body []byte
++	if delivery {
++		// TCP control cookie и issuer-created UDP relay cookie независимы.
++		body = udpDelivery(t, a.runtime.admission.launch, uint64(r.slot+1), r.cookie+100, r.control, r.associate)
++	} else {
++		var tail [32]byte
++		be.PutUint64(tail[:], r.operation)
++		be.PutUint64(tail[8:], uint64(r.slot+2))
++		be.PutUint64(tail[16:], 3)
++		be.PutUint64(tail[24:], uint64(time.Second))
++		b, n, e := profileUDPEncode(a.runtime.admission.launch, 1, tail[:])
++		if e != nil {
++			t.Fatal(e)
++		}
++		body = append([]byte(nil), b[:n]...)
++	}
++	p := profileProofPacket{body: body, credentials: 1, pid: int32(a.runtime.admission.launch.hostPID), uid: 0}
++	if fd != nil {
++		p.count = 1
++		p.rightsMessages = 1
++		p.rights[0] = fd
++	}
++	return p
++}
++func udpActorDeliver(t *testing.T, a *profileUDPActor, r *profileUDPControlRequest, receiver profileUDPReceiver) {
++	t.Helper()
++	if e := a.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if r.phase != 1 {
++		t.Fatal("UCS not emitted")
++	}
++	if e := a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, false, nil), nil }); e != nil {
++		t.Fatal(e)
++	}
++	if e := a.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if r.phase != 3 {
++		t.Fatal("UAQ not emitted")
++	}
++	a.inspect = func(fd profileProofFD, b []byte) (profileUDPReceiver, error) {
++		if a.fdCredits < 22 || a.runtime.flow.buffered < profileUDPBudgetCredit+profileUDPAssociationCredit {
++			t.Fatal("inspection before credits")
++		}
++		return &udpActorOwnedReceiver{profileUDPReceiver: receiver, fd: fd}, nil
++	}
++	if e := a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, true, &proofFakeFD{}), nil }); e != nil {
++		t.Fatal(e)
++	}
++	if r.phase != 4 || r.association == nil {
++		t.Fatal("no private association")
++	}
++}
++func TestProfileUDPActorControlFDDeliveryDoesNotReadOrGrant(t *testing.T) {
++	f, a, accepted := udpActorFixture(t)
++	r, e := a.submit(f.p.ctx, accepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	receiver := &udpReceiveFake{}
++	udpActorDeliver(t, a, r, receiver)
++	if receiver.reads.Load() != 0 || len(f.writes) != 0 || r.association.phase != profileUDPBound {
++		t.Fatal("control/FD promoted to user grant")
++	}
++	if r.association.cookie == r.cookie {
++		t.Fatal("TCP cookie reused as relay binding")
++	}
++	if a.fdCredits != 6 || f.c.udpBudget.used != 3 || f.p.transportState().pending != 1 {
++		t.Fatal("reservation missing")
++	}
++	if e := a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, false, nil), nil }); e == nil {
++		t.Fatal("replayed ACK accepted")
++	}
++}
++func TestProfileUDPActorScratchBeforeReceiveAndFailedCloseRetainsCustody(t *testing.T) {
++	f, a, accepted := udpActorFixture(t)
++	_, e := a.submit(f.p.ctx, accepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	a.fdCredits = 49
++	called := false
++	if e = a.receive(func() (profileProofPacket, error) { called = true; return profileProofPacket{}, nil }); e == nil || called {
++		t.Fatal("SCM effect before scratch credit")
++	}
++	a.fdCredits = 6
++	fd := &proofFakeFD{result: errProfile}
++	e = a.receive(func() (profileProofPacket, error) {
++		if a.fdCredits != 22 {
++			t.Fatal("scratch not reserved")
++		}
++		return profileProofPacket{count: 1, rights: [32]profileProofFD{fd}}, nil
++	})
++	if e == nil || a.rejected[0] != fd || fd.calls != 1 || a.fdCredits != 22 || f.p.admission.state != profileUnknown {
++		t.Fatal("unknown FD custody lost")
++	}
++}
++func TestProfileUDPActorAssociationCancelDoesNotCloseNeighbourOrReuseCredits(t *testing.T) {
++	f, a, accepted := udpActorFixture(t)
++	ctx, cancel := context.WithCancel(f.p.ctx)
++	r, e := a.submit(ctx, accepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	first := &udpReceiveFake{}
++	udpActorDeliver(t, a, r, first)
++	otherAccepted := *accepted
++	be.PutUint16(otherAccepted.tuple[4:], 32009)
++	other, e := a.submit(f.p.ctx, &otherAccepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	second := &udpReceiveFake{}
++	udpActorDeliver(t, a, other, second)
++	cancel()
++	if e = a.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if first.closes.Load() != 1 || first.joins.Load() != 1 || second.closes.Load() != 0 || f.p.ctx.Err() != nil || other.phase != 4 || a.fdCredits != 12 || f.c.udpBudget.used != 6 {
++		t.Fatal("cancel escaped association or reused retained IDs")
++	}
++	if e = a.tick(); e != nil || first.closes.Load() != 1 {
++		t.Fatal("repeated cleanup")
++	}
++}
++func TestProfileUDPActorCapsBeforeEffectsAndDeadlineNotRenewed(t *testing.T) {
++	f, a, accepted := udpActorFixture(t)
++	f.c.manifest.caps[7] = 2
++	if _, e := a.submit(f.p.ctx, accepted); e == nil || f.p.transportState().pending != 0 || a.fdCredits != 0 {
++		t.Fatal("cap after effect")
++	}
++	f.c.manifest.caps[7] = 256
++	r, e := a.submit(f.p.ctx, accepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = a.tick(); e != nil {
++		t.Fatal(e)
++	}
++	f.now = f.now.Add(time.Second)
++	if e = a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, false, nil), nil }); e == nil {
++		t.Fatal("late ACK prolonged control lifetime")
++	}
++}
++
++func TestProfileUDPActorDoesNotOvertakePendingOperationOrLateCancelDelivery(t *testing.T) {
++	f, a, accepted := udpActorFixture(t)
++	ctx, cancel := context.WithCancel(f.p.ctx)
++	r, e := a.submit(ctx, accepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	otherAccepted := *accepted
++	be.PutUint16(otherAccepted.tuple[4:], 32009)
++	next, e := a.submit(f.p.ctx, &otherAccepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	sends := 0
++	a.send = func([]byte, profileProofFD) error { sends++; return nil }
++	if e = a.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if e = a.tick(); e != nil || sends != 1 || next.phase != 0 {
++		t.Fatal("later operation overtook pending control")
++	}
++	if e = a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, false, nil), nil }); e != nil {
++		t.Fatal(e)
++	}
++	if e = a.tick(); e != nil || sends != 2 {
++		t.Fatal("no associate", e)
++	}
++	cancel()
++	fd := &proofFakeFD{}
++	inspections := 0
++	a.inspect = func(profileProofFD, []byte) (profileUDPReceiver, error) { inspections++; return &udpReceiveFake{}, nil }
++	if e = a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, true, fd), nil }); e != nil {
++		t.Fatal(e)
++	}
++	if fd.calls != 1 || inspections != 0 || r.association != nil || f.p.ctx.Err() != nil {
++		t.Fatal("late cancelled FD published or escaped association")
++	}
++	if e = a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, true, &proofFakeFD{}), nil }); e == nil {
++		t.Fatal("late delivery replay accepted")
++	}
++}
++
++type udpActorOwnedReceiver struct {
++	profileUDPReceiver
++	fd profileProofFD
++}
++
++func (r *udpActorOwnedReceiver) Close() error {
++	return errors.Join(r.profileUDPReceiver.Close(), r.fd.Close())
++}
++
++func TestProfileUDPActorCancelInsideInspectionClosesBeforePublication(t *testing.T) {
++	f, a, accepted := udpActorFixture(t)
++	ctx, cancel := context.WithCancel(f.p.ctx)
++	r, e := a.submit(ctx, accepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = a.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if e = a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, false, nil), nil }); e != nil {
++		t.Fatal(e)
++	}
++	if e = a.tick(); e != nil {
++		t.Fatal(e)
++	}
++	receiver := &udpReceiveFake{}
++	fd := &proofFakeFD{}
++	a.inspect = func(handle profileProofFD, _ []byte) (profileUDPReceiver, error) {
++		cancel()
++		return &udpActorOwnedReceiver{profileUDPReceiver: receiver, fd: handle}, nil
++	}
++	if e = a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, true, fd), nil }); e != nil {
++		t.Fatal(e)
++	}
++	if fd.calls != 1 || receiver.closes.Load() != 1 || receiver.joins.Load() != 1 || r.association != nil || r.phase != 5 || f.p.ctx.Err() != nil {
++		t.Fatal("inspection cancel leaked FD or published association")
++	}
++}
++
++func TestProfileUDPActorControlCannotBorrowLocalOrForeignPrivateContext(t *testing.T) {
++	f, a, accepted := udpActorFixture(t)
++	for _, mutate := range []func(){func() { a.runtime.proofs.version = 1 }, func() { accepted.provenance = 3 }, func() { accepted.runtime = nil }, func() { accepted.proof = nil }, func() { accepted.tuple[0] = 17 }} {
++		copyAccepted := *accepted
++		mutate()
++		if _, e := a.submit(f.p.ctx, accepted); e == nil || a.fdCredits != 0 {
++			t.Fatal("invalid control effect")
++		}
++		*accepted = copyAccepted
++		a.runtime.proofs.version = 2
++	}
++}
++
++func TestProfileUDPActorRuntimeScratchAndAcceptedDuplicatesShareFDCap(t *testing.T) {
++	f, a, _ := udpActorFixture(t)
++	f.p.udpActor = a
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	duplicates := 0
++	fd := &proofFakeFD{result: errProfile}
++	f.p.duplicateAccepted = func(xnet.Conn, [40]byte) (profileProofFD, error) { duplicates++; return fd, nil }
++	f.c.udpBudget.fdSlots = 64
++	if _, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e == nil || duplicates != 0 {
++		t.Fatal("duplicate before shared credit")
++	}
++	if _, e := f.p.reserveUDPInput(); e == nil {
++		t.Fatal("runtime scratch bypassed shared cap")
++	}
++	f.c.udpBudget.fdSlots = 48
++	release, e := f.p.reserveUDPInput()
++	if e != nil {
++		t.Fatal(e)
++	}
++	if _, e = ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e == nil || duplicates != 0 {
++		t.Fatal("runtime scratch not charged")
++	}
++	release(true)
++	accepted, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
++	if e != nil || duplicates != 1 || f.c.udpBudget.fdSlots != 49 {
++		t.Fatal("missing duplicate reservation", e)
++	}
++	proof := accepted.Value(profileAcceptedKey{}).(*profileAccepted)
++	f.c.mu.Lock()
++	e = proof.closeProofLocked(f.c)
++	f.c.mu.Unlock()
++	if e == nil || f.c.udpBudget.fdSlots != 49 || proof.proof != fd {
++		t.Fatal("failed duplicate cleanup released custody")
++	}
++}
++
++func TestProfileUDPActorIssuerCloseJoinsOnlyItsDuplicateWithoutKnownACK(t *testing.T) {
++	f, a, accepted := udpActorFixture(t)
++	r, e := a.submit(f.p.ctx, accepted)
++	if e != nil {
++		t.Fatal(e)
++	}
++	receiver := &udpReceiveFake{}
++	udpActorDeliver(t, a, r, receiver)
++	var tail [32]byte
++	be.PutUint64(tail[:], r.association.id)
++	be.PutUint64(tail[8:], 99)
++	be.PutUint64(tail[16:], r.control)
++	b, n, e := profileUDPEncode(f.p.admission.launch, 8, tail[:])
++	if e != nil {
++		t.Fatal(e)
++	}
++	packet := profileProofPacket{body: b[:n], credentials: 1, pid: 7}
++	if e = a.receive(func() (profileProofPacket, error) { return packet, nil }); e != nil {
++		t.Fatal(e)
++	}
++	if receiver.closes.Load() != 1 || receiver.joins.Load() != 1 || r.ctx.Err() == nil || f.p.ctx.Err() != nil || a.fdCredits != 6 || r.issuerClose != 99 || len(f.writes) != 0 {
++		t.Fatal("issuer close escaped binding or published closure authority")
++	}
++	if e = a.receive(func() (profileProofPacket, error) { return packet, nil }); e == nil {
++		t.Fatal("close ID replay accepted")
++	}
++}
+diff --git a/common/yonikbroker/profile_udp_actor_linux.go b/common/yonikbroker/profile_udp_actor_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_udp_actor_linux.go
+@@ -0,0 +1,408 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"time"
++)
++
++// Единственный consumer proof-v2 — существующий runtime monitor. Submit не
++// выполняет I/O; actor methods вызываются только его goroutine.
++type profileUDPControlRequest struct {
++	ctx                                                   context.Context
++	cancel                                                context.CancelFunc
++	accepted                                              *profileAccepted
++	done                                                  chan struct{}
++	closed                                                chan struct{}
++	association                                           *profileUDPAssociation
++	err                                                   error
++	slot                                                  int
++	operation, associate, closeID, proof, control, cookie uint64
++	deadline, sent                                        time.Time
++	phase                                                 byte
++	cancelPhase                                           byte
++	lateDelivery                                          bool
++	issuerClose                                           uint64
++}
++
++type profileUDPActor struct {
++	runtime   *ProfileRuntime
++	mu        sync.Mutex
++	requests  [8]*profileUDPControlRequest
++	rejected  [32]profileProofFD
++	fdCredits int
++	failed    error
++	send      func([]byte, profileProofFD) error
++	inspect   func(profileProofFD, []byte) (profileUDPReceiver, error)
++}
++
++func (a *profileUDPActor) submit(ctx context.Context, accepted *profileAccepted) (*profileUDPControlRequest, error) {
++	p := a.runtime
++	if ctx == nil || ctx.Err() != nil || accepted == nil || accepted.runtime != p || accepted.ctx == nil || accepted.ctx.Err() != nil || accepted.provenance != 2 || accepted.proof == nil || !profileUDPv2Tuple(accepted.tuple, 6) || p.proofs == nil || p.proofs.version != 2 || !p.flowFresh() {
++		return nil, errProfile
++	}
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.failed != nil {
++		return nil, a.failed
++	}
++	slot := -1
++	for i, r := range a.requests {
++		if r != nil && r.accepted == accepted {
++			return nil, errProfile
++		}
++		if r == nil {
++			slot = i
++			break
++		}
++	}
++	if slot < 0 || a.fdCredits+6 > 64 {
++		return nil, errProfileFlowBusy
++	}
++	s := p.transportState()
++	s.mu.Lock()
++	count := s.pending
++	for _, v := range s.sockets {
++		if v != nil {
++			count++
++		}
++	}
++	for _, v := range s.objects {
++		if v != nil {
++			if _, ok := v.value.(*profileDNSConnection); ok {
++				count++
++			}
++		}
++	}
++	if !s.live() || count >= min(int(p.flow.manifest.caps[1]), 128) {
++		s.mu.Unlock()
++		return nil, errProfileFlowBusy
++	}
++	s.pending++
++	s.mu.Unlock()
++	reserved := false
++	defer func() {
++		if !reserved {
++			s.mu.Lock()
++			s.pending--
++			s.mu.Unlock()
++		}
++	}()
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	b := c.udpBudget
++	if b == nil || !c.live() || b.fdSlots+6 > 64 || b.used+3 > min(int(c.manifest.caps[7]), 256) || c.operations+b.proofPending+3 > min(int(c.manifest.caps[3]), 64) || b.nextProofOperation > ^uint64(0)-4 || c.buffered+c.manifest.memoryCredit+profileUDPAssociationCredit > uint64(c.manifest.caps[4]) {
++		return nil, errProfileFlowBusy
++	}
++	// История control, associate и будущего close резервируется до первого send.
++	start := b.used
++	for range 3 {
++		c.udpReserveLocked()
++	}
++	p.proofs.mu.Lock()
++	if p.proofs.closed || p.proofs.lastProof >= ^uint64(0)-1 {
++		p.proofs.mu.Unlock()
++		return nil, errProfile
++	}
++	p.proofs.lastProof++
++	proof := p.proofs.lastProof
++	p.proofs.mu.Unlock()
++	child, cancel := context.WithCancel(ctx)
++	r := &profileUDPControlRequest{ctx: child, cancel: cancel, accepted: accepted, done: make(chan struct{}), closed: make(chan struct{}), slot: start, operation: b.entries[start].operation, associate: b.entries[start+1].operation, closeID: b.entries[start+2].operation, proof: proof, deadline: profileUDPControlDeadline(ctx, c.clock(), c.sessionDeadline)}
++	c.buffered += profileUDPAssociationCredit
++	a.fdCredits += 6
++	b.fdSlots += 6
++	a.requests[slot] = r
++	reserved = true
++	return r, nil
++}
++
++func (a *profileUDPActor) failLocked(e error) error {
++	a.failed = errors.Join(a.failed, e, errProfile)
++	for _, r := range a.requests {
++		if r == nil {
++			continue
++		}
++		r.cancel()
++		if r.association != nil {
++			a.failed = errors.Join(a.failed, r.association.CloseAndJoin())
++		}
++		if r.phase < 4 {
++			close(r.done)
++		}
++		r.err = a.failed
++		if r.phase != 5 {
++			close(r.closed)
++		}
++		r.phase = 5
++	}
++	// Local duplicate cleanup не является durable issuer retirement. Все
++	// credits/custody остаются retained; UCR/KnownClosed здесь не публикуется.
++	a.runtime.flow.mu.Lock()
++	a.runtime.flow.revoked = true
++	a.runtime.flow.mu.Unlock()
++	a.runtime.mu.Lock()
++	a.runtime.admission.state = profileUnknown
++	a.runtime.mu.Unlock()
++	a.runtime.cancel()
++	return a.failed
++}
++
++func (a *profileUDPActor) tick() error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.failed != nil {
++		return a.failed
++	}
++	p := a.runtime
++	for _, r := range a.requests {
++		if r == nil {
++			continue
++		}
++		if r.ctx.Err() != nil || r.accepted.ctx.Err() != nil {
++			a.retireCancelledLocked(r)
++			// Отмена control изолирована. До durable retirement ACK credits и
++			// tombstones этого request остаются retained, соседний relay жив.
++			continue
++		}
++		if !p.flow.clock().Before(r.deadline) && r.phase < 4 {
++			return a.failLocked(errProfile)
++		}
++		if r.phase == 5 {
++			continue
++		}
++		if r.phase == 4 {
++			continue
++		}
++		var tail [64]byte
++		kind, n := 0, 64
++		be.PutUint64(tail[:], r.operation)
++		if r.phase == 0 {
++			be.PutUint64(tail[8:], r.proof)
++			be.PutUint16(tail[16:], r.accepted.index)
++			tail[18] = 3
++			copy(tail[20:60], r.accepted.tuple[:])
++		} else if r.phase == 2 {
++			kind, n = 2, 32
++			be.PutUint64(tail[:], r.associate)
++			be.PutUint64(tail[8:], r.control)
++			be.PutUint64(tail[16:], r.cookie)
++		} else {
++			return nil
++		}
++		b, size, e := profileUDPEncode(p.admission.launch, kind, tail[:n])
++		if e != nil || a.send == nil {
++			return a.failLocked(errProfile)
++		}
++		var fd profileProofFD
++		if kind == 0 {
++			fd = r.accepted.proof
++		}
++		e = a.send(b[:size], fd)
++		if e == errProfileProofBusy {
++			return nil
++		}
++		if e != nil {
++			return a.failLocked(e)
++		}
++		if r.ctx.Err() != nil || r.accepted.ctx.Err() != nil {
++			return a.failLocked(errProfile)
++		}
++		if r.phase == 0 {
++			r.sent = p.flow.clock()
++			r.phase = 1
++		} else {
++			r.phase = 3
++		}
++		return nil
++	}
++	return nil
++}
++
++func (a *profileUDPActor) retireCancelledLocked(r *profileUDPControlRequest) {
++	if r.phase == 5 {
++		return
++	}
++	r.cancelPhase = r.phase
++	r.cancel()
++	r.err = errProfile
++	if r.association != nil {
++		r.err = errors.Join(r.err, r.association.CloseAndJoin())
++	}
++	if r.phase < 4 {
++		close(r.done)
++	}
++	r.phase = 5
++	close(r.closed)
++}
++
++// Резервируются все16 ancillary scratch rights ДО recvmsg/materialization.
++func (a *profileUDPActor) receive(read func() (profileProofPacket, error)) error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	c := a.runtime.flow
++	c.mu.Lock()
++	if a.failed != nil || !c.live() || a.fdCredits+16 > 64 || c.udpBudget.fdSlots+16 > 64 || c.operations+c.udpBudget.proofPending+1 > min(int(c.manifest.caps[3]), 64) {
++		c.mu.Unlock()
++		return errProfileFlowBusy
++	}
++	a.fdCredits += 16
++	c.udpBudget.fdSlots += 16
++	c.udpBudget.proofPending++
++	c.mu.Unlock()
++	packet, e := read()
++	if e == nil {
++		e = a.packetLocked(packet)
++	}
++	if e != nil {
++		for i, fd := range packet.rights {
++			if fd != nil {
++				if ce := fd.Close(); ce != nil {
++					a.rejected[i] = fd
++					e = errors.Join(e, ce)
++				}
++			}
++		}
++		return a.failLocked(e)
++	}
++	a.fdCredits -= 16
++	c.mu.Lock()
++	c.udpBudget.fdSlots -= 16
++	c.udpBudget.proofPending--
++	c.mu.Unlock()
++	return nil
++}
++
++func (a *profileUDPActor) packetLocked(packet profileProofPacket) error {
++	p := a.runtime
++	if packet.invalid || packet.credentials != 1 || !profileSenderValid(p.admission.launch, packet.pid, packet.uid, 0) || packet.rightsMessages != packet.count || packet.count > 1 {
++		return errProfile
++	}
++	kind, e := profileUDPDecode(p.admission.launch, packet.body, packet.count, true)
++	if e != nil {
++		return e
++	}
++	for _, r := range a.requests {
++		if r == nil {
++			continue
++		}
++		if r.ctx.Err() != nil || r.accepted.ctx.Err() != nil {
++			a.retireCancelledLocked(r)
++		}
++		if kind == 8 && r.association != nil && u64(packet.body, 128) == r.association.id && u64(packet.body, 144) == r.control {
++			id := u64(packet.body, 136)
++			for _, other := range a.requests {
++				if other != nil && other.issuerClose == id {
++					return errProfile
++				}
++			}
++			r.issuerClose = id
++			p.flow.mu.Lock()
++			entry := &p.flow.udpBudget.entries[r.slot+2]
++			entry.namespace = 3
++			entry.operation = id
++			p.flow.mu.Unlock()
++			r.cancel()
++			r.err = errors.Join(ErrProfileUnsupported, r.association.CloseAndJoin())
++			if r.phase != 5 {
++				r.phase = 5
++				close(r.closed)
++			}
++			return nil
++		}
++		if r.phase >= 4 {
++			if r.phase == 5 && r.ctx.Err() != nil {
++				if kind == 1 && r.cancelPhase == 1 && r.control == 0 && u64(packet.body, 128) == r.operation {
++					r.control = u64(packet.body, 136)
++					r.cookie = u64(packet.body, 144)
++					return nil
++				}
++				if kind == 3 && r.cancelPhase == 3 && !r.lateDelivery && u64(packet.body, 128) == r.associate && u64(packet.body, 136) == r.control && packet.rights[0] != nil {
++					r.lateDelivery = true
++					return packet.rights[0].Close()
++				}
++			}
++			continue
++		}
++		if r.ctx.Err() != nil || r.accepted.ctx.Err() != nil || !p.flow.clock().Before(r.deadline) {
++			return errProfile
++		}
++		b := packet.body
++		if kind == 1 && r.phase == 1 && u64(b, 128) == r.operation {
++			r.control, r.cookie = u64(b, 136), u64(b, 144)
++			limit := r.sent.Add(time.Duration(u64(b, 152)))
++			if limit.Before(r.deadline) {
++				r.deadline = limit
++			}
++			if !p.flow.clock().Before(r.deadline) {
++				return errProfile
++			}
++			r.phase = 2
++			return nil
++		}
++		if kind == 3 && r.phase == 3 && u64(b, 128) == r.associate && u64(b, 136) == r.control && packet.rights[0] != nil && a.inspect != nil {
++			var receiver profileUDPReceiver
++			var inspectError error
++			receiver, inspectError = a.inspect(packet.rights[0], b)
++			if inspectError != nil || receiver == nil {
++				return errors.Join(errProfile, inspectError)
++			}
++			// Ownership передаётся только после exact FD inspection. Constructor
++			// уже владеет prepaid buffer/history reservation, в том числе при error.
++			r.association, e = profileNewUDPAssociationReserved(p.flow, p.admission.launch, r.ctx, b, func() (profileUDPReceiver, error) { return receiver, nil }, r.slot+1)
++			if e != nil {
++				if r.ctx.Err() != nil || r.accepted.ctx.Err() != nil {
++					var cleanup error
++					if r.association != nil {
++						cleanup = r.association.CloseAndJoin()
++					} else {
++						cleanup = errors.Join(receiver.Close(), receiver.Join())
++					}
++					a.retireCancelledLocked(r)
++					return cleanup
++				}
++				return e
++			}
++			r.phase = 4
++			close(r.done)
++			return nil
++		}
++	}
++	return errProfile
++}
++
++// Deadline задаётся до первого control effect и не обновляется ответом.
++func profileUDPControlDeadline(ctx context.Context, now, session time.Time) time.Time {
++	d := now.Add(time.Second)
++	if session.Before(d) {
++		d = session
++	}
++	if v, ok := ctx.Deadline(); ok && v.Before(d) {
++		d = v
++	}
++	return d
++}
++
++func (p *ProfileRuntime) reserveUDPInput() (func(bool), error) {
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	b := c.udpBudget
++	if b == nil || !c.live() || b.fdSlots+16 > 64 || c.operations+b.proofPending+1 > min(int(c.manifest.caps[3]), 64) {
++		return nil, errProfileFlowBusy
++	}
++	b.fdSlots += 16
++	b.proofPending++
++	return func(clean bool) {
++		c.mu.Lock()
++		defer c.mu.Unlock()
++		if clean {
++			b.fdSlots -= 16
++			b.proofPending--
++		}
++	}, nil
++}
+diff --git a/common/yonikbroker/profile-udp-original-destination-v1.json b/common/yonikbroker/profile-udp-original-destination-v1.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-udp-original-destination-v1.json
+@@ -0,0 +1,19 @@
++[
++  {"name":"Example.INVALID","allowed":true},
++  {"name":"a-b.example","allowed":true},
++  {"name":"localhost","allowed":true},
++  {"name":"123","allowed":true},
++  {"name":"xn--e1afmkfd.xn--p1ai","allowed":true},
++  {"name":"_srv.example","allowed":false},
++  {"name":"example.invalid.","allowed":false},
++  {"name":".","allowed":false},
++  {"name":"192.0.2.1","allowed":false},
++  {"name":"2001:db8::1","allowed":false},
++  {"name":"[2001:db8::1]","allowed":false},
++  {"name":"","allowed":false},
++  {"name":"a..example","allowed":false},
++  {"name":"-a.example","allowed":false},
++  {"name":"a-.example","allowed":false},
++  {"name":"пример.рф","allowed":false},
++  {"name":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example","allowed":false}
++]
 diff --git a/proxy/socks/yonik_udp_v2_test.go b/proxy/socks/yonik_udp_v2_test.go
 new file mode 100644
 --- /dev/null
 +++ b/proxy/socks/yonik_udp_v2_test.go
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,86 @@
 +package socks
 +
 +import (
@@ -62,6 +1138,31 @@ new file mode 100644
 +	_, e := profileHandshakeBeforeUDPFactory(s, bytes.NewReader([]byte{5, 1, 2}), &profileHandshakeConn{}, func() error { t.Fatal("unauthenticated admission"); return nil })
 +	if e == nil {
 +		t.Fatal("auth failure accepted")
++	}
++}
++
++func TestYonikUDPv2SOCKSSuccessOnlyAfterWholeRequestAndRelayDelivery(t *testing.T) {
++	s := &ServerSession{config: &ServerConfig{UdpEnabled: true}, address: net.LocalHostIP, port: 1080}
++	for _, input := range [][]byte{{5, 1, 0, 5, 3, 0}, {5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0}} {
++		conn := &profileHandshakeConn{}
++		calls := 0
++		r, e := profileHandshakeWithUDPDelivery(s, bytes.NewReader(input), conn, nil, func() (net.Destination, error) { calls++; return net.UDPDestination(net.LocalHostIP, 49152), nil })
++		if len(input) == 6 {
++			if e == nil || calls != 0 || r != nil {
++				t.Fatal("partial request caused control effect")
++			}
++			continue
++		}
++		if e != nil || calls != 1 || r.Command != protocol.RequestCommandUDP || !bytes.Equal(conn.Bytes(), []byte{5, 0, 5, 0, 0, 1, 127, 0, 0, 1, 192, 0}) {
++			t.Fatal("relay delivery did not produce exact success", e, conn.Bytes())
++		}
++	}
++	for _, endpoint := range []net.Destination{{}, net.UDPDestination(net.ParseAddress("relay.invalid"), 49152), net.UDPDestination(net.ParseAddress("192.0.2.1"), 49152), net.UDPDestination(net.LocalHostIP, 0)} {
++		conn := &profileHandshakeConn{}
++		r, e := profileHandshakeWithUDPDelivery(s, bytes.NewReader([]byte{5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0}), conn, nil, func() (net.Destination, error) { return endpoint, nil })
++		if e == nil || r != nil || conn.Bytes()[3] != statusCmdNotSupport {
++			t.Fatal("invalid delivery produced success", endpoint)
++		}
 +	}
 +}
 diff --git a/common/yonikbroker/profile-udp-proof-v2-rust.json b/common/yonikbroker/profile-udp-proof-v2-rust.json
@@ -902,7 +2003,7 @@ diff --git a/common/yonikbroker/profile_udp_v2_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_v2_linux.go
-@@ -0,0 +1,619 @@
+@@ -0,0 +1,716 @@
 +//go:build linux
 +
 +package nativehooks
@@ -915,6 +2016,8 @@ new file mode 100644
 +	"net/netip"
 +	"sync"
 +	"time"
++
++	xnet "github.com/xtls/xray-core/common/net"
 +)
 +
 +// Незамороженная proof-v2 extension. Runtime/ABI260 остаются rights-free.
@@ -1085,6 +2188,7 @@ new file mode 100644
 +
 +// Общий retained budget proof + runtime, без compaction/eviction/ID reuse.
 +type profileUDPBudget struct {
++	fdSlots                                                                  int
 +	unknown                                                                  func()
 +	launch                                                                   profileLaunch
 +	used, proofPending, active, associations                                 int
@@ -1096,7 +2200,7 @@ new file mode 100644
 +const profileUDPBudgetCredit = 32768
 +
 +// Вызывается только после consumed trusted PF002 и ADMIT, до flow operations.
-+// Production пока НЕ вызывает initializer: negotiated v2 gate закрыт.
++// Launch вызывает initializer условно для v2; OS bootstrap gate пока закрыт.
 +func profileInitUDPBudget(p *ProfileRuntime) error {
 +	if p == nil || p.cancel == nil || p.flow == nil || p.proofs == nil || p.proofs.version != 2 || p.admission.launch.mode != 2 || p.proofs.launch != p.admission.launch || !p.proofs.live() || !p.flowFresh() {
 +		return errProfile
@@ -1108,12 +2212,12 @@ new file mode 100644
 +		return errProfile
 +	}
 +	c.buffered += profileUDPBudgetCredit
-+	c.udpBudget = &profileUDPBudget{launch: p.admission.launch, unknown: func() { p.mu.Lock(); p.admission.state = profileUnknown; p.mu.Unlock(); p.cancel() }}
++	c.udpBudget = &profileUDPBudget{fdSlots: 1, launch: p.admission.launch, unknown: func() { p.mu.Lock(); p.admission.state = profileUnknown; p.mu.Unlock(); p.cancel() }}
 +	return nil
 +}
 +
 +type profileUDPRetainedOperation struct {
-+	namespace                                                                byte // 1 runtime request, 2 proof operation; не wire enum.
++	namespace                                                                byte // 1 runtime request, 2 proof operation, 3 issuer close; не wire enum.
 +	terminal                                                                 bool // terminal operation, НЕ доказательство resource KnownClosed.
 +	operation, runtimeSequence, association, packet, permit, control, cookie uint64
 +}
@@ -1193,15 +2297,18 @@ new file mode 100644
 +	closeStarted                                              bool
 +}
 +
-+// Caller резервирует shared physical/FD custody ДО factory; этот consumer пока
-+// не подключён к OS delivery. Никакой session credential не вызывает factory.
++// Actor резервирует physical/FD/buffer custody до Associate и OS delivery.
++// Pure constructor сохраняет отдельный self-reserving путь для fake fixtures.
 +func profileNewUDPAssociation(c *profileFlowControl, r profileLaunch, ctx context.Context, delivery []byte, factory func() (profileUDPReceiver, error)) (*profileUDPAssociation, error) {
++	return profileNewUDPAssociationReserved(c, r, ctx, delivery, factory, -1)
++}
++func profileNewUDPAssociationReserved(c *profileFlowControl, r profileLaunch, ctx context.Context, delivery []byte, factory func() (profileUDPReceiver, error), reserved int) (*profileUDPAssociation, error) {
 +	if kind, e := profileUDPDecode(r, delivery, 1, true); e != nil || kind != 3 {
 +		return nil, errProfile
 +	}
 +	id, cookie, control := u64(delivery, 144), u64(delivery, 152), u64(delivery, 136)
 +	c.mu.Lock()
-+	if ctx == nil || ctx.Err() != nil || !c.live() || c.udpBudget == nil || c.udpBudget.active >= 8 || !profileUDPId(id) || id <= c.udpBudget.lastAssociation || cookie == 0 || !profileUDPId(control) || control <= c.udpBudget.lastControl || factory == nil || c.buffered+c.manifest.memoryCredit+profileUDPAssociationCredit > uint64(c.manifest.caps[4]) {
++	if ctx == nil || ctx.Err() != nil || !c.live() || c.udpBudget == nil || c.udpBudget.active >= 8 || !profileUDPId(id) || id <= c.udpBudget.lastAssociation || cookie == 0 || !profileUDPId(control) || control <= c.udpBudget.lastControl || factory == nil || reserved < 0 && c.buffered+c.manifest.memoryCredit+profileUDPAssociationCredit > uint64(c.manifest.caps[4]) {
 +		c.mu.Unlock()
 +		return nil, errProfile
 +	}
@@ -1209,7 +2316,7 @@ new file mode 100644
 +		c.mu.Unlock()
 +		return nil, errProfile
 +	}
-+	if u64(delivery, 128) != c.udpBudget.nextProofOperation+1 {
++	if reserved < 0 && u64(delivery, 128) != c.udpBudget.nextProofOperation+1 {
 +		c.mu.Unlock()
 +		return nil, errProfile
 +	}
@@ -1219,7 +2326,11 @@ new file mode 100644
 +			return nil, errProfile
 +		}
 +	}
-+	if !c.udpReserveLocked() {
++	if reserved >= 0 && (reserved >= c.udpBudget.used || c.udpBudget.entries[reserved].terminal || c.udpBudget.entries[reserved].namespace != 2 || c.udpBudget.entries[reserved].operation != u64(delivery, 128)) {
++		c.mu.Unlock()
++		return nil, errProfile
++	}
++	if reserved < 0 && !c.udpReserveLocked() {
 +		c.mu.Unlock()
 +		return nil, errProfile
 +	}
@@ -1228,12 +2339,17 @@ new file mode 100644
 +	c.udpBudget.lastAssociation = id
 +	c.udpBudget.lastControl = control
 +	creationSlot := c.udpBudget.used - 1
++	if reserved >= 0 {
++		creationSlot = reserved
++	}
 +	entry := &c.udpBudget.entries[creationSlot]
 +	entry.association = id
 +	entry.control = control
 +	entry.cookie = cookie
 +	c.udpBudget.active++
-+	c.buffered += profileUDPAssociationCredit
++	if reserved < 0 {
++		c.buffered += profileUDPAssociationCredit
++	}
 +	c.mu.Unlock()
 +	child, cancel := context.WithCancel(ctx)
 +	a := &profileUDPAssociation{flow: c, launch: r, ctx: child, cancel: cancel, id: id, cookie: cookie, control: control, credit: true, closeDone: make(chan struct{})}
@@ -1522,6 +2638,88 @@ new file mode 100644
 +	}
 +	return ErrProfileUnsupported
 +}
++
++// Opaque control/relay custody. Endpoint — DATA для SOCKS reply, не FlowGrant;
++// raw FD, socket writer и payload API не экспортируются.
++type ProfileUDPControl struct {
++	actor   *profileUDPActor
++	request *profileUDPControlRequest
++	cancel  context.CancelFunc
++	stop    func() bool
++}
++
++func ProfileOpenSOCKSUDPControl(ctx context.Context) (*ProfileUDPControl, error) {
++	p := profileRuntime(ctx)
++	if p == nil || !p.flowFresh() || p.udpActor == nil {
++		return nil, ErrProfileUnsupported
++	}
++	a, _ := ctx.Value(profileAcceptedKey{}).(*profileAccepted)
++	if a == nil || a.runtime != p || int(a.index) >= len(p.flow.manifest.rows[6]) || p.flow.manifest.rows[6][a.index][0] != 2 {
++		return nil, errProfile
++	}
++	child, cancel := context.WithCancel(ctx)
++	stop := context.AfterFunc(p.ctx, cancel)
++	r, e := p.udpActor.submit(child, a)
++	if e != nil {
++		stop()
++		cancel()
++		return nil, e
++	}
++	select {
++	case <-r.done:
++	case <-child.Done():
++		stop()
++		cancel()
++		return nil, child.Err()
++	case <-p.ctx.Done():
++		stop()
++		cancel()
++		return nil, errProfile
++	}
++	p.udpActor.mu.Lock()
++	valid := r.phase == 4 && r.err == nil && r.association != nil && child.Err() == nil && p.ctx.Err() == nil
++	p.udpActor.mu.Unlock()
++	if !valid {
++		stop()
++		cancel()
++		return nil, errProfile
++	}
++	return &ProfileUDPControl{actor: p.udpActor, request: r, cancel: cancel, stop: stop}, nil
++}
++func (c *ProfileUDPControl) OnCancel(fn func()) func() bool {
++	if c == nil || c.actor == nil || c.request == nil || fn == nil {
++		return func() bool { return false }
++	}
++	return context.AfterFunc(c.request.ctx, fn)
++}
++func (c *ProfileUDPControl) Endpoint() (xnet.Destination, error) {
++	if c == nil || c.actor == nil || c.request == nil {
++		return xnet.Destination{}, errProfile
++	}
++	c.actor.mu.Lock()
++	defer c.actor.mu.Unlock()
++	r := c.request
++	if r.phase != 4 || r.association == nil || r.ctx.Err() != nil || c.actor.runtime.ctx.Err() != nil {
++		return xnet.Destination{}, errProfile
++	}
++	return xnet.UDPDestination(xnet.LocalHostIP, xnet.Port(r.association.bound.port)), nil
++}
++func (c *ProfileUDPControl) Close() error {
++	if c == nil {
++		return nil
++	}
++	if c.actor == nil || c.request == nil || c.cancel == nil || c.stop == nil {
++		return errProfile
++	}
++	c.cancel()
++	c.stop()
++	<-c.request.closed
++	c.actor.mu.Lock()
++	defer c.actor.mu.Unlock()
++	// Нет durable-flow retirement counterpart в этом atomic milestone.
++	// Даже успешный local CloseAndJoin не становится KnownClosed/UCR.
++	return errors.Join(ErrProfileUnsupported, c.request.err)
++}
 diff --git a/common/yonikbroker/profile-system-proof-v1.json b/common/yonikbroker/profile-system-proof-v1.json
 new file mode 100644
 --- /dev/null
@@ -1704,7 +2902,7 @@ new file mode 100644
 +	return p.proofs.fd.withFD(func(n int) error {
 +		fds := []unix.PollFd{{Fd: int32(n), Events: unix.POLLIN}}
 +		count, e := unix.Poll(fds, 0)
-+		if e != nil || count != 0 {
++		if e != nil || count != 0 && (p.proofs.version != 2 || p.udpActor == nil || fds[0].Revents != unix.POLLIN) {
 +			return errProfile
 +		}
 +		return nil
@@ -1882,7 +3080,7 @@ diff --git a/common/yonikbroker/profile_proof_linux.go b/common/yonikbroker/prof
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_proof_linux.go
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,244 @@
 +//go:build linux
 +
 +package nativehooks
@@ -2094,6 +3292,10 @@ new file mode 100644
 +	if a.proofCredit {
 +		a.proofCredit = false
 +		c.buffered -= profileAcceptedFDCredit
++	}
++	if a.udpFDCredit {
++		a.udpFDCredit = false
++		c.udpBudget.fdSlots--
 +	}
 +	return nil
 +}
@@ -11307,7 +12509,7 @@ diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_hooks_linux.go
-@@ -0,0 +1,833 @@
+@@ -0,0 +1,841 @@
 +//go:build linux
 +
 +package nativehooks
@@ -11325,6 +12527,7 @@ new file mode 100644
 +)
 +
 +type profileAccepted struct {
++	udpFDCredit bool
 +	proof       profileProofFD
 +	proofCredit bool
 +	runtime     *ProfileRuntime
@@ -11490,12 +12693,19 @@ new file mode 100644
 +	}
 +	for i, a := range c.accepted {
 +		if a == nil && i < int(c.manifest.caps[6]) {
++			if c.udpBudget != nil && c.udpBudget.fdSlots >= 64 {
++				return ctx, errProfileFlowBusy
++			}
 +			if p.admission.launch.mode == 2 && c.buffered+c.manifest.memoryCredit+profileAcceptedFDCredit > uint64(c.manifest.caps[4]) {
 +				return ctx, errProfileFlowBusy
 +			}
 +			a = &profileAccepted{runtime: p, ctx: ctx, index: uint16(index), provenance: provenance, tuple: tuple}
 +			c.accepted[i] = a
 +			if p.admission.launch.mode == 2 {
++				if c.udpBudget != nil {
++					c.udpBudget.fdSlots++
++					a.udpFDCredit = true
++				}
 +				c.buffered += profileAcceptedFDCredit
 +				a.proofCredit = true
 +				duplicate := p.duplicateAccepted
@@ -12145,7 +13355,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,898 @@
+@@ -0,0 +1,899 @@
 +//go:build linux
 +
 +package nativehooks
@@ -12171,7 +13381,8 @@ new file mode 100644
 +		return false
 +	}
 +	if d.family == 3 {
-+		return profileDomain([]byte(d.address))
++		_, ipError := netip.ParseAddr(d.address)
++		return ipError != nil && profileDomain([]byte(d.address))
 +	}
 +	a, e := netip.ParseAddr(d.address)
 +	return e == nil && a.Zone() == "" && !a.Is4In6() && !a.IsUnspecified() && !a.IsMulticast() && (d.family == 4 && a.Is4() || d.family == 6 && a.Is6())
@@ -13972,7 +15183,7 @@ diff --git a/common/yonikbroker/profile_flow_other.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_other.go
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,57 @@
 +//go:build !linux
 +
 +package nativehooks
@@ -13985,6 +15196,18 @@ new file mode 100644
 +
 +func ProfileSOCKSUDPRequiresPrivateControl(context.Context) bool { return false }
 +func ProfileAdmitSOCKSUDPControl(context.Context) error          { return ErrProfileUnsupported }
++
++type ProfileUDPControl struct{}
++
++func (*ProfileUDPControl) OnCancel(func()) func() bool { return func() bool { return false } }
++
++func ProfileOpenSOCKSUDPControl(context.Context) (*ProfileUDPControl, error) {
++	return nil, ErrProfileUnsupported
++}
++func (*ProfileUDPControl) Endpoint() (xnet.Destination, error) {
++	return xnet.Destination{}, ErrProfileUnsupported
++}
++func (*ProfileUDPControl) Close() error { return ErrProfileUnsupported }
 +
 +// На этих платформах PrepareProfileLaunch отказывает до создания runtime.
 +// Legacy callers сохраняют поведение и не получают profile authority.
@@ -14265,7 +15488,7 @@ diff --git a/common/yonikbroker/profile_launch_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux.go
-@@ -0,0 +1,685 @@
+@@ -0,0 +1,720 @@
 +//go:build linux
 +
 +package nativehooks
@@ -14304,6 +15527,7 @@ new file mode 100644
 +// ProfileRuntime не содержит FlowGrant. Constructor доступен только через
 +// потребление sealed record и authenticated channel. Владение FD однократное.
 +type ProfileRuntime struct {
++	udpActor                    *profileUDPActor
 +	proofs                      *profileProofChannel
 +	proofRejected               [32]profileProofFD
 +	duplicateAccepted           func(xnet.Conn, [40]byte) (profileProofFD, error)
@@ -14373,6 +15597,15 @@ new file mode 100644
 +			continue
 +		}
 +		if len(fds) == 3 && fds[2].Revents != 0 {
++			if p.udpActor != nil && fds[2].Revents == unix.POLLIN {
++				if e := p.receiveUDPProof(); e != nil {
++					return nil, e
++				}
++				if e := p.udpActor.tick(); e != nil {
++					return nil, e
++				}
++				continue
++			}
 +			if fds[2].Revents&unix.POLLIN != 0 {
 +				p.rejectProofInput()
 +			}
@@ -14382,8 +15615,18 @@ new file mode 100644
 +			return nil, errProfile
 +		}
 +		// Fixed bounded RX/ancillary allocation; received rights никогда не принимаются.
++		release := func(bool) {}
++		controlLimit := unix.CmsgSpace(16*4) + unix.CmsgSpace(unix.SizeofUcred)
++		if p.udpActor != nil {
++			var e error
++			release, e = p.reserveUDPInput()
++			if e != nil {
++				return nil, e
++			}
++			controlLimit = unix.CmsgSpace(16 * 4)
++		}
 +		b := make([]byte, profileFrameLimit)
-+		oob := make([]byte, unix.CmsgSpace(16*4)+unix.CmsgSpace(unix.SizeofUcred))
++		oob := make([]byte, controlLimit)
 +		size, control, flags, _, err := unix.Recvmsg(int(p.channel.Fd()), b, oob, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
 +		if size < 0 {
 +			size = 0
@@ -14394,9 +15637,10 @@ new file mode 100644
 +		}
 +		packet := profileParseAncillary(b[:size], oob[:control], flags, profileAdoptFD)
 +		if packet.count != 0 {
-+			p.rejectRights(packet)
++			release(p.rejectRights(packet) == nil)
 +			return nil, errProfile
 +		}
++		release(true)
 +		if err != nil || size < 128 || packet.invalid || packet.credentials != 1 || !profileSenderValid(p.admission.launch, packet.pid, packet.uid, uint32(os.Geteuid())) || p.peerAlive() != nil {
 +			return nil, errProfile
 +		}
@@ -14588,6 +15832,12 @@ new file mode 100644
 +	}
 +	p.flow.sessionDeadline = a.deadline
 +	p.flowFence = p.fresh
++	if p.proofs != nil && p.proofs.version == 2 {
++		if e = profileInitUDPBudget(p); e != nil {
++			return nil, e
++		}
++		p.udpActor = &profileUDPActor{runtime: p, send: p.sendUDPProof, inspect: profileInspectUDP}
++	}
 +	profileResolverClosed.Store(true)
 +	// Existing native DAT loader получает только retained controlled root.
 +	// Никакой provider path или унаследованный XRAY_LOCATION_ASSET не принимается.
@@ -14632,6 +15882,11 @@ new file mode 100644
 +		}
 +		p.cancel()
 +		p.mu.Unlock()
++		if p.udpActor != nil {
++			p.udpActor.mu.Lock()
++			p.udpActor.failLocked(errProfile)
++			p.udpActor.mu.Unlock()
++		}
 +		if p.flow != nil {
 +			p.flow.revoke()
 +			if e := p.flow.closeAcceptedProofs(); e != nil {
@@ -14661,6 +15916,9 @@ new file mode 100644
 +	var renewRequest uint64
 +	var renewSent, renewDeadline time.Time
 +	for {
++		if p.udpActor != nil && p.udpActor.tick() != nil {
++			return
++		}
 +		if p.flow != nil {
 +			for n := 0; n < 64; n++ {
 +				select {
@@ -16006,23 +17264,35 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  	"github.com/xtls/xray-core/core"
  	"github.com/xtls/xray-core/features/policy"
  	"github.com/xtls/xray-core/features/routing"
-@@ -119,7 +120,14 @@
+@@ -119,8 +120,26 @@
  		Reader: buf.NewReader(conn),
  		Buffer: buf.MultiBuffer{buf.FromBytes(firstbyte)},
  	}
 -	request, tempUDPConn, err := svrSession.Handshake(reader, conn)
 +	var request *protocol.RequestHeader
 +	var tempUDPConn *TempUDPConn
++	var privateUDP *nativehooks.ProfileUDPControl
 +	var err error
 +	if nativehooks.ProfileSOCKSUDPRequiresPrivateControl(ctx) {
-+		request, err = profileHandshakeBeforeUDPFactory(svrSession, reader, conn, func() error { return nativehooks.ProfileAdmitSOCKSUDPControl(ctx) })
++		request, err = profileHandshakeWithUDPDelivery(svrSession, reader, conn, nil, func() (net.Destination, error) {
++			var e error
++			privateUDP, e = nativehooks.ProfileOpenSOCKSUDPControl(ctx)
++			if e != nil {
++				return net.Destination{}, e
++			}
++			return privateUDP.Endpoint()
++		})
 +	} else {
 +		request, tempUDPConn, err = svrSession.Handshake(reader, conn)
 +	}
  	defer common.CloseIfExists(tempUDPConn)
++	if privateUDP != nil {
++		defer privateUDP.Close()
++	}
  	if err != nil {
  		if inbound.Source.IsValid() {
-@@ -142,6 +150,11 @@
+ 			log.Record(&log.AccessMessage{
+@@ -142,6 +161,11 @@
  
  	if request.Command == protocol.RequestCommandTCP {
  		dest := request.Destination()
@@ -16034,7 +17304,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  		errors.LogInfo(ctx, "TCP Connect request to ", dest)
  		if inbound.Source.IsValid() {
  			ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
-@@ -155,7 +168,7 @@
+@@ -155,7 +179,7 @@
  			inbound.CanSpliceCopy = 1
  		}
  		if err := dispatcher.DispatchLink(
@@ -16043,13 +17313,35 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  				Reader: reader,
  				Writer: buf.NewWriter(conn),
  			},
-@@ -192,6 +205,55 @@
+@@ -166,6 +190,18 @@
+ 	}
+ 
+ 	if request.Command == protocol.RequestCommandUDP {
++		if privateUDP != nil {
++			stop := privateUDP.OnCancel(func() {
++				if e := conn.Close(); e != nil {
++					errors.LogInfoInner(ctx, e, "private UDP control close")
++				}
++			})
++			defer stop()
++			// Issuer relay custody не экспортируется в legacy UDP dispatcher.
++			// До OPEN/Consumed + private GRANT bridge нет Peek/Receive/forward.
++			_, e := io.Copy(buf.DiscardBytes, conn)
++			return goerrors.Join(e, privateUDP.Close())
++		}
+ 		if tempUDPConn == nil {
+ 			return errors.New("UDP associate with listen port failed")
+ 		}
+@@ -192,6 +228,76 @@
  	return nil
  }
  
 +// Использует native auth/address/response helpers, но UDP command перехватывает
 +// ДО handshake5::ListenSystemPacket. Child port/tempUDPConn не является proof.
 +func profileHandshakeBeforeUDPFactory(s *ServerSession, reader io.Reader, writer net.Conn, admit func() error) (*protocol.RequestHeader, error) {
++	return profileHandshakeWithUDPDelivery(s, reader, writer, admit, nil)
++}
++func profileHandshakeWithUDPDelivery(s *ServerSession, reader io.Reader, writer net.Conn, admit func() error, delivery func() (net.Destination, error)) (*protocol.RequestHeader, error) {
 +	var prefix [2]byte
 +	if _, e := io.ReadFull(reader, prefix[:]); e != nil {
 +		return nil, e
@@ -16069,8 +17361,26 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
 +		return nil, e
 +	}
 +	if command[1] == cmdUDPAssociate {
-+		if command[0] != 5 || command[2] != 0 || !s.config.UdpEnabled || admit == nil {
++		if command[0] != 5 || command[2] != 0 || !s.config.UdpEnabled || admit == nil && delivery == nil {
 +			return nil, nativehooks.ErrProfileUnsupported
++		}
++		if delivery != nil {
++			address, port, e := addrParser.ReadAddressPort(nil, reader)
++			if e != nil {
++				return nil, e
++			}
++			endpoint, e := delivery()
++			if e != nil || endpoint.Network != net.Network_UDP || endpoint.Address == nil || !endpoint.Address.Family().IsIP() || !endpoint.Address.IP().Equal(net.LocalHostIP.IP()) || endpoint.Port == 0 {
++				return nil, goerrors.Join(nativehooks.ErrProfileUnsupported, e, writeSocks5Response(writer, statusCmdNotSupport, net.AnyIP, 0))
++			}
++			if e = writeSocks5Response(writer, statusSuccess, endpoint.Address, endpoint.Port); e != nil {
++				return nil, e
++			}
++			request := &protocol.RequestHeader{Command: protocol.RequestCommandUDP, Version: socks5Version, Address: address, Port: port}
++			if username != "" {
++				request.User = &protocol.MemoryUser{Email: username}
++			}
++			return request, nil
 +		}
 +		e = admit()
 +		responseError := writeSocks5Response(writer, statusCmdNotSupport, net.AnyIP, 0)
@@ -16099,7 +17409,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
  	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
  		payload := packet.Payload
-@@ -230,6 +292,7 @@
+@@ -230,6 +336,7 @@
  
  	reader := buf.NewPacketReader(conn)
  	var changeRemote sync.Once
@@ -16107,7 +17417,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  	for {
  		mpayload, err := reader.ReadMultiBuffer()
  		if err != nil {
-@@ -245,7 +308,12 @@
+@@ -245,7 +352,12 @@
  				ctx = session.ContextWithInbound(ctx, inbound)
  				errors.LogInfo(ctx, "client UDP connection from ", inbound.Source)
  			}
@@ -16120,7 +17430,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  
  		for _, payload := range mpayload {
  			request, err := DecodeUDPPacket(payload)
-@@ -262,10 +330,14 @@
+@@ -262,10 +374,14 @@
  
  			destination := request.Destination()
  
@@ -16137,7 +17447,7 @@ diff --git a/proxy/socks/server.go b/proxy/socks/server.go
  					From:   inbound.Source,
  					To:     destination,
  					Status: log.AccessAccepted,
-@@ -275,7 +347,7 @@
+@@ -275,7 +391,7 @@
  
  			payload.UDP = &destination
  
