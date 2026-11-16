@@ -376,7 +376,7 @@ DNSGrant. Observatory request/dial сохраняют callback cancellation и m
 не запускают late dial goroutine через task.Run, не следуют redirects. Cancel
 закрывает только logical probe, shared physical session остаётся session-owned.
 
-### Незакрытая caller интеграция: exact DNS result
+### Исходный gap R13: exact DNS result (outer caller закрыт ниже)
 
 `ProfileDNSQueryContext(ctx,name) (context.Context,func(),error)` резервирует
 private per-query state, но не разрешает I/O. `ProfileLookupSnapshot` требует
@@ -812,3 +812,28 @@ history exhaustion, delayed send blocking KnownClosed, uncertain send и
 logical task joins. OS wrappers и main не исполнялись. Producer/consumer
 counterpart SOURCE review и интеграция остаются обязательны перед opening gates.
 DNS outer два файла, provider cache/resolver-peer provenance не изменены.
+
+## Разрешённый DNS outer caller
+
+Base `4ea6c087925ba6045bcfeba26cc31685b3b474b0`. После явного расширения scope
+`app/dns/dns.go::LookupIPWithContext` передаёт original domain без изменения
+через `ProfileDNSQueryContext` → `lookupIP(query,domain,option)` →
+`ProfileCheckDNSAnswer(query,domain,ips)`. Private `profileDNSLookup` позволяет
+инъекцию этих трёх функций только package tests; production использует broker
+напрямую. Release отложен до завершения проверки и выполняется на error/deny.
+TTL/IP не возвращаются при отказе guard. Snapshot check остаётся one-shot,
+с exact query/RRset/private source/live grants; provider/cache result без этого
+proof отказывается. Local snapshot не назначается вместо provider policy.
+
+`Client.QueryIP` передаёт owned-latch в private `queryIP` только для suppression
+четырёх domain/IP debug logs. Фильтры expected/unexpected/prior/unprior и
+legacy log statements сохранены. Этот bool не выдаёт DNS authority.
+Pure caller injection проверяет порядок/scope/result/release и отказ checker;
+Client tests исполняют оба режима фильтрации с fake server и захватом logs.
+Семантические wrong-query/IP/replay/cancel/service freshness controls остаются
+в real broker pure tests; caller injection не является issuer proof.
+
+Не закрыты internal DNS-subject binding, independent loopback resolver-peer
+proof, provider/cache waiter authority и physical hostname RRset handoff.
+System class3 required/Known≤20ms не изменён. Wire/ABI260, UDP/R9–R25 guards
+и все глобальные readiness/builder gates сохранены; runtime не исполнялся.
