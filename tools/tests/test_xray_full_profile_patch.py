@@ -37,6 +37,7 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertFalse(metadata["udp_v2_consumer_ready"])
         self.assertTrue(metadata["udp_v2_name_policy_parity"])
         self.assertTrue(metadata["udp_v2_receive_os_source"])
+        self.assertTrue(metadata["udp_v2_namespace_binding_source"])
         self.assertFalse(metadata["udp_v2_runtime_flow_handoff_connected"])
         self.assertFalse(metadata["udp_v2_close_receipt_connected"])
         self.assertTrue(metadata["dns_service_consumer_connected"])
@@ -178,6 +179,7 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertIn("p.udpActor.receive(func() (profileProofPacket, error)", patch)
         self.assertIn("privateUDP.Endpoint()", patch)
         self.assertIn("p.udpActor.tick()", patch)
+        self.assertIn("namespace: profileKernelSocketNamespace", patch)
         self.assertEqual(
             metadata["udp_v2_original_grammar_head"],
             "7f1f5a8139ecd7f06e64b483b44c627ae2f99654",

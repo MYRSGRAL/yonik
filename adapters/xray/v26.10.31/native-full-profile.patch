@@ -1,8 +1,143 @@
+diff --git a/common/yonikbroker/profile_udp_namespace_linux_test.go b/common/yonikbroker/profile_udp_namespace_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_udp_namespace_linux_test.go
+@@ -0,0 +1,130 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"errors"
++	"testing"
++)
++
++func TestProfileUDPActorNamespaceBindingBeforeFactoryAndPublication(t *testing.T) {
++	for _, tc := range []struct {
++		name                                                         string
++		control, relay                                               uint64
++		controlError, relayError                                     error
++		missing, missingControl, missingGuard, closeFailure, allowed bool
++	}{
++		{name: "matching", control: 41, relay: 41, allowed: true},
++		{name: "matching-opaque-max", control: ^uint64(0), relay: ^uint64(0), allowed: true},
++		{name: "foreign-netns-same-UAC-cookie", control: 41, relay: 42},
++		{name: "zero-control", relay: 41},
++		{name: "zero-relay", control: 41},
++		{name: "both-zero"},
++		{name: "control-error", control: 41, relay: 41, controlError: errProfile},
++		{name: "relay-error", control: 41, relay: 41, relayError: errProfile},
++		{name: "missing-proof-reader", missing: true},
++		{name: "missing-namespace-guard", missingGuard: true},
++		{name: "missing-actual-control", missingControl: true},
++		{name: "foreign-netns-close-error", control: 41, relay: 42, closeFailure: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			f, a, accepted := udpActorFixture(t)
++			control := &proofFakeFD{}
++			accepted.proof = control
++			r, e := a.submit(f.p.ctx, accepted)
++			if e != nil {
++				t.Fatal(e)
++			}
++			if e = a.tick(); e != nil {
++				t.Fatal(e)
++			}
++			if e = a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, false, nil), nil }); e != nil {
++				t.Fatal(e)
++			}
++			if e = a.tick(); e != nil {
++				t.Fatal(e)
++			}
++			relay := &proofFakeFD{}
++			if tc.closeFailure {
++				relay.result = errProfile
++			}
++			calls, factories := 0, 0
++			read := func(fd profileProofFD) (uint64, error) {
++				calls++
++				switch fd {
++				case control:
++					return tc.control, tc.controlError
++				case relay:
++					return tc.relay, tc.relayError
++				default:
++					t.Fatal("namespace read from a foreign object")
++					return 0, errProfile
++				}
++			}
++			if tc.missing {
++				read = nil
++			}
++			a.namespace = func(actualControl, actualRelay profileProofFD) error {
++				if actualControl != accepted.proof || actualRelay != relay {
++					t.Fatal("actor substituted namespace anchor")
++				}
++				return profileRequireSameSocketNamespace(actualControl, actualRelay, read)
++			}
++			if tc.missingGuard {
++				a.namespace = nil
++			}
++			a.inspect = func(actual profileProofFD, _ []byte) (profileUDPReceiver, error) {
++				factories++
++				return &udpActorOwnedReceiver{profileUDPReceiver: &udpReceiveFake{}, fd: actual}, nil
++			}
++			if tc.missingControl {
++				accepted.proof = nil
++			}
++			e = a.receive(func() (profileProofPacket, error) { return udpActorPacket(t, a, r, true, relay), nil })
++			handle := &ProfileUDPControl{actor: a, request: r}
++			endpoint, endpointError := handle.Endpoint()
++			if tc.allowed {
++				if e != nil || factories != 1 || calls != 2 || r.association == nil || endpointError != nil || endpoint.Port != 49152 {
++					t.Fatal("matching kernel namespace rejected", e, factories, calls)
++				}
++				r.association.CloseAndJoin()
++			} else {
++				if e == nil || factories != 0 || r.association != nil || endpointError == nil || relay.calls != 1 || control.calls != 0 || f.p.admission.state != profileUnknown {
++					t.Fatal("unbound relay reached factory/SOCKS endpoint or lost custody", e, factories, calls)
++				}
++				if tc.closeFailure && (a.rejected[0] != relay || a.fdCredits != 22) {
++					t.Fatal("Unknown FD custody/credit lost")
++				}
++			}
++		})
++	}
++}
++
++func TestProfileUDPNamespaceProofRequiresLiveHandlesAndKernelReader(t *testing.T) {
++	first, second := &proofFakeFD{}, &proofFakeFD{}
++	reader := func(fd profileProofFD) (value uint64, e error) {
++		e = fd.withFD(func(int) error { value = 17; return nil })
++		return
++	}
++	if e := profileRequireSameSocketNamespace(nil, second, reader); e == nil {
++		t.Fatal("missing control proof accepted")
++	}
++	if e := profileRequireSameSocketNamespace(first, nil, reader); e == nil {
++		t.Fatal("missing relay proof accepted")
++	}
++	if e := profileRequireSameSocketNamespace(first, second, nil); e == nil {
++		t.Fatal("missing kernel reader accepted")
++	}
++	first.Close()
++	if e := profileRequireSameSocketNamespace(first, second, reader); e == nil {
++		t.Fatal("closed source handle accepted")
++	}
++	first = &proofFakeFD{}
++	second.Close()
++	if e := profileRequireSameSocketNamespace(first, second, reader); e == nil {
++		t.Fatal("closed delivered handle accepted")
++	}
++	if e := profileRequireSameSocketNamespace(first, second, reader); !errors.Is(e, ErrProfileUnsupported) {
++		t.Fatal("proof error lacks typed closed denial", e)
++	}
++}
 diff --git a/common/yonikbroker/profile_udp_os_linux.go b/common/yonikbroker/profile_udp_os_linux.go
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_os_linux.go
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,266 @@
 +//go:build linux
 +
 +package nativehooks
@@ -16,6 +151,34 @@ new file mode 100644
 +
 +	"golang.org/x/sys/unix"
 +)
++
++// Kernel namespace обоих retained socket handles; wire cookie/SO_COOKIE и
++// namespace текущей goroutine здесь не являются proof. Linux adc218676eef:
++// sk_getsockopt(SO_NETNS_COOKIE) читает written-once sock_net(sk)->net_cookie.
++func profileRequireSameSocketNamespace(control, relay profileProofFD, read func(profileProofFD) (uint64, error)) error {
++	if control == nil || relay == nil || read == nil {
++		return ErrProfileUnsupported
++	}
++	source, e := read(control)
++	if e != nil || source == 0 {
++		return errors.Join(ErrProfileUnsupported, e)
++	}
++	delivered, e := read(relay)
++	if e != nil || delivered == 0 || delivered != source {
++		return errors.Join(ErrProfileUnsupported, e)
++	}
++	return nil
++}
++func profileKernelSocketNamespace(control, relay profileProofFD) error {
++	return profileRequireSameSocketNamespace(control, relay, func(handle profileProofFD) (value uint64, err error) {
++		err = handle.withFD(func(n int) error {
++			var e error
++			value, e = unix.GetsockoptUint64(n, unix.SOL_SOCKET, unix.SO_NETNS_COOKIE)
++			return e
++		})
++		return
++	})
++}
 +
 +// Только consuming duplicate; нет Write/FD getter/Peek/child factory API.
 +type profileOSUDPReceiver struct {
@@ -245,7 +408,7 @@ diff --git a/common/yonikbroker/profile_udp_actor_linux_test.go b/common/yonikbr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_actor_linux_test.go
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,448 @@
 +//go:build linux
 +
 +package nativehooks
@@ -318,7 +481,9 @@ new file mode 100644
 +	if e := profileInitUDPBudget(f.p); e != nil {
 +		t.Fatal(e)
 +	}
-+	a := &profileUDPActor{runtime: f.p}
++	// Pure fixture моделирует уже проверенный kernel namespace. Dedicated
++	// namespace tests заменяют callback настоящим comparator с injected reader.
++	a := &profileUDPActor{runtime: f.p, namespace: func(profileProofFD, profileProofFD) error { return nil }}
 +	accepted := &profileAccepted{runtime: f.p, ctx: f.p.ctx, provenance: 2, proof: &flowProofFD{}, tuple: fakeFlowTuple(6)}
 +	a.send = func(b []byte, fd profileProofFD) error {
 +		rights := 0
@@ -692,12 +857,11 @@ new file mode 100644
 +		t.Fatal("close ID replay accepted")
 +	}
 +}
-
 diff --git a/common/yonikbroker/profile_udp_actor_linux.go b/common/yonikbroker/profile_udp_actor_linux.go
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_actor_linux.go
-@@ -0,0 +1,408 @@
+@@ -0,0 +1,418 @@
 +//go:build linux
 +
 +package nativehooks
@@ -729,6 +893,7 @@ new file mode 100644
 +}
 +
 +type profileUDPActor struct {
++	namespace func(profileProofFD, profileProofFD) error
 +	runtime   *ProfileRuntime
 +	mu        sync.Mutex
 +	requests  [8]*profileUDPControlRequest
@@ -1045,6 +1210,15 @@ new file mode 100644
 +			return nil
 +		}
 +		if kind == 3 && r.phase == 3 && u64(b, 128) == r.associate && u64(b, 136) == r.control && packet.rights[0] != nil && a.inspect != nil {
++			if a.namespace == nil {
++				return ErrProfileUnsupported
++			}
++			p.flow.mu.Lock()
++			control := r.accepted.proof
++			p.flow.mu.Unlock()
++			if e := a.namespace(control, packet.rights[0]); e != nil {
++				return e
++			}
 +			var receiver profileUDPReceiver
 +			var inspectError error
 +			receiver, inspectError = a.inspect(packet.rights[0], b)
@@ -1106,7 +1280,6 @@ new file mode 100644
 +		}
 +	}, nil
 +}
-
 diff --git a/common/yonikbroker/profile-udp-original-destination-v1.json b/common/yonikbroker/profile-udp-original-destination-v1.json
 new file mode 100644
 --- /dev/null
@@ -15893,7 +16066,7 @@ new file mode 100644
 +		if e = profileInitUDPBudget(p); e != nil {
 +			return nil, e
 +		}
-+		p.udpActor = &profileUDPActor{runtime: p, send: p.sendUDPProof, inspect: profileInspectUDP}
++		p.udpActor = &profileUDPActor{runtime: p, send: p.sendUDPProof, inspect: profileInspectUDP, namespace: profileKernelSocketNamespace}
 +	}
 +	profileResolverClosed.Store(true)
 +	// Existing native DAT loader получает только retained controlled root.

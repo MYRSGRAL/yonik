@@ -3,7 +3,7 @@
   "version": "26.10.31",
   "source_commit": "a4a3dff5b20c2faae567b742c172c7b95e75c083",
   "base_archive_sha256": "e5184047fd1380472f69114fb8173a0adfd8c50970560eceb9c87fcba0bb35e9",
-  "patch_sha256": "7ddff9aecf76b3678f53164393a457a7ce66867f2af9d4716aad9930b5f1eaf4",
+  "patch_sha256": "0b5400a50fa888bf5aaf86450421354e57e89b78b0437b657e3f3710f98945b5",
   "status": "partial-udp-v2-actor-source",
   "runtime_hooks_connected": false,
   "native_protocol": null,
@@ -34,7 +34,7 @@
     "profile_flow_linux_test.go": "d23a59f7fb727e4e03c7e9c7a02c812a8c9efb6dd43eddc479366c1a79257aba",
     "profile_flow_other.go": "e94338e89fc5e5a8427622cbb053569f6b61a8670aa4fde2e769b8b40b5381ba",
     "profile_launch.go": "a8d8b2c170ed186241aefbbb2cb2d34ad3fb86a9dc9736c506d4798dc3919b6b",
-    "profile_launch_linux.go": "3797ccff305c268e6264ae7b0f97b9e40cf419dca56fc213c7a06a036aa734f0",
+    "profile_launch_linux.go": "439637e9a562d34b4e096bb90f58490c5807078ead65a155c64fa794174a2665",
     "profile_launch_linux_test.go": "49ffcbe0a196a6ed4a37a339cc7fab948794b153482828ee804fc4536b0b957d",
     "profile_launch_other.go": "21b31d0b7a19536438c2c097f2795414f249c05f1955a4cebf7b0d5252acc71a",
     "profile_launch_test.go": "d614d592feed1d6527b82fc1503fb6c1a5416022b53b5b58f43283f0feb5d032",
@@ -58,10 +58,11 @@
     "profile_udp_v2_linux_test.go": "9d8e2ba665713d42153af462e29f519af46ac5681361ac41632f3ba46d4e30de",
     "profile-udp-proof-v2-source.json": "fbf2a9219ecd6eada355e75c811abf69f66b1f13c6123cd5e1a121680440f2da",
     "profile-udp-proof-v2-rust.json": "69e8a6750d454a049ee4da41a8d7f2b3b15c966ecc5e4372a779664e500bfe0d",
-    "profile_udp_actor_linux.go": "825ce573d212ff92c8a1a8851e7aeae2ccf9c8bf66d3c6a9a1b6a571e935c6ad",
-    "profile_udp_actor_linux_test.go": "0d12695a1c791d5354e1f3e340f7285f39d7532261bbae2d59454a8fe5758905",
-    "profile_udp_os_linux.go": "29d0d4bb28f7b25213343e8eae889bac336c0b5249461ecf5c39d0c563ec027b",
-    "profile-udp-original-destination-v1.json": "bfd7715dc09392c51e9ab7ebf6fb0a601dda37331a8ec87f41bb04611c79872c"
+    "profile_udp_actor_linux.go": "9dff531fe291bae520d722e87be9051572e54c25a70a858cae7a4601933bf8f1",
+    "profile_udp_actor_linux_test.go": "85c5e9b1ff58c12e9eeeacf1a7c76615c37f133cb7e2b73fcc97e60d4bf8e01c",
+    "profile_udp_os_linux.go": "5f55110133eedc493942a7b94f4797d4bb70141f20e5a497e481e90e311c91ad",
+    "profile-udp-original-destination-v1.json": "bfd7715dc09392c51e9ab7ebf6fb0a601dda37331a8ec87f41bb04611c79872c",
+    "profile_udp_namespace_linux_test.go": "b5916e89f4d46604c9e0341a4874e99f151866c254bfd2e7c5761211e8ffcca2"
   },
   "callsite_files_sha256": {
     "transport/internet/splithttp/yonik_r9_test.go": "de0efd0442bbb2a6bc9cdca69fa70294b0496c20d5907089cb885d057d968b1e",
@@ -124,5 +125,6 @@
   "udp_v2_receive_os_source": true,
   "udp_v2_runtime_flow_handoff_connected": false,
   "udp_v2_close_receipt_connected": false,
-  "udp_v2_original_grammar_head": "7f1f5a8139ecd7f06e64b483b44c627ae2f99654"
+  "udp_v2_original_grammar_head": "7f1f5a8139ecd7f06e64b483b44c627ae2f99654",
+  "udp_v2_namespace_binding_source": true
 }
