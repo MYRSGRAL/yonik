@@ -38,6 +38,7 @@ enum Fault {
     Publish,
     Waiters,
     WaitersKeep,
+    WaiterShortReservation,
     WaiterWrongSource,
     WaiterWrongRoot,
     WaiterCancelQueued,
@@ -57,30 +58,32 @@ impl Fault {
             self,
             Self::Waiters
                 | Self::WaitersKeep
+                | Self::WaiterShortReservation
                 | Self::WaiterWrongSource
                 | Self::WaiterWrongRoot
                 | Self::WaiterCancelQueued
         )
     }
     fn publishing(self) -> bool {
-        matches!(
-            self,
-            Self::Publish
-                | Self::Waiters
-                | Self::WaitersKeep
-                | Self::WaiterWrongSource
-                | Self::WaiterWrongRoot
-                | Self::WaiterCancelQueued
-                | Self::PublishNoAuthority
-                | Self::PublishRevision
-                | Self::PublishQuestion
-                | Self::PublishAddress
-                | Self::PublishCancel
-                | Self::PublishReplay
-                | Self::PublishExpired
-                | Self::PublishLarge
-                | Self::PublishExhausted
-        )
+        self.waitering()
+            || matches!(
+                self,
+                Self::Publish
+                    | Self::Waiters
+                    | Self::WaitersKeep
+                    | Self::WaiterWrongSource
+                    | Self::WaiterWrongRoot
+                    | Self::WaiterCancelQueued
+                    | Self::PublishNoAuthority
+                    | Self::PublishRevision
+                    | Self::PublishQuestion
+                    | Self::PublishAddress
+                    | Self::PublishCancel
+                    | Self::PublishReplay
+                    | Self::PublishExpired
+                    | Self::PublishLarge
+                    | Self::PublishExhausted
+            )
     }
     fn releasing(self) -> bool {
         matches!(
@@ -589,7 +592,10 @@ impl Channel for Driver {
         match f.record.operation() {
             Operation::BundleGranted if self.current_acquire.borrow().is_some() => {
                 let a = self.current_acquire.borrow();
-                let body = self.reserve_for(a.as_ref().unwrap(), 3, 0, n64(b, 8));
+                let mut body = self.reserve_for(a.as_ref().unwrap(), 3, 0, n64(b, 8));
+                if self.fault == Fault::WaiterShortReservation {
+                    p64(&mut body, 56, 5_000_000);
+                }
                 self.next_queue(Operation::Reserve, &body);
             }
             Operation::BundleGranted => {
@@ -600,6 +606,9 @@ impl Channel for Driver {
                 self.queue(4, Operation::Reserve, &b);
             }
             Operation::Reserved if b[60] == 3 => {
+                if self.fault == Fault::WaiterShortReservation {
+                    self.elapsed.fetch_add(3_000_000, Ordering::AcqRel);
+                }
                 let a = self.current_acquire.borrow();
                 let a = a.as_ref().unwrap();
                 let base = &a[72..72 + usize::from(n16(a, 48))];
@@ -890,6 +899,22 @@ fn additional_query(issuer: &mut Issuer<Fake>, first: &[u8], port: u16, query: u
     body
 }
 
+#[test]
+fn dns_transport_driver_waiter_receipt_keeps_original_reservation_deadline() {
+    let (mut issuer, a) = bundle_fixture(Mode::System, false);
+    let second = additional_query(&mut issuer, &a, 32002, 10);
+    let io = Driver::new(&issuer, a, false, Fault::WaiterShortReservation);
+    io.extra_acquires.borrow_mut().push_back(second);
+    run(&mut issuer, &io);
+    let out = io.output.borrow();
+    let receipt = out.iter().find(|b| n16(b, 10) == 54).unwrap();
+    assert_eq!(receipt[130], 1);
+    assert!(
+        n64(receipt, 128 + 48) <= 2_000_000,
+        "receipt exceeds reservation deadline"
+    );
+    assert!(n64(receipt, 128 + 48) > 0);
+}
 #[test]
 fn dns_transport_driver_publish_two_private_waiters_cancel_one_preserves_sibling() {
     for mode in [Mode::Local, Mode::System] {

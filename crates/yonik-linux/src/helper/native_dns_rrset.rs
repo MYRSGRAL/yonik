@@ -612,7 +612,7 @@ impl<A: Authority> Issuer<A> {
         let b = v.bytes();
         let reservation = n64(b, 8);
         let producer = n64(b, 16);
-        let binding = self.dns_waiter_binding(reservation)?;
+        let (binding, reservation_expires) = self.dns_waiter_binding(reservation)?;
         let p = self
             .rrsets
             .producers
@@ -638,6 +638,7 @@ impl<A: Authority> Issuer<A> {
         }
         let expires = p
             .expires
+            .min(reservation_expires)
             .min(session)
             .min(self.authority.now() + Duration::from_nanos(n64(b, 56)));
         let memory = self
@@ -724,10 +725,14 @@ impl<A: Authority> Issuer<A> {
             let binding = w.binding;
             let expiry = w.expires.min(p.expires);
             let (producer, reservation, count) = (w.producer, w.reservation, p.answer.count);
-            if self.dns_waiter_binding(reservation)? != binding {
+            let (current_binding, reservation_expires) = self.dns_waiter_binding(reservation)?;
+            if current_binding != binding {
                 return Err(ServiceError::Unavailable);
             }
-            let until = self.fresh_waiter(binding)?.min(expiry);
+            let until = self
+                .fresh_waiter(binding)?
+                .min(expiry)
+                .min(reservation_expires);
             let now = self.authority.now();
             if now >= until {
                 return Err(ServiceError::Unavailable);

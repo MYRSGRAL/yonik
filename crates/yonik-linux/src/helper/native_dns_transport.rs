@@ -595,7 +595,7 @@ impl<A: Authority> Issuer<A> {
         p.published = true;
         Ok(())
     }
-    pub(super) fn dns_waiter_binding(&self, id: u64) -> Result<Binding, ServiceError> {
+    pub(super) fn dns_waiter_binding(&self, id: u64) -> Result<(Binding, Instant), ServiceError> {
         let r = self
             .transport
             .reservations
@@ -609,7 +609,7 @@ impl<A: Authority> Issuer<A> {
         {
             return Err(ServiceError::Unavailable);
         }
-        Ok(r.binding)
+        Ok((r.binding, r.expires))
     }
     fn retire_dns(
         &mut self,

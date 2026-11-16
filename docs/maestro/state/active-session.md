@@ -654,6 +654,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   issuer — следующий cut, остальные proxy/service/loopback/bootstrap формы ещё
   Unsupported. OS/runtime не исполнялись, все public gates false.
 
+- R43 выявил P2 в Publish/Waiter0e14393: receipt expiry терял исходный
+  reservation deadline. Root возвращает binding вместе с deadline, включает
+  его в минимум waiter state и повторно перед ACK. Actual driver RED короткого
+  Reserve5ms→Bind через3ms с большим remaining воспроизведён; GREEN28 serial
+  transport driver tests PASS. CODEC3/schema неизменны, correction ждёт narrow
+  recheck. Numeric42→durable USER GRANT ещё не реализован; production transcript
+  pin DNS_WIRE_REVIEWED_PATCH=None, public gates закрыты.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
