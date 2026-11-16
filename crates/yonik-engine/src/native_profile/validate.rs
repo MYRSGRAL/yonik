@@ -816,7 +816,7 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
         }
     }
     let chained: HashSet<_> = chains.iter().map(|(s, _)| s.as_str()).collect();
-    let subject_endpoints = tags
+    let subject_endpoints: Vec<_> = tags
         .iter()
         .flat_map(|tag| {
             endpoints
@@ -824,6 +824,14 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
                 .into_iter()
                 .chain(packet_endpoints.get(tag))
                 .map(|endpoint| (tag.clone(), endpoint.clone()))
+        })
+        .collect();
+    let physical_bootstrap = subject_endpoints
+        .iter()
+        .filter(|(tag, endpoint)| !chained.contains(tag.as_str()) && endpoint.requires_bootstrap())
+        .map(|(tag, endpoint)| PhysicalFirstHopBootstrap {
+            subject: tag.clone(),
+            endpoint: endpoint.clone(),
         })
         .collect();
     let mut physical = Vec::new();
@@ -859,6 +867,7 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
             resolvers,
             subject_endpoints,
             system_resolvers,
+            physical_bootstrap,
         },
         tags,
         selectors,

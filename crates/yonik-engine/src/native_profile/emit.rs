@@ -11,7 +11,7 @@ pub(super) fn emit(
     if system != runtime.tun.is_some() {
         return Err(Error::Ownership);
     }
-    if !graph.egress.system_resolvers().is_empty() && runtime.system_resolver.is_none() {
+    if graph.egress.requires_system_snapshot() && runtime.system_resolver.is_none() {
         return Err(Error::ResourceRequired);
     }
     for endpoint in graph.egress.physical() {

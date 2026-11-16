@@ -825,6 +825,30 @@ fn provider_dns_is_separate_from_transport_exceptions() {
 }
 
 #[test]
+fn bootstrap_snapshot_roles_do_not_change_provider_dns_or_numeric_capture() {
+    let mut value = document(1);
+    value["dns"] = json!({"servers":["192.0.2.53"]});
+    value["outbounds"][0]["settings"]["servers"][0]["address"] = json!("Edge.invalid");
+    // Используем checked fixture protocol без чтения NSS/hosts/OS resolver.
+    let graph = validate_profile(&from_value(&value)).unwrap();
+    assert_eq!(graph.egress().system_resolver_roles(), 4);
+    assert!(graph.egress().requires_system_snapshot());
+    assert!(graph.egress().system_resolvers().is_empty());
+    assert_eq!(
+        graph.egress().resolvers()[0].endpoint().host(),
+        "192.0.2.53"
+    );
+    let requirements = PhysicalRequirements::new(graph.egress()).unwrap();
+    assert!(matches!(
+        requirements.validate_numeric(),
+        Err(EgressError::BootstrapRequired)
+    ));
+    value["dns"] = json!({"servers":["localhost"]});
+    let graph = validate_profile(&from_value(&value)).unwrap();
+    assert_eq!(graph.egress().system_resolver_roles(), 6);
+}
+
+#[test]
 fn digest_writer_rejects_overflow_before_hashing_extra_bytes() {
     let mut writer = DigestWriter {
         digest: Sha256::new(),

@@ -59,6 +59,20 @@ pub struct EgressPlan {
     pub(super) resolvers: Vec<ResolverRequirement>,
     pub(super) subject_endpoints: Vec<(String, PhysicalEndpoint)>,
     pub(super) system_resolvers: Vec<SystemResolverRequirement>,
+    pub(super) physical_bootstrap: Vec<PhysicalFirstHopBootstrap>,
+}
+/// Закрытое требование snapshot для physical leaf, отдельно от provider DNS.
+pub struct PhysicalFirstHopBootstrap {
+    pub(super) subject: String,
+    pub(super) endpoint: PhysicalEndpoint,
+}
+impl PhysicalFirstHopBootstrap {
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+    pub fn endpoint(&self) -> &PhysicalEndpoint {
+        &self.endpoint
+    }
 }
 /// Native localhost использует OS resolver вне provider dispatcher.
 pub struct SystemResolverRequirement {
@@ -100,6 +114,17 @@ impl ResolverRequirement {
     }
 }
 impl EgressPlan {
+    pub fn physical_bootstrap(&self) -> &[PhysicalFirstHopBootstrap] {
+        &self.physical_bootstrap
+    }
+    /// Mapping4 table11 purpose bits. Hosts-absent bit0 принадлежит capture.
+    pub fn system_resolver_roles(&self) -> u32 {
+        (u32::from(!self.system_resolvers.is_empty()) * 2)
+            | (u32::from(!self.physical_bootstrap.is_empty()) * 4)
+    }
+    pub fn requires_system_snapshot(&self) -> bool {
+        self.system_resolver_roles() != 0
+    }
     pub fn physical(&self) -> &[PhysicalEndpoint] {
         &self.physical
     }
