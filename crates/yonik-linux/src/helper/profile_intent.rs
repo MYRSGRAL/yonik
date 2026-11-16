@@ -1439,6 +1439,18 @@ fn resolver_snapshot_data(
     {
         return Err(EgressError::Budget);
     }
+    // net/parse.go::file.readLine не растит fixed 64KiB buffer: слишком
+    // длинная строка остановила бы pinned reader. Не разбирать её иначе.
+    if [nss, resolv, hosts.unwrap_or_default()]
+        .iter()
+        .any(|source| {
+            source
+                .split(|b| *b == b'\n')
+                .any(|line| line.len() >= 65536)
+        })
+    {
+        return Err(EgressError::Budget);
+    }
     // Raw retained sources + parsed aliases + canonical asset/readback scratch.
     let memory = super::memory::config_budget()
         .reserve(8 * 1024 * 1024)
@@ -1556,16 +1568,25 @@ fn resolver_snapshot_data(
                         _ => {
                             let (key, value) =
                                 option.split_once(':').ok_or(EgressError::Resolver)?;
-                            if value.starts_with('+') {
+                            // net/parse.go::dtoi насыщается на 0xffffff;
+                            // отрицательный prefix даёт 0, а не signed integer.
+                            // Повреждённые/trailing формы, терпимые Go, закрыты
+                            // capture policy: они не становятся новой grammar.
+                            let digits = value.strip_prefix('-').unwrap_or(value);
+                            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                                 return Err(EgressError::Resolver);
                             }
-                            let n = value.parse::<i64>().map_err(|_| EgressError::Resolver)?;
+                            let n = if value.starts_with('-') {
+                                0
+                            } else {
+                                digits
+                                    .bytes()
+                                    .fold(0u32, |n, b| (n * 10 + u32::from(b - b'0')).min(0xffffff))
+                            };
                             match key {
-                                "ndots" => data.ndots = n.clamp(0, 15) as u8,
+                                "ndots" => data.ndots = n.min(15) as u8,
                                 "attempts" if n.max(1) <= 5 => data.attempts = n.max(1) as u8,
-                                "timeout" if n.max(1) <= 30 => {
-                                    data.timeout_ms = n.max(1) as u32 * 1000
-                                }
+                                "timeout" if n.max(1) <= 30 => data.timeout_ms = n.max(1) * 1000,
                                 _ => return Err(EgressError::Resolver),
                             }
                         }
@@ -1599,6 +1620,11 @@ fn resolver_snapshot_data(
             let Some(address) = fields.next() else {
                 continue;
             };
+            // readHosts пропускает len(fields)<2 до parseLiteralIP: zone или
+            // mapped literal без alias не является записью и не даёт отказ.
+            let Some(first_alias) = fields.next() else {
+                continue;
+            };
             if let Some((ip, zone)) = address.split_once('%') {
                 if ip.parse::<std::net::Ipv6Addr>().is_ok() && !zone.is_empty() {
                     return Err(EgressError::Resolver);
@@ -1610,7 +1636,7 @@ fn resolver_snapshot_data(
             if matches!(ip,IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some()) {
                 return Err(EgressError::Resolver);
             }
-            for alias in fields {
+            for alias in std::iter::once(first_alias).chain(fields) {
                 // Canonical lookup на stack: 4097-я unique alias не аллоцирует
                 // String до проверки cap; повторные aliases не копируют keys.
                 if alias.is_empty()
@@ -1635,6 +1661,8 @@ fn resolver_snapshot_data(
                 }
                 let alias =
                     std::str::from_utf8(&canonical[..length]).map_err(|_| EgressError::Resolver)?;
+                crate::profile_channel::resolver_name(alias, alias.contains('.'), true)
+                    .map_err(|_| EgressError::Resolver)?;
                 let index = match aliases.get(alias) {
                     Some(index) => *index,
                     None => {
@@ -1674,62 +1702,63 @@ fn resolver_snapshot_data(
     Ok(data)
 }
 fn resolver_nss_order(nss: &str) -> Result<u8, EgressError> {
-    let mut hosts = None;
+    // net/nss.go::parseNSSConf дописывает повторные databases. Храним
+    // только hosts sources, но проверяем grammar остальных строк: их ошибка
+    // в Go инвалидирует весь nssConf. Никаких NSS plugins здесь нет.
+    let mut names = [""; 64];
+    let mut count = 0;
     for line in nss.lines() {
         let line = line.split('#').next().unwrap_or_default().trim();
         if line.is_empty() {
             continue;
         }
-        let (database, sources) = line.split_once(':').ok_or(EgressError::Resolver)?;
-        if database.trim() != "hosts" {
-            continue;
-        }
-        if hosts.replace(sources).is_some() {
-            return Err(EgressError::Resolver);
-        }
-    }
-    let Some(mut sources) = hosts else {
-        return Ok(3);
-    };
-    let mut names = Vec::new();
-    loop {
-        sources = sources.trim_matches([' ', '\t']);
-        if sources.is_empty() {
-            break;
-        }
-        let n = sources.find([' ', '[']).unwrap_or(sources.len());
-        let source = &sources[..n];
-        if source.is_empty()
-            || !source
+        let (database, mut sources) = line.split_once(':').ok_or(EgressError::Resolver)?;
+        loop {
+            sources = sources.trim_matches([' ', '\t', '\r']);
+            if sources.is_empty() {
+                break;
+            }
+            // Именно literal space, как в Go1.27.1. Внутренний TAB остаётся
+            // частью unknown source; files\tdns НЕ означает files + dns.
+            let n = sources.find(' ').unwrap_or(sources.len());
+            let source = &sources[..n];
+            if !source
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || [b'_', b'-'].contains(&b))
-            || names.len() == 64
-        {
-            return Err(EgressError::Resolver);
-        }
-        names.push(source);
-        sources = sources[n..].trim_start_matches([' ', '\t']);
-        if let Some(criteria) = sources.strip_prefix('[') {
-            let end = criteria.find(']').ok_or(EgressError::Resolver)?;
-            if end == 0 {
+                .all(|b| b.is_ascii_alphanumeric() || [b'_', b'-', b'\t'].contains(&b))
+            {
                 return Err(EgressError::Resolver);
             }
-            for criterion in criteria[..end].split_ascii_whitespace() {
-                let (status, action) = criterion.split_once('=').ok_or(EgressError::Resolver)?;
-                let status = status.strip_prefix('!').unwrap_or(status);
-                if !["SUCCESS", "NOTFOUND", "UNAVAIL", "TRYAGAIN"]
-                    .iter()
-                    .any(|s| status.eq_ignore_ascii_case(s))
-                    || !["return", "continue"]
-                        .iter()
-                        .any(|a| action.eq_ignore_ascii_case(a))
-                {
-                    return Err(EgressError::Resolver);
+            if database.trim() == "hosts" {
+                if count == names.len() {
+                    return Err(EgressError::Budget);
                 }
+                names[count] = source;
+                count += 1;
             }
-            sources = &criteria[end + 1..];
+            sources = sources[n..].trim_start_matches([' ', '\t', '\r']);
+            if let Some(criteria) = sources.strip_prefix('[') {
+                let end = criteria.find(']').ok_or(EgressError::Resolver)?;
+                for criterion in criteria[..end].split_ascii_whitespace() {
+                    let (status, action) =
+                        criterion.split_once('=').ok_or(EgressError::Resolver)?;
+                    let status = status.strip_prefix('!').unwrap_or(status);
+                    if !["SUCCESS", "NOTFOUND", "UNAVAIL", "TRYAGAIN"]
+                        .iter()
+                        .any(|s| status.eq_ignore_ascii_case(s))
+                        || !["return", "continue"]
+                            .iter()
+                            .any(|a| action.eq_ignore_ascii_case(a))
+                    {
+                        return Err(EgressError::Resolver);
+                    }
+                }
+                // lookupOrder проверяет standardCriteria только canUseCgo.
+                // В закрытом CGO0 режиме recognized actions не меняют order.
+                sources = &criteria[end + 1..];
+            }
         }
     }
+    let names = &names[..count];
     if names.is_empty() {
         return Ok(3);
     }
@@ -1737,7 +1766,7 @@ fn resolver_nss_order(nss: &str) -> Result<u8, EgressError> {
     let mut first = None;
     let mut files = false;
     let mut dns = false;
-    for source in names {
+    for &source in names {
         match source {
             "files" => {
                 files = true;
@@ -1762,61 +1791,6 @@ fn resolver_nss_order(nss: &str) -> Result<u8, EgressError> {
         _ => 3,
     })
 }
-#[cfg(test)]
-fn resolver_content(resolv: &[u8], nss: &[u8]) -> Result<(Vec<SocketAddr>, [u8; 32]), EgressError> {
-    if resolv.len() > 65536 || nss.len() > 65536 {
-        return Err(EgressError::Budget);
-    }
-    // Единственная поддержанная NSS grammar исключает files/mDNS/resolve и
-    // dynamic modules. Расширение требует custody всех дополнительных sources.
-    let nss = std::str::from_utf8(nss).map_err(|_| EgressError::Resolver)?;
-    let mut hosts = nss
-        .lines()
-        .filter_map(|line| line.split('#').next())
-        .filter_map(|line| line.split_once(':'))
-        .filter_map(|(database, sources)| (database.trim() == "hosts").then_some(sources));
-    if hosts.next().map(str::trim) != Some("dns") || hosts.next().is_some() {
-        return Err(EgressError::Resolver);
-    }
-    let mut servers = Vec::new();
-    for line in std::str::from_utf8(resolv)
-        .map_err(|_| EgressError::Resolver)?
-        .lines()
-    {
-        let line = line.split(['#', ';']).next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = line.split_whitespace();
-        if fields.next() != Some("nameserver") || servers.len() >= 16 {
-            return Err(EgressError::Resolver);
-        }
-        let ip: IpAddr = fields
-            .next()
-            .ok_or(EgressError::Resolver)?
-            .parse()
-            .map_err(|_| EgressError::Resolver)?;
-        if fields.next().is_some()
-            || ip.is_unspecified()
-            || ip.is_multicast()
-            || matches!(ip,IpAddr::V6(ip) if ip.is_unicast_link_local()||ip.to_ipv4().is_some())
-        {
-            return Err(EgressError::Resolver);
-        }
-        servers.push(SocketAddr::new(ip, 53));
-    }
-    if servers.is_empty() {
-        return Err(EgressError::Resolver);
-    }
-    let mut digest = Sha256::new();
-    digest.update(b"YONIK-RESOLVER-SOURCES-v1\0");
-    digest.update((resolv.len() as u64).to_be_bytes());
-    digest.update(resolv);
-    digest.update((nss.len() as u64).to_be_bytes());
-    digest.update(nss.as_bytes());
-    Ok((servers, digest.finalize().into()))
-}
-
 /// Отдельно от DNS: resolver requirement не становится firewall exception.
 pub struct PhysicalRequirements<'a> {
     plan: &'a EgressPlan,
