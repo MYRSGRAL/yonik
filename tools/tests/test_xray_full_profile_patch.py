@@ -12,6 +12,31 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_dns_direct_transport_uses_private_actor_and_keeps_public_gates_closed(
+        self,
+    ) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for caller in (
+            "return profileDNSDialDirect(ctx, dest, runner)",
+            "return c.dnsDirectDispatch(op)",
+            "c.dnsDirectAccept(f)",
+            "p.reserveDNSInput()",
+            "hooks.ProfileDNSDirectFactory(ctx)",
+            "profileKernelSocketNamespace(source.proof, fd)",
+            "op.sequence = op.dnsDirect.request.sequence",
+            "op.sent = op.dnsDirect.request.sent",
+            "s.tasks.Wait()",
+        ):
+            self.assertIn(caller, patch)
+        metadata = json.loads((ADAPTER / "native-full-profile.json").read_text())
+        for gate in (
+            "builder_apply_enabled",
+            "runtime_hooks_connected",
+            "authority_issuer_connected",
+            "physical_resolver_proof_connected",
+        ):
+            self.assertFalse(metadata[gate])
+
     def test_dns_v2_canonical_pin_is_data_only_and_embedded_exactly(self) -> None:
         raw = (ADAPTER / "full-profile-fixtures/dns-v2-canonical.json").read_bytes()
         self.assertEqual(

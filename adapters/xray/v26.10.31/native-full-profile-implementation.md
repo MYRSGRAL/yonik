@@ -938,11 +938,73 @@ Known cleanup требует завершения pending cancel и bundle cance
 не отменяется. Bundle ACK не является доказательством закрытия Go FD: этот cut
 ещё не создаёт DNS physical resource.
 
-Граница milestone закрыта: `ProfileDNSForwardReady` после bundle guard возвращает
-Unsupported до отдельного PhysicalBind/LogicalBind proof; raw physical dial из
-DNS context запрещён. Actual Rust issuer/service policy, DirectSocket resources,
-StubBind, append/resource guards, RRset Publish/WaiterBind/cache authority и
-numeric durable route handoff остаются следующими частями DNS vertical.
+Первоначальная граница bundle-only milestone заменена следующим DirectSocket
+cut. Actual Rust issuer/service policy, ProxiedLogical/append, StubBind,
+RRset Publish/WaiterBind/cache authority и numeric durable route handoff остаются
+следующими частями DNS vertical.
 Здесь поддержан USER-backed classic routed producer с единственным подходящим
 manifest resolver row. Service flow0/internal DNS/ambiguous resolver не получают
 выдуманный bundle. Public readiness/require_consumer/builder gates остаются false.
+
+## DNS DirectSocket: Reserve → raw PhysicalBind → LogicalAck
+
+Canonical CODEC-2/corpus pin не изменён. Новый private consumer использует
+Kind35/36 Exchange, отдельный Kind35/36 Physical, raw DNSPHY02/192 Kind52
+с одним SCM FD и kernel credentials на existing proof endpoint, Kind37,
+затем Kind38/39 Direct/revision1. Raw52 не получает Header128 или свой runtime
+sequence: PhysicalAck.reply — исходный Physical Reserve.sequence. Remaining
+PhysicalAck считается от исходного Reserve send, включая factory/SCM latency.
+
+Production chain: classic UDP/TCP producer → native Handler.Dispatch actual
+chooser → ProfileDNSPrepareHandler/ForwardReady → Handler.Dial/internet.Dial →
+guardedSystemDial → ProfileDialPhysical → profileDNSDialDirect. ForwardReady
+разрешает лишь terminal unmuxed numeric nonloopback DirectSocket metadata path;
+ProxiedLogical/hostname/loopback/chain/mux остаются Unsupported. Отдельный
+private factory context появляется после обоих Reserved ACK. USER/Probe grant,
+tag, session и исходный class3 root не заменяют resource/proof authority.
+
+Actual TCPConn/connected UDPConn поступает в broker до wrappers/crypto. Broker
+получает CLOEXEC duplicate через syscall.Conn/RawConn, проверяет kernel type,
+protocol, actual numeric connected peer, nonblocking и nonzero namespace cookie.
+Namespace сравнивается с retained actual accepted TCP source proof через
+SO_NETNS_COOKIE; Rust независимо проверяет retained stamp/peer/netns/route.
+Это не child namespace metadata. Default production path требует legitimate
+proof channel и retained source FD; Local/TUN/missing proof остаются Unsupported,
+новый bootstrap или capability не выдумывается. Pure tests используют private
+injected inspector/sender; OS wrappers только компилируются.
+
+System dialer для этого private UDP factory использует connected UDP вместо
+legacy unconnected PacketConnWrapper. Legacy ветвь сохраняется. Native
+socket settings/controllers проходят прежний protected producer path после
+reservation; returned raw socket не экспортируется downstream. Только после
+exact live PhysicalAck и LogicalAck публикуется закрытый net.Conn wrapper.
+Read/Write проверяют собственный query/bundle/root, source epoch, remaining,
+revision1 и cancel. Root/bundle renewal не продлевает старый physical proof.
+Factory context имеет absolute deadline; Read/Write и пользовательские deadline
+setters ограничены remaining самого transport proof. Нулевой или более поздний
+caller deadline не отключает этот предел; более ранний сохраняется.
+Каждый query создаёт не больше одного Exchange; reconnect/append не имитируется
+новой reservation под тем же query и пока закрыт.
+
+До factory зарезервированы retained slot,12 pending/history credits,64KiB
+metadata и2 FD (actual socket+Go duplicate); Physical Reserved обязан подтвердить
+не меньше2 credits. Общая FD64 граница включает USER physical factories,
+accepted duplicates, UDP fdSlots и DNS/scratch. Runtime/proof reader резервирует
+16 scratch FD/pending/buffer до recvmsg; unexpected rights идут в existing
+rejectRights, failed close удерживает credits и Unknown. Новых channel owners
+нет: runtime requests и raw SCM send исполняет существующий monitor actor.
+
+Close запрещает новые tasks, cancels consumer, закрывает actual connection и
+duplicate, ждёт Read/Write joins. Затем actor получает отдельные Retired46 для
+Proof4/Resource3 и Canceled48 для Physical/Exchange reservations и Exchange.
+Только вся подтверждённая цепочка освобождает FD/pending/query credits;
+history/retained metadata остаются до session end. Error/Unknown sticky, повторный
+Close возвращает тот же результат, late ACK не возрождает consumer. Pending
+request cancellation сохраняет tombstone до исходного deadline; lost/invalid ACK
+не разрешает retry/use. Отмена одного DirectSocket не закрывает соседний query.
+
+Новые общие accounting links ограничены FD credits в existing physical factory/
+Close, accepted duplicate reservation и трёх UDP reservation predicates. R9
+object/H1/mux lifecycle и R14/UDP proof wire не изменены. Append43/44,
+ProxiedLogical resource set, RRset/Waiter/Numeric и public readiness здесь не
+открываются; outer answer guard продолжает deny без отдельной authority.
