@@ -1,11 +1,12 @@
-# DNS_V2: дополнение wire для root interop review
+# DNS_V2: согласованный HostsSnapshot wire tail
 
-Статус: конкретный вариант недостающего HostsSnapshot tail, ещё не codec
-authority. Нормативные PhysicalBind192, Append48+8N, Publish144 и
+Статус: root принял layout с коррекцией полного retained path вместо chainRows[4].
+Это specification для codec/goldens, не production authority или runtime PASS.
+Нормативные PhysicalBind192, Append48+8N, Publish144 и
 NumericAuthorize16 из dns-completion-scope.md сохранены. Runtime gates false.
 Этот документ не разрешает V1 fallback или synthetic DNS response.
 
-## HostsSnapshot tail: предлагаемый единственный layout
+## HostsSnapshot tail: единственный layout
 
 Publish purpose=3/sourceKind=2 использует этот tail после fixed144; request,
 response lengths и transportProofId/proofRevision строго0. Никакого TTL,
@@ -16,7 +17,7 @@ DNS ID, qtype, resolver peer или DNSBundle вместо snapshot observation.
 | --- | --- |
 | 0 | magic[8]=DNHOST02 |
 | 8 | version u16=2 |
-| 10 | total tail bytes u16=136+keyLen+originalLen+2*memberCount |
+| 10 | total tail bytes u16=128+keyLen+originalLen+2*memberCount |
 | 12 | flags u32=0 |
 | 16 | table11 sourceDigest[32] |
 | 48 | table11 assetHash[32] |
@@ -34,24 +35,37 @@ DNS ID, qtype, resolver peer или DNSBundle вместо snapshot observation.
 | 120 | branch u8, checked actual branch |
 | 121 | carrier u8=6/17 |
 | 122 | port u16, nonzero/exact original endpoint |
-| 124 | chainCount u16=0..4 |
-| 126 | reserved u16=0 |
-| 128 | chainRows[4] u16, ordered checked path, unused slots=FFFF |
-| 136 | pinned-netgo canonical lookup key[keyLen] |
+| 124 | reserved u32=0 |
+| 128 | pinned-netgo canonical lookup key[keyLen] |
 | next | immutable original hostname[originalLen], case/bytes preserved |
 | next | ordered distinct member indices[memberCount] u16 |
 
-Maximum tail674, Publish body818. Indices относятся к exact retained asset,
+Maximum tail666, Publish body810. Indices относятся к exact retained asset,
 не к producer-supplied address vector. Source/asset hashes только matching:
 без retained source FDs, identity revalidation и issuer observation отказ.
 Canonical key обязан совпасть с pinned lookup original hostname; hostsRow alias
 сравнивается с этим key. Member indices должны быть внутри addresses данной
 строки и сохранять исходный порядок. Table11 mapping4 обязан иметь bit2;
 Application-only bit1 не разрешает bootstrap. Bootstrap endpoint/subject/
-scope/branch/carrier/chain независимо выводятся issuer из closed graph.
+scope/branch/carrier независимо выводятся issuer из closed graph.
+Observation удерживает полный ordered checked chain path и все остальные поля
+BootstrapBinding. Дублировать/усекать path в tail нельзя: прежнего лимита4 здесь
+нет. Issuer сверяет exact binding observation и Publish/query, включая path
+и actual physical frontier; один совпавший scopeIndex не заменяет этой проверки.
 
-SourceObservationId выпускает issuer только после retained-source revalidation;
-producer его не выбирает. remainingNs — переносимый остаток, не чужой monotonic
+В Publish prefix для HostsSnapshot: resolverRow=FFFF, qtype=0, serviceGrantId=0,
+exchangeId=0, question/request/response lengths=0, transportProofId/revision=0.
+QueryId остаётся ненулевым и точно bound observation; original находится в этом
+tail, не в DNS question bytes. Source epoch/digests, subject/endpoint и
+frontier(scopeIndex)/carrier prefix точно совпадают с tail и observation.
+Source authority здесь — snapshot observation, не фиктивный DNS exchange/grant.
+
+SourceObservationId выпускает issuer только после retained-source revalidation
+для exact purpose2 BootstrapBinding/query/options/lookup key и retained row.
+Producer его не выбирает. Один observation допускает один Hosts Publish;
+повтор/replay отвергается. RRset/cache derivative не переиспользует observation
+как fresh permission; parent class/use/freshness проверяются отдельно.
+remainingNs — переносимый остаток, не чужой monotonic
 timestamp. Issuer удерживает собственный absolute deadline и ограничивает его
 min(original observation, source/session expiry, now+remaining-elapsed/RTT).
 Publish/receipt/cache/новый waiter этот deadline не продлевают. Новая observation
@@ -66,13 +80,12 @@ counts и indices до materialization; общие pending64/FD64/8MiB без о
 overflow credit. NumericAuthorize use2 сохраняет exact bootstrap binding;
 use1 и повышение service flow0 до user запрещены.
 
-## Точечная синхронизация перед codec
+## Реализация codec
 
-Root: подтвердить этот tail либо вернуть конкретное поле/offset. После этого
-один canonical codec commit закрепит message kinds, descriptor/ACK/cancel,
+Root подтвердил этот исправленный tail. Один canonical codec commit закрепляет message kinds, descriptor/ACK/cancel,
 все positive/negative goldens и no-downgrade. Go не должен независимо выбирать
-другой HostsSnapshot layout. До подтверждения этого варианта production decoder
-не принимает DNHOST02; существующие records/ABI260 не меняются.
+другой HostsSnapshot layout. До завершения codec/parity/review production
+decoder/admission остаётся закрытым; существующий ABI260 не меняется.
 
 Основание: dns-completion-scope.md разделы «Обязательный bootstrap binding
 (R31)» и «Resource revisions и append-before-use (R31)». Отдельная observation
