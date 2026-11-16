@@ -526,7 +526,13 @@ fn udp_v2_known_ack_cannot_retire_live_flows_or_recover_unknown() {
     let (_, a) = association(&mut i, 1);
     let now = i.ops.now;
     let credit = i.budget.reserve(128).unwrap();
-    i.relays.get_mut(&a).unwrap().flows.insert(2, credit);
+    i.relays.get_mut(&a).unwrap().flows.insert(
+        2,
+        super::UdpFlowRef {
+            _credit: credit,
+            binding: None,
+        },
+    );
     let r = i.retire(a, now).unwrap();
     let Record::Close { close, .. } = r.record else {
         panic!("close")
@@ -548,4 +554,115 @@ fn udp_v2_known_ack_cannot_retire_live_flows_or_recover_unknown() {
     i.cancel_flow(2);
     assert!(request(&mut i, ack, None).is_err());
     assert_eq!(i.relays.len(), 1);
+}
+
+#[test]
+fn association_retirement_calls_real_issuer_durable_cancel_and_keeps_neighbor() {
+    use super::issuer_tests::{authorize, issuer as root_issuer, open};
+    for fail in [false, true] {
+        let mut i = issuer(Mode::Local, 256);
+        let (c, a) = association(&mut i, 1);
+        let now = i.ops.now;
+        let mut root = root_issuer(Mode::System);
+        let (flow, _) = root.open(3, &open(Mode::System, 32001)).unwrap();
+        let (neighbor, _) = root.open(4, &open(Mode::System, 32002)).unwrap();
+        let (gone, _) = root.authorize(5, 0, &authorize(flow)).unwrap();
+        let (alive, _) = root.authorize(6, 0, &authorize(neighbor)).unwrap();
+        let credit = i.budget.reserve(128).unwrap();
+        i.relays.get_mut(&a).unwrap().flows.insert(
+            flow,
+            super::UdpFlowRef {
+                _credit: credit,
+                binding: None,
+            },
+        );
+        root.authority.unknown_release = fail;
+        let before = i.slots.fds.used();
+        let mut calls = 0;
+        let result = i.retire_control(
+            c,
+            &mut |source| {
+                calls += 1;
+                root.cancel_flow(source)
+            },
+            now,
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(result.is_err(), fail);
+        assert!(root.grants.contains_key(&alive));
+        assert!(root.flows.contains_key(&neighbor));
+        assert_eq!(root.grants.contains_key(&gone), fail);
+        assert_eq!(root.flows.contains_key(&flow), fail);
+        assert_eq!(i.slots.fds.used(), before); // Go duplicate ещё не KnownClosed.
+        if fail {
+            assert!(i.unknown);
+            assert!(root.unknown);
+            assert_eq!(i.relays[&a].flows.len(), 1);
+        } else {
+            assert!(i.relays[&a].flows.is_empty());
+            assert!(
+                i.retire_control(c, &mut |_| { panic!("повтор cleanup") }, now)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn supervisor_custody_requires_worker_closed_then_durable_rules() {
+    let mut system = super::ClosureFence::new(Mode::System);
+    assert!(system.local_reaped().is_err());
+    assert!(system.rules_retired().is_err());
+    assert!(!system.known());
+    system.worker_closed().unwrap();
+    assert!(!system.known());
+    system.rules_retired().unwrap();
+    assert!(system.known());
+    let mut local = super::ClosureFence::new(Mode::Local);
+    assert!(local.worker_closed().is_err());
+    assert!(!local.known());
+    local.local_reaped().unwrap();
+    assert!(local.known());
+}
+
+#[test]
+fn denied_payload_waits_for_verified_release_and_does_not_touch_waiting_neighbor() {
+    let mut i = issuer(Mode::Local, 256);
+    let (c, a) = association(&mut i, 1);
+    let (d, b) = association(&mut i, 3);
+    let p = permit(&mut i, c, a, 5);
+    permit(&mut i, d, b, 6);
+    i.relays.get_mut(&b).unwrap().cycle.as_mut().unwrap().stage = UdpStage::Waiting;
+    request(
+        &mut i,
+        Record::Consumed {
+            packet: p,
+            sequence: 9,
+        },
+        None,
+    )
+    .unwrap();
+    let original = i.relays[&a].cycle.as_ref().unwrap().original.unwrap();
+    let now = i.ops.now;
+    i.bind_source(9, 2, p.tuple, original.wire(), now).unwrap();
+    i.denied(0, Some(2));
+    assert!(i.relays[&b].cycle.as_ref().unwrap().stage == UdpStage::Waiting);
+    let before = i.ops.peeks.get();
+    assert!(matches!(
+        request(
+            &mut i,
+            Record::Peek {
+                association: a,
+                operation: 7,
+                control: c
+            },
+            None
+        ),
+        Err(ServiceError::Busy)
+    ));
+    assert_eq!(i.ops.peeks.get(), before);
+    i.ops.retired.set(true);
+    permit(&mut i, c, a, 7);
+    assert_eq!(i.ops.peeks.get(), before + 1);
 }

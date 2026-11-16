@@ -774,3 +774,57 @@ exact-child retired custody. Local session пока не negotiates v2. Эти e
 
 Это bounded initial contract. После исчерпания общей истории новые effects
 закрыты; безопасная watermark compaction и long-lived UDP readiness не доказаны.
+
+### Следующее Rust подключение после d79a26fc: SOURCE/PURE, gates false
+
+`Rendezvous::udp_proof/next/take` теперь сопоставляет provenance3 OPEN с actual
+Consumed metadata в обоих порядках. Original, tuple, ingress и первоначальный
+deadline совпадают побайтно; метаданные берутся из issuer Peeked cycle. На match
+`SystemChannel::receive_proof` удерживает собственные relay/nsfs duplicates и
+private `UdpBinding`, которые через `Peer::socket` попадают в `SourceFlow`.
+`Authority::bind_ingress` сравнивает **actual UDP Known receipt** с retained TCP
+principal; повторный lookup для подмены receipt или продления20ms не выполняется.
+`Capsule::validate_associated_request` проверяет также immutable original.
+
+`SidebandCredits` общий для runtime frames, proof frames, delivered/queued frames
+и outstanding packet cycles: pending≤64, descriptor credits≤64. Это более
+консервативный descriptor cap; association по-прежнему максимум8, шесть FD credits
+перед factory/duplicate. Перед recvmsg резервируются pending1 и ancillary scratch16;
+перед runtime read — pending1. Namespace/relay SourceFlow duplicates и временный
+namespace probe имеют credit до effect. `DeliveryCredit` сохраняется после read
+до фактической обработки/ответа, поэтому drain queue не образует второй budget64.
+Пулы не расширяют aggregate8MiB и invocation tombstone256, не вытесняют записи.
+
+`Channel::maintain` вызывается из `run_issuer` и `drain_before_publication`.
+Actual control EOF запускает `AssociationIssuer::retire_control`, отменяет только
+его SourceFlows через настоящий `Issuer::cancel_flow` и existing durable
+`RouteAuthority::release`; ошибка сохраняет flow/grant/FD refs и Unknown custody.
+Pending/ready proof и queued OPEN соответствующего actual relay endpoint
+отменяются без изменения watermarks. ControlSource не принимается за user source
+в runtime CANCEL. Закрытый control не регистрируется в readiness wait повторно.
+
+Runtime GRANT success отмечается только после actual successful send. Runtime
+Deny/known cancel отмечает terminal packet outcome; buffers остаются занятыми.
+**Без нового wire:** следующий authenticated Peek служит release receipt только
+для source-reviewed exclusive Go producer, который уже передал payload в
+отдельно credited downstream flow после GRANT либо уничтожил его после отказа.
+YNKUCR01 принимается как duplicate-close receipt только под тем же pinned
+producer contract после CloseAndJoin, при пустом flow set и exact close/cookie.
+Произвольный child ACK/Peek сам по себе не является этой authority.
+`KernelUdpOperations::ready` требует одновременно закрытые сейчас
+`udp_v2_consumer_ready` и `require_consumer`, плюс peer revalidation. Нельзя
+открывать эти gates до source/parity проверки фактических Go release/close
+producers и installed-image binding. Это конкретное требование к Go counterpart;
+здесь не заявляется, что его source proof уже получен.
+
+`ProfileRuntime::worker_closed` вызывается supervisor только после existing
+all-empty fence; `rules_retired` — из backend durable retirement confirmation.
+`ClosureFence` требует обе границы, прежде чем Drop освобождает boxed issuer,
+UDP ledger, buffers и descriptors. Ошибка rules confirmation оставляет
+`retired_profile` на месте. Local использует отдельное `confirmed_closed` после
+exact child cleanup; System не может пройти через Local confirmation. Local v2
+negotiation по-прежнему закрыта, нормальный Host factory сохранён.
+
+Wire bytes/ten goldens/ACK hash d79a26fc не изменены. Никакие OS wrappers этого
+подключения не исполнялись. До общей Go compatibility, service proof и production
+acceptance полный P5/long-lived UDP readiness не заявляются.

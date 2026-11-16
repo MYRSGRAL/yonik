@@ -1445,7 +1445,8 @@ impl SystemWorkerSupervisor {
                     if runtime.profile.is_some() && self.retired_profile.is_some() {
                         return Err(WorkerSupervisorError::RecoveryRequired);
                     }
-                    if let Some(profile) = runtime.profile.take() {
+                    if let Some(mut profile) = runtime.profile.take() {
+                        profile.worker_closed().map_err(unavailable)?;
                         self.retired_profile = Some(profile);
                     }
                 }
@@ -1471,9 +1472,10 @@ impl SystemWorkerSupervisor {
         {
             return Err(WorkerSupervisorError::RecoveryRequired);
         }
-        if let Some(mut profile) = self.retired_profile.take() {
-            profile.confirmed_closed();
+        if let Some(profile) = self.retired_profile.as_mut() {
+            profile.rules_retired().map_err(unavailable)?;
         }
+        self.retired_profile.take();
         Ok(())
     }
     async fn unit_job(&self, method: &str, unit: &str) -> Result<()> {
