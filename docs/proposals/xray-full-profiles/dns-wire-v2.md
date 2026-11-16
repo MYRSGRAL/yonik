@@ -53,6 +53,83 @@ Reserve остаётся Unsupported. Reserve/Reserved echo не являетс�
 acquisition layout и его schema/hash закрепляются отдельным canonical commit;
 DATA roundtrip CODEC-1 не подтверждает готовность этого production перехода.
 
+### CODEC-2: выдача полного class3 bundle
+
+Следующий canonical codec должен использовать schemaHash SHA256 ASCII
+`YONIK-DNS-V2-CODEC-2` + NUL, при прежних descriptor/version/ABI. CODEC-1
+не принимает следующие kinds. До реализации CODEC-2/goldens/interop этот раздел
+задаёт контракт реализации, а не разрешение negotiation или network Reserve.
+
+BundleAcquire55 — producer→issuer, обычный Header128/request.reply0/rights0.
+Body fixed72 + canonical class3 base + original name + pathCount*4, максимум2164:
+version u16@0=2,flags u16@2=0,zero u32@4;
+rootServiceGrantId u64@8,queryId u64@16,sourceEpoch u64@24,
+renewBundleId u64@32 (0 только initial),remainingNs u64@40 (1..1s);
+baseLen u16@48 (1..815),pathCount u16@50 (1..256),qtype u16@52 (1/28),
+queryOptions u16@54,udpPayload u16@56,originalLen u16@58 (1..253),
+resolverRow u16@60 (неFFFF),zero u16@62.
+expectedBundleRevision u64@64 (initial0, renewal exact retained revision).
+Base — прежний canonical AUTHORIZE class3, со всеми legacy FFFF/zero rules;
+query/resolver/private source binding должен совпадать с retained root grant.
+Original name имеет прежнюю Reserve grammar и сохраняется без подмены. EDNS
+options/payload имеют прежние Reserve правила. Tail после base/name — ordered
+rows: scope u16@0 (неFFFF),branch u8@2 (0/1),zero u8@3. Первый row — actual
+root handler decision; остальные — решения того же native chooser для каждого
+последующего logical handler, включая промежуточные remote-host hops. Child
+не передаёт subject/chain/frontier/stream/action/carrier и не назначает hop grants.
+
+Issuer проверяет live root class3 ServiceGrant с exact resolver/question/private
+source/revision/epoch и текущей owner freshness. По каждому scope/branch он
+независимо восстанавливает subject, table3 chain, stream, endpoint, action и
+carrier из exact retained manifest; next input равен previous carrier. Native
+branch ограничивается manifest mask. Root должен принадлежать разрешённому
+resolver route; path обязан точно закончиться на terminal leaf без пропусков,
+лишних rows, циклов или remote-host promotion в physical leaf. Если current
+manifest не позволяет установить root/path binding, результат Unsupported.
+
+До Allow issuer выполняет отдельную class3 authorization/route installation
+каждого hop и сохраняет ordered private DNSHopPermit records в новом DNSBundle.
+DNSHopPermit не является user class1 grant или экспортируемым ServiceGrantId:
+его identity — issuer-retained (DNSBundleId, path index), со своим route ticket,
+deadline и cancellation state. ServiceGrantId сам эти permits не заменяет.
+Physical resource или logical stream публикуется только после полного bundle;
+partial failure требует retirement всех уже созданных tickets, Unknown сохраняет
+custody. DATA path, tag, child bool и самостоятельно выданный ID authority не дают.
+
+BundleGranted56 — issuer→producer, exact pending55 reply/rights0, body fixed64:
+version u16@0=2,status u8@2 (Allow1/Deny2/Unknown3),bytes3..7=0;
+DNSBundleId u64@8,rootServiceGrantId u64@16,queryId u64@24,sourceEpoch u64@32,
+remainingNs u64@40,pathCount u16@48,zero6@50,bundleRevision u64@56.
+Allow требует nonzero/nonMAX IDs/revision, count exact request1..256 и
+remainingNs>0, ограниченный minimum всех hop/root/session/owner deadlines.
+Producer вычитает полный request RTT и проверяет live root private receipt;
+System user owner не получает новый срок20ms от ACK. Deny/Unknown bytes3..63=0.
+
+Initial выдаёт новый bundleId/revision1. Renewal требует exact live bundle,
+того же root/query/options/original/source/path; возвращает тот же ID/revision+1
+без wrap, после обновления каждого permit и общего заключительного freshness
+fence. На bundle допускается только один pending renewal; duplicate/reordered
+request или stale expected revision отвергается до effects. Expired/canceled
+bundle не возрождается. BundleGranted не выдаёт RRset
+или WaiterReceipt. Reserve35 network roles ссылаются на этот exact bundle и
+root grant; чужой query/path/epoch/root отвергается. Каждому waiter нужен свой
+bundle, даже при общем cached ProducerRRset. Hosts bundle0 не меняется.
+
+Go хранит opaque live bundle вместе с actual ordered native decisions в private
+DNS context и использует DNS-specific guards для каждого handshake/send/reuse;
+legacy class0/1 ProfilePrepareChain не превращается в class3 authority. Каждый
+guard проверяет matching path index и весь live bundle/root; explicit logical
+consumer не заменяется соседом shared pool. Resource Bind/Append и LogicalBind
+сверяют этот же bundle/path. Remote DNS proxy peer не становится resolver peer.
+
+Cancel47 получает отдельный target8 DNSBundle; target7 остаётся Reservation.
+Bundle cancel/revoke отзывает все его hop permits и dependent exchanges/resources/
+waiter authority с durable retirement до KnownClosed; соседние bundles и общий
+ProducerRRset не отзываются. Root/source/epoch revoke каскадно отзывает dependents.
+Acquire/renewal и все permits заранее резервируют общие pending/history/memory/
+route credits; pathCount256 не увеличивает существующие aggregate caps. Каждый
+новый hop учитывается до effects, исчерпание даёт отказ до installation.
+
 ## Routine bounded records
 
 Common request prefix8: version u16=2@0, flags/reserved bytes2..7=0, кроме
