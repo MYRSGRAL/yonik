@@ -31,6 +31,28 @@ Codec negotiation token — только DATA matching; issuer обязан не
 Missing token, wrong version/schema/mapping/caps/launch/hash → deny, без V1
 fallback. Legacy Frame decoder отвергает весь DNS kind set и descriptor magic.
 
+### Порядок setup и граница CODEC-1
+
+После proof bootstrap выполняется прежний HELLO → ADMIT → ADMIT_ACK. Producer
+после отправки ADMIT_ACK, а issuer после его точной проверки переходят в отдельную
+setup-стадию на существующем runtime endpoint: producer отправляет raw Descriptor272,
+issuer отвечает raw ACK40. Оба сообщения без Header128 и SCM_RIGHTS/credentials.
+Этот обмен завершает единственный setup reader/owner до передачи endpoint monitor;
+до успешного ACK запрещены DNS features и другие runtime sends. Proof bootstrap
+до HELLO, frozen bootstrap и FD counts не меняются. Все стадии используют исходный
+абсолютный admission deadline без продления. Missing/bad/late ACK, лишние ancillary,
+cancel/revoke или ошибка передачи запрещают запуск monitor и требуют существующий
+cleanup с сохранением Unknown custody; fallback отсутствует.
+
+CODEC-1 проверяет форму DNSBundleId, но ещё не задаёт его issuance. Legacy
+AUTHORIZE18/GRANT19 class3 выдаёт ServiceGrantId, а не полный DNS chain bundle;
+приравнивать эти namespaces либо выпускать bundle на child запрещено. До отдельного
+canonical acquisition/ACK, связывающего issuer-issued bundle с exact query/private
+source, root service grant и всеми выбранными class3 hops, production network
+Reserve остаётся Unsupported. Reserve/Reserved echo не является issuance. Новый
+acquisition layout и его schema/hash закрепляются отдельным canonical commit;
+DATA roundtrip CODEC-1 не подтверждает готовность этого production перехода.
+
 ## Routine bounded records
 
 Common request prefix8: version u16=2@0, flags/reserved bytes2..7=0, кроме
