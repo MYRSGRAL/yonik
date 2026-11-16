@@ -153,6 +153,30 @@ impl SystemSession {
         );
         Ok(())
     }
+    pub async fn prepare_full_profile(
+        &mut self,
+        revision: ProfileRevision,
+        request: &yonik_linux::helper::profile_intent::FullProfileRequest,
+        deadline: Instant,
+        cancel: Cancellation,
+    ) -> Result<(), ClientError> {
+        self.prepared = None;
+        self.fence(revision)?;
+        cancel.check().map_err(|_| ClientError::Cancelled)?;
+        yonik_linux::full_profile_preflight(yonik_linux::FullProfileMode::System)
+            .map_err(|_| ClientError::Unsupported)?;
+        let prepared = self
+            .client
+            .prepare_full_profile(request, deadline, cancel.clone())
+            .await?;
+        cancel.check().map_err(|_| ClientError::Cancelled)?;
+        self.fence(revision)?;
+        self.prepared = Some(
+            PreparedOutput::bind(prepared, Engine::Xray, &self.log, revision.generation)
+                .map_err(|_| ClientError::Unavailable)?,
+        );
+        Ok(())
+    }
     pub async fn apply(
         &mut self,
         revision: ProfileRevision,
