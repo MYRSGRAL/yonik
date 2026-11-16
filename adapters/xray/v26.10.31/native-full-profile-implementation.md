@@ -58,8 +58,9 @@ bounded stdin, затем ждёт HELLO; Go читает stdin перед HELLO
 Runtime header YNKCAP01/version1 —128 bytes; frame<=65536. Sequence начинается
 с1, строго +1; gap/replay/wrap/binding mismatch отзывает канал. Go поддерживает
 HELLO1, ADMIT2, ADMIT_ACK3, OPEN_INGRESS16, INGRESS_REPLY17, AUTHORIZE18,
-GRANT19, RENEW21, CANCEL32, REVOKE33 и CLOSE_ACK34. PROBE20/DNS class3 пока
-не создают service authority; неизвестные сообщения fail closed.
+GRANT19, PROBE20, RENEW21, CANCEL32, REVOKE33 и CLOSE_ACK34. Служебная authority
+возникает только после authenticated GRANT exact класса; admission её не выдаёт.
+Неизвестные сообщения fail closed.
 Initial deadline1s; session lease<=60s отсчитывается от HELLO send, renewal —
 от RENEW send. ACK не продлевает deadline. Один reader/writer и один renewal;
 неверный/опоздавший ACK не обновляет состояние. Manifest при renewal неизменен;
@@ -220,8 +221,8 @@ Cancel одного HTTP request не помечает shared client как tran
 TCP/raw UDP/gRPC/XHTTP logical connections повторяют checks на read/write.
 
 Оставшиеся закрытые пути явно возвращают `ErrProfileUnsupported`: domain
-physical dial до pinned snapshot query/peer proof, pooled source с action=Chain
-до per-logical grants каждого hop при reuse. Обычный redirect продолжает проверять
+physical dial до pinned snapshot query/peer proof. Numeric pooled Chain
+подключён последующим milestone ниже. Обычный redirect продолжает проверять
 carrier→next input; конечный pool разделяется по накопленному chain path.
 Нельзя выдать source FlowGrant за полномочия всех последующих scopes. Snapshot
 queries, DNS/Probe grants и resolver provenance hooks — следующий milestone;
@@ -300,6 +301,245 @@ process-error stop без self-wait, picker lock и retained session error.
 Broker reservation и H1 correction сохранены byte-exact относительно6918221.
 Это исправление оставшегося mux finding, не завершение transport/P4.
 
+## DNS/Probe consumer и pinned snapshot queries
+
+SOURCE/COMPILE/PURE результат; issuer service paths ещё закрыты, gate=false.
+Подключены `features/dns/localdns/client.go::LookupIPWithContext`,
+`app/dns/nameserver_local.go::QueryIP` и `app/observatory/observer.go::probe`.
+Local resolver выбирает только retained decoded YNKDNS01. После authenticated
+owned launch process latch запрещает live fallback callers без private context;
+latch не содержит runtime и не создаёт полномочий. Legacy path остаётся прежним.
+Owned local nameserver не пишет query/IP в свой DNS log.
+
+Snapshot view сохраняет files/DNS order1..4, ordered search/ndots, first-three
+peers включая duplicates/defaultNS из exporter, attempts/timeout, rotate,
+single-request, use-vc, trust-ad и EDNS0. Files aliases индексируются O(n log n),
+без live hosts/NSS/hostname/env чтений. Параллельные A/AAAA имеют разные grants
+и sockets; TCP fallback получает новый grant для TCP row того же peer.
+DNS ID/question/class и actual numeric RemoteAddr/protocol проверяются до
+публикации. CNAME/RRset связан с owner name, цикл/неоднозначность отвергаются.
+Response≤65535, records≤256, CNAME path≤16; overflow отвергается до decoded rows,
+без truncation. Нет resolver cache/singleflight, authority callers не объединяется.
+RRset остаётся data: он не создаёт physical endpoint exception.
+
+Admission preflight отдельно учитывает snapshot index128KiB и возможность хотя
+бы одного query. Private query scope резервирует768KiB до allocation, делит
+pending cap≤64 и общий8MiB; после cancel credit удерживается до выхода lookup.
+Actual DNS factory резервирует custody до dial в existing object ledger;
+service и user sockets делят physical cap. Wrong peer/error/revoke после factory
+закрывают ресурс; Close error остаётся Unknown и сохраняет объект.
+
+### Exact service wire counterpart для Rust
+
+Header, mappingVersion3/tableCount11 и ABI260 не меняются. Все поля big endian.
+`full-profile-fixtures/service-grants-v3.json` и embedded
+`common/yonikbroker/profile-service-vectors.json` содержат независимые Python
+vectors; это DATA без authority.
+
+- `PROBE=20`, body8: purpose u16@0,index u16@2,subject u16@4,resolver u16@6.
+  Purpose1: table8 index, exact expanded subject, resolver=ffff; GRANT class2.
+  Purpose2: table2 physical hostname endpoint, exact owning subject, table5
+  system resolver row; GRANT class3. Caller hostname не добавляется в body.
+  Search candidates выводятся consumer только из endpoint+verified snapshot;
+  произвольного service DNS hostname API нет.
+- `AUTHORIZE=18` class3 сохраняет existing v3 prefix20: sourceFlowId@0,class3@8,
+  reserved0@9, subject/chain/stream/scope=ffff@10/12/14/16, branch0@18,
+  reserved0@19. Далее immutable original Destination, exact numeric resolver
+  Destination, resolverIndex u16, queryName(u16+canonical ASCII≤253), затем
+  OwnerReceiptKind=None/reserved7/id0. Source flow — live private receipt.
+- `GRANT=19` body56 прежний; class/sourceFlowId/revision сверяются с pending.
+  Probe/bootstrap sourceFlowId=0, required=0, ownerFreshNs=0,
+  OwnerReceiptKind=None/id0, revision=manifest.policy. Local USER DNS тоже
+  required0/fresh0/None. Это не снимает manifest/mandatory/active-ACL constraints.
+  System USER DNS AUTHORIZE class3 требует live private original receipt,
+  совпадение pending receipt/flow/revision и required=1; freshKnown 1..20ms
+  от исходного send time минус RTT. FrozenSent=1 и SidebandOperation=2 —
+  разные typed owner namespaces, id ненулевой; reserved7=0. Unknown/expired/
+  чужой owner не публикуется. Повтор того же kind/id не продлевает observation;
+  перед DNS I/O freshness проверяется, при остатке ≤5ms нужен refresh.
+  Session credential и DNSGrant не дают user transport authority.
+  Exact encoder Rust abf5c2435dd71b272c8f064b155267c52fde9809, полный
+  System YNKCAP01 GRANT с owner tail включён в service-grants-v3.json;
+  producer не должен обнулять mandatory attribution ради decoder.
+- ObjectId=0 при initial request; refresh использует тот же kind/body с
+  ObjectId=live grantId. Это private consumer convention для counterpart:
+  Rust должен принять refresh PROBE20 exact purpose/index/subject/resolver,
+  либо отказать. Закрытый/expired grant не возрождается. Lease≤1000ms от
+  monotonic send time минус RTT, bounded session deadline; renewal session
+  не продлевает старый grant. CANCEL/grant IDs, tombstones и ledger caps общие
+  с user grants; отдельного бесконечного service ledger нет.
+
+Probe URL/tag только сверяются с manifest до PROBE. Actual handler выбирает
+branch, затем private grant один раз связывается с этим scope/stream/chain.
+User original receipt API не принимает ProbeGrant, а transport API отвергает
+DNSGrant. Observatory request/dial сохраняют callback cancellation и min deadline,
+не запускают late dial goroutine через task.Run, не следуют redirects. Cancel
+закрывает только logical probe, shared physical session остаётся session-owned.
+
+### Незакрытая caller интеграция: exact DNS result
+
+`ProfileDNSQueryContext(ctx,name) (context.Context,func(),error)` резервирует
+private per-query state, но не разрешает I/O. `ProfileLookupSnapshot` требует
+authenticated DNS grants. `ProfileCheckDNSAnswer(ctx,name,ips) error` проверяет
+именно этот query context, snapshot, original receipt, live service grants и
+принадлежность каждого IP проверенному RRset; разрешает только narrowing
+provider IP filters. Однократный result нельзя перенести на соседний query,
+caller или использовать после cancel. Detached/Background не получает authority.
+Без внешнего query scope localdns выполняет такую проверку внутри своего caller.
+
+Новый source gap: `app/dns/dns.go::LookupIPWithContext` (текущие261–273) передаёт
+в guard только ctx, без query/result, и не несёт per-query token через
+`lookupIP`. Сам файл отсутствует в явном upstream ownership перечне задания.
+Его не меняли. Старый `CheckAfterDNS(ctx)` остаётся deny для full-profile,
+а не использует общий completion bit на ingress. Минимальный root diff:
+
+```go
+query, release, err := hooks.ProfileDNSQueryContext(ctx, domain)
+if err != nil { return nil, 0, err }
+defer release()
+ips, ttl, err := s.lookupIP(query, domain, option)
+if err == nil {
+    if guardErr := hooks.ProfileCheckDNSAnswer(query, domain, ips); guardErr != nil {
+        return nil, 0, guardErr
+    }
+}
+```
+
+Нужны также отдельные provider-cache waiter/service hooks: snapshot не заменяет
+provider DNS. `app/dns/nameserver.go::Client.QueryIP`195–230 содержит existing
+query/IP debug logs при provider expected/unexpected filters; owned suppression
+там требует этого дополнительного caller scope. Ни cache grant, ни эти logs
+не объявлены закрытыми текущим local snapshot milestone.
+Default localdns выбирает только table5 subject=None. Internal DNS-subject rows
+не заимствуются по совпадению peer: для них нужен typed caller binding.
+
+Independent resolver-peer capture/ownership proof остаётся обязанностью issuer
+до GRANT; numeric RemoteAddr проверка consumer его не подменяет. Rustb04c2c0
+отказывает service paths, следовательно production I/O не получает allow.
+Physical domain dial остаётся Unsupported: нет authenticated RRset→numeric
+endpoint proof handoff. Snapshot выдаёт RRset без live source-address probes.
+Отдельный wire gap: purpose2 индексирует table2, а hostname probe URL находится
+в table8. DNS для direct probe URL, не являющегося physical endpoint, этим
+индексом не кодируется. Consumer не переиспользует probe index как endpoint
+index и не принимает user FlowGrant вместо service parent; этот путь closed
+до отдельного согласованного typed reference/purpose для counterpart.
+Полная parity RFC6724 preference из Go net/addrselect.go14–58 (srcAddrs делает
+DialUDP) требует отдельного trusted route/source projection, отсутствующего
+в YNKDNS01. Live netgo sorting/DNS fallback ради неё не выполняется.
+Native provider DNS/proxy paths ещё не завершены; numeric pooled chain описан ниже.
+
+Следующая System integration по exact Rusta049da5fddbde79f43e8f621c7a77c65bc63535c:
+fixture `tests/fixtures/xray-profile-channel-v3/system-proof-extension-v1.json`
+и соответствующий system-completion-api.md, без выдумывания нового layout.
+Один pre-HELLO YNKPF001/128bytes/rights1
+с отдельным proof FD и ACK YNKPFA01+SHA256 record. Затем runtime rights-free;
+YNKSPF01/192bytes actual acceptedTCP FD связывается с pending OPEN/request seq,
+proofId и tuple. Go consumer этой extension описан ниже. UDP association
+по-прежнему Unsupported без independent association proof; TCP proof не UDP proof.
+
+## Numeric pooled chain: private per-logical bundle
+
+`Handler.Dispatch` после `ProfileAuthorizeHandler` вызывает
+`ProfilePrepareChain(ctx, choose func(tag string, target Destination)(mux bool,error))`
+до `ProfileGuardLink`, proxy Process и native mux Dispatch. Production choose
+получает следующий exact native Handler из existing outbound.Manager и вызывает
+тот же `profileMuxDecision`, который использует actual Dispatch. Foreign handler,
+reject или branch вне table3 nextBranchMask дают denial; mask не выбирает mux.
+
+Wire не расширяется: AUTHORIZE18/class1/sourceFlowId@0, subject@10, chain@12,
+stream@14, scope@16, branch@18, затем immutable original и effective endpoint.
+Root и каждый выбранный hop получают отдельный GRANT19 того же private source.
+Rust abf5c243 `native_profile_channel.rs:425–608` уже проверяет exact root и
+frontier `(sourceFlow, nextScope, branch, sourceEndpointIndex)`; предыдущий grant
+удерживается. Go не подставляет grantId в поле chain (это table3 index).
+
+Preflight идёт по actual carrier→next input, не меняя original network/tuple.
+Bundle≤256 связывает private parent/next grants; лимиты операций64/grants4096,
+aggregate metadata и fixed5MiB credit прежние. Дополнительные links учитываются
+в fixed metadata sizing; standalone ledger entry ограничен272 bytes.
+Pool key дополнен ordered selected hop scope/stream/chain/branch/effective target.
+Ни один hop grant и ни один sourceFlowId не входят в shared pool как authority.
+
+Reuse/send проверяет весь bundle именно текущего explicit consumer; соседний
+live grant не заменяет его expired/cancelled hop. Каждый System hop проверяет
+собственную owner freshness. После всех renewal RPC последний atomic fence
+проверяет весь путь снова, без продления20ms ожиданиями следующих hops.
+Only private session factory context выбирает live bundle для physical lifetime.
+Redirect переносит его выбранный hop в existing nextHandler.Dispatch, где actual
+mux decision повторно сверяется; новый grant от имени session не создаётся.
+Physical chain link проверяет live pool, user logical link — свой bundle.
+Отмена одного user не закрывает shared link соседнего consumer; revoke fences все.
+
+Любой hostname physical leaf остаётся Unsupported до authenticated RRset→numeric
+endpoint proof. Child DNS answer и snapshot RRset не повышаются до такого proof.
+DNS outer pending files, provider cache/resolver peer proof, UDP System proof и
+runtime readiness этим batch не объявляются завершёнными. Gates остаются false.
+
+## System acceptedTCP proof consumer
+
+Counterpart — exact Rusta049da5fddbde79f43e8f621c7a77c65bc63535c и Root614dfa4
+(cancel correction без wire change). Independent fixture скопирована byte-exact
+в `full-profile-fixtures/system-proof-extension-v1.json` и embedded
+`common/yonikbroker/profile-system-proof-v1.json`; DATA не являются authority.
+
+`openProfileRuntime` после sealed launch/config/peer validation, до HELLO и
+features, в System mode принимает ровно один YNKPF001128/rights1. Credentials,
+pidfd/liveness, nonce/digest/session/invocation/generation/epoch обязательны.
+Proof endpoint проверяется как отдельный connected AF_UNIX/SOCK_SEQPACKET с
+expected SO_PEERCRED, CLOEXEC и SO_PASSCRED; duplicate runtime socket отвергается.
+ACK ровно40 bytes YNKPFA01+SHA256 record, rights0. Initial deadline сохраняется
+в `admitProfileUntil`: bootstrap/HELLO/ADMIT не начинают новый timeout. Local
+не потребляет bootstrap и не получает System proof. После bootstrap runtime
+receiver остаётся rights-free. Cmsg parser идёт по одному header и сохраняет
+rights prefix для cleanup при повреждённом suffix; лишние/unknown/truncated
+ancillary отвергаются. Proof channel не имеет входящих штатных сообщений:
+любые bytes/rights/EOF/HUP вызывают fence/revoke и cleanup.
+
+`app/proxyman/inbound/worker.go::tcpWorker.callback` вызывает `ProfileAccept`
+до stats wrapper. Broker получает actual connection через `syscall.Conn` /
+`RawConn.Control`, выполняет F_DUPFD_CLOEXEC и проверяет duplicate TCP tuple через
+getsockname/getpeername/SO_PROTOCOL/SO_TYPE. Сравнение с Go tuple повторяется
+при proof send. Нет env-number, TCPConn.File, unwrap/stat API расширения,
+pidfd_getfd, proc/exe fallback или child-supplied namespace FD.
+Duplicate — inspect/SCM-only private interface без Read/Write/raw getter.
+F_DUPFD сохраняет kernel access flags socket; O_RDONLY socket capability здесь
+не заявляется. Никаких payload operations через duplicate нет.
+
+Accepted slot и256 bytes FD metadata credit резервируются до duplicate. Actual
+kernel object удерживается до закрытия connection context, а не одного HTTP
+request. Каждый OPEN получает новый proofId и exact request sequence. После
+runtime OPEN existing single actor отправляет YNKSPF01 body192 и ровно1 FD:
+binding80=digest32/session16/invocation16/generation8/epoch8@16, nonce32@96,
+request8@128,proof8@136,ingress2@144,provenance2@146,reserved0@147,
+initiator tuple40@148,reserved4@188. Local=initiator, remote=ingress.
+Proof не создаёт Known owner и не заменяет FlowGrant.
+
+Pending requests≤64 и tombstone reservation прежние; System preflight добавляет
+128KiB proof metadata credit. EAGAIN оставляет pending operation с исходными
+proofId/sequence/deadline. Более поздний proof не обгоняет ранний ID; cancel
+разрешает пропустить неотправленный ID, но никогда не отправить его позднее.
+Zero/MAX/wrap/replay отвергаются. Разные каналы могут быть прочитаны Rust в любом
+порядке: sender не требует нового acknowledgement или polling owner actor.
+INGRESS_REPLY Allow не публикуется до proof send и после caller cancellation.
+Proof health входит в System publication/live fences. FD cleanup сериализован
+с отправкой, не допускает close/reuse numeric FD race; Close error sticky,
+handle/credit остаются в custody и session отзывается. Повторный Close не
+превращает Unknown в KnownClosed.
+
+Pure controls используют fake SCM bytes, RawConn.Control и FD operations, без
+actual sockets/ioctl/netpipe/proc/core execution. Они проверяют wire/hash parity,
+bootstrap mismatch/credential/count/deadline, Local separation, malformed cmsg
+cleanup, FIFO/EAGAIN/cancel, original deadline, EOF publication fence, partial
+export, same-object retention, Unknown и wrap preflight. Existing control
+fixtures явно моделируют уже проверенный System proof; это не production bypass.
+System UDP association возвращает Unsupported; tuple vectors остаются data,
+UDP positive control использует отдельный Local mode без OS attribution.
+
+Gate остаётся false. DNS outer files pending permission не изменены;
+provider-cache/internal DNS и resolver-peer/RRset handoff не завершены.
+Numeric pooled chain consumer подключён выше; Actual System end-to-end/runtime
+acceptance не выполнялся.
+
 ## Детерминированный R8 contract: tuple orientation
 
 Go `profile_flow_hooks_linux.go::ProfileAccept` кодирует original initiator в
@@ -337,7 +577,8 @@ direct policy и original-flow receipts принадлежат назначен�
 Независимые Rust9b1bba9 fixtures local-minimal/system-chain-default-reject/
 system-chain-probe/resolver-snapshot-v1 сохранены byte-exact под own fixtures и
 в patch. Capsule DATA tests не являются source/asset ACK proof для synthetic
-System snapshot ref. Следующие части P4: authenticated issuer/durable direct
-policy, per-logical pooled chain hop grants, UDP issuer association binding,
-probe/DNS service grants и pinned snapshot query engine.
+System snapshot ref. Source consumers numeric pooled chain, service grants и
+snapshot query engine описаны выше. Остаток P4: интеграция issuer/durable direct
+policy, DNS outer/provider cache, authenticated resolver-peer/RRset endpoint
+handoff и отдельно утверждённое UDP issuer association binding.
 Gate остаётся false; full runtime acceptance не выполнялся.

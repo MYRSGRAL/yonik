@@ -1,3 +1,3910 @@
+diff --git a/common/yonikbroker/profile-system-proof-v1.json b/common/yonikbroker/profile-system-proof-v1.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-system-proof-v1.json
+@@ -0,0 +1,9 @@
++{
++  "provenance": "independent Python struct.pack big-endian; synthetic DATA only",
++  "launch_hex": "594e4b4558543031000100c0000100000606060606060606060606060606060606060606060606060606060606060606030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000500000007000000080000000000000009000000000000000a0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0000000000000000",
++  "exec_hex": "594e4b45584330310001010000020000060606060606060606060606060606060606060606060606060606060606060603030303030303030303030303030303030303030303030303030303030303030101010101010101010101010101010102020202020202020202020202020202000000000000000400000000000000050000000800000000000000000000000a0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c03030303030303030303030303030303030303030303030303030303030303030b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b00000000000010000000004000000000",
++  "exec_ack_hex": "594e4b45584130312fba0b79dd5b7133d213551c517f5f5eef816918aea91b3b85c8884c370c29de",
++  "bootstrap_hex": "594e4b5046303031000100800001000006060606060606060606060606060606060606060606060606060606060606060303030303030303030303030303030303030303030303030303030303030303010101010101010101010101010101010202020202020202020202020202020200000000000000040000000000000005",
++  "bootstrap_ack_hex": "594e4b5046413031a3df463f8028114a78f9a8f1e7fee1e5ad43b99d9ab199e38583388f9e42ccca",
++  "socket_hex": "594e4b5350463031000100c000010000030303030303030303030303030303030303030303030303030303030303030301010101010101010101010101010101020202020202020202020202020202020000000000000004000000000000000506060606060606060606060606060606060606060606060606060606060606060000000000000003000000000000000100000200060400007d010438c00002010000000000000000000000007f00000100000000000000000000000000000000"
++}
+diff --git a/common/yonikbroker/profile_proof_os_linux.go b/common/yonikbroker/profile_proof_os_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_proof_os_linux.go
+@@ -0,0 +1,332 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"net/netip"
++	"os"
++	"syscall"
++	"time"
++
++	xnet "github.com/xtls/xray-core/common/net"
++	"golang.org/x/sys/unix"
++)
++
++// Разбор по одному cmsg сохраняет уже принятые rights при повреждённом suffix.
++func profileParseAncillary(body, oob []byte, flags int, adopt func(int) profileProofFD) profileProofPacket {
++	p := profileProofPacket{body: body, invalid: flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0}
++	for len(oob) > 0 {
++		h, data, rest, e := unix.ParseOneSocketControlMessage(oob)
++		if e != nil {
++			p.invalid = true
++			break
++		}
++		oob = rest
++		m := unix.SocketControlMessage{Header: h, Data: data}
++		if h.Level != unix.SOL_SOCKET {
++			p.invalid = true
++			continue
++		}
++		switch h.Type {
++		case unix.SCM_RIGHTS:
++			p.rightsMessages++
++			if len(m.Data)%4 != 0 {
++				p.invalid = true
++				m.Data = m.Data[:len(m.Data)&^3]
++			}
++			fds, e := unix.ParseUnixRights(&m)
++			if e != nil {
++				p.invalid = true
++				continue
++			}
++			if len(fds) == 0 || p.rightsMessages != 1 {
++				p.invalid = true
++			}
++			for _, fd := range fds {
++				if p.count >= len(p.rights) {
++					p.invalid = true
++					adopt(fd).Close()
++					continue
++				}
++				p.rights[p.count] = adopt(fd)
++				p.count++
++			}
++		case unix.SCM_CREDENTIALS:
++			p.credentials++
++			cred, e := unix.ParseUnixCredentials(&m)
++			if e != nil {
++				p.invalid = true
++			} else {
++				p.pid, p.uid = cred.Pid, cred.Uid
++			}
++		default:
++			p.invalid = true
++		}
++	}
++	return p
++}
++func profileAdoptFD(fd int) profileProofFD {
++	return &profileFileFD{file: os.NewFile(uintptr(fd), "profile-proof-owned")}
++}
++func (p *ProfileRuntime) proofPeerAlive() bool { return p.peerAlive() == nil }
++func (p *ProfileRuntime) receiveBootstrap(deadline time.Time) (profileProofPacket, error) {
++	for time.Now().Before(deadline) {
++		if p.peerAlive() != nil {
++			return profileProofPacket{}, errProfile
++		}
++		fds := []unix.PollFd{{Fd: int32(p.channel.Fd()), Events: unix.POLLIN}, {Fd: int32(p.peer.Fd()), Events: unix.POLLIN}}
++		wait := time.Until(deadline)
++		if wait > 20*time.Millisecond {
++			wait = 20 * time.Millisecond
++		}
++		n, e := unix.Poll(fds, int((wait+time.Millisecond-1)/time.Millisecond))
++		if e == unix.EINTR {
++			continue
++		}
++		if e != nil || fds[1].Revents != 0 {
++			return profileProofPacket{}, errProfile
++		}
++		if n == 0 {
++			continue
++		}
++		if fds[0].Revents&unix.POLLIN == 0 {
++			return profileProofPacket{}, errProfile
++		}
++		body := make([]byte, 128)
++		oob := make([]byte, unix.CmsgSpace(16*4)+unix.CmsgSpace(unix.SizeofUcred))
++		n, control, flags, _, e := unix.Recvmsg(int(p.channel.Fd()), body, oob, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
++		if n < 0 {
++			n = 0
++		}
++		if n > len(body) {
++			n = len(body)
++			flags |= unix.MSG_TRUNC
++		}
++		packet := profileParseAncillary(body[:n], oob[:control], flags, profileAdoptFD)
++		if e != nil || n == 0 {
++			packet.invalid = true
++			return packet, errProfile
++		}
++		return packet, nil
++	}
++	return profileProofPacket{}, errProfileTimeout
++}
++func (p *ProfileRuntime) validateProofFD(fd profileProofFD) error {
++	return fd.withFD(func(n int) error {
++		kind, e := unix.GetsockoptInt(n, unix.SOL_SOCKET, unix.SO_TYPE)
++		if e != nil || kind != unix.SOCK_SEQPACKET {
++			return errProfile
++		}
++		address, e := unix.Getsockname(n)
++		if e != nil {
++			return errProfile
++		}
++		if _, ok := address.(*unix.SockaddrUnix); !ok {
++			return errProfile
++		}
++		cred, e := unix.GetsockoptUcred(n, unix.SOL_SOCKET, unix.SO_PEERCRED)
++		if e != nil || !profileSenderValid(p.admission.launch, cred.Pid, cred.Uid, uint32(os.Geteuid())) {
++			return errProfile
++		}
++		var a, b unix.Stat_t
++		if unix.Fstat(n, &a) != nil || unix.Fstat(int(p.channel.Fd()), &b) != nil || a.Dev == b.Dev && a.Ino == b.Ino {
++			return errProfile
++		}
++		flags, e := unix.FcntlInt(uintptr(n), unix.F_GETFD, 0)
++		if e != nil || flags&unix.FD_CLOEXEC == 0 {
++			return errProfile
++		}
++		return unix.SetsockoptInt(n, unix.SOL_SOCKET, unix.SO_PASSCRED, 1)
++	})
++}
++func (p *ProfileRuntime) sendBootstrapAck(body []byte) error {
++	if len(body) != 40 || p.peerAlive() != nil {
++		return errProfile
++	}
++	n, e := unix.SendmsgN(int(p.channel.Fd()), body, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++	if e != nil || n != len(body) {
++		return errProfile
++	}
++	return nil
++}
++func (p *ProfileRuntime) proofHealth() error {
++	if p.proofs == nil || p.proofs.fd == nil {
++		return errProfile
++	}
++	return p.proofs.fd.withFD(func(n int) error {
++		fds := []unix.PollFd{{Fd: int32(n), Events: unix.POLLIN}}
++		count, e := unix.Poll(fds, 0)
++		if e != nil || count != 0 {
++			return errProfile
++		}
++		return nil
++	})
++}
++func (p *ProfileRuntime) sendSocketProof(body []byte, socket profileProofFD) error {
++	return p.proofs.fd.withFD(func(channel int) error {
++		return socket.withFD(func(fd int) error {
++			if p.peerAlive() != nil {
++				return errProfile
++			}
++			actual, e := profileSocketTuple(fd)
++			if e != nil || len(body) != 192 || string(actual[:]) != string(body[148:188]) {
++				return errProfile
++			}
++			n, e := unix.SendmsgN(channel, body, unix.UnixRights(fd), nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++			if e == unix.EAGAIN || e == unix.EWOULDBLOCK {
++				return errProfileProofBusy
++			}
++			if e != nil || n != len(body) {
++				return errProfile
++			}
++			return nil
++		})
++	})
++}
++func profileSockaddrValue(a unix.Sockaddr) (profileDestinationValue, error) {
++	v := profileDestinationValue{network: 6}
++	switch a := a.(type) {
++	case *unix.SockaddrInet4:
++		v.family = 4
++		v.port = uint16(a.Port)
++		v.address = netip.AddrFrom4(a.Addr).String()
++	case *unix.SockaddrInet6:
++		if a.ZoneId != 0 {
++			return v, errProfile
++		}
++		ip := netip.AddrFrom16(a.Addr).Unmap()
++		v.family = 6
++		if ip.Is4() {
++			v.family = 4
++		}
++		v.port = uint16(a.Port)
++		v.address = ip.String()
++	default:
++		return v, errProfile
++	}
++	if !v.valid() {
++		return v, errProfile
++	}
++	return v, nil
++}
++func profileSocketTuple(fd int) ([40]byte, error) {
++	var empty [40]byte
++	kind, e := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
++	if e != nil || kind != unix.SOCK_STREAM {
++		return empty, errProfile
++	}
++	protocol, e := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_PROTOCOL)
++	if e != nil || protocol != unix.IPPROTO_TCP {
++		return empty, errProfile
++	}
++	remote, e := unix.Getpeername(fd)
++	if e != nil {
++		return empty, errProfile
++	}
++	local, e := unix.Getsockname(fd)
++	if e != nil {
++		return empty, errProfile
++	}
++	r, e := profileSockaddrValue(remote)
++	if e != nil {
++		return empty, e
++	}
++	l, e := profileSockaddrValue(local)
++	if e != nil {
++		return empty, e
++	}
++	return profileTuple(xnet.TCPDestination(xnet.ParseAddress(r.address), xnet.Port(r.port)), xnet.TCPDestination(xnet.ParseAddress(l.address), xnet.Port(l.port)))
++}
++func profileDuplicateAccepted(conn xnet.Conn, tuple [40]byte) (profileProofFD, error) {
++	return profileDuplicateAcceptedWith(conn, tuple, func(fd uintptr) (profileProofFD, error) {
++		n, e := unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 3)
++		if e != nil {
++			return nil, e
++		}
++		return profileAdoptFD(n), nil
++	}, func(fd profileProofFD) (actual [40]byte, err error) {
++		err = fd.withFD(func(n int) error { var e error; actual, e = profileSocketTuple(n); return e })
++		return actual, err
++	})
++}
++func profileDuplicateAcceptedWith(conn xnet.Conn, tuple [40]byte, duplicate func(uintptr) (profileProofFD, error), inspect func(profileProofFD) ([40]byte, error)) (profileProofFD, error) {
++	source, ok := conn.(syscall.Conn)
++	if !ok {
++		return nil, ErrProfileUnsupported
++	}
++	raw, e := source.SyscallConn()
++	if e != nil {
++		return nil, e
++	}
++	var owned profileProofFD
++	var result error
++	e = raw.Control(func(fd uintptr) {
++		owned, result = duplicate(fd)
++		if result != nil {
++			return
++		}
++		if owned == nil {
++			result = errProfile
++			return
++		}
++		actual, e := inspect(owned)
++		if e != nil || actual != tuple {
++			result = errProfile
++		}
++	})
++	if e != nil {
++		result = e
++	}
++	if result != nil {
++		return owned, result
++	}
++	if owned == nil {
++		return nil, errProfile
++	}
++	return owned, nil
++}
++func (p *ProfileRuntime) proofPollFD() (int, error) {
++	if p.proofs == nil || p.proofs.fd == nil {
++		return -1, errProfile
++	}
++	fd := -1
++	e := p.proofs.fd.withFD(func(n int) error { fd = n; return nil })
++	return fd, e
++}
++func (p *ProfileRuntime) rejectRights(packet profileProofPacket) error {
++	var result error
++	for i, fd := range packet.rights {
++		if fd != nil {
++			if e := fd.Close(); e != nil {
++				p.proofRejected[i] = fd
++				result = e
++			}
++		}
++	}
++	if result != nil {
++		p.mu.Lock()
++		p.admission.state = profileUnknown
++		p.mu.Unlock()
++	}
++	return result
++}
++func (p *ProfileRuntime) rejectProofInput() {
++	if p.proofs == nil || p.proofs.fd == nil {
++		return
++	}
++	var packet profileProofPacket
++	_ = p.proofs.fd.withFD(func(fd int) error {
++		var body [128]byte
++		oob := make([]byte, unix.CmsgSpace(16*4)+unix.CmsgSpace(unix.SizeofUcred))
++		n, control, flags, _, _ := unix.Recvmsg(fd, body[:], oob, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
++		if n < 0 {
++			n = 0
++		}
++		if n > len(body) {
++			n = len(body)
++		}
++		packet = profileParseAncillary(body[:n], oob[:control], flags, profileAdoptFD)
++		return nil
++	})
++	_ = p.rejectRights(packet)
++}
+diff --git a/common/yonikbroker/profile_proof_linux.go b/common/yonikbroker/profile_proof_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_proof_linux.go
+@@ -0,0 +1,233 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"errors"
++	"os"
++	"sync"
++	"time"
++)
++
++var errProfileProofBusy = errors.New("profile proof channel backpressure")
++
++const profileAcceptedFDCredit = 256
++
++var errProfileProofCancelled = errors.New("profile proof request cancelled")
++
++// Kernel handle потребляется только через private scoped callback. Read/Write,
++// raw socket getters и произвольных integer FD constructors у API нет.
++type profileProofFD interface {
++	Close() error
++	withFD(func(int) error) error
++}
++type profileFileFD struct {
++	mu     sync.Mutex
++	file   *os.File
++	closed bool
++	result error
++}
++
++func (f *profileFileFD) Close() error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if !f.closed {
++		f.closed = true
++		f.result = f.file.Close()
++	}
++	return f.result
++}
++func (f *profileFileFD) withFD(fn func(int) error) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.closed || f.file == nil {
++		return errProfile
++	}
++	return fn(int(f.file.Fd()))
++}
++
++type profileProofPacket struct {
++	body               []byte
++	rights             [32]profileProofFD
++	count, credentials int
++	rightsMessages     int
++	pid                int32
++	uid                uint32
++	invalid            bool
++}
++type profileProofBootstrapIO interface {
++	receiveBootstrap(time.Time) (profileProofPacket, error)
++	validateProofFD(profileProofFD) error
++	sendBootstrapAck([]byte) error
++	proofPeerAlive() bool
++}
++type profileProofChannel struct {
++	mu          sync.Mutex
++	launch      profileLaunch
++	fd          profileProofFD
++	custody     [32]profileProofFD
++	lastProof   uint64
++	lastEmitted uint64
++	closed      bool
++	result      error
++	peer        func() bool
++	check       func() error
++	send        func([]byte, profileProofFD) error
++}
++
++func (c *profileProofChannel) Close() error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.closed {
++		c.closed = true
++		for i, fd := range c.custody {
++			if fd != nil {
++				e := fd.Close()
++				c.result = errors.Join(c.result, e)
++				if e == nil {
++					c.custody[i] = nil
++				}
++			}
++		}
++	}
++	return c.result
++}
++func (c *profileProofChannel) live() bool {
++	if c == nil {
++		return false
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return !c.closed && c.result == nil && c.fd != nil && (c.peer == nil || c.peer()) && (c.check == nil || c.check() == nil)
++}
++func (c *profileProofChannel) bootstrap(r profileLaunch, ch profileProofBootstrapIO, deadline time.Time, clock func() time.Time) error {
++	if r.mode != 2 || ch == nil || c.fd != nil || c.closed || !clock().Before(deadline) {
++		return errProfile
++	}
++	packet, e := ch.receiveBootstrap(deadline)
++	c.launch = r
++	c.custody = packet.rights
++	fail := func() error { return errors.Join(errProfile, c.Close()) }
++	expected, e2 := profileProofBootstrap(r)
++	if e != nil || e2 != nil || packet.invalid || packet.count != 1 || packet.rightsMessages != 1 || packet.credentials != 1 || !profileSenderValid(r, packet.pid, packet.uid, 0) || !bytes.Equal(packet.body, expected[:]) || !clock().Before(deadline) || !ch.proofPeerAlive() {
++		return fail()
++	}
++	c.fd = packet.rights[0]
++	if c.fd == nil || ch.validateProofFD(c.fd) != nil {
++		return fail()
++	}
++	ack := profileProofAck(expected)
++	if ch.sendBootstrapAck(ack[:]) != nil || !clock().Before(deadline) || !ch.proofPeerAlive() {
++		return fail()
++	}
++	return nil
++}
++func (c *profileProofChannel) prepare(op *profileOperation) error {
++	if op == nil || op.receipt == nil || op.receipt.association == nil {
++		return errProfile
++	}
++	a := op.receipt.association
++	if op.ctx.Err() != nil || a.ctx.Err() != nil {
++		return errProfileProofCancelled
++	}
++	if a.proof == nil || a.provenance != 2 || a.tuple != op.receipt.tuple || !c.live() {
++		return errProfile
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.closed || c.lastProof >= ^uint64(0)-1 {
++		return errProfile
++	}
++	if op.proof == 0 {
++		c.lastProof++
++		op.proof = c.lastProof
++	}
++	return nil
++}
++func (c *profileProofChannel) sendOpen(op *profileOperation) error {
++	if op.proofSent {
++		return errProfile
++	}
++	c.mu.Lock()
++	replay := op.proof <= c.lastEmitted
++	c.mu.Unlock()
++	if replay {
++		return errProfile
++	}
++	if op.ctx.Err() != nil || op.receipt.association.ctx.Err() != nil {
++		return errProfileProofCancelled
++	}
++	if !c.live() {
++		return errProfile
++	}
++	b, e := profileSocketRecord(c.launch, op.sequence, op.proof, op.receipt.index, op.receipt.tuple)
++	if e != nil {
++		return e
++	}
++	if c.send == nil {
++		return errProfile
++	}
++	if e = c.send(b[:], op.receipt.association.proof); e != nil {
++		return e
++	}
++	c.mu.Lock()
++	c.lastEmitted = op.proof
++	c.mu.Unlock()
++	op.proofSent = true
++	if op.ctx.Err() != nil {
++		return errProfileProofCancelled
++	}
++	return nil
++}
++
++func (c *profileFlowControl) closeAcceptedProofs() error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	var result error
++	for _, a := range c.accepted {
++		if a != nil {
++			result = errors.Join(result, a.closeProofLocked(c))
++		}
++	}
++	return result
++}
++func (a *profileAccepted) closeProofLocked(c *profileFlowControl) error {
++	if a.proof != nil {
++		if e := a.proof.Close(); e != nil {
++			return e
++		}
++		a.proof = nil
++	}
++	if a.proofCredit {
++		a.proofCredit = false
++		c.buffered -= profileAcceptedFDCredit
++	}
++	return nil
++}
++func (c *profileFlowControl) proofRequired(op *profileOperation) bool {
++	return c.mode == 2 && op.kind == 16 && op.receipt.provenance == 2
++}
++func (c *profileFlowControl) tryProof(op *profileOperation) error {
++	if !c.proofRequired(op) || op.proofSent {
++		return nil
++	}
++	// EAGAIN не разрешает более позднему proof обогнать ранний monotonic ID.
++	for _, other := range c.pending {
++		if other != nil && other != op && c.proofRequired(other) && !other.proofSent && !other.cancelled && other.ctx.Err() == nil && other.proof < op.proof {
++			return nil
++		}
++	}
++	if c.sendProof == nil {
++		return errProfile
++	}
++	e := c.sendProof(op)
++	if e == errProfileProofBusy {
++		return nil
++	}
++	if e == errProfileProofCancelled {
++		op.cancelled = true
++		return nil
++	}
++	return e
++}
+diff --git a/common/yonikbroker/profile_proof.go b/common/yonikbroker/profile_proof.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_proof.go
+@@ -0,0 +1,56 @@
++package nativehooks
++
++import "crypto/sha256"
++
++func profileProofBootstrap(r profileLaunch) (b [128]byte, err error) {
++	if r.mode != 2 {
++		return b, errProfile
++	}
++	copy(b[:], "YNKPF001")
++	be.PutUint16(b[8:], 1)
++	be.PutUint16(b[10:], 128)
++	be.PutUint16(b[12:], 1)
++	copy(b[16:], r.nonce[:])
++	copy(b[48:], r.digest[:])
++	copy(b[80:], r.session[:])
++	copy(b[96:], r.invocation[:])
++	be.PutUint64(b[112:], r.generation)
++	be.PutUint64(b[120:], r.epoch)
++	return b, nil
++}
++func profileProofAck(b [128]byte) (ack [40]byte) {
++	copy(ack[:], "YNKPFA01")
++	h := sha256.Sum256(b[:])
++	copy(ack[8:], h[:])
++	return ack
++}
++func profileSocketRecord(r profileLaunch, request, proof uint64, ingress uint16, tuple [40]byte) (b [192]byte, err error) {
++	if r.mode != 2 || request == 0 || request == ^uint64(0) || proof == 0 || proof == ^uint64(0) || ingress >= 4 || tuple[0] != 6 || !profileProofTuple(tuple) {
++		return b, errProfile
++	}
++	copy(b[:], "YNKSPF01")
++	be.PutUint16(b[8:], 1)
++	be.PutUint16(b[10:], 192)
++	be.PutUint16(b[12:], 1)
++	copy(b[16:], r.digest[:])
++	copy(b[48:], r.session[:])
++	copy(b[64:], r.invocation[:])
++	be.PutUint64(b[80:], r.generation)
++	be.PutUint64(b[88:], r.epoch)
++	copy(b[96:], r.nonce[:])
++	be.PutUint64(b[128:], request)
++	be.PutUint64(b[136:], proof)
++	be.PutUint16(b[144:], ingress)
++	b[146] = 2
++	copy(b[148:], tuple[:])
++	return b, nil
++}
++func profileProofTuple(t [40]byte) bool {
++	if t[0] != 6 || !zero(t[2:4]) || u16(t[:], 4) == 0 || u16(t[:], 6) == 0 {
++		return false
++	}
++	if t[1] == 4 {
++		return zero(t[12:24]) && zero(t[28:40]) && profileIP(t[8:12]) && profileIP(t[24:28])
++	}
++	return t[1] == 6 && profileIP(t[8:24]) && profileIP(t[24:40])
++}
+diff --git a/common/yonikbroker/profile_socket_proof_linux_test.go b/common/yonikbroker/profile_socket_proof_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_socket_proof_linux_test.go
+@@ -0,0 +1,534 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	_ "embed"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"golang.org/x/sys/unix"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++)
++
++//go:embed profile-system-proof-v1.json
++var systemProofVector []byte
++
++type proofFixture struct {
++	Launch    string `json:"launch_hex"`
++	Bootstrap string `json:"bootstrap_hex"`
++	Ack       string `json:"bootstrap_ack_hex"`
++	Socket    string `json:"socket_hex"`
++}
++
++func proofVector(t *testing.T) (profileLaunch, proofFixture) {
++	t.Helper()
++	var v proofFixture
++	if e := json.Unmarshal(systemProofVector, &v); e != nil {
++		t.Fatal(e)
++	}
++	b, e := hex.DecodeString(v.Launch)
++	if e != nil {
++		t.Fatal(e)
++	}
++	r, e := decodeProfileLaunch(b)
++	if e != nil {
++		t.Fatal(e)
++	}
++	return r, v
++}
++func proofBytes(t *testing.T, s string) []byte {
++	t.Helper()
++	b, e := hex.DecodeString(s)
++	if e != nil {
++		t.Fatal(e)
++	}
++	return b
++}
++
++type proofFakeFD struct {
++	mu     sync.Mutex
++	closed bool
++	calls  int
++	result error
++}
++
++func (f *proofFakeFD) Close() error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if !f.closed {
++		f.closed = true
++		f.calls++
++	}
++	return f.result
++}
++func (f *proofFakeFD) withFD(fn func(int) error) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.closed {
++		return errProfile
++	}
++	return fn(71)
++}
++
++type proofFakeBootstrap struct {
++	packet                             profileProofPacket
++	alive                              bool
++	clock                              *time.Time
++	advance                            time.Duration
++	readError, validateError, ackError error
++	reads, validates                   int
++	ack                                []byte
++}
++
++func (f *proofFakeBootstrap) receiveBootstrap(time.Time) (profileProofPacket, error) {
++	f.reads++
++	if f.clock != nil {
++		*f.clock = f.clock.Add(f.advance)
++	}
++	return f.packet, f.readError
++}
++func (f *proofFakeBootstrap) validateProofFD(profileProofFD) error {
++	f.validates++
++	return f.validateError
++}
++func (f *proofFakeBootstrap) sendBootstrapAck(b []byte) error {
++	f.ack = append([]byte(nil), b...)
++	return f.ackError
++}
++func (f *proofFakeBootstrap) proofPeerAlive() bool { return f.alive }
++
++func TestProfileProofExactRustWireAndTupleOrientation(t *testing.T) {
++	r, v := proofVector(t)
++	bootstrap, e := profileProofBootstrap(r)
++	if e != nil || !bytes.Equal(bootstrap[:], proofBytes(t, v.Bootstrap)) {
++		t.Fatal("YNKPF001 parity", e)
++	}
++	ack := profileProofAck(bootstrap)
++	if !bytes.Equal(ack[:], proofBytes(t, v.Ack)) {
++		t.Fatal("YNKPFA01 hash parity")
++	}
++	vector := proofBytes(t, v.Socket)
++	var tuple [40]byte
++	copy(tuple[:], vector[148:188])
++	record, e := profileSocketRecord(r, 3, 1, 0, tuple)
++	if e != nil || !bytes.Equal(record[:], vector) {
++		t.Fatal("YNKSPF01 parity", e)
++	}
++	if u16(tuple[:], 4) != 32001 || u16(tuple[:], 6) != 1080 {
++		t.Fatal("initiator/ingress flipped")
++	}
++	for _, request := range []uint64{0, ^uint64(0)} {
++		if _, e = profileSocketRecord(r, request, 1, 0, tuple); e == nil {
++			t.Fatal("invalid request ID")
++		}
++	}
++	for _, id := range []uint64{0, ^uint64(0)} {
++		if _, e = profileSocketRecord(r, 3, id, 0, tuple); e == nil {
++			t.Fatal("invalid proof ID")
++		}
++	}
++	r.mode = 1
++	if _, e = profileProofBootstrap(r); e == nil {
++		t.Fatal("Local minted System bootstrap")
++	}
++	if _, e = profileSocketRecord(r, 3, 1, 0, tuple); e == nil {
++		t.Fatal("Local minted System socket proof")
++	}
++}
++func TestProfileProofBootstrapRejectsMismatchAndClosesEveryRight(t *testing.T) {
++	for _, what := range []string{"valid", "binding", "credentials", "uid", "count", "truncated", "peer", "expired", "type", "ack", "read", "local", "duplicate"} {
++		t.Run(what, func(t *testing.T) {
++			r, v := proofVector(t)
++			now := time.Now()
++			fd, extra := &proofFakeFD{}, &proofFakeFD{}
++			io := &proofFakeBootstrap{packet: profileProofPacket{body: proofBytes(t, v.Bootstrap), count: 1, rightsMessages: 1, credentials: 1, pid: 7, uid: 0}, alive: true, clock: &now}
++			io.packet.rights[0] = fd
++			deadline := now.Add(time.Second)
++			switch what {
++			case "binding":
++				io.packet.body[16] ^= 1
++			case "credentials":
++				io.packet.credentials = 2
++			case "uid":
++				io.packet.uid = 1000
++			case "count":
++				io.packet.count = 2
++				io.packet.rights[1] = extra
++			case "truncated":
++				io.packet.invalid = true
++			case "peer":
++				io.alive = false
++			case "expired":
++				io.advance = time.Second
++			case "type":
++				io.validateError = errProfile
++			case "ack":
++				io.ackError = errProfile
++			case "read":
++				io.readError = errProfile
++			case "local":
++				r.mode = 1
++			}
++			channel := &profileProofChannel{}
++			e := channel.bootstrap(r, io, deadline, func() time.Time { return now })
++			if what == "valid" || what == "duplicate" {
++				if e != nil || !bytes.Equal(io.ack, proofBytes(t, v.Ack)) {
++					t.Fatal("valid bootstrap", e)
++				}
++				if what == "duplicate" && channel.bootstrap(r, io, deadline, func() time.Time { return now }) == nil {
++					t.Fatal("duplicate bootstrap")
++				}
++				channel.Close()
++				if fd.calls != 1 {
++					t.Fatal("bootstrap custody")
++				}
++				return
++			}
++			if e == nil || len(io.ack) != 0 && what != "ack" {
++				t.Fatal("invalid bootstrap accepted", what, e)
++			}
++			if what == "local" {
++				if io.reads != 0 {
++					t.Fatal("Local consumed System bootstrap")
++				}
++				return
++			}
++			if fd.calls != 1 || what == "count" && extra.calls != 1 {
++				t.Fatal("unexpected right leaked", fd.calls, extra.calls)
++			}
++		})
++	}
++}
++func TestProfileProofAncillarySuffixAndRuntimeRightsAreClosed(t *testing.T) {
++	fd := &proofFakeFD{}
++	adopt := func(n int) profileProofFD {
++		if n != 71 {
++			t.Fatal("wrong fake handle", n)
++		}
++		return fd
++	}
++	oob := append(unix.UnixRights(71), []byte{1, 2, 3}...)
++	packet := profileParseAncillary(nil, oob, 0, adopt)
++	if !packet.invalid || packet.count != 1 {
++		t.Fatal("malformed suffix lost prefix rights")
++	}
++	p := &ProfileRuntime{}
++	p.rejectRights(packet)
++	if fd.calls != 1 {
++		t.Fatal("runtime accepted/leaked SCM_RIGHTS")
++	}
++	for _, flags := range []int{unix.MSG_TRUNC, unix.MSG_CTRUNC} {
++		packet = profileParseAncillary(nil, unix.UnixRights(71), flags, adopt)
++		if !packet.invalid {
++			t.Fatal("truncated ancillary accepted")
++		}
++	}
++}
++func TestProfileProofUnknownCloseRetainsCustody(t *testing.T) {
++	r, v := proofVector(t)
++	failure := errors.New("synthetic close Unknown")
++	fd := &proofFakeFD{result: failure}
++	io := &proofFakeBootstrap{packet: profileProofPacket{body: proofBytes(t, v.Bootstrap), count: 1, credentials: 2, pid: 7}, alive: true}
++	io.packet.rights[0] = fd
++	c := &profileProofChannel{}
++	if e := c.bootstrap(r, io, time.Now().Add(time.Second), time.Now); !errors.Is(e, failure) {
++		t.Fatal("cleanup error lost", e)
++	}
++	if c.custody[0] != fd || !errors.Is(c.Close(), failure) || fd.calls != 1 || c.live() {
++		t.Fatal("Unknown became KnownClosed")
++	}
++}
++func TestProfileProofActualAcceptOpenSendAndReceiptLifetime(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	handle := &proofFakeFD{}
++	f.p.duplicateAccepted = func(xnet.Conn, [40]byte) (profileProofFD, error) { return handle, nil }
++	var records [][]byte
++	var objects []profileProofFD
++	f.p.proofs.send = func(b []byte, fd profileProofFD) error {
++		records = append(records, append([]byte(nil), b...))
++		objects = append(objects, fd)
++		return nil
++	}
++	ctx, cancel := context.WithCancel(context.WithValue(f.p.ctx, profileContextKey{}, f.p))
++	defer cancel()
++	accepted, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	a, _ := accepted.Value(profileAcceptedKey{}).(*profileAccepted)
++	r, op, e := f.c.open(accepted, a.index, 2, a.tuple, profileDestinationValue{family: 3, network: 6, port: 443, address: "original.invalid"}, a)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	if len(records) != 1 || objects[0] != handle || u64(records[0], 128) != op.sequence || u64(records[0], 136) != op.proof || !bytes.Equal(records[0][148:188], a.tuple[:]) || r.id != 0 {
++		t.Fatal("proof/OPEN binding or premature receipt")
++	}
++	if e = f.c.accept(f.ingressReply(op)); e != nil || r.id == 0 {
++		t.Fatal("matched ingress reply", e)
++	}
++	if e = f.p.proofs.sendOpen(op); e == nil {
++		t.Fatal("proof replay emitted")
++	}
++	f.c.mu.Lock()
++	f.c.closeReceipt(r)
++	f.c.mu.Unlock()
++	if handle.calls != 0 {
++		t.Fatal("one request closed shared accepted object")
++	}
++	cancel()
++	if e = f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if handle.calls != 1 {
++		t.Fatal("accepted lifetime did not retire FD")
++	}
++}
++func TestProfileProofBackpressureCancelAndOriginalDeadline(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	f.p.duplicateAccepted = func(xnet.Conn, [40]byte) (profileProofFD, error) { return &proofFakeFD{}, nil }
++	sends := 0
++	f.p.proofs.send = func([]byte, profileProofFD) error { sends++; return errProfileProofBusy }
++	ctx, cancel := context.WithCancel(context.WithValue(f.p.ctx, profileContextKey{}, f.p))
++	accepted, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	a := accepted.Value(profileAcceptedKey{}).(*profileAccepted)
++	r, op, e := f.c.open(accepted, 0, 2, a.tuple, profileDestinationValue{family: 3, network: 6, port: 443, address: "busy.invalid"}, a)
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(op)
++	deadline, id := op.deadline, op.proof
++	f.now = f.now.Add(100 * time.Millisecond)
++	f.c.tick()
++	if sends != 2 || op.proofSent || op.proof != id || op.deadline != deadline {
++		t.Fatal("EAGAIN changed identity/deadline")
++	}
++	cancel()
++	f.c.tick()
++	before := sends
++	if e = f.c.accept(f.ingressReply(op)); e != nil {
++		t.Fatal(e)
++	}
++	if r.id != 0 || f.c.receiptLive(r) || sends != before {
++		t.Fatal("late proof/reply resurrected cancelled OPEN")
++	}
++}
++func TestProfileProofEOFFenceBeforeIngressPublication(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	r, op := f.open(t, context.Background(), "fence.invalid")
++	f.p.proofs.check = func() error { return errProfile }
++	if e := f.c.accept(f.ingressReply(op)); e == nil || r.id != 0 {
++		t.Fatal("proof EOF admitted pending source")
++	}
++}
++
++func TestProfileSystemAcceptedTCPRequiresActualKernelHandle(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	f.p.proofs = nil
++	f.p.duplicateAccepted = nil
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	if _, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e == nil {
++		t.Fatal("System acceptedTCP получил receipt без actual kernel FD/proof channel")
++	}
++}
++
++type proofRawConn struct {
++	calls int
++	after error
++}
++
++func (r *proofRawConn) Control(fn func(uintptr)) error { r.calls++; fn(901); return r.after }
++func (*proofRawConn) Read(func(uintptr) bool) error    { panic("proof attempted payload read") }
++func (*proofRawConn) Write(func(uintptr) bool) error   { panic("proof attempted payload write") }
++
++type proofConn struct {
++	*flowFakeConn
++	raw *proofRawConn
++}
++
++func (c *proofConn) SyscallConn() (syscall.RawConn, error) { return c.raw, nil }
++func TestProfileProofActualExportUsesControlAndRetainsPartialFailure(t *testing.T) {
++	for _, what := range []string{"valid", "tuple", "control"} {
++		t.Run(what, func(t *testing.T) {
++			conn := &proofConn{flowFakeConn: fakeTCPFlowConn(), raw: &proofRawConn{}}
++			tuple, e := profileTuple(xnet.DestinationFromAddr(conn.RemoteAddr()), xnet.DestinationFromAddr(conn.LocalAddr()))
++			if e != nil {
++				t.Fatal(e)
++			}
++			handle := &proofFakeFD{}
++			if what == "control" {
++				conn.raw.after = errProfile
++			}
++			owned, e := profileDuplicateAcceptedWith(conn, tuple, func(fd uintptr) (profileProofFD, error) {
++				if fd != 901 {
++					t.Fatal("used locator instead of actual Control FD")
++				}
++				return handle, nil
++			}, func(fd profileProofFD) ([40]byte, error) {
++				if fd != handle {
++					t.Fatal("inspect did not use duplicate")
++				}
++				copy := tuple
++				if what == "tuple" {
++					copy[4] ^= 1
++				}
++				return copy, nil
++			})
++			if owned != handle || conn.raw.calls != 1 || (e == nil) != (what == "valid") {
++				t.Fatal("export/partial custody", owned, e)
++			}
++			owned.Close()
++			if handle.calls != 1 {
++				t.Fatal("partial descriptor leaked")
++			}
++		})
++	}
++}
++func TestProfileProofPendingFIFOAndWrapPreflight(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	accepted, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	a := accepted.Value(profileAcceptedKey{}).(*profileAccepted)
++	busy := true
++	var emitted []uint64
++	f.p.proofs.send = func(b []byte, _ profileProofFD) error {
++		if busy {
++			return errProfileProofBusy
++		}
++		emitted = append(emitted, u64(b, 136))
++		return nil
++	}
++	open := func(name string) *profileOperation {
++		_, op, e := f.c.open(accepted, 0, 2, a.tuple, profileDestinationValue{family: 3, network: 6, port: 443, address: name}, a)
++		if e != nil {
++			t.Fatal(e)
++		}
++		if e = f.c.dispatch(op); e != nil {
++			t.Fatal(e)
++		}
++		return op
++	}
++	one := open("one.invalid")
++	busy = false
++	two := open("two.invalid")
++	if len(emitted) != 0 {
++		t.Fatal("later proof overtook EAGAIN")
++	}
++	f.c.tick()
++	if !one.proofSent || !two.proofSent || len(emitted) != 2 || emitted[0] >= emitted[1] {
++		t.Fatal("proof FIFO", emitted)
++	}
++	f.p.proofs.lastProof = ^uint64(0) - 1
++	before := len(f.writes)
++	_, op, e := f.c.open(accepted, 0, 2, a.tuple, profileDestinationValue{family: 3, network: 6, port: 443, address: "wrap.invalid"}, a)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if f.c.dispatch(op) == nil || len(f.writes) != before {
++		t.Fatal("proof wrap emitted OPEN")
++	}
++}
++func TestProfileLocalAcceptedTCPDoesNotRequireSystemProof(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	if _, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e != nil {
++		t.Fatal("Local ошибочно требует System proof", e)
++	}
++}
++func TestProfileProofSystemUDPAndMissingRawHandleStayUnsupported(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	ctx := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	f.p.duplicateAccepted = nil
++	if _, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e == nil {
++		t.Fatal("valid channel replaced actual kernel handle")
++	}
++	if _, e := ProfileAssociateUDP(ctx, fakeTCPFlowConn()); e == nil {
++		t.Fatal("TCP proof promoted into UDP")
++	}
++}
++
++type proofDeadlineAdmission struct {
++	*fakeProfileAdmission
++	clock *time.Time
++}
++
++func (c *proofDeadlineAdmission) receive(deadline time.Time) ([]byte, error) {
++	*c.clock = c.clock.Add(150 * time.Millisecond)
++	return c.fakeProfileAdmission.receive(deadline)
++}
++func TestProfileProofBootstrapCannotExtendInitialHelloDeadline(t *testing.T) {
++	body, r := syntheticProfileCapsule()
++	r.mode = 2
++	body[76], body[77] = 2, 1
++	rehashProfileCapsule(body, &r)
++	start := time.Now()
++	now := start.Add(900 * time.Millisecond)
++	ch := &proofDeadlineAdmission{fakeProfileAdmission: &fakeProfileAdmission{r: r, body: body}, clock: &now}
++	if _, e := admitProfileUntil(r, []byte("config"), ch, func(*profileCapsule) error { return nil }, func() time.Time { return now }, start.Add(time.Second)); e == nil {
++		t.Fatal("bootstrap/HELLO restarted initial deadline")
++	}
++	for _, event := range ch.events {
++		if event == "ack" {
++			t.Fatal("late admission ACK")
++		}
++	}
++}
++func TestProfileProofAcceptedPreflightAndCancelledExportKeepCustody(t *testing.T) {
++	for _, what := range []string{"budget", "cancel", "unknown"} {
++		t.Run(what, func(t *testing.T) {
++			f := newFlowFixture(t, 2)
++			ctx, cancel := context.WithCancel(context.WithValue(f.p.ctx, profileContextKey{}, f.p))
++			defer cancel()
++			called := false
++			fd := &proofFakeFD{}
++			if what == "unknown" {
++				fd.result = errors.New("export cleanup Unknown")
++			}
++			f.p.duplicateAccepted = func(xnet.Conn, [40]byte) (profileProofFD, error) {
++				called = true
++				if what == "cancel" {
++					cancel()
++					return fd, nil
++				}
++				return fd, errProfile
++			}
++			if what == "budget" {
++				f.c.buffered = uint64(f.c.manifest.caps[4])
++			}
++			if _, e := ProfileAccept(ctx, fakeTCPFlowConn(), "i"); e == nil {
++				t.Fatal("invalid late export published")
++			}
++			if what == "budget" {
++				if called {
++					t.Fatal("overflow exported FD")
++				}
++				return
++			}
++			if fd.calls != 1 {
++				t.Fatal("export cleanup missing")
++			}
++			if what == "unknown" {
++				if f.c.accepted[0] == nil || f.c.accepted[0].proof != fd || f.p.ctx.Err() == nil {
++					t.Fatal("Unknown export lost custody")
++				}
++			} else if f.c.accepted[0] != nil {
++				t.Fatal("cancelled export retained known slot")
++			}
++		})
++	}
++}
+diff --git a/common/yonikbroker/profile_service_other.go b/common/yonikbroker/profile_service_other.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_service_other.go
+@@ -0,0 +1,29 @@
++//go:build !linux
++
++package nativehooks
++
++import (
++	"context"
++	xnet "github.com/xtls/xray-core/common/net"
++	"net"
++)
++
++func profileSourceValid(ctx context.Context) error { return ProfileOriginalValid(ctx) }
++func ProfileCheckDNSResult(context.Context) error  { return ErrDenied }
++func ProfileDNSQueryContext(ctx context.Context, _ string) (context.Context, func(), error) {
++	return ctx, func() {}, nil
++}
++func ProfileCheckDNSAnswer(ctx context.Context, _ string, _ []net.IP) error {
++	return CheckAfterDNS(ctx)
++}
++func ProfileResolverRequired(context.Context) bool { return false }
++func ProfileLookupSnapshot(context.Context, string, bool, bool) ([]net.IP, uint32, error) {
++	return nil, 0, ErrProfileUnsupported
++}
++func ProfileOpenProbe(ctx context.Context, _ string, _ string) (context.Context, func(), error) {
++	return ctx, func() {}, nil
++}
++func ProfileProbeDialContext(_ context.Context, callback context.Context) (context.Context, func(), error) {
++	return callback, func() {}, nil
++}
++func ProfileProbeDialTarget(context.Context, xnet.Destination) error { return nil }
+diff --git a/common/yonikbroker/profile_service_linux_test.go b/common/yonikbroker/profile_service_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_service_linux_test.go
+@@ -0,0 +1,1019 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	_ "embed"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"golang.org/x/net/dns/dnsmessage"
++	"io"
++	"net"
++	"reflect"
++	"sort"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++	"unsafe"
++)
++
++//go:embed profile-service-vectors.json
++var serviceVectors []byte
++
++// Полный frame получен извлечёнными Header/Grant encoder Rust abf5c243.
++// Kind 2 = SidebandOperation; kind 1 = FrozenSent, это разные namespaces.
++func TestProfileServiceSystemUserDNSRustOwnerTail(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	r := profileReceiptFrom(ctx)
++	g, op, e := f.c.authorizeDNS(ctx, r, 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	var v struct {
++		Frame string `json:"systemUserDNSGrantFrameHex"`
++	}
++	if e = json.Unmarshal(serviceVectors, &v); e != nil {
++		t.Fatal(e)
++	}
++	wire, e := hex.DecodeString(v.Frame)
++	if e != nil {
++		t.Fatal(e)
++	}
++	packet, e := f.p.admission.launch.decodePacket(wire, 9)
++	if e != nil || packet.reply != op.sequence {
++		t.Fatal("Rust frame binding", e, packet.reply, op.sequence)
++	}
++	if r.id != 1 || r.revision != 1 {
++		t.Fatal("fixture source изменился", r.id, r.revision)
++	}
++	f.now = f.now.Add(3 * time.Millisecond)
++	if e = f.c.accept(packet); e != nil || op.err != nil || !f.c.grantLive(g) {
++		t.Fatal("System user DNS обязательный owner tail отвергнут", e, op.err)
++	}
++	if g.ownerID != 42 || g.ownerKind != 2 || g.ownerDeadline.Sub(f.now) != 17*time.Millisecond {
++		t.Fatal("freshness не вычла RTT", g.ownerDeadline.Sub(f.now))
++	}
++}
++
++func TestProfileServiceSystemOwnerTailRejectsForeignUnknownAndExpired(t *testing.T) {
++	// FrozenSent=1 разрешён отдельно от SidebandOperation=2, без нормализации id.
++	f, ctx := serviceFixture(t)
++	g, op, e := f.c.authorizeDNS(ctx, profileReceiptFrom(ctx), 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(op)
++	reply := serviceReply(f, op)
++	reply.body[40] = 1
++	if e = f.c.accept(reply); e != nil || op.err != nil || g.ownerKind != 1 {
++		t.Fatal("FrozenSent namespace", e, op.err)
++	}
++	for _, name := range []string{"required0", "unknown", "id0", "reserved", "fresh0", "freshOverflow", "expiredRTT", "foreignFlow", "revision", "foreignPrivate", "closedPrivate", "noPrivate", "probeClass", "localOwner"} {
++		t.Run(name, func(t *testing.T) {
++			f, ctx := serviceFixture(t)
++			r := profileReceiptFrom(ctx)
++			g, op, e := f.c.authorizeDNS(ctx, r, 0, "query.invalid")
++			if e != nil {
++				t.Fatal(e)
++			}
++			if e = f.c.dispatch(op); e != nil {
++				t.Fatal(e)
++			}
++			b, _ := hex.DecodeString("01030100000000000000000b0000000000000001000003e800000000000000010000000001312d000200000000000000000000000000002a")
++			switch name {
++			case "required0":
++				b[2] = 0
++			case "unknown":
++				b[40] = 3
++			case "id0":
++				clear(b[48:])
++			case "reserved":
++				b[41] = 1
++			case "fresh0":
++				clear(b[32:40])
++			case "freshOverflow":
++				be.PutUint64(b[32:], uint64(20*time.Millisecond+1))
++			case "expiredRTT":
++				f.now = f.now.Add(20 * time.Millisecond)
++			case "foreignFlow":
++				be.PutUint64(b[12:], r.id+1)
++			case "revision":
++				be.PutUint64(b[24:], r.revision+1)
++			case "foreignPrivate":
++				other := newFlowFixture(t, 2)
++				op.receipt = other.admittedReceipt(t, "foreign.invalid")
++			case "closedPrivate":
++				f.c.closeReceipt(r)
++			case "noPrivate":
++				g.receipt = nil
++			case "probeClass":
++				g.class, b[1] = 2, 2
++			case "localOwner":
++				f.c.mode = 1
++			}
++			if e = f.c.publishService(op, profilePacket{kind: 19, object: 11, body: b}); e == nil || g.id != 0 {
++				t.Fatal("чужой/Unknown/expired owner опубликован", name)
++			}
++		})
++	}
++	for _, class := range []byte{2, 3} {
++		f := newFlowFixture(t, 2)
++		ctx, cancel := context.WithCancel(f.p.ctx)
++		defer cancel()
++		g := &profileGrant{ctx: ctx, cancel: cancel, class: class, purpose: 1}
++		f.c.grants[0] = g
++		op := &profileOperation{kind: 20, grant: g, sent: f.now, sessionDeadline: f.now.Add(time.Second)}
++		b, _ := hex.DecodeString("01030100000000000000000b0000000000000001000003e800000000000000010000000001312d000200000000000000000000000000002a")
++		b[1] = class
++		clear(b[12:20])
++		if e := f.c.publishService(op, profilePacket{kind: 19, object: 11, body: b}); e == nil {
++			t.Fatal("service flow0 принял user attribution", class)
++		}
++	}
++}
++
++func TestProfileServiceSystemOwnerRefreshKeepsOriginalObservationExpiry(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	g, op, e := f.c.authorizeDNS(ctx, profileReceiptFrom(ctx), 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(op)
++	reply := serviceReply(f, op)
++	if e = f.c.accept(reply); e != nil || op.err != nil {
++		t.Fatal(e, op.err)
++	}
++	expires := g.ownerDeadline
++	f.now = f.now.Add(16 * time.Millisecond)
++	renew, e := f.c.refreshServiceLocked(g)
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(renew)
++	if renew.deadline.Sub(renew.sent) != 20*time.Millisecond {
++		t.Fatal("System DNS request потерял freshness deadline")
++	}
++	reply = serviceReply(f, renew)
++	if e = f.c.accept(reply); e != nil || renew.err != nil {
++		t.Fatal(e, renew.err)
++	}
++	if !g.ownerDeadline.Equal(expires) {
++		t.Fatal("тот же owner receipt продлил observation")
++	}
++	f.now = expires
++	// Даже пока lease жив, истёкший Known owner не разрешает DNS I/O.
++	g.refresh = &profileOperation{ctx: ctx, queued: true, done: make(chan struct{})}
++	close(g.refresh.done)
++	if e = profileEnsureService(ctx, g); e == nil {
++		t.Fatal("lease подменил свежий Known owner")
++	}
++}
++
++func TestProfileServiceIndependentWireVectorsAndBootstrapScope(t *testing.T) {
++	var vectors struct {
++		Probe      string `json:"probeBodyHex"`
++		Bootstrap  string `json:"bootstrapBodyHex"`
++		DNS        string `json:"dnsAuthorizeBodyHex"`
++		DNSGrant   string `json:"dnsGrantBodyHex"`
++		ProbeGrant string `json:"probeGrantBodyHex"`
++	}
++	if e := json.Unmarshal(serviceVectors, &vectors); e != nil {
++		t.Fatal(e)
++	}
++	decode := func(s string) []byte {
++		b, e := hex.DecodeString(s)
++		if e != nil {
++			t.Fatal(e)
++		}
++		return b
++	}
++	f, ctx := serviceFixture(t)
++	g, op, e := f.c.authorizeDNS(ctx, profileReceiptFrom(ctx), 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if !bytes.Equal(op.body, decode(vectors.DNS)) {
++		t.Fatal("independent AUTHORIZE mismatch")
++	}
++	// Старый независимый golden — Local, где mandatory owner отсутствует.
++	f.c.mode = 1
++	f.c.dispatch(op)
++	if e = f.c.accept(profilePacket{kind: 19, reply: op.sequence, object: 11, body: decode(vectors.DNSGrant)}); e != nil || op.err != nil || !f.c.grantLive(g) {
++		t.Fatal("independent DNS GRANT", e, op.err)
++	}
++	installProbe(f, "203.0.113.7")
++	base := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	probe, pending, e := f.c.probe(base, 1, 0, 0, 65535)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if !bytes.Equal(pending.body, decode(vectors.Probe)) {
++		t.Fatal("independent PROBE mismatch")
++	}
++	f.c.dispatch(pending)
++	if e = f.c.accept(profilePacket{kind: 19, reply: pending.sequence, object: 12, body: decode(vectors.ProbeGrant)}); e != nil || pending.err != nil || !f.c.grantLive(probe) {
++		t.Fatal("independent probe GRANT", e, pending.err)
++	}
++	ep := profileDestinationValue{family: 3, network: 6, port: 443, address: "server.invalid"}.encode()
++	f.c.manifest.rows[1] = [][]byte{append(ep, 0, 0, 0, 0)}
++	f.c.manifest.rows[8][0][20] = 1
++	be.PutUint16(f.c.manifest.rows[8][0][8:], 0)
++	bootstrap, request, e := f.c.probe(base, 2, 0, 0, 0)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if !bytes.Equal(request.body, decode(vectors.Bootstrap)) || bootstrap.query != "server.invalid" || bootstrap.class != 3 {
++		t.Fatal("bootstrap manifest reference mismatch")
++	}
++	if _, _, e = f.c.probe(base, 2, 1, 0, 0); e == nil {
++		t.Fatal("arbitrary endpoint reference")
++	}
++}
++
++func TestProfileServiceGrantConsumesClassWithoutUserOwner(t *testing.T) {
++	for _, class := range []byte{2, 3} {
++		f := newFlowFixture(t, 2)
++		ctx, cancel := context.WithCancel(context.Background())
++		defer cancel()
++		g := &profileGrant{ctx: ctx, cancel: cancel, subject: 0, scope: 0, slot: 0, class: class, purpose: 1}
++		f.c.grants[0] = g
++		op := &profileOperation{kind: 20, grant: g, sent: f.now, sessionDeadline: f.now.Add(time.Minute)}
++		b := make([]byte, 56)
++		b[0], b[1] = 1, class
++		be.PutUint64(b[4:], 11)
++		be.PutUint32(b[20:], 1000)
++		be.PutUint64(b[24:], f.c.manifest.policy)
++		if err := f.c.publish(op, profilePacket{kind: 19, object: 11, body: b}); err != nil {
++			t.Fatalf("authenticated service class%d отвергнут как user flow: %v", class, err)
++		}
++		if !f.c.grantLive(g) {
++			t.Fatal("service grant требует user owner/receipt")
++		}
++	}
++}
++
++func serviceText(b []byte, s string) []byte {
++	var size [2]byte
++	be.PutUint16(size[:], uint16(len(s)))
++	b = append(b, size[:]...)
++	return append(b, s...)
++}
++func serviceFixture(t *testing.T) (*flowFixture, context.Context) {
++	t.Helper()
++	f := newFlowFixture(t, 2)
++	var v struct {
++		Wire string `json:"wireHex"`
++	}
++	if e := json.Unmarshal(rustSnapshot, &v); e != nil {
++		t.Fatal(e)
++	}
++	b, e := hex.DecodeString(v.Wire)
++	if e != nil {
++		t.Fatal(e)
++	}
++	s, e := decodeProfileSnapshot(b, snapshotAsset(b))
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.p.snapshot = s
++	f.p.dnsID = func() uint16 { return 0x1234 }
++	for _, network := range []byte{17, 6} {
++		row := make([]byte, 36)
++		row[0], row[1] = 2, network
++		be.PutUint16(row[2:], 65535)
++		copy(row[4:], s.encoded[16:48])
++		peer := profileDestinationValue{family: 4, network: network, port: 53, address: "127.0.0.53"}
++		row = append(row, peer.encode()...)
++		f.c.manifest.rows[4] = append(f.c.manifest.rows[4], row)
++	}
++	r := f.admittedReceipt(t, "original.invalid")
++	return f, context.WithValue(context.WithValue(r.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r)
++}
++func serviceReply(f *flowFixture, op *profileOperation) profilePacket {
++	id := op.object
++	if id == 0 {
++		f.grantID++
++		id = f.grantID
++	}
++	b := make([]byte, 56)
++	b[0], b[1] = 1, op.grant.class
++	be.PutUint64(b[4:], id)
++	be.PutUint32(b[20:], 1000)
++	revision := f.c.manifest.policy
++	if op.receipt != nil {
++		be.PutUint64(b[12:], op.receipt.id)
++		revision = op.receipt.revision
++		if f.c.mode == 2 {
++			b[2], b[40] = 1, 2
++			be.PutUint64(b[32:], uint64(20*time.Millisecond))
++			be.PutUint64(b[48:], 42)
++		}
++	}
++	be.PutUint64(b[24:], revision)
++	return profilePacket{kind: 19, reply: op.sequence, object: id, body: b}
++}
++func serveService(t *testing.T, f *flowFixture, alter func(*profileOperation, *profilePacket)) func() {
++	t.Helper()
++	stop, done := make(chan struct{}), make(chan struct{})
++	go func() {
++		defer close(done)
++		for {
++			select {
++			case <-stop:
++				return
++			case op := <-f.p.flowQueue:
++				if e := f.c.dispatch(op); e != nil {
++					f.c.mu.Lock()
++					f.c.finish(op, e)
++					f.c.mu.Unlock()
++					continue
++				}
++				if op.completed {
++					continue
++				}
++				reply := serviceReply(f, op)
++				if alter != nil {
++					alter(op, &reply)
++				}
++				if e := f.c.accept(reply); e != nil {
++					f.c.mu.Lock()
++					f.c.finish(op, e)
++					f.c.mu.Unlock()
++				}
++			}
++		}
++	}()
++	return func() { close(stop); <-done }
++}
++func installProbe(f *flowFixture, host string) {
++	row := []byte{2, 0, 1, 187}
++	row = serviceText(row, host)
++	row = serviceText(row, "/health")
++	row = append(row, 0, 1, 0, 0)
++	f.c.manifest.rows[7] = [][]byte{row}
++}
++func TestProfileServiceProbeWireRouteAndClassIsolation(t *testing.T) {
++	f, _ := serviceFixture(t)
++	installProbe(f, "203.0.113.7")
++	defer serveService(t, f, func(op *profileOperation, _ *profilePacket) {
++		if op.kind != 20 || !bytes.Equal(op.body, []byte{0, 1, 0, 0, 0, 0, 255, 255}) {
++			t.Error("PROBE scope/wire отличается", op.body)
++		}
++	})()
++	base := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	if _, _, e := ProfileOpenProbe(base, "a", "https://203.0.113.7/wrong"); e == nil {
++		t.Fatal("URL создал service scope")
++	}
++	ctx, release, e := ProfileOpenProbe(base, "a", "https://203.0.113.7/health")
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	dest := xnet.TCPDestination(xnet.ParseAddress("203.0.113.7"), 443)
++	if ProfileOriginalValid(ctx) == nil {
++		t.Fatal("ProbeGrant подменил original user receipt")
++	}
++	if e = ProfileDispatchEntry(ctx, dest); e != nil {
++		t.Fatal(e)
++	}
++	ctx, e = ProfileSelectRoute(ctx, "a", dest)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, _, e = ProfileAuthorizeHandler(ctx, "a", dest, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = profileEnsureGrant(ctx, profileServiceGrant(ctx)); e != nil {
++		t.Fatal(e)
++	}
++	wrong := xnet.TCPDestination(xnet.ParseAddress("203.0.113.8"), 443)
++	if ProfileDispatchEntry(ctx, wrong) == nil {
++		t.Fatal("probe destination расширен")
++	}
++	release()
++	if ProfileDispatchEntry(ctx, dest) == nil {
++		t.Fatal("cancelled probe resurrected")
++	}
++}
++func TestProfileServiceRejectsWrongGrantClassOwnerReplayAndLateReply(t *testing.T) {
++	for _, mutation := range []string{"class", "owner", "required", "flow", "revision", "late"} {
++		t.Run(mutation, func(t *testing.T) {
++			f, ctx := serviceFixture(t)
++			r := profileReceiptFrom(ctx)
++			g, op, e := f.c.authorizeDNS(ctx, r, 0, "query.invalid")
++			if e != nil {
++				t.Fatal(e)
++			}
++			if e = f.c.dispatch(op); e != nil {
++				t.Fatal(e)
++			}
++			reply := serviceReply(f, op)
++			switch mutation {
++			case "class":
++				reply.body[1] = 1
++			case "owner":
++				reply.body[40] = 0
++			case "required":
++				reply.body[2] = 0
++			case "flow":
++				be.PutUint64(reply.body[12:], r.id+1)
++			case "revision":
++				be.PutUint64(reply.body[24:], 7)
++			case "late":
++				f.c.abort(op)
++				if e = f.c.tick(); e != nil {
++					t.Fatal(e)
++				}
++			}
++			if e = f.c.accept(reply); e != nil && mutation == "late" {
++				t.Fatal(e)
++			}
++			if f.c.grantLive(g) || g.id != 0 {
++				t.Fatal("wrong/late service grant published")
++			}
++			if !f.c.receiptLive(r) {
++				t.Fatal("service denial отменил original flow")
++			}
++			if e = f.c.accept(reply); e == nil {
++				t.Fatal("conflicting reply accepted")
++			}
++		})
++	}
++}
++
++type serviceDNSConn struct {
++	mu         sync.Mutex
++	remote     net.Addr
++	response   *bytes.Reader
++	respond    func([]byte) []byte
++	closed     bool
++	writes     int
++	closeError error
++}
++
++func (c *serviceDNSConn) Read(b []byte) (int, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.closed {
++		return 0, io.ErrClosedPipe
++	}
++	return c.response.Read(b)
++}
++func (c *serviceDNSConn) Write(b []byte) (int, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.closed {
++		return 0, io.ErrClosedPipe
++	}
++	c.writes++
++	c.response = bytes.NewReader(c.respond(b))
++	return len(b), nil
++}
++func (c *serviceDNSConn) Close() error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.closed = true
++	return c.closeError
++}
++func (c *serviceDNSConn) RemoteAddr() net.Addr { return c.remote }
++func (*serviceDNSConn) LocalAddr() net.Addr {
++	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
++}
++func (*serviceDNSConn) SetDeadline(time.Time) error      { return nil }
++func (*serviceDNSConn) SetReadDeadline(time.Time) error  { return nil }
++func (*serviceDNSConn) SetWriteDeadline(time.Time) error { return nil }
++func serviceAnswer(t *testing.T, request []byte, truncate, cname bool) []byte {
++	t.Helper()
++	var p dnsmessage.Parser
++	h, e := p.Start(request)
++	if e != nil {
++		t.Fatal(e)
++	}
++	q, e := p.Question()
++	if e != nil {
++		t.Fatal(e)
++	}
++	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: h.ID, Response: true, RecursionAvailable: true, Truncated: truncate})
++	b.StartQuestions()
++	b.Question(q)
++	b.StartAnswers()
++	name := q.Name
++	if cname {
++		alias, _ := dnsmessage.NewName("canonical.invalid.")
++		b.CNAMEResource(dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, TTL: 120}, dnsmessage.CNAMEResource{CNAME: alias})
++		name = alias
++	}
++	if !truncate {
++		if q.Type == dnsmessage.TypeA {
++			b.AResource(dnsmessage.ResourceHeader{Name: name, Type: q.Type, Class: dnsmessage.ClassINET, TTL: 60}, dnsmessage.AResource{A: [4]byte{203, 0, 113, 9}})
++			b.AResource(dnsmessage.ResourceHeader{Name: name, Type: q.Type, Class: dnsmessage.ClassINET, TTL: 60}, dnsmessage.AResource{A: [4]byte{203, 0, 113, 10}})
++		} else {
++			b.AAAAResource(dnsmessage.ResourceHeader{Name: name, Type: q.Type, Class: dnsmessage.ClassINET, TTL: 60}, dnsmessage.AAAAResource{AAAA: [16]byte{0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9}})
++		}
++	}
++	result, e := b.Finish()
++	if e != nil {
++		t.Fatal(e)
++	}
++	return result
++}
++func TestProfileSnapshotResolverActualQueriesCNAMEFamiliesAndTCPFallback(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	ctx, scopeClose, scopeErr := ProfileDNSQueryContext(ctx, "proxy")
++	if scopeErr != nil {
++		t.Fatal(scopeErr)
++	}
++	defer scopeClose()
++	defer serveService(t, f, nil)()
++	var mu sync.Mutex
++	var networks []string
++	var questions []string
++	f.p.dnsDial = func(_ context.Context, network, address string) (net.Conn, error) {
++		if address != "127.0.0.53:53" {
++			t.Error("wrong peer", address)
++		}
++		mu.Lock()
++		networks = append(networks, network)
++		mu.Unlock()
++		var remote net.Addr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 53), Port: 53}
++		if network == "tcp" {
++			remote = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 53), Port: 53}
++		}
++		return &serviceDNSConn{remote: remote, respond: func(b []byte) []byte {
++			if network == "tcp" {
++				b = b[2:]
++			}
++			var p dnsmessage.Parser
++			p.Start(b)
++			q, _ := p.Question()
++			mu.Lock()
++			questions = append(questions, q.Name.String())
++			mu.Unlock()
++			answer := serviceAnswer(t, b, network == "udp", true)
++			if network == "tcp" {
++				var size [2]byte
++				be.PutUint16(size[:], uint16(len(answer)))
++				answer = append(size[:], answer...)
++			}
++			return answer
++		}}, nil
++	}
++	ips, ttl, e := ProfileLookupSnapshot(ctx, "proxy", true, true)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if len(ips) != 3 || ips[0].String() != "203.0.113.9" || ips[1].String() != "203.0.113.10" || ips[2].String() != "2001:db8::9" || ttl != 60 {
++		t.Fatal("RRset/family/CNAME", ips, ttl)
++	}
++	for _, q := range questions {
++		if q != "proxy.example.invalid." {
++			t.Fatal("search changed", q)
++		}
++	}
++	mu.Lock()
++	sort.Strings(networks)
++	got := append([]string(nil), networks...)
++	mu.Unlock()
++	if !reflect.DeepEqual(got, []string{"tcp", "tcp", "udp", "udp"}) {
++		t.Fatal("TCP fallback", got)
++	}
++	if ProfileCheckDNSResult(ctx) == nil {
++		t.Fatal("query-less guard accepted answer")
++	}
++	if ProfileCheckDNSAnswer(ctx, "wrong", ips) == nil {
++		t.Fatal("query binding bypassed")
++	}
++	if ProfileCheckDNSAnswer(ctx, "proxy", []net.IP{net.IPv4(203, 0, 113, 111)}) == nil {
++		t.Fatal("unrelated result promoted")
++	}
++	if e = ProfileCheckDNSAnswer(ctx, "proxy", ips); e != nil {
++		t.Fatal(e)
++	}
++	if ProfileCheckDNSAnswer(ctx, "proxy", ips) == nil {
++		t.Fatal("completion proof replayed")
++	}
++}
++func TestProfileSnapshotFilesHitStillNeedsGrantAndDoesNotDial(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	var dialed bool
++	f.p.dnsDial = func(context.Context, string, string) (net.Conn, error) {
++		dialed = true
++		return nil, errors.New("unexpected socket")
++	}
++	defer serveService(t, f, nil)()
++	ips, _, e := ProfileLookupSnapshot(ctx, "LOCALHOST", true, true)
++	if e != nil || len(ips) != 1 || ips[0].String() != "127.0.0.1" || dialed {
++		t.Fatal("captured files lookup", ips, e, dialed)
++	}
++	if len(f.writes) == 0 || f.writes[0].kind != 16 {
++		t.Fatal("fixture ingress")
++	}
++	if f.c.operations != 0 {
++		t.Fatal("pending service operation leaked")
++	}
++}
++func TestProfileSnapshotMissingAuthorityPeerAndBudgetFailBeforeIO(t *testing.T) {
++	for _, what := range []string{"receipt", "source", "subject", "budget", "wrongpeer", "deny", "cancel"} {
++		t.Run(what, func(t *testing.T) {
++			f, ctx := serviceFixture(t)
++			dialed, wrote := false, false
++			if what == "receipt" {
++				ctx = context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++			}
++			if what == "source" {
++				f.c.manifest.rows[4][0][4] ^= 1
++			}
++			if what == "subject" {
++				be.PutUint16(f.c.manifest.rows[4][0][2:], 0)
++			}
++			if what == "budget" {
++				f.c.buffered = uint64(f.c.manifest.caps[4])
++			}
++			if what == "cancel" {
++				child, cancel := context.WithCancel(ctx)
++				cancel()
++				ctx = child
++			}
++			defer serveService(t, f, func(_ *profileOperation, r *profilePacket) {
++				if what == "deny" {
++					r.body[0] = 2
++					r.object = 0
++				}
++			})()
++			f.p.dnsDial = func(context.Context, string, string) (net.Conn, error) {
++				dialed = true
++				return &serviceDNSConn{remote: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 54), Port: 53}, respond: func([]byte) []byte { wrote = true; return nil }}, nil
++			}
++			ips, _, e := ProfileLookupSnapshot(ctx, "proxy", true, false)
++			if e == nil || len(ips) != 0 || wrote || what != "wrongpeer" && dialed {
++				t.Fatal("closed resolver bypass", what, e, dialed, wrote)
++			}
++		})
++	}
++}
++func TestProfileSnapshotNamesAndFilesIndexMatchPinnedRules(t *testing.T) {
++	f, _ := serviceFixture(t)
++	s := f.p.snapshot
++	for name, want := range map[string][]string{"proxy": {"proxy.example.invalid.", "proxy."}, "a.b": {"a.b.example.invalid.", "a.b."}, "a.b.c": {"a.b.c.", "a.b.c.example.invalid."}, "root.": {"root."}, "private.onion.": nil} {
++		if got := s.names(name); !reflect.DeepEqual(got, want) {
++			t.Fatal(name, got, want)
++		}
++	}
++	if ips := s.files("LOCALHOST.", true, false); len(ips) != 1 || ips[0].String() != "127.0.0.1" {
++		t.Fatal("rooted files alias", ips)
++	}
++}
++
++func TestProfileServiceDNSWireBindsQueryResolverAndNoUserDial(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	defer serveService(t, f, nil)()
++	g, e := f.p.dnsAuthority(ctx, 0, "query.invalid.", "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer f.p.releaseDNS(g)
++	if g.class != 3 || g.receipt != profileReceiptFrom(ctx) || g.subject != 65535 || g.scope != 65535 {
++		t.Fatal("DNS grant scope")
++	}
++	wire := f.writes[len(f.writes)-1].body
++	if wire[8] != 3 || !bytes.Equal(wire[10:18], bytes.Repeat([]byte{255}, 8)) || !bytes.Contains(wire, []byte("query.invalid")) {
++		t.Fatal("AUTHORIZE DNS wire", wire)
++	}
++	if profileEnsureGrant(context.WithValue(ctx, profileGrantKey{}, g), g) == nil {
++		t.Fatal("DNSGrant стал FlowGrant")
++	}
++	f.p.dnsDial = func(context.Context, string, string) (net.Conn, error) {
++		t.Fatal("wrong query reached socket")
++		return nil, nil
++	}
++	request, _ := f.p.dnsRequest("other.invalid.", dnsmessage.TypeA, 16)
++	if _, e = f.p.dnsWire(ctx, g, request); e == nil {
++		t.Fatal("query binding bypassed")
++	}
++}
++
++type serviceBlockedConn struct {
++	serviceDNSConn
++	entered, release, closed chan struct{}
++	readOnce, closeOnce      sync.Once
++}
++
++func (c *serviceBlockedConn) Read(b []byte) (int, error) {
++	c.readOnce.Do(func() { close(c.entered) })
++	select {
++	case <-c.closed:
++		return 0, io.ErrClosedPipe
++	case <-c.release:
++		return c.serviceDNSConn.Read(b)
++	}
++}
++func (c *serviceBlockedConn) Close() error {
++	c.closeOnce.Do(func() { close(c.closed) })
++	return c.serviceDNSConn.Close()
++}
++func TestProfileSnapshotCallersDoNotShareCancelOrCacheAuthority(t *testing.T) {
++	f, ctx1 := serviceFixture(t)
++	r2 := f.admittedReceipt(t, "other-original.invalid")
++	ctx2 := context.WithValue(context.WithValue(r2.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r2)
++	ctx1, cancel1 := context.WithCancel(ctx1)
++	defer cancel1()
++	var authorized atomic.Int32
++	defer serveService(t, f, func(_ *profileOperation, _ *profilePacket) { authorized.Add(1) })()
++	one := &serviceBlockedConn{entered: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
++	two := &serviceBlockedConn{entered: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
++	configure := func(c *serviceBlockedConn) {
++		c.remote = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 53), Port: 53}
++		c.respond = func(b []byte) []byte { return serviceAnswer(t, b, false, false) }
++	}
++	configure(one)
++	configure(two)
++	f.p.dnsDial = func(ctx context.Context, _ string, _ string) (net.Conn, error) {
++		if profileReceiptFrom(ctx) == profileReceiptFrom(ctx1) {
++			return one, nil
++		}
++		return two, nil
++	}
++	type outcome struct {
++		ips []net.IP
++		e   error
++	}
++	result1, result2 := make(chan outcome, 1), make(chan outcome, 1)
++	go func() { ips, _, e := ProfileLookupSnapshot(ctx1, "same", true, false); result1 <- outcome{ips, e} }()
++	go func() { ips, _, e := ProfileLookupSnapshot(ctx2, "same", true, false); result2 <- outcome{ips, e} }()
++	<-one.entered
++	<-two.entered
++	cancel1()
++	first := <-result1
++	if first.e == nil || len(first.ips) != 0 {
++		t.Fatal("cancelled waiter published answer")
++	}
++	select {
++	case <-two.closed:
++		t.Fatal("cancel one closed neighbour DNS")
++	default:
++	}
++	close(two.release)
++	second := <-result2
++	if second.e != nil || len(second.ips) != 2 {
++		t.Fatal("neighbour lost answer", second)
++	}
++	before := authorized.Load()
++	if ips, _, e := ProfileLookupSnapshot(ctx1, "same", true, false); e == nil || len(ips) != 0 || authorized.Load() != before {
++		t.Fatal("cancelled caller inherited cache authority")
++	}
++}
++func TestProfileServiceDNSReservationRetainsFailedLateCleanup(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	stop := serveService(t, f, nil)
++	g, e := f.p.dnsAuthority(ctx, 0, "query.invalid.", "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	stop()
++	entered, release := make(chan struct{}), make(chan struct{})
++	closeError := errors.New("synthetic DNS cleanup Unknown")
++	raw := &serviceDNSConn{remote: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 53), Port: 53}, closeError: closeError}
++	f.p.dnsDial = func(context.Context, string, string) (net.Conn, error) { close(entered); <-release; return raw, nil }
++	result := make(chan error, 1)
++	go func() { _, _, e := f.p.dnsConnection(ctx, g); result <- e }()
++	<-entered
++	f.p.cancel()
++	close(release)
++	if e = <-result; !errors.Is(e, closeError) {
++		t.Fatal("late cleanup error lost", e)
++	}
++	if e = f.p.closeTransports(); !errors.Is(e, closeError) {
++		t.Fatal("shutdown lost custody", e)
++	}
++	s := f.p.transports
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	count := 0
++	for _, entry := range s.objects {
++		if entry != nil {
++			count++
++			if entry.value == nil || !errors.Is(entry.result, closeError) {
++				t.Fatal("Unknown custody cleared")
++			}
++		}
++	}
++	if count != 1 {
++		t.Fatal("failed resource not retained", count)
++	}
++}
++func TestProfileServiceRefreshCannotResurrectExpiredGrant(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	g, op, e := f.c.authorizeDNS(ctx, profileReceiptFrom(ctx), 0, "query.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(op)
++	if e = f.c.accept(serviceReply(f, op)); e != nil {
++		t.Fatal(e)
++	}
++	old := g.deadline
++	f.now = f.now.Add(800 * time.Millisecond)
++	f.c.mu.Lock()
++	refresh, e := f.c.refreshServiceLocked(g)
++	f.c.mu.Unlock()
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.dispatch(refresh)
++	if g.deadline != old {
++		t.Fatal("refresh moved old deadline before reply")
++	}
++	f.now = f.now.Add(201 * time.Millisecond)
++	if e = f.c.accept(serviceReply(f, refresh)); e != nil {
++		t.Fatal(e)
++	}
++	if f.c.grantLive(g) || !g.closed {
++		t.Fatal("expired DNS grant resurrected")
++	}
++}
++
++func TestProfileSnapshotResponseBindsQuestionAndRejectsUnrelatedRRset(t *testing.T) {
++	f, _ := serviceFixture(t)
++	request, _ := f.p.dnsRequest("asked.invalid.", dnsmessage.TypeA, 16)
++	good := serviceAnswer(t, request, false, true)
++	if ips, _, _, e := profileDNSAnswers(request, good, dnsmessage.TypeA); e != nil || len(ips) != 2 {
++		t.Fatal("positive CNAME control", e)
++	}
++	for _, mutation := range []string{"id", "question", "rrcount"} {
++		bad := append([]byte(nil), good...)
++		switch mutation {
++		case "id":
++			bad[0] ^= 1
++		case "question":
++			bad[13] = 'z'
++		case "rrcount":
++			be.PutUint16(bad[6:], 257)
++		}
++		if ips, _, _, e := profileDNSAnswers(request, bad, dnsmessage.TypeA); e == nil || len(ips) != 0 {
++			t.Fatal("untrusted reply accepted", mutation)
++		}
++	}
++	var parser dnsmessage.Parser
++	h, _ := parser.Start(request)
++	q, _ := parser.Question()
++	wrong, _ := dnsmessage.NewName("unrelated.invalid.")
++	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: h.ID, Response: true, RecursionAvailable: true})
++	b.StartQuestions()
++	b.Question(q)
++	b.StartAnswers()
++	b.AResource(dnsmessage.ResourceHeader{Name: wrong, Class: dnsmessage.ClassINET, TTL: 10}, dnsmessage.AResource{A: [4]byte{203, 0, 113, 123}})
++	answer, _ := b.Finish()
++	if ips, _, _, e := profileDNSAnswers(request, answer, dnsmessage.TypeA); e == nil || len(ips) != 0 {
++		t.Fatal("unrelated RRset promoted")
++	}
++}
++func TestProfileSnapshotOwnedLatchOnlyDeniesMissingContext(t *testing.T) {
++	old := profileResolverClosed.Swap(true)
++	defer profileResolverClosed.Store(old)
++	ctx := context.WithValue(context.Background(), "profile", "caller assertion")
++	if !ProfileResolverRequired(ctx) {
++		t.Fatal("owned process enabled live fallback")
++	}
++	if ips, _, e := ProfileLookupSnapshot(ctx, "localhost", true, true); e == nil || len(ips) != 0 {
++		t.Fatal("latch became authority")
++	}
++}
++func TestProfileServiceProbeCallbackPreservesDeadlineAndGrantCancel(t *testing.T) {
++	f, _ := serviceFixture(t)
++	installProbe(f, "203.0.113.7")
++	defer serveService(t, f, nil)()
++	base := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	base, cancel := context.WithTimeout(base, time.Second)
++	defer cancel()
++	probe, release, e := ProfileOpenProbe(base, "a", "https://203.0.113.7/health")
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	callback, cleanup, e := ProfileProbeDialContext(probe, context.WithoutCancel(probe))
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer cleanup()
++	want, _ := base.Deadline()
++	if got, ok := callback.Deadline(); !ok || got != want {
++		t.Fatal("HTTP callback lost deadline")
++	}
++	release()
++	<-callback.Done()
++	if ProfileProbeDialTarget(callback, xnet.TCPDestination(xnet.ParseAddress("203.0.113.7"), 443)) == nil {
++		t.Fatal("cancelled callback still authorized")
++	}
++}
++
++func TestProfileDNSQueryScopePreflightAndAnswerIsolation(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	saved := f.c.buffered
++	f.c.buffered = uint64(f.c.manifest.caps[4])
++	if n := testing.AllocsPerRun(100, func() {
++		if _, _, e := ProfileDNSQueryContext(ctx, "query.invalid"); e == nil {
++			t.Fatal("overflow scope")
++		}
++	}); n != 0 {
++		t.Fatal("overflow allocated", n)
++	}
++	f.c.buffered = saved
++	defer serveService(t, f, nil)()
++	one, closeOne, e := ProfileDNSQueryContext(ctx, "localhost")
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer closeOne()
++	two, closeTwo, e := ProfileDNSQueryContext(ctx, "two.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer closeTwo()
++	ips, _, e := ProfileLookupSnapshot(one, "localhost", true, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if ProfileCheckDNSAnswer(two, "two.invalid", ips) == nil {
++		t.Fatal("parallel query inherited neighbour answer")
++	}
++	if ProfileCheckDNSAnswer(one, "localhost", []net.IP{net.IPv4(203, 0, 113, 11)}) == nil {
++		t.Fatal("child answer promoted")
++	}
++	if e = ProfileCheckDNSAnswer(one, "localhost", ips); e != nil {
++		t.Fatal(e)
++	}
++	if ProfileCheckDNSAnswer(one, "localhost", ips) == nil {
++		t.Fatal("answer receipt reused")
++	}
++}
++
++type serviceHeldCloseConn struct {
++	*serviceBlockedConn
++	cleanupEntered, cleanupRelease chan struct{}
++	cleanupOnce                    sync.Once
++}
++
++func (c *serviceHeldCloseConn) Close() error {
++	c.cleanupOnce.Do(func() { close(c.cleanupEntered); <-c.cleanupRelease })
++	return c.serviceBlockedConn.Close()
++}
++func TestProfileDNSQueryCreditsRemainUntilCancelledLookupExits(t *testing.T) {
++	f, ctx := serviceFixture(t)
++	defer serveService(t, f, nil)()
++	ctx, scopeClose, e := ProfileDNSQueryContext(ctx, "held.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer scopeClose()
++	q := profileQueryFrom(ctx)
++	raw := &serviceHeldCloseConn{serviceBlockedConn: &serviceBlockedConn{entered: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}, cleanupEntered: make(chan struct{}), cleanupRelease: make(chan struct{})}
++	raw.remote = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 53), Port: 53}
++	raw.respond = func(b []byte) []byte { return serviceAnswer(t, b, false, false) }
++	f.p.dnsDial = func(context.Context, string, string) (net.Conn, error) { return raw, nil }
++	result := make(chan error, 1)
++	go func() { _, _, e := ProfileLookupSnapshot(ctx, "held.invalid", true, false); result <- e }()
++	<-raw.entered
++	scopeClose()
++	<-raw.cleanupEntered
++	f.c.mu.Lock()
++	held := q.refs == 1 && f.c.dnsQueries[q.slot] == q && f.c.buffered >= profileDNSLookupCredit
++	f.c.mu.Unlock()
++	close(raw.cleanupRelease)
++	if e = <-result; e == nil || !held {
++		t.Fatal("cancel released live lookup credits", held, e)
++	}
++	f.c.mu.Lock()
++	if q.refs != 0 || f.c.dnsQueries[q.slot] != nil {
++		t.Fatal("finished lookup retained reservation")
++	}
++	before := f.c.buffered
++	f.c.mu.Unlock()
++	scopeClose()
++	f.c.mu.Lock()
++	after := f.c.buffered
++	f.c.mu.Unlock()
++	if before != after {
++		t.Fatal("duplicate scope release")
++	}
++}
++
++func TestProfileServiceFixedMetadataFitsReservedBudget(t *testing.T) {
++	// Closed query scopes могут удерживаться grant/op contexts до tick. Между
++	// ticks admission допускает максимум256 requests через tombstone reservation.
++	fixed := unsafe.Sizeof(profileFlowControl{}) +
++		4096*(unsafe.Sizeof(profileReceipt{})+unsafe.Sizeof(profileGrant{})+unsafe.Sizeof(profileAccepted{})+unsafe.Sizeof(profileFlowReader{})+unsafe.Sizeof(profileFlowWriter{})) +
++		64*(unsafe.Sizeof(profileOperation{})+2048) + 256*(unsafe.Sizeof(profileDNSQuery{})+1024) +
++		128*(unsafe.Sizeof(ProfilePool{})+unsafe.Sizeof(profilePhysicalConn{})+unsafe.Sizeof(profileResourceCustody{})+1024) + 256*1024
++	if fixed > profileFlowFixedCredit {
++		t.Fatal("fixed metadata exceeds preflight reservation", fixed, profileFlowFixedCredit)
++	}
++}
+diff --git a/common/yonikbroker/profile_service_linux.go b/common/yonikbroker/profile_service_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_service_linux.go
+@@ -0,0 +1,412 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"net"
++	"net/netip"
++	"net/url"
++	"strconv"
++	"strings"
++	"time"
++
++	xnet "github.com/xtls/xray-core/common/net"
++)
++
++func profileGrantCredit(g *profileGrant) uint64 {
++	return uint64((len(g.effective.address)+15)&^15) + uint64((len(g.query)+15)&^15)
++}
++func profileDecodedDestination(b []byte) (profileDestinationValue, bool) {
++	c := profileCursor{b: b}
++	h := c.take(8)
++	if h == nil {
++		return profileDestinationValue{}, false
++	}
++	a := c.take(int(u16(h, 4)))
++	v := profileDestinationValue{family: h[0], network: h[1], port: u16(h, 2), address: string(a)}
++	if h[0] != 3 {
++		ip, ok := netip.AddrFromSlice(a)
++		if !ok {
++			return v, false
++		}
++		v.address = ip.String()
++	}
++	return v, !c.bad && v.valid()
++}
++func (c *profileFlowControl) resolverPeer(index uint16, system bool) (profileDestinationValue, bool) {
++	if int(index) >= len(c.manifest.rows[4]) {
++		return profileDestinationValue{}, false
++	}
++	row := c.manifest.rows[4][index]
++	if system && row[0] != 2 {
++		return profileDestinationValue{}, false
++	}
++	v, ok := profileDecodedDestination(row[36:])
++	return v, ok && v.family != 3 && row[1] == v.network
++}
++func (c *profileFlowControl) allocateService(ctx context.Context, r *profileReceipt, g *profileGrant, kind uint16, body []byte) (*profileGrant, *profileOperation, error) {
++	if ctx == nil || ctx.Err() != nil || !c.live() || !c.operationAvailable() || r != nil && (!c.receiptLive(r) || r.id == 0) {
++		return nil, nil, errProfile
++	}
++	slot := -1
++	for i, item := range c.grants {
++		if item == nil && i < int(c.manifest.caps[0]) {
++			slot = i
++			break
++		}
++	}
++	extra := profileGrantCredit(g)
++	if slot < 0 || c.buffered+extra+c.manifest.memoryCredit > uint64(c.manifest.caps[4]) {
++		return nil, nil, errProfileFlowBusy
++	}
++	g.ctx, g.cancel = context.WithCancel(ctx)
++	g.slot, g.receipt = uint16(slot), r
++	c.grants[slot] = g
++	c.buffered += extra
++	if r != nil {
++		r.grantCount++
++	}
++	op, e := c.operation(g.ctx, r, g, kind, 0, body)
++	if e != nil {
++		c.closeGrant(g)
++	}
++	return g, op, e
++}
++func (c *profileFlowControl) dnsBody(g *profileGrant) []byte {
++	b := make([]byte, 20)
++	be.PutUint64(b, g.receipt.id)
++	b[8] = 3
++	for _, offset := range []int{10, 12, 14, 16} {
++		be.PutUint16(b[offset:], 65535)
++	}
++	b = append(b, g.receipt.original.encode()...)
++	b = append(b, g.effective.encode()...)
++	var field [4]byte
++	be.PutUint16(field[:], g.resolver)
++	be.PutUint16(field[2:], uint16(len(g.query)))
++	b = append(b, field[:]...)
++	b = append(b, g.query...)
++	b = append(b, make([]byte, 16)...)
++	return b
++}
++func (c *profileFlowControl) authorizeDNS(ctx context.Context, r *profileReceipt, index uint16, query string) (*profileGrant, *profileOperation, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	peer, ok := c.resolverPeer(index, false)
++	if !ok || !profileDomain([]byte(query)) || r == nil {
++		return nil, nil, errProfile
++	}
++	g := &profileGrant{class: 3, resolver: index, query: query, effective: peer, subject: 65535, scope: 65535, stream: 65535, chain: 65535, receipt: r, bound: true}
++	return c.allocateService(ctx, r, g, 18, c.dnsBody(g))
++}
++func profileProbeBody(g *profileGrant) []byte {
++	b := make([]byte, 8)
++	be.PutUint16(b, g.purpose)
++	be.PutUint16(b[2:], g.serviceIndex)
++	be.PutUint16(b[4:], g.subject)
++	be.PutUint16(b[6:], g.resolver)
++	return b
++}
++func (c *profileFlowControl) probe(ctx context.Context, purpose, index, subject, resolver uint16) (*profileGrant, *profileOperation, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if int(subject) >= len(c.manifest.rows[0]) {
++		return nil, nil, errProfile
++	}
++	g := &profileGrant{class: 2, purpose: purpose, serviceIndex: index, subject: subject, resolver: resolver, chain: 65535, stream: 65535, scope: 65535}
++	if purpose == 1 {
++		if int(index) >= len(c.manifest.rows[7]) || resolver != 65535 {
++			return nil, nil, errProfile
++		}
++		row := c.manifest.rows[7][index]
++		cur := profileCursor{b: row[4:]}
++		host := string(cur.str(253))
++		cur.str(2048)
++		n := int(cur.n16())
++		found := false
++		for i := 0; i < n; i++ {
++			if cur.n16() == subject {
++				found = true
++			}
++		}
++		if !found || !cur.done() {
++			return nil, nil, errProfile
++		}
++		g.effective = profileDestinationValue{family: 3, network: 6, port: u16(row, 2), address: host}
++		if ip, e := netip.ParseAddr(host); e == nil {
++			g.effective.family = 6
++			if ip.Is4() {
++				g.effective.family = 4
++			}
++		}
++		s := c.manifest.rows[0][subject]
++		g.scope = u16(s, len(s)-4)
++	} else if purpose == 2 {
++		if int(index) >= len(c.manifest.rows[1]) {
++			return nil, nil, errProfile
++		}
++		ep, ok := profileDecodedDestination(c.manifest.rows[1][index])
++		if !ok || ep.family != 3 {
++			return nil, nil, errProfile
++		}
++		found := false
++		for _, s := range c.manifest.rows[8] {
++			if u16(s, 0) == subject && (s[20] == 1 && u16(s, 8) == index || s[21] == 1 && u16(s, 10) == index) {
++				found = true
++			}
++		}
++		peer, ok := c.resolverPeer(resolver, true)
++		if !found || !ok {
++			return nil, nil, errProfile
++		}
++		g.class, g.query, g.effective, g.bound = 3, ep.address, peer, true
++	} else {
++		return nil, nil, errProfile
++	}
++	return c.allocateService(ctx, nil, g, 20, profileProbeBody(g))
++}
++func (c *profileFlowControl) refreshServiceLocked(g *profileGrant) (*profileOperation, error) {
++	if !c.grantLive(g) || g.id == 0 {
++		return nil, errProfile
++	}
++	if g.refresh != nil {
++		return g.refresh, nil
++	}
++	kind, body := uint16(20), profileProbeBody(g)
++	if g.receipt != nil {
++		kind, body = 18, c.dnsBody(g)
++	}
++	op, e := c.operation(g.ctx, g.receipt, g, kind, g.id, body)
++	if e == nil {
++		g.refresh = op
++	}
++	return op, e
++}
++func (c *profileFlowControl) publishService(op *profileOperation, f profilePacket) error {
++	g, b := op.grant, f.body
++	flow, revision := uint64(0), c.manifest.policy
++	// Только private original receipt связывает USER DNS с System attribution.
++	if g.receipt != nil {
++		if g.class != 3 || g.purpose != 0 || op.kind != 18 || op.receipt != g.receipt || !c.receiptLive(g.receipt) || g.receipt.id == 0 {
++			return errProfile
++		}
++		flow, revision = g.receipt.id, g.receipt.revision
++	} else if op.kind != 20 || op.receipt != nil || g.purpose == 0 {
++		return errProfile
++	}
++	required := byte(0)
++	if c.mode == 2 && g.receipt != nil {
++		required = 1
++	}
++	if f.kind != 19 || len(b) != 56 || b[0] != 1 || b[1] != g.class || b[2] != required || b[3] != 0 || u64(b, 4) == 0 || f.object != u64(b, 4) || u64(b, 12) != flow || u32(b, 20) == 0 || u32(b, 20) > 1000 || u64(b, 24) != revision || !zero(b[41:48]) {
++		return errProfile
++	}
++	ownerNS, ownerKind, ownerID := u64(b, 32), b[40], u64(b, 48)
++	if required == 0 {
++		if ownerNS != 0 || ownerKind != 0 || ownerID != 0 {
++			return errProfile
++		}
++	} else if ownerNS == 0 || ownerNS > uint64(20*time.Millisecond) || ownerKind < 1 || ownerKind > 2 || ownerID == 0 {
++		return errProfile
++	}
++	id := u64(b, 4)
++	if op.object == 0 {
++		if id <= c.highestGrant {
++			return errProfile
++		}
++	} else if id != op.object || g.id != id || !c.grantLive(g) {
++		return errProfile
++	}
++	deadline := op.sent.Add(time.Duration(u32(b, 20)) * time.Millisecond)
++	if op.sessionDeadline.Before(deadline) {
++		deadline = op.sessionDeadline
++	}
++	ownerDeadline := op.sent.Add(time.Duration(ownerNS))
++	if op.object != 0 && ownerKind == g.ownerKind && ownerID == g.ownerID && g.ownerDeadline.Before(ownerDeadline) {
++		ownerDeadline = g.ownerDeadline
++	}
++	if !c.clock().Before(deadline) || required == 1 && !c.clock().Before(ownerDeadline) {
++		return errProfile
++	}
++	g.id, g.deadline, g.revision = id, deadline, revision
++	g.ownerDeadline, g.ownerKind, g.ownerID = ownerDeadline, ownerKind, ownerID
++	if id > c.highestGrant {
++		c.highestGrant = id
++	}
++	return nil
++}
++func profileEnsureService(ctx context.Context, g *profileGrant) error {
++	p := profileRuntime(ctx)
++	if p == nil || g == nil || g.class != 2 && g.class != 3 || ctx.Err() != nil || !p.flowFresh() {
++		return errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	if !c.grantLive(g) {
++		c.mu.Unlock()
++		return errProfile
++	}
++	renew := g.deadline.Sub(c.clock()) <= 250*time.Millisecond || c.serviceOwnerRequired(g) && g.ownerDeadline.Sub(c.clock()) <= 5*time.Millisecond
++	var op *profileOperation
++	var e error
++	if renew {
++		op, e = c.refreshServiceLocked(g)
++	}
++	c.mu.Unlock()
++	if e != nil {
++		return e
++	}
++	if op != nil {
++		if e = p.flowRPC(op); e != nil {
++			return e
++		}
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.grantLive(g) || c.serviceOwnerRequired(g) && !c.clock().Before(g.ownerDeadline) {
++		return errProfile
++	}
++	return nil
++}
++func (c *profileFlowControl) serviceOwnerRequired(g *profileGrant) bool {
++	return c.mode == 2 && g.class == 3 && g.receipt != nil
++}
++func profileServiceGrant(ctx context.Context) *profileGrant {
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if g != nil && g.class == 2 {
++		return g
++	}
++	return nil
++}
++func profileSourceValid(ctx context.Context) error {
++	if g := profileServiceGrant(ctx); g != nil {
++		return profileEnsureService(ctx, g)
++	}
++	return ProfileOriginalValid(ctx)
++}
++func profileProbeTarget(ctx context.Context, target profileDestinationValue, subject *uint16) error {
++	g := profileServiceGrant(ctx)
++	if profileEnsureService(ctx, g) != nil || target != g.effective || subject != nil && *subject != g.subject {
++		return errProfile
++	}
++	return nil
++}
++
++// URL/tag выбирают только exact manifest scope. Authority приходит из GRANT.
++func ProfileOpenProbe(ctx context.Context, tag, rawURL string) (context.Context, func(), error) {
++	p := profileRuntime(ctx)
++	noop := func() {}
++	if p == nil {
++		return ctx, noop, nil
++	}
++	if len(rawURL) > 253+2048+32 || len(tag) > 160 || !p.flowFresh() || len(p.flow.manifest.rows[7]) != 1 {
++		return ctx, noop, errProfile
++	}
++	row := p.flow.manifest.rows[7][0]
++	cur := profileCursor{b: row[4:]}
++	host, path := string(cur.str(253)), string(cur.str(2048))
++	u, e := url.Parse(rawURL)
++	scheme := "http"
++	if row[0] == 2 {
++		scheme = "https"
++	}
++	if e != nil || u.User != nil || u.Fragment != "" || u.Hostname() != host || u.Scheme != scheme {
++		return ctx, noop, errProfile
++	}
++	port := u.Port()
++	if port == "" {
++		port = "80"
++		if u.Scheme == "https" {
++			port = "443"
++		}
++	}
++	actualPath := u.EscapedPath()
++	if actualPath == "" {
++		actualPath = "/"
++	}
++	if u.RawQuery != "" || u.ForceQuery {
++		actualPath += "?" + u.RawQuery
++	}
++	portValue, portError := strconv.ParseUint(port, 10, 16)
++	if portError != nil || uint16(portValue) != u16(row, 2) || actualPath != path {
++		return ctx, noop, errProfile
++	}
++	subject, ok := profileSubject(&p.flow.manifest, tag)
++	if !ok {
++		return ctx, noop, errProfile
++	}
++	g, op, e := p.flow.probe(ctx, 1, 0, subject, 65535)
++	if e != nil {
++		return ctx, noop, e
++	}
++	if e = p.flowRPC(op); e != nil {
++		return ctx, noop, e
++	}
++	return context.WithValue(g.ctx, profileGrantKey{}, g), func() { p.flow.mu.Lock(); p.flow.closeGrant(g); p.flow.mu.Unlock() }, nil
++}
++
++func profileBindProbe(ctx context.Context, route profileSelectedRoute, branch byte) (context.Context, func(), error) {
++	p := profileRuntime(ctx)
++	g := profileServiceGrant(ctx)
++	noop := func() {}
++	if profileProbeTarget(ctx, route.effective, &route.subject) != nil {
++		return ctx, noop, errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	s := c.manifest.rows[8][g.scope]
++	if branch > 1 || s[3]&(1<<branch) == 0 || g.bound && g.branch != branch {
++		return ctx, noop, errProfile
++	}
++	if g.bound {
++		return ctx, noop, nil
++	}
++	g.branch, g.stream, g.chain, g.bound = branch, u16(s, 12+int(branch)*2), u16(s, 16+int(branch)*2), true
++	return ctx, noop, nil
++}
++
++func profileResolverAddress(v profileDestinationValue) string {
++	return net.JoinHostPort(v.address, strconv.Itoa(int(v.port)))
++}
++func profileCanonicalQuery(name string) string { return strings.ToLower(strings.TrimSuffix(name, ".")) }
++func ProfileProbeDialContext(parent, callback context.Context) (context.Context, func(), error) {
++	if parent == nil || callback == nil || parent.Err() != nil || callback.Err() != nil {
++		return nil, func() {}, errProfile
++	}
++	g := profileServiceGrant(parent)
++	if ProfileSession(parent) && (profileEnsureService(parent, g) != nil || profileRuntime(callback) != nil && profileRuntime(callback) != profileRuntime(parent)) {
++		return nil, func() {}, errProfile
++	}
++	base := CarryProfileSession(parent, callback)
++	deadline, hasDeadline := parent.Deadline()
++	if other, ok := callback.Deadline(); ok && (!hasDeadline || other.Before(deadline)) {
++		deadline, hasDeadline = other, true
++	}
++	var ctx context.Context
++	var cancel context.CancelFunc
++	if hasDeadline {
++		ctx, cancel = context.WithDeadline(base, deadline)
++	} else {
++		ctx, cancel = context.WithCancel(base)
++	}
++	stop := context.AfterFunc(parent, cancel)
++	stopGrant := func() bool { return false }
++	if g != nil {
++		ctx = context.WithValue(ctx, profileGrantKey{}, g)
++		stopGrant = context.AfterFunc(g.ctx, cancel)
++	}
++	return ctx, func() { stop(); stopGrant(); cancel() }, nil
++}
++
++func ProfileProbeDialTarget(ctx context.Context, target xnet.Destination) error {
++	if !ProfileSession(ctx) {
++		return nil
++	}
++	v, e := profileValue(target)
++	if e != nil {
++		return e
++	}
++	return profileProbeTarget(ctx, v, nil)
++}
+diff --git a/common/yonikbroker/profile_resolver_linux.go b/common/yonikbroker/profile_resolver_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_resolver_linux.go
+@@ -0,0 +1,571 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"errors"
++	"net"
++	"net/netip"
++	"sort"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"golang.org/x/net/dns/dnsmessage"
++)
++
++// Latch только запрещает legacy fallback после authenticated owned launch.
++// Он не хранит runtime и не выдаёт authority callers без private context.
++var profileResolverClosed atomic.Bool
++
++func ProfileResolverRequired(ctx context.Context) bool {
++	return ProfileSession(ctx) || profileResolverClosed.Load()
++}
++
++var errProfileDNSMissing = errors.New("snapshot DNS name not found")
++
++func (s *profileSnapshot) names(name string) []string {
++	if len(name) == 0 || len(name) > 254 || len(name) == 254 && !strings.HasSuffix(name, ".") {
++		return nil
++	}
++	avoid := func(n string) bool { return strings.HasSuffix(strings.ToLower(strings.TrimSuffix(n, ".")), ".onion") }
++	if strings.HasSuffix(name, ".") {
++		if avoid(name) {
++			return nil
++		}
++		return []string{name}
++	}
++	first := strings.Count(name, ".") >= int(s.ndots)
++	name += "."
++	result := make([]string, 0, s.searchCount+1)
++	if first && !avoid(name) {
++		result = append(result, name)
++	}
++	for _, suffix := range s.search[:s.searchCount] {
++		candidate := name + string(suffix)
++		if len(candidate) <= 254 && !avoid(candidate) {
++			result = append(result, candidate)
++		}
++	}
++	if !first && !avoid(name) {
++		result = append(result, name)
++	}
++	return result
++}
++func (s *profileSnapshot) files(name string, v4, v6 bool) []net.IP {
++	key := profileCanonicalQuery(name)
++	if strings.Contains(key, ".") {
++		key += "."
++	}
++	i := sort.Search(s.hostCount, func(i int) bool { c := profileCursor{b: s.hosts[i]}; return string(c.str(253)) >= key })
++	if i == s.hostCount {
++		return nil
++	}
++	c := profileCursor{b: s.hosts[i]}
++	if string(c.str(253)) != key {
++		return nil
++	}
++	count := int(c.n16())
++	ips := make([]net.IP, 0, count)
++	for j := 0; j < count; j++ {
++		family := c.take(1)[0]
++		n := 4
++		if family == 6 {
++			n = 16
++		}
++		ip := c.take(n)
++		if family == 4 && v4 || family == 6 && v6 {
++			ips = append(ips, append(net.IP(nil), ip...))
++		}
++	}
++	return ips
++}
++func (p *ProfileRuntime) snapshotRow(peer int, network byte) (uint16, bool) {
++	s := p.snapshot
++	for i, row := range p.flow.manifest.rows[4] {
++		// Internal DNS-subject paths требуют собственного typed caller binding;
++		// default localdns не подставляет себе другой admitted subject.
++		if row[0] != 2 || row[1] != network || u16(row, 2) != 65535 {
++			continue
++		}
++		v, ok := profileDecodedDestination(row[36:])
++		if ok && v.family == s.families[peer] {
++			a, _ := netip.ParseAddr(v.address)
++			if bytes.Equal(a.AsSlice(), s.peers[peer]) && bytes.Equal(row[4:36], s.encoded[16:48]) {
++				return uint16(i), true
++			}
++		}
++	}
++	return 0, false
++}
++func (p *ProfileRuntime) dnsAuthority(ctx context.Context, index uint16, query, origin string) (*profileGrant, error) {
++	if q := profileQueryFrom(ctx); q != nil {
++		ctx = q.ctx
++	}
++	var g *profileGrant
++	var op *profileOperation
++	var e error
++	if pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); pool != nil {
++		if pool.state.runtime != p || pool.endpoint.address != origin {
++			return nil, errProfile
++		}
++		if _, e := pool.Context(ctx); e != nil {
++			return nil, e
++		}
++		row := p.flow.manifest.rows[8][pool.scope]
++		ep := u16(row, 8+int(pool.branch)*2)
++		g, op, e = p.flow.probe(ctx, 2, ep, u16(row, 0), index)
++	} else {
++		r := profileReceiptFrom(ctx)
++		if r == nil {
++			return nil, ErrProfileUnsupported
++		}
++		g, op, e = p.flow.authorizeDNS(ctx, r, index, profileCanonicalQuery(query))
++	}
++	if e != nil {
++		return nil, e
++	}
++	if e = p.flowRPC(op); e != nil {
++		return nil, e
++	}
++	return g, nil
++}
++func (p *ProfileRuntime) releaseDNS(g *profileGrant) {
++	p.flow.mu.Lock()
++	p.flow.closeGrant(g)
++	p.flow.mu.Unlock()
++}
++func (p *ProfileRuntime) dnsRequest(name string, qtype dnsmessage.Type, flags uint16) ([]byte, error) {
++	qname, e := dnsmessage.NewName(name)
++	if e != nil {
++		return nil, e
++	}
++	var id uint16
++	if p.dnsID != nil {
++		id = p.dnsID()
++	} else {
++		var b [2]byte
++		if _, e = rand.Read(b[:]); e != nil {
++			return nil, e
++		}
++		id = u16(b[:], 0)
++	}
++	b := dnsmessage.NewBuilder(make([]byte, 0, 512), dnsmessage.Header{ID: id, RecursionDesired: true, AuthenticData: flags&8 != 0})
++	if e = b.StartQuestions(); e != nil {
++		return nil, e
++	}
++	if e = b.Question(dnsmessage.Question{Name: qname, Type: qtype, Class: dnsmessage.ClassINET}); e != nil {
++		return nil, e
++	}
++	if flags&16 != 0 {
++		if e = b.StartAdditionals(); e != nil {
++			return nil, e
++		}
++		var h dnsmessage.ResourceHeader
++		if e = h.SetEDNS0(1232, dnsmessage.RCodeSuccess, false); e != nil {
++			return nil, e
++		}
++		if e = b.OPTResource(h, dnsmessage.OPTResource{}); e != nil {
++			return nil, e
++		}
++	}
++	return b.Finish()
++}
++func profileDNSQuestionMatch(request, response []byte) bool {
++	var q, r dnsmessage.Parser
++	qh, e := q.Start(request)
++	if e != nil {
++		return false
++	}
++	rh, e := r.Start(response)
++	if e != nil || !rh.Response || rh.ID != qh.ID || rh.OpCode != 0 {
++		return false
++	}
++	qq, e := q.Question()
++	if e != nil {
++		return false
++	}
++	rq, e := r.Question()
++	if e != nil || qq.Type != rq.Type || qq.Class != rq.Class || !strings.EqualFold(qq.Name.String(), rq.Name.String()) {
++		return false
++	}
++	return r.SkipQuestion() == dnsmessage.ErrSectionDone
++}
++
++type profileDNSRecord struct {
++	name, alias string
++	ip          netip.Addr
++	ttl         uint32
++	kind        dnsmessage.Type
++}
++
++func profileDNSAnswers(request, response []byte, qtype dnsmessage.Type) ([]net.IP, uint32, bool, error) {
++	if len(response) < 12 {
++		return nil, 0, false, errProfile
++	}
++	// До RR/string materialization; весь response также ограничен DNS wire length.
++	if int(u16(response, 6))+int(u16(response, 8))+int(u16(response, 10)) > 256 {
++		return nil, 0, false, errProfileFlowBusy
++	}
++	if !profileDNSQuestionMatch(request, response) {
++		return nil, 0, false, errProfile
++	}
++	var parser dnsmessage.Parser
++	h, e := parser.Start(response)
++	if e != nil {
++		return nil, 0, false, e
++	}
++	q, e := parser.Question()
++	if e != nil {
++		return nil, 0, false, e
++	}
++	parser.SkipAllQuestions()
++	if h.RCode == dnsmessage.RCodeNameError {
++		return nil, 0, h.Truncated, errProfileDNSMissing
++	}
++	if h.RCode != dnsmessage.RCodeSuccess {
++		return nil, 0, h.Truncated, errProfile
++	}
++	var records [256]profileDNSRecord
++	count := 0
++	for {
++		rh, e := parser.AnswerHeader()
++		if e == dnsmessage.ErrSectionDone {
++			break
++		}
++		if e != nil {
++			return nil, 0, h.Truncated, e
++		}
++		v := profileDNSRecord{name: strings.ToLower(rh.Name.String()), ttl: rh.TTL, kind: rh.Type}
++		if !profileDNSName([]byte(v.name), false) {
++			return nil, 0, h.Truncated, errProfile
++		}
++		if rh.Class != dnsmessage.ClassINET {
++			if e = parser.SkipAnswer(); e != nil {
++				return nil, 0, h.Truncated, e
++			}
++			continue
++		}
++		switch rh.Type {
++		case dnsmessage.TypeA:
++			r, e := parser.AResource()
++			if e != nil {
++				return nil, 0, h.Truncated, e
++			}
++			v.ip = netip.AddrFrom4(r.A)
++		case dnsmessage.TypeAAAA:
++			r, e := parser.AAAAResource()
++			if e != nil {
++				return nil, 0, h.Truncated, e
++			}
++			v.ip = netip.AddrFrom16(r.AAAA)
++		case dnsmessage.TypeCNAME:
++			r, e := parser.CNAMEResource()
++			if e != nil {
++				return nil, 0, h.Truncated, e
++			}
++			v.alias = strings.ToLower(r.CNAME.String())
++			if !profileDNSName([]byte(v.alias), false) {
++				return nil, 0, h.Truncated, errProfile
++			}
++		default:
++			if e = parser.SkipAnswer(); e != nil {
++				return nil, 0, h.Truncated, e
++			}
++			continue
++		}
++		records[count] = v
++		count++
++	}
++	if e = parser.SkipAllAuthorities(); e != nil {
++		return nil, 0, h.Truncated, e
++	}
++	for {
++		rh, e := parser.AdditionalHeader()
++		if e == dnsmessage.ErrSectionDone {
++			break
++		}
++		if e != nil {
++			return nil, 0, h.Truncated, e
++		}
++		if rh.Type == dnsmessage.TypeOPT && rh.ExtendedRCode(h.RCode) != dnsmessage.RCodeSuccess {
++			return nil, 0, h.Truncated, errProfile
++		}
++		if e = parser.SkipAdditional(); e != nil {
++			return nil, 0, h.Truncated, e
++		}
++	}
++	sort.Slice(records[:count], func(i, j int) bool { return records[i].name < records[j].name })
++	name := strings.ToLower(q.Name.String())
++	ttl := uint32(300)
++	var visited [16]string
++	for depth := 0; depth < len(visited); depth++ {
++		for _, old := range visited[:depth] {
++			if old == name {
++				return nil, 0, h.Truncated, errProfile
++			}
++		}
++		visited[depth] = name
++		i := sort.Search(count, func(i int) bool { return records[i].name >= name })
++		ips := make([]net.IP, 0, 4)
++		alias := ""
++		for ; i < count && records[i].name == name; i++ {
++			r := records[i]
++			if r.ttl < ttl {
++				ttl = r.ttl
++			}
++			if r.kind == dnsmessage.TypeCNAME {
++				if alias != "" && alias != r.alias {
++					return nil, 0, h.Truncated, errProfile
++				}
++				alias = r.alias
++			} else if r.kind == qtype && r.ip.IsValid() {
++				ips = append(ips, append(net.IP(nil), r.ip.AsSlice()...))
++			}
++		}
++		if alias != "" {
++			if len(ips) != 0 {
++				return nil, 0, h.Truncated, errProfile
++			}
++			name = alias
++			continue
++		}
++		if len(ips) == 0 {
++			return nil, 0, h.Truncated, errProfileDNSMissing
++		}
++		return ips, ttl, h.Truncated, nil
++	}
++	return nil, 0, h.Truncated, errProfile
++}
++func (p *ProfileRuntime) snapshotOne(ctx context.Context, origin, name string, qtype dnsmessage.Type) ([]net.IP, uint32, error) {
++	s := p.snapshot
++	offset := uint32(0)
++	if s.flags&1 != 0 {
++		offset = s.rotation.Add(1) - 1
++	}
++	request, e := p.dnsRequest(name, qtype, s.flags)
++	if e != nil {
++		return nil, 0, e
++	}
++	var last error = errProfileDNSMissing
++	for attempt := 0; attempt < int(s.attempts); attempt++ {
++		for j := 0; j < s.count; j++ {
++			peer := int((offset + uint32(j)) % uint32(s.count))
++			network := byte(17)
++			if s.flags&4 != 0 {
++				network = 6
++			}
++			for {
++				index, ok := p.snapshotRow(peer, network)
++				if !ok {
++					return nil, 0, errProfile
++				}
++				g, e := p.dnsAuthority(ctx, index, name, origin)
++				if e != nil {
++					return nil, 0, e
++				}
++				query, cancel := context.WithTimeout(ctx, time.Duration(s.timeout)*time.Millisecond)
++				response, e := p.dnsWire(query, g, request)
++				var ips []net.IP
++				var ttl uint32
++				var truncated bool
++				if e == nil {
++					truncated = network == 17 && len(response) >= 4 && profileDNSQuestionMatch(request, response) && response[2]&2 != 0
++					if !truncated {
++						ips, ttl, _, e = profileDNSAnswers(request, response, qtype)
++					}
++				}
++				if profileEnsureService(query, g) != nil {
++					e = errProfile
++					ips = nil
++				}
++				cancel()
++				if e == nil && !truncated {
++					e = p.keepDNSGrant(ctx, g)
++				}
++				if e != nil || truncated {
++					p.releaseDNS(g)
++				}
++				if ctx.Err() != nil {
++					return nil, 0, ctx.Err()
++				}
++				if truncated && network == 17 {
++					network = 6
++					continue
++				}
++				if e == nil {
++					return ips, ttl, nil
++				}
++				if errors.Is(e, errProfileDNSMissing) {
++					return nil, 0, e
++				}
++				last = e
++				break
++			}
++		}
++	}
++	return nil, 0, last
++}
++
++// Нет общего cache/singleflight: pinned netgo не кеширует ответы; каждый caller
++// получает свой query grant, deadline, socket и post-result fence.
++func ProfileLookupSnapshot(ctx context.Context, name string, v4, v6 bool) ([]net.IP, uint32, error) {
++	if ctx == nil {
++		return nil, 0, errProfile
++	}
++	own := profileQueryFrom(ctx) == nil
++	scoped, release, e := ProfileDNSQueryContext(ctx, name)
++	if e != nil {
++		return nil, 0, e
++	}
++	defer release()
++	ips, ttl, e := profileLookupSnapshot(scoped, name, v4, v6)
++	if e == nil && own {
++		e = ProfileCheckDNSAnswer(scoped, name, ips)
++	}
++	if e != nil {
++		return nil, 0, e
++	}
++	return ips, ttl, nil
++}
++func profileLookupSnapshot(ctx context.Context, name string, v4, v6 bool) ([]net.IP, uint32, error) {
++	p := profileRuntime(ctx)
++	if p == nil || ctx == nil || ctx.Err() != nil || !p.flowFresh() || p.snapshot == nil || !v4 && !v6 || !profileDNSName([]byte(name), false) {
++		return nil, 0, errProfile
++	}
++	q := profileQueryFrom(ctx)
++	if q == nil || q.runtime != p {
++		return nil, 0, errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	if !q.liveLocked() || q.refs != 0 || q.ready {
++		c.mu.Unlock()
++		return nil, 0, errProfile
++	}
++	q.refs++
++	c.mu.Unlock()
++	defer func() { c.mu.Lock(); q.refs--; q.releaseLocked(); c.mu.Unlock() }()
++	if ip, e := netip.ParseAddr(name); e == nil {
++		ip = ip.Unmap()
++		if ip.Zone() != "" || ip.Is4() && !v4 || ip.Is6() && !v6 {
++			return nil, 0, errProfileDNSMissing
++		}
++		c.mu.Lock()
++		q.literal = true
++		c.mu.Unlock()
++		return p.snapshotResult(ctx, []net.IP{append(net.IP(nil), ip.AsSlice()...)}, 300)
++	}
++	query, cancel := context.WithCancel(ctx)
++	defer cancel()
++	stop := context.AfterFunc(p.ctx, cancel)
++	defer stop()
++	if r := profileReceiptFrom(ctx); r != nil {
++		stopReceipt := context.AfterFunc(r.ctx, cancel)
++		defer stopReceipt()
++	}
++	index, ok := p.snapshotRow(0, 17)
++	if !ok {
++		return nil, 0, errProfile
++	}
++	g, e := p.dnsAuthority(query, index, name, name)
++	if e != nil {
++		return nil, 0, e
++	}
++	s := p.snapshot
++	if s.order == 1 || s.order == 3 {
++		ips := s.files(name, v4, v6)
++		if len(ips) > 0 {
++			if profileEnsureService(query, g) != nil {
++				p.releaseDNS(g)
++				return nil, 0, errProfile
++			}
++			if e = p.keepDNSGrant(ctx, g); e != nil {
++				p.releaseDNS(g)
++				return nil, 0, e
++			}
++			return p.snapshotResult(ctx, ips, 300)
++		}
++		if s.order == 1 {
++			p.releaseDNS(g)
++			return nil, 0, errProfileDNSMissing
++		}
++	}
++	p.releaseDNS(g)
++	var last error = errProfileDNSMissing
++	for _, candidate := range s.names(name) {
++		types := []dnsmessage.Type{}
++		if v4 {
++			types = append(types, dnsmessage.TypeA)
++		}
++		if v6 {
++			types = append(types, dnsmessage.TypeAAAA)
++		}
++		type result struct {
++			ips []net.IP
++			ttl uint32
++			err error
++		}
++		results := make([]result, len(types))
++		var all []net.IP
++		ttl := uint32(300)
++		if s.flags&2 != 0 {
++			for i, typ := range types {
++				results[i].ips, results[i].ttl, results[i].err = p.snapshotOne(query, name, candidate, typ)
++			}
++		} else {
++			type indexed struct {
++				index int
++				r     result
++			}
++			lane := make(chan indexed, len(types))
++			for i, typ := range types {
++				go func(i int, typ dnsmessage.Type) {
++					ips, ttl, e := p.snapshotOne(query, name, candidate, typ)
++					lane <- indexed{i, result{ips, ttl, e}}
++				}(i, typ)
++			}
++			for range types {
++				r := <-lane
++				results[r.index] = r.r
++			}
++		}
++		for _, r := range results {
++			if r.err != nil {
++				last = r.err
++			} else {
++				all = append(all, r.ips...)
++				if r.ttl < ttl {
++					ttl = r.ttl
++				}
++			}
++		}
++		if query.Err() != nil || !p.flowFresh() {
++			return nil, 0, errProfile
++		}
++		if len(all) > 0 {
++			return p.snapshotResult(ctx, all, ttl)
++		}
++	}
++	if s.order == 4 {
++		if ips := s.files(name, v4, v6); len(ips) > 0 {
++			g, e := p.dnsAuthority(query, index, name, name)
++			if e != nil {
++				return nil, 0, e
++			}
++			if e = profileEnsureService(query, g); e != nil {
++				p.releaseDNS(g)
++				return nil, 0, e
++			}
++			if e = p.keepDNSGrant(ctx, g); e != nil {
++				p.releaseDNS(g)
++				return nil, 0, e
++			}
++			return p.snapshotResult(ctx, ips, 300)
++		}
++	}
++	return nil, 0, last
++}
+diff --git a/common/yonikbroker/profile_dns_query_linux.go b/common/yonikbroker/profile_dns_query_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_dns_query_linux.go
+@@ -0,0 +1,195 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"net"
++	"net/netip"
++	"sort"
++)
++
++type profileDNSQueryKey struct{}
++type profileDNSQuery struct {
++	runtime                      *ProfileRuntime
++	receipt                      *profileReceipt
++	pool                         *ProfilePool
++	ctx                          context.Context
++	cancel                       context.CancelFunc
++	name                         string
++	snapshot                     *profileSnapshot
++	grants                       [2]*profileGrant
++	ips                          [256]netip.Addr
++	count, refs, slot            int
++	ready, closed, used, literal bool
++}
++
++func profileQueryFrom(ctx context.Context) *profileDNSQuery {
++	q, _ := ctx.Value(profileDNSQueryKey{}).(*profileDNSQuery)
++	return q
++}
++func (q *profileDNSQuery) liveLocked() bool {
++	c := q.runtime.flow
++	return !q.closed && !q.used && q.ctx.Err() == nil && q.snapshot == q.runtime.snapshot && c.live() && c.dnsQueries[q.slot] == q && (q.receipt != nil && c.receiptLive(q.receipt) || q.pool != nil && q.pool.state.runtime == q.runtime)
++}
++func (q *profileDNSQuery) releaseLocked() {
++	if q.closed && q.refs == 0 && q.runtime.flow.dnsQueries[q.slot] == q {
++		q.runtime.flow.dnsQueries[q.slot] = nil
++		q.runtime.flow.buffered -= profileDNSLookupCredit
++	}
++}
++func (q *profileDNSQuery) closeLocked() {
++	if !q.closed {
++		q.closed = true
++		q.cancel()
++		for _, g := range q.grants {
++			q.runtime.flow.closeGrant(g)
++		}
++	}
++	q.releaseLocked()
++}
++
++// Query scope резервирует metadata/buffers, но не разрешает DNS I/O.
++// Все эффекты требуют отдельного authenticated DNSGrant.
++func ProfileDNSQueryContext(ctx context.Context, name string) (context.Context, func(), error) {
++	noop := func() {}
++	p := profileRuntime(ctx)
++	if p == nil {
++		if ProfileResolverRequired(ctx) {
++			return ctx, noop, errProfile
++		}
++		return ctx, noop, nil
++	}
++	if ctx.Err() != nil || len(name) > 254 || !profileDNSName([]byte(name), false) || !p.flowFresh() {
++		return ctx, noop, errProfile
++	}
++	if q := profileQueryFrom(ctx); q != nil {
++		c := p.flow
++		c.mu.Lock()
++		valid := q.runtime == p && q.name == profileCanonicalQuery(name) && q.liveLocked()
++		c.mu.Unlock()
++		if !valid {
++			return ctx, noop, errProfile
++		}
++		return ctx, noop, nil
++	}
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	r := profileReceiptFrom(ctx)
++	pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool)
++	if !c.live() || r == nil && (pool == nil || pool.state.runtime != p) || r != nil && (!c.receiptLive(r) || r.id == 0) {
++		return ctx, noop, errProfile
++	}
++	slot := -1
++	for i, q := range c.dnsQueries {
++		if q == nil && i < int(c.manifest.caps[3]) {
++			slot = i
++			break
++		}
++	}
++	if slot < 0 || c.buffered+c.manifest.memoryCredit+profileDNSLookupCredit > uint64(c.manifest.caps[4]) {
++		return ctx, noop, errProfileFlowBusy
++	}
++	base, cancel := context.WithCancel(ctx)
++	q := &profileDNSQuery{runtime: p, receipt: r, pool: pool, ctx: base, cancel: cancel, name: profileCanonicalQuery(name), snapshot: p.snapshot, slot: slot}
++	child := context.WithValue(base, profileDNSQueryKey{}, q)
++	q.ctx = child
++	c.dnsQueries[slot] = q
++	c.buffered += profileDNSLookupCredit
++	return child, func() { c.mu.Lock(); q.closeLocked(); c.mu.Unlock() }, nil
++}
++func (p *ProfileRuntime) keepDNSGrant(ctx context.Context, g *profileGrant) error {
++	q := profileQueryFrom(ctx)
++	if q == nil || q.runtime != p || profileEnsureService(ctx, g) != nil {
++		return errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !q.liveLocked() {
++		return errProfile
++	}
++	for i, existing := range q.grants {
++		if existing == g {
++			return nil
++		}
++		if existing == nil {
++			q.grants[i] = g
++			return nil
++		}
++	}
++	return errProfileFlowBusy
++}
++func (p *ProfileRuntime) snapshotResult(ctx context.Context, ips []net.IP, ttl uint32) ([]net.IP, uint32, error) {
++	q := profileQueryFrom(ctx)
++	if q == nil || q.runtime != p || ctx.Err() != nil || !p.flowFresh() {
++		return nil, 0, errProfile
++	}
++	for _, g := range q.grants {
++		if g != nil && profileEnsureService(q.ctx, g) != nil {
++			return nil, 0, errProfile
++		}
++	}
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !q.liveLocked() || q.ready || len(ips) == 0 || len(ips) > len(q.ips) || q.grants[0] == nil && !q.literal {
++		return nil, 0, errProfile
++	}
++	for i, ip := range ips {
++		v, ok := netip.AddrFromSlice(ip)
++		if !ok {
++			return nil, 0, errProfile
++		}
++		q.ips[i] = v.Unmap()
++	}
++	q.count = len(ips)
++	sort.Slice(q.ips[:q.count], func(i, j int) bool { return q.ips[i].Compare(q.ips[j]) < 0 })
++	q.ready = true
++	return ips, ttl, nil
++}
++func ProfileCheckDNSAnswer(ctx context.Context, name string, ips []net.IP) error {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return CheckAfterDNS(ctx)
++	}
++	q := profileQueryFrom(ctx)
++	if q == nil || q.runtime != p || q.name != profileCanonicalQuery(name) || ctx.Err() != nil || !p.flowFresh() {
++		return errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	if !q.liveLocked() || !q.ready {
++		c.mu.Unlock()
++		return errProfile
++	}
++	grants := q.grants
++	c.mu.Unlock()
++	for _, g := range grants {
++		if g != nil && profileEnsureService(q.ctx, g) != nil {
++			return errProfile
++		}
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !q.liveLocked() || !q.ready || len(ips) == 0 || len(ips) > 256 {
++		return errProfile
++	}
++	for _, ip := range ips {
++		v, ok := netip.AddrFromSlice(ip)
++		if !ok {
++			return errProfile
++		}
++		v = v.Unmap()
++		i := sort.Search(q.count, func(i int) bool { return q.ips[i].Compare(v) >= 0 })
++		if i == q.count || q.ips[i] != v {
++			return errProfile
++		}
++	}
++	q.used = true
++	return nil
++}
++
++// Старый API не получает query/RRset и не может подтвердить scoped answer.
++func ProfileCheckDNSResult(context.Context) error { return errProfile }
+diff --git a/common/yonikbroker/profile_dns_io_linux.go b/common/yonikbroker/profile_dns_io_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_dns_io_linux.go
+@@ -0,0 +1,209 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"golang.org/x/net/dns/dnsmessage"
++	"io"
++	"net"
++	"sync"
++)
++
++type profileDNSConnection struct {
++	conn net.Conn
++	once sync.Once
++	err  error
++}
++
++func (c *profileDNSConnection) Close() error {
++	c.once.Do(func() { c.err = c.conn.Close() })
++	return c.err
++}
++
++// Reservation видима shutdown до factory; sockets и service sockets делят cap.
++func (p *ProfileRuntime) dnsConnection(ctx context.Context, g *profileGrant) (*profileDNSConnection, *profileResourceCustody, error) {
++	if g == nil || g.class != 3 || profileEnsureService(ctx, g) != nil {
++		return nil, nil, errProfile
++	}
++	s := p.transportState()
++	s.mu.Lock()
++	count, slot := 0, -1
++	for i, entry := range s.objects {
++		if entry != nil {
++			count++
++		} else if slot < 0 && i < int(p.flow.manifest.caps[2]) {
++			slot = i
++		}
++	}
++	physical := s.pending
++	for _, socket := range s.sockets {
++		if socket != nil {
++			physical++
++		}
++	}
++	for _, item := range s.objects {
++		if item != nil {
++			if _, ok := item.value.(*profileDNSConnection); ok {
++				physical++
++			}
++		}
++	}
++	if !s.live() || slot < 0 || count >= int(p.flow.manifest.caps[2]) || physical >= int(p.flow.manifest.caps[1]) {
++		s.mu.Unlock()
++		return nil, nil, errProfileFlowBusy
++	}
++	entry := &profileResourceCustody{state: s, slot: slot, ready: make(chan struct{}), pending: true}
++	s.objects[slot] = entry
++	s.objectPending++
++	s.pending++
++	s.mu.Unlock()
++	dial := p.dnsDial
++	if dial == nil {
++		dial = (&net.Dialer{}).DialContext
++	}
++	network := "udp"
++	if g.effective.network == 6 {
++		network = "tcp"
++	}
++	raw, err := dial(ctx, network, profileResolverAddress(g.effective))
++	var value *profileDNSConnection
++	if raw != nil {
++		value = &profileDNSConnection{conn: raw}
++	}
++	s.mu.Lock()
++	entry.pending = false
++	s.objectPending--
++	s.pending--
++	if value != nil {
++		entry.value = value
++	}
++	entry.closing = err != nil || value == nil || !s.live()
++	close(entry.ready)
++	s.mu.Unlock()
++	if err == nil && value != nil {
++		actual, e := profileValueFromAddr(raw.RemoteAddr())
++		if e != nil || actual != g.effective || profileEnsureService(ctx, g) != nil {
++			err = errProfile
++		}
++	} else if err == nil {
++		err = errProfile
++	}
++	if err != nil {
++		return nil, nil, errors.Join(err, entry.Close())
++	}
++	s.mu.Lock()
++	publish := !entry.terminal && s.live()
++	s.mu.Unlock()
++	if !publish {
++		return nil, nil, errors.Join(errProfile, entry.Close())
++	}
++	return value, entry, nil
++}
++func profileValueFromAddr(addr net.Addr) (profileDestinationValue, error) {
++	if addr == nil {
++		return profileDestinationValue{}, errProfile
++	}
++	return profileValue(xnet.DestinationFromAddr(addr))
++}
++
++func (p *ProfileRuntime) dnsWire(ctx context.Context, g *profileGrant, request []byte) (response []byte, err error) {
++	if len(request) > 4096 || profileEnsureService(ctx, g) != nil {
++		return nil, errProfile
++	}
++	var parser dnsmessage.Parser
++	if _, e := parser.Start(request); e != nil {
++		return nil, errProfile
++	}
++	question, e := parser.Question()
++	if e != nil || question.Type != dnsmessage.TypeA && question.Type != dnsmessage.TypeAAAA || question.Class != dnsmessage.ClassINET {
++		return nil, errProfile
++	}
++	name := profileCanonicalQuery(question.Name.String())
++	allowed := name == profileCanonicalQuery(g.query)
++	if g.purpose == 2 && p.snapshot != nil {
++		for _, candidate := range p.snapshot.names(g.query) {
++			if name == profileCanonicalQuery(candidate) {
++				allowed = true
++			}
++		}
++	}
++	if !allowed {
++		return nil, errProfile
++	}
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	stopGrant := context.AfterFunc(g.ctx, cancel)
++	defer stopGrant()
++	stopSession := context.AfterFunc(p.ctx, cancel)
++	defer stopSession()
++	c, entry, err := p.dnsConnection(ctx, g)
++	if err != nil {
++		return nil, err
++	}
++	stopIO := context.AfterFunc(ctx, func() { entry.Close() })
++	defer stopIO()
++	defer func() {
++		if e := entry.Close(); e != nil {
++			response = nil
++			err = errors.Join(err, e)
++		}
++	}()
++	if deadline, ok := ctx.Deadline(); ok {
++		if err = c.conn.SetDeadline(deadline); err != nil {
++			return nil, err
++		}
++	}
++	if profileEnsureService(ctx, g) != nil {
++		return nil, errProfile
++	}
++	packet := request
++	if g.effective.network == 6 {
++		packet = make([]byte, len(request)+2)
++		be.PutUint16(packet, uint16(len(request)))
++		copy(packet[2:], request)
++	}
++	if n, e := c.conn.Write(packet); e != nil || n != len(packet) {
++		if e == nil {
++			e = io.ErrShortWrite
++		}
++		return nil, e
++	}
++	if g.effective.network == 6 {
++		var length [2]byte
++		if _, err = io.ReadFull(c.conn, length[:]); err != nil {
++			return nil, err
++		}
++		n := int(u16(length[:], 0))
++		if n < 12 {
++			return nil, errProfile
++		}
++		response = make([]byte, n)
++		_, err = io.ReadFull(c.conn, response)
++	} else {
++		response = make([]byte, 65535)
++		for {
++			n, e := c.conn.Read(response)
++			err = e
++			if err != nil {
++				break
++			}
++			if profileDNSQuestionMatch(request, response[:n]) {
++				response = response[:n]
++				break
++			}
++			if profileEnsureService(ctx, g) != nil {
++				return nil, errProfile
++			}
++		}
++	}
++	if err != nil {
++		return nil, err
++	}
++	if profileEnsureService(ctx, g) != nil {
++		return nil, errProfile
++	}
++	return response, nil
++}
+diff --git a/common/yonikbroker/profile-service-vectors.json b/common/yonikbroker/profile-service-vectors.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-service-vectors.json
+@@ -0,0 +1,12 @@
++{
++  "mappingVersion": 3,
++  "tableCount": 11,
++  "authority": false,
++  "probeBodyHex": "000100000000ffff",
++  "bootstrapBodyHex": "0002000000000000",
++  "dnsAuthorizeBodyHex": "00000000000000010300ffffffffffffffff0000030601bb001000006f726967696e616c2e696e76616c696404110035000400007f0000350000000d71756572792e696e76616c696400000000000000000000000000000000",
++  "dnsGrantBodyHex": "01030000000000000000000b0000000000000001000003e80000000000000001000000000000000000000000000000000000000000000000",
++  "probeGrantBodyHex": "01020000000000000000000c0000000000000000000003e80000000000000001000000000000000000000000000000000000000000000000",
++  "systemUserDNSRustHead": "abf5c2435dd71b272c8f064b155267c52fde9809",
++  "systemUserDNSGrantFrameHex": "594e4b434150303100010013000000b8000000000000000900000000000000040100000000000000000000000000000002000000000000000000000000000000b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e34391000000000000000010000000000000001000000000000000b000000000000000001030100000000000000000b0000000000000001000003e800000000000000010000000001312d000200000000000000000000000000002a"
++}
+diff --git a/app/observatory/yonik_profile_service_test.go b/app/observatory/yonik_profile_service_test.go
+new file mode 100644
+--- /dev/null
++++ b/app/observatory/yonik_profile_service_test.go
+@@ -0,0 +1,50 @@
++package observatory
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++)
++
++type probeContextTestKey struct{}
++
++func TestYonikProbeRequestKeepsParentDeadlineCancelAndURL(t *testing.T) {
++	parent, cancel := context.WithCancel(context.WithValue(context.Background(), probeContextTestKey{}, "owned-values"))
++	defer cancel()
++	o := &Observer{ctx: parent, config: &Config{ProbeUrl: "http://synthetic.invalid/health?fixed=1"}}
++	called := false
++	result := o.probeWithClient("subject", func(client *http.Client, req *http.Request) (*http.Response, error) {
++		called = true
++		if req.Context().Value(probeContextTestKey{}) != "owned-values" || req.URL.String() != "http://synthetic.invalid/health?fixed=1" {
++			t.Fatal("probe request потерял URL/context")
++		}
++		deadline, ok := req.Context().Deadline()
++		if !ok || time.Until(deadline) > 5*time.Second {
++			t.Fatal("probe request потерял deadline")
++		}
++		if client.CheckRedirect(req, nil) != http.ErrUseLastResponse {
++			t.Fatal("probe follows redirect")
++		}
++		cancel()
++		<-req.Context().Done()
++		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(""))}, nil
++	})
++	if !called || result.Alive {
++		t.Fatal("late response после cancel отмечен Alive")
++	}
++}
++func TestYonikCancelledProbeDoesNotReachHTTPClient(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	o := &Observer{ctx: ctx, config: &Config{ProbeUrl: "http://synthetic.invalid/health"}}
++	result := o.probeWithClient("subject", func(*http.Client, *http.Request) (*http.Response, error) {
++		t.Fatal("cancelled probe reached HTTP client")
++		return nil, nil
++	})
++	if result.Alive {
++		t.Fatal("cancelled probe Alive")
++	}
++}
+diff --git a/app/observatory/observer.go b/app/observatory/observer.go
+--- a/app/observatory/observer.go
++++ b/app/observatory/observer.go
+@@ -15,8 +15,8 @@
+ 	v2net "github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/common/signal/done"
+-	"github.com/xtls/xray-core/common/task"
+ 	"github.com/xtls/xray-core/common/utils"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/extension"
+ 	"github.com/xtls/xray-core/features/outbound"
+@@ -28,6 +28,7 @@
+ type Observer struct {
+ 	config *Config
+ 	ctx    context.Context
++	cancel context.CancelFunc
+ 
+ 	statusLock sync.Mutex
+ 	status     []*OutboundStatus
+@@ -55,6 +56,9 @@
+ }
+ 
+ func (o *Observer) Close() error {
++	if o.cancel != nil {
++		o.cancel()
++	}
+ 	if o.finished != nil {
+ 		return o.finished.Close()
+ 	}
+@@ -134,35 +138,63 @@
+ }
+ 
+ func (o *Observer) probe(outbound string) ProbeResult {
++	return o.probeWithClient(outbound, func(client *http.Client, request *http.Request) (*http.Response, error) { return client.Do(request) })
++}
++func (o *Observer) probeWithClient(outbound string, do func(*http.Client, *http.Request) (*http.Response, error)) ProbeResult {
+ 	errorCollectorForRequest := newErrorCollector()
++	probeURL := "https://www.google.com/generate_204"
++	if o.config.ProbeUrl != "" {
++		probeURL = o.config.ProbeUrl
++	}
++	parent, cancelRequest := context.WithTimeout(o.ctx, 5*time.Second)
++	defer cancelRequest()
++	probeCtx, release, grantErr := hooks.ProfileOpenProbe(parent, outbound, probeURL)
++	if grantErr != nil {
++		return ProbeResult{Alive: false, LastErrorReason: "probe admission denied"}
++	}
++	defer release()
++	if probeCtx.Err() != nil {
++		return ProbeResult{Alive: false, LastErrorReason: "probe cancelled"}
++	}
+ 
+ 	httpTransport := http.Transport{
+ 		Proxy: func(*http.Request) (*url.URL, error) {
+ 			return nil, nil
+ 		},
+ 		DialContext: func(ctx context.Context, network string, addr string) (net.Conn, error) {
+-			var connection net.Conn
+-			taskErr := task.Run(ctx, func() error {
+-				// MUST use Xray's built in context system
+-				dest, err := v2net.ParseDestination(network + ":" + addr)
+-				if err != nil {
+-					return errors.New("cannot understand address").Base(err)
++			callback, cleanup, err := hooks.ProfileProbeDialContext(probeCtx, ctx)
++			if err != nil {
++				return nil, err
++			}
++			dest, err := v2net.ParseDestination(network + ":" + addr)
++			if err != nil {
++				cleanup()
++				return nil, errors.New("cannot understand address").Base(err)
++			}
++			if err = hooks.ProfileProbeDialTarget(callback, dest); err != nil {
++				cleanup()
++				return nil, err
++			}
++			trackedCtx := session.TrackedConnectionError(callback, errorCollectorForRequest)
++			connection, err := tagged.Dialer(trackedCtx, o.dispatcher, dest, outbound)
++			if err == nil && callback.Err() != nil {
++				err = callback.Err()
++			}
++			if err == nil {
++				err = hooks.ProfileProbeDialTarget(callback, dest)
++			}
++			if err != nil {
++				if connection != nil {
++					connection.Close()
+ 				}
+-				trackedCtx := session.TrackedConnectionError(o.ctx, errorCollectorForRequest)
+-				conn, err := tagged.Dialer(trackedCtx, o.dispatcher, dest, outbound)
+-				if err != nil {
+-					return errors.New("cannot dial remote address ", dest).Base(err)
+-				}
+-				connection = conn
+-				return nil
+-			})
+-			if taskErr != nil {
+-				return nil, errors.New("cannot finish connection").Base(taskErr)
+-			}
+-			return connection, nil
++				cleanup()
++				return nil, err
++			}
++			return &probeOwnedConnection{Conn: connection, cancel: cleanup}, nil
+ 		},
+ 		TLSHandshakeTimeout: time.Second * 5,
+ 	}
++	defer httpTransport.CloseIdleConnections()
+ 	httpClient := &http.Client{
+ 		Transport: &httpTransport,
+ 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+@@ -172,25 +204,30 @@
+ 		Timeout: time.Second * 5,
+ 	}
+ 	var GETTime time.Duration
+-	err := task.Run(o.ctx, func() error {
++	err := func() error {
+ 		startTime := time.Now()
+-		probeURL := "https://www.google.com/generate_204"
+-		if o.config.ProbeUrl != "" {
+-			probeURL = o.config.ProbeUrl
+-		}
+-		req, _ := http.NewRequest(http.MethodGet, probeURL, nil)
++		req, requestErr := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
++		if requestErr != nil {
++			return requestErr
++		}
+ 		utils.TryDefaultHeadersWith(req.Header, "nav")
+-		response, err := httpClient.Do(req)
++		response, err := do(httpClient, req)
++		if response != nil && response.Body != nil {
++			defer response.Body.Close()
++		}
+ 		if err != nil {
+ 			return errors.New("outbound failed to relay connection").Base(err)
+ 		}
+-		if response.Body != nil {
+-			response.Body.Close()
++		if response == nil {
++			return errors.New("empty probe response")
++		}
++		if probeCtx.Err() != nil {
++			return probeCtx.Err()
+ 		}
+ 		endTime := time.Now()
+ 		GETTime = endTime.Sub(startTime)
+ 		return nil
+-	})
++	}()
+ 	if err != nil {
+ 		errorMessage := "the outbound " + outbound + " is dead: GET request failed:" + err.Error() + "with outbound handler report underlying connection failed"
+ 		errors.LogInfoInner(o.ctx, errorCollectorForRequest.UnderlyingError(), errorMessage)
+@@ -199,6 +236,14 @@
+ 	errors.LogInfo(o.ctx, "the outbound ", outbound, " is alive:", GETTime.Seconds())
+ 	return ProbeResult{Alive: true, Delay: GETTime.Milliseconds()}
+ }
++
++type probeOwnedConnection struct {
++	net.Conn
++	cancel context.CancelFunc
++	once   sync.Once
++}
++
++func (c *probeOwnedConnection) Close() error { err := c.Conn.Close(); c.once.Do(c.cancel); return err }
+ 
+ func (o *Observer) updateStatusForResult(outbound string, result *ProbeResult) {
+ 	o.statusLock.Lock()
+@@ -243,9 +288,11 @@
+ 	if err != nil {
+ 		return nil, errors.New("Cannot get depended features").Base(err)
+ 	}
++	ctx, cancel := context.WithCancel(ctx)
+ 	return &Observer{
+ 		config:     config,
+ 		ctx:        ctx,
++		cancel:     cancel,
+ 		ohm:        outboundManager,
+ 		dispatcher: dispatcher,
+ 	}, nil
 diff --git a/common/mux/yonik_r9_lifecycle_test.go b/common/mux/yonik_r9_lifecycle_test.go
 new file mode 100644
 --- /dev/null
@@ -2238,7 +6145,7 @@ diff --git a/common/yonikbroker/profile_transport_linux_test.go b/common/yonikbr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux_test.go
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,660 @@
 +//go:build linux
 +
 +package nativehooks
@@ -2269,7 +6176,9 @@ new file mode 100644
 +	if e := json.Unmarshal(profileOriginalFlowV3, &v); e != nil {
 +		t.Fatal(e)
 +	}
-+	f := newFlowFixture(t, 2)
++	// Tuple vectors не являются System proof. UDP positive остаётся Local;
++	// System association Unsupported проверяется proof controls отдельно.
++	f := newFlowFixture(t, 1)
 +	rows := f.c.manifest.rows
 +	be.PutUint16(rows[6][0][2:], 1080)
 +	f.installManifest(t, rows)
@@ -2306,6 +6215,360 @@ new file mode 100644
 +}
 +
 +type profilePureClose struct{ count atomic.Int32 }
++
++func TestProfilePooledChainNumericSourceCanCreatePool(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	defer f.serve(t)()
++	r := f.admittedReceipt(t, "same.invalid")
++	ctx := context.WithValue(context.WithValue(r.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r)
++	d := xnet.TCPDestination(xnet.DomainAddress("same.invalid"), 443)
++	ctx, e := ProfileSelectRoute(ctx, "a", d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, release, e := ProfileAuthorizeHandler(ctx, "a", d, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	if e = ProfilePrepareChain(ctx, func(tag string, target xnet.Destination) (bool, error) { return false, nil }); e != nil {
++		t.Fatal(e)
++	}
++	if _, e = ProfileTransportPool(ctx, 2); e != nil {
++		t.Fatal("numeric chained transport remains disconnected", e)
++	}
++}
++
++func pooledChainConsumer(t *testing.T, f *flowFixture, choose func(string, xnet.Destination) (bool, error)) context.Context {
++	t.Helper()
++	r := f.admittedReceipt(t, "same.invalid")
++	ctx := context.WithValue(context.WithValue(r.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r)
++	d := xnet.TCPDestination(xnet.DomainAddress("same.invalid"), 443)
++	ctx, e := ProfileSelectRoute(ctx, "a", d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, release, e := ProfileAuthorizeHandler(ctx, "a", d, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	t.Cleanup(release)
++	if e = ProfilePrepareChain(ctx, choose); e != nil {
++		t.Fatal(e)
++	}
++	return ctx
++}
++
++func TestProfilePooledChainPerFlowWireAndPhysicalLifetime(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	defer f.serve(t)()
++	choose := func(tag string, d xnet.Destination) (bool, error) {
++		if tag != "b" || d.Network != xnet.Network_TCP || d.Port != 443 {
++			t.Error("actual hop selector", tag, d)
++		}
++		return false, nil
++	}
++	first, second := pooledChainConsumer(t, f, choose), pooledChainConsumer(t, f, choose)
++	a, b := first.Value(profileGrantKey{}).(*profileGrant), second.Value(profileGrantKey{}).(*profileGrant)
++	if a.receipt == b.receipt || a.next == b.next || a.next.receipt != a.receipt || a.next.scope != 2 {
++		t.Fatal("hop grant shared across source flows")
++	}
++	counts := map[uint64]int{}
++	for _, frame := range f.writes {
++		if frame.kind == 18 {
++			counts[u64(frame.body, 0)]++
++			if frame.body[8] != 1 || u16(frame.body, 10) != u16(f.c.manifest.rows[8][u16(frame.body, 16)], 0) {
++				t.Fatal("AUTHORIZE selectors")
++			}
++		}
++	}
++	if counts[a.receipt.id] != 2 || counts[b.receipt.id] != 2 {
++		t.Fatal("missing per-flow hop AUTHORIZE", counts)
++	}
++	pool, e := ProfileTransportPool(first, 2)
++	if e != nil {
++		t.Fatal(e)
++	}
++	other, e := ProfileTransportPool(second, 2)
++	if e != nil || other != pool {
++		t.Fatal("same immutable path did not share", e)
++	}
++	physical, e := pool.SessionContext()
++	if e != nil {
++		t.Fatal(e)
++	}
++	target := xnet.TCPDestination(xnet.ParseAddress("198.51.100.1"), 443)
++	chained, e := ProfileChain(physical, target, "b")
++	if e != nil {
++		t.Fatal(e)
++	}
++	child, release, e := ProfileAuthorizeHandler(chained, "b", target, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	f.c.mu.Lock()
++	f.c.closeGrant(a.next)
++	f.c.mu.Unlock()
++	physical, e = pool.SessionContext()
++	if e != nil || ProfilePhysicalGate(physical) != nil {
++		t.Fatal("revoked first hop hid live physical neighbour", e)
++	}
++	if _, e = pool.Context(first); e == nil {
++		t.Fatal("live neighbour replaced cancelled current hop")
++	}
++	if _, e = pool.Context(second); e != nil {
++		t.Fatal("cancel one affected neighbour", e)
++	}
++	if ProfileLogicalGate(child) != nil {
++		t.Fatal("shared physical chain retained first consumer authority")
++	}
++	if _, _, e = ProfileAuthorizeHandler(chained, "b", target, true); e == nil {
++		t.Fatal("actual branch mismatch bypassed preflight")
++	}
++	f.p.cancel()
++	if ProfileLogicalGate(child) == nil {
++		t.Fatal("revoke did not fence shared chain")
++	}
++}
++
++func TestProfilePooledChainExpiryDelayedCallbackAndPrivateFactory(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	defer f.serve(t)()
++	ctx := pooledChainConsumer(t, f, func(string, xnet.Destination) (bool, error) { return false, nil })
++	g := ctx.Value(profileGrantKey{}).(*profileGrant)
++	pool, e := ProfileTransportPool(ctx, 2)
++	if e != nil {
++		t.Fatal(e)
++	}
++	leaf := xnet.TCPDestination(xnet.ParseAddress("198.51.100.2"), 8388)
++	calls := 0
++	sessionOnly := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	if _, e = ProfileDialPhysical(sessionOnly, leaf, func(context.Context) (net.Conn, error) { calls++; return fakeTCPFlowConn(), nil }); e == nil || calls != 0 {
++		t.Fatal("session credential opened physical socket")
++	}
++	f.c.mu.Lock()
++	g.next.deadline = f.now
++	f.c.mu.Unlock()
++	if _, e = pool.Context(ctx); e == nil {
++		t.Fatal("expired hop reused pool")
++	}
++	delayed, cancel := context.WithCancel(ctx)
++	cancel()
++	if _, e = pool.Context(delayed); e == nil {
++		t.Fatal("delayed cancelled callback reused pool")
++	}
++	if ProfileLogicalGate(ctx) == nil {
++		t.Fatal("root grant replaced expired child")
++	}
++}
++
++func TestProfilePooledChainSelectedBranchAndSourceCannotBeSubstituted(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "xhttp-h3")
++	defer f.serve(t)()
++	normal := pooledChainConsumer(t, f, func(string, xnet.Destination) (bool, error) { return false, nil })
++	otherFlow := pooledChainConsumer(t, f, func(string, xnet.Destination) (bool, error) { return false, nil })
++	a, b := normal.Value(profileGrantKey{}).(*profileGrant), otherFlow.Value(profileGrantKey{}).(*profileGrant)
++	pool, e := ProfileTransportPool(normal, 3)
++	if e != nil {
++		t.Fatal(e)
++	}
++	wrongHop := context.WithValue(otherFlow, profileGrantKey{}, b.next)
++	if _, e = pool.Context(wrongHop); e == nil {
++		t.Fatal("cross-chain callback accepted")
++	}
++	physical, e := pool.SessionContext()
++	if e != nil {
++		t.Fatal(e)
++	}
++	target := xnet.UDPDestination(xnet.ParseAddress("198.51.100.1"), 443)
++	chained, e := ProfileChain(physical, target, "b")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if _, _, e = ProfileAuthorizeHandler(chained, "b", target, true); e == nil {
++		t.Fatal("actual mux picker overrode nextBranchMask")
++	}
++	wrong := context.WithValue(normal, profileReceiptKey{}, b.receipt)
++	if _, e = pool.Context(wrong); e == nil {
++		t.Fatal("cross-flow private source accepted")
++	}
++	f.c.mu.Lock()
++	a.next.ownerDeadline = f.now
++	a.next.deadline = f.now
++	f.c.mu.Unlock()
++	if ProfileLogicalGate(normal) == nil || ProfileLogicalGate(otherFlow) != nil {
++		t.Fatal("consumer expiry isolation")
++	}
++}
++
++func TestProfilePooledChainCancelDuringActualSelectorNeverPublishesPool(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	defer f.serve(t)()
++	r := f.admittedReceipt(t, "cancel.invalid")
++	ctx := context.WithValue(context.WithValue(r.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r)
++	d := xnet.TCPDestination(xnet.DomainAddress("cancel.invalid"), 443)
++	ctx, e := ProfileSelectRoute(ctx, "a", d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, release, e := ProfileAuthorizeHandler(ctx, "a", d, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	e = ProfilePrepareChain(ctx, func(string, xnet.Destination) (bool, error) {
++		f.c.mu.Lock()
++		f.c.closeReceipt(r)
++		f.c.mu.Unlock()
++		return false, nil
++	})
++	if e == nil {
++		t.Fatal("cancelled selector published bundle")
++	}
++	if _, e = ProfileTransportPool(ctx, 2); e == nil {
++		t.Fatal("cancelled preparation published pool")
++	}
++}
++
++func TestProfilePooledChainSystemHopNeedsItsOwnFreshOwner(t *testing.T) {
++	f := newFlowFixture(t, 2)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	defer f.serve(t)()
++	ctx := pooledChainConsumer(t, f, func(string, xnet.Destination) (bool, error) { return false, nil })
++	g := ctx.Value(profileGrantKey{}).(*profileGrant)
++	pool, e := ProfileTransportPool(ctx, 2)
++	if e != nil {
++		t.Fatal(e)
++	}
++	f.c.mu.Lock()
++	g.next.ownerDeadline = f.now
++	g.next.refresh = &profileOperation{ctx: g.next.ctx, queued: true, done: make(chan struct{}), err: errProfile}
++	close(g.next.refresh.done)
++	f.c.mu.Unlock()
++	if _, e = pool.Context(ctx); e == nil {
++		t.Fatal("fresh root owner replaced stale hop owner")
++	}
++}
++
++func TestProfilePooledChainDomainLeafHasNoAnswerPromotion(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	rows := f.c.manifest.rows
++	rows[1][1] = append((profileDestinationValue{family: 3, network: 6, port: 8388, address: "leaf.invalid"}).encode(), 0, 0, 0, 0)
++	f.installManifest(t, rows)
++	defer f.serve(t)()
++	r := f.admittedReceipt(t, "same.invalid")
++	ctx := context.WithValue(context.WithValue(r.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r)
++	d := xnet.TCPDestination(xnet.DomainAddress("same.invalid"), 443)
++	ctx, e := ProfileSelectRoute(ctx, "a", d)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, release, e := ProfileAuthorizeHandler(ctx, "a", d, false)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	if e = ProfilePrepareChain(ctx, func(string, xnet.Destination) (bool, error) { return false, nil }); !errors.Is(e, ErrProfileUnsupported) {
++		t.Fatal("domain leaf promoted without authenticated endpoint proof", e)
++	}
++	if _, e = ProfileTransportPool(ctx, 2); e == nil {
++		t.Fatal("unproved domain path published pool")
++	}
++}
++
++func TestProfilePooledChainDelayedHopGrantAfterCancelIsDiscarded(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	r := f.admittedReceipt(t, "same.invalid")
++	g := f.granted(t, r)
++	ctx := context.WithValue(context.WithValue(context.WithValue(g.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r), profileGrantKey{}, g)
++	done := make(chan error, 1)
++	go func() {
++		done <- ProfilePrepareChain(ctx, func(string, xnet.Destination) (bool, error) { return false, nil })
++	}()
++	op := <-f.p.flowQueue
++	if op.receipt != r || op.grant.scope != 2 {
++		t.Fatal("wrong delayed hop")
++	}
++	if e := f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	f.c.mu.Lock()
++	f.c.closeReceipt(r)
++	f.c.mu.Unlock()
++	if e := f.c.accept(f.grantReply(op, 2)); e != nil {
++		t.Fatal(e)
++	}
++	if e := <-done; e == nil || op.grant.id != 0 || g.prepared {
++		t.Fatal("late hop grant resurrected cancelled bundle", e)
++	}
++}
++
++func TestProfilePooledChainActualMuxWorkerKeepsOriginalUDP(t *testing.T) {
++	f := newFlowFixture(t, 1)
++	f.chainGraph(t, "grpc-udp-to-tcp")
++	rows := f.c.manifest.rows
++	s := rows[8][1]
++	s[3] = 3
++	s[6], s[7] = 6, 6
++	s[21] = 2
++	be.PutUint16(s[10:], 0)
++	be.PutUint16(s[14:], 0)
++	be.PutUint16(s[18:], 2)
++	edge := flowEdge(1, 2)
++	edge[4] = 1
++	rows[2] = append(rows[2], edge)
++	f.installManifest(t, rows)
++	defer f.serve(t)()
++	d := profileDestinationValue{family: 3, network: 17, port: 53, address: "original.invalid"}
++	base := context.WithValue(f.p.ctx, profileContextKey{}, f.p)
++	base, e := ProfileAccept(base, fakeTCPFlowConn(), "i")
++	if e != nil {
++		t.Fatal(e)
++	}
++	udp := &flowFakeConn{local: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 49152}, remote: &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 32001}}
++	base, e = ProfileAssociateUDP(base, udp)
++	if e != nil {
++		t.Fatal(e)
++	}
++	target := xnet.UDPDestination(xnet.DomainAddress(d.address), 53)
++	ctx, releaseOriginal, e := ProfileOpenOriginal(base, target)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer releaseOriginal()
++	ctx, e = ProfileSelectRoute(ctx, "a", target)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ctx, release, e := ProfileAuthorizeHandler(ctx, "a", target, true)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer release()
++	if e = ProfilePrepareChain(ctx, func(_ string, next xnet.Destination) (bool, error) {
++		if next.Network != xnet.Network_TCP {
++			t.Error("mux carrier did not become TCP input")
++		}
++		return false, nil
++	}); e != nil {
++		t.Fatal(e)
++	}
++	g := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if g.branch != 1 || g.receipt.original.network != 17 || g.next.scope != 2 || g.next.effective.network != 6 {
++		t.Fatal("mux replaced original UDP or wrong next input")
++	}
++	if _, e = ProfileTransportPool(ctx, 2); e != nil {
++		t.Fatal(e)
++	}
++}
 +
 +func (c *profilePureClose) Close() error { c.count.Add(1); return nil }
 +
@@ -2547,7 +6810,7 @@ diff --git a/common/yonikbroker/profile_transport_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux.go
-@@ -0,0 +1,796 @@
+@@ -0,0 +1,844 @@
 +//go:build linux
 +
 +package nativehooks
@@ -2567,6 +6830,7 @@ new file mode 100644
 +type ProfileCloser = io.Closer
 +type profilePoolContextKey struct{}
 +type profilePathKey struct{}
++type profilePhysicalContextKey struct{}
 +
 +// Key не credential. Создать usable pool может только live private FlowGrant.
 +type ProfilePool struct {
@@ -2862,13 +7126,13 @@ new file mode 100644
 +	row := p.flow.manifest.rows[8][g.scope]
 +	branch := int(g.branch)
 +	endpoint := g.effective
-+	if row[20+branch] == 2 {
++	if row[20+branch] == 2 && !g.prepared {
 +		return key, endpoint, ErrProfileUnsupported
-+	} // Chain reuse требует grants каждого hop.
++	}
 +	if row[20+branch] == 4 {
 +		return key, endpoint, errProfile
 +	}
-+	if row[20+branch] == 1 {
++	if row[20+branch] == 1 || row[20+branch] == 2 {
 +		c := profileCursor{b: p.flow.manifest.rows[1][u16(row, 8+branch*2)]}
 +		h := c.take(8)
 +		a := c.take(int(u16(h, 4)))
@@ -2903,6 +7167,17 @@ new file mode 100644
 +	}
 +	h.Write(g.effective.encode())
 +	h.Write(endpoint.encode())
++	for hop, depth := g.next, 0; hop != nil; hop, depth = hop.next, depth+1 {
++		if depth >= 255 || hop.receipt != g.receipt || !hop.prepared {
++			return key, endpoint, errProfile
++		}
++		be.PutUint16(b[:], hop.scope)
++		be.PutUint16(b[2:], hop.stream)
++		be.PutUint16(b[4:], hop.chain)
++		b[6] = hop.branch
++		h.Write(b[:7])
++		h.Write(hop.effective.encode())
++	}
 +	copy(key[:], h.Sum(nil))
 +	return key, endpoint, nil
 +}
@@ -2915,7 +7190,7 @@ new file mode 100644
 +		if existing.state.runtime != p {
 +			return nil, errProfile
 +		}
-+		g, e := existing.candidate()
++		g, e := existing.resolve(ctx)
 +		if e != nil {
 +			return nil, e
 +		}
@@ -2971,22 +7246,30 @@ new file mode 100644
 +		return nil, errProfile
 +	}
 +	c := p.state.runtime.flow
-+	c.mu.Lock()
-+	var chosen *profileGrant
-+	for _, g := range c.grants {
-+		if c.grantLive(g) && g.scope == p.scope && g.branch == p.branch {
-+			k, _, e := profilePoolIdentity(p.state.runtime, g)
-+			if e == nil && k == p.key {
-+				chosen = g
-+				break
++	for index := 0; index < len(c.grants); {
++		c.mu.Lock()
++		var chosen *profileGrant
++		for index < len(c.grants) {
++			g := c.grants[index]
++			index++
++			if c.grantLive(g) && g.scope == p.scope && g.branch == p.branch {
++				k, _, e := profilePoolIdentity(p.state.runtime, g)
++				if e == nil && k == p.key {
++					chosen = g
++					break
++				}
 +			}
 +		}
++		c.mu.Unlock()
++		if chosen == nil {
++			break
++		}
++		// Renewal выполняется без mutex; невалидный bundle не скрывает соседей.
++		if profileEnsureChain(context.WithValue(chosen.ctx, profileContextKey{}, p.state.runtime), chosen) == nil {
++			return chosen, nil
++		}
 +	}
-+	c.mu.Unlock()
-+	if chosen == nil || profileEnsureGrant(context.WithValue(chosen.ctx, profileContextKey{}, p.state.runtime), chosen) != nil {
-+		return nil, errProfile
-+	}
-+	return chosen, nil
++	return nil, errProfile
 +}
 +func (p *ProfilePool) Context(callback context.Context) (context.Context, error) {
 +	if p == nil {
@@ -3000,7 +7283,7 @@ new file mode 100644
 +	}
 +	if callback != nil {
 +		if g, _ := callback.Value(profileGrantKey{}).(*profileGrant); g != nil {
-+			if g.receipt == nil || g.receipt.control != p.state.runtime.flow {
++			if g.receipt == nil && (g.class != 2 || g.purpose != 1) || g.receipt != nil && g.receipt.control != p.state.runtime.flow {
 +				return nil, errProfile
 +			}
 +			key, _, e := profilePoolIdentity(p.state.runtime, g)
@@ -3018,7 +7301,7 @@ new file mode 100644
 +	if !live {
 +		return nil, errProfile
 +	}
-+	if _, e := p.candidate(); e != nil {
++	if _, e := p.resolve(callback); e != nil {
 +		return nil, e
 +	}
 +	// Callback cancellation/deadline сохраняются; authority берётся из private
@@ -3030,7 +7313,28 @@ new file mode 100644
 +	if p == nil || p.state == nil || p.state.runtime == nil {
 +		return nil, errProfile
 +	}
-+	return p.Context(p.state.runtime.ctx)
++	return p.Context(context.WithValue(p.state.runtime.ctx, profilePhysicalContextKey{}, true))
++}
++
++// Explicit logical consumer никогда не подменяется живым соседом из pool.
++func (p *ProfilePool) resolve(ctx context.Context) (*profileGrant, error) {
++	if ctx == nil || ctx.Err() != nil {
++		return nil, errProfile
++	}
++	physical, _ := ctx.Value(profilePhysicalContextKey{}).(bool)
++	if !physical {
++		if g, _ := ctx.Value(profileGrantKey{}).(*profileGrant); g != nil {
++			if profileEnsureChain(ctx, g) != nil {
++				return nil, errProfile
++			}
++			key, _, e := profilePoolIdentity(p.state.runtime, g)
++			if e != nil || key != p.key {
++				return nil, errProfile
++			}
++			return g, nil
++		}
++	}
++	return p.candidate()
 +}
 +
 +// Вызывается только под state.mu: копия opaque value не становится capability.
@@ -3085,7 +7389,7 @@ new file mode 100644
 +		return e
 +	}
 +	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
-+	return profileEnsureGrant(ctx, g)
++	return profileEnsureChain(ctx, g)
 +}
 +
 +func ProfileCheckTransport(ctx context.Context, kind byte) error {
@@ -3095,7 +7399,7 @@ new file mode 100644
 +	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
 +	if pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); pool != nil {
 +		var e error
-+		g, e = pool.candidate()
++		g, e = pool.resolve(ctx)
 +		if e != nil {
 +			return e
 +		}
@@ -3139,6 +7443,13 @@ new file mode 100644
 +	s := pool.state
 +	s.mu.Lock()
 +	count := s.pending
++	for _, entry := range s.objects {
++		if entry != nil {
++			if _, ok := entry.value.(*profileDNSConnection); ok {
++				count++
++			}
++		}
++	}
 +	for _, socket := range s.sockets {
 +		if socket != nil {
 +			count++
@@ -4012,15 +8323,26 @@ diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
 diff --git a/app/dns/nameserver_local.go b/app/dns/nameserver_local.go
 --- a/app/dns/nameserver_local.go
 +++ b/app/dns/nameserver_local.go
-@@ -19,7 +19,7 @@
+@@ -7,6 +7,7 @@
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/log"
+ 	"github.com/xtls/xray-core/common/net"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/features/dns"
+ 	"github.com/xtls/xray-core/features/dns/localdns"
+ )
+@@ -19,9 +20,9 @@
  // QueryIP implements Server.
  func (s *LocalNameServer) QueryIP(ctx context.Context, domain string, option dns.IPOption) (ips []net.IP, ttl uint32, err error) {
  	start := time.Now()
 -	ips, ttl, err = s.client.LookupIP(domain, option)
 +	ips, ttl, err = s.client.LookupIPWithContext(ctx, domain, option)
  
- 	if len(ips) > 0 {
+-	if len(ips) > 0 {
++	if len(ips) > 0 && !hooks.ProfileResolverRequired(ctx) {
  		errors.LogInfo(ctx, "Localhost got answer: ", domain, " -> ", ips)
+ 		log.Record(&log.DNSLog{Server: s.Name(), Domain: domain, Result: ips, Status: log.DNSQueried, Elapsed: time.Since(start), Error: err})
+ 	}
 diff --git a/app/proxyman/inbound/worker.go b/app/proxyman/inbound/worker.go
 --- a/app/proxyman/inbound/worker.go
 +++ b/app/proxyman/inbound/worker.go
@@ -4032,10 +8354,12 @@ diff --git a/app/proxyman/inbound/worker.go b/app/proxyman/inbound/worker.go
  	"github.com/xtls/xray-core/features/routing"
  	"github.com/xtls/xray-core/features/stats"
  	"github.com/xtls/xray-core/proxy"
-@@ -116,6 +117,13 @@
- 		Conn:    conn,
- 	})
- 
+@@ -100,6 +101,15 @@
+ 		}
+ 	}
+ 	ctx = session.ContextWithOutbounds(ctx, outbounds)
++	// Actual accepted object захватывается до CounterConnection: stats wrapper
++	// не получает raw FD API и не участвует в доказательстве kernel identity.
 +	var acceptErr error
 +	ctx, acceptErr = nativehooks.ProfileAccept(ctx, conn, w.tag)
 +	if acceptErr != nil {
@@ -4043,10 +8367,10 @@ diff --git a/app/proxyman/inbound/worker.go b/app/proxyman/inbound/worker.go
 +		conn.Close()
 +		return
 +	}
- 	content := new(session.Content)
- 	content.SniffingRequest = w.sniffingRequest
- 	ctx = session.ContextWithContent(ctx, content)
-@@ -355,6 +363,13 @@
+ 
+ 	if w.uplinkCounter != nil || w.downlinkCounter != nil {
+ 		conn = &stat.CounterConnection{
+@@ -355,6 +365,13 @@
  				Gateway: net.UDPDestination(w.address, w.port),
  				Tag:     w.tag,
  			})
@@ -4071,7 +8395,37 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	"github.com/xtls/xray-core/core"
  	"github.com/xtls/xray-core/features/outbound"
  	"github.com/xtls/xray-core/features/policy"
-@@ -175,11 +176,64 @@
+@@ -55,6 +56,7 @@
+ 
+ // Handler implements outbound.Handler.
+ type Handler struct {
++	profileBranch   func(string, net.Destination) (bool, error)
+ 	tag             string
+ 	senderSettings  *proxyman.SenderConfig
+ 	streamSettings  *internet.MemoryStreamConfig
+@@ -75,6 +77,21 @@
+ 		tag:             config.Tag,
+ 		uplinkCounter:   uplinkCounter,
+ 		downlinkCounter: downlinkCounter,
++	}
++	h.profileBranch = func(tag string, target net.Destination) (bool, error) {
++		manager, ok := v.GetFeature(outbound.ManagerType()).(outbound.Manager)
++		if !ok {
++			return false, nativehooks.ErrProfileUnsupported
++		}
++		next, ok := manager.GetHandler(tag).(*Handler)
++		if !ok {
++			return false, nativehooks.ErrProfileUnsupported
++		}
++		decision := next.profileMuxDecision(target)
++		if decision == profileMuxReject {
++			return false, nativehooks.ErrProfileUnsupported
++		}
++		return decision != profileMuxNormal, nil
+ 	}
+ 
+ 	if config.SenderSettings != nil {
+@@ -175,11 +192,71 @@
  }
  
  // Dispatch implements proxy.Outbound.Dispatch.
@@ -4119,6 +8473,13 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
 +	authorizeProfile := func(mux bool) (func(), error) {
 +		next, release, e := nativehooks.ProfileAuthorizeHandler(ctx, h.tag, ob.Target, mux)
 +		if e == nil {
++			e = nativehooks.ProfilePrepareChain(next, h.profileBranch)
++		}
++		if e != nil {
++			release()
++			return func() {}, e
++		}
++		if e == nil {
 +			ctx = next
 +			nativehooks.ProfileGuardLink(ctx, link)
 +		}
@@ -4136,7 +8497,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  		strategy := h.senderSettings.TargetStrategy
  		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
  			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
-@@ -204,38 +258,41 @@
+@@ -204,38 +281,41 @@
  		link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  		link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  	}
@@ -4200,7 +8561,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	err := h.proxy.Process(ctx, link, h)
  	var errC error
  	if err != nil {
-@@ -266,6 +323,9 @@
+@@ -266,6 +346,9 @@
  
  // Dial implements internet.Dialer.
  func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
@@ -4476,7 +8837,7 @@ diff --git a/common/yonikbroker/profile_capsule.go b/common/yonikbroker/profile_
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_capsule.go
-@@ -0,0 +1,509 @@
+@@ -0,0 +1,514 @@
 +package nativehooks
 +
 +import (
@@ -4696,11 +9057,16 @@ new file mode 100644
 +	// Одновременные frame/rows/strings, fixed decoder state, snapshot
 +	// и streaming DAT category index резервируются до materialization assets.
 +	credit := uint64(512*1024 + len(b)*3)
++	if r.mode == 2 {
++		credit += 128 * 1024
++	}
 +	dat := false
++	dnsQueryCredit := uint64(0)
 +	for i := 0; i < m.assetCount; i++ {
 +		a := m.assets[i]
 +		if a.dns {
-+			credit += a.size
++			credit += a.size + 128*1024
++			dnsQueryCredit = profileDNSLookupCredit
 +		} else {
 +			dat = true
 +		}
@@ -4712,7 +9078,7 @@ new file mode 100644
 +		stageCredit = 2*1024*1024 + 32768
 +	}
 +	m.memoryCredit = credit + uint64(profileFlowFixedCredit)
-+	if credit+stageCredit > uint64(m.caps[4]) {
++	if credit+stageCredit+dnsQueryCredit > uint64(m.caps[4]) {
 +		return profileCapsule{}, errProfile
 +	}
 +	return m, nil
@@ -5373,7 +9739,7 @@ diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_hooks_linux.go
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,833 @@
 +//go:build linux
 +
 +package nativehooks
@@ -5391,11 +9757,13 @@ new file mode 100644
 +)
 +
 +type profileAccepted struct {
-+	runtime    *ProfileRuntime
-+	ctx        context.Context
-+	tuple      [40]byte
-+	index      uint16
-+	provenance byte
++	proof       profileProofFD
++	proofCredit bool
++	runtime     *ProfileRuntime
++	ctx         context.Context
++	tuple       [40]byte
++	index       uint16
++	provenance  byte
 +}
 +type profileSelectedRoute struct {
 +	subject, scope uint16
@@ -5523,6 +9891,9 @@ new file mode 100644
 +	if !p.flowFresh() || conn == nil {
 +		return ctx, errProfile
 +	}
++	if p.admission.launch.mode == 2 && (!p.proofs.live() || conn.RemoteAddr() == nil || conn.RemoteAddr().Network() != "tcp") {
++		return ctx, ErrProfileUnsupported
++	}
 +	tuple, e := profileTuple(xnet.DestinationFromAddr(conn.RemoteAddr()), xnet.DestinationFromAddr(conn.LocalAddr()))
 +	if e != nil {
 +		return ctx, e
@@ -5551,8 +9922,37 @@ new file mode 100644
 +	}
 +	for i, a := range c.accepted {
 +		if a == nil && i < int(c.manifest.caps[6]) {
++			if p.admission.launch.mode == 2 && c.buffered+c.manifest.memoryCredit+profileAcceptedFDCredit > uint64(c.manifest.caps[4]) {
++				return ctx, errProfileFlowBusy
++			}
 +			a = &profileAccepted{runtime: p, ctx: ctx, index: uint16(index), provenance: provenance, tuple: tuple}
 +			c.accepted[i] = a
++			if p.admission.launch.mode == 2 {
++				c.buffered += profileAcceptedFDCredit
++				a.proofCredit = true
++				duplicate := p.duplicateAccepted
++				if duplicate == nil {
++					duplicate = profileDuplicateAccepted
++				}
++				fd, e := duplicate(conn, tuple)
++				a.proof = fd
++				if e != nil || fd == nil {
++					if closeErr := a.closeProofLocked(c); closeErr != nil {
++						p.cancel()
++						return ctx, closeErr
++					}
++					c.accepted[i] = nil
++					return ctx, ErrProfileUnsupported
++				}
++			}
++			if ctx.Err() != nil || !c.live() {
++				if e := a.closeProofLocked(c); e != nil {
++					p.cancel()
++					return ctx, e
++				}
++				c.accepted[i] = nil
++				return ctx, errProfile
++			}
 +			return context.WithValue(ctx, profileAcceptedKey{}, a), nil
 +		}
 +	}
@@ -5564,6 +9964,9 @@ new file mode 100644
 +	p := profileRuntime(ctx)
 +	if p == nil {
 +		return ctx, nil
++	}
++	if p.admission.launch.mode == 2 {
++		return ctx, ErrProfileUnsupported
 +	}
 +	parent, _ := ctx.Value(profileAcceptedKey{}).(*profileAccepted)
 +	if parent == nil || parent.runtime != p || parent.ctx.Err() != nil || conn == nil || !p.flowFresh() {
@@ -5679,6 +10082,13 @@ new file mode 100644
 +	if !ProfileSession(ctx) {
 +		return nil
 +	}
++	if profileServiceGrant(ctx) != nil {
++		v, e := profileValue(destination)
++		if e != nil {
++			return e
++		}
++		return profileProbeTarget(ctx, v, nil)
++	}
 +	if ProfileOriginalValid(ctx) != nil {
 +		return errProfile
 +	}
@@ -5692,6 +10102,9 @@ new file mode 100644
 +func ProfileSameOriginal(a, b context.Context) bool {
 +	if !ProfileSession(a) && !ProfileSession(b) {
 +		return true
++	}
++	if profileServiceGrant(a) != nil || profileServiceGrant(b) != nil {
++		return profileRuntime(a) == profileRuntime(b) && profileServiceGrant(a) != nil && profileServiceGrant(a) == profileServiceGrant(b)
 +	}
 +	return profileRuntime(a) == profileRuntime(b) && profileReceiptFrom(a) != nil && profileReceiptFrom(a) == profileReceiptFrom(b)
 +}
@@ -5710,7 +10123,7 @@ new file mode 100644
 +	if p == nil {
 +		return ctx, nil
 +	}
-+	if ProfileOriginalValid(ctx) != nil {
++	if profileSourceValid(ctx) != nil {
 +		return ctx, errProfile
 +	}
 +	subject, ok := profileSubject(&p.flow.manifest, tag)
@@ -5720,6 +10133,12 @@ new file mode 100644
 +	v, e := profileValue(effective)
 +	if e != nil {
 +		return ctx, e
++	}
++	if profileServiceGrant(ctx) != nil {
++		if profileProbeTarget(ctx, v, &subject) != nil {
++			return ctx, errProfile
++		}
++		return context.WithValue(ctx, profileRouteKey{}, profileSelectedRoute{subject: subject, branches: 3, effective: v}), nil
 +	}
 +	if v.network != profileReceiptFrom(ctx).original.network {
 +		return ctx, errProfile
@@ -5731,7 +10150,7 @@ new file mode 100644
 +	if p == nil {
 +		return nil
 +	}
-+	if ProfileOriginalValid(ctx) != nil {
++	if profileSourceValid(ctx) != nil {
 +		return errProfile
 +	}
 +	route, ok := ctx.Value(profileRouteKey{}).(profileSelectedRoute)
@@ -5766,6 +10185,9 @@ new file mode 100644
 +	if route.branches&(1<<branch) == 0 {
 +		return ctx, noop, errProfile
 +	}
++	if profileServiceGrant(ctx) != nil {
++		return profileBindProbe(ctx, route, branch)
++	}
 +	row := p.flow.manifest.rows[0][route.subject]
 +	offset := len(row) - 4
 +	if v.network == 17 {
@@ -5774,6 +10196,20 @@ new file mode 100644
 +	scope := u16(row, offset)
 +	if route.chained && scope != route.scope {
 +		return ctx, noop, errProfile
++	}
++	if ready, _ := ctx.Value(profileGrantKey{}).(*profileGrant); route.chained && ready != nil {
++		if ready.scope != scope || ready.branch != branch || ready.effective != v || profileEnsureChain(ctx, ready) != nil {
++			return ctx, noop, errProfile
++		}
++		if physical, _ := ctx.Value(profilePhysicalContextKey{}).(bool); physical {
++			pool, e := ProfileTransportPool(ctx, 0)
++			if e != nil {
++				return ctx, noop, e
++			}
++			next, e := pool.Context(ctx)
++			return next, noop, e
++		}
++		return ctx, noop, nil
 +	}
 +	g, op, e := p.flow.authorize(ctx, profileReceiptFrom(ctx), scope, branch, v, nil)
 +	if e != nil {
@@ -5785,6 +10221,22 @@ new file mode 100644
 +	return context.WithValue(g.ctx, profileGrantKey{}, g), func() { p.flow.mu.Lock(); p.flow.closeGrant(g); p.flow.mu.Unlock() }, nil
 +}
 +func profileEnsureGrant(ctx context.Context, g *profileGrant) error {
++	if g != nil && g.class == 2 {
++		p := profileRuntime(ctx)
++		if p == nil {
++			return errProfile
++		}
++		p.flow.mu.Lock()
++		bound := g.bound
++		p.flow.mu.Unlock()
++		if !bound {
++			return errProfile
++		}
++		return profileEnsureService(ctx, g)
++	}
++	if g != nil && g.class == 3 {
++		return errProfile
++	}
 +	p := profileRuntime(ctx)
 +	if p == nil || g == nil || g.receipt.control != p.flow || !p.flowFresh() {
 +		return errProfile
@@ -5823,7 +10275,7 @@ new file mode 100644
 +		if ctx.Err() != nil || pool.state.runtime != p {
 +			return errProfile
 +		}
-+		g, e := pool.candidate()
++		g, e := pool.resolve(ctx)
 +		if e != nil {
 +			return e
 +		}
@@ -5876,6 +10328,16 @@ new file mode 100644
 +	if p == nil {
 +		return ctx, nil
 +	}
++	if pool, _ := ctx.Value(profilePoolContextKey{}).(*ProfilePool); pool != nil {
++		g, e := pool.resolve(ctx)
++		if e != nil {
++			return ctx, e
++		}
++		ctx = context.WithValue(ctx, profileGrantKey{}, g)
++		ctx = context.WithValue(ctx, profileReceiptKey{}, g.receipt)
++		ctx = context.WithValue(ctx, profilePathKey{}, g.ctx.Value(profilePathKey{}))
++		ctx = context.WithValue(ctx, profilePoolContextKey{}, (*ProfilePool)(nil))
++	}
 +	if ProfileCheckDial(ctx, target, true) != nil {
 +		return ctx, errProfile
 +	}
@@ -5892,7 +10354,10 @@ new file mode 100644
 +	if !ok || e != nil || u16(next, 0) != subject || next[2] != v.network || u16(edge, 0) != g.scope || edge[4] != g.branch {
 +		return ctx, errProfile
 +	}
-+	ctx = context.WithValue(ctx, profileGrantKey{}, (*profileGrant)(nil))
++	p.flow.mu.Lock()
++	preparedNext := g.next
++	p.flow.mu.Unlock()
++	ctx = context.WithValue(ctx, profileGrantKey{}, preparedNext)
 +	h := sha256.New()
 +	h.Write([]byte("YNKCAP-CHAIN-PATH-v1\x00"))
 +	if path, ok := ctx.Value(profilePathKey{}).([32]byte); ok {
@@ -5911,18 +10376,163 @@ new file mode 100644
 +	return context.WithValue(ctx, profileRouteKey{}, profileSelectedRoute{subject: subject, scope: nextScope, branches: edge[5], effective: v, chained: true}), nil
 +}
 +
++// Native picker сообщает actual mux decision; capsule mask лишь ограничивает его.
++// Каждый hop остаётся отдельным AUTHORIZE class1 того же original receipt.
++func ProfilePrepareChain(ctx context.Context, choose func(string, xnet.Destination) (bool, error)) error {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return nil
++	}
++	root, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if root != nil && root.class == 2 {
++		return nil
++	}
++	if root == nil || root.class != 0 && root.class != 1 {
++		return ErrProfileUnsupported
++	}
++	p.flow.mu.Lock()
++	prepared := root.prepared
++	p.flow.mu.Unlock()
++	if prepared {
++		return profileEnsureChain(ctx, root)
++	}
++	g := root
++	for depth := 0; depth < 256; depth++ {
++		if profileEnsureGrant(ctx, g) != nil {
++			return errProfile
++		}
++		row := p.flow.manifest.rows[8][g.scope]
++		action := row[20+int(g.branch)]
++		if action != 2 {
++			endpoint := g.effective
++			if action == 1 {
++				var ok bool
++				endpoint, ok = profileDecodedDestination(p.flow.manifest.rows[1][u16(row, 8+int(g.branch)*2)])
++				if !ok {
++					return errProfile
++				}
++			}
++			if action == 4 {
++				return errProfile
++			}
++			if endpoint.family == 3 {
++				return ErrProfileUnsupported
++			}
++			p.flow.mu.Lock()
++			for item := root; item != nil; item = item.next {
++				item.prepared = true
++			}
++			p.flow.mu.Unlock()
++			return profileEnsureChain(ctx, root)
++		}
++		if choose == nil || g.chain == 65535 {
++			return ErrProfileUnsupported
++		}
++		edge := p.flow.manifest.rows[2][g.chain]
++		nextScope := u16(edge, 2)
++		subject := u16(p.flow.manifest.rows[8][nextScope], 0)
++		cursor := profileCursor{b: p.flow.manifest.rows[0][subject]}
++		tag := string(cursor.str(160))
++		endpoint, ok := profileDecodedDestination(p.flow.manifest.rows[1][u16(row, 8+int(g.branch)*2)])
++		if !ok {
++			return errProfile
++		}
++		target := xnet.Destination{Network: xnet.Network_TCP, Address: xnet.ParseAddress(endpoint.address), Port: xnet.Port(endpoint.port)}
++		if endpoint.network == 17 {
++			target.Network = xnet.Network_UDP
++		}
++		next, e := ProfileChain(ctx, target, tag)
++		if e != nil {
++			return e
++		}
++		mux, e := choose(tag, target)
++		if e != nil {
++			return e
++		}
++		next, _, e = ProfileAuthorizeHandler(next, tag, target, mux)
++		if e != nil {
++			return e
++		}
++		child := next.Value(profileGrantKey{}).(*profileGrant)
++		p.flow.mu.Lock()
++		g.next = child
++		child.parent = g
++		p.flow.mu.Unlock()
++		g, ctx = child, next
++	}
++	return errProfile
++}
++
++func profileEnsureChain(ctx context.Context, g *profileGrant) error {
++	p := profileRuntime(ctx)
++	if p == nil || g == nil {
++		return errProfile
++	}
++	if source := profileReceiptFrom(ctx); source != nil && source != g.receipt {
++		return errProfile
++	}
++	p.flow.mu.Lock()
++	for depth := 0; g.parent != nil; depth++ {
++		if depth >= 255 || g.parent.next != g || g.parent.receipt != g.receipt {
++			p.flow.mu.Unlock()
++			return errProfile
++		}
++		g = g.parent
++	}
++	p.flow.mu.Unlock()
++	root := g
++	for depth := 0; depth < 256; depth++ {
++		if profileEnsureGrant(ctx, g) != nil {
++			return errProfile
++		}
++		p.flow.mu.Lock()
++		child, prepared := g.next, g.prepared
++		p.flow.mu.Unlock()
++		row := p.flow.manifest.rows[8][g.scope]
++		if row[20+int(g.branch)] != 2 {
++			// RPC каждого hop мог израсходовать freshness предыдущего. Последний
++			// atomic fence проверяет весь bundle после всех ожиданий.
++			p.flow.mu.Lock()
++			defer p.flow.mu.Unlock()
++			for item, depth := root, 0; item != nil; item, depth = item.next, depth+1 {
++				if depth >= 256 || !p.flow.grantLive(item) || p.flow.mode == 2 && item.class != 2 && !p.flow.clock().Before(item.ownerDeadline) {
++					return errProfile
++				}
++			}
++			return nil
++		}
++		if !prepared || child == nil || child.receipt != g.receipt || child.chain == g.chain {
++			return errProfile
++		}
++		edge := p.flow.manifest.rows[2][g.chain]
++		endpoint, ok := profileDecodedDestination(p.flow.manifest.rows[1][u16(row, 8+int(g.branch)*2)])
++		if !ok || child.scope != u16(edge, 2) || edge[5]&(1<<child.branch) == 0 || child.effective != endpoint {
++			return errProfile
++		}
++		g = child
++	}
++	return errProfile
++}
++
 +type profileFlowReader struct {
 +	ctx    context.Context
 +	grant  *profileGrant
 +	reader buf.Reader
 +}
 +
++func profileLinkGate(ctx context.Context, g *profileGrant) error {
++	if physical, _ := ctx.Value(profilePhysicalContextKey{}).(bool); physical {
++		return ProfileLogicalGate(ctx)
++	}
++	return profileEnsureChain(ctx, g)
++}
++
 +func (r *profileFlowReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-+	if profileEnsureGrant(r.ctx, r.grant) != nil {
++	if profileLinkGate(r.ctx, r.grant) != nil {
 +		return nil, errProfile
 +	}
 +	mb, e := r.reader.ReadMultiBuffer()
-+	if profileEnsureGrant(r.ctx, r.grant) != nil {
++	if profileLinkGate(r.ctx, r.grant) != nil {
 +		buf.ReleaseMulti(mb)
 +		return nil, errProfile
 +	}
@@ -5947,7 +10557,7 @@ new file mode 100644
 +}
 +
 +func (w *profileFlowWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-+	if profileEnsureGrant(w.ctx, w.grant) != nil {
++	if profileLinkGate(w.ctx, w.grant) != nil {
 +		buf.ReleaseMulti(mb)
 +		return errProfile
 +	}
@@ -5967,7 +10577,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,806 @@
+@@ -0,0 +1,881 @@
 +//go:build linux
 +
 +package nativehooks
@@ -6056,6 +10666,13 @@ new file mode 100644
 +	openOperation       *profileOperation
 +}
 +type profileGrant struct {
++	next                                *profileGrant
++	parent                              *profileGrant
++	prepared                            bool
++	class                               byte
++	purpose, serviceIndex, resolver     uint16
++	query                               string
++	bound                               bool
 +	receipt                             *profileReceipt
 +	ctx                                 context.Context
 +	cancel                              context.CancelFunc
@@ -6069,6 +10686,8 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	proof                                   uint64
++	proofSent                               bool
 +	ctx                                     context.Context
 +	receipt                                 *profileReceipt
 +	grant                                   *profileGrant
@@ -6089,6 +10708,10 @@ new file mode 100644
 +	replied, cancelled                                       bool
 +}
 +type profileFlowControl struct {
++	proofAlive                                     func() bool
++	prepareProof                                   func(*profileOperation) error
++	sendProof                                      func(*profileOperation) error
++	dnsQueries                                     [64]*profileDNSQuery
 +	mu                                             sync.Mutex
 +	manifest                                       profileCapsule
 +	mode                                           byte
@@ -6112,20 +10735,29 @@ new file mode 100644
 +	return &profileFlowControl{manifest: m, mode: mode, clock: clock, write: write, alive: alive, sessionDeadline: clock().Add(time.Duration(m.lease) * time.Millisecond)}
 +}
 +func (c *profileFlowControl) live() bool {
-+	return !c.revoked && c.alive != nil && c.alive() && c.clock().Before(c.sessionDeadline)
++	return !c.revoked && c.alive != nil && c.alive() && c.clock().Before(c.sessionDeadline) && (c.mode != 2 || c.proofAlive != nil && c.proofAlive())
 +}
 +func (c *profileFlowControl) receiptLive(r *profileReceipt) bool {
-+	return c.live() && r != nil && r.control == c && !r.closed && r.ctx.Err() == nil && c.receipts[r.slot] == r
++	return c.live() && r != nil && r.control == c && !r.closed && r.ctx.Err() == nil && (r.association == nil || r.association.ctx.Err() == nil) && c.receipts[r.slot] == r
 +}
 +func (c *profileFlowControl) grantLive(g *profileGrant) bool {
-+	return g != nil && c.receiptLive(g.receipt) && !g.closed && g.ctx.Err() == nil && c.grants[g.slot] == g && c.clock().Before(g.deadline)
++	return g != nil && c.live() && (g.receipt == nil && g.purpose != 0 || c.receiptLive(g.receipt)) && !g.closed && g.ctx.Err() == nil && c.grants[g.slot] == g && c.clock().Before(g.deadline)
++}
++
++func (c *profileFlowControl) operationLive(op *profileOperation) bool {
++	if op.receipt != nil {
++		return c.receiptLive(op.receipt)
++	}
++	return op.kind == 20 && op.grant != nil && op.grant.purpose != 0 && !op.grant.closed && op.grant.ctx.Err() == nil && c.grants[op.grant.slot] == op.grant && c.live()
 +}
 +func (c *profileFlowControl) operation(ctx context.Context, r *profileReceipt, g *profileGrant, kind uint16, object uint64, body []byte) (*profileOperation, error) {
 +	if ctx == nil || ctx.Err() != nil || len(body) > 1024 || !c.live() || !c.operationAvailable() {
 +		return nil, errProfile
 +	}
 +	c.operations++
-+	r.pending++
++	if r != nil {
++		r.pending++
++	}
 +	if g != nil {
 +		g.pending++
 +	}
@@ -6298,11 +10930,13 @@ new file mode 100644
 +		return
 +	}
 +	op.completed = true
-+	if op.receipt.openOperation == op {
++	if op.receipt != nil && op.receipt.openOperation == op {
 +		op.receipt.openOperation = nil
 +	}
 +	c.operations--
-+	op.receipt.pending--
++	if op.receipt != nil {
++		op.receipt.pending--
++	}
 +	if op.grant != nil {
 +		op.grant.pending--
 +		if op.grant.refresh == op {
@@ -6386,7 +11020,7 @@ new file mode 100644
 +	if op.submitted {
 +		return nil
 +	}
-+	if !c.live() || op.cancelled || op.ctx.Err() != nil || !c.receiptLive(op.receipt) {
++	if !c.live() || op.cancelled || op.ctx.Err() != nil || !c.operationLive(op) {
 +		if op.kind == 16 {
 +			c.closeReceipt(op.receipt)
 +		} else {
@@ -6405,10 +11039,23 @@ new file mode 100644
 +	if slot < 0 {
 +		return errProfile
 +	}
++	if c.proofRequired(op) {
++		if c.prepareProof == nil {
++			return errProfile
++		}
++		if e := c.prepareProof(op); e != nil {
++			if e == errProfileProofCancelled {
++				c.closeReceipt(op.receipt)
++				c.finish(op, e)
++				return nil
++			}
++			return e
++		}
++	}
 +	op.sent = c.clock()
 +	op.sessionDeadline = c.sessionDeadline
 +	op.deadline = op.sent.Add(time.Second)
-+	if op.kind == 18 && c.mode == 2 {
++	if op.kind == 18 && op.receipt != nil && c.mode == 2 {
 +		op.deadline = op.sent.Add(20 * time.Millisecond)
 +	}
 +	if deadline, ok := op.ctx.Deadline(); ok && deadline.Before(op.deadline) {
@@ -6425,7 +11072,7 @@ new file mode 100644
 +	if seq > c.lastSent {
 +		c.lastSent = seq
 +	}
-+	return nil
++	return c.tryProof(op)
 +}
 +func (c *profileFlowControl) accept(f profilePacket) error {
 +	c.mu.Lock()
@@ -6453,6 +11100,9 @@ new file mode 100644
 +			}
 +		} else {
 +			c.revoked = true
++			for _, g := range c.grants {
++				c.closeGrant(g)
++			}
 +			for _, r := range c.receipts {
 +				c.closeReceipt(r)
 +			}
@@ -6481,7 +11131,7 @@ new file mode 100644
 +			return errProfile
 +		}
 +		c.pending[i] = nil
-+		cancelled := op.cancelled || op.ctx.Err() != nil || !c.receiptLive(op.receipt) || !c.clock().Before(op.deadline)
++		cancelled := op.cancelled || op.ctx.Err() != nil || !c.operationLive(op) || !c.clock().Before(op.deadline)
 +		if cancelled {
 +			if op.kind == 16 {
 +				c.closeReceipt(op.receipt)
@@ -6551,7 +11201,7 @@ new file mode 100644
 +}
 +func (c *profileFlowControl) discardLate(f profilePacket, kind uint16) error {
 +	var target byte
-+	if kind == 18 {
++	if kind == 18 || kind == 20 {
 +		if f.kind != 19 || len(f.body) != 56 {
 +			return errProfile
 +		}
@@ -6600,6 +11250,9 @@ new file mode 100644
 +func (c *profileFlowControl) publish(op *profileOperation, f profilePacket) error {
 +	if op.kind == 16 {
 +		b := f.body
++		if c.proofRequired(op) && !op.proofSent {
++			return errProfile
++		}
 +		if f.kind != 17 || f.object != 0 || len(b) != 24 || b[0] != 1 || b[1] != c.mode-1 || !zero(b[2:4]) || u64(b, 4) == 0 || u64(b, 4) <= c.highestFlow || u32(b, 12) != 0 || u64(b, 16) == 0 {
 +			return errProfile
 +		}
@@ -6610,6 +11263,9 @@ new file mode 100644
 +	}
 +	b := f.body
 +	g := op.grant
++	if g.class == 2 || g.class == 3 {
++		return c.publishService(op, f)
++	}
 +	if f.kind != 19 || len(b) != 56 || b[0] != 1 || b[1] != 1 || b[2] != c.mode-1 || b[3] != 0 || u64(b, 4) == 0 || f.object != u64(b, 4) || u64(b, 12) != op.receipt.id || u32(b, 20) == 0 || u32(b, 20) > 1000 || u64(b, 24) != op.receipt.revision || !zero(b[41:48]) {
 +		return errProfile
 +	}
@@ -6662,11 +11318,19 @@ new file mode 100644
 +	}
 +	for i, a := range c.accepted {
 +		if a != nil && a.ctx.Err() != nil {
++			if e := a.closeProofLocked(c); e != nil {
++				return e
++			}
 +			c.accepted[i] = nil
 +		}
 +	}
 +	for i, op := range c.pending {
-+		if op != nil && (op.cancelled || op.ctx.Err() != nil || !c.receiptLive(op.receipt) || !now.Before(op.deadline)) {
++		if op != nil && !op.cancelled && op.ctx.Err() == nil && now.Before(op.deadline) {
++			if e := c.tryProof(op); e != nil {
++				return e
++			}
++		}
++		if op != nil && (op.cancelled || op.ctx.Err() != nil || !c.operationLive(op) || !now.Before(op.deadline)) {
 +			if op.kind == 16 {
 +				c.closeReceipt(op.receipt)
 +			} else {
@@ -6686,7 +11350,18 @@ new file mode 100644
 +		if g.ctx.Err() != nil || !g.deadline.IsZero() && !now.Before(g.deadline) {
 +			c.closeGrant(g)
 +		}
++		if !g.closed && g.id != 0 && g.refresh == nil && (g.class == 2 || g.class == 3) && c.grantLive(g) && (g.deadline.Sub(now) <= 250*time.Millisecond || c.serviceOwnerRequired(g) && g.ownerDeadline.Sub(now) <= 5*time.Millisecond) {
++			if op, e := c.refreshServiceLocked(g); e == nil {
++				op.queued = true
++				if e = c.dispatchLocked(op); e != nil {
++					return e
++				}
++			}
++		}
 +		if !g.closed && g.id != 0 && g.refresh == nil && c.receiptLive(g.receipt) && g.deadline.Sub(now) <= 250*time.Millisecond {
++			if g.class == 3 {
++				continue
++			}
 +			_, op, e := c.authorizeLocked(g.ctx, g.receipt, g.scope, g.branch, g.effective, g)
 +			if e == nil {
 +				op.queued = true
@@ -6706,8 +11381,10 @@ new file mode 100644
 +				g.cancelSent = true
 +			}
 +			if g.pending == 0 {
-+				c.buffered -= uint64((len(g.effective.address) + 15) &^ 15)
-+				g.receipt.grantCount--
++				c.buffered -= profileGrantCredit(g)
++				if g.receipt != nil {
++					g.receipt.grantCount--
++				}
 +				c.grants[i] = nil
 +			}
 +		}
@@ -6764,6 +11441,14 @@ new file mode 100644
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
 +	c.revoked = true
++	for _, q := range c.dnsQueries {
++		if q != nil {
++			q.closeLocked()
++		}
++	}
++	for _, g := range c.grants {
++		c.closeGrant(g)
++	}
 +	for _, r := range c.receipts {
 +		c.closeReceipt(r)
 +	}
@@ -6778,7 +11463,7 @@ diff --git a/common/yonikbroker/profile_flow_linux_test.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux_test.go
-@@ -0,0 +1,887 @@
+@@ -0,0 +1,919 @@
 +//go:build linux
 +
 +package nativehooks
@@ -6905,7 +11590,38 @@ new file mode 100644
 +	}, live)
 +	p.flow = f.c
 +	p.flowFence = live
++	if mode == 2 {
++		// Остальные control tests моделируют уже проверенный kernel proof.
++		// Actual export/bootstrap/custody проверяются отдельными pure controls.
++		p.proofs = &profileProofChannel{launch: r, fd: &flowProofFD{}, peer: live, send: func([]byte, profileProofFD) error { return nil }}
++		f.c.proofAlive = p.proofs.live
++		p.duplicateAccepted = func(xnet.Conn, [40]byte) (profileProofFD, error) { return &flowProofFD{}, nil }
++		f.c.prepareProof = func(op *profileOperation) error {
++			if op.receipt.association == nil {
++				op.proof = 1
++				return nil
++			}
++			return p.proofs.prepare(op)
++		}
++		f.c.sendProof = func(op *profileOperation) error {
++			if op.receipt.association == nil {
++				op.proofSent = true
++				return nil
++			}
++			return p.proofs.sendOpen(op)
++		}
++	}
 +	return f
++}
++
++type flowProofFD struct{ closed bool }
++
++func (f *flowProofFD) Close() error { f.closed = true; return nil }
++func (f *flowProofFD) withFD(fn func(int) error) error {
++	if f.closed {
++		return errProfile
++	}
++	return fn(101)
 +}
 +func fakeFlowTuple(network byte) [40]byte {
 +	var b [40]byte
@@ -7145,7 +11861,8 @@ new file mode 100644
 +	if allocations != 0 {
 +		t.Fatal("tombstone overflow allocated", allocations)
 +	}
-+	if unsafe.Sizeof(profileReceipt{}) > 256 || unsafe.Sizeof(profileGrant{}) > 256 || unsafe.Sizeof(profileTombstone{}) > 64 || unsafe.Sizeof(profileOperation{})+1024 > 2048 {
++	// Две private chain links включены в общий fixed metadata preflight.
++	if unsafe.Sizeof(profileReceipt{}) > 256 || unsafe.Sizeof(profileGrant{}) > 272 || unsafe.Sizeof(profileTombstone{}) > 64 || unsafe.Sizeof(profileOperation{})+1024 > 2048 {
 +		t.Fatal("ledger sizing changed")
 +	}
 +}
@@ -7670,7 +12387,7 @@ diff --git a/common/yonikbroker/profile_flow_other.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_other.go
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,42 @@
 +//go:build !linux
 +
 +package nativehooks
@@ -7683,7 +12400,10 @@ new file mode 100644
 +
 +// На этих платформах PrepareProfileLaunch отказывает до создания runtime.
 +// Legacy callers сохраняют поведение и не получают profile authority.
-+func ProfileSession(context.Context) bool                                           { return false }
++func ProfileSession(context.Context) bool { return false }
++func ProfilePrepareChain(context.Context, func(string, xnet.Destination) (bool, error)) error {
++	return nil
++}
 +func CarryProfileSession(_ context.Context, target context.Context) context.Context { return target }
 +func ProfileAccept(ctx context.Context, _ xnet.Conn, _ string) (context.Context, error) {
 +	return ctx, nil
@@ -7714,7 +12434,7 @@ diff --git a/common/yonikbroker/profile_launch.go b/common/yonikbroker/profile_l
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch.go
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,238 @@
 +package nativehooks
 +
 +import (
@@ -7840,20 +12560,33 @@ new file mode 100644
 +}
 +
 +func admitProfile(r profileLaunch, config []byte, ch profileAdmissionChannel, verify func(*profileCapsule) error, now func() time.Time) (a profileAdmission, err error) {
++	return admitProfileUntil(r, config, ch, verify, now, time.Time{})
++}
++func admitProfileUntil(r profileLaunch, config []byte, ch profileAdmissionChannel, verify func(*profileCapsule) error, now func() time.Time, initial time.Time) (a profileAdmission, err error) {
 +	a.launch = r
 +	if sha256.Sum256(config) != r.digest || ch == nil || verify == nil || now == nil {
 +		return a, errProfile
 +	}
 +	a.state = profileAdmitting
 +	sent := now()
++	deadline := sent.Add(time.Second)
++	if !initial.IsZero() && initial.Before(deadline) {
++		deadline = initial
++	}
++	if !now().Before(deadline) {
++		return a, errProfile
++	}
 +	hello := make([]byte, 40)
 +	copy(hello, r.nonce[:])
 +	hello[32] = r.mode
 +	if ch.send(1, 0, hello) != nil {
 +		return a, errProfile
 +	}
-+	raw, e := ch.receive(sent.Add(time.Second))
++	raw, e := ch.receive(deadline)
 +	if e != nil {
++		return a, errProfile
++	}
++	if !now().Before(deadline) {
 +		return a, errProfile
 +	}
 +	frame, e := r.decodePacket(raw, 1)
@@ -7866,7 +12599,7 @@ new file mode 100644
 +	}
 +	a.capsule = capsule
 +	a.deadline = sent.Add(time.Duration(capsule.lease) * time.Millisecond)
-+	if verify(&a.capsule) != nil || !now().Before(sent.Add(time.Second)) || !now().Before(a.deadline) {
++	if verify(&a.capsule) != nil || !now().Before(deadline) || !now().Before(a.deadline) {
 +		return a, errProfile
 +	}
 +	ack := make([]byte, 48)
@@ -7944,7 +12677,7 @@ diff --git a/common/yonikbroker/profile_launch_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux.go
-@@ -0,0 +1,632 @@
+@@ -0,0 +1,685 @@
 +//go:build linux
 +
 +package nativehooks
@@ -7955,12 +12688,14 @@ new file mode 100644
 +	"encoding/hex"
 +	"errors"
 +	"io"
++	"net"
 +	"os"
 +	"strconv"
 +	"strings"
 +	"sync"
 +	"time"
 +
++	xnet "github.com/xtls/xray-core/common/net"
 +	"github.com/xtls/xray-core/common/platform/filesystem"
 +	"golang.org/x/sys/unix"
 +)
@@ -7981,6 +12716,9 @@ new file mode 100644
 +// ProfileRuntime не содержит FlowGrant. Constructor доступен только через
 +// потребление sealed record и authenticated channel. Владение FD однократное.
 +type ProfileRuntime struct {
++	proofs                      *profileProofChannel
++	proofRejected               [32]profileProofFD
++	duplicateAccepted           func(xnet.Conn, [40]byte) (profileProofFD, error)
 +	transports                  *profileTransportState
 +	flow                        *profileFlowControl
 +	flowQueue                   chan *profileOperation
@@ -7991,6 +12729,8 @@ new file mode 100644
 +	assets                      [16]*os.File
 +	assetStamps                 [16]unix.Stat_t
 +	snapshot                    *profileSnapshot
++	dnsDial                     func(context.Context, string, string) (net.Conn, error)
++	dnsID                       func() uint16
 +	ctx                         context.Context
 +	cancel                      context.CancelFunc
 +	rx, tx                      uint64
@@ -8023,6 +12763,13 @@ new file mode 100644
 +			return nil, errProfile
 +		}
 +		fds := []unix.PollFd{{Fd: int32(p.channel.Fd()), Events: unix.POLLIN}, {Fd: int32(p.peer.Fd()), Events: unix.POLLIN}}
++		if p.proofs != nil {
++			fd, e := p.proofPollFD()
++			if e != nil {
++				return nil, e
++			}
++			fds = append(fds, unix.PollFd{Fd: int32(fd), Events: unix.POLLIN})
++		}
 +		wait := time.Until(deadline)
 +		if wait > 20*time.Millisecond {
 +			wait = 20 * time.Millisecond
@@ -8037,6 +12784,12 @@ new file mode 100644
 +		if n == 0 {
 +			continue
 +		}
++		if len(fds) == 3 && fds[2].Revents != 0 {
++			if fds[2].Revents&unix.POLLIN != 0 {
++				p.rejectProofInput()
++			}
++			return nil, errProfile
++		}
 +		if fds[0].Revents&unix.POLLIN == 0 {
 +			return nil, errProfile
 +		}
@@ -8044,32 +12797,19 @@ new file mode 100644
 +		b := make([]byte, profileFrameLimit)
 +		oob := make([]byte, unix.CmsgSpace(16*4)+unix.CmsgSpace(unix.SizeofUcred))
 +		size, control, flags, _, err := unix.Recvmsg(int(p.channel.Fd()), b, oob, unix.MSG_DONTWAIT|unix.MSG_CMSG_CLOEXEC)
-+		valid := err == nil && size >= 128 && flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) == 0
-+		messages, e := unix.ParseSocketControlMessage(oob[:control])
-+		if e != nil {
-+			valid = false
++		if size < 0 {
++			size = 0
 +		}
-+		credentials := 0
-+		for _, m := range messages {
-+			if m.Header.Level == unix.SOL_SOCKET && m.Header.Type == unix.SCM_RIGHTS {
-+				rights, e := unix.ParseUnixRights(&m)
-+				if e == nil {
-+					for _, fd := range rights {
-+						_ = unix.Close(fd)
-+					}
-+				}
-+				valid = false
-+			} else if m.Header.Level == unix.SOL_SOCKET && m.Header.Type == unix.SCM_CREDENTIALS {
-+				credentials++
-+				cred, e := unix.ParseUnixCredentials(&m)
-+				if e != nil || !profileSenderValid(p.admission.launch, cred.Pid, cred.Uid, uint32(os.Geteuid())) {
-+					valid = false
-+				}
-+			} else {
-+				valid = false
-+			}
++		if size > len(b) {
++			size = len(b)
++			flags |= unix.MSG_TRUNC
 +		}
-+		if !valid || credentials != 1 || p.peerAlive() != nil {
++		packet := profileParseAncillary(b[:size], oob[:control], flags, profileAdoptFD)
++		if packet.count != 0 {
++			p.rejectRights(packet)
++			return nil, errProfile
++		}
++		if err != nil || size < 128 || packet.invalid || packet.credentials != 1 || !profileSenderValid(p.admission.launch, packet.pid, packet.uid, uint32(os.Geteuid())) || p.peerAlive() != nil {
 +			return nil, errProfile
 +		}
 +		return b[:size], nil
@@ -8080,7 +12820,7 @@ new file mode 100644
 +	return p.sendObject(kind, reply, 0, body)
 +}
 +func (p *ProfileRuntime) sendObject(kind uint16, reply, object uint64, body []byte) error {
-+	if p.tx == ^uint64(0) || p.peerAlive() != nil || kind == 3 && p.admission.state != profileAdmitted && !p.channelClear() {
++	if p.tx == ^uint64(0) || kind == 16 && p.admission.launch.mode == 2 && p.tx >= ^uint64(0)-1 || p.peerAlive() != nil || kind == 3 && p.admission.state != profileAdmitted && !p.channelClear() {
 +		return errProfile
 +	}
 +	p.tx++
@@ -8227,7 +12967,17 @@ new file mode 100644
 +	if unix.SetsockoptInt(int(p.channel.Fd()), unix.SOL_SOCKET, unix.SO_PASSCRED, 1) != nil {
 +		return nil, errProfile
 +	}
-+	a, e := admitProfile(r, config, p, func(m *profileCapsule) error { p.admission.capsule = *m; return p.verifyAssets() }, time.Now)
++	initialDeadline := time.Now().Add(time.Second)
++	if r.mode == 2 {
++		p.proofs = &profileProofChannel{}
++		if e = p.proofs.bootstrap(r, p, initialDeadline, time.Now); e != nil {
++			return nil, e
++		}
++		p.proofs.peer = p.proofPeerAlive
++		p.proofs.check = p.proofHealth
++		p.proofs.send = p.sendSocketProof
++	}
++	a, e := admitProfileUntil(r, config, p, func(m *profileCapsule) error { p.admission.capsule = *m; return p.verifyAssets() }, time.Now, initialDeadline)
 +	if e != nil {
 +		return nil, errProfile
 +	}
@@ -8243,8 +12993,14 @@ new file mode 100644
 +		return !p.closed && p.ctx.Err() == nil && p.admission.state == profileAdmitted && time.Now().Before(p.admission.deadline)
 +	})
 +	p.flow.reply = p.send
++	if p.proofs != nil {
++		p.flow.prepareProof = p.proofs.prepare
++		p.flow.sendProof = p.proofs.sendOpen
++		p.flow.proofAlive = p.proofs.live
++	}
 +	p.flow.sessionDeadline = a.deadline
 +	p.flowFence = p.fresh
++	profileResolverClosed.Store(true)
 +	// Existing native DAT loader получает только retained controlled root.
 +	// Никакой provider path или унаследованный XRAY_LOCATION_ASSET не принимается.
 +	if os.Setenv("XRAY_LOCATION_ASSET", "/proc/self/fd/"+strconv.Itoa(int(p.root.Fd()))) != nil {
@@ -8290,6 +13046,18 @@ new file mode 100644
 +		p.mu.Unlock()
 +		if p.flow != nil {
 +			p.flow.revoke()
++			if e := p.flow.closeAcceptedProofs(); e != nil {
++				p.mu.Lock()
++				p.admission.state = profileUnknown
++				p.mu.Unlock()
++			}
++			if p.proofs != nil {
++				if e := p.proofs.Close(); e != nil {
++					p.mu.Lock()
++					p.admission.state = profileUnknown
++					p.mu.Unlock()
++				}
++			}
 +			for {
 +				select {
 +				case op := <-p.flowQueue:
@@ -8430,6 +13198,21 @@ new file mode 100644
 +		p.cancel()
 +	}
 +	var first error
++	if p.proofs != nil {
++		first = p.proofs.Close()
++	}
++	if p.flow != nil {
++		if e := p.flow.closeAcceptedProofs(); e != nil && first == nil {
++			first = e
++		}
++	}
++	for _, fd := range p.proofRejected {
++		if fd != nil {
++			if e := fd.Close(); e != nil && first == nil {
++				first = e
++			}
++		}
++	}
 +	closeOne := func(f *os.File) {
 +		if f != nil {
 +			if e := f.Close(); e != nil && first == nil {
@@ -8531,6 +13314,9 @@ new file mode 100644
 +func (p *ProfileRuntime) Done() <-chan struct{} { return p.ctx.Done() }
 +func (p *ProfileRuntime) fresh() bool {
 +	if p.closed || p.ctx.Err() != nil || p.peerAlive() != nil || p.admission.state != profileAdmitted || !time.Now().Before(p.admission.deadline) {
++		return false
++	}
++	if p.admission.launch.mode == 2 && (p.proofs == nil || !p.proofs.live()) {
 +		return false
 +	}
 +	for i, f := range p.assets {
@@ -9126,22 +13912,32 @@ diff --git a/common/yonikbroker/profile_snapshot.go b/common/yonikbroker/profile
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_snapshot.go
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,211 @@
 +package nativehooks
 +
 +import (
 +	"bytes"
 +	"crypto/sha256"
 +	"net/netip"
++	"sync/atomic"
 +)
 +
-+// Snapshot пока удерживает exact verified encoding. DNS consumer следующего
-+// milestone получает только этот тип, а не произвольный filename/hash.
++const profileDNSLookupCredit = 768 * 1024
++
++// Все views принадлежат verified immutable encoding, не live resolver files.
 +type profileSnapshot struct {
-+	encoded  []byte
-+	peers    [3][]byte
-+	families [3]byte
-+	count    int
++	encoded                []byte
++	peers                  [3][]byte
++	families               [3]byte
++	count                  int
++	order, ndots, attempts byte
++	timeout                uint32
++	flags                  uint16
++	search                 [6][]byte
++	searchCount            int
++	hosts                  [4096][]byte
++	hostCount              int
++	rotation               atomic.Uint32
 +}
 +
 +func profileDNSName(b []byte, root bool) bool {
@@ -9189,13 +13985,15 @@ new file mode 100644
 +	if search > 6 {
 +		return nil, errProfile
 +	}
++	var searches [6][]byte
 +	for i := 0; i < search; i++ {
-+		if !profileDNSName(c.str(253), true) {
++		searches[i] = c.str(253)
++		if !profileDNSName(searches[i], true) {
 +			return nil, errProfile
 +		}
 +	}
 +	peers := int(c.n16())
-+	snapshot := &profileSnapshot{encoded: b, count: peers}
++	snapshot := &profileSnapshot{encoded: b, count: peers, order: p[0], ndots: p[1], attempts: p[2], timeout: u32(p, 4), flags: flags, search: searches, searchCount: search}
 +	// Pinned netgo использует первые три valid nameserver, включая duplicates.
 +	if peers == 0 || peers > 3 {
 +		return nil, errProfile
@@ -9225,6 +14023,7 @@ new file mode 100644
 +	// O(n log n) duplicate check с fixed stack storage, без map capacity.
 +	var aliases [4096][]byte
 +	for i := 0; i < hosts; i++ {
++		start := c.b
 +		alias := c.str(253)
 +		if !profileHostsAlias(alias) {
 +			return nil, errProfile
@@ -9249,6 +14048,7 @@ new file mode 100644
 +				return nil, errProfile
 +			}
 +		}
++		snapshot.hosts[i] = start[:len(start)-len(c.b)]
 +	}
 +	if !c.done() {
 +		return nil, errProfile
@@ -9269,6 +14069,7 @@ new file mode 100644
 +				return
 +			}
 +			aliases[i], aliases[child] = aliases[child], aliases[i]
++			snapshot.hosts[i], snapshot.hosts[child] = snapshot.hosts[child], snapshot.hosts[i]
 +			i = child
 +		}
 +	}
@@ -9277,6 +14078,7 @@ new file mode 100644
 +	}
 +	for i := hosts - 1; i > 0; i-- {
 +		aliases[0], aliases[i] = aliases[i], aliases[0]
++		snapshot.hosts[0], snapshot.hosts[i] = snapshot.hosts[i], snapshot.hosts[0]
 +		down(0, i)
 +	}
 +	for i := 1; i < hosts; i++ {
@@ -9284,6 +14086,7 @@ new file mode 100644
 +			return nil, errProfile
 +		}
 +	}
++	snapshot.hostCount = hosts
 +	return snapshot, nil
 +}
 +
@@ -9324,20 +14127,18 @@ new file mode 100644
 diff --git a/common/yonikbroker/routing.go b/common/yonikbroker/routing.go
 --- a/common/yonikbroker/routing.go
 +++ b/common/yonikbroker/routing.go
-@@ -63,6 +63,17 @@
+@@ -63,6 +63,15 @@
  }
  
  func guardEntry(ctx context.Context, stage Stage) error {
 +	if ProfileSession(ctx) {
 +		if stage == BeforeRouting {
-+			return ProfileOriginalValid(ctx)
++			return profileSourceValid(ctx)
 +		}
 +		if stage == BeforeDial {
 +			return ProfilePhysicalGate(ctx)
 +		}
-+		// Physical ownership и DNS service grants подключаются следующим
-+		// transport milestone; owner-only legacy consumer не даёт fallback.
-+		return ErrDenied
++		return ProfileCheckDNSResult(ctx)
 +	}
  	c, ok := ctx.Value(routingKey{}).(*routingConsumer)
  	if !ok || c == nil {
@@ -9345,7 +14146,15 @@ diff --git a/common/yonikbroker/routing.go b/common/yonikbroker/routing.go
 diff --git a/features/dns/localdns/client.go b/features/dns/localdns/client.go
 --- a/features/dns/localdns/client.go
 +++ b/features/dns/localdns/client.go
-@@ -31,12 +31,20 @@
+@@ -8,6 +8,7 @@
+ 
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/features/dns"
+ 	"github.com/xtls/xray-core/transport/internet"
+ )
+@@ -31,12 +32,26 @@
  
  // LookupIP implements Client.
  func (c *Client) LookupIP(host string, option dns.IPOption) ([]net.IP, uint32, error) {
@@ -9354,13 +14163,20 @@ diff --git a/features/dns/localdns/client.go b/features/dns/localdns/client.go
 +
 +// LookupIPWithContext сохраняет отмену и закрытые значения исходного запроса.
 +func (c *Client) LookupIPWithContext(ctx context.Context, host string, option dns.IPOption) ([]net.IP, uint32, error) {
++	if ctx == nil {
++		return nil, 0, hooks.ErrDenied
++	}
 +	if err := ctx.Err(); err != nil {
 +		return nil, 0, err
 +	}
  	var ips []net.IP
  	var err error
- 	if len(internet.Controllers) > 0 {
+-	if len(internet.Controllers) > 0 {
 -		ips, err = c.r.LookupIP(context.Background(), "ip", host)
++	ttl := uint32(dns.DefaultTTL)
++	if hooks.ProfileResolverRequired(ctx) {
++		ips, ttl, err = hooks.ProfileLookupSnapshot(ctx, host, option.IPv4Enable, option.IPv6Enable)
++	} else if len(internet.Controllers) > 0 {
 +		ips, err = c.r.LookupIP(ctx, "ip", host)
  	} else {
 -		ips, err = net.LookupIP(host)
@@ -9368,6 +14184,25 @@ diff --git a/features/dns/localdns/client.go b/features/dns/localdns/client.go
  	}
  	if err != nil {
  		return nil, 0, err
+@@ -62,15 +77,15 @@
+ 	switch {
+ 	case option.IPv4Enable && option.IPv6Enable:
+ 		if len(parsedIPs) > 0 {
+-			return parsedIPs, dns.DefaultTTL, nil
++			return parsedIPs, ttl, nil
+ 		}
+ 	case option.IPv4Enable:
+ 		if len(ipv4) > 0 {
+-			return ipv4, dns.DefaultTTL, nil
++			return ipv4, ttl, nil
+ 		}
+ 	case option.IPv6Enable:
+ 		if len(ipv6) > 0 {
+-			return ipv6, dns.DefaultTTL, nil
++			return ipv6, ttl, nil
+ 		}
+ 	}
+ 	return nil, 0, dns.ErrEmptyResponse
 diff --git a/features/dns/localdns/yonik_context_test.go b/features/dns/localdns/yonik_context_test.go
 new file mode 100644
 --- /dev/null
