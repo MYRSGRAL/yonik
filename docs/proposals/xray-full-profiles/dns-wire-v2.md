@@ -23,7 +23,7 @@ flags u32=0@12; exact encoded LaunchRecord192@16; schemaHash32@208;
 mapping u16=4@240, tables u16=11@242, aggregate u32=8388608@244,
 FD u16=64@248,pending u16=64@250,resources u16=64@252,
 RRmembers u16=256@254,history u16=256@256,reserved14=0@258.
-schemaHash=SHA256 ASCII `YONIK-DNS-V2-CODEC-2` + один NUL byte. После первого
+schemaHash=SHA256 ASCII `YONIK-DNS-V2-CODEC-3` + один NUL byte. После первого
 canonical commit изменение field/offset/семантики требует нового CODEC-N/hash;
 этот identifier нельзя переиспользовать для несовместимого parser.
 ACK40 = ASCII DNSACK02 + SHA256 exact Descriptor272. Descriptor и ACK rights0.
@@ -134,7 +134,7 @@ route credits; pathCount256 не увеличивает существующие
 
 ## Routine bounded records
 
-### Следующая revision CODEC-3: DirectSocket release receipt
+### Canonical revision CODEC-3: DirectSocket release receipt
 
 Этот контракт требует coordinated schemaHash SHA256 ASCII
 `YONIK-DNS-V2-CODEC-3` + NUL без fallback на CODEC-2. До реализации typed producer

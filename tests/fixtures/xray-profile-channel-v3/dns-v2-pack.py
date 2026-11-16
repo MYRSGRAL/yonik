@@ -73,7 +73,7 @@ def descriptor(mode: int) -> bytes:
             field(8, 2, "u16"),
             field(10, 272, "u16"),
             raw(16, launch(mode)),
-            raw(208, hashlib.sha256(b"YONIK-DNS-V2-CODEC-2\0").digest()),
+            raw(208, hashlib.sha256(b"YONIK-DNS-V2-CODEC-3\0").digest()),
             field(240, 4, "u16"),
             field(242, 11, "u16"),
             field(244, 8388608, "u32"),
@@ -901,7 +901,7 @@ def corpus() -> dict[str, Any]:
     reject("bundle-granted-initial-allow", field(48, 257, "u16"))
     reject("bundle-granted-initial-allow", field(50, 1, "u16"))
     return {
-        "contract": "DNS_V2-CODEC-2",
+        "contract": "DNS_V2-CODEC-3",
         "packing": "stdlib struct.pack + explicit offset/type/value tables; no Rust encoder",
         "maximumDnsPayloadIsBoundsOnly": True,
         "negotiations": negotiations,

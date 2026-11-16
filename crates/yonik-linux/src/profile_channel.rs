@@ -621,7 +621,7 @@ pub(crate) mod dns_v2 {
             super::put16(&mut b, 8, 2);
             super::put16(&mut b, 10, 272);
             b[16..208].copy_from_slice(&launch.encode()?);
-            b[208..240].copy_from_slice(&Sha256::digest(b"YONIK-DNS-V2-CODEC-2\0"));
+            b[208..240].copy_from_slice(&Sha256::digest(b"YONIK-DNS-V2-CODEC-3\0"));
             for (at, n) in [
                 (240, 4),
                 (242, 11),
@@ -5342,12 +5342,14 @@ mod tests {
             let ack = dns_v2_hex(n["ackHex"].as_str().unwrap());
             assert_eq!(Negotiated::descriptor(launch).unwrap().as_slice(), d);
             assert_eq!(Negotiated::ack(&d).unwrap().as_slice(), ack);
-            let mut old = d.clone();
-            old[208..240].copy_from_slice(&sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-1\0"));
-            let mut old_ack = [0; 40];
-            old_ack[..8].copy_from_slice(b"DNSACK02");
-            old_ack[8..].copy_from_slice(&sha2::Sha256::digest(&old));
-            assert!(Negotiated::accept(&old, &old_ack, launch, [(0, 0); 2]).is_err());
+            for schema in [b"YONIK-DNS-V2-CODEC-1\0", b"YONIK-DNS-V2-CODEC-2\0"] {
+                let mut old = d.clone();
+                old[208..240].copy_from_slice(&sha2::Sha256::digest(schema));
+                let mut old_ack = [0; 40];
+                old_ack[..8].copy_from_slice(b"DNSACK02");
+                old_ack[8..].copy_from_slice(&sha2::Sha256::digest(&old));
+                assert!(Negotiated::accept(&old, &old_ack, launch, [(0, 0); 2]).is_err());
+            }
             for len in 0..d.len() {
                 assert!(Negotiated::ack(&d[..len]).is_err());
             }
