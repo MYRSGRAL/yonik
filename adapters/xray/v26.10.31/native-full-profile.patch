@@ -8007,7 +8007,7 @@ diff --git a/common/yonikbroker/profile_dns_query_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_query_linux.go
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,196 @@
 +//go:build linux
 +
 +package nativehooks
@@ -8027,6 +8027,7 @@ new file mode 100644
 +	ctx                          context.Context
 +	cancel                       context.CancelFunc
 +	name                         string
++	original                     string
 +	snapshot                     *profileSnapshot
 +	grants                       [2]*profileGrant
 +	ips                          [256]netip.Addr
@@ -8102,7 +8103,7 @@ new file mode 100644
 +		return ctx, noop, errProfileFlowBusy
 +	}
 +	base, cancel := context.WithCancel(ctx)
-+	q := &profileDNSQuery{runtime: p, receipt: r, pool: pool, ctx: base, cancel: cancel, name: profileCanonicalQuery(name), snapshot: p.snapshot, slot: slot}
++	q := &profileDNSQuery{runtime: p, receipt: r, pool: pool, ctx: base, cancel: cancel, name: profileCanonicalQuery(name), original: name, snapshot: p.snapshot, slot: slot}
 +	child := context.WithValue(base, profileDNSQueryKey{}, q)
 +	q.ctx = child
 +	c.dnsQueries[slot] = q
@@ -13213,7 +13214,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	}
  
  	if config.SenderSettings != nil {
-@@ -175,11 +192,71 @@
+@@ -175,11 +192,82 @@
  }
  
  // Dispatch implements proxy.Outbound.Dispatch.
@@ -13259,6 +13260,17 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
 +		return
 +	}
 +	authorizeProfile := func(mux bool) (func(), error) {
++		if next, release, handled, e := nativehooks.ProfileDNSPrepareHandler(ctx, h.tag, ob.Target, mux, h.profileBranch); handled {
++			if e == nil {
++				e = nativehooks.ProfileDNSForwardReady(next, h.tag, ob.Target, mux)
++			}
++			if e != nil {
++				release()
++				return func() {}, e
++			}
++			ctx = next
++			return release, nil
++		}
 +		next, release, e := nativehooks.ProfileAuthorizeHandler(ctx, h.tag, ob.Target, mux)
 +		if e == nil {
 +			e = nativehooks.ProfilePrepareChain(next, h.profileBranch)
@@ -13285,7 +13297,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  		strategy := h.senderSettings.TargetStrategy
  		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
  			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
-@@ -204,38 +281,41 @@
+@@ -204,38 +292,41 @@
  		link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  		link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  	}
@@ -13349,7 +13361,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	err := h.proxy.Process(ctx, link, h)
  	var errC error
  	if err != nil {
-@@ -266,6 +346,9 @@
+@@ -266,6 +357,9 @@
  
  // Dial implements internet.Dialer.
  func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
@@ -14529,7 +14541,7 @@ diff --git a/common/yonikbroker/profile_flow_hooks_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_hooks_linux.go
-@@ -0,0 +1,864 @@
+@@ -0,0 +1,883 @@
 +//go:build linux
 +
 +package nativehooks
@@ -14877,6 +14889,9 @@ new file mode 100644
 +	return nil
 +}
 +func ProfileDispatchEntry(ctx context.Context, destination xnet.Destination) error {
++	if profileDNSExchangeFrom(ctx) != nil {
++		return profileDNSDispatchGate(ctx, destination)
++	}
 +	if !ProfileSession(ctx) {
 +		return nil
 +	}
@@ -14931,6 +14946,16 @@ new file mode 100644
 +	v, e := profileValue(effective)
 +	if e != nil {
 +		return ctx, e
++	}
++	if exchange := profileDNSExchangeFrom(ctx); exchange != nil {
++		if profileDNSDispatchGate(ctx, effective) != nil {
++			return ctx, errProfile
++		}
++		row := p.flow.manifest.rows[4][exchange.root.resolver]
++		if u16(row, 2) != 65535 && u16(row, 2) != subject {
++			return ctx, ErrProfileUnsupported
++		}
++		return context.WithValue(ctx, profileRouteKey{}, profileSelectedRoute{subject: subject, branches: 3, effective: v}), nil
 +	}
 +	if profileServiceGrant(ctx) != nil {
 +		if profileProbeTarget(ctx, v, &subject) != nil {
@@ -15070,6 +15095,9 @@ new file mode 100644
 +	return nil
 +}
 +func ProfileCheckDial(ctx context.Context, target xnet.Destination, carrier bool) error {
++	if profileDNSExchangeFrom(ctx) != nil {
++		return ErrProfileUnsupported
++	}
 +	p := profileRuntime(ctx)
 +	if p == nil {
 +		return nil
@@ -15127,6 +15155,9 @@ new file mode 100644
 +	return nil
 +}
 +func ProfileChain(ctx context.Context, target xnet.Destination, nextTag string) (context.Context, error) {
++	if profileDNSExchangeFrom(ctx) != nil {
++		return profileDNSChainContext(ctx, target, nextTag)
++	}
 +	p := profileRuntime(ctx)
 +	if p == nil {
 +		return ctx, nil
@@ -15398,7 +15429,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,997 @@
+@@ -0,0 +1,1039 @@
 +//go:build linux
 +
 +package nativehooks
@@ -15490,6 +15521,7 @@ new file mode 100644
 +	openOperation       *profileOperation
 +}
 +type profileGrant struct {
++	dnsOwner                            *profileDNSExchange
 +	next                                *profileGrant
 +	parent                              *profileGrant
 +	prepared                            bool
@@ -15510,6 +15542,7 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	dns                                     *profileDNSBundleRPC
 +	denied                                  bool
 +	fixedDeadline                           time.Time
 +	udpSlot                                 int
@@ -15537,6 +15570,9 @@ new file mode 100644
 +	replied, cancelled                                       bool
 +}
 +type profileFlowControl struct {
++	dnsRequests                                    [256]*profileOperation
++	dnsRequestUsed, dnsHistoryUsed, dnsHopCredits  int
++	nextDNSQuery                                   uint64
 +	dnsTasks                                       [256]*ProfileDNSTask
 +	dnsTasksUsed, dnsTasksActive                   int
 +	udpBudget                                      *profileUDPBudget
@@ -15610,6 +15646,17 @@ new file mode 100644
 +	return op, nil
 +}
 +func (c *profileFlowControl) operationAvailable() bool {
++	if c.dnsHopCredits != 0 {
++		used := c.dnsHopCredits
++		for _, g := range c.grants {
++			if g != nil {
++				used++
++			}
++		}
++		if used >= int(c.manifest.caps[0]) {
++			return false
++		}
++	}
 +	if c.udpBudget != nil && (c.udpBudget.used >= int(c.manifest.caps[7]) || c.udpBudget.used >= 256 || c.operations+c.dnsTasksActive+c.udpBudget.proofPending >= int(c.manifest.caps[3]) || c.operations+c.dnsTasksActive+c.udpBudget.proofPending >= 64) {
 +		return false
 +	}
@@ -15617,7 +15664,7 @@ new file mode 100644
 +		return false
 +	}
 +	// Pending и будущий tombstone резервируются одновременно, до enqueue.
-+	reserved := c.operations + c.dnsTasksUsed
++	reserved := c.operations + c.dnsTasksUsed + c.dnsHistoryUsed
 +	for _, t := range c.tombs {
 +		if t.sequence != 0 {
 +			reserved++
@@ -15775,6 +15822,10 @@ new file mode 100644
 +	}
 +}
 +func (c *profileFlowControl) finish(op *profileOperation, e error) {
++	if op.dns != nil {
++		c.dnsFinish(op, e)
++		return
++	}
 +	if op.completed {
 +		return
 +	}
@@ -15801,6 +15852,10 @@ new file mode 100644
 +func (c *profileFlowControl) abort(op *profileOperation) {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
++	if op.dns != nil {
++		c.dnsClose(op.dns.bundle)
++		return
++	}
 +	op.cancelled = true
 +	if op.kind == 16 {
 +		c.closeReceipt(op.receipt)
@@ -15853,7 +15908,7 @@ new file mode 100644
 +	if kind == 1 {
 +		return c.cancelWire(kind, id)
 +	}
-+	reserved := c.operations
++	reserved := c.operations + c.dnsHistoryUsed + c.dnsTasksUsed
 +	for _, t := range c.tombs {
 +		if t.sequence != 0 {
 +			reserved++
@@ -15907,6 +15962,9 @@ new file mode 100644
 +	return c.dispatchLocked(op)
 +}
 +func (c *profileFlowControl) dispatchLocked(op *profileOperation) error {
++	if op.dns != nil {
++		return c.dnsDispatch(op)
++	}
 +	if op.completed {
 +		return nil
 +	}
@@ -15980,6 +16038,12 @@ new file mode 100644
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
 +	if !c.live() {
++		return errProfile
++	}
++	if f.kind == 56 || f.kind == 48 {
++		return c.dnsAccept(f)
++	}
++	if profileDNSV2Operation(f.kind) {
 +		return errProfile
 +	}
 +	if f.kind == 32 {
@@ -16247,6 +16311,9 @@ new file mode 100644
 +func (c *profileFlowControl) tick() error {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
++	if err := c.dnsTick(); err != nil {
++		return err
++	}
 +	now := c.clock()
 +	for i, t := range c.tombs {
 +		if c.udpBudget == nil && t.sequence != 0 && !now.Before(t.deadline) {
@@ -16349,7 +16416,7 @@ new file mode 100644
 +			}
 +		}
 +	}
-+	floor := c.lastSent + 1
++	floor := c.dnsFloor(c.lastSent + 1)
 +	for _, op := range c.pending {
 +		if op != nil && op.sequence < floor {
 +			floor = op.sequence
@@ -16378,6 +16445,12 @@ new file mode 100644
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
 +	c.revoked = true
++	for _, op := range c.dnsRequests[:c.dnsRequestUsed] {
++		if !op.dns.bundle.released {
++			c.dnsUnknown(op.dns.bundle)
++		}
++		c.dnsNotify(op, errProfile)
++	}
 +	for _, q := range c.dnsQueries {
 +		if q != nil {
 +			q.closeLocked()
@@ -17633,7 +17706,7 @@ diff --git a/common/yonikbroker/profile_launch_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux.go
-@@ -0,0 +1,729 @@
+@@ -0,0 +1,755 @@
 +//go:build linux
 +
 +package nativehooks
@@ -17798,12 +17871,32 @@ new file mode 100644
 +	return p.sendObject(kind, reply, 0, body)
 +}
 +func (p *ProfileRuntime) sendObject(kind uint16, reply, object uint64, body []byte) error {
++	dns := profileDNSV2Operation(kind)
++	if dns {
++		if kind != 55 && kind != 47 {
++			return ErrProfileUnsupported
++		}
++		if !p.dnsV2 || p.tx >= ^uint64(0)-1 || reply != 0 || object != 0 || !profileDNSV2Body(kind, body) {
++			return errProfile
++		}
++		if epoch, ok := profileDNSV2Epoch(kind, body); ok && epoch != p.admission.launch.epoch {
++			return errProfile
++		}
++	}
 +	if p.tx == ^uint64(0) || kind == 16 && p.admission.launch.mode == 2 && p.tx >= ^uint64(0)-1 || p.peerAlive() != nil || kind == 3 && p.admission.state != profileAdmitted && !p.channelClear() {
 +		return errProfile
 +	}
 +	p.tx++
-+	b := p.admission.launch.packet(kind, p.tx, reply, body)
-+	be.PutUint64(b[112:], object)
++	var b []byte
++	if dns {
++		b = make([]byte, 128+len(body))
++		if _, e := profileDNSV2Encode(p.admission.launch, kind, p.tx, reply, body, b); e != nil {
++			return e
++		}
++	} else {
++		b = p.admission.launch.packet(kind, p.tx, reply, body)
++		be.PutUint64(b[112:], object)
++	}
 +	n, err := unix.SendmsgN(int(p.channel.Fd()), b, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
 +	if err != nil || n != len(b) {
 +		return errProfile
@@ -18136,6 +18229,9 @@ new file mode 100644
 +			return
 +		}
 +		p.rx++
++		if profileDNSV2Operation(frame.kind) && (!p.dnsV2 || !profileDNSV2Envelope(a.launch, raw, true, 0, 0, frame.reply)) {
++			return
++		}
 +		if frame.kind == 33 {
 +			if frame.reply != 0 || frame.object != 0 || len(frame.body) != 8 || !zero(frame.body[2:]) {
 +				return
@@ -18203,6 +18299,9 @@ new file mode 100644
 +	}
 +	if p.flow != nil {
 +		if e := p.flow.closeAcceptedProofs(); e != nil && first == nil {
++			first = e
++		}
++		if e := p.flow.dnsCleanupResult(); e != nil && first == nil {
 +			first = e
 +		}
 +	}
@@ -20171,7 +20270,15 @@ diff --git a/app/dns/dnscommon.go b/app/dns/dnscommon.go
  	"math"
  	"strings"
  	"time"
-@@ -34,6 +35,8 @@
+@@ -12,6 +13,7 @@
+ 	"github.com/xtls/xray-core/common/log"
+ 	"github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/common/session"
++	hooks "github.com/xtls/xray-core/common/yonikbroker"
+ 
+ 	dns_feature "github.com/xtls/xray-core/features/dns"
+ 
+@@ -34,6 +36,8 @@
  
  // IPRecord is a cacheable item for a resolved domain
  type IPRecord struct {
@@ -20180,7 +20287,7 @@ diff --git a/app/dns/dnscommon.go b/app/dns/dnscommon.go
  	ReqID     uint16
  	IP        []net.IP
  	Expire    time.Time
-@@ -62,12 +65,17 @@
+@@ -62,12 +66,17 @@
  var errRecordNotFound = errors.New("record not found")
  
  type dnsRequest struct {
@@ -20198,7 +20305,7 @@ diff --git a/app/dns/dnscommon.go b/app/dns/dnscommon.go
  
  func genEDNS0Options(clientIP net.IP, padding int) *dnsmessage.Resource {
  	if len(clientIP) == 0 && padding == 0 {
-@@ -184,6 +192,186 @@
+@@ -184,6 +193,186 @@
  }
  
  // parseResponse parses DNS answers from the returned payload
@@ -20385,6 +20492,61 @@ diff --git a/app/dns/dnscommon.go b/app/dns/dnscommon.go
  func parseResponse(payload []byte) (*IPRecord, error) {
  	var parser dnsmessage.Parser
  	h, err := parser.Start(payload)
+@@ -258,11 +447,29 @@
+ 
+ // toDnsContext create a new background context with parent inbound, session and dns log
+ func toDnsContext(ctx context.Context, addr string) context.Context {
+-	dnsCtx := context.WithoutCancel(ctx)
++	dnsCtx := ctx
++	if !hooks.ProfileResolverRequired(ctx) {
++		dnsCtx = context.WithoutCancel(ctx)
++	} else {
++		dnsCtx = ownedDNSMetadataContext(ctx)
++	}
+ 	if inbound := session.InboundFromContext(ctx); inbound != nil {
+ 		dnsCtx = session.ContextWithInbound(dnsCtx, inbound)
+ 	}
+-	dnsCtx = session.ContextWithContent(dnsCtx, session.ContentFromContext(ctx))
++	content := session.ContentFromContext(ctx)
++	if hooks.ProfileResolverRequired(ctx) {
++		// Classic owned service route использует metadata, не sniffing payload
++		// до BundleGranted. Исходный user Content не изменяется.
++		copy := session.Content{}
++		if content != nil {
++			copy = *content
++		}
++		copy.Protocol = "dns"
++		copy.SkipDNSResolve = true
++		copy.SniffingRequest = session.SniffingRequest{}
++		content = &copy
++	}
++	dnsCtx = session.ContextWithContent(dnsCtx, content)
+ 	dnsCtx = log.ContextWithAccessMessage(dnsCtx, &log.AccessMessage{
+ 		From:   "DNS",
+ 		To:     addr,
+@@ -271,3 +478,22 @@
+ 	})
+ 	return dnsCtx
+ }
++
++// Dispatcher меняет последний Outbound. Owned DNS наследует routing metadata
++// без изменения user outbound и без потери cancellation/source context.
++func ownedDNSMetadataContext(ctx context.Context) context.Context {
++	original := session.OutboundsFromContext(ctx)
++	if len(original) > 256 {
++		denied, cancel := context.WithCancel(ctx)
++		cancel()
++		return denied
++	}
++	cloned := make([]*session.Outbound, len(original))
++	for i, outbound := range original {
++		if outbound != nil {
++			copy := *outbound
++			cloned[i] = &copy
++		}
++	}
++	return session.ContextWithOutbounds(ctx, cloned)
++}
 diff --git a/app/dns/dnscommon_test.go b/app/dns/dnscommon_test.go
 --- a/app/dns/dnscommon_test.go
 +++ b/app/dns/dnscommon_test.go
@@ -20661,7 +20823,7 @@ diff --git a/app/dns/nameserver_tcp.go b/app/dns/nameserver_tcp.go
  
  	reqs, err := buildReqMsgs(fqdn, option, s.newReqID, genEDNS0Options(s.clientIP, 0))
  	if err != nil {
-@@ -135,110 +171,163 @@
+@@ -135,110 +171,180 @@
  	}
  
  	for _, req := range reqs {
@@ -20817,6 +20979,24 @@ diff --git a/app/dns/nameserver_tcp.go b/app/dns/nameserver_tcp.go
 +		}
 +		return
 +	}
++	defer b.Release()
++	if hooks.ProfileResolverRequired(dnsCtx) {
++		if s.destination == nil {
++			if noResponseErrCh != nil {
++				noResponseErrCh <- hooks.ErrProfileUnsupported
++			}
++			return
++		}
++		var release func()
++		dnsCtx, release, err = hooks.ProfileDNSExchangeContext(dnsCtx, b.Bytes(), *s.destination)
++		if err != nil {
++			if noResponseErrCh != nil {
++				noResponseErrCh <- err
++			}
++			return
++		}
++		defer release()
++	}
 +
 +	conn, err := s.dial(dnsCtx)
 +	if task != nil {
@@ -20838,6 +21018,7 @@ diff --git a/app/dns/nameserver_tcp.go b/app/dns/nameserver_tcp.go
 +		defer conn.Close()
 +	}
 +	dnsReqBuf := buf.New()
++	defer dnsReqBuf.Release()
 +	err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
 +	if err != nil {
 +		errors.LogErrorInner(ctx, err, "binary write failed")
@@ -20854,7 +21035,6 @@ diff --git a/app/dns/nameserver_tcp.go b/app/dns/nameserver_tcp.go
 +		}
 +		return
 +	}
-+	b.Release()
 +
 +	_, err = conn.Write(dnsReqBuf.Bytes())
 +	if err != nil {
@@ -20864,7 +21044,6 @@ diff --git a/app/dns/nameserver_tcp.go b/app/dns/nameserver_tcp.go
 +		}
 +		return
 +	}
-+	dnsReqBuf.Release()
 +
 +	var response []byte
 +	if r.owned || hooks.ProfileResolverRequired(dnsCtx) {
@@ -20986,7 +21165,7 @@ diff --git a/app/dns/nameserver_udp.go b/app/dns/nameserver_udp.go
  		return
  	}
  
-@@ -132,6 +149,10 @@
+@@ -132,9 +149,34 @@
  			newMsg.Additionals = append(newMsg.Additionals, *opt)
  			newMsg.ID = s.newReqID()
  			newReq.msg = &newMsg
@@ -20994,10 +21173,36 @@ diff --git a/app/dns/nameserver_udp.go b/app/dns/nameserver_udp.go
 +				newReq.lineage = &ownedDNSExchange{}
 +				newReq.ctx = context.WithValue(req.ctx, ownedDNSExchangeKey{}, newReq.lineage)
 +			}
++			b, packError := dns.PackMessage(newReq.msg)
++			if packError != nil {
++				return
++			}
++			server := s.udpServer
++			if newReq.owned {
++				var release func()
++				var e error
++				newReq.ctx, release, e = hooks.ProfileDNSExchangeContext(newReq.ctx, b.Bytes(), *s.address)
++				if e != nil {
++					b.Release()
++					return
++				}
++				context.AfterFunc(newReq.ctx, release)
++				var isolated *udp.Dispatcher
++				isolated = udp.NewDispatcher(s.dispatcher, func(replyCtx context.Context, packet *udp_proto.Packet) {
++					s.HandleResponse(replyCtx, packet)
++					isolated.RemoveRay()
++				})
++				context.AfterFunc(newReq.ctx, func() { isolated.RemoveRay() })
++				server = isolated
++			}
  			s.addPendingRequest(&newReq)
- 			b, _ := dns.PackMessage(newReq.msg)
- 			s.udpServer.Dispatch(toDnsContext(newReq.ctx, s.address.String()), *s.address, b)
-@@ -162,7 +183,20 @@
+-			b, _ := dns.PackMessage(newReq.msg)
+-			s.udpServer.Dispatch(toDnsContext(newReq.ctx, s.address.String()), *s.address, b)
++			server.Dispatch(toDnsContext(newReq.ctx, s.address.String()), *s.address, b)
+ 			return
+ 		}
+ 	}
+@@ -162,7 +204,20 @@
  
  // sendQuery implements CachedNameserver.
  func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns_feature.IPOption) {
@@ -21019,7 +21224,7 @@ diff --git a/app/dns/nameserver_udp.go b/app/dns/nameserver_udp.go
  
  	reqs, err := buildReqMsgs(fqdn, option, s.newReqID, genEDNS0Options(s.clientIP, 0))
  	if err != nil {
-@@ -179,9 +213,15 @@
+@@ -179,11 +234,19 @@
  	}
  
  	for _, req := range reqs {
@@ -21032,20 +21237,40 @@ diff --git a/app/dns/nameserver_udp.go b/app/dns/nameserver_udp.go
  		udpReq := &udpDnsRequest{
  			dnsRequest: *req,
 -			ctx:        ctx,
+-		}
+-		s.addPendingRequest(udpReq)
 +			ctx:        queryCtx,
- 		}
- 		s.addPendingRequest(udpReq)
++		}
++		if !req.owned {
++			s.addPendingRequest(udpReq)
++		}
  		b, err := dns.PackMessage(req.msg)
-@@ -193,7 +233,7 @@
+ 		if err != nil {
+ 			errors.LogErrorInner(ctx, err, "failed to pack dns query")
+@@ -193,7 +256,21 @@
  			return
  		}
  		server := s.udpServer
 -		if hooks.HasFlowContext(ctx) {
++		if req.owned {
++			var release func()
++			queryCtx, release, err = hooks.ProfileDNSExchangeContext(queryCtx, b.Bytes(), *s.address)
++			if err != nil {
++				b.Release()
++				if noResponseErrCh != nil {
++					noResponseErrCh <- err
++				}
++				return
++			}
++			context.AfterFunc(queryCtx, release)
++			udpReq.ctx = queryCtx
++			s.addPendingRequest(udpReq)
++		}
 +		if req.owned || hooks.HasFlowContext(ctx) {
  			// Managed exchange не переиспользует socket другого flow.
  			var isolated *udp.Dispatcher
  			isolated = udp.NewDispatcher(s.dispatcher, func(replyCtx context.Context, packet *udp_proto.Packet) {
-@@ -203,7 +243,7 @@
+@@ -203,7 +280,7 @@
  			server = isolated
  			go func() { <-ctx.Done(); isolated.RemoveRay() }()
  		}
@@ -21078,7 +21303,7 @@ diff --git a/app/dns/yonik_lineage_test.go b/app/dns/yonik_lineage_test.go
 new file mode 100644
 --- /dev/null
 +++ b/app/dns/yonik_lineage_test.go
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,287 @@
 +package dns
 +
 +import (
@@ -21088,6 +21313,7 @@ new file mode 100644
 +	"github.com/xtls/xray-core/common/buf"
 +	xnet "github.com/xtls/xray-core/common/net"
 +	udp "github.com/xtls/xray-core/common/protocol/udp"
++	"github.com/xtls/xray-core/common/session"
 +	fdns "github.com/xtls/xray-core/features/dns"
 +	"golang.org/x/net/dns/dnsmessage"
 +	stdnet "net"
@@ -21099,6 +21325,30 @@ new file mode 100644
 +	read    *bytes.Reader
 +	written bytes.Buffer
 +	closed  int
++}
++
++func TestYonikDNSOwnedMetadataDoesNotChangeUserOutboundOrDetachCancel(t *testing.T) {
++	parent, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	original := &session.Outbound{Target: xnet.TCPDestination(xnet.ParseAddress("user.invalid"), 443)}
++	parent = session.ContextWithOutbounds(parent, []*session.Outbound{original})
++	child := ownedDNSMetadataContext(parent)
++	got := session.OutboundsFromContext(child)
++	if len(got) != 1 || got[0] == original {
++		t.Fatal("DNS dispatcher shares mutable user outbound")
++	}
++	got[0].Target = xnet.UDPDestination(xnet.ParseAddress("192.0.2.53"), 53)
++	if original.Target.Address.String() != "user.invalid" {
++		t.Fatal("DNS rewrote original native target")
++	}
++	cancel()
++	if child.Err() == nil {
++		t.Fatal("DNS metadata detached cancellation")
++	}
++	many := session.ContextWithOutbounds(context.Background(), make([]*session.Outbound, 257))
++	if ownedDNSMetadataContext(many).Err() == nil {
++		t.Fatal("metadata bound ignored")
++	}
 +}
 +
 +func (c *ownedDNSFakeTCP) Read(b []byte) (int, error)  { return c.read.Read(b) }
@@ -21345,23 +21595,23 @@ diff --git a/common/yonikbroker/profile-dns-v2-canonical.json b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile-dns-v2-canonical.json
-@@ -0,0 +1,6639 @@
+@@ -0,0 +1,7758 @@
 +{
-+  "contract": "DNS_V2-CODEC-1",
++  "contract": "DNS_V2-CODEC-2",
 +  "packing": "stdlib struct.pack + explicit offset/type/value tables; no Rust encoder",
 +  "maximumDnsPayloadIsBoundsOnly": true,
 +  "negotiations": [
 +    {
 +      "mode": 1,
 +      "launchHex": "594e4b4c4f433031000100c00000000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e900000000000000000000002a000000000000000003030303030303030303030303030303030303030303030303030303030303030000000000000000",
-+      "descriptorHex": "444e534e454730320002011000000000594e4b4c4f433031000100c00000000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e900000000000000000000002a000000000000000003030303030303030303030303030303030303030303030303030303030303030000000000000000cd183a11d8ed2d467809bc68cdbeae02ec2407809144c0983d43665a3ab4cdcf0004000b00800000004000400040010001000000000000000000000000000000",
-+      "ackHex": "444e5341434b3032d62d85df99ac0112da1366480355bababedb122c7db23a7c7d7895ae3f27b422"
++      "descriptorHex": "444e534e454730320002011000000000594e4b4c4f433031000100c00000000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e900000000000000000000002a0000000000000000030303030303030303030303030303030303030303030303030303030303030300000000000000007b2975158f31a515488251dab5abf956c1921b1548562cd64b95da0a506375cb0004000b00800000004000400040010001000000000000000000000000000000",
++      "ackHex": "444e5341434b3032fb922e79dc9cfa7f6fb4745618076694131574a7d9cb8008d9c8ce0146962415"
 +    },
 +    {
 +      "mode": 2,
 +      "launchHex": "594e4b4558543031000100c00001000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e9000007d2000000000000002a000000000000002b03030303030303030303030303030303030303030303030303030303030303030000000000000000",
-+      "descriptorHex": "444e534e454730320002011000000000594e4b4558543031000100c00001000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e9000007d2000000000000002a000000000000002b03030303030303030303030303030303030303030303030303030303030303030000000000000000cd183a11d8ed2d467809bc68cdbeae02ec2407809144c0983d43665a3ab4cdcf0004000b00800000004000400040010001000000000000000000000000000000",
-+      "ackHex": "444e5341434b3032297bea826eef492773081a420e2746bbd2ad7b68ee12eca33aba1773b3bf462d"
++      "descriptorHex": "444e534e454730320002011000000000594e4b4558543031000100c00001000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e9000007d2000000000000002a000000000000002b030303030303030303030303030303030303030303030303030303030303030300000000000000007b2975158f31a515488251dab5abf956c1921b1548562cd64b95da0a506375cb0004000b00800000004000400040010001000000000000000000000000000000",
++      "ackHex": "444e5341434b30322e1c286a295962fb1875b77f2bf5a4eb4b8a2c76962e3f6ea558f6680fcd9386"
 +    }
 +  ],
 +  "vectors": [
@@ -26013,6 +26263,511 @@ new file mode 100644
 +      "frameHex": "594e4b4341503031000100230000048000000000000000af00000000000000000202020202020202020202020202020203030303030303030303030303030303010101010101010101010101010101010101010101010101010101010101010100000000000000050000000000000007000000000000000000000000000000000002010000000000000000000000000b000000000000000c000000000000000d00000000000000050000000000000006000000000000000700000000000003e800000000ffff0000000101011103010000010070032f00000000000000000000686161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612e62626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626200000000000000050300ffffffffffffffff0000030601bb00fd00006161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612e6262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262622e6363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363632e64646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464030601bb00fd00006161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612e6262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262622e6363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363632e64646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464000000fd6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612e6262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262622e6363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363632e6464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646400000000000000000000000000000000",
 +      "bodySha256": "58a2d6de47ff62f5fa62f524c7fd36fb7e9c51299d8b4dda71c421402d155b9d",
 +      "frameSha256": "d310a2467b4966e813fc57c5a154fdb7a00fa1462d83ad723d0f0a6bdaf3f17d"
++    },
++    {
++      "name": "bundle-acquire-initial",
++      "kind": 55,
++      "mode": 1,
++      "size": 172,
++      "direction": "producer",
++      "rights": 0,
++      "credentials": 0,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          8,
++          "u64",
++          13
++        ],
++        [
++          16,
++          "u64",
++          11
++        ],
++        [
++          24,
++          "u64",
++          7
++        ],
++        [
++          32,
++          "u64",
++          0
++        ],
++        [
++          40,
++          "u64",
++          1000
++        ],
++        [
++          48,
++          "u16",
++          80
++        ],
++        [
++          50,
++          "u16",
++          1
++        ],
++        [
++          52,
++          "u16",
++          1
++        ],
++        [
++          54,
++          "u16",
++          12
++        ],
++        [
++          56,
++          "u16",
++          1232
++        ],
++        [
++          58,
++          "u16",
++          16
++        ],
++        [
++          64,
++          "u64",
++          0
++        ],
++        [
++          72,
++          "hex",
++          "00000000000000050300ffffffffffffffff0000040601bb00040000c0000201040601bb00040000c0000201000000107265736f6c7665722e696e76616c6964000000000000000000000000000000007265736f6c7665722e696e76616c696400000000"
++        ]
++      ],
++      "bodyHex": "0002000000000000000000000000000d000000000000000b0000000000000007000000000000000000000000000003e8005000010001000c04d0001000000000000000000000000000000000000000050300ffffffffffffffff0000040601bb00040000c0000201040601bb00040000c0000201000000107265736f6c7665722e696e76616c6964000000000000000000000000000000007265736f6c7665722e696e76616c696400000000",
++      "frameHex": "594e4b4341503031000100370000012c00000000000000b000000000000000000202020202020202020202020202020203030303030303030303030303030303010101010101010101010101010101010101010101010101010101010101010100000000000000050000000000000007000000000000000000000000000000000002000000000000000000000000000d000000000000000b0000000000000007000000000000000000000000000003e8005000010001000c04d0001000000000000000000000000000000000000000050300ffffffffffffffff0000040601bb00040000c0000201040601bb00040000c0000201000000107265736f6c7665722e696e76616c6964000000000000000000000000000000007265736f6c7665722e696e76616c696400000000",
++      "bodySha256": "112cb0c8c27dd2a32ab95a6c7732d632a231665a40bbaa4764a272c605ce2a4e",
++      "frameSha256": "bac7eaa7d4d8ba6435c0bf2a1d8a87ec5e82e46d9ef31f32c2a689676fc63d23"
++    },
++    {
++      "name": "bundle-acquire-renew",
++      "kind": 55,
++      "mode": 1,
++      "size": 176,
++      "direction": "producer",
++      "rights": 0,
++      "credentials": 0,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          8,
++          "u64",
++          13
++        ],
++        [
++          16,
++          "u64",
++          11
++        ],
++        [
++          24,
++          "u64",
++          7
++        ],
++        [
++          32,
++          "u64",
++          12
++        ],
++        [
++          40,
++          "u64",
++          1000
++        ],
++        [
++          48,
++          "u16",
++          80
++        ],
++        [
++          50,
++          "u16",
++          2
++        ],
++        [
++          52,
++          "u16",
++          1
++        ],
++        [
++          54,
++          "u16",
++          12
++        ],
++        [
++          56,
++          "u16",
++          1232
++        ],
++        [
++          58,
++          "u16",
++          16
++        ],
++        [
++          64,
++          "u64",
++          1
++        ],
++        [
++          72,
++          "hex",
++          "00000000000000050300ffffffffffffffff0000040601bb00040000c0000201040601bb00040000c0000201000000107265736f6c7665722e696e76616c6964000000000000000000000000000000007265736f6c7665722e696e76616c69640000000000010100"
++        ]
++      ],
++      "bodyHex": "0002000000000000000000000000000d000000000000000b0000000000000007000000000000000c00000000000003e8005000020001000c04d0001000000000000000000000000100000000000000050300ffffffffffffffff0000040601bb00040000c0000201040601bb00040000c0000201000000107265736f6c7665722e696e76616c6964000000000000000000000000000000007265736f6c7665722e696e76616c69640000000000010100",
++      "frameHex": "594e4b4341503031000100370000013000000000000000b100000000000000000202020202020202020202020202020203030303030303030303030303030303010101010101010101010101010101010101010101010101010101010101010100000000000000050000000000000007000000000000000000000000000000000002000000000000000000000000000d000000000000000b0000000000000007000000000000000c00000000000003e8005000020001000c04d0001000000000000000000000000100000000000000050300ffffffffffffffff0000040601bb00040000c0000201040601bb00040000c0000201000000107265736f6c7665722e696e76616c6964000000000000000000000000000000007265736f6c7665722e696e76616c69640000000000010100",
++      "bodySha256": "da39aff1515cd9f4e77cdbe1a4cff3b93726c579e9989cc31980c7359b8baec5",
++      "frameSha256": "10d0d5ef4fd79cd948221407ece41ae4091e7a0bcc27725935925661441c68e7"
++    },
++    {
++      "name": "bundle-acquire-max",
++      "kind": 55,
++      "mode": 1,
++      "size": 2164,
++      "direction": "producer",
++      "rights": 0,
++      "credentials": 0,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          8,
++          "u64",
++          13
++        ],
++        [
++          16,
++          "u64",
++          11
++        ],
++        [
++          24,
++          "u64",
++          7
++        ],
++        [
++          32,
++          "u64",
++          0
++        ],
++        [
++          40,
++          "u64",
++          1000
++        ],
++        [
++          48,
++          "u16",
++          815
++        ],
++        [
++          50,
++          "u16",
++          256
++        ],
++        [
++          52,
++          "u16",
++          1
++        ],
++        [
++          54,
++          "u16",
++          12
++        ],
++        [
++          56,
++          "u16",
++          1232
++        ],
++        [
++          58,
++          "u16",
++          253
++        ],
++        [
++          64,
++          "u64",
++          0
++        ],
++        [
++          72,
++          "hex",
++          "00000000000000050300ffffffffffffffff0000030601bb00fd00006161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612e6262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262622e6363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363632e64646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464030601bb00fd00006161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612e6262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262622e6363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363632e64646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464000000fd6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612e6262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262622e6363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363632e64646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464000000000000000000000000000000006161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612e6262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262622e6363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363632e6464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646400000000000101000002000000030100000400000005010000060000000701000008000000090100000a0000000b0100000c0000000d0100000e0000000f010000100000001101000012000000130100001400000015010000160000001701000018000000190100001a0000001b0100001c0000001d0100001e0000001f010000200000002101000022000000230100002400000025010000260000002701000028000000290100002a0000002b0100002c0000002d0100002e0000002f010000300000003101000032000000330100003400000035010000360000003701000038000000390100003a0000003b0100003c0000003d0100003e0000003f010000400000004101000042000000430100004400000045010000460000004701000048000000490100004a0000004b0100004c0000004d0100004e0000004f010000500000005101000052000000530100005400000055010000560000005701000058000000590100005a0000005b0100005c0000005d0100005e0000005f010000600000006101000062000000630100006400000065010000660000006701000068000000690100006a0000006b0100006c0000006d0100006e0000006f010000700000007101000072000000730100007400000075010000760000007701000078000000790100007a0000007b0100007c0000007d0100007e0000007f010000800000008101000082000000830100008400000085010000860000008701000088000000890100008a0000008b0100008c0000008d0100008e0000008f010000900000009101000092000000930100009400000095010000960000009701000098000000990100009a0000009b0100009c0000009d0100009e0000009f010000a0000000a1010000a2000000a3010000a4000000a5010000a6000000a7010000a8000000a9010000aa000000ab010000ac000000ad010000ae000000af010000b0000000b1010000b2000000b3010000b4000000b5010000b6000000b7010000b8000000b9010000ba000000bb010000bc000000bd010000be000000bf010000c0000000c1010000c2000000c3010000c4000000c5010000c6000000c7010000c8000000c9010000ca000000cb010000cc000000cd010000ce000000cf010000d0000000d1010000d2000000d3010000d4000000d5010000d6000000d7010000d8000000d9010000da000000db010000dc000000dd010000de000000df010000e0000000e1010000e2000000e3010000e4000000e5010000e6000000e7010000e8000000e9010000ea000000eb010000ec000000ed010000ee000000ef010000f0000000f1010000f2000000f3010000f4000000f5010000f6000000f7010000f8000000f9010000fa000000fb010000fc000000fd010000fe000000ff0100"
++        ]
++      ],
++      "bodyHex": null,
++      "frameHex": null,
++      "bodySha256": "bde801e17931778351e9972e76989887b8d9e79b00e11c7ecbd1a0a1aec00db9",
++      "frameSha256": "5de0eec04fca1bdae60e099d9e3b239447b798106fd6f9f317a8236ad99c92b4"
++    },
++    {
++      "name": "bundle-granted-initial-allow",
++      "kind": 56,
++      "mode": 1,
++      "size": 64,
++      "direction": "issuer",
++      "rights": 0,
++      "credentials": 0,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          1
++        ],
++        [
++          8,
++          "u64",
++          12
++        ],
++        [
++          16,
++          "u64",
++          13
++        ],
++        [
++          24,
++          "u64",
++          11
++        ],
++        [
++          32,
++          "u64",
++          7
++        ],
++        [
++          40,
++          "u64",
++          1000
++        ],
++        [
++          48,
++          "u16",
++          1
++        ],
++        [
++          56,
++          "u64",
++          1
++        ]
++      ],
++      "bodyHex": "0002010000000000000000000000000c000000000000000d000000000000000b000000000000000700000000000003e800010000000000000000000000000001",
++      "frameHex": "594e4b434150303100010038000000c000000000000000b300000000000000090202020202020202020202020202020203030303030303030303030303030303010101010101010101010101010101010101010101010101010101010101010100000000000000050000000000000007000000000000000000000000000000000002010000000000000000000000000c000000000000000d000000000000000b000000000000000700000000000003e800010000000000000000000000000001",
++      "bodySha256": "2fc666e6528cfe15264046b0a2ff52708f9b2be160b2f709e2c644d5fde21438",
++      "frameSha256": "4d2e138a684da3d34b7a06a6dd1433a75920fcc13e03ca79540f06829adc6190"
++    },
++    {
++      "name": "bundle-granted-initial-deny",
++      "kind": 56,
++      "mode": 1,
++      "size": 64,
++      "direction": "issuer",
++      "rights": 0,
++      "credentials": 0,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          2
++        ]
++      ],
++      "bodyHex": "00020200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "frameHex": "594e4b434150303100010038000000c000000000000000b4000000000000000902020202020202020202020202020202030303030303030303030303030303030101010101010101010101010101010101010101010101010101010101010101000000000000000500000000000000070000000000000000000000000000000000020200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "bodySha256": "89b87aa159862caf9cac0eb0415471ebc16ba5dc9502be59fe1224d2da86e9a3",
++      "frameSha256": "83e3c0e1a32a2271a959f372bbe7198ee4b472efe137ed9dd172babf8b1a45d0"
++    },
++    {
++      "name": "bundle-granted-initial-unknown",
++      "kind": 56,
++      "mode": 1,
++      "size": 64,
++      "direction": "issuer",
++      "rights": 0,
++      "credentials": 0,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          3
++        ]
++      ],
++      "bodyHex": "00020300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "frameHex": "594e4b434150303100010038000000c000000000000000b5000000000000000902020202020202020202020202020202030303030303030303030303030303030101010101010101010101010101010101010101010101010101010101010101000000000000000500000000000000070000000000000000000000000000000000020300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "bodySha256": "4a3fa1e8ee0e068bd8c6a4ddb2b4021ebda052e78ddf5f1c1f9b50f92a270363",
++      "frameSha256": "72ad7dbf0080594d4abc4f05296771fec3f93ec8a25b5edd7ae3e563d3efb493"
++    },
++    {
++      "name": "bundle-granted-renew-allow",
++      "kind": 56,
++      "mode": 1,
++      "size": 64,
++      "direction": "issuer",
++      "rights": 0,
++      "credentials": 0,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          1
++        ],
++        [
++          8,
++          "u64",
++          12
++        ],
++        [
++          16,
++          "u64",
++          13
++        ],
++        [
++          24,
++          "u64",
++          11
++        ],
++        [
++          32,
++          "u64",
++          7
++        ],
++        [
++          40,
++          "u64",
++          1000
++        ],
++        [
++          48,
++          "u16",
++          1
++        ],
++        [
++          56,
++          "u64",
++          2
++        ]
++      ],
++      "bodyHex": "0002010000000000000000000000000c000000000000000d000000000000000b000000000000000700000000000003e800010000000000000000000000000002",
++      "frameHex": "594e4b434150303100010038000000c000000000000000b600000000000000090202020202020202020202020202020203030303030303030303030303030303010101010101010101010101010101010101010101010101010101010101010100000000000000050000000000000007000000000000000000000000000000000002010000000000000000000000000c000000000000000d000000000000000b000000000000000700000000000003e800010000000000000000000000000002",
++      "bodySha256": "74f0fe8fa798b902c9c7e335ff3aba53e6114403ed58f736e0042e0cf0f2e5a6",
++      "frameSha256": "e3885ebe060960fc49027bda77b5f8e81b9184a1fd39d7d960a96c1841a8cb9a"
++    },
++    {
++      "name": "bundle-granted-renew-deny",
++      "kind": 56,
++      "mode": 1,
++      "size": 64,
++      "direction": "issuer",
++      "rights": 0,
++      "credentials": 0,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          2
++        ]
++      ],
++      "bodyHex": "00020200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "frameHex": "594e4b434150303100010038000000c000000000000000b7000000000000000902020202020202020202020202020202030303030303030303030303030303030101010101010101010101010101010101010101010101010101010101010101000000000000000500000000000000070000000000000000000000000000000000020200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "bodySha256": "89b87aa159862caf9cac0eb0415471ebc16ba5dc9502be59fe1224d2da86e9a3",
++      "frameSha256": "647866fee1c7ef6ead009f45db5ebd8603f4eaa9070217c9a5bbc28370cb9a70"
++    },
++    {
++      "name": "bundle-granted-renew-unknown",
++      "kind": 56,
++      "mode": 1,
++      "size": 64,
++      "direction": "issuer",
++      "rights": 0,
++      "credentials": 0,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          3
++        ]
++      ],
++      "bodyHex": "00020300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "frameHex": "594e4b434150303100010038000000c000000000000000b8000000000000000902020202020202020202020202020202030303030303030303030303030303030101010101010101010101010101010101010101010101010101010101010101000000000000000500000000000000070000000000000000000000000000000000020300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "bodySha256": "4a3fa1e8ee0e068bd8c6a4ddb2b4021ebda052e78ddf5f1c1f9b50f92a270363",
++      "frameSha256": "ae0fda856fbaf71473b9a226fd501d4cdca7859858f6266073c5b318255afb2b"
++    },
++    {
++      "name": "cancel-bundle",
++      "kind": 47,
++      "mode": 1,
++      "size": 24,
++      "direction": "producer",
++      "rights": 0,
++      "credentials": 0,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          8
++        ],
++        [
++          8,
++          "u64",
++          12
++        ]
++      ],
++      "bodyHex": "0002080000000000000000000000000c0000000000000000",
++      "frameHex": "594e4b43415030310001002f0000009800000000000000b900000000000000000202020202020202020202020202020203030303030303030303030303030303010101010101010101010101010101010101010101010101010101010101010100000000000000050000000000000007000000000000000000000000000000000002080000000000000000000000000c0000000000000000",
++      "bodySha256": "65c640c2cb2419e57e7c378d9d4a4705b332ad857b2a503cc728c0af1dc363fa",
++      "frameSha256": "31446796cd85c4d8107d0d924c443bb041afeb42ff5b0813100c23c4ca6ff726"
 +    }
 +  ],
 +  "rejectedBodies": [
@@ -27084,6 +27839,160 @@ new file mode 100644
 +      "appendZeroBytes": 0
 +    },
 +    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          0,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-renew",
++      "patches": [
++        [
++          0,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-max",
++      "patches": [
++        [
++          0,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          0,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-deny",
++      "patches": [
++        [
++          0,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-deny",
++      "patches": [
++        [
++          8,
++          "u64",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-unknown",
++      "patches": [
++        [
++          0,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-unknown",
++      "patches": [
++        [
++          8,
++          "u64",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-renew-allow",
++      "patches": [
++        [
++          0,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-renew-deny",
++      "patches": [
++        [
++          0,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-renew-deny",
++      "patches": [
++        [
++          8,
++          "u64",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-renew-unknown",
++      "patches": [
++        [
++          0,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-renew-unknown",
++      "patches": [
++        [
++          8,
++          "u64",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "cancel-bundle",
++      "patches": [
++        [
++          0,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
 +      "case": "reserve-user",
 +      "patches": [
 +        [
@@ -27801,7 +28710,7 @@ new file mode 100644
 +        [
 +          2,
 +          "u8",
-+          8
++          9
 +        ]
 +      ],
 +      "appendZeroBytes": 0
@@ -27816,9 +28725,469 @@ new file mode 100644
 +        ]
 +      ],
 +      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          8,
++          "u64",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          8,
++          "u64",
++          18446744073709551615
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          16,
++          "u64",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          16,
++          "u64",
++          18446744073709551615
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          24,
++          "u64",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          24,
++          "u64",
++          18446744073709551615
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          48,
++          "u16",
++          816
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          50,
++          "u16",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          50,
++          "u16",
++          257
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          52,
++          "u16",
++          15
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          54,
++          "u16",
++          32
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          56,
++          "u16",
++          4097
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          58,
++          "u16",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          60,
++          "u16",
++          65535
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          62,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          40,
++          "u64",
++          1000000001
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          32,
++          "u64",
++          12
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          64,
++          "u64",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-renew",
++      "patches": [
++        [
++          32,
++          "u64",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-renew",
++      "patches": [
++        [
++          64,
++          "u64",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-renew",
++      "patches": [
++        [
++          64,
++          "u64",
++          18446744073709551615
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          80,
++          "u8",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          60,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          168,
++          "u16",
++          65535
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          170,
++          "u8",
++          2
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          171,
++          "u8",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [],
++      "appendZeroBytes": 1
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          8,
++          "u64",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          8,
++          "u64",
++          18446744073709551615
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          16,
++          "u64",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          16,
++          "u64",
++          18446744073709551615
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          24,
++          "u64",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          24,
++          "u64",
++          18446744073709551615
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          32,
++          "u64",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          32,
++          "u64",
++          18446744073709551615
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          56,
++          "u64",
++          0
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          56,
++          "u64",
++          18446744073709551615
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          40,
++          "u64",
++          1000000001
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          48,
++          "u16",
++          257
++        ]
++      ],
++      "appendZeroBytes": 0
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          50,
++          "u16",
++          1
++        ]
++      ],
++      "appendZeroBytes": 0
 +    }
 +  ],
 +  "rejectedFrames": [
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [
++        [
++          152,
++          "u64",
++          8
++        ]
++      ]
++    },
++    {
++      "case": "bundle-granted-initial-allow",
++      "patches": [
++        [
++          160,
++          "u64",
++          8
++        ]
++      ]
++    },
++    {
++      "case": "bundle-acquire-initial",
++      "patches": [],
++      "rights": 1,
++      "credentials": 0
++    },
 +    {
 +      "case": "publish-1",
 +      "patches": [
@@ -28450,7 +29819,7 @@ new file mode 100644
 +	if c.udpBudget != nil {
 +		pending += c.udpBudget.proofPending
 +	}
-+	history := c.dnsTasksUsed
++	history := c.dnsTasksUsed + c.dnsHistoryUsed
 +	if c.udpBudget != nil {
 +		history = c.udpBudget.used
 +	} else {
@@ -28734,13 +30103,14 @@ diff --git a/common/yonikbroker/profile_dns_tasks_other.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_tasks_other.go
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,28 @@
 +//go:build !linux
 +
 +package nativehooks
 +
 +import (
 +	"context"
++	xnet "github.com/xtls/xray-core/common/net"
 +	"io"
 +)
 +
@@ -28752,11 +30122,21 @@ new file mode 100644
 +func (*ProfileDNSTask) Own(io.Closer) error                         { return nil }
 +func (*ProfileDNSTask) OwnContext(context.Context, io.Closer) error { return nil }
 +func (*ProfileDNSTask) Finish(...error) error                       { return nil }
++
++func ProfileDNSExchangeContext(ctx context.Context, _ []byte, _ xnet.Destination) (context.Context, func(), error) {
++	return ctx, func() {}, nil
++}
++func ProfileDNSPrepareHandler(ctx context.Context, _ string, _ xnet.Destination, _ bool, _ func(string, xnet.Destination) (bool, error)) (context.Context, func(), bool, error) {
++	return ctx, func() {}, false, nil
++}
++func ProfileDNSForwardReady(context.Context, string, xnet.Destination, bool) error {
++	return ErrProfileUnsupported
++}
 diff --git a/common/yonikbroker/profile_dns_v2.go b/common/yonikbroker/profile_dns_v2.go
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_v2.go
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,515 @@
 +package nativehooks
 +
 +import (
@@ -28775,7 +30155,7 @@ new file mode 100644
 +	be.PutUint16(out[8:], 2)
 +	be.PutUint16(out[10:], 272)
 +	copy(out[16:], launch)
-+	hash := sha256.Sum256([]byte("YONIK-DNS-V2-CODEC-1\x00"))
++	hash := sha256.Sum256([]byte("YONIK-DNS-V2-CODEC-2\x00"))
 +	copy(out[208:], hash[:])
 +	for _, v := range [][2]uint16{{240, 4}, {242, 11}, {248, 64}, {250, 64}, {252, 64}, {254, 256}, {256, 256}} {
 +		be.PutUint16(out[v[0]:], v[1])
@@ -28798,9 +30178,17 @@ new file mode 100644
 +	hash := sha256.Sum256(descriptor)
 +	return string(ack[:8]) == "DNSACK02" && bytes.Equal(ack[8:], hash[:])
 +}
++func profileDNSV2Operation(kind uint16) bool {
++	switch kind {
++	case 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 52, 53, 54, 55, 56:
++		return true
++	}
++	return false
++}
++
 +func profileDNSV2Reply(kind uint16) bool {
 +	switch kind {
-+	case 36, 37, 39, 41, 44, 46, 48, 54:
++	case 36, 37, 39, 41, 44, 46, 48, 54, 56:
 +		return true
 +	}
 +	return false
@@ -28847,6 +30235,12 @@ new file mode 100644
 +	switch kind {
 +	case 35:
 +		return u64(b, 48), true
++	case 55:
++		return u64(b, 24), true
++	case 56:
++		if b[2] == 1 {
++			return u64(b, 32), true
++		}
 +	case 40:
 +		return u64(b, 36), true
 +	case 52:
@@ -29169,7 +30563,7 @@ new file mode 100644
 +		if kind == 45 {
 +			return profileDNSV2Retire(b[2], u64(b, 16))
 +		}
-+		return b[2] >= 1 && b[2] <= 7 && zero(b[18:])
++		return b[2] >= 1 && b[2] <= 8 && zero(b[18:])
 +	case 46:
 +		if len(b) != 40 || b[2] < 1 || b[2] > 3 {
 +			return false
@@ -29178,6 +30572,38 @@ new file mode 100644
 +			return zero(b[3:])
 +		}
 +		return zero(b[4:8]) && zero(b[29:32]) && ids(8) && profileDNSV2Retire(b[3], u64(b, 16)) && u16(b, 24) <= 64 && u16(b, 26) <= 64 && b[28] <= 1 && (b[2] != 1 || u16(b, 24) == 0 && u16(b, 26) == 0 && b[28] == 1)
++	case 55:
++		if len(b) < 72 || len(b) > 2164 || !zero(b[2:8]) || !zero(b[62:64]) || !ids(8, 16, 24) || !profileDNSV2Lease(u64(b, 40)) || (u64(b, 32) == 0) != (u64(b, 64) == 0) || u64(b, 32) != 0 && !ids(32, 64) {
++			return false
++		}
++		base, count, original := int(u16(b, 48)), int(u16(b, 50)), int(u16(b, 58))
++		if base < 1 || base > 815 || count < 1 || count > 256 || original < 1 || original > 253 || 72+base+original+count*4 != len(b) || u16(b, 52) != 1 && u16(b, 52) != 28 || u16(b, 60) == 65535 {
++			return false
++		}
++		flags, payload := u16(b, 54), u16(b, 56)
++		if flags&^uint16(31) != 0 || flags&8 == 0 && (payload != 0 || flags&4 != 0) || flags&8 != 0 && (payload < 512 || payload > 4096) || base < 20 || !profileDNSV2Base(3, b[72:72+base]) || !profileDNSV2Name(b[72+base:72+base+original], false) {
++			return false
++		}
++		cur := profileCursor{b: b[72+20 : 72+base]}
++		profileDNSV2LegacyDestination(&cur)
++		profileDNSV2LegacyDestination(&cur)
++		if cur.n16() != u16(b, 60) {
++			return false
++		}
++		for at := 72 + base + original; at < len(b); at += 4 {
++			if u16(b, at) == 65535 || b[at+2] > 1 || b[at+3] != 0 {
++				return false
++			}
++		}
++		return true
++	case 56:
++		if len(b) != 64 || b[2] < 1 || b[2] > 3 || !zero(b[3:8]) {
++			return false
++		}
++		if b[2] != 1 {
++			return zero(b[8:])
++		}
++		return ids(8, 16, 24, 32, 56) && profileDNSV2Lease(u64(b, 40)) && u16(b, 48) >= 1 && u16(b, 48) <= 256 && zero(b[50:56])
 +	case 53:
 +		return len(b) == 64 && zero(b[2:8]) && ids(8, 16, 32) && (u64(b, 40) == 0) == (u64(b, 48) == 0) && (u64(b, 24) == 0 || ids(24)) && (u64(b, 40) == 0 || ids(40, 48)) && profileDNSV2Lease(u64(b, 56))
 +	case 54, 41:
@@ -29425,7 +30851,7 @@ new file mode 100644
 +func TestProfileDNSV2CanonicalBodies(t *testing.T) {
 +	raw := profileDNSV2Golden
 +	var e error
-+	if sha256.Sum256(raw) != [32]byte{0x57, 0x03, 0xa0, 0xf5, 0x56, 0xec, 0x76, 0x15, 0x8d, 0x79, 0xc1, 0x96, 0xf4, 0x89, 0x6c, 0x19, 0xb1, 0x3f, 0xf0, 0x5f, 0x44, 0x57, 0x0f, 0xad, 0xfe, 0x24, 0x08, 0xc9, 0x61, 0xe3, 0x0a, 0xe5} {
++	if sha256.Sum256(raw) != [32]byte{0x10, 0xd7, 0x98, 0xff, 0xd4, 0x5f, 0x7d, 0x25, 0x0e, 0x4c, 0x3f, 0x38, 0xc0, 0x2b, 0x9f, 0x39, 0x46, 0x71, 0xd1, 0xf9, 0xee, 0x48, 0x71, 0xcd, 0xcd, 0x39, 0xb9, 0xd0, 0x42, 0xe5, 0x93, 0x59} {
 +		t.Fatal("canonical corpus pin")
 +	}
 +	var corpus struct {
@@ -29493,5 +30919,1670 @@ new file mode 100644
 +				t.Fatal("invalid snapshot role accepted", flags)
 +			}
 +		}
++	}
++}
+diff --git a/common/yonikbroker/profile_dns_bundle_linux.go b/common/yonikbroker/profile_dns_bundle_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_dns_bundle_linux.go
+@@ -0,0 +1,919 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"golang.org/x/net/dns/dnsmessage"
++	"sync"
++	"time"
++)
++
++type profileDNSExchangeKey struct{}
++type profileDNSBundleKey struct{}
++
++const (
++	profileDNSExchangeCredit       = 4 * 1024
++	profileDNSBundleBaseCredit     = 48 * 1024
++	profileDNSBundleHopCredit      = 512
++	profileDNSBundleRetainedCredit = 32 * 1024
++	profileDNSBundleRenewCredit    = 4 * 1024
++)
++
++type profileDNSExchange struct {
++	query                   *profileDNSQuery
++	ctx                     context.Context
++	root                    *profileGrant
++	id                      uint64
++	original                string
++	target                  profileDestinationValue
++	qtype, options, payload uint16
++	bundle                  *profileDNSBundle
++}
++type profileDNSBundle struct {
++	exchange                          *profileDNSExchange
++	path                              [256]profileDNSHop
++	count                             int
++	id, revision                      uint64
++	deadline                          time.Time
++	closed, unknown                   bool
++	ctx                               context.Context
++	cancel                            context.CancelFunc
++	targets                           [256]profileDestinationValue
++	rootID, rootRevision              uint64
++	queryID                           uint64
++	original                          string
++	qtype, options, payload, resolver uint16
++	pending                           *profileOperation
++	closeSequence                     uint64
++	closeAck, closeSent, released     bool
++	credit                            uint64
++	retained                          uint64
++	rejectedID                        uint64
++	renewLead                         time.Duration
++}
++
++type profileDNSBundleUse struct {
++	bundle *profileDNSBundle
++	index  int
++}
++type profileDNSBundleRPC struct {
++	bundle                      *profileDNSBundle
++	renewal                     bool
++	replied, settled            bool
++	cancelSequence              uint64
++	cancelAck                   bool
++	ownerDeadline, rootDeadline time.Time
++	leaseLimit                  time.Time
++	credit                      uint64
++}
++
++func profileDNSExchangeFrom(ctx context.Context) *profileDNSExchange {
++	if ctx == nil {
++		return nil
++	}
++	e, _ := ctx.Value(profileDNSExchangeKey{}).(*profileDNSExchange)
++	return e
++}
++
++// Вход только из classic producer: exact packed query, не JSON/tag/session grant.
++func ProfileDNSExchangeContext(ctx context.Context, request []byte, target xnet.Destination) (context.Context, func(), error) {
++	noop := func() {}
++	if ctx == nil {
++		return ctx, noop, errProfile
++	}
++	if !ProfileResolverRequired(ctx) {
++		return ctx, noop, nil
++	}
++	p := profileRuntime(ctx)
++	q := profileQueryFrom(ctx)
++	if p == nil || q == nil || q.runtime != p || ctx.Err() != nil || !p.dnsV2 || len(request) < 12 || len(request) > 512 || u16(request, 4) != 1 || u16(request, 6) != 0 || u16(request, 8) != 0 || u16(request, 10) > 1 || q.receipt == nil || len(q.original) < 1 || len(q.original) > 253 {
++		return ctx, noop, ErrProfileUnsupported
++	}
++	targetValue, err := profileValue(target)
++	if err != nil || targetValue.family == 3 {
++		return ctx, noop, ErrProfileUnsupported
++	}
++	c := p.flow
++	c.mu.Lock()
++	if !q.liveLocked() || c.nextDNSQuery >= ^uint64(0)-1 || c.buffered+c.manifest.memoryCredit+profileDNSExchangeCredit > uint64(c.manifest.caps[4]) {
++		c.mu.Unlock()
++		return ctx, noop, errProfileFlowBusy
++	}
++	resolver := -1
++	for i, row := range c.manifest.rows[4] {
++		peer, ok := profileDecodedDestination(row[36:])
++		if ok && peer == targetValue {
++			if resolver != -1 {
++				c.mu.Unlock()
++				return ctx, noop, ErrProfileUnsupported
++			}
++			resolver = i
++		}
++	}
++	if resolver < 0 {
++		c.mu.Unlock()
++		return ctx, noop, ErrProfileUnsupported
++	}
++	if c.manifest.rows[4][resolver][0] == 2 && (p.snapshot == nil || len(c.manifest.rows[10]) != 1 || u32(c.manifest.rows[10][0], 72)&2 == 0) {
++		c.mu.Unlock()
++		return ctx, noop, ErrProfileUnsupported
++	}
++	q.refs++
++	c.buffered += profileDNSExchangeCredit
++	c.nextDNSQuery++
++	id := c.nextDNSQuery
++	c.mu.Unlock()
++	child, cancel := context.WithCancel(ctx)
++	// Original receipt остаётся private source; прежний USER FlowGrant не
++	// переносится в DNS logical consumer и не становится DNSHopPermit.
++	child = context.WithValue(child, profileGrantKey{}, (*profileGrant)(nil))
++	var once sync.Once
++	release := func() {
++		once.Do(func() {
++			cancel()
++			c.mu.Lock()
++			q.refs--
++			c.buffered -= profileDNSExchangeCredit
++			q.releaseLocked()
++			c.mu.Unlock()
++		})
++	}
++	var message dnsmessage.Message
++	if err = message.Unpack(request); err != nil || message.Header.Response || message.Header.Truncated || message.Header.OpCode != 0 || message.Header.RCode != 0 || len(message.Questions) != 1 {
++		release()
++		return ctx, noop, errProfile
++	}
++	question := message.Questions[0]
++	// Protected classic producer использует тот же AppendPack. Сравнение
++	// закрывает trailing/alternate encoding, исходные bytes не переписываются.
++	packed, packError := message.Pack()
++	if packError != nil || !bytes.Equal(packed, request) {
++		release()
++		return ctx, noop, errProfile
++	}
++	if question.Class != dnsmessage.ClassINET || question.Type != dnsmessage.TypeA && question.Type != dnsmessage.TypeAAAA || profileCanonicalQuery(question.Name.String()) != q.name {
++		release()
++		return ctx, noop, errProfile
++	}
++	e := &profileDNSExchange{query: q, id: id, original: q.original, target: targetValue, qtype: uint16(question.Type)}
++	if message.Header.RecursionDesired {
++		e.options |= 1
++	}
++	if message.Header.CheckingDisabled {
++		e.options |= 2
++	}
++	if message.Header.AuthenticData {
++		e.options |= 16
++	}
++	for _, opt := range message.Additionals {
++		if opt.Header.Type != dnsmessage.TypeOPT || opt.Header.Name.String() != "." {
++			release()
++			return ctx, noop, ErrProfileUnsupported
++		}
++		e.options |= 8
++		e.payload = uint16(opt.Header.Class)
++		if opt.Header.TTL&32768 != 0 {
++			e.options |= 4
++		}
++	}
++	if e.options&8 == 0 && (e.payload != 0 || e.options&4 != 0) || e.options&8 != 0 && (e.payload < 512 || e.payload > 4096) {
++		release()
++		return ctx, noop, errProfile
++	}
++	e.ctx = context.WithValue(child, profileDNSExchangeKey{}, e)
++	g, op, err := c.authorizeDNS(e.ctx, q.receipt, uint16(resolver), q.name)
++	if err == nil {
++		err = p.flowRPC(op)
++	}
++	if err != nil {
++		release()
++		return ctx, noop, err
++	}
++	c.mu.Lock()
++	e.root = g
++	g.dnsOwner = e
++	c.mu.Unlock()
++	stop := context.AfterFunc(child, func() {
++		release()
++		c.mu.Lock()
++		c.closeGrant(g)
++		if e.bundle != nil {
++			c.dnsClose(e.bundle)
++		}
++		c.mu.Unlock()
++	})
++	return e.ctx, func() {
++		stop()
++		release()
++		c.mu.Lock()
++		c.closeGrant(g)
++		if e.bundle != nil {
++			c.dnsClose(e.bundle)
++		}
++		c.mu.Unlock()
++	}, nil
++}
++
++// Gate разрешает только metadata route selection. Payload/physical factory
++// по-прежнему требуют bundle и отдельный не реализованный transport proof.
++func profileDNSDispatchGate(ctx context.Context, target xnet.Destination) error {
++	e := profileDNSExchangeFrom(ctx)
++	p := profileRuntime(ctx)
++	value, err := profileValue(target)
++	if e == nil || p == nil || e.query.runtime != p || profileQueryFrom(ctx) != e.query || profileReceiptFrom(ctx) != e.query.receipt || err != nil || value != e.target || ctx.Err() != nil {
++		return errProfile
++	}
++	p.flow.mu.Lock()
++	defer p.flow.mu.Unlock()
++	if !p.flow.dnsRootLive(e) {
++		return errProfile
++	}
++	return nil
++}
++
++func ProfileDNSForwardReady(ctx context.Context, tag string, target xnet.Destination, mux bool) error {
++	if err := ProfileDNSBundleGuard(ctx, tag, target, mux); err != nil {
++		return err
++	}
++	// Bundle — hop permits, не PhysicalBind/LogicalBind proof. Не открываем
++	// transport до следующего source cut и authenticated resource admission.
++	return ErrProfileUnsupported
++}
++func (c *profileFlowControl) dnsRootLive(e *profileDNSExchange) bool {
++	if e == nil || e.query == nil || e.ctx == nil || e.ctx.Err() != nil || e.query.runtime.flow != c || !e.query.liveLocked() || e.query.receipt == nil {
++		return false
++	}
++	g := e.root
++	return g != nil && g.dnsOwner == e && int(g.resolver) < len(c.manifest.rows[4]) && g.class == 3 && g.receipt == e.query.receipt && g.query == e.query.name && g.effective == e.target && c.grantLive(g) && g.id != 0 && g.revision == g.receipt.revision && (!c.serviceOwnerRequired(g) || c.clock().Before(g.ownerDeadline) && g.ownerKind >= 1 && g.ownerKind <= 2 && g.ownerID != 0)
++}
++func (c *profileFlowControl) dnsBundleLive(b *profileDNSBundle) bool {
++	return b != nil && !b.closed && !b.unknown && b.ctx.Err() == nil && b.id != 0 && b.revision != 0 && c.clock().Before(b.deadline) && c.dnsRootLive(b.exchange) && b.exchange.root.id == b.rootID && b.exchange.root.revision == b.rootRevision && b.exchange.id == b.queryID && b.exchange.original == b.original && b.exchange.qtype == b.qtype && b.exchange.options == b.options && b.exchange.payload == b.payload && b.exchange.root.resolver == b.resolver
++}
++
++func profileDNSChosenPath(m *profileCapsule, tag string, target profileDestinationValue, mux bool, choose func(string, xnet.Destination) (bool, error)) (path [256]profileDNSHop, targets [256]profileDestinationValue, count int, err error) {
++	subject, ok := profileSubject(m, tag)
++	if !ok || !target.valid() {
++		return path, targets, 0, errProfile
++	}
++	row := m.rows[0][subject]
++	if len(row) < 4 {
++		return path, targets, 0, errProfile
++	}
++	offset := len(row) - 4
++	if target.network == 17 {
++		offset += 2
++	}
++	scope := u16(row, offset)
++	branch := byte(0)
++	if mux {
++		branch = 1
++	}
++	var seen [512]bool
++	for count < len(path) {
++		if int(scope) >= len(m.rows[8]) || int(scope) >= len(seen) || seen[scope] {
++			return path, targets, 0, errProfile
++		}
++		seen[scope] = true
++		r := m.rows[8][scope]
++		if len(r) != 24 || r[2] != target.network || r[3]&(1<<branch) == 0 {
++			return path, targets, 0, errProfile
++		}
++		path[count] = profileDNSHop{scope, branch}
++		targets[count] = target
++		count++
++		action := r[20+int(branch)]
++		carrier := r[5+int(branch)*2]
++		if action == 3 {
++			return path, targets, count, nil
++		}
++		if action != 1 && action != 2 {
++			return path, targets, 0, ErrProfileUnsupported
++		}
++		index := u16(r, 8+int(branch)*2)
++		if int(index) >= len(m.rows[1]) {
++			return path, targets, 0, errProfile
++		}
++		var valid bool
++		target, valid = profileDecodedDestination(m.rows[1][index])
++		if !valid || target.network != carrier {
++			return path, targets, 0, errProfile
++		}
++		if action == 1 {
++			return path, targets, count, nil
++		}
++		chain := u16(r, 16+int(branch)*2)
++		if int(chain) >= len(m.rows[2]) || choose == nil {
++			return path, targets, 0, ErrProfileUnsupported
++		}
++		edge := m.rows[2][chain]
++		if len(edge) != 8 || u16(edge, 0) != scope || edge[4] != branch {
++			return path, targets, 0, errProfile
++		}
++		scope = u16(edge, 2)
++		if int(scope) >= len(m.rows[8]) || m.rows[8][scope][2] != carrier {
++			return path, targets, 0, errProfile
++		}
++		next := u16(m.rows[8][scope], 0)
++		if int(next) >= len(m.rows[0]) {
++			return path, targets, 0, errProfile
++		}
++		cur := profileCursor{b: m.rows[0][next]}
++		name := cur.str(160)
++		if cur.bad {
++			return path, targets, 0, errProfile
++		}
++		dst := xnet.Destination{Network: xnet.Network_TCP, Address: xnet.ParseAddress(target.address), Port: xnet.Port(target.port)}
++		if carrier == 17 {
++			dst.Network = xnet.Network_UDP
++		}
++		decision, e := choose(string(name), dst)
++		if e != nil {
++			return path, targets, 0, e
++		}
++		branch = 0
++		if decision {
++			branch = 1
++		}
++		if edge[5]&(1<<branch) == 0 {
++			return path, targets, 0, errProfile
++		}
++	}
++	return path, targets, 0, errProfile
++}
++
++func (c *profileFlowControl) dnsReserveHistory(n int) bool {
++	used := c.dnsHistoryUsed + c.dnsTasksUsed + c.operations
++	if c.udpBudget != nil {
++		used = c.udpBudget.used
++	} else {
++		for _, t := range c.tombs {
++			if t.sequence != 0 {
++				used++
++			}
++		}
++	}
++	if used+n > min(int(c.manifest.caps[7]), 256) {
++		return false
++	}
++	if c.udpBudget != nil {
++		for i := 0; i < n; i++ {
++			c.udpBudget.entries[c.udpBudget.used] = profileUDPRetainedOperation{namespace: 10}
++			c.udpBudget.used++
++		}
++	}
++	c.dnsHistoryUsed += n
++	return true
++}
++func (c *profileFlowControl) dnsAcquire(e *profileDNSExchange, path [256]profileDNSHop, targets [256]profileDestinationValue, count int, renew *profileDNSBundle, callers ...context.Context) (*profileDNSBundle, *profileOperation, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.dnsRootLive(e) || !e.query.runtime.dnsV2 || c.manifest.mapping != 4 || count < 1 || count > 256 || c.dnsRequestUsed >= len(c.dnsRequests) {
++		return nil, nil, errProfile
++	}
++	caller := e.ctx
++	if len(callers) > 0 {
++		caller = callers[0]
++	}
++	if caller == nil || caller.Err() != nil || profileDNSExchangeFrom(caller) != e || profileQueryFrom(caller) != e.query || profileReceiptFrom(caller) != e.query.receipt {
++		return nil, nil, errProfile
++	}
++	if renew == nil && e.bundle != nil {
++		return nil, nil, errProfile
++	}
++	if renew != nil {
++		if renew.exchange != e || renew.queryID != e.id || renew.original != e.original || renew.qtype != e.qtype || renew.options != e.options || renew.payload != e.payload || renew.resolver != e.root.resolver || !c.dnsBundleLive(renew) || renew.revision >= ^uint64(0)-1 {
++			return nil, nil, errProfile
++		}
++		if renew.pending != nil {
++			return renew, renew.pending, nil
++		}
++		if renew.count != count || renew.path != path || renew.targets != targets {
++			return nil, nil, errProfile
++		}
++	}
++	if !profileDNSV2ID(e.id) || !profileDNSV2Name([]byte(e.original), false) || len(e.original) > 253 || e.qtype != 1 && e.qtype != 28 {
++		return nil, nil, errProfile
++	}
++	addressBytes := func(v profileDestinationValue) int {
++		if v.family == 4 {
++			return 4
++		}
++		if v.family == 6 {
++			return 16
++		}
++		return len(v.address)
++	}
++	baseLen := 20 + 8 + addressBytes(e.root.receipt.original) + 8 + addressBytes(e.root.effective) + 4 + len(e.root.query) + 16
++	bodyLen := 72 + baseLen + len(e.original) + 4*count
++	pending := 2
++	history := 2 + count
++	credit := uint64(profileDNSBundleRenewCredit)
++	if renew == nil {
++		pending = 3
++		history = 3 + count
++		// Bundle, fixed path arrays, body/contexts и retained query/root
++		// metadata оплачены до первого make и issuer effects.
++		credit = profileDNSBundleBaseCredit + uint64(count)*profileDNSBundleHopCredit
++	}
++	total := c.operations + c.dnsTasksActive + pending
++	if c.udpBudget != nil {
++		total += c.udpBudget.proofPending
++	}
++	grants := c.dnsHopCredits
++	for _, g := range c.grants {
++		if g != nil {
++			grants++
++		}
++	}
++	if total > min(int(c.manifest.caps[3]), 64) || bodyLen > 2164 || c.buffered+c.manifest.memoryCredit+credit > uint64(c.manifest.caps[4]) || renew == nil && grants+count > int(c.manifest.caps[0]) || !c.dnsReserveHistory(history) {
++		return nil, nil, errProfileFlowBusy
++	}
++	c.operations += pending
++	c.buffered += credit
++	base := c.dnsBody(e.root)
++	b := renew
++	if b == nil {
++		ctx, cancel := context.WithCancel(e.ctx)
++		b = &profileDNSBundle{exchange: e, path: path, targets: targets, count: count, ctx: ctx, cancel: cancel, rootID: e.root.id, rootRevision: e.root.revision, queryID: e.id, original: e.original, qtype: e.qtype, options: e.options, payload: e.payload, resolver: e.root.resolver, credit: credit, retained: profileDNSBundleRetainedCredit}
++		e.bundle = b
++		e.query.refs++
++		c.dnsHopCredits += count
++	} else {
++		b.credit += credit
++		b.retained += credit
++	}
++	body := make([]byte, bodyLen)
++	be.PutUint16(body, 2)
++	be.PutUint64(body[8:], e.root.id)
++	be.PutUint64(body[16:], e.id)
++	be.PutUint64(body[24:], e.query.runtime.admission.launch.epoch)
++	be.PutUint64(body[40:], uint64(time.Second))
++	be.PutUint16(body[48:], uint16(len(base)))
++	be.PutUint16(body[50:], uint16(count))
++	be.PutUint16(body[52:], e.qtype)
++	be.PutUint16(body[54:], e.options)
++	be.PutUint16(body[56:], e.payload)
++	be.PutUint16(body[58:], uint16(len(e.original)))
++	be.PutUint16(body[60:], e.root.resolver)
++	if renew != nil {
++		be.PutUint64(body[32:], b.id)
++		be.PutUint64(body[64:], b.revision)
++	}
++	at := 72
++	copy(body[at:], base)
++	at += len(base)
++	copy(body[at:], e.original)
++	at += len(e.original)
++	for _, hop := range path[:count] {
++		be.PutUint16(body[at:], hop.scope)
++		body[at+2] = hop.branch
++		at += 4
++	}
++	rpc := &profileDNSBundleRPC{bundle: b, renewal: renew != nil, credit: credit}
++	op := &profileOperation{ctx: caller, kind: 55, body: body, done: make(chan struct{}), dns: rpc}
++	b.pending = op
++	c.dnsRequests[c.dnsRequestUsed] = op
++	c.dnsRequestUsed++
++	e.root.pending++
++	return b, op, nil
++}
++func (c *profileFlowControl) dnsNotify(op *profileOperation, e error) {
++	if !op.completed {
++		op.completed = true
++		op.err = e
++		close(op.done)
++	}
++}
++func (c *profileFlowControl) dnsSettle(op *profileOperation) {
++	r := op.dns
++	if r.settled || !r.replied || r.cancelSequence != 0 && !r.cancelAck {
++		return
++	}
++	r.settled = true
++	c.operations -= 2
++	r.bundle.exchange.root.pending--
++	if r.bundle.pending == op {
++		r.bundle.pending = nil
++	}
++}
++func (c *profileFlowControl) dnsRelease(b *profileDNSBundle) {
++	if b.released || b.unknown || !b.closed || b.pending != nil || b.id != 0 && !b.closeAck {
++		return
++	}
++	b.released = true
++	c.operations--
++	c.dnsHopCredits -= b.count
++	b.exchange.query.refs--
++	b.exchange.query.releaseLocked()
++	c.buffered -= b.credit - b.retained
++	b.credit = b.retained
++}
++func (c *profileFlowControl) dnsUnknown(b *profileDNSBundle) {
++	b.unknown = true
++	b.closed = true
++	b.cancel()
++}
++func (c *profileFlowControl) dnsFinish(op *profileOperation, e error) {
++	b := op.dns.bundle
++	c.dnsNotify(op, e)
++	if !op.submitted {
++		b.closed = true
++		b.cancel()
++		op.dns.replied = true
++		c.dnsSettle(op)
++		c.dnsRelease(b)
++	} else {
++		c.dnsUnknown(b)
++	}
++}
++func (c *profileFlowControl) dnsDispatch(op *profileOperation) error {
++	if op.submitted || op.completed {
++		return nil
++	}
++	b := op.dns.bundle
++	if b.closed || op.ctx.Err() != nil || !c.dnsRootLive(b.exchange) {
++		c.dnsFinish(op, errProfile)
++		return nil
++	}
++	op.sent = c.clock()
++	op.deadline = op.sent.Add(time.Second)
++	r := op.dns
++	r.rootDeadline = b.exchange.root.deadline
++	r.ownerDeadline = b.exchange.root.ownerDeadline
++	for _, deadline := range []time.Time{r.rootDeadline, c.sessionDeadline} {
++		if deadline.Before(op.deadline) {
++			op.deadline = deadline
++		}
++	}
++	if c.serviceOwnerRequired(b.exchange.root) && r.ownerDeadline.Before(op.deadline) {
++		op.deadline = r.ownerDeadline
++	}
++	if deadline, ok := op.ctx.Deadline(); ok && deadline.Before(op.deadline) {
++		op.deadline = deadline
++	}
++	r.leaseLimit = op.deadline
++	if r.renewal && b.deadline.Before(op.deadline) {
++		op.deadline = b.deadline
++	}
++	if !op.sent.Before(op.deadline) || !profileDNSV2Body(55, op.body) {
++		c.dnsFinish(op, errProfile)
++		return nil
++	}
++	if c.lastSent >= ^uint64(0)-1 {
++		c.dnsFinish(op, errProfile)
++		return errProfile
++	}
++	// Новый lease ограничен fresh root/session; deadline ожидания renewal ACK
++	// отдельно ограничен старым bundle, чтобы expiry не превращался в resurrection.
++	be.PutUint64(op.body[40:], uint64(r.leaseLimit.Sub(op.sent)))
++	seq, e := c.write(55, 0, op.body)
++	if e != nil {
++		op.submitted = true
++		c.dnsFinish(op, e)
++		return e
++	}
++	op.sequence = seq
++	op.submitted = true
++	if !profileDNSV2ID(seq) {
++		c.dnsUnknown(b)
++		return errProfile
++	}
++	if seq > c.lastSent {
++		c.lastSent = seq
++	}
++	return nil
++}
++func (c *profileFlowControl) dnsCancel(target byte, id uint64) (uint64, error) {
++	if c.lastSent >= ^uint64(0)-1 {
++		return 0, errProfile
++	}
++	body := make([]byte, 24)
++	be.PutUint16(body, 2)
++	body[2] = target
++	be.PutUint64(body[8:], id)
++	seq, e := c.write(47, 0, body)
++	if seq > c.lastSent {
++		c.lastSent = seq
++	}
++	if e != nil || !profileDNSV2ID(seq) {
++		return seq, errors.Join(errProfile, e)
++	}
++	return seq, nil
++}
++func (c *profileFlowControl) dnsClose(b *profileDNSBundle) {
++	if !b.closed {
++		b.closed = true
++		b.cancel()
++	}
++}
++func (c *profileFlowControl) dnsAccept(f profilePacket) error {
++	if f.object != 0 || !profileDNSV2Body(f.kind, f.body) {
++		return errProfile
++	}
++	for _, op := range c.dnsRequests[:c.dnsRequestUsed] {
++		r := op.dns
++		b := r.bundle
++		if f.reply == op.sequence && op.submitted && f.kind == 56 {
++			if r.replied {
++				if f.body[2] == 1 {
++					b.rejectedID = u64(f.body, 8)
++					c.dnsUnknown(b)
++				}
++				return errProfile
++			}
++			r.replied = true
++			data := f.body
++			if data[2] != 1 {
++				c.dnsNotify(op, errProfile)
++				c.dnsClose(b)
++				if data[2] == 3 {
++					c.dnsUnknown(b)
++					return nil
++				}
++				c.dnsSettle(op)
++				c.dnsRelease(b)
++				return nil
++			}
++			id, revision := u64(data, 8), u64(data, 56)
++			if u64(data, 16) != b.rootID || u64(data, 24) != b.queryID || u64(data, 24) != u64(op.body, 16) || u64(data, 32) != b.exchange.query.runtime.admission.launch.epoch || u64(data, 40) > u64(op.body, 40) || int(u16(data, 48)) != b.count || !r.renewal && revision != 1 || r.renewal && (id != b.id || b.revision != u64(op.body, 64) || revision != u64(op.body, 64)+1) {
++				b.rejectedID = id
++				c.dnsUnknown(b)
++				c.dnsNotify(op, errProfile)
++				return errProfile
++			}
++			if !r.renewal {
++				for _, other := range c.dnsRequests[:c.dnsRequestUsed] {
++					if other.dns.bundle != b && other.dns.bundle.id == id {
++						c.dnsUnknown(b)
++						return errProfile
++					}
++				}
++				b.id = id
++			}
++			deadline := op.sent.Add(time.Duration(u64(data, 40)))
++			if r.leaseLimit.Before(deadline) {
++				deadline = r.leaseLimit
++			}
++			if b.closed || op.ctx.Err() != nil || !c.dnsRootLive(b.exchange) || !c.clock().Before(deadline) || !c.clock().Before(op.deadline) {
++				c.dnsClose(b)
++				c.dnsNotify(op, errProfile)
++				c.dnsSettle(op)
++				return nil
++			}
++			b.id, b.revision, b.deadline = id, revision, deadline
++			b.renewLead = deadline.Sub(op.sent) / 4
++			c.dnsNotify(op, nil)
++			c.dnsSettle(op)
++			return nil
++		}
++		if f.kind == 48 && f.reply != 0 && (f.reply == r.cancelSequence || f.reply == b.closeSequence) {
++			if f.body[2] != 1 {
++				c.dnsUnknown(b)
++				return nil
++			}
++			expected := op.sequence
++			if f.reply == b.closeSequence {
++				expected = b.id
++			}
++			if u64(f.body, 8) != expected {
++				return errProfile
++			}
++			if f.reply == r.cancelSequence {
++				if r.cancelAck {
++					return errProfile
++				}
++				r.cancelAck = true
++				c.dnsSettle(op)
++			} else {
++				if b.closeAck {
++					return errProfile
++				}
++				b.closeAck = true
++			}
++			c.dnsRelease(b)
++			return nil
++		}
++	}
++	return errProfile
++}
++func (c *profileFlowControl) dnsTick() error {
++	for _, op := range c.dnsRequests[:c.dnsRequestUsed] {
++		r := op.dns
++		b := r.bundle
++		if !c.dnsRootLive(b.exchange) || b.id != 0 && !c.clock().Before(b.deadline) || b.ctx.Err() != nil || !r.replied && op.ctx.Err() != nil {
++			c.dnsClose(b)
++		}
++		if !op.submitted && b.closed {
++			c.dnsFinish(op, errProfile)
++		}
++		if op.submitted && !r.replied && (b.closed || !c.clock().Before(op.deadline)) {
++			c.dnsClose(b)
++			c.dnsNotify(op, errProfile)
++			if r.cancelSequence == 0 {
++				seq, e := c.dnsCancel(1, op.sequence)
++				if e != nil {
++					c.dnsUnknown(b)
++					return e
++				}
++				r.cancelSequence = seq
++			}
++			if !c.clock().Before(op.deadline) {
++				if r.cancelAck {
++					r.replied = true
++					c.dnsSettle(op)
++				} else if !c.clock().Before(op.deadline.Add(time.Second)) {
++					c.dnsUnknown(b)
++				}
++			}
++		}
++		if b.closed && b.id != 0 && !b.closeSent {
++			seq, e := c.dnsCancel(8, b.id)
++			if e != nil {
++				c.dnsUnknown(b)
++				return e
++			}
++			b.closeSequence = seq
++			b.closeSent = true
++		}
++		c.dnsRelease(b)
++	}
++	return nil
++}
++
++func (c *profileFlowControl) dnsFloor(floor uint64) uint64 {
++	for _, op := range c.dnsRequests[:c.dnsRequestUsed] {
++		r := op.dns
++		b := r.bundle
++		for _, ref := range []struct {
++			sequence uint64
++			pending  bool
++		}{{op.sequence, !r.settled}, {r.cancelSequence, !r.cancelAck}, {b.closeSequence, !b.closeAck}} {
++			if ref.pending && ref.sequence != 0 && ref.sequence < floor {
++				floor = ref.sequence
++			}
++		}
++	}
++	return floor
++}
++
++func (c *profileFlowControl) dnsCleanupResult() error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	for _, op := range c.dnsRequests[:c.dnsRequestUsed] {
++		b := op.dns.bundle
++		if b.unknown || b.rejectedID != 0 || op.submitted && !op.dns.settled || b.id != 0 && !b.closeAck {
++			return ErrProfileCleanupUnknown
++		}
++	}
++	return nil
++}
++
++func ProfileDNSPrepareHandler(ctx context.Context, tag string, target xnet.Destination, mux bool, choose func(string, xnet.Destination) (bool, error)) (context.Context, func(), bool, error) {
++	noop := func() {}
++	e := profileDNSExchangeFrom(ctx)
++	if e == nil {
++		return ctx, noop, false, nil
++	}
++	if _, ok := ctx.Value(profileDNSBundleKey{}).(profileDNSBundleUse); ok {
++		return ctx, noop, true, ProfileDNSBundleGuard(ctx, tag, target, mux)
++	}
++	p := profileRuntime(ctx)
++	if p == nil || e.query.runtime != p || profileQueryFrom(ctx) != e.query || profileReceiptFrom(ctx) != e.query.receipt || !p.dnsV2 {
++		return ctx, noop, true, ErrProfileUnsupported
++	}
++	p.flow.mu.Lock()
++	live := p.flow.dnsRootLive(e)
++	p.flow.mu.Unlock()
++	if ctx.Err() != nil || !live {
++		return ctx, noop, true, errProfile
++	}
++	value, err := profileValue(target)
++	if err != nil || value != e.target {
++		return ctx, noop, true, errProfile
++	}
++	path, targets, count, err := profileDNSChosenPath(&p.flow.manifest, tag, value, mux, choose)
++	if err != nil {
++		return ctx, noop, true, err
++	}
++	resolver := p.flow.manifest.rows[4][e.root.resolver]
++	rootSubject, _ := profileSubject(&p.flow.manifest, tag)
++	if u16(resolver, 2) != 65535 && u16(resolver, 2) != rootSubject {
++		return ctx, noop, true, ErrProfileUnsupported
++	}
++	b, op, err := p.flow.dnsAcquire(e, path, targets, count, nil, ctx)
++	if err != nil {
++		return ctx, noop, true, err
++	}
++	if err = p.flowRPC(op); err != nil {
++		return ctx, noop, true, err
++	}
++	// Сохраняем native route/session values caller; lifetime ограничен также
++	// private bundle. Background/WithoutCancel здесь authority не переносят.
++	consumer, cancel := context.WithCancel(ctx)
++	stop := context.AfterFunc(b.ctx, cancel)
++	next := context.WithValue(consumer, profileDNSBundleKey{}, profileDNSBundleUse{b, 0})
++	release := func() { p.flow.mu.Lock(); p.flow.dnsClose(b); p.flow.mu.Unlock() }
++	return next, func() { stop(); cancel(); release() }, true, nil
++}
++func ProfileDNSRefreshBundle(ctx context.Context) error {
++	if ctx == nil {
++		return errProfile
++	}
++	use, ok := ctx.Value(profileDNSBundleKey{}).(profileDNSBundleUse)
++	if !ok {
++		return errProfile
++	}
++	b := use.bundle
++	p := profileRuntime(ctx)
++	if p == nil || b.exchange.query.runtime != p || profileDNSExchangeFrom(ctx) != b.exchange || profileQueryFrom(ctx) != b.exchange.query || profileReceiptFrom(ctx) != b.exchange.query.receipt {
++		return errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	live := c.dnsBundleLive(b)
++	c.mu.Unlock()
++	if !live {
++		return errProfile
++	}
++	if err := profileEnsureService(ctx, b.exchange.root); err != nil {
++		return err
++	}
++	_, op, err := c.dnsAcquire(b.exchange, b.path, b.targets, b.count, b, ctx)
++	if err != nil {
++		return err
++	}
++	return p.flowRPC(op)
++}
++func ProfileDNSBundleGuard(ctx context.Context, tag string, target xnet.Destination, mux bool) error {
++	if ctx == nil {
++		return errProfile
++	}
++	p := profileRuntime(ctx)
++	use, ok := ctx.Value(profileDNSBundleKey{}).(profileDNSBundleUse)
++	if p == nil || !ok || use.bundle == nil || profileDNSExchangeFrom(ctx) != use.bundle.exchange || profileQueryFrom(ctx) != use.bundle.exchange.query || profileReceiptFrom(ctx) != use.bundle.exchange.query.receipt || use.bundle.exchange.query.runtime != p || ctx.Err() != nil || !p.flowFresh() {
++		return errProfile
++	}
++	b := use.bundle
++	c := p.flow
++	c.mu.Lock()
++	live := c.dnsBundleLive(b)
++	renew := live && b.deadline.Sub(c.clock()) <= b.renewLead
++	c.mu.Unlock()
++	if !live {
++		return errProfile
++	}
++	if renew {
++		if err := ProfileDNSRefreshBundle(ctx); err != nil {
++			return err
++		}
++	}
++	value, err := profileValue(target)
++	if err != nil {
++		return err
++	}
++	branch := byte(0)
++	if mux {
++		branch = 1
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.dnsBundleLive(b) || use.index < 0 || use.index >= b.count || b.path[use.index].branch != branch || b.targets[use.index] != value {
++		return errProfile
++	}
++	subject, found := profileSubject(&c.manifest, tag)
++	if !found || u16(c.manifest.rows[8][b.path[use.index].scope], 0) != subject {
++		return errProfile
++	}
++	return nil
++}
++
++func profileDNSChainContext(ctx context.Context, target xnet.Destination, nextTag string) (context.Context, error) {
++	use, ok := ctx.Value(profileDNSBundleKey{}).(profileDNSBundleUse)
++	p := profileRuntime(ctx)
++	if !ok || p == nil || use.bundle == nil || profileDNSExchangeFrom(ctx) != use.bundle.exchange || profileQueryFrom(ctx) != use.bundle.exchange.query || profileReceiptFrom(ctx) != use.bundle.exchange.query.receipt {
++		return ctx, errProfile
++	}
++	b := use.bundle
++	c := p.flow
++	value, err := profileValue(target)
++	if err != nil {
++		return ctx, err
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	next := use.index + 1
++	if !c.dnsBundleLive(b) || next < 1 || next >= b.count || b.targets[next] != value {
++		return ctx, errProfile
++	}
++	subject, found := profileSubject(&c.manifest, nextTag)
++	scope := b.path[next].scope
++	if !found || u16(c.manifest.rows[8][scope], 0) != subject {
++		return ctx, errProfile
++	}
++	child := context.WithValue(ctx, profileDNSBundleKey{}, profileDNSBundleUse{b, next})
++	return context.WithValue(child, profileRouteKey{}, profileSelectedRoute{subject: subject, scope: scope, branches: 1 << b.path[next].branch, effective: value, chained: true}), nil
++}
+diff --git a/common/yonikbroker/profile_dns_bundle_linux_test.go b/common/yonikbroker/profile_dns_bundle_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_dns_bundle_linux_test.go
+@@ -0,0 +1,736 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"golang.org/x/net/dns/dnsmessage"
++	"testing"
++	"time"
++)
++
++func dnsBundleFixture(t *testing.T, mode byte) (*flowFixture, context.Context, xnet.Destination) {
++	f := newFlowFixture(t, mode)
++	f.p.dnsV2 = true
++	f.c.manifest.mapping = 4
++	target := profileDestinationValue{family: 4, network: 6, port: 53, address: "192.0.2.53"}
++	row := make([]byte, 36)
++	row[0], row[1] = 1, 6
++	be.PutUint16(row[2:], 0)
++	row = append(row, target.encode()...)
++	f.c.manifest.rows[4] = [][]byte{row}
++	receipt := f.admittedReceipt(t, "user.invalid")
++	base := context.WithValue(context.WithValue(f.p.ctx, profileContextKey{}, f.p), profileReceiptKey{}, receipt)
++	query, release, e := ProfileDNSQueryContext(base, "Original.INVALID")
++	if e != nil {
++		t.Fatal(e)
++	}
++	t.Cleanup(release)
++	g, op, e := f.c.authorizeDNS(query, receipt, 0, "original.invalid")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.accept(serviceReply(f, op)); e != nil {
++		t.Fatal(e)
++	}
++	exchange := &profileDNSExchange{query: profileQueryFrom(query), ctx: query, root: g, id: 1, original: "Original.INVALID", target: target, qtype: 1}
++	exchange.ctx = context.WithValue(query, profileDNSExchangeKey{}, exchange)
++	g.dnsOwner = exchange
++	return f, exchange.ctx, xnet.TCPDestination(xnet.ParseAddress(target.address), 53)
++}
++func dnsBundleReply(op *profileOperation, id, revision uint64) profilePacket {
++	b := make([]byte, 64)
++	be.PutUint16(b, 2)
++	b[2] = 1
++	be.PutUint64(b[8:], id)
++	be.PutUint64(b[16:], u64(op.body, 8))
++	be.PutUint64(b[24:], u64(op.body, 16))
++	be.PutUint64(b[32:], u64(op.body, 24))
++	be.PutUint64(b[40:], min(uint64(time.Second), u64(op.body, 40)))
++	be.PutUint16(b[48:], u16(op.body, 50))
++	be.PutUint64(b[56:], revision)
++	return profilePacket{kind: 56, reply: op.sequence, body: b}
++}
++func TestProfileDNSBundleActualChooserRPCAndPrivateGuard(t *testing.T) {
++	f, ctx, target := dnsBundleFixture(t, 1)
++	type metadataKey struct{}
++	ctx = context.WithValue(ctx, metadataKey{}, "native-route")
++	type result struct {
++		ctx     context.Context
++		release func()
++		handled bool
++		err     error
++	}
++	done := make(chan result, 1)
++	go func() {
++		next, release, handled, e := ProfileDNSPrepareHandler(ctx, "a", target, false, func(string, xnet.Destination) (bool, error) {
++			t.Error("Direct path unexpectedly called next chooser")
++			return false, nil
++		})
++		done <- result{next, release, handled, e}
++	}()
++	select {
++	case got := <-done:
++		t.Fatalf("native acquisition returned before issuer RPC: %v", got.err)
++	case op := <-f.p.flowQueue:
++		if op.kind != 55 || !profileDNSV2Body(55, op.body) || string(op.body[72+int(u16(op.body, 48)):72+int(u16(op.body, 48))+int(u16(op.body, 58))]) != "Original.INVALID" {
++			t.Fatal("private BundleAcquire shape")
++		}
++		if e := f.c.dispatch(op); e != nil {
++			t.Fatal(e)
++		}
++		if e := f.c.accept(dnsBundleReply(op, 41, 1)); e != nil {
++			t.Fatal(e)
++		}
++	}
++	got := <-done
++	if got.err != nil || !got.handled {
++		t.Fatal(got.err)
++	}
++	defer got.release()
++	if got.ctx.Value(metadataKey{}) != "native-route" {
++		t.Fatal("bundle handoff discarded native caller metadata")
++	}
++	if e := ProfileDNSBundleGuard(got.ctx, "a", target, false); e != nil {
++		t.Fatal(e)
++	}
++	if ProfileDNSBundleGuard(ctx, "a", target, false) == nil {
++		t.Fatal("exchange credential replaced bundle")
++	}
++	wrong := xnet.TCPDestination(xnet.ParseAddress("192.0.2.54"), 53)
++	if ProfileDNSBundleGuard(got.ctx, "a", wrong, false) == nil || ProfileDNSBundleGuard(got.ctx, "a", target, true) == nil {
++		t.Fatal("foreign target/branch accepted")
++	}
++}
++
++func dnsAcquirePure(t *testing.T, f *flowFixture, ctx context.Context) (*profileDNSBundle, *profileOperation) {
++	t.Helper()
++	e := profileDNSExchangeFrom(ctx)
++	path, targets, count, err := profileDNSChosenPath(&f.c.manifest, "a", e.target, false, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	b, op, err := f.c.dnsAcquire(e, path, targets, count, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = f.c.dispatch(op); err != nil {
++		t.Fatal(err)
++	}
++	return b, op
++}
++func dnsUse(b *profileDNSBundle) context.Context {
++	return context.WithValue(b.ctx, profileDNSBundleKey{}, profileDNSBundleUse{b, 0})
++}
++func dnsCancelAck(sequence, id uint64) profilePacket {
++	b := make([]byte, 32)
++	be.PutUint16(b, 2)
++	b[2] = 1
++	be.PutUint64(b[8:], id)
++	be.PutUint64(b[16:], sequence)
++	return profilePacket{kind: 48, reply: sequence, body: b}
++}
++func TestProfileDNSBundleReplyBindingsAndNoResurrection(t *testing.T) {
++	for _, mode := range []string{"root", "query", "epoch", "count", "revision", "duplicate-id", "cancel", "expired", "unknown"} {
++		t.Run(mode, func(t *testing.T) {
++			f, ctx, target := dnsBundleFixture(t, 1)
++			b, op := dnsAcquirePure(t, f, ctx)
++			reply := dnsBundleReply(op, 41, 1)
++			switch mode {
++			case "root":
++				be.PutUint64(reply.body[16:], 999)
++			case "query":
++				be.PutUint64(reply.body[24:], 2)
++			case "epoch":
++				be.PutUint64(reply.body[32:], 2)
++			case "count":
++				be.PutUint16(reply.body[48:], 2)
++			case "revision":
++				be.PutUint64(reply.body[56:], 2)
++			case "cancel":
++				f.c.mu.Lock()
++				f.c.dnsClose(b)
++				f.c.mu.Unlock()
++			case "expired":
++				f.now = op.deadline
++			case "unknown":
++				clear(reply.body)
++				be.PutUint16(reply.body, 2)
++				reply.body[2] = 3
++			case "duplicate-id":
++				// Retained issuer ID другого bundle не становится новым namespace.
++				other := &profileDNSBundle{id: 41}
++				f.c.dnsRequests[f.c.dnsRequestUsed] = &profileOperation{dns: &profileDNSBundleRPC{bundle: other}}
++				f.c.dnsRequestUsed++
++			}
++			err := f.c.accept(reply)
++			if mode != "cancel" && mode != "expired" && mode != "unknown" && err == nil {
++				t.Fatal("mismatched ACK accepted")
++			}
++			if ProfileDNSBundleGuard(dnsUse(b), "a", target, false) == nil {
++				t.Fatal("invalid ACK published logical authority")
++			}
++			if mode == "unknown" && (!b.unknown || b.released || b.exchange.query.refs == 0) {
++				t.Fatal("Unknown lost custody")
++			}
++		})
++	}
++}
++func TestProfileDNSBundleRefreshIsExactAndDoesNotResurrect(t *testing.T) {
++	f, ctx, target := dnsBundleFixture(t, 1)
++	b, first := dnsAcquirePure(t, f, ctx)
++	if e := f.c.accept(dnsBundleReply(first, 41, 1)); e != nil {
++		t.Fatal(e)
++	}
++	f.now = f.now.Add(400 * time.Millisecond)
++	b.exchange.root.deadline = f.now.Add(time.Second)
++	_, op, e := f.c.dnsAcquire(b.exchange, b.path, b.targets, b.count, b)
++	if e != nil {
++		t.Fatal(e)
++	}
++	before := f.c.operations
++	_, same, e := f.c.dnsAcquire(b.exchange, b.path, b.targets, b.count, b)
++	if e != nil || same != op || before != f.c.operations {
++		t.Fatal("parallel renewal did not join")
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	if u64(op.body, 32) != 41 || u64(op.body, 64) != 1 {
++		t.Fatal("renewal identity")
++	}
++	if u64(op.body, 40) != uint64(time.Second) {
++		t.Fatal("renewal request clipped new lease to old ACK deadline")
++	}
++	reply := dnsBundleReply(op, 41, 2)
++	f.now = f.now.Add(10 * time.Millisecond)
++	if e = f.c.accept(reply); e != nil {
++		t.Fatal(e)
++	}
++	if b.revision != 2 || !b.deadline.After(first.sent.Add(time.Second)) || b.deadline.After(op.sent.Add(time.Second)) {
++		t.Fatal("renewal failed original RTT/root bounds")
++	}
++	if e = f.c.accept(reply); e == nil || b.revision != 2 {
++		t.Fatal("duplicate renewal ACK changed revision")
++	}
++	f.now = b.deadline
++	if e = ProfileDNSBundleGuard(dnsUse(b), "a", target, false); e == nil {
++		t.Fatal("expired bundle guard")
++	}
++	if _, _, e = f.c.dnsAcquire(b.exchange, b.path, b.targets, b.count, b); e == nil {
++		t.Fatal("expired bundle resurrected")
++	}
++}
++func TestProfileDNSBundleSystemOwnerRTTAndClassSeparation(t *testing.T) {
++	for _, mode := range []string{"matching", "owner-expired", "owner-unknown", "probe", "foreign-receipt"} {
++		t.Run(mode, func(t *testing.T) {
++			f, ctx, target := dnsBundleFixture(t, 2)
++			e := profileDNSExchangeFrom(ctx)
++			switch mode {
++			case "owner-expired":
++				e.root.ownerDeadline = f.now
++			case "owner-unknown":
++				e.root.ownerKind = 0
++			case "probe":
++				e.root.class = 2
++			case "foreign-receipt":
++				e.root.receipt = f.admittedReceipt(t, "neighbor.invalid")
++			}
++			path, targets, count, err := profileDNSChosenPath(&f.c.manifest, "a", e.target, false, nil)
++			if err != nil {
++				t.Fatal(err)
++			}
++			b, op, err := f.c.dnsAcquire(e, path, targets, count, nil)
++			if mode != "matching" {
++				if err == nil {
++					t.Fatal("root proof/class replaced")
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err = f.c.dispatch(op); err != nil {
++				t.Fatal(err)
++			}
++			f.now = f.now.Add(5 * time.Millisecond)
++			if err = f.c.accept(dnsBundleReply(op, 41, 1)); err != nil {
++				t.Fatal(err)
++			}
++			if b.deadline != op.sent.Add(20*time.Millisecond) || ProfileDNSBundleGuard(dnsUse(b), "a", target, false) != nil {
++				t.Fatal("System freshKnown did not subtract RTT")
++			}
++			f.now = op.sent.Add(20 * time.Millisecond)
++			if ProfileDNSBundleGuard(dnsUse(b), "a", target, false) == nil {
++				t.Fatal("ACK prolonged owner20ms")
++			}
++		})
++	}
++}
++func TestProfileDNSBundleCreditsBeforeRPCAndNoSchemaOneFallback(t *testing.T) {
++	for _, mode := range []string{"pending", "memory", "history", "hops", "codec"} {
++		t.Run(mode, func(t *testing.T) {
++			f, ctx, _ := dnsBundleFixture(t, 1)
++			e := profileDNSExchangeFrom(ctx)
++			path, targets, count, err := profileDNSChosenPath(&f.c.manifest, "a", e.target, false, nil)
++			if err != nil {
++				t.Fatal(err)
++			}
++			switch mode {
++			case "pending":
++				f.c.operations = 62
++			case "memory":
++				f.c.buffered = uint64(f.c.manifest.caps[4])
++			case "history":
++				f.c.dnsHistoryUsed = 256
++			case "hops":
++				f.c.dnsHopCredits = int(f.c.manifest.caps[0])
++			case "codec":
++				f.p.dnsV2 = false
++			}
++			refs, used, history, bytes := e.query.refs, f.c.dnsRequestUsed, f.c.dnsHistoryUsed, f.c.buffered
++			if _, _, err = f.c.dnsAcquire(e, path, targets, count, nil); err == nil {
++				t.Fatal("budget gate ignored")
++			}
++			if e.query.refs != refs || f.c.dnsRequestUsed != used || f.c.dnsHistoryUsed != history || f.c.buffered != bytes || e.bundle != nil {
++				t.Fatal("failed preflight allocated custody")
++			}
++		})
++	}
++}
++func TestProfileDNSBundleCancelLateAllowKeepsNeighborAndWaitsCleanup(t *testing.T) {
++	f, ctx, target := dnsBundleFixture(t, 1)
++	b, op := dnsAcquirePure(t, f, ctx)
++	e := profileDNSExchangeFrom(ctx)
++	other := *e
++	other.id = 2
++	other.bundle = nil
++	other.ctx = context.WithValue(e.ctx, profileDNSExchangeKey{}, &other)
++	root, rootOp, err := f.c.authorizeDNS(other.ctx, e.query.receipt, e.root.resolver, e.query.name)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = f.c.dispatch(rootOp); err != nil {
++		t.Fatal(err)
++	}
++	if err = f.c.accept(serviceReply(f, rootOp)); err != nil {
++		t.Fatal(err)
++	}
++	other.root = root
++	root.dnsOwner = &other
++	path, targets, count, err := profileDNSChosenPath(&f.c.manifest, "a", other.target, false, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	neighbor, second, err := f.c.dnsAcquire(&other, path, targets, count, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = f.c.dispatch(second); err != nil {
++		t.Fatal(err)
++	}
++	if err = f.c.accept(dnsBundleReply(second, 42, 1)); err != nil {
++		t.Fatal(err)
++	}
++	f.c.mu.Lock()
++	f.c.dnsClose(b)
++	f.c.mu.Unlock()
++	if err = f.c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	if op.dns.cancelSequence == 0 || b.released {
++		t.Fatal("pending cancellation lost custody")
++	}
++	if err = f.c.accept(dnsBundleReply(op, 41, 1)); err != nil {
++		t.Fatal(err)
++	}
++	if err = f.c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	if b.closeSequence == 0 || b.released || ProfileDNSBundleGuard(dnsUse(b), "a", target, false) == nil {
++		t.Fatal("late allow became live or retired early")
++	}
++	if err = f.c.accept(dnsCancelAck(b.closeSequence, b.id)); err != nil {
++		t.Fatal(err)
++	}
++	if b.released {
++		t.Fatal("bundle ACK did not wait pending request cancel")
++	}
++	if err = f.c.accept(dnsCancelAck(op.dns.cancelSequence, op.sequence)); err != nil {
++		t.Fatal(err)
++	}
++	if !b.released || b.unknown || ProfileDNSBundleGuard(dnsUse(neighbor), "a", target, false) != nil {
++		t.Fatal("cancel killed neighbor or lost known cleanup")
++	}
++	if err = f.c.accept(dnsCancelAck(b.closeSequence, b.id)); err == nil {
++		t.Fatal("duplicate close ACK")
++	}
++}
++func TestProfileDNSBundleUnknownCleanupRetainsCustody(t *testing.T) {
++	f, ctx, _ := dnsBundleFixture(t, 1)
++	b, op := dnsAcquirePure(t, f, ctx)
++	if e := f.c.accept(dnsBundleReply(op, 41, 1)); e != nil {
++		t.Fatal(e)
++	}
++	f.c.mu.Lock()
++	f.c.dnsClose(b)
++	f.c.mu.Unlock()
++	if e := f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	ack := dnsCancelAck(b.closeSequence, b.id)
++	clear(ack.body)
++	be.PutUint16(ack.body, 2)
++	ack.body[2] = 3
++	credit, refs := f.c.buffered, b.exchange.query.refs
++	if e := f.c.accept(ack); e != nil {
++		t.Fatal(e)
++	}
++	if !b.unknown || b.released || f.c.buffered != credit || b.exchange.query.refs != refs {
++		t.Fatal("Unknown cleanup released custody")
++	}
++	if e := f.c.accept(dnsCancelAck(b.closeSequence, b.id)); e != nil {
++		t.Fatal(e)
++	}
++	if b.released || !b.unknown {
++		t.Fatal("late ACK cleared sticky Unknown")
++	}
++}
++
++func TestProfileDNSBundleShortLeaseSubtractsFullRTT(t *testing.T) {
++	f, ctx, _ := dnsBundleFixture(t, 1)
++	b, op := dnsAcquirePure(t, f, ctx)
++	reply := dnsBundleReply(op, 41, 1)
++	be.PutUint64(reply.body[40:], uint64(100*time.Millisecond))
++	f.now = f.now.Add(40 * time.Millisecond)
++	if e := f.c.accept(reply); e != nil {
++		t.Fatal(e)
++	}
++	if b.deadline != op.sent.Add(100*time.Millisecond) {
++		t.Fatal("ACK moved deadline forward by network RTT")
++	}
++}
++
++func TestProfileDNSBundleRejectsLeaseBeyondPrivateRequest(t *testing.T) {
++	f, ctx, target := dnsBundleFixture(t, 1)
++	profileDNSExchangeFrom(ctx).root.deadline = f.now.Add(100 * time.Millisecond)
++	b, op := dnsAcquirePure(t, f, ctx)
++	reply := dnsBundleReply(op, 41, 1)
++	be.PutUint64(reply.body[40:], uint64(200*time.Millisecond))
++	if e := f.c.accept(reply); e == nil {
++		t.Fatal("issuer lease exceeded requested root cap")
++	}
++	if !b.unknown || b.rejectedID != 41 || ProfileDNSBundleGuard(dnsUse(b), "a", target, false) == nil {
++		t.Fatal("invalid lease lost custody or published authority")
++	}
++}
++func TestProfileDNSBundleCanonicalNegotiationRejectsSchemaOne(t *testing.T) {
++	var corpus struct {
++		Negotiations []struct{ LaunchHex, DescriptorHex, AckHex string }
++	}
++	if e := json.Unmarshal(profileDNSV2Golden, &corpus); e != nil {
++		t.Fatal(e)
++	}
++	for _, v := range corpus.Negotiations {
++		launchBytes, _ := hex.DecodeString(v.LaunchHex)
++		r, e := decodeProfileLaunch(launchBytes)
++		if e != nil {
++			t.Fatal(e)
++		}
++		descriptor, _ := hex.DecodeString(v.DescriptorHex)
++		old := sha256.Sum256([]byte("YONIK-DNS-V2-CODEC-1\x00"))
++		copy(descriptor[208:], old[:])
++		h := sha256.Sum256(descriptor)
++		ack := append([]byte("DNSACK02"), h[:]...)
++		if profileDNSV2Negotiate(r, descriptor, ack, 0, 0) {
++			t.Fatal("schema1 downgraded CODEC2")
++		}
++	}
++}
++
++func TestProfileDNSBundleCodecRejectsProbeBaseBeforeCursor(t *testing.T) {
++	b := make([]byte, 72+8+1+4)
++	be.PutUint16(b, 2)
++	be.PutUint64(b[8:], 1)
++	be.PutUint64(b[16:], 1)
++	be.PutUint64(b[24:], 1)
++	be.PutUint64(b[40:], 1)
++	be.PutUint16(b[48:], 8)
++	be.PutUint16(b[50:], 1)
++	be.PutUint16(b[52:], 1)
++	be.PutUint16(b[58:], 1)
++	be.PutUint16(b[72:], 2)
++	b[80] = 'a'
++	if profileDNSV2Body(55, b) {
++		t.Fatal("PROBE8 replaced required class3 AUTHORIZE")
++	}
++}
++func TestProfileDNSBundleActualRequestProducerAndClosedForwardGate(t *testing.T) {
++	f, fixture, target := dnsBundleFixture(t, 1)
++	q := profileQueryFrom(fixture)
++	request := dnsmessage.Message{Header: dnsmessage.Header{ID: 17, RecursionDesired: true}, Questions: []dnsmessage.Question{{Name: dnsmessage.MustNewName("Original.INVALID."), Class: dnsmessage.ClassINET, Type: dnsmessage.TypeAAAA}}}
++	wire, e := request.Pack()
++	if e != nil {
++		t.Fatal(e)
++	}
++	type result struct {
++		ctx     context.Context
++		release func()
++		err     error
++	}
++	done := make(chan result, 1)
++	go func() {
++		ctx, release, e := ProfileDNSExchangeContext(q.ctx, wire, target)
++		done <- result{ctx, release, e}
++	}()
++	select {
++	case got := <-done:
++		t.Fatalf("producer skipped root class3 RPC: %v", got.err)
++	case op := <-f.p.flowQueue:
++		if op.kind != 18 || op.body[8] != 3 || op.receipt != q.receipt {
++			t.Fatal("query borrowed user/probe authority")
++		}
++		if e = f.c.dispatch(op); e != nil {
++			t.Fatal(e)
++		}
++		if e = f.c.accept(serviceReply(f, op)); e != nil {
++			t.Fatal(e)
++		}
++	}
++	got := <-done
++	if got.err != nil {
++		t.Fatal(got.err)
++	}
++	defer got.release()
++	exchange := profileDNSExchangeFrom(got.ctx)
++	if exchange == nil || exchange.root.dnsOwner != exchange || exchange.qtype != 28 || exchange.original != "Original.INVALID" || exchange.options != 1 {
++		t.Fatal("private query binding lost")
++	}
++	if e = ProfileDispatchEntry(got.ctx, target); e != nil {
++		t.Fatal(e)
++	}
++	next, e := ProfileSelectRoute(got.ctx, "a", target)
++	if e != nil {
++		t.Fatal(e)
++	}
++	ready := make(chan result, 1)
++	go func() {
++		ctx, release, handled, e := ProfileDNSPrepareHandler(next, "a", target, false, nil)
++		if !handled {
++			t.Error("native handler missed DNS path")
++		}
++		ready <- result{ctx, release, e}
++	}()
++	op := <-f.p.flowQueue
++	if op.kind != 55 || u16(op.body, 52) != 28 {
++		t.Fatal("native handler skipped BundleAcquire")
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.accept(dnsBundleReply(op, 51, 1)); e != nil {
++		t.Fatal(e)
++	}
++	prepared := <-ready
++	if prepared.err != nil {
++		t.Fatal(prepared.err)
++	}
++	defer prepared.release()
++	if e = ProfileDNSForwardReady(prepared.ctx, "a", target, false); !errors.Is(e, ErrProfileUnsupported) {
++		t.Fatal("bundle replaced missing resource proof", e)
++	}
++	if ProfileCheckDial(prepared.ctx, target, false) == nil {
++		t.Fatal("bundle-only context opened physical target")
++	}
++}
++
++func TestProfileDNSBundleNativeChainUsesCarrierAndEachHopGuard(t *testing.T) {
++	f, ctx, target := dnsBundleFixture(t, 1)
++	remote := profileDestinationValue{family: 3, network: 17, port: 443, address: "Remote.INVALID"}
++	leaf := profileDestinationValue{family: 4, network: 17, port: 8443, address: "192.0.2.9"}
++	f.c.manifest.rows[1] = [][]byte{remote.encode(), leaf.encode()}
++	root := append([]byte(nil), f.c.manifest.rows[8][0]...)
++	root[5] = 17
++	root[20] = 2
++	be.PutUint16(root[8:], 0)
++	be.PutUint16(root[16:], 0)
++	f.c.manifest.rows[8][0] = root
++	next := make([]byte, 24)
++	be.PutUint16(next, 1)
++	next[2], next[3], next[6], next[7], next[21] = 17, 2, 17, 17, 1
++	be.PutUint16(next[10:], 1)
++	f.c.manifest.rows[8] = append(f.c.manifest.rows[8], next)
++	subject := append([]byte(nil), f.c.manifest.rows[0][0]...)
++	subject[2] = 'b'
++	be.PutUint16(subject[len(subject)-4:], 65535)
++	be.PutUint16(subject[len(subject)-2:], 2)
++	f.c.manifest.rows[0] = append(f.c.manifest.rows[0], subject)
++	edge := make([]byte, 8)
++	be.PutUint16(edge[2:], 2)
++	edge[5] = 2
++	f.c.manifest.rows[2] = [][]byte{edge}
++	nextTarget := xnet.UDPDestination(xnet.ParseAddress(remote.address), 443)
++	calls := 0
++	choose := func(tag string, value xnet.Destination) (bool, error) {
++		calls++
++		if tag != "b" || value != nextTarget {
++			t.Fatal("native next target/carrier changed")
++		}
++		return true, nil
++	}
++	path, targets, count, e := profileDNSChosenPath(&f.c.manifest, "a", profileDNSExchangeFrom(ctx).target, false, choose)
++	if e != nil || count != 2 || calls != 1 || path[1] != (profileDNSHop{2, 1}) {
++		t.Fatal("actual mux choice lost", e)
++	}
++	b, op, e := f.c.dnsAcquire(profileDNSExchangeFrom(ctx), path, targets, count, nil)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.dispatch(op); e != nil {
++		t.Fatal(e)
++	}
++	if e = f.c.accept(dnsBundleReply(op, 41, 1)); e != nil {
++		t.Fatal(e)
++	}
++	hopped, e := ProfileChain(dnsUse(b), nextTarget, "b")
++	if e != nil {
++		t.Fatal(e)
++	}
++	if e = ProfileDNSBundleGuard(hopped, "b", nextTarget, true); e != nil {
++		t.Fatal(e)
++	}
++	if ProfileDNSBundleGuard(dnsUse(b), "b", nextTarget, true) == nil || ProfileDNSBundleGuard(hopped, "a", target, false) == nil {
++		t.Fatal("hop index borrowed neighbor permission")
++	}
++	if _, _, e = ProfileAuthorizeHandler(hopped, "b", nextTarget, true); e == nil {
++		t.Fatal("DNS bundle became USER grant")
++	}
++	next[2] = 6
++	if _, _, _, e = profileDNSChosenPath(&f.c.manifest, "a", profileDNSExchangeFrom(ctx).target, false, choose); e == nil {
++		t.Fatal("original TCP replaced previous carrier")
++	}
++	next[2] = 17
++	f.c.mu.Lock()
++	f.c.dnsClose(b)
++	f.c.mu.Unlock()
++	if _, e = ProfileChain(dnsUse(b), nextTarget, "b"); e == nil {
++		t.Fatal("delayed callback revived canceled bundle")
++	}
++}
++func TestProfileDNSBundleCancelInsideSuccessfulSendRetainsPublicationFence(t *testing.T) {
++	f, ctx, target := dnsBundleFixture(t, 1)
++	e := profileDNSExchangeFrom(ctx)
++	path, targets, count, err := profileDNSChosenPath(&f.c.manifest, "a", e.target, false, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	b, op, err := f.c.dnsAcquire(e, path, targets, count, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	write := f.c.write
++	f.c.write = func(kind uint16, object uint64, body []byte) (uint64, error) {
++		seq, err := write(kind, object, body)
++		if kind == 55 && err == nil {
++			b.cancel()
++		}
++		return seq, err
++	}
++	if err = f.c.dispatch(op); err != nil {
++		t.Fatal(err)
++	}
++	if !op.submitted || op.sequence == 0 || b.released {
++		t.Fatal("successful send lost pending custody")
++	}
++	if err = f.c.accept(dnsBundleReply(op, 41, 1)); err != nil {
++		t.Fatal(err)
++	}
++	if ProfileDNSBundleGuard(dnsUse(b), "a", target, false) == nil || b.released {
++		t.Fatal("cancel inside send published grant")
++	}
++	if err = f.c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	if b.closeSequence == 0 {
++		t.Fatal("late accepted bundle not retired")
++	}
++}
++
++func TestProfileDNSBundleForeignQueryAndRenewalMutationDenied(t *testing.T) {
++	for _, mode := range []string{"foreign-query", "id", "original", "qtype", "options", "payload", "resolver"} {
++		t.Run(mode, func(t *testing.T) {
++			f, ctx, target := dnsBundleFixture(t, 1)
++			b, op := dnsAcquirePure(t, f, ctx)
++			if e := f.c.accept(dnsBundleReply(op, 41, 1)); e != nil {
++				t.Fatal(e)
++			}
++			e := b.exchange
++			if mode == "foreign-query" {
++				base := context.WithValue(context.WithValue(f.p.ctx, profileContextKey{}, f.p), profileReceiptKey{}, e.query.receipt)
++				query, release, err := ProfileDNSQueryContext(base, "neighbor.invalid")
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer release()
++				foreign := context.WithValue(context.WithValue(query, profileDNSExchangeKey{}, e), profileDNSBundleKey{}, profileDNSBundleUse{b, 0})
++				if ProfileDNSBundleGuard(foreign, "a", target, false) == nil || ProfileDNSRefreshBundle(foreign) == nil {
++					t.Fatal("neighbor query borrowed bundle")
++				}
++				return
++			}
++			switch mode {
++			case "id":
++				e.id++
++			case "original":
++				e.original = "foreign.invalid"
++			case "qtype":
++				e.qtype = 28
++			case "options":
++				e.options = 1
++			case "payload":
++				e.payload = 1232
++			case "resolver":
++				e.root.resolver = 65535
++			}
++			before := f.c.dnsRequestUsed
++			if ProfileDNSRefreshBundle(dnsUse(b)) == nil || f.c.dnsRequestUsed != before {
++				t.Fatal("renewal changed immutable query")
++			}
++		})
++	}
++}
++
++func TestProfileDNSBundleKnownRequestCancelCannotAdmitLateAllow(t *testing.T) {
++	f, ctx, target := dnsBundleFixture(t, 1)
++	b, op := dnsAcquirePure(t, f, ctx)
++	f.c.mu.Lock()
++	f.c.dnsClose(b)
++	f.c.mu.Unlock()
++	if e := f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if e := f.c.accept(dnsCancelAck(op.dns.cancelSequence, op.sequence)); e != nil {
++		t.Fatal(e)
++	}
++	f.now = op.deadline
++	if e := f.c.tick(); e != nil {
++		t.Fatal(e)
++	}
++	if !b.released || !op.dns.replied || !op.dns.settled || f.c.dnsCleanupResult() != nil {
++		t.Fatal("known request cleanup did not retire locally")
++	}
++	if e := f.c.accept(dnsBundleReply(op, 99, 1)); e == nil {
++		t.Fatal("KnownClosed tombstone admitted late Allow")
++	}
++	if b.id != 0 || b.rejectedID != 99 || !b.unknown || ProfileDNSBundleGuard(dnsUse(b), "a", target, false) == nil || f.c.dnsCleanupResult() == nil {
++		t.Fatal("late issuer effects lost Unknown custody or gained authority")
 +	}
 +}

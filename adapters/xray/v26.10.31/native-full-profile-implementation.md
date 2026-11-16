@@ -879,3 +879,70 @@ class3→USER fallback или выдачи provider permission по tag. Ост�
 bundle/PhysicalBind/append/Publish/WaiterBind, StubBind и numeric durable handoff.
 Internal `proxy/dns` subject остаётся Unsupported и вне текущих изменений.
 Global runtime/consumer/builder gates остаются false.
+
+## CODEC-2 и private DNS bundle consumer
+
+Canonical pin `a7a9544e233689659a5df5a39f90d01def4c3239`; corpus SHA256
+`10d798ffd45f7d250e4c3f38c02b9f394671d1f9ee4871cdcd39b9d042e59359`:
+86 positive, 218 rejected bodies, 17 rejected envelopes. Старые 76 records
+сохранены; descriptor требует CODEC-2 schemaHash, CODEC-1 fallback отсутствует.
+Kind55/56 и Cancel target8 реализованы по canonical layout без новых полей.
+
+Classic UDP/TCP producer вызывает `ProfileDNSExchangeContext` с exact packed
+request до dispatcher/dial. Private query сохраняет original bytes отдельно
+от canonical DNS identity. Question/class/type/options/payload и bounded wire
+проверяются до root class3 RPC; root grant принадлежит одному private exchange,
+не соседнему waiter или pool. USER FlowGrant из parent context очищается,
+immutable original receipt остаётся source. System USER DNS сохраняет mandatory
+Known≤20ms из старого service consumer; legacy service/R14 wire не меняется.
+Owned `toDnsContext` сохраняет cancellation, копирует mutable Outbounds и
+отключает service payload sniffing до bundle admission, не меняя user Content.
+
+`Handler.Dispatch` использует отдельный `ProfileDNSPrepareHandler` перед
+legacy AUTHORIZE/PrepareChain. Root decision — actual native mux decision;
+следующие decisions получены через тот же `h.profileBranch`. Producer удерживает
+полный ordered scope/branch path, logical targets и carrier transitions.
+Remote hostname промежуточного proxy не становится physical leaf. Issuer
+сам восстанавливает subject/stream/chain/frontier и выдаёт собственные hop permits.
+
+BundleAcquire идёт через существующий runtime actor/flowQueue; новых channel
+readers/writers нет. BundleGranted проверяет exact pending sequence, root grant,
+query/epoch/count, ID/revision и live private source. Initial revision1; renewal
+сохраняет ID и весь binding/path, требует exact revision и один pending request.
+Остаток отсчитывается от исходного send, ограничен root/session/context/owner
+deadline; старый bundle обязан оставаться live до ACK. Новый ACK не продлевает
+старый System owner receipt и не возрождает expired/canceled bundle.
+
+Opaque DNS bundle находится в private context. `ProfileDNSBundleGuard` и
+DNS branch `ProfileChain` проверяют тот же logical consumer, private original
+receipt/query, весь live bundle/root, path index, subject, target и actual branch.
+Это не USER/Probe FlowGrant и не session credential. Callback не заимствует
+bundle соседнего query. Caller route/session values сохраняются при handoff.
+
+До effects резервируются общие pending/history/memory и hop credits. Initial
+RPC резервирует request и оба возможных cancel; renewal — request/cancel,
+а bundle удерживает собственный close credit. History также заранее учитывает
+каждый hop/revision; codec bound256 не обещает256 live permits поверх cap.
+History≤min(caps7,256) общая с
+runtime/proof ledger; IDs не compact/evict/reuse. Hop credits разделяют caps0
+с обычными grants, aggregate memory≤8MiB. Base credit48KiB+512 bytes/hop,
+retained metadata32KiB и4KiB/renewal ограничивают живую/retained custody.
+
+Cancel target1 относится к pending request, target8 — к issuer bundle, target7
+по-прежнему Reservation. Pending/late ACK не публикует permission; успешный
+late bundle удерживается только для retirement. Known request-cancel оставляет
+tombstone: поздний Allow отвергается, rejected ID сохраняется как sticky Unknown.
+Known cleanup требует завершения pending cancel и bundle cancel ACK; Unknown
+удерживает metadata/query/credits. Runtime cleanup агрегирует этот результат,
+не выдавая KnownClosed после одного неподтверждённого действия. Соседний bundle
+не отменяется. Bundle ACK не является доказательством закрытия Go FD: этот cut
+ещё не создаёт DNS physical resource.
+
+Граница milestone закрыта: `ProfileDNSForwardReady` после bundle guard возвращает
+Unsupported до отдельного PhysicalBind/LogicalBind proof; raw physical dial из
+DNS context запрещён. Actual Rust issuer/service policy, DirectSocket resources,
+StubBind, append/resource guards, RRset Publish/WaiterBind/cache authority и
+numeric durable route handoff остаются следующими частями DNS vertical.
+Здесь поддержан USER-backed classic routed producer с единственным подходящим
+manifest resolver row. Service flow0/internal DNS/ambiguous resolver не получают
+выдуманный bundle. Public readiness/require_consumer/builder gates остаются false.
