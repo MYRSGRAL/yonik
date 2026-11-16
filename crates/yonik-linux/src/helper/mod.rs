@@ -11,6 +11,7 @@ mod native_profile;
 pub(crate) mod native_profile_channel;
 pub mod profile_intent;
 mod protection_host;
+pub(crate) mod resolver_stub;
 mod session_network;
 pub use session_network::SessionNetworkPlan;
 pub(crate) mod run_authorization;
