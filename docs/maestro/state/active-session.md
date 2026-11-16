@@ -635,6 +635,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   actual counterpart parity и legitimate KnownClosed retirement не подтверждены.
   Forwarding/public gates false; protected builder/image allowlist ещё прежний.
 
+- R40 SOURCE scoped CLEAN: Rust DirectSocket21cc8b3 интегрирован после проверки
+  retained kernel FD facts, bundle/query/root/source/epoch/path/route ticket,
+  freshness fence и rendezvous/cancel/Unknown. Совместный штатный retirement
+  пока несовместим: Rust Retire возвращает Unknown, Go ожидает успешные ACK;
+  independent duplicate-close/join proof отсутствует. Это явный integration
+  limitation, не KnownClosed/runtime PASS. Local SIOCGSKNS доступность не
+  проверялась исполнением. Следующий шаг — exact producer retirement contract
+  по обоим pinned callers без synthetic success или ослабления custody.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
