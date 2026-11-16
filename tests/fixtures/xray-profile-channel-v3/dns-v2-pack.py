@@ -950,13 +950,367 @@ def corpus() -> dict[str, Any]:
     }
 
 
+def codec4_corpus() -> dict[str, Any]:
+    """CODEC3 basis неизменен; новые variants задаются независимыми field tables."""
+    result = corpus()
+    result["contract"] = "DNS_V2-CODEC-4"
+    result["codec3Basis"] = {
+        "file": "dns-v2-canonical.json",
+        "sha256": hashlib.sha256(
+            (json.dumps(corpus(), indent=2) + "\n").encode()
+        ).hexdigest(),
+        "records": len(result["vectors"]),
+        "changedBodyAcceptance": {
+            "reserve-hosts": "Probe2 resolver0 запрещён в Hosts; требуется FFFF"
+        },
+        "changedNegativeAcceptance": "Allow56 root0 допустим только DATA; variant проверяет exact pending55",
+    }
+    for n in result["negotiations"]:
+        d = bytearray.fromhex(n["descriptorHex"])
+        d[208:240] = hashlib.sha256(b"YONIK-DNS-V2-CODEC-4\0").digest()
+        n["descriptorHex"] = d.hex()
+        n["ackHex"] = (b"DNSACK02" + hashlib.sha256(d).digest()).hex()
+    for v in result["vectors"]:
+        if v["name"] == "reserve-hosts":
+            v["accepted"] = False
+    # Root0 теперь Hosts DATA, но не network root и не выдача authority.
+    result["rejectedBodies"] = [
+        r
+        for r in result["rejectedBodies"]
+        if not (
+            r["case"] == "bundle-granted-initial-allow"
+            and list(map(list, r["patches"])) == [[16, "u64", 0]]
+        )
+    ]
+    vectors = result["vectors"]
+
+    def add(
+        name: str, kind: int, size: int, fields: list[tuple[int, str, Any]]
+    ) -> None:
+        fields = [field(0, 2, "u16"), *fields]
+        body = pack(size, fields)
+        issuer = kind == 56
+        frame = header(kind, body, 100 + len(vectors), issuer)
+        vectors.append(
+            {
+                "name": name,
+                "kind": kind,
+                "mode": 1,
+                "size": size,
+                "direction": "issuer" if issuer else "producer",
+                "rights": 0,
+                "credentials": 0,
+                "fields": fields,
+                "bodyHex": body.hex(),
+                "frameHex": frame.hex(),
+                "bodySha256": hashlib.sha256(body).hexdigest(),
+                "frameSha256": hashlib.sha256(frame).hexdigest(),
+            }
+        )
+
+    def selector(hosts: bool) -> bytes:
+        return pack(
+            8,
+            [
+                field(0, 2, "u16"),
+                field(2, 7, "u16"),
+                field(4, 7, "u16"),
+                field(6, 65535 if hosts else 0, "u16"),
+            ],
+        )
+
+    for hosts in [False, True]:
+        label = "hosts" if hosts else "service"
+        for shape, count, original, renew in [
+            ("initial", 8, b"Edge.invalid", False),
+            ("renew", 8, b"Edge.invalid", True),
+            (
+                "max",
+                256,
+                b"a" * 63 + b"." + b"b" * 63 + b"." + b"c" * 63 + b"." + b"d" * 61,
+                False,
+            ),
+        ]:
+            path = b"".join(
+                struct.pack(">HBB", i * 2 if count == 8 else i, i % 2, 0)
+                for i in range(count)
+            )
+            add(
+                "acquire-" + label + "-" + shape,
+                55,
+                72 + 8 + len(original) + len(path),
+                [
+                    field(8, 0 if hosts else 13),
+                    field(16, 11),
+                    field(24, 7),
+                    field(32, 12 if renew else 0),
+                    field(40, 1000),
+                    field(48, 8, "u16"),
+                    field(50, count, "u16"),
+                    field(52, 0 if hosts else 28, "u16"),
+                    field(58, len(original), "u16"),
+                    field(60, 65535 if hosts else 0, "u16"),
+                    field(64, 1 if renew else 0),
+                    raw(72, selector(hosts) + original + path),
+                ],
+            )
+        for renew in [False, True]:
+            add(
+                "granted-" + label + ("-renew" if renew else "-initial"),
+                56,
+                64,
+                [
+                    field(2, 1, "u8"),
+                    field(8, 12),
+                    field(16, 0 if hosts else 13),
+                    field(24, 11),
+                    field(32, 7),
+                    field(40, 1000),
+                    field(48, 8, "u16"),
+                    field(56, 2 if renew else 1),
+                ],
+            )
+        original = b"Edge.invalid"
+        add(
+            "reserve-codec4-" + label,
+            35,
+            96 + len(original) * (1 if hosts else 2) + 8,
+            [
+                field(2, 3 if hosts else 1, "u8"),
+                field(8, 11),
+                field(16, 0 if hosts else 12),
+                field(24, 0 if hosts else 13),
+                field(48, 7),
+                field(56, 1000),
+                field(64, 65535 if hosts else 0, "u16"),
+                field(66, 7, "u16"),
+                field(68, 7, "u16"),
+                field(70, 14, "u16"),
+                field(72, 0 if hosts else 28, "u16"),
+                field(74, 3 if hosts else 2, "u8"),
+                field(75, 2 if hosts else 1, "u8"),
+                field(76, 17, "u8"),
+                field(77, 3, "u8"),
+                field(78, 2, "u8"),
+                field(80, len(original), "u16"),
+                field(82, 0 if hosts else len(original), "u16"),
+                field(84, 8, "u16"),
+                raw(
+                    96,
+                    original + (b"" if hosts else original.lower()) + selector(hosts),
+                ),
+            ],
+        )
+        add(
+            "numeric-codec4-" + label,
+            42,
+            47,
+            [
+                field(4, 74),
+                field(12, 8, "u16"),
+                field(14, 2, "u8"),
+                field(15, 3, "u8"),
+                raw(16, selector(hosts) + destination("2001:db8::9", 17, 8443)),
+            ],
+        )
+    original = b"a" * 63 + b"." + b"b" * 63 + b"." + b"c" * 63 + b"." + b"d" * 61
+    template = next(v for v in vectors if v["name"] == "reserve-codec4-hosts")
+    add(
+        "reserve-codec4-hosts-max",
+        35,
+        357,
+        [
+            (
+                a,
+                k,
+                len(original)
+                if a == 80
+                else original + selector(True)
+                if a == 96
+                else v,
+            )
+            for a, k, v in template["fields"]
+            if a != 0 and a != 96
+        ]
+        + [raw(96, original + selector(True))],
+    )
+
+    def reject(case: str, *patches: tuple[int, str, Any], append: int = 0) -> None:
+        result["rejectedBodies"].append(
+            {"case": case, "patches": patches, "appendZeroBytes": append}
+        )
+
+    for label in ["service", "hosts"]:
+        case = "acquire-" + label + "-initial"
+        for at, value, kind in [
+            (0, 1, "u16"),
+            (2, 1, "u16"),
+            (4, 1, "u32"),
+            (8, 18446744073709551615, "u64"),
+            (16, 0, "u64"),
+            (24, 0, "u64"),
+            (40, 0, "u64"),
+            (48, 7, "u16"),
+            (50, 257, "u16"),
+            (58, 254, "u16"),
+            (62, 1, "u16"),
+            (72, 1, "u16"),
+            (74, 65535, "u16"),
+            (76, 65535, "u16"),
+        ]:
+            reject(case, field(at, value, kind))
+        reject(case, append=1)
+        reject(case, field(32, 12))
+        reject("acquire-" + label + "-renew", field(64, 0))
+        for flags in [0, 1, 8, 12]:
+            if label == "hosts" and flags:
+                reject(case, field(54, flags, "u16"))
+        for at, val in [
+            (50, 0),
+            (60, 0 if label == "hosts" else 65535),
+            (78, 0 if label == "hosts" else 65535),
+        ]:
+            reject(case, field(at, val, "u16"))
+        reject(case, field(8, 13 if label == "hosts" else 0))
+        reject(case, field(52, 1 if label == "hosts" else 0, "u16"))
+        reject(case, field(56, 512, "u16"))
+        path_at = 72 + 8 + len(b"Edge.invalid")
+        for at, val, kind in [
+            (path_at, 65535, "u16"),
+            (path_at, 512, "u16"),
+            (path_at + 2, 2, "u8"),
+            (path_at + 3, 1, "u8"),
+        ]:
+            reject(case, field(at, val, kind))
+        for at, val, kind in [
+            (77, 1, "u8"),
+            (78, 1, "u8"),
+            (32, 1, "u64"),
+            (40, 1, "u64"),
+            (66, 6, "u16"),
+            (68, 6, "u16"),
+        ]:
+            reject("reserve-codec4-" + label, field(at, val, kind))
+        reject("numeric-codec4-" + label, field(14, 1, "u8"))
+        reject("numeric-codec4-" + label, field(15, 1, "u8"))
+        reject("numeric-codec4-" + label, field(16, 1, "u16"))
+    reject("reserve-codec4-hosts", field(102 + len(b"Edge.invalid"), 0, "u16"))
+    network = next(v for v in vectors if v["name"] == "reserve-codec4-service")
+    physical_fields = [
+        (a, k, 2 if a == 2 else 6 if a == 76 else value)
+        for a, k, value in network["fields"]
+        if a != 0
+    ]
+    add(
+        "reserve-codec4-service-physical",
+        35,
+        network["size"],
+        [*physical_fields, field(88, 21)],
+    )
+    initial = next(v for v in vectors if v["name"] == "acquire-service-initial")
+    add(
+        "acquire-service-edns-max-id",
+        55,
+        initial["size"],
+        [
+            (
+                a,
+                k,
+                18446744073709551614
+                if a == 8
+                else 31
+                if a == 54
+                else 4096
+                if a == 56
+                else value,
+            )
+            for a, k, value in initial["fields"]
+            if a != 0
+        ]
+        + [field(54, 31, "u16"), field(56, 4096, "u16")],
+    )
+    for label in ["service", "hosts"]:
+        for at, value in [(74, 512), (76, 256)]:
+            reject("acquire-" + label + "-initial", field(at, value, "u16"))
+        for at in [16, 24]:
+            reject("acquire-" + label + "-initial", field(at, 18446744073709551615))
+        reject("reserve-codec4-" + label, field(32, 5), field(40, 6))
+        reject("numeric-codec4-" + label, field(18, 512, "u16"))
+    reject("numeric-class-1-use-1", field(16, 18446744073709551615))
+    reject("bundle-acquire-initial", field(72, 18446744073709551615))
+    for case in [
+        "numeric-class-1-use-1",
+        "numeric-class-2-use-1",
+        "numeric-class-3-use-1",
+    ]:
+        reject(case, field(14, 2, "u8"))
+    reject("reserve-user", field(74, 2, "u8"), field(78, 2, "u8"), field(68, 0, "u16"))
+    result["acquireReplies"] = [
+        {
+            "request": "acquire-" + label + "-" + shape,
+            "reply": "granted-" + label + "-" + shape,
+            "hosts": label == "hosts",
+        }
+        for label in ["service", "hosts"]
+        for shape in ["initial", "renew"]
+    ]
+    result["rejectedAcquireReplies"] = [
+        {
+            "request": "acquire-service-initial",
+            "reply": "granted-hosts-initial",
+            "patches": [],
+        },
+        {
+            "request": "acquire-hosts-initial",
+            "reply": "granted-service-initial",
+            "patches": [],
+        },
+        {
+            "request": "acquire-service-renew",
+            "reply": "granted-service-initial",
+            "patches": [],
+        },
+        {
+            "request": "acquire-hosts-initial",
+            "reply": "granted-hosts-renew",
+            "patches": [],
+        },
+        *[
+            {
+                "request": "acquire-hosts-initial",
+                "reply": "granted-hosts-initial",
+                "patches": [field(at, value)],
+            }
+            for at, value in [(16, 13), (24, 12), (32, 8), (40, 1001), (56, 2)]
+        ],
+    ]
+    result["rejectedAcquireReplies"].append(
+        {
+            "request": "acquire-hosts-renew",
+            "requestPatches": [field(64, 18446744073709551614)],
+            "reply": "granted-hosts-renew",
+            "patches": [],
+        }
+    )
+    for v in vectors[86:]:
+        if v["kind"] in [55, 56]:
+            epoch = 24 if v["kind"] == 55 else 32
+            result["rejectedFrames"].append(
+                {"case": v["name"], "patches": [field(128 + epoch, 8)]}
+            )
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--codec", type=int, choices=[3, 4], default=3)
     args = parser.parse_args()
-    result = corpus()
+    result = codec4_corpus() if args.codec == 4 else corpus()
     if args.check:
-        target = pathlib.Path(__file__).with_name("dns-v2-canonical.json")
+        target = pathlib.Path(__file__).with_name(
+            "dns-v2-codec4.json" if args.codec == 4 else "dns-v2-canonical.json"
+        )
         if json.loads(target.read_text()) != json.loads(json.dumps(result)):
             raise SystemExit("DNS_V2 golden corpus отличается от field-table packer")
     else:

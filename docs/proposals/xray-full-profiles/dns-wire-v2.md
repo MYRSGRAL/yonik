@@ -1,5 +1,49 @@
 # DNS_V2: согласованный HostsSnapshot wire tail
 
+## Canonical CODEC4 DATA
+
+Root semantics заданы в [bootstrap-service-codec4.md](bootstrap-service-codec4.md).
+Реализованный DATA codec использует прежние kinds, fixed prefixes, row layouts,
+version2 и caps; descriptor272 связывает только schemaHash
+`3d2ebf29fe6d9c31780a6f241ea9693918f68344e412c06801e713e5ce13cd13`
+(SHA256 `YONIK-DNS-V2-CODEC-4` + NUL). Descriptor/ACK с CODEC1/2/3 отвергаются.
+
+Acquire55 fixed72 сохраняет offsets и tail `base + original + pathCount*4`:
+
+| DATA variant | base | root@8 | qtype@52 | options/payload | resolver@60 |
+| --- | --- | --- | --- | --- | --- |
+| UserDns | canonical AUTHORIZE class3 | ненулевой UserDnsRootId | 1/28 | прежние EDNS rules | exact AUTHORIZE resolver |
+| BootstrapService | Probe8 `[2,endpoint,subject,resolver]` | ненулевой ServiceGrantId | 1/28 | прежние EDNS rules | exact Probe resolver, неFFFF |
+| HostsPath | Probe8 `[2,endpoint,subject,FFFF]` | 0 | 0 | 0/0 | FFFF |
+
+Full path1..256 передаётся всеми variants; renewal context/revision либо оба0,
+либо оба ненулевые. Для Probe variants selector indices bounded table caps;
+проверку фактического graph/path/source/choice оставляет issuer. Максимальная
+Probe Acquire shape1357, Hosts Reserve357, Numeric42 Probe shape47 bytes.
+
+Allow56 fixed64 с root@16=0 является HostsPath DATA, не DNSBundle/Observation.
+Typed `DnsFrame::acquired_context(pending55)` проверяет binding/reply/source epoch,
+root/query/pathCount, initial/renew revision, context ID при renew и request lease
+cap; возвращает `DnsContext::Network` либо `DnsContext::HostsPath`. Deadline/RTT,
+nonreuse/variant registry, source custody и выдача authority не являются codec
+effects. Cancel47 target8 возвращает opaque exported-context reference, не
+автоматический DNSBundleId. UserDns и BootstrapService root IDs — разные типы.
+
+Probe2 resolverFFFF допускается только в CODEC4 Hosts Acquire/Reserve и Numeric42
+use2/class3. Legacy Probe20/AUTHORIZE18 decoder не менялся. PublishHosts сохраняет
+прежний prefix144 и DNHOST02 tail, zero DNS/proof/grant fields; Probe bytes в него
+не добавляются. Source-role/mapping validation остаётся отдельной проверкой DATA;
+typed IDs, hash либо successful roundtrip сами не разрешают bootstrap/open.
+
+`dns-v2-canonical.json` и default `dns-v2-pack.py --check` сохраняют exact CODEC3
+basis из86 body/frame vectors. Новый `dns-v2-codec4.json` воспроизводится через
+`dns-v2-pack.py --codec 4 --check`. Все86 preimages сохранены; старый Hosts Reserve
+с Probe resolver0 теперь explicitly rejected. Старый negative Allow56 root0 стал
+допустимым DATA, но matching pending network55 его отвергает. Остальные
+совместимые body records не переписывались. Producer/issuer/Go negotiation и
+reviewed release/wire pins требуют отдельной coordinated CODEC4 интеграции;
+этот canonical codec commit не устанавливает production readiness.
+
 ## Canonical operation envelope и negotiation
 
 Все integers BE. DATA codec не создаёт authority. Runtime Header128 остаётся YNKCAP01
