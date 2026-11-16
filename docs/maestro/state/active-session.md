@@ -670,6 +670,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   остаётся fail-closed Reference. Следующий отдельный writer cut — capsule mapping,
   без изменения DNS_V2 wire/issuer authority. Public/runtime gates остаются false.
 
+- Parallel resolver-policy28b4eca прошёл R46 SOURCE scoped CLEAN и интегрирован:
+  bounded protected record reader/revalidation и private verifier, повторная
+  проверка handles перед census. Production FactsSource пока отсутствует,
+  require_protected_policy остаётся PolicyUnavailable. Следующий cut использует
+  уже существующий zbus/systemd authenticated-owner pattern и retained service
+  facts; reviewed installed unit policy/allowlist остаётся отдельным обязательством.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
