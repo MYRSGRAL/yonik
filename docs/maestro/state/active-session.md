@@ -499,11 +499,16 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
 - Go UDP producer0ea9495 от basebbaa989 завершил SOURCE/PURE milestone:
   provenance3 OPEN/Match, private grant, guarded downstream/response и UCR.
   Автор55 broker+4 SOCKS+11 mux pure, Python28+28/fresh pins/gofmt/Ruff PASS;
-  main compile-only, сборка очищена. Пока не интегрирован до R25a authority review.
+  main compile-only, сборка очищена. Интегрирован для R25a correction.
   R25b counterpart/lifecycle/accounting SOURCE scoped CLEAN: transfer/retirement,
   cancel ACK, credits и joins согласованы с Rust pinned producer contract.
   Это не независимый runtime proof child closure. Readiness gates остаются false,
   DNS/provider/domain/compaction gaps не закрыты; полного P4/P5 PASS нет.
+  R25a нашёл pre-GRANT payload sniffing в producer reader. Rootda1c80b запрещает
+  payload-sniffing перед dispatch и выдачу reader без transfer/live bound grant.
+  RED старого producer → GREEN UDP suite, fresh81 pins и Python9+9 PASS;
+  evidence r25-root-sniff сохранён до tests, собственная сборка очищена.
+  Narrow source recheck ожидается; native/runtime gates не открывались.
 
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
