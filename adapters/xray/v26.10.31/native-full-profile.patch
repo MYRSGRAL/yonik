@@ -30053,7 +30053,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux.go
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,838 @@
 +//go:build linux
 +
 +package nativehooks
@@ -30067,8 +30067,16 @@ new file mode 100644
 +	"time"
 +)
 +
-+const profileHostsObservationCredit = 16 * 1024
-+const profileHostsObservationPending = 3
++const profileHostsObservationCredit = 32 * 1024
++const profileHostsObservationPending = 6
++
++// ProducerRRset DATA не является WaiterReceipt, grant или transport permission.
++type profileHostsProducerData struct {
++	owner     *profileHostsObservation
++	id, epoch uint64
++	expires   time.Time
++	count     int
++}
 +
 +type profileHostsSelection struct {
 +	row     uint16
@@ -30077,6 +30085,11 @@ new file mode 100644
 +	key     string
 +}
 +type profileHostsObservation struct {
++	data                                                    *profileHostsProducerData
++	publish                                                 *profileOperation
++	publishHash                                             [32]byte
++	publishReceived, publishCancelAck, producerCloseAck     bool
++	publishCancelSequence, producerCloseSequence            uint64
 +	runtime                                                 *ProfileRuntime
 +	ctx                                                     context.Context
 +	cancel                                                  context.CancelFunc
@@ -30232,7 +30245,7 @@ new file mode 100644
 +}
 +
 +// Actual chain caller не получает IP или permission: этот cut заканчивается
-+// issuer observation. Publish/Waiter/Numeric/physical conjunction пока закрыты.
++// Hosts Producer DATA. Waiter/Numeric/physical conjunction пока закрыты.
 +func profilePrepareHostsObservation(ctx context.Context, root *profileGrant) error {
 +	p := profileRuntime(ctx)
 +	if p == nil || !p.dns4CaptureReviewed {
@@ -30314,8 +30327,189 @@ new file mode 100644
 +	if err = p.flowRPC(op); err != nil {
 +		return err
 +	}
-+	// Observation ID не SourcePermission. Даже successful ACK не открывает dial.
++	if err = profilePublishHostsObservation(h); err != nil {
++		return err
++	}
++	// DATA ID не WaiterReceipt/BootstrapPhysicalPermission. Numeric/use2 и
++	// conjunction отсутствуют в current physical seam; raw open остаётся закрыт.
 +	return ErrProfileUnsupported
++}
++
++func profilePublishHostsObservation(h *profileHostsObservation) error {
++	c := h.runtime.flow
++	c.mu.Lock()
++	if h.publish != nil || !h.replied || h.observation == 0 || h.reservation == 0 || !c.hostsObservationSourceLive(h) || !c.dnsContext4Live(h.context) || h.context.identity.kind != profileDNSHostsRoot {
++		c.mu.Unlock()
++		return errProfile
++	}
++	s := h.selection
++	f := h.frontier
++	if len(s.key) < 1 || len(s.key) > 253 || len(f.target.address) < 1 || len(f.target.address) > 253 || s.count < 1 || s.count > 16 {
++		c.mu.Unlock()
++		return errProfile
++	}
++	tailSize := 128 + len(s.key) + len(f.target.address) + 2*s.count
++	body := make([]byte, 144+tailSize)
++	be.PutUint16(body, 2)
++	be.PutUint16(body[4:], 65535)
++	be.PutUint16(body[6:], f.subject)
++	be.PutUint16(body[8:], f.endpoint)
++	be.PutUint64(body[12:], h.context.source.query)
++	be.PutUint64(body[36:], h.context.source.epoch)
++	row := c.manifest.rows[10][0]
++	copy(body[44:], row[:32])
++	copy(body[76:], row[32:64])
++	body[136], body[137] = 3, 2
++	be.PutUint16(body[140:], f.scope)
++	body[142] = f.carrier
++	tail := body[144:]
++	copy(tail, "DNHOST02")
++	be.PutUint16(tail[8:], 2)
++	be.PutUint16(tail[10:], uint16(tailSize))
++	copy(tail[16:], row[:32])
++	copy(tail[48:], row[32:64])
++	be.PutUint64(tail[80:], h.context.source.epoch)
++	be.PutUint64(tail[88:], h.observation)
++	be.PutUint64(tail[96:], uint64(time.Second))
++	for _, field := range [][2]uint16{{106, s.row}, {108, uint16(s.count)}, {110, uint16(len(s.key))}, {112, uint16(len(f.target.address))}, {114, f.subject}, {116, f.endpoint}, {118, f.scope}, {122, f.target.port}} {
++		be.PutUint16(tail[field[0]:], field[1])
++	}
++	tail[120], tail[121] = f.branch, f.carrier
++	at := 128
++	copy(tail[at:], s.key)
++	at += len(s.key)
++	copy(tail[at:], f.target.address)
++	at += len(f.target.address)
++	for _, member := range s.members[:s.count] {
++		be.PutUint16(tail[at:], member)
++		at += 2
++	}
++	h.data = &profileHostsProducerData{owner: h, epoch: h.context.source.epoch, count: s.count}
++	op := &profileOperation{hostsObservation: h, ctx: h.ctx, kind: 40, body: body, done: make(chan struct{})}
++	h.publish = op
++	h.publishHash = sha256.Sum256(body)
++	c.mu.Unlock()
++	return h.runtime.flowRPC(op)
++}
++func (c *profileFlowControl) hostsPublishDispatch(op *profileOperation) error {
++	h := op.hostsObservation
++	if op.submitted || op.completed {
++		return nil
++	}
++	if op != h.publish || !c.hostsObservationSourceLive(h) || !c.dnsContext4Live(h.context) || h.observation == 0 || h.reservation == 0 || h.publishHash != sha256.Sum256(op.body) || !profileDNSV2Body(40, op.body) {
++		c.hostsObservationClose(h)
++		c.dnsNotify(op, errProfile)
++		return nil
++	}
++	op.sent = c.clock()
++	op.deadline = h.deadline
++	if h.context.deadline.Before(op.deadline) {
++		op.deadline = h.context.deadline
++	}
++	if d, ok := op.ctx.Deadline(); ok && d.Before(op.deadline) {
++		op.deadline = d
++	}
++	if !op.sent.Before(op.deadline) {
++		c.hostsObservationClose(h)
++		c.dnsNotify(op, errProfile)
++		return nil
++	}
++	be.PutUint64(op.body[144+96:], uint64(op.deadline.Sub(op.sent)))
++	op.submitted = true
++	seq, err := c.write(40, 0, op.body)
++	op.sequence = seq
++	if seq > c.lastSent {
++		c.lastSent = seq
++	}
++	if err != nil || !profileDNSV2ID(seq) {
++		h.unknown = true
++		c.hostsObservationClose(h)
++		c.dnsNotify(op, errProfile)
++		return errProfile
++	}
++	return nil
++}
++func (c *profileFlowControl) hostsPublishAccept(f profilePacket) (bool, error) {
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		op := h.publish
++		if op != nil && op.submitted && f.kind == 41 && f.reply == op.sequence {
++			if h.publishReceived || h.publishCancelAck || f.object != 0 || !profileDNSV2Body(41, f.body) {
++				h.unknown = true
++				c.hostsObservationClose(h)
++				c.dnsNotify(op, errProfile)
++				return true, errProfile
++			}
++			h.publishReceived = true
++			b := f.body
++			if b[2] != 1 {
++				if b[2] == 3 {
++					h.unknown = true
++				}
++				c.hostsObservationClose(h)
++				c.dnsNotify(op, errProfile)
++				return true, nil
++			}
++			d := h.data
++			d.id = u64(b, 8)
++			remaining := u64(b, 32)
++			until := op.sent.Add(time.Duration(remaining))
++			valid := u64(b, 16) == 0 && u64(b, 24) == d.epoch && int(u16(b, 40)) == d.count && remaining <= u64(op.body[144:], 96) && !until.After(h.deadline)
++			for _, other := range c.hostsObservations[:c.hostsObservationUsed] {
++				if other != h && other.data != nil && other.data.id == d.id {
++					valid = false
++				}
++			}
++			for _, other := range c.dnsResults[:c.dnsResultUsed] {
++				if other.data != nil && other.data.id == d.id {
++					valid = false
++				}
++			}
++			if !valid {
++				h.unknown = true
++				c.hostsObservationClose(h)
++				c.dnsNotify(op, errProfile)
++				return true, errProfile
++			}
++			d.expires = until
++			if !c.hostsProducerDataLive(d) || !c.clock().Before(op.deadline) {
++				c.hostsObservationClose(h)
++				c.dnsNotify(op, errProfile)
++				return true, nil
++			}
++			c.dnsNotify(op, nil)
++			return true, nil
++		}
++		if f.kind == 48 && f.reply != 0 && (f.reply == h.publishCancelSequence || f.reply == h.producerCloseSequence) {
++			if f.object != 0 || !profileDNSV2Body(48, f.body) || !c.clock().Before(h.cleanupDeadline) {
++				h.unknown = true
++				return true, errProfile
++			}
++			if f.body[2] != 1 {
++				h.unknown = true
++				return true, nil
++			}
++			expected := uint64(0)
++			duplicate := false
++			if f.reply == h.publishCancelSequence {
++				expected = op.sequence
++				duplicate = h.publishCancelAck
++			} else {
++				expected = h.data.id
++				duplicate = h.producerCloseAck
++			}
++			if duplicate || u64(f.body, 8) != expected {
++				h.unknown = true
++				return true, errProfile
++			}
++			if f.reply == h.publishCancelSequence {
++				h.publishCancelAck = true
++			} else {
++				h.producerCloseAck = true
++			}
++			return true, nil
++		}
++	}
++	return false, nil
 +}
 +func (c *profileFlowControl) hostsObservationSourceLive(h *profileHostsObservation) bool {
 +	if h == nil || h.closed || h.unknown || h.ctx.Err() != nil || !c.clock().Before(h.deadline) || !c.hostsSnapshotLive(h.runtime, h.snapshot) {
@@ -30335,6 +30529,9 @@ new file mode 100644
 +	}
 +}
 +func (c *profileFlowControl) hostsObservationDispatch(op *profileOperation) error {
++	if op.kind == 40 {
++		return c.hostsPublishDispatch(op)
++	}
 +	h := op.hostsObservation
 +	if op.submitted || op.completed {
 +		return nil
@@ -30373,6 +30570,9 @@ new file mode 100644
 +	return nil
 +}
 +func (c *profileFlowControl) hostsObservationAccept(f profilePacket) (bool, error) {
++	if handled, err := c.hostsPublishAccept(f); handled {
++		return true, err
++	}
 +	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
 +		op := h.pending
 +		if op != nil && op.submitted && f.kind == 36 && f.reply == op.sequence {
@@ -30463,11 +30663,43 @@ new file mode 100644
 +		if !c.hostsObservationSourceLive(h) || h.context != nil && !c.dnsContext4Live(h.context) || h.pending != nil && h.pending.submitted && !h.replied && !c.clock().Before(h.pending.deadline) {
 +			c.hostsObservationClose(h)
 +		}
++		if op := h.publish; op != nil && op.submitted && !h.publishReceived && !c.clock().Before(op.deadline) {
++			c.hostsObservationClose(h)
++		}
 +		if !h.closed {
 +			continue
 +		}
 +		if !c.clock().Before(h.cleanupDeadline) {
 +			h.unknown = true
++			continue
++		}
++		if op := h.publish; op != nil && op.submitted && !h.publishReceived {
++			c.dnsNotify(op, errProfile)
++			if h.publishCancelSequence == 0 {
++				seq, err := c.dnsCancel(1, op.sequence)
++				h.publishCancelSequence = seq
++				if err != nil {
++					h.unknown = true
++					return err
++				}
++			}
++			if !h.publishCancelAck || c.clock().Before(op.deadline) {
++				continue
++			}
++			h.publishReceived = true
++		}
++		if h.publishCancelSequence != 0 && !h.publishCancelAck {
++			continue
++		}
++		if h.data != nil && h.data.id != 0 && !h.producerCloseAck {
++			if h.producerCloseSequence == 0 {
++				seq, err := c.dnsCancel(5, h.data.id)
++				h.producerCloseSequence = seq
++				if err != nil {
++					h.unknown = true
++					return err
++				}
++			}
 +			continue
 +		}
 +		op := h.pending
@@ -30485,6 +30717,9 @@ new file mode 100644
 +				continue
 +			}
 +			h.replied = true
++		}
++		if h.cancelSequence != 0 && !h.cancelAck {
++			continue
 +		}
 +		if h.reservation != 0 && !h.closeAck {
 +			if h.closeSequence == 0 {
@@ -30512,6 +30747,15 @@ new file mode 100644
 +		if h.released {
 +			continue
 +		}
++		if op := h.publish; op != nil && op.submitted && !h.publishReceived && op.sequence < floor {
++			floor = op.sequence
++		}
++		if h.publishCancelSequence != 0 && !h.publishCancelAck && h.publishCancelSequence < floor {
++			floor = h.publishCancelSequence
++		}
++		if h.producerCloseSequence != 0 && !h.producerCloseAck && h.producerCloseSequence < floor {
++			floor = h.producerCloseSequence
++		}
 +		if op := h.pending; op != nil && op.submitted && !h.replied && op.sequence < floor {
 +			floor = op.sequence
 +		}
@@ -30532,6 +30776,23 @@ new file mode 100644
 +		}
 +	}
 +	return false
++}
++
++func (c *profileFlowControl) hostsProducerUsed(id uint64) bool {
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		if h.data != nil && h.data.id != 0 && h.data.id == id {
++			return true
++		}
++	}
++	return false
++}
++
++func (c *profileFlowControl) hostsProducerDataLive(d *profileHostsProducerData) bool {
++	if d == nil || d.owner == nil || d.owner.data != d || !profileDNSV2ID(d.id) || !c.clock().Before(d.expires) {
++		return false
++	}
++	h := d.owner
++	return c.hostsObservationSourceLive(h) && c.dnsContext4Live(h.context) && h.context.identity.kind == profileDNSHostsRoot && d.epoch == h.context.source.epoch && d.count == h.selection.count && !d.expires.After(h.deadline)
 +}
 +
 +type profileDNSHop struct {
@@ -30635,15 +30896,18 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux_test.go b/common/yoni
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux_test.go
-@@ -0,0 +1,504 @@
+@@ -0,0 +1,769 @@
 +//go:build linux
 +
 +package nativehooks
 +
 +import (
++	"bytes"
 +	"context"
 +	"crypto/sha256"
 +	xnet "github.com/xtls/xray-core/common/net"
++	"net"
++	"strconv"
 +	"testing"
 +	"time"
 +)
@@ -30722,6 +30986,7 @@ new file mode 100644
 +	case <-time.After(time.Second):
 +		t.Fatal("missing reserve")
 +	}
++	hostsFinishPublish(t, f, 803, false)
 +	select {
 +	case err := <-done:
 +		if err == nil {
@@ -30737,7 +31002,15 @@ new file mode 100644
 +	if h.observation != 802 || h.reservation != 801 || h.context.hostReferences != 1 || !h.closed {
 +		t.Fatal("issuer observation ownership")
 +	}
-+	if f.c.dnsTick() != nil || h.closeSequence == 0 || h.context.closeSequence != 0 {
++	if f.c.dnsTick() != nil || h.producerCloseSequence == 0 || h.closeSequence != 0 || h.context.closeSequence != 0 {
++		t.Fatal("producer must retire before reservation")
++	}
++	ackData := make([]byte, 32)
++	be.PutUint16(ackData, 2)
++	ackData[2] = 1
++	be.PutUint64(ackData[8:], 803)
++	be.PutUint64(ackData[16:], f.c.lastSent)
++	if f.c.accept(profilePacket{kind: 48, reply: h.producerCloseSequence, body: ackData}) != nil || f.c.dnsTick() != nil || h.closeSequence == 0 || h.context.closeSequence != 0 {
 +		t.Fatal("context retired before observation")
 +	}
 +	ack := make([]byte, 32)
@@ -30767,6 +31040,258 @@ new file mode 100644
 +	be.PutUint16(b[58:], 1)
 +	b[60] = 3
 +	return profilePacket{kind: 36, reply: op.sequence, body: b}
++}
++
++func hostsPublishReply(op *profileOperation, id uint64) profilePacket {
++	b := make([]byte, 48)
++	be.PutUint16(b, 2)
++	b[2] = 1
++	be.PutUint64(b[8:], id)
++	be.PutUint64(b[24:], u64(op.body, 36))
++	be.PutUint64(b[32:], u64(op.body[144:], 96))
++	be.PutUint16(b[40:], u16(op.body[144:], 108))
++	return profilePacket{kind: 41, reply: op.sequence, body: b}
++}
++func hostsFinishPublish(t *testing.T, f *flowFixture, id uint64, deny bool) *profileOperation {
++	t.Helper()
++	select {
++	case op := <-f.p.flowQueue:
++		if op.kind != 40 || f.c.dispatch(op) != nil {
++			t.Fatal("Publish")
++		}
++		reply := hostsPublishReply(op, id)
++		if deny {
++			clear(reply.body[3:])
++			reply.body[2] = 2
++		}
++		if f.c.accept(reply) != nil {
++			t.Fatal("Published")
++		}
++		return op
++	case <-time.After(time.Second):
++		t.Fatal("missing Publish")
++	}
++	return nil
++}
++
++func TestProfileHostsActualCallerPublishesExactObservationBeforeReturn(t *testing.T) {
++	f, ctx := hostsCallerFixture(t)
++	op, done := hostsCallerReserve(t, f, ctx)
++	if f.c.dispatch(op) != nil || f.c.accept(hostsReserveReply(op)) != nil {
++		t.Fatal("observation")
++	}
++	select {
++	case err := <-done:
++		t.Fatal("caller returned before Hosts Publish", err)
++	case publish := <-f.p.flowQueue:
++		if publish.kind != 40 || !profileDNSV2Body(40, publish.body) || publish.body[136] != 3 || publish.body[137] != 2 {
++			t.Fatal("actual Hosts Publish")
++		}
++		tail := publish.body[144:]
++		row := f.c.manifest.rows[10][0]
++		if u64(publish.body, 12) != u64(op.body, 8) || !bytes.Equal(publish.body[44:76], row[:32]) || !bytes.Equal(publish.body[76:108], row[32:64]) || u64(tail, 88) != 902 || u16(tail, 106) != 1 || u16(tail, 108) != 2 || u16(tail, 122) != 8443 || tail[121] != 6 {
++			t.Fatal("source/observation/frontier offsets")
++		}
++		at := 128
++		key := string(tail[at : at+int(u16(tail, 110))])
++		at += len(key)
++		original := string(tail[at : at+int(u16(tail, 112))])
++		at += len(original)
++		if key != "physical.invalid." || original != "Physical.INVALID" || len(tail) != at+4 || u16(tail, at) != 0 || u16(tail, at+2) != 1 {
++			t.Fatal("exact lookup original/member indices")
++		}
++		if f.c.dispatch(publish) != nil {
++			t.Fatal("publish dispatch")
++		}
++		b := make([]byte, 48)
++		be.PutUint16(b, 2)
++		b[2] = 1
++		be.PutUint64(b[8:], 903)
++		be.PutUint64(b[24:], u64(publish.body, 36))
++		be.PutUint64(b[32:], u64(publish.body[144:], 96))
++		be.PutUint16(b[40:], 2)
++		if f.c.accept(profilePacket{kind: 41, reply: publish.sequence, body: b}) != nil {
++			t.Fatal("Published DATA ACK")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("Publish caller missing")
++	}
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("DATA became physical permission")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("caller blocked")
++	}
++	h := op.hostsObservation
++	if h.data == nil || h.data.id != 903 || h.data.count != 2 || h.data.expires.After(h.deadline) {
++		t.Fatal("typed DATA/absolute observation lease")
++	}
++	calls := 0
++	for _, target := range []xnet.Destination{profileNumericDestination(h.frontier.target), xnet.TCPDestination(xnet.ParseAddress("203.0.113.7"), 8443)} {
++		if _, err := ProfileDialPhysical(ctx, target, func(context.Context) (net.Conn, error) { calls++; return &flowFakeConn{}, nil }); err == nil || calls != 0 {
++			t.Fatal("DATA opened physical factory")
++		}
++	}
++}
++
++func hostsCallerPublish(t *testing.T, f *flowFixture, ctx context.Context) (*profileOperation, <-chan error) {
++	t.Helper()
++	op, done := hostsCallerReserve(t, f, ctx)
++	if f.c.dispatch(op) != nil || f.c.accept(hostsReserveReply(op)) != nil {
++		t.Fatal("observation")
++	}
++	select {
++	case publish := <-f.p.flowQueue:
++		if publish.kind != 40 {
++			t.Fatal("Publish kind")
++		}
++		return publish, done
++	case err := <-done:
++		t.Fatal("Publish absent", err)
++	case <-time.After(time.Second):
++		t.Fatal("Publish blocked")
++	}
++	return nil, done
++}
++func TestProfileHostsPublishActualCallerRejectsMutationBeforeEffect(t *testing.T) {
++	for _, offset := range []int{12, 44, 76, 140, 144 + 88, 144 + 106, 144 + 120, 144 + 128} {
++		t.Run(strconv.Itoa(offset), func(t *testing.T) {
++			f, ctx := hostsCallerFixture(t)
++			op, done := hostsCallerPublish(t, f, ctx)
++			op.body[offset] ^= 1
++			before := len(f.writes)
++			if f.c.dispatch(op) != nil {
++				t.Fatal("local rejection")
++			}
++			select {
++			case err := <-done:
++				if err == nil || len(f.writes) != before || op.submitted {
++					t.Fatal("mutated DATA effect")
++				}
++			case <-time.After(time.Second):
++				t.Fatal("caller blocked")
++			}
++		})
++	}
++}
++func TestProfileHostsPublishedReplyExpirySourceAndNamespaces(t *testing.T) {
++	for _, fault := range []string{"exchange", "epoch", "count", "lease", "object", "unknown", "deny", "replay", "cancel", "snapshot", "role", "expired", "duplicate-data"} {
++		t.Run(fault, func(t *testing.T) {
++			f, ctx := hostsCallerFixture(t)
++			op, done := hostsCallerPublish(t, f, ctx)
++			if f.c.dispatch(op) != nil {
++				t.Fatal("dispatch")
++			}
++			h := op.hostsObservation
++			reply := hostsPublishReply(op, 903)
++			switch fault {
++			case "exchange":
++				be.PutUint64(reply.body[16:], 901)
++			case "epoch":
++				be.PutUint64(reply.body[24:], 99)
++			case "count":
++				be.PutUint16(reply.body[40:], 1)
++			case "lease":
++				be.PutUint64(reply.body[32:], u64(op.body[144:], 96)+1)
++			case "object":
++				reply.object = 903
++			case "unknown":
++				clear(reply.body[3:])
++				reply.body[2] = 3
++			case "deny":
++				clear(reply.body[3:])
++				reply.body[2] = 2
++			case "cancel":
++				h.cancel()
++				if f.c.dnsTick() != nil || h.publishCancelSequence == 0 {
++					t.Fatal("Publish cancel1")
++				}
++				ack := make([]byte, 32)
++				be.PutUint16(ack, 2)
++				ack[2] = 1
++				be.PutUint64(ack[8:], op.sequence)
++				be.PutUint64(ack[16:], f.c.lastSent)
++				if f.c.accept(profilePacket{kind: 48, reply: h.publishCancelSequence, body: ack}) != nil {
++					t.Fatal("cancel ACK")
++				}
++			case "snapshot":
++				f.c.manifest.rows[10][0][32] ^= 1
++			case "role":
++				be.PutUint32(f.c.manifest.rows[10][0][72:], 2)
++			case "expired":
++				f.now = op.deadline
++			case "duplicate-data":
++				f.c.dnsResults[0] = &profileDNSResultOwner{data: &ProfileDNSProducerData{id: 903}}
++				f.c.dnsResultUsed = 1
++			}
++			_ = f.c.accept(reply)
++			if fault == "replay" {
++				_ = f.c.accept(reply)
++			}
++			select {
++			case err := <-done:
++				if err == nil {
++					t.Fatal("DATA promoted to permission")
++				}
++			case <-time.After(time.Second):
++				t.Fatal("caller blocked")
++			}
++			if !h.closed || f.p.ctx.Err() != nil {
++				t.Fatal("bad DATA published or unrelated session revoked")
++			}
++			if fault != "snapshot" && fault != "role" && fault != "expired" && fault != "deny" && !h.unknown {
++				t.Fatal("uncertain DATA lost custody")
++			}
++		})
++	}
++}
++func TestProfileHostsProducerUnknownCleanupCannotRetireObservation(t *testing.T) {
++	f, ctx := hostsCallerFixture(t)
++	op, done := hostsCallerPublish(t, f, ctx)
++	if f.c.dispatch(op) != nil || f.c.accept(hostsPublishReply(op, 903)) != nil {
++		t.Fatal("Published")
++	}
++	<-done
++	h := op.hostsObservation
++	if f.c.dnsTick() != nil || h.producerCloseSequence == 0 || h.closeSequence != 0 || h.context.closeSequence != 0 {
++		t.Fatal("DATA barrier")
++	}
++	b := make([]byte, 32)
++	be.PutUint16(b, 2)
++	b[2] = 3
++	if f.c.accept(profilePacket{kind: 48, reply: h.producerCloseSequence, body: b}) != nil || !h.unknown || h.released || h.context.hostReferences != 1 || f.c.dnsTick() != nil || h.closeSequence != 0 {
++		t.Fatal("Unknown erased DATA/observation custody")
++	}
++}
++
++func TestProfileHostsLatePublishedWaitsForPendingRequestCancelACK(t *testing.T) {
++	f, ctx := hostsCallerFixture(t)
++	op, done := hostsCallerPublish(t, f, ctx)
++	if f.c.dispatch(op) != nil {
++		t.Fatal("dispatch")
++	}
++	h := op.hostsObservation
++	h.cancel()
++	if f.c.dnsTick() != nil || h.publishCancelSequence == 0 {
++		t.Fatal("request cancel")
++	}
++	if f.c.accept(hostsPublishReply(op, 903)) != nil {
++		t.Fatal("late reply identity")
++	}
++	<-done
++	if f.c.dnsTick() != nil || h.producerCloseSequence != 0 || h.closeSequence != 0 {
++		t.Fatal("late DATA bypassed pending Cancel1 ACK")
++	}
++	b := make([]byte, 32)
++	be.PutUint16(b, 2)
++	b[2] = 1
++	be.PutUint64(b[8:], op.sequence)
++	be.PutUint64(b[16:], f.c.lastSent)
++	if f.c.accept(profilePacket{kind: 48, reply: h.publishCancelSequence, body: b}) != nil || f.c.dnsTick() != nil || h.producerCloseSequence == 0 || h.closeSequence != 0 {
++		t.Fatal("cancel barrier did not unlock own DATA retirement")
++	}
 +}
 +func hostsCallerReserve(t *testing.T, f *flowFixture, ctx context.Context) (*profileOperation, <-chan error) {
 +	t.Helper()
@@ -30905,6 +31430,7 @@ new file mode 100644
 +	if f.c.dispatch(op) != nil || f.c.accept(hostsReserveReply(op)) != nil {
 +		t.Fatal("observation")
 +	}
++	hostsFinishPublish(t, f, 0, true)
 +	<-done
 +	h := op.hostsObservation
 +	if f.c.dnsTick() != nil || h.closeSequence == 0 || h.context.closeSequence != 0 {
@@ -39149,7 +39675,7 @@ new file mode 100644
 +				d := o.data
 +				d.id = u64(b, 8)
 +				remaining = u64(b, 32)
-+				valid = u64(b, 16) == o.transport.exchange && u64(b, 24) == d.epoch && int(u16(b, 40)) == d.count
++				valid = !c.hostsProducerUsed(d.id) && u64(b, 16) == o.transport.exchange && u64(b, 24) == d.epoch && int(u16(b, 40)) == d.count
 +				until := op.sent.Add(time.Duration(remaining))
 +				if until.Before(d.expires) {
 +					d.expires = until

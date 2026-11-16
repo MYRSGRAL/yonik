@@ -1350,3 +1350,54 @@ schema4 source proof/record и root literal pin требуют отдельно�
 Rust/canonical wire/schema/corpus, registry/builder/allowlists и public gates
 не менялись. Из ранее принятого Direct consumer затронута только дополнительная
 reservation-ID collision guard; consuming-close/joins и frozen guards сохранены.
+
+### Hosts Publish: typed DATA reply, physical open закрыт
+
+Следующий bounded unit продолжает тот же actual `ProfilePrepareChain` caller:
+после observation36 вызывается `profilePublishHostsObservation`, а затем
+existing flowRPC actor отправляет40 и принимает exact pending41. Prefix144 и
+DNHOST02 tail128+strings+indices соответствуют canonical d456/CODEC4; schema,
+kinds и offsets не менялись. В wire нет synthetic DNS request/response, IP list,
+TTL, service grant или transportProof. SourceObservationId@88 берётся только из
+ранее проверенного Reserved36. Query/source epoch/asset hashes, original row и
+ordered indices, полный retained context/path и private parent сверяются снова.
+Case-preserved physical hostname/port/carrier не заменяются child IP.
+
+`profileHostsProducerData` — отдельный private ProducerRRset DATA namespace:
+owner/query/context/epoch/memberCount связаны с данным publisher, expiry не
+выходит за исходный observation/context/parent/System Known deadline. Consumer
+вычитает весь RTT. Published41 exchange0 обязателен; count/epoch/remaining и
+pending sequence точны. Foreign/duplicate IDs, source change, expired parent,
+replay и late-after-cancel не публикуют usable DATA. Hash/ID/body roundtrip не
+являются authority; production capture-reviewed flag и новый issuer source
+contract по-прежнему нужны. Network/Hosts producer IDs проверяются взаимно.
+
+До constructor effects теперь оплачены32KiB и6 общих pending/history credits:
+Reserve/Publish и отдельные request/producer/reservation cleanup barriers.
+RX scratch/FD ledger не менялись. После local stop порядок:
+pending Publish Cancel1 ACK → owned ProducerRRset Cancel5 ACK → reservation
+Cancel7 ACK → context reference release/Cancel8. Reserve Cancel1 также нельзя
+обойти поздним Allow. Неизвестный cleanup удерживает DATA/observation/context
+custody и credits; повторный close его не очищает. Tombstones остаются bounded,
+без eviction/reuse. DATA в cache/public lookup не экспортируется этим unit.
+
+**Почему physical handoff ещё deny:** существующий
+`profile_transport_linux.go::ProfileDialPhysical` отвергает любой domain до
+runner, а `profile_flow_hooks_linux.go::ProfileCheckDial` для static physical
+scope требует exact table2 hostname и отвергает numeric member. Pool identity
+и consumer resolution работают с одним `profileGrant`; отдельного sealed
+BootstrapPhysicalPermission + original-parent conjunction там пока нет.
+Подстановка class3/flow0 GRANT в USER grant или child numeric override нарушила
+бы проверку. Эти gates сохранены; pure caller проверяет zero factory effects
+и для original hostname, и для numeric Hosts member.
+
+Canonical `dns-wire-v2.md` требует отдельный WaiterReceipt53/54 для Numeric42:
+поле u64@4 — WaiterReceiptId, не ProducerRRsetId/SourceObservationId. Поэтому
+Published41 не alias-ится в42 и новый layout/фиктивный waiter не вводился.
+Следующий конкретный cut — Hosts waiter по existing reservation contract,
+typed Numeric use2/GRANT19 и private two-authority physical bridge с проверкой
+всего original frontier/parent на open/reuse. В этом unit caller после41
+возвращает Unsupported; никакой physical success/route install не заявлен.
+Protected records/pins, capture reviewed flag, allowlists/public gates, Rust,
+registry/builder/compiler/desktop/policy не менялись. Старые R9/UDP/R14/USER
+Numeric guards сохранены. Это Publish/typed DATA source unit, не полный P4 PASS.

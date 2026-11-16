@@ -12,6 +12,25 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_hosts_publish_is_actual_data_caller_with_ordered_retirement(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "profilePublishHostsObservation(h)",
+            "c.hostsPublishDispatch(op)",
+            "c.hostsPublishAccept(f)",
+            "func (c *profileFlowControl) hostsProducerDataLive(",
+            "c.dnsCancel(5, h.data.id)",
+            "h.publishCancelSequence != 0 && !h.publishCancelAck",
+            "h.cancelSequence != 0 && !h.cancelAck",
+            "!c.hostsProducerUsed(d.id)",
+        ):
+            self.assertTrue(anchor in patch, anchor)
+        section = patch.split(
+            "+++ b/common/yonikbroker/profile_dns_frontier_linux.go\n", 1
+        )[1].split("diff --git ", 1)[0]
+        self.assertNotIn("dns4CaptureReviewed = true", section)
+        self.assertNotIn("\n+\tttl ", section)
+
     def test_hosts_constructor_is_called_from_actual_chain_and_observation_is_not_ip(
         self,
     ) -> None:
