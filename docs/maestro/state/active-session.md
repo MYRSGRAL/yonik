@@ -695,6 +695,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   ELF evidence r48-fixture сохранены, cargo clean выполнен. Issuer/bootstrap service
   flow0/Hosts custody и production authority остаются следующими закрытыми paths.
 
+- R49 SOURCE scoped CLEAN: resolver FactsSourcebf985be интегрирован. Fixed zbus
+  manager owner/credentials/current invocation, retained protected ancestry/
+  cgroup2/netns/epoch/view, revalidation around census и sticky failure реализованы.
+  APPROVED=None сохраняет отказ до effects: reviewed installation/executable/unit
+  policy ещё отсутствует. Host visibility, actual D-Bus latency/resource bounds
+  и Stub runtime не проверялись. Эта ветка ждёт deployment contract; произвольный
+  host unit не выбирается автоматически. Остальные DNS workstreams продолжаются.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
