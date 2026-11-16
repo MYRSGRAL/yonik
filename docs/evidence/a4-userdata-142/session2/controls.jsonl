@@ -1,6 +1,0 @@
-{"request": {"action": "status", "stage": "initial"}, "result": {"gui_exit": null, "provider_exit": null}}
-{"request": {"action": "inspect", "stage": "before-old"}, "result": {"owner": ":1.1", "provider_pid": 4, "uid": 1000, "items": [[], []], "same_item": false}}
-{"request": {"action": "launch", "stage": "old-first"}, "result": {"pid": 28}}
-{"request": {"action": "inspect", "stage": "old-db"}, "result": {"owner": ":1.1", "provider_pid": 4, "uid": 1000, "items": [[], []], "same_item": false}}
-{"request": {"action": "status", "stage": "old-start-status"}, "result": {"gui_exit": 1, "provider_exit": null}}
-{"request": {"action": "finish", "stage": "abi-setup-fail"}, "result": {"finishing": true}}

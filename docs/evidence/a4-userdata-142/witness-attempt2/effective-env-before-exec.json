@@ -1,9 +1,0 @@
-{
-  "PATH": "/home/myrs/.rustup/toolchains/1.85.1-x86_64-unknown-linux-gnu/bin:/usr/bin",
-  "RUSTUP_TOOLCHAIN": "1.85.1-x86_64-unknown-linux-gnu",
-  "RUSTC": "/home/myrs/.rustup/toolchains/1.85.1-x86_64-unknown-linux-gnu/bin/rustc",
-  "CARGO_TARGET_DIR": "/var/tmp/codex-myrs/transient/a4-witness-142-v_mcz03u/target",
-  "CARGO_BUILD_JOBS": "1",
-  "RUSTC_WRAPPER": "",
-  "RUSTC_WORKSPACE_WRAPPER": ""
-}

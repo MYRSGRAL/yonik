@@ -63,7 +63,7 @@ Go-интеграции обоих закреплённых ядер с Rust bro
 ## Историческая очередь (10 ноября; не текущий статус)
 
 Продолжается полное выполнение спецификации по
-[плану волн](superpowers/plans/2026-11-10-spec-completion-waves.md).
+[плану волн](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-10-spec-completion-waves.md).
 Первая волна влита в main: PR #43 (`374ec75`) — переводы и CI,
 #44 (`3768988`) — переносимый scheduler, #45 (`830af0d`) — матрица импорта,
 #46 (`e33fa19`) — проверки восстановления хранения. На принятых heads все пять
@@ -135,7 +135,7 @@ Arch-пакет и ранний Android gate. Завершение волны н
    Шесть протоколов DTO и configure/capture/external-check/cleanup проверены;
    [evidence](validation/2026-11-10-session-plan.md). Сам SystemSessionHost ещё нужен.
    Следом нужны системная установка/клиент, live reconcile и TUN-сессия с явным
-   владением ресурсами и cleanup по [плану интеграции](superpowers/plans/2026-11-10-system-session-integration.md);
+   владением ресурсами и cleanup по [плану интеграции](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-10-system-session-integration.md);
    затем DNS/Fake-IP и атрибуцию приложений.
 3. Интегрировать приватные VPN/LAN/ru-direct, сценарии смены сети и полную
    Linux-матрицу. При включённом kill switch после исчерпания retries сеть

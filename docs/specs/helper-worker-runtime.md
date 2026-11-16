@@ -1,6 +1,6 @@
 # Закреплённый worker системной сессии
 
-Продолжение P09/P12/P13 и [плана интеграции](../superpowers/plans/2026-11-10-system-session-integration.md).
+Продолжение P09/P12/P13 и [плана интеграции](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-10-system-session-integration.md).
 Это транспорт, launcher и supervisor; действующий public-protection IPC пока
 не принимает системные профили, capability system_tun остаётся false.
 

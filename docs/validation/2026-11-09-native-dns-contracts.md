@@ -108,7 +108,7 @@ P2: FakeIP-проба только записывала `within_original_ttl`; �
 
 Одного guard `ip:[0/0,::/0]`, SERVFAIL frontend или короткого DNS TTL недостаточно
 для доказательства полного контракта. Нужны атомарная full-family lease, её перенос
-в dial и владение mapping между TTL/epochs/pool exhaustion. [Рабочий план](../superpowers/plans/2026-11-09-strict-dns-adapter.md)
+в dial и владение mapping между TTL/epochs/pool exhaustion. [Рабочий план](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-09-strict-dns-adapter.md)
 фиксирует требования, но выбор native hooks/другого адаптера ещё не принят.
 Go-код, бинарники и compatibility manifest этим этапом не изменены.
 
