@@ -3,7 +3,7 @@
   "version": "26.10.31",
   "source_commit": "a4a3dff5b20c2faae567b742c172c7b95e75c083",
   "base_archive_sha256": "e5184047fd1380472f69114fb8173a0adfd8c50970560eceb9c87fcba0bb35e9",
-  "patch_sha256": "542d4abdab94770419bc5416de703550fc977cf970ceaad2efc8e03435ffe883",
+  "patch_sha256": "83863e6f794e8851521b4af64e416811f4acbc08640a6dc6c6400b105383a745",
   "status": "partial-udp-v2-producer-source",
   "runtime_hooks_connected": false,
   "native_protocol": null,
@@ -63,8 +63,8 @@
     "profile_udp_os_linux.go": "bfd248b82003908f8739d8801d4b360082ddcb2eec1463a328bfbbba9ad8e170",
     "profile-udp-original-destination-v1.json": "bfd7715dc09392c51e9ab7ebf6fb0a601dda37331a8ec87f41bb04611c79872c",
     "profile_udp_namespace_linux_test.go": "b5916e89f4d46604c9e0341a4874e99f151866c254bfd2e7c5761211e8ffcca2",
-    "profile_udp_producer_linux.go": "1495d871fa74e8bc8bddd6a3f76635790399d477abf5e59066f369ca19586040",
-    "profile_udp_producer_linux_test.go": "cb1bfc54b849b5edf51a11e43c7627a85debba3d6773a0abaaaab36b4a8b1430"
+    "profile_udp_producer_linux.go": "60dbddef6b01ed690f702e74f80f56ca4dbb0b0eeeda94a49a835a5024f8d6a6",
+    "profile_udp_producer_linux_test.go": "432df8547d89731b6d4b4f32374723ba800dc423954c07bf08bf516175b9efff"
   },
   "callsite_files_sha256": {
     "transport/internet/splithttp/yonik_r9_test.go": "de0efd0442bbb2a6bc9cdca69fa70294b0496c20d5907089cb885d057d968b1e",

@@ -2,7 +2,7 @@ diff --git a/common/yonikbroker/profile_udp_producer_linux_test.go b/common/yoni
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_producer_linux_test.go
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,738 @@
 +//go:build linux
 +
 +package nativehooks
@@ -21,6 +21,25 @@ new file mode 100644
 +	xnet "github.com/xtls/xray-core/common/net"
 +	"github.com/xtls/xray-core/transport"
 +)
++
++import "github.com/xtls/xray-core/common/session"
++
++func TestProfileUDPProducerSniffingBoundary(t *testing.T) {
++	for _, metadata := range []bool{false, true} {
++		ctx := session.ContextWithContent(context.Background(), &session.Content{SniffingRequest: session.SniffingRequest{Enabled: true, MetadataOnly: metadata}})
++		called := false
++		p := &profileUDPProducer{runtime: &ProfileRuntime{}, dispatch: func(context.Context, xnet.Destination, *transport.Link) error { called = true; return nil }}
++		u := &profileUDPFlow{ctx: ctx, cancel: func() {}, receipt: &profileReceipt{}, tasks: 1, original: profileDestinationValue{family: 4, network: 17, address: "1.1.1.1", port: 53}}
++		p.runFlow(u)
++		if called != metadata {
++			t.Fatal("payload sniffer reached dispatcher", metadata, called)
++		}
++	}
++	u := &profileUDPFlow{ctx: context.Background(), payload: []byte("secret"), transferred: true}
++	if mb, e := (&profileUDPPayloadReader{flow: u}).ReadMultiBuffer(); e == nil || len(mb) != 0 || u.read {
++		t.Fatal("reader exposed payload without bound grant")
++	}
++}
 +
 +func TestProfileUDPConsumingProducerTransfersOnlyMatchedUserGrant(t *testing.T) {
 +	f, a, receiver := udpStateFixture(t)
@@ -722,11 +741,12 @@ new file mode 100644
 +		t.Fatal("Unknown custody released")
 +	}
 +}
+
 diff --git a/common/yonikbroker/profile_udp_producer_linux.go b/common/yonikbroker/profile_udp_producer_linux.go
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_udp_producer_linux.go
-@@ -0,0 +1,844 @@
+@@ -0,0 +1,855 @@
 +//go:build linux
 +
 +package nativehooks
@@ -745,6 +765,8 @@ new file mode 100644
 +	xnet "github.com/xtls/xray-core/common/net"
 +	"github.com/xtls/xray-core/transport"
 +)
++
++import "github.com/xtls/xray-core/common/session"
 +
 +// Private producer использует только verified consuming association. Public
 +// caller не может передать tuple, original destination или mint grant.
@@ -1202,7 +1224,12 @@ new file mode 100644
 +	}()
 +	ctx := context.WithValue(context.WithValue(u.ctx, profileContextKey{}, p.runtime), profileReceiptKey{}, u.receipt)
 +	target := xnet.UDPDestination(xnet.ParseAddress(u.original.address), xnet.Port(u.original.port))
-+	e := p.dispatch(ctx, target, &transport.Link{Reader: &profileUDPPayloadReader{flow: u}, Writer: &profileUDPResponseWriter{flow: u}})
++	var e error
++	if content := session.ContentFromContext(ctx); content != nil && content.SniffingRequest.Enabled && !content.SniffingRequest.MetadataOnly {
++		e = ErrProfileUnsupported
++	} else {
++		e = p.dispatch(ctx, target, &transport.Link{Reader: &profileUDPPayloadReader{flow: u}, Writer: &profileUDPResponseWriter{flow: u}})
++	}
 +	u.mu.Lock()
 +	u.dispatchError = e
 +	u.mu.Unlock()
@@ -1216,6 +1243,10 @@ new file mode 100644
 +	if u.closed || u.ctx.Err() != nil {
 +		u.mu.Unlock()
 +		return nil, io.EOF
++	}
++	if !u.transferred || u.grant == nil || u.grant.receipt != u.receipt || profileReceiptFrom(u.grantContext) != u.receipt || profileLinkGate(u.grantContext, u.grant) != nil {
++		u.mu.Unlock()
++		return nil, errProfile
 +	}
 +	if !u.read {
 +		u.read = true
@@ -1571,6 +1602,7 @@ new file mode 100644
 +	}
 +	return a.AsSlice(), nil
 +}
+
 diff --git a/common/yonikbroker/profile_udp_namespace_linux_test.go b/common/yonikbroker/profile_udp_namespace_linux_test.go
 new file mode 100644
 --- /dev/null
