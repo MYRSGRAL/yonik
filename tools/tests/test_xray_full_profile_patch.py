@@ -12,6 +12,26 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_dns_wire_capture_and_independent_cache_waiters_stay_closed(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "func ProfileDNSPublish(",
+            "bytes.Equal(response, raw)",
+            "t.wireSent == t.wireRequestLength()",
+            "func ProfileDNSBindWaiter(",
+            "dnsResultRequest(o, 35, 36, body)",
+            "dnsResultRequest(o, 53, 54, body)",
+            "o.waiter.reservationDeadline.Before(until)",
+            "func ownedPublishResponse(",
+            "ProfileDNSWaiterContext(",
+            "ProfileDNSCacheRecord(ctx, data, rec.IP)",
+            "!c.dnsPublicationSettled(t)",
+        ):
+            self.assertTrue(anchor in patch, anchor)
+        metadata = json.loads((ADAPTER / "native-full-profile.json").read_text())
+        self.assertFalse(metadata["builder_apply_enabled"])
+        self.assertFalse(metadata["authority_issuer_connected"])
+
     def test_dns_factory_is_consuming_private_fd_not_arbitrary_conn(self) -> None:
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         direct = patch.split(

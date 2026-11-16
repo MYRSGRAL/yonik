@@ -1107,3 +1107,84 @@ Cleanup window фиксирован: не позже исходного physical
 KnownClosed; pending operations/replay tombstones остаются bounded. R39 scratch
 и FD2/pending12/64KiB owner credits не менялись. RRset/Waiter/Numeric/Append/
 Proxy/flow0/loopback здесь не включены, outer DNS answer guard остаётся deny.
+
+## USER DirectSocket Publish/Waiter: consuming DNS wire producer
+
+База этого Go cut — root `f9a95d40aefc76b58e0def9c1abb5173aa675f9b`,
+включающий Rust Publish/Waiter `0e14393` и R43 `a40e1d5`. Canonical CODEC3
+pin/corpus/layouts выше не меняются. Numeric42, Proxy/Append, loopback,
+service flow0, internal DNS и system snapshot Publish остаются Unsupported.
+
+Отдельный SOURCE contract: `direct-dns-bound-request-response-v1`, version1;
+contract digest — SHA256 ASCII имени плюс NUL:
+`dbd7d79a9dd3d607897b98742b30ee2d4e23152985a64bbdd8918223978e533d`.
+Это не `dns_release`:
+consuming close/join сам по себе не подтверждает capture DNS transcript.
+DNS_WIRE_REVIEWED_PATCH/installed producer record остаются None; public gates
+false. Требуется независимый root review именно actual capture/caller contract,
+exact patch/source/toolchain/recipe/image digest, прежде чем issuer mint допустим.
+
+`profileDNSExchange` сохраняет копию exact packed request после private query
+validation. Direct factory резервирует128KiB вместо прежних64KiB до effects:
+параллельно живут bounded capture и Publish body. Private guarded Conn разрешает
+единственную exact request последовательность: TCP length prefix+bytes либо
+один UDP payload, с совпадением каждого отправляемого фрагмента до socket Write.
+Чужой/repeated request не попадает в I/O. Ошибка/partial/uncertain write закрывает
+transcript; retry полного payload не допускается. Каждый raw I/O retry также
+проверяет текущий private bundle/root. Context/deadline не отрывается.
+
+Response capture происходит только в Read того же retained resource, после
+полной отправки query. TCP frame12..32768 читается с exact prefix/bounds; UDP
+проверяется по captured advertised payload (512 без EDNS). Packet/peer/kernel
+namespace/protocol proofs остаются независимыми обязательными PhysicalBind
+guards. App-provided bytes должны побайтно совпасть с полным captured response.
+Raw FD/WriteTo/перенос arbitrary Conn или caller-selected transcript отсутствуют.
+Следующий reader ждёт publication result либо cancellation, не закрывает proof
+раньше Publish ACK. Все эти ожидания остаются counted I/O owners R41.
+
+Реальные strict UDP/TCP callers вызывают `ProfileDNSPublish` до buffer Release
+и cache update. Broker повторяет bounded ID/question/flags/IN A/AAAA/CNAME/
+member/TTL/extent/backward-pointer parsing; issuer независимо повторяет parser,
+kernel/resource/revision/source checks. Publish40 содержит exact query/root/
+exchange/proof/revision/epoch/resolver/subject/options-derived request и response.
+Publisher caller ждёт exact41; stale/cancel/late/replay/Unknown не публикуют DATA.
+Pending Publish удерживает Proof/Resource retirement до ответа либо bounded
+request-cancel barrier. KnownClosed cancel не является разрешением late Allow.
+
+Cache хранит opaque `ProfileDNSProducerData`, immutable numeric members и
+absolute expiry=min(exchange creation+actual TTL, session/source). Published41
+выдаёт только ProducerRRsetId. IPRecord.owned/IP/TTL без этого private DATA
+не разрешают owned cache result; legacy logs/branches сохраняются. Base DATA
+переживает обычное закрытие publisher transport, но не Unknown/source revoke.
+
+Первый и каждый соседний waiter создают собственный ExchangeContext/class3
+root и проходят metadata-only actual forced/router/default native chooser:
+`DefaultDispatcher.ProfileDNSWaiterContext` → native Handler branch chooser →
+BundleAcquire55/56. Создания link/worker/socket на cache hit нет. Полный checked
+path сверяется с DATA route, namespaces root/bundle не заимствуются у publisher.
+Нет chooser/legitimate private USER source — отказ, без provider replacement.
+
+Затем `ProfileDNSBindWaiter` делает Reserve35 role3/Reserved36(contextId0) и
+WaiterBind53/WaiterBound54. Exact query/sourceFlow/revision/root/bundle/epoch/
+resolver/options/qtype/path/memberCount проверяются независимо. Каждый ACK
+вычитает полный RTT, ограничен исходным deadline, включая первоначальный
+reservation deadline R43; fresh System Known≤20ms не продлевается очередью.
+WaiterReceipt — отдельный private typed record. Только этот waiter может вернуть
+копию members; outer exact-query answer guard проверяет его live state и one-shot
+result, включая narrowing. DATA/grant соседнего query не подставляется.
+
+До Publish/Waiter effects result owner резервирует общие6 pending/history slots
+и64KiB; permanent R39 RX reserve не debit-ится снова. Owner/result count≤64,
+8MiB/FD64/pending64/history256 не повышены. Полный outgoing body освобождается
+после exact ACK; retained typed metadata отдельно оплачена. Reader/monitor новых
+не появилось. Cancel1 pending → Cancel6 waiter → Cancel7 reservation → bundle
+cleanup требуют отдельных exact ACK. Cancel5 base не используется для отмены
+соседнего waiter. Late/failed/Unknown cleanup удерживает custody/credits;
+terminal IDs/requests не reuse/evict. Cache hit не продлевает DATA TTL.
+
+В этом unit IP answer не является numeric transport permission. Numeric42 и
+private USER handoff после outer query release ещё не подключены; hostname
+physical open без соответствующего отдельного numeric/durable grant закрыт.
+R47 Rust Numeric `2dfc539` доступен для следующего unit; его presence не включает
+Go caller или runtime readiness. Pure fake issuer controls не являются image/
+kernel measurement или actual Go/Rust runtime acceptance.
