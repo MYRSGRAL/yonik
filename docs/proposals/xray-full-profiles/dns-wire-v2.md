@@ -134,6 +134,53 @@ route credits; pathCount256 не увеличивает существующие
 
 ## Routine bounded records
 
+### Следующая revision CODEC-3: DirectSocket release receipt
+
+Этот контракт требует coordinated schemaHash SHA256 ASCII
+`YONIK-DNS-V2-CODEC-3` + NUL без fallback на CODEC-2. До реализации typed producer
+binding и CODEC-3 admission обычный DirectSocket Retire остаётся Unknown.
+Новые kinds/layouts не вводятся: Retire24/Retired40 сохраняются. Caller receipt
+сам по себе не является kernel measurement или producer authority.
+
+Protected build/install record должен отдельно связывать reviewed
+`direct-dns-consuming-close-join-v1`, его contract digest, exact source/patch/
+toolchain/build inputs и final ELF digest с negotiated schema и exact launch.
+Существующий UDP producer contract автоматически DNS capability не выдаёт.
+Decoder, caller hash/env/JSON или произвольный child ACK opaque released proof
+не создают. Issuer создаёт private typed release proof только из проверенного
+protected record, authenticated launch и retained proof/resource binding.
+
+Pinned Go DirectSocket factory/Conn не допускает неучтённых aliases/dup/tasks.
+Stopping запрещает новые factory/Read/Write, отменяет context, закрывает actual
+underlying Conn и sender duplicate и join-ит все task owners. Только после
+подтверждённого localDone и завершения pending send/cancel допускается Retire.
+Uncertain close/join запрещает receipt и удерживает Unknown custody.
+
+Порядок строго Proof4 → Resource3 → physical Reservation7 → parent Reservation7
+→ Exchange2, каждый следующий RPC только после exact предыдущего Allow ACK.
+Proof Retire фиксирует irreversible ProducerReleased, запрещает use и снимает
+все proof consumers/refs после их подтверждённого release/join. Proof ACK Allow
+не утверждает закрытие physical receiver FD. Resource Retire требует terminal
+proof, отсутствие refs/pending bind/reply/tasks; затем consuming close retained
+socket и namespace handles. Только подтверждённый cleanup даёт Resource Allow.
+Состояние published physical reservation переводится в terminal before cancel,
+иначе её прежний live-resource guard не может быть обойдён. Route tickets и
+durable firewall bookkeeping закрываются отдельно существующим bundle lifecycle;
+Resource ACK их retirement не подменяет. Reverse order не получает Allow.
+
+Terminal IDs/revisions не переиспользуются. Результат cleanup неизменен и
+оплачен history/memory до effects; write(false)/повторная отправка не повторяет
+release/close. Unknown поглощает дальнейшие попытки и сохраняет custody/error;
+повторный raw close по числовому FD после uncertain close запрещён. Shared
+FD64/pending64/history256/8MiB caps и постоянный RX reserve сохраняются.
+
+Authority expiry запрещает новое use/GRANT, но не запрещает закрывать retained
+obligations. Terminal cleanup ACK допустим в исходном bounded cleanup window≤1s
+после проверки identity/record/retained state; он не продлевает grant/owner proof
+и не возрождает flow. Loss/late ACK, failed close/join/release или timeout не
+считаются KnownClosed и не разрешают возврат producer credits. Stop сохраняет
+terminal result/неопределённые custody до supervisor fences.
+
 Common request prefix8: version u16=2@0, flags/reserved bytes2..7=0, кроме
 явно перечисленных fields. Common ACK prefix8: version u16=2@0,status u8@2
 (Allow1/Deny2/Unknown3), bytes3..7=0. Deny/Unknown ACK bytes3..end=0, кроме
