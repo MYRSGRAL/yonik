@@ -926,7 +926,7 @@ public require_consumer/capabilities/builder readiness остаются закр
 
 Дополнительные source точки: `helper/registry.rs` (schema/opaque proof),
 `host/binary.rs` (связь image-contract с sealed custody), pure tests и existing
-`tools/build_native_adapter.py`/tests. Два Rust-файла вне completion-scope;
-реализация ожидает разрешения. Negative controls: legacy/no-contract, untrusted
+`tools/build_native_adapter.py`/tests. Пользователь разрешил оба дополнения:
+registry/binary/builder и DNS caller-файлы с тестами. Negative controls: legacy/no-contract, untrusted
 record, wrong ELF/patch/contract/launch/config/manifest; positive exact-image
 binding проверяется без OS exec.
