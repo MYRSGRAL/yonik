@@ -1239,3 +1239,58 @@ Factory deadline ограничен USER/Known deadline; поздний cancelle
 Public gates/allowlists/install не включены. CODEC4, Proxy/Append/Bootstrap/Hosts,
 serviceflow0, loopback proof, Sender TargetStrategy и USER TLS/chain Numeric не
 заявлены готовыми; без соответствующей private authority остаются закрыты.
+
+### CODEC4: закрытый context/setup consumer
+
+Canonical pin `d456727`, corpus `dns-v2-codec4.json` SHA256
+`fe4ad88a6f519ee00051b7a02192c04e7a795ff869dd3ff3ebc2f6cffebf06a5`.
+Descriptor272 использует только schema
+`3d2ebf29fe6d9c31780a6f241ea9693918f68344e412c06801e713e5ce13cd13`.
+Setup после ADMIT_ACK, исходный admission deadline, единственный reader и
+rights-free ACK40 сохранены; CODEC1/2/3 descriptor/ACK отвергаются. Старый
+CODEC3 corpus и четыре USER Numeric vectors сохранены побайтно как basis.
+
+DATA codec принимает closed Root union: UserDns AUTHORIZE3, BootstrapService
+Probe8 purpose2/root service ID, HostsPath Probe8 resolverFFFF/root0. Hosts
+qtype/options/payload0; network A/AAAA/resolver exact nonFFFF. Reserve35/42
+проверяют selector/sourceKind/purpose/use/flow0 без ослабления legacy Probe20
+или USER AUTHORIZE18. Hosts Allow56 — отдельный context, не DNSBundle,
+SourceObservation, TTL, DNS result или network grant. Mapping4 role bits2/4/6
+отделены от asset bit0; mapping3 новые роли не принимает.
+
+`profileDNSV2Acquired` проверяет envelope и exact pending55: variant/root/query/
+epoch/pathCount/lease, initial revision1 и exact renewal ID/revision+1 без wrap.
+Runtime single actor дополнительно удерживает original deadlines/RTT,
+pending tombstones/cancel/late ACK. UserDns bundle и новые contexts используют
+общий bounded nonreuse exported-ID registry, включая terminal IDs; target8
+закрывает соответствующий typed owner, не grant с совпавшим числом.
+
+`ProfileDNSAcquirePhysicalContext` — endpoint для private captured lookup planner.
+Вход `profileDNSCapture4Key` содержит private parent, retained snapshot, actual
+`profileDNSFrontier`, fresh service purpose2 либо Hosts metadata variant, query,
+epoch/options/deadline. Frontier повторно выводится `profileDNSFirstHop` из
+полного сохранённого ordered path; первый scope/branch обязан совпасть с parent.
+Original domain/port/carrier берутся из table2, child numeric IP не принимается.
+Query ID монотонно резервируется в общем `nextDNSQuery` до effects; повторный
+или уже занятый ID отклоняется. Service root проверяется отдельно от USER parent:
+class3/purpose2/flow0, exact endpoint/subject/captured resolver peer. System
+parent Known≤20ms и его original deadline ограничивают ACK, service grant их
+не продлевает. Независимый DNS transport permit этим context не выпускается.
+
+Endpoint подключён к существующим flowRPC/dispatch/accept/tick/floor/revoke и
+cleanup owner. До allocation/RPC оплачиваются3 pending/history+path,8KiB+512
+bytes/hop; renewal2 pending/history+path и8KiB. Общие caps и R39 RX lease не
+увеличены. Pending renewal не меняет old authority. Cancel1 и Cancel8 требуют
+разных exact barriers; request KnownClosed не разрешает late56. Unknown/timeout/
+неверный ACK сохраняют custody. Metadata/history/IDs не compact/reuse.
+
+**Production граница этого unit:** `dns4CaptureReviewed` по умолчанию false и
+не имеет production assignment. Setup4 и прежние Direct3 protected records его
+не включают. Capture constructor/planner delivery и новый reviewed protected
+CODEC4 producer contract ещё нужны; tests инъецируют только fake source facts и
+authenticated fake replies. Metadata context маскирует parent grant; handler,
+AUTHORIZE и physical dial guards отвергают его. Hosts Reserve/Observation,
+DirectSystemTransportPermit, RRset/Waiter/Numeric bootstrap и actual service I/O
+не подключены этим context unit. UserDns CODEC3 semantics/Numeric one-attempt
+сохранены под negotiated CODEC4. Registry/builder/allowlists/install/gates не
+менялись; новый patch требует отдельного source/schema4 review и literal pin.
