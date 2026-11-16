@@ -83,7 +83,7 @@ struct ProducerRecord {
 }
 // Семантический contract отдельно от artifact pin. Новый DNS patchset должен
 // пройти root source review и обновить allowlist до trusted install.
-const PRODUCER_PATCH: &str = "83863e6f794e8851521b4af64e416811f4acbc08640a6dc6c6400b105383a745";
+const PRODUCER_PATCH: &str = "205b5337b8c38c608e4a341885dfe02174b33761e4dfda7724432359e84910c6";
 #[derive(Clone)]
 pub(crate) struct ImageContract {
     image: [u8; 32],
@@ -399,6 +399,17 @@ fn validate_regular_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn producer_pin_matches_reviewed_adapter_metadata() {
+        let metadata: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../adapters/xray/v26.10.31/native-full-profile.json"
+        ))
+        .expect("закреплённый adapter metadata");
+        assert_eq!(
+            metadata["patch_sha256"].as_str(),
+            Some(super::PRODUCER_PATCH)
+        );
+    }
     #[test]
     fn schema2_recognizes_optional_producer_without_legacy_authority() {
         let parsed = serde_json::from_value::<super::Manifest>(
