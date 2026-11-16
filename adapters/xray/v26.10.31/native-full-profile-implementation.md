@@ -221,8 +221,8 @@ Cancel одного HTTP request не помечает shared client как tran
 TCP/raw UDP/gRPC/XHTTP logical connections повторяют checks на read/write.
 
 Оставшиеся закрытые пути явно возвращают `ErrProfileUnsupported`: domain
-physical dial до pinned snapshot query/peer proof, pooled source с action=Chain
-до per-logical grants каждого hop при reuse. Обычный redirect продолжает проверять
+physical dial до pinned snapshot query/peer proof. Numeric pooled Chain
+подключён последующим milestone ниже. Обычный redirect продолжает проверять
 carrier→next input; конечный pool разделяется по накопленному chain path.
 Нельзя выдать source FlowGrant за полномочия всех последующих scopes. Snapshot
 queries, DNS/Probe grants и resolver provenance hooks — следующий milestone;
@@ -426,7 +426,7 @@ index и не принимает user FlowGrant вместо service parent; э�
 Полная parity RFC6724 preference из Go net/addrselect.go14–58 (srcAddrs делает
 DialUDP) требует отдельного trusted route/source projection, отсутствующего
 в YNKDNS01. Live netgo sorting/DNS fallback ради неё не выполняется.
-Pooled chain-hop grants и native provider DNS/proxy paths ещё не завершены.
+Native provider DNS/proxy paths ещё не завершены; numeric pooled chain описан ниже.
 
 Следующая System integration по exact Rusta049da5fddbde79f43e8f621c7a77c65bc63535c:
 fixture `tests/fixtures/xray-profile-channel-v3/system-proof-extension-v1.json`
@@ -436,6 +436,44 @@ fixture `tests/fixtures/xray-profile-channel-v3/system-proof-extension-v1.json`
 YNKSPF01/192bytes actual acceptedTCP FD связывается с pending OPEN/request seq,
 proofId и tuple. Go consumer этой extension описан ниже. UDP association
 по-прежнему Unsupported без independent association proof; TCP proof не UDP proof.
+
+## Numeric pooled chain: private per-logical bundle
+
+`Handler.Dispatch` после `ProfileAuthorizeHandler` вызывает
+`ProfilePrepareChain(ctx, choose func(tag string, target Destination)(mux bool,error))`
+до `ProfileGuardLink`, proxy Process и native mux Dispatch. Production choose
+получает следующий exact native Handler из existing outbound.Manager и вызывает
+тот же `profileMuxDecision`, который использует actual Dispatch. Foreign handler,
+reject или branch вне table3 nextBranchMask дают denial; mask не выбирает mux.
+
+Wire не расширяется: AUTHORIZE18/class1/sourceFlowId@0, subject@10, chain@12,
+stream@14, scope@16, branch@18, затем immutable original и effective endpoint.
+Root и каждый выбранный hop получают отдельный GRANT19 того же private source.
+Rust abf5c243 `native_profile_channel.rs:425–608` уже проверяет exact root и
+frontier `(sourceFlow, nextScope, branch, sourceEndpointIndex)`; предыдущий grant
+удерживается. Go не подставляет grantId в поле chain (это table3 index).
+
+Preflight идёт по actual carrier→next input, не меняя original network/tuple.
+Bundle≤256 связывает private parent/next grants; лимиты операций64/grants4096,
+aggregate metadata и fixed5MiB credit прежние. Дополнительные links учитываются
+в fixed metadata sizing; standalone ledger entry ограничен272 bytes.
+Pool key дополнен ordered selected hop scope/stream/chain/branch/effective target.
+Ни один hop grant и ни один sourceFlowId не входят в shared pool как authority.
+
+Reuse/send проверяет весь bundle именно текущего explicit consumer; соседний
+live grant не заменяет его expired/cancelled hop. Каждый System hop проверяет
+собственную owner freshness. После всех renewal RPC последний atomic fence
+проверяет весь путь снова, без продления20ms ожиданиями следующих hops.
+Only private session factory context выбирает live bundle для physical lifetime.
+Redirect переносит его выбранный hop в existing nextHandler.Dispatch, где actual
+mux decision повторно сверяется; новый grant от имени session не создаётся.
+Physical chain link проверяет live pool, user logical link — свой bundle.
+Отмена одного user не закрывает shared link соседнего consumer; revoke fences все.
+
+Любой hostname physical leaf остаётся Unsupported до authenticated RRset→numeric
+endpoint proof. Child DNS answer и snapshot RRset не повышаются до такого proof.
+DNS outer pending files, provider cache/resolver peer proof, UDP System proof и
+runtime readiness этим batch не объявляются завершёнными. Gates остаются false.
 
 ## System acceptedTCP proof consumer
 
@@ -498,8 +536,9 @@ System UDP association возвращает Unsupported; tuple vectors оста�
 UDP positive control использует отдельный Local mode без OS attribution.
 
 Gate остаётся false. DNS outer files pending permission не изменены;
-provider-cache/internal DNS, resolver-peer/RRset handoff и pooled chain-hop grants
-не завершены. Actual System end-to-end/runtime acceptance не выполнялся.
+provider-cache/internal DNS и resolver-peer/RRset handoff не завершены.
+Numeric pooled chain consumer подключён выше; Actual System end-to-end/runtime
+acceptance не выполнялся.
 
 ## Детерминированный R8 contract: tuple orientation
 
@@ -538,7 +577,8 @@ direct policy и original-flow receipts принадлежат назначен�
 Независимые Rust9b1bba9 fixtures local-minimal/system-chain-default-reject/
 system-chain-probe/resolver-snapshot-v1 сохранены byte-exact под own fixtures и
 в patch. Capsule DATA tests не являются source/asset ACK proof для synthetic
-System snapshot ref. Следующие части P4: authenticated issuer/durable direct
-policy, per-logical pooled chain hop grants, UDP issuer association binding,
-probe/DNS service grants и pinned snapshot query engine.
+System snapshot ref. Source consumers numeric pooled chain, service grants и
+snapshot query engine описаны выше. Остаток P4: интеграция issuer/durable direct
+policy, DNS outer/provider cache, authenticated resolver-peer/RRset endpoint
+handoff и отдельно утверждённое UDP issuer association binding.
 Gate остаётся false; full runtime acceptance не выполнялся.
