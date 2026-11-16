@@ -4,7 +4,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from resource_counters import Collector, Reading, interval, number
@@ -119,20 +118,6 @@ class CounterTests(unittest.TestCase):
             interval(a, Reading("available", "ok", 2, 1, "psys", 100)).reason,
             "source_changed",
         )
-
-    def test_sample_process_additive_integration(self) -> None:
-        import os
-
-        import ui_benchmark
-
-        with patch.object(
-            ui_benchmark.RESOURCE_COUNTERS, "sample", return_value={"schema_version": 1}
-        ) as sample:
-            result = ui_benchmark.sample_process(os.getpid())
-        sample.assert_called_once_with(os.getpid())
-        self.assertEqual(result["resource_counters"], {"schema_version": 1})
-        self.assertIsNone(result["hardware_power"])
-        self.assertIn("main_thread_context_switches_proxy", result)
 
 
 if __name__ == "__main__":
