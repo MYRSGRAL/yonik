@@ -733,6 +733,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   context ещё не реализован. Go Numeric a30d4af ожидает R56 review.
   Public/runtime gates false; реального startup/установки не было.
 
+- R56 SOURCE scoped CLEAN: Go terminal Direct/raw Numerica30d4af интегрирован.
+  Private source→42→USER19→one-shot physical gate; class3-only/ordinaryAUTHORIZE
+  after narrowing/multidial запрещены. Rust counterpart R47 принят, stateful pair
+  ещё не запускался. TLS/mux/chain Numeric пока Unsupported. Новый Go patch hash
+  ещё не принят в root producer/builder allowlist, поэтому metadata-pin regression
+  временно требует coordinated pin update после следующих reviewed CODEC4 cuts.
+  Production mint/Connect/readiness false; общий runtime PASS не заявлен.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
