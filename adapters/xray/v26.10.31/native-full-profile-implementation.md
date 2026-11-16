@@ -1401,3 +1401,58 @@ typed Numeric use2/GRANT19 и private two-authority physical bridge с пров�
 Protected records/pins, capture reviewed flag, allowlists/public gates, Rust,
 registry/builder/compiler/desktop/policy не менялись. Старые R9/UDP/R14/USER
 Numeric guards сохранены. Это Publish/typed DATA source unit, не полный P4 PASS.
+
+### Hosts waiter и отдельная physical permission: raw TCP leaf
+
+Actual `ProfilePrepareChain` продолжает предыдущий DATA caller только для
+одного static raw TCP leaf без mux/TLS/chain, custom dialer/controllers,
+sockopt и explicit source bind. Outbound handler передаёт DATA marker фактически
+выбранных raw settings; marker не выдаёт authority. Повторный constructor для
+того же parent после начатой попытки не создаёт новый Numeric attempt.
+
+После Published41 constructor приобретает новый HostsPath context55/56 с
+отдельным private query и тем же полным actual frontier/snapshot. Затем отдельные
+Reserve35 role3/Reserved36 observation и WaiterBind53/WaiterBound54 связывают
+publisher DATA с собственными reservation/query/epoch/memberCount/source2 и
+purpose3. Root/grant/flow/revision поля Hosts waiter нулевые по CODEC4; IDs
+producer/observation/waiter не alias-ятся. Reservation и observation IDs, а также
+WaiterReceipt namespace проверяются взаимно с network DNS consumer.
+
+Numeric42 использует WaiterReceiptId@4, выбранный eligible numeric member,
+use2/parentClass3 и canonical Probe8 actual endpoint/subject/FFFF. GRANT19
+принимается только exact pending actor: class3/flow0/required0/owner0, текущая
+policy revision, общий неповторяемый grant ID, исходные lease/deadlines с полным
+RTT. Это отдельный непрозрачный `profileBootstrapPhysicalPermission`, который
+не вставляется в USER grants, не меняет parent class/id/effective/original и не
+расширяет generic USER live/resolve/AUTHORIZE. System parent Known20ms проверяется
+независимо, expiry observation/context/reservation/waiter/permission не продлевается.
+
+`guardedSystemDial` вызывает `ProfileDialBootstrap` только с original hostname.
+Private bridge проверяет одновременно original live parent/receipt/full frontier,
+retained source и permission/member/port/carrier/epoch, затем передаёт numeric
+endpoint только существующему физическому runner. Hostname остаётся у native
+transport; static table2 hostname не сравнивается с IP вместо binding. Обычный
+`ProfileCheckDial` и USER Numeric остаются прежними. One-shot factory и private
+physical key не доступны metadata caller; повторный open/late callback запрещён.
+
+Возвращаемый connection не экспортирует FD/underlying Conn. Перед и после каждого
+Read/Write проверяются обе authority, deadline ограничен permission; canceled
+Read не публикует bytes. Close запрещает новый I/O, закрывает actual owned socket
+и ждёт начатые задачи. Factory custody удерживается до возврата и проверки late
+result. Retirement начинается только после close/join: grant Close32/34 →
+waiter Cancel6 → waiter reservation Cancel7 → waiter context Cancel8 → publisher
+Cancel5 → publisher reservation Cancel7 → publisher context Cancel8. Pending
+request Cancel1 и late-reply tombstones сохраняются. Ошибка cleanup оставляет
+sticky Unknown и custody; повторный Close не меняет результат.
+
+До effects raw owner резервирует16 pending/history и96KiB; два context actors
+платят собственные credits. Общие RX precredits/FD64/pending64/8MiB/history256
+сохранены. Existing R9 physical custody и byte-exact H1/mux/UDP/R14 guards не
+менялись. Pure fake issuer/Conn controls проверяют реальный caller, оба режима,
+wire binding, отмену/late grant, foreign parent/member, delayed factory/read join
+и failed Close. Они не доказывают kernel/runtime acceptance или durable route.
+
+TLS/mux/chained parent, UDP, network bootstrap, Probe/service-parent и дальнейшие
+Physical/Proxy paths этим unit не заявлены: Unsupported. CODEC4/schema/corpus,
+Rust/registry/builder/protected allowlists не менялись. `dns4CaptureReviewed` и
+public gates false; новый patch требует отдельного root source/pin review.

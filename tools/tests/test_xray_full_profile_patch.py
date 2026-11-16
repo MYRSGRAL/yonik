@@ -12,6 +12,29 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_hosts_waiter_numeric_keeps_two_private_physical_authorities(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "profileAcquireBootstrapPermission(h)",
+            "c.bootstrapRequest(h, 53, 54, body)",
+            "c.bootstrapRequest(h, 42, 19, body)",
+            "type profileBootstrapPhysicalPermission struct",
+            "profileBootstrapGate(callback, permission)",
+            "h.bootstrap.opening = true",
+            "b.tasks.Wait()",
+            "c.bootstrapCleanup(h)",
+            "ProfileBootstrapRawContext(next, raw)",
+            "hooks.ProfileDialBootstrap(ctx, dest,",
+        ):
+            self.assertIn(anchor, patch)
+        section = patch.split(
+            "+++ b/common/yonikbroker/profile_dns_frontier_linux.go\n", 1
+        )[1].split("diff --git ", 1)[0]
+        self.assertNotIn("dns4CaptureReviewed = true", section)
+        self.assertNotIn("root.class = 3", section)
+        self.assertIn("data[2] != 0", section)
+        self.assertIn("!zero(data[32:])", section)
+
     def test_hosts_publish_is_actual_data_caller_with_ordered_retirement(self) -> None:
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         for anchor in (
