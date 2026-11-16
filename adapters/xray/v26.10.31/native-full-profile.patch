@@ -6145,7 +6145,7 @@ diff --git a/common/yonikbroker/profile_transport_linux_test.go b/common/yonikbr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux_test.go
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,660 @@
 +//go:build linux
 +
 +package nativehooks
@@ -6312,6 +6312,10 @@ new file mode 100644
 +	f.c.mu.Lock()
 +	f.c.closeGrant(a.next)
 +	f.c.mu.Unlock()
++	physical, e = pool.SessionContext()
++	if e != nil || ProfilePhysicalGate(physical) != nil {
++		t.Fatal("revoked first hop hid live physical neighbour", e)
++	}
 +	if _, e = pool.Context(first); e == nil {
 +		t.Fatal("live neighbour replaced cancelled current hop")
 +	}
@@ -6806,7 +6810,7 @@ diff --git a/common/yonikbroker/profile_transport_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux.go
-@@ -0,0 +1,836 @@
+@@ -0,0 +1,844 @@
 +//go:build linux
 +
 +package nativehooks
@@ -7242,22 +7246,30 @@ new file mode 100644
 +		return nil, errProfile
 +	}
 +	c := p.state.runtime.flow
-+	c.mu.Lock()
-+	var chosen *profileGrant
-+	for _, g := range c.grants {
-+		if c.grantLive(g) && g.scope == p.scope && g.branch == p.branch {
-+			k, _, e := profilePoolIdentity(p.state.runtime, g)
-+			if e == nil && k == p.key {
-+				chosen = g
-+				break
++	for index := 0; index < len(c.grants); {
++		c.mu.Lock()
++		var chosen *profileGrant
++		for index < len(c.grants) {
++			g := c.grants[index]
++			index++
++			if c.grantLive(g) && g.scope == p.scope && g.branch == p.branch {
++				k, _, e := profilePoolIdentity(p.state.runtime, g)
++				if e == nil && k == p.key {
++					chosen = g
++					break
++				}
 +			}
 +		}
++		c.mu.Unlock()
++		if chosen == nil {
++			break
++		}
++		// Renewal выполняется без mutex; невалидный bundle не скрывает соседей.
++		if profileEnsureChain(context.WithValue(chosen.ctx, profileContextKey{}, p.state.runtime), chosen) == nil {
++			return chosen, nil
++		}
 +	}
-+	c.mu.Unlock()
-+	if chosen == nil || profileEnsureChain(context.WithValue(chosen.ctx, profileContextKey{}, p.state.runtime), chosen) != nil {
-+		return nil, errProfile
-+	}
-+	return chosen, nil
++	return nil, errProfile
 +}
 +func (p *ProfilePool) Context(callback context.Context) (context.Context, error) {
 +	if p == nil {
