@@ -512,6 +512,24 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   MetadataOnly не читает Cache; reader требует transfer и live bound grant.
   R25b counterpart scoped CLEAN сохранён. Native/runtime gates не открывались.
 
+- R26 typed VerifiedUdpProducer1f6b958 интегрирован после scoped SOURCE CLEAN;
+  production constructor ещё Unsupported без trusted install record. Root515671f
+  переносит engine guard в SystemSession, убирая backend-зависимость imported
+  linux test target. Desktop+linux all-targets clippy/fmt и2pure PASS;
+  evidence r26-root-build соответствует commit, cargo clean удалил2.5GiB.
+  Пользователь разрешил registry/binary/builder и два DNS caller-файла с тестами;
+  root4ea6c08 фиксирует разрешение. Rust автор реализует approved install binding.
+- DNS outer009c03b интегрирован после R27 scoped SOURCE CLEAN: query context
+  проходит до exact-answer check после фильтров, defer release покрывает исходы,
+  четыре owned query/IP logsite закрыты, legacy фильтры/log statements сохранены.
+  При lookup error наружу возвращаются nil IP/0 TTL. Автор2caller+23broker,
+  4SOCKS/11mux pure, Python28+28/fresh pins/gofmt/Ruff PASS, main compile-only.
+  Caller tests используют private injection; полная production lookup цепочка
+  ими не исполнялась. Provider/cache waiter authority, internal DNS subject,
+  resolver-peer proof и physical hostname handoff остаются closed gaps.
+  Source/ELF evidence p4-dnsouter-f36 сохранён, собственная сборка очищена.
+  Full P4/P5/runtime не PASS; installed e14 не обновлён, readiness gates false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
