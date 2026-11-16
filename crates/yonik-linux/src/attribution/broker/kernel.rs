@@ -25,6 +25,493 @@ fn u32n(b: &[u8]) -> Result<u32, Unavailable> {
         b.try_into().map_err(|_| Unavailable::Malformed)?,
     ))
 }
+
+/// Независимый listener census. Не owner lookup и не proof доверенного unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Listener {
+    pub family: u8,
+    pub protocol: u8,
+    pub state: u8,
+    pub local: [u8; 16],
+    pub remote: [u8; 16],
+    pub port: u16,
+    pub remote_port: u16,
+    pub interface: u32,
+    pub uid: u32,
+    pub inode: u32,
+    pub cookie: u64,
+    pub cgroup: u64,
+    pub v6only: bool,
+}
+pub(crate) struct ListenerSet {
+    rows: [Option<Listener>; 64],
+    count: usize,
+}
+impl ListenerSet {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Listener> {
+        self.rows[..self.count].iter().filter_map(Option::as_ref)
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(rows: &[Listener]) -> Self {
+        assert!(rows.len() <= 64);
+        let mut result = Self {
+            rows: [None; 64],
+            count: rows.len(),
+        };
+        for (out, row) in result.rows.iter_mut().zip(rows) {
+            *out = Some(*row);
+        }
+        result
+    }
+}
+/// Fixed storage оплачивается capture caller до socket/recv. Обе families
+/// обязательны; EOF/ошибка отравляют capture, partial set наружу не выходит.
+pub(crate) struct ListenerDump {
+    protocol: u8,
+    port: u16,
+    family: u8,
+    sequence: u32,
+    done: [bool; 2],
+    scanned: usize,
+    poisoned: bool,
+    rows: ListenerSet,
+}
+impl ListenerDump {
+    pub(crate) fn new(protocol: u8, port: u16) -> Result<Self, Unavailable> {
+        if !matches!(protocol, 6 | 17) || port == 0 {
+            return Err(Unavailable::Malformed);
+        }
+        Ok(Self {
+            protocol,
+            port,
+            family: 2,
+            sequence: 1,
+            done: [false; 2],
+            scanned: 0,
+            poisoned: false,
+            rows: ListenerSet {
+                rows: [None; 64],
+                count: 0,
+            },
+        })
+    }
+    pub(crate) fn begin_v6(&mut self) -> Result<(), Unavailable> {
+        if self.poisoned || !self.done[0] || self.done[1] || self.family != 2 {
+            self.poisoned = true;
+            return Err(Unavailable::Coverage);
+        }
+        self.family = 10;
+        self.sequence = 2;
+        Ok(())
+    }
+    pub(crate) fn request(&self) -> [u8; 72] {
+        let mut b = [0; 72];
+        b[..4].copy_from_slice(&72u32.to_ne_bytes());
+        b[4..6].copy_from_slice(&20u16.to_ne_bytes());
+        b[6..8].copy_from_slice(&0x301u16.to_ne_bytes());
+        b[8..12].copy_from_slice(&self.sequence.to_ne_bytes());
+        b[16] = self.family;
+        b[17] = self.protocol;
+        let states = if self.protocol == 6 {
+            1u32 << 10
+        } else {
+            u32::MAX
+        };
+        b[20..24].copy_from_slice(&states.to_ne_bytes());
+        // Ни адрес, ни interface/cookie/UID не фильтруют wildcard/reuseport.
+        b[64..72].fill(255);
+        b
+    }
+    pub(crate) fn consume(
+        &mut self,
+        bytes: &[u8],
+        flags: ReturnFlags,
+        kernel_sender: bool,
+    ) -> Result<bool, Unavailable> {
+        if self.poisoned {
+            return Err(Unavailable::Revoked);
+        }
+        let result = self.consume_inner(bytes, flags, kernel_sender);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+    fn consume_inner(
+        &mut self,
+        bytes: &[u8],
+        flags: ReturnFlags,
+        kernel_sender: bool,
+    ) -> Result<bool, Unavailable> {
+        let index = usize::from(self.family == 10);
+        if !kernel_sender
+            || self.done[index]
+            || bytes.is_empty()
+            || flags.intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
+        {
+            return Err(Unavailable::Coverage);
+        }
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let h = bytes
+                .get(offset..offset + 16)
+                .ok_or(Unavailable::Malformed)?;
+            let len = u32n(&h[..4])? as usize;
+            let end = offset.checked_add(len).ok_or(Unavailable::Limit)?;
+            if len < 16 || end > bytes.len() || u32n(&h[8..12])? != self.sequence {
+                return Err(Unavailable::Malformed);
+            }
+            let nflags = u16::from_ne_bytes([h[6], h[7]]);
+            if nflags & 0x30 != 0 || nflags & 2 == 0 {
+                return Err(Unavailable::Coverage);
+            }
+            let kind = u16::from_ne_bytes([h[4], h[5]]);
+            let body = &bytes[offset + 16..end];
+            let aligned = (len + 3) & !3;
+            if kind == 3 {
+                if body.len() != 4 || u32n(body)? != 0 || offset + aligned != bytes.len() {
+                    return Err(Unavailable::Coverage);
+                }
+                self.done[index] = true;
+                return Ok(true);
+            }
+            if kind == 2 || kind == 4 {
+                return Err(Unavailable::ReceiveOverflow);
+            }
+            if kind != 20 || body.len() < 72 || body[0] != self.family {
+                return Err(Unavailable::Malformed);
+            }
+            self.scanned += 1;
+            if self.scanned > MAX_DIAG_RECORDS {
+                return Err(Unavailable::Limit);
+            }
+            let port = u16::from_be_bytes([body[4], body[5]]);
+            if port == self.port && self.protocol == 6 && body[1] != 10 {
+                return Err(Unavailable::Coverage);
+            }
+            if port == self.port && (self.protocol == 17 || body[1] == 10) {
+                if self.rows.count == 64 {
+                    return Err(Unavailable::Limit);
+                }
+                let mut cgroup = None;
+                let mut v6only = None;
+                let mut at = 72;
+                while at < body.len() {
+                    let h = body.get(at..at + 4).ok_or(Unavailable::Malformed)?;
+                    let n = usize::from(u16::from_ne_bytes([h[0], h[1]]));
+                    let tag = u16::from_ne_bytes([h[2], h[3]]);
+                    if n < 4 || at + n > body.len() {
+                        return Err(Unavailable::Malformed);
+                    }
+                    let value = &body[at + 4..at + n];
+                    match tag {
+                        21 => {
+                            if value.len() != 8 || cgroup.is_some() {
+                                return Err(Unavailable::Coverage);
+                            }
+                            cgroup = Some(u64::from_ne_bytes(
+                                value.try_into().map_err(|_| Unavailable::Malformed)?,
+                            ));
+                        }
+                        11 => {
+                            if value.len() != 1 || value[0] > 1 || v6only.is_some() {
+                                return Err(Unavailable::Coverage);
+                            }
+                            v6only = Some(value[0] != 0);
+                        }
+                        _ => {}
+                    }
+                    at += (n + 3) & !3;
+                    if at > body.len() {
+                        return Err(Unavailable::Malformed);
+                    }
+                }
+                let mut local = [0; 16];
+                local.copy_from_slice(&body[8..24]);
+                let mut remote = [0; 16];
+                remote.copy_from_slice(&body[24..40]);
+                if self.family == 2
+                    && (local[4..].iter().any(|b| *b != 0) || remote[4..].iter().any(|b| *b != 0))
+                {
+                    return Err(Unavailable::Malformed);
+                }
+                let cookie =
+                    u64::from(u32n(&body[44..48])?) | (u64::from(u32n(&body[48..52])?) << 32);
+                let group = cgroup.ok_or(Unavailable::Coverage)?;
+                if group == 0 || cookie == 0 || cookie == u64::MAX {
+                    return Err(Unavailable::Coverage);
+                }
+                let row = Listener {
+                    family: self.family,
+                    protocol: self.protocol,
+                    state: body[1],
+                    local,
+                    remote,
+                    port,
+                    remote_port: u16::from_be_bytes([body[6], body[7]]),
+                    interface: u32n(&body[40..44])?,
+                    uid: u32n(&body[64..68])?,
+                    inode: u32n(&body[68..72])?,
+                    cookie,
+                    cgroup: group,
+                    v6only: if self.family == 10 {
+                        v6only.ok_or(Unavailable::Coverage)?
+                    } else {
+                        false
+                    },
+                };
+                self.rows.rows[self.rows.count] = Some(row);
+                self.rows.count += 1;
+            }
+            offset += aligned;
+            if offset > bytes.len() {
+                return Err(Unavailable::Malformed);
+            }
+        }
+        Ok(false)
+    }
+    pub(crate) fn finish(self) -> Result<ListenerSet, Unavailable> {
+        if self.poisoned || self.done != [true; 2] {
+            return Err(Unavailable::Coverage);
+        }
+        Ok(self.rows)
+    }
+}
+
+#[cfg(test)]
+mod listener_pure_tests {
+    use super::*;
+    fn message(family: u8, port: u16, cookie: u64) -> Vec<u8> {
+        let size = 16 + 72 + 12 + usize::from(family == 10) * 8;
+        let mut b = vec![0; size];
+        b[..4].copy_from_slice(&(size as u32).to_ne_bytes());
+        b[4..6].copy_from_slice(&20u16.to_ne_bytes());
+        b[6..8].copy_from_slice(&2u16.to_ne_bytes());
+        b[8..12].copy_from_slice(&(if family == 2 { 1u32 } else { 2u32 }).to_ne_bytes());
+        let d = &mut b[16..];
+        d[0] = family;
+        d[1] = 7;
+        d[4..6].copy_from_slice(&port.to_be_bytes());
+        if family == 2 {
+            d[8..12].copy_from_slice(&[127, 0, 0, 53]);
+        } else {
+            d[23] = 1;
+        }
+        d[44..48].copy_from_slice(&(cookie as u32).to_ne_bytes());
+        d[48..52].copy_from_slice(&((cookie >> 32) as u32).to_ne_bytes());
+        d[64..68].copy_from_slice(&991u32.to_ne_bytes());
+        d[68..72].copy_from_slice(&100u32.to_ne_bytes());
+        d[72..74].copy_from_slice(&12u16.to_ne_bytes());
+        d[74..76].copy_from_slice(&21u16.to_ne_bytes());
+        d[76..84].copy_from_slice(&42u64.to_ne_bytes());
+        if family == 10 {
+            d[84..86].copy_from_slice(&5u16.to_ne_bytes());
+            d[86..88].copy_from_slice(&11u16.to_ne_bytes());
+            d[88] = 1;
+        }
+        b
+    }
+    fn done(seq: u32) -> Vec<u8> {
+        let mut b = vec![0; 20];
+        b[..4].copy_from_slice(&20u32.to_ne_bytes());
+        b[4..6].copy_from_slice(&3u16.to_ne_bytes());
+        b[6..8].copy_from_slice(&2u16.to_ne_bytes());
+        b[8..12].copy_from_slice(&seq.to_ne_bytes());
+        b
+    }
+    #[test]
+    fn listener_pure_requires_both_complete_families_and_keeps_kernel_fields() {
+        let mut dump = ListenerDump::new(17, 53).unwrap();
+        assert!(
+            !dump
+                .consume(&message(2, 53, 11), ReturnFlags::empty(), true)
+                .unwrap()
+        );
+        assert!(dump.consume(&done(1), ReturnFlags::empty(), true).unwrap());
+        dump.begin_v6().unwrap();
+        dump.consume(&message(10, 53, 12), ReturnFlags::empty(), true)
+            .unwrap();
+        dump.consume(&done(2), ReturnFlags::empty(), true).unwrap();
+        let rows = dump.finish().unwrap();
+        let rows = rows.iter().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].uid, rows[0].cgroup, rows[0].cookie), (991, 42, 11));
+        assert!(rows[1].v6only);
+        let mut incomplete = ListenerDump::new(17, 53).unwrap();
+        incomplete
+            .consume(&done(1), ReturnFlags::empty(), true)
+            .unwrap();
+        assert!(incomplete.finish().is_err());
+    }
+    #[test]
+    fn listener_pure_malformed_partial_foreign_and_sticky_errors() {
+        let valid = message(2, 53, 11);
+        for len in 0..valid.len() {
+            let mut d = ListenerDump::new(17, 53).unwrap();
+            assert!(
+                d.consume(&valid[..len], ReturnFlags::empty(), true)
+                    .is_err()
+            );
+            assert!(d.finish().is_err());
+        }
+        for mutation in 0..6 {
+            let mut b = valid.clone();
+            match mutation {
+                0 => b[6] |= 0x10,
+                1 => b[6] |= 0x20,
+                2 => b[8] = 9,
+                3 => b[16] = 10,
+                4 => b[16 + 74] = 0,
+                _ => b[16 + 76..16 + 84].fill(0),
+            }
+            let mut d = ListenerDump::new(17, 53).unwrap();
+            assert!(d.consume(&b, ReturnFlags::empty(), true).is_err());
+            assert!(matches!(
+                d.consume(&valid, ReturnFlags::empty(), true),
+                Err(Unavailable::Revoked)
+            ));
+        }
+        for flags in [ReturnFlags::TRUNC, ReturnFlags::CTRUNC] {
+            let mut d = ListenerDump::new(17, 53).unwrap();
+            assert!(d.consume(&valid, flags, true).is_err());
+        }
+        let mut d = ListenerDump::new(17, 53).unwrap();
+        assert!(d.consume(&valid, ReturnFlags::empty(), false).is_err());
+    }
+    #[test]
+    fn listener_pure_cgroup_v6only_duplicate_attributes_and_candidate_cap() {
+        let mut d = ListenerDump::new(17, 53).unwrap();
+        d.consume(&done(1), ReturnFlags::empty(), true).unwrap();
+        d.begin_v6().unwrap();
+        let mut b = message(10, 53, 1);
+        b.truncate(16 + 84);
+        let n = b.len() as u32;
+        b[..4].copy_from_slice(&n.to_ne_bytes());
+        assert!(d.consume(&b, ReturnFlags::empty(), true).is_err());
+        let mut duplicate = message(2, 53, 1);
+        let attr = duplicate[88..100].to_vec();
+        duplicate.extend(attr);
+        let n = duplicate.len() as u32;
+        duplicate[..4].copy_from_slice(&n.to_ne_bytes());
+        assert!(
+            ListenerDump::new(17, 53)
+                .unwrap()
+                .consume(&duplicate, ReturnFlags::empty(), true)
+                .is_err()
+        );
+        let mut d = ListenerDump::new(17, 53).unwrap();
+        for i in 1..=64 {
+            d.consume(&message(2, 53, i), ReturnFlags::empty(), true)
+                .unwrap();
+        }
+        assert!(matches!(
+            d.consume(&message(2, 53, 65), ReturnFlags::empty(), true),
+            Err(Unavailable::Limit)
+        ));
+    }
+    #[test]
+    fn listener_pure_scan_budget_is_shared_across_families() {
+        let mut d = ListenerDump::new(17, 53).unwrap();
+        let unrelated = message(2, 54, 1);
+        for _ in 0..65536 {
+            d.consume(&unrelated, ReturnFlags::empty(), true).unwrap();
+        }
+        d.consume(&done(1), ReturnFlags::empty(), true).unwrap();
+        d.begin_v6().unwrap();
+        assert!(matches!(
+            d.consume(&message(10, 53, 2), ReturnFlags::empty(), true),
+            Err(Unavailable::Limit)
+        ));
+    }
+}
+
+/// Compile-only OS producer: caller заранее держит common FD/byte credits и
+/// independently retained netns identity. Ошибка не возвращает partial census.
+pub(crate) fn listener_census(
+    protocol: u8,
+    port: u16,
+    namespace: (u64, u64),
+    deadline: Instant,
+    cancel: &AtomicBool,
+    _credit: &crate::helper::resolver_stub::CaptureCredits,
+) -> Result<ListenerSet, Unavailable> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(Unavailable::Cancelled);
+    }
+    let begun = Instant::now();
+    if begun >= deadline || namespace == (0, 0) {
+        return Err(Unavailable::Timeout);
+    }
+    let deadline = deadline.min(begun + DEADLINE);
+    let mut dump = ListenerDump::new(protocol, port)?;
+    let socket = socket_with(
+        AddressFamily::NETLINK,
+        SocketType::RAW,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        Some(SOCK_DIAG),
+    )
+    .map_err(diag_error)?;
+    let ns = std::fs::File::from(
+        yonik_nsfs::socket_namespace::socket_namespace(&socket)
+            .map_err(|_| Unavailable::Coverage)?,
+    );
+    let m = ns.metadata().map_err(|_| Unavailable::Coverage)?;
+    if (m.dev(), m.ino()) != namespace {
+        return Err(Unavailable::Authority);
+    }
+    rustix::net::sockopt::set_socket_recv_buffer_size(&socket, 32768).map_err(diag_error)?;
+    for family in 0..2 {
+        if family == 1 {
+            dump.begin_v6()?;
+        }
+        if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(Unavailable::Timeout);
+        }
+        rustix::net::sendto(
+            &socket,
+            &dump.request(),
+            SendFlags::empty(),
+            &SocketAddrNetlink::new(0, 0),
+        )
+        .map_err(diag_error)?;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(Unavailable::Cancelled);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Unavailable::Timeout);
+            }
+            let mut bytes = [0; 32768];
+            let mut space = [];
+            let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+            let msg = match recvmsg(
+                &socket,
+                &mut [IoSliceMut::new(&mut bytes)],
+                &mut ancillary,
+                RecvFlags::DONTWAIT,
+            ) {
+                Ok(msg) => msg,
+                Err(rustix::io::Errno::AGAIN) => {
+                    std::thread::park_timeout(
+                        (deadline - now).min(std::time::Duration::from_millis(1)),
+                    );
+                    continue;
+                }
+                Err(e) => return Err(diag_error(e)),
+            };
+            let sender = msg
+                .address
+                .as_ref()
+                .and_then(|a| SocketAddrNetlink::try_from(a.clone()).ok());
+            let trusted = sender.is_some_and(|a| a.pid() == 0 && a.groups() == 0);
+            if dump.consume(&bytes[..msg.bytes], msg.flags, trusted)? {
+                break;
+            }
+        }
+    }
+    dump.finish()
+}
 /// Полный bounded SOCK_DIAG dump: DUMP_INTR, truncation и overflow запрещают proof.
 fn witness(
     flow: Flow,

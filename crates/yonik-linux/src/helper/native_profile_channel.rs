@@ -4612,7 +4612,14 @@ pub(super) fn reject_unproved_stub(peer: wire::Destination<'_>) -> Result<(), Se
         )),
         _ => return Err(ServiceError::Unsupported),
     };
-    if address.is_loopback() || address.is_unspecified() || address.is_multicast() {
+    if address.is_loopback() {
+        return super::resolver_stub::require_protected_policy(
+            SocketAddr::new(address, peer.port),
+            peer.protocol,
+        )
+        .map_err(|_| ServiceError::Unsupported);
+    }
+    if address.is_unspecified() || address.is_multicast() {
         return Err(ServiceError::Unsupported);
     }
     Ok(())

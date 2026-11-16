@@ -21,7 +21,7 @@ use std::{
 
 mod inspect_codec;
 mod inspect_peer;
-mod kernel;
+pub(crate) mod kernel;
 mod lookup_channel;
 #[allow(dead_code)]
 mod lookup_codec;

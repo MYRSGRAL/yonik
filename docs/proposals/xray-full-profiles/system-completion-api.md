@@ -1022,3 +1022,43 @@ Trusted provider отдельно проверяет final source review/evidenc
 schema2 entry вместе с exact ELF. Текущий patch pin — reviewed UDP source
 prerequisite, не обещание полной DNS/P4/P5 semantics или production-ready ELF.
 Public require_consumer/capabilities/builder_apply_enabled/Connect остаются false.
+
+### StubBind: bounded listener observation, не service authority
+
+`helper/resolver_stub.rs` отделяет retained sampled observation от policy issuer.
+`native_profile_channel::reject_unproved_stub` вызывает закрытый
+`require_protected_policy`; loopback остаётся Unsupported до появления
+легитимного protected resolver policy producer. DATA/UID/unit name/hash не
+создают StubBind authority. CODEC-2 BundleAcquire/Granted здесь не реализованы.
+
+`attribution/broker/kernel.rs::ListenerDump` требует полный IPv4 и IPv6 dump
+с terminal DONE, без interrupted/filtered/truncated/foreign сообщений.
+Общий предел — 65536 просмотренных строк и 64 кандидата одного порта;
+candidate credit проверяется до разбора атрибутов. Сохраняются kernel UID,
+cgroup ID, inode, cookie, адреса, state и IPv6-only. Основание — Linux v6.12
+`net/ipv4/inet_diag.c`: INET_DIAG_CGROUP_ID=21, SKV6ONLY=11; последний
+выдаётся для IPv6 LISTEN/CLOSE. Отсутствующий атрибут, включая connected UDP,
+закрывает путь. Wildcard, dualstack overlap, несколько совпадений/reuseport,
+чужой cgroup/UID, remote tuple и неполная visibility не принимаются.
+
+Compile-only `listener_census` проверяет namespace собственного diag socket
+через существующий safe SIOCGSKNS wrapper и retained netns identity.
+`kernel_sample` сверяет retained cgroup2/root-owned directory identity и
+64-bit inode/cgroup ID. Source factory резервирует из общих invocation ledgers
+4 FD, 1 pending и 65536 bytes до effects. Pure injected source проверяет
+manager/invocation/source epoch/Local-vs-System до и после census, freshness
+20ms и исходный expiry. Ошибка revalidation sticky; retained handles/credits
+не освобождаются самим отрицательным результатом. Это sampled observation,
+не remote listener pin, user attribution или DNS grant.
+
+Конкретный оставшийся producer gap: `systemd_worker.rs::verify_installed`
+проверяет только защищённые yonik-worker/check units; `registry.rs::Entry`
+описывает engine/image producer, а не resolver service policy. Ни один из них
+не доказывает exclusive/nondelegated resolver cgroup, запрет foreign socket
+passing/socket activation и допустимый host namespace/view. Минимальное
+дополнение — trusted protected resolver policy issuer, выдающий непрозрачные
+проверенные service facts: authenticated manager unique owner, exact reviewed
+unit contract/invocation, UID, retained cgroup2/netns identities, source epoch
+и указанные ограничения socket custody. Его наблюдение нужно повторно
+проверять вокруг полного census. Без этого private UnitEvidence не имеет
+production constructor; registry/packaging policy в данном cut не меняются.
