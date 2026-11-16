@@ -134,6 +134,10 @@ route credits; pathCount256 не увеличивает существующие
 
 ## Routine bounded records
 
+Следующая coordinated revision для service bootstrap и полного Hosts path
+закреплена в [CODEC4 contract](bootstrap-service-codec4.md); текущий CODEC3 её
+не принимает. Kinds/offsets не расширяются, schema/no-downgrade обязательны.
+
 ### Canonical revision CODEC-3: DirectSocket release receipt
 
 Этот контракт требует coordinated schemaHash SHA256 ASCII
