@@ -10,6 +10,219 @@ pub(crate) const LAUNCH_FD_LOCATOR: &str = "YONIK_PROFILE_LAUNCH_FD";
 pub(crate) const PEER_PIDFD_LOCATOR: &str = "YONIK_PROFILE_PEER_PIDFD";
 pub(crate) const ASSET_ROOT_FD_LOCATOR: &str = "YONIK_PROFILE_ASSET_ROOT_FD";
 
+/// DNS_V2 DATA preflight. Проверка bytes не является negotiation/authority.
+mod dns_v2 {
+    use super::{Error, Result};
+
+    fn n16(b: &[u8], at: usize) -> u16 {
+        u16::from_be_bytes([b[at], b[at + 1]])
+    }
+    fn n64(b: &[u8], at: usize) -> u64 {
+        u64::from_be_bytes([
+            b[at],
+            b[at + 1],
+            b[at + 2],
+            b[at + 3],
+            b[at + 4],
+            b[at + 5],
+            b[at + 6],
+            b[at + 7],
+        ])
+    }
+    fn zero(b: &[u8]) -> Result<()> {
+        if b.iter().any(|v| *v != 0) {
+            Err(Error::Schema)
+        } else {
+            Ok(())
+        }
+    }
+    fn id(n: u64) -> Result<()> {
+        if n == 0 || n == u64::MAX {
+            Err(Error::Reference)
+        } else {
+            Ok(())
+        }
+    }
+    fn lease(n: u64) -> Result<()> {
+        if n == 0 || n > 1_000_000_000 {
+            Err(Error::Bounds)
+        } else {
+            Ok(())
+        }
+    }
+    fn source(kind: u8, purpose: u8) -> Result<()> {
+        if matches!((kind, purpose), (1, 1 | 2) | (2, 3)) {
+            Ok(())
+        } else {
+            Err(Error::Schema)
+        }
+    }
+    pub(super) fn preflight(kind: u16, b: &[u8]) -> Result<()> {
+        if b.len() < 8 || n16(b, 0) != 2 {
+            return Err(Error::Schema);
+        }
+        match kind {
+            53 => {
+                if b.len() != 64 {
+                    return Err(Error::Bounds);
+                }
+                zero(&b[2..8])?;
+                for at in [8, 16, 32] {
+                    id(n64(b, at))?;
+                }
+                if (n64(b, 40) == 0) != (n64(b, 48) == 0) {
+                    return Err(Error::Reference);
+                }
+                lease(n64(b, 56))
+            }
+            54 | 41 => {
+                let size = if kind == 54 { 64 } else { 48 };
+                if b.len() != size {
+                    return Err(Error::Bounds);
+                }
+                if !matches!(b[2], 1..=3) {
+                    return Err(Error::Schema);
+                }
+                if b[2] != 1 {
+                    return zero(&b[3..]);
+                }
+                zero(&b[3..8])?;
+                id(n64(b, 8))?;
+                if kind == 54 {
+                    for at in [16, 24, 32, 40] {
+                        id(n64(b, at))?;
+                    }
+                    lease(n64(b, 48))?;
+                    if !(1..=256).contains(&n16(b, 56)) {
+                        return Err(Error::Bounds);
+                    }
+                    source(b[58], b[59])?;
+                    zero(&b[60..64])
+                } else {
+                    id(n64(b, 24))?;
+                    if n64(b, 32) == 0 || !(1..=256).contains(&n16(b, 40)) {
+                        return Err(Error::Bounds);
+                    }
+                    zero(&b[42..48])
+                }
+            }
+            40 => {
+                if !(144..=33679).contains(&b.len()) {
+                    return Err(Error::Bounds);
+                }
+                zero(&b[2..4])?;
+                zero(&b[116..120])?;
+                zero(&b[138..140])?;
+                zero(&b[143..144])?;
+                id(n64(b, 12))?;
+                id(n64(b, 36))?;
+                source(b[137], b[136])?;
+                if !matches!(b[142], 6 | 17) {
+                    return Err(Error::Schema);
+                }
+                if b[137] == 2 {
+                    if n16(b, 4) != u16::MAX || n16(b, 10) != 0 {
+                        return Err(Error::Schema);
+                    }
+                    zero(&b[20..36])?;
+                    zero(&b[108..116])?;
+                    zero(&b[120..136])?;
+                    let tail = &b[144..];
+                    hosts(tail)?;
+                    for (prefix, offset, length) in [
+                        (44, 16, 32),
+                        (76, 48, 32),
+                        (36, 80, 8),
+                        (6, 114, 2),
+                        (8, 116, 2),
+                        (140, 118, 2),
+                        (142, 121, 1),
+                    ] {
+                        if b[prefix..prefix + length] != tail[offset..offset + length] {
+                            return Err(Error::Binding);
+                        }
+                    }
+                    Ok(())
+                } else {
+                    for at in [20, 28, 120, 128] {
+                        id(n64(b, at))?;
+                    }
+                    if !matches!(n16(b, 10), 1 | 28) {
+                        return Err(Error::Schema);
+                    }
+                    let question = usize::from(n16(b, 108));
+                    let request = usize::from(n16(b, 110));
+                    let response =
+                        u32::from_be_bytes(b[112..116].try_into().map_err(|_| Error::Bounds)?)
+                            as usize;
+                    if !(1..=255).contains(&question)
+                        || !(12..=512).contains(&request)
+                        || !(12..=32768).contains(&response)
+                        || 144 + question + request + response != b.len()
+                    {
+                        return Err(Error::Bounds);
+                    }
+                    if b[144..144 + question].contains(&0) {
+                        return Err(Error::Schema);
+                    }
+                    if b[136] == 1 && (n16(b, 8) != u16::MAX || n16(b, 140) != u16::MAX) {
+                        return Err(Error::Reference);
+                    }
+                    // Strict DNS/question/RR validation выполняет issuer после
+                    // DATA preflight, до receipt/durable numeric admission.
+                    Ok(())
+                }
+            }
+            _ => Err(Error::Schema),
+        }
+    }
+    fn hosts(b: &[u8]) -> Result<()> {
+        if !(130..=666).contains(&b.len())
+            || &b[..8] != b"DNHOST02"
+            || n16(b, 8) != 2
+            || usize::from(n16(b, 10)) != b.len()
+        {
+            return Err(Error::Bounds);
+        }
+        zero(&b[12..16])?;
+        if b[16..48].iter().all(|v| *v == 0) || b[48..80].iter().all(|v| *v == 0) {
+            return Err(Error::Binding);
+        }
+        zero(&b[104..106])?;
+        zero(&b[124..128])?;
+        for at in [80, 88] {
+            id(n64(b, at))?;
+        }
+        lease(n64(b, 96))?;
+        let count = usize::from(n16(b, 108));
+        let key = usize::from(n16(b, 110));
+        let original = usize::from(n16(b, 112));
+        if !(1..=16).contains(&count)
+            || !(1..=253).contains(&key)
+            || !(1..=253).contains(&original)
+            || 128 + key + original + 2 * count != b.len()
+            || b[120] > 1
+            || !matches!(b[121], 6 | 17)
+            || n16(b, 122) == 0
+        {
+            return Err(Error::Bounds);
+        }
+        for (start, length) in [(128, key), (128 + key, original)] {
+            let name = std::str::from_utf8(&b[start..start + length]).map_err(|_| Error::Schema)?;
+            super::resolver_name(name, false, start == 128)?;
+        }
+        let mut previous = None;
+        for pair in b[128 + key + original..].chunks_exact(2) {
+            let member = u16::from_be_bytes([pair[0], pair[1]]);
+            if member >= 16 || previous.is_some_and(|p| p >= member) {
+                return Err(Error::Reference);
+            }
+            previous = Some(member);
+        }
+        Ok(())
+    }
+}
+
 /// Private proof v2 DATA codec. Сам по себе не создаёт admission/FlowGrant.
 pub(crate) mod udp_v2 {
     use super::{
@@ -830,7 +1043,13 @@ impl Header {
         if r.take(8)? != b"YNKCAP01" || r.u16()? != 1 {
             return Err(Error::Schema);
         }
-        let kind = Kind::try_from(r.u16()?)?;
+        let kind_number = r.u16()?;
+        // Legacy Header не выдаёт DNS_V2 negotiation. Новые kinds не могут
+        // пройти через старый runtime decoder даже с корректным DATA body.
+        if matches!(kind_number, 40 | 41 | 53 | 54) {
+            return Err(Error::Schema);
+        }
+        let kind = Kind::try_from(kind_number)?;
         if r.u32()? as usize != total {
             return Err(Error::Bounds);
         }
@@ -3544,6 +3763,13 @@ impl<'a> Frame<'a> {
         mode: Mode,
         from_host: bool,
     ) -> Result<Self> {
+        if bytes.len() >= HEADER {
+            let kind = u16::from_be_bytes([bytes[10], bytes[11]]);
+            if matches!(kind, 40 | 41 | 53 | 54) {
+                dns_v2::preflight(kind, &bytes[HEADER..])?;
+                return Err(Error::Schema);
+            }
+        }
         let header = Header::decode(bytes.get(..HEADER).ok_or(Error::Bounds)?, bytes.len())?;
         if header.binding != binding {
             return Err(Error::Binding);
@@ -3644,6 +3870,79 @@ impl Sequence {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dns_v2_hosts_requires_nonzero_snapshot_identity() {
+        let mut b = vec![0; 144 + 138];
+        b[1] = 2;
+        b[4..6].fill(255);
+        b[19] = 1;
+        b[43] = 1;
+        b[136] = 3;
+        b[137] = 2;
+        b[142] = 6;
+        let t = &mut b[144..];
+        t[..8].copy_from_slice(b"DNHOST02");
+        t[9] = 2;
+        t[11] = 138;
+        t[87] = 1;
+        t[95] = 1;
+        t[103] = 1;
+        t[109] = 1;
+        t[111] = 4;
+        t[113] = 4;
+        t[121] = 6;
+        t[123] = 80;
+        t[128..132].copy_from_slice(b"host");
+        t[132..136].copy_from_slice(b"Host");
+        assert!(super::dns_v2::preflight(40, &b).is_err());
+        b[44..76].fill(1);
+        b[76..108].fill(2);
+        b[160..192].fill(1);
+        b[192..224].fill(2);
+        super::dns_v2::preflight(40, &b).unwrap();
+        for len in 0..b.len() {
+            assert!(super::dns_v2::preflight(40, &b[..len]).is_err());
+        }
+        for at in [144 + 104, 144 + 124, 144 + 137, 20, 108, 128] {
+            let mut bad = b.clone();
+            bad[at] = 255;
+            assert!(super::dns_v2::preflight(40, &bad).is_err());
+        }
+    }
+    #[test]
+    fn dns_v2_waiter_independent_wire_and_no_legacy_downgrade() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/dns-v2-waiter.json"
+        ))
+        .unwrap();
+        let body: Vec<u8> = fixture["bodyHex"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect();
+        super::dns_v2::preflight(53, &body).unwrap();
+        for len in 0..64 {
+            assert!(super::dns_v2::preflight(53, &body[..len]).is_err());
+        }
+        for at in [0, 2, 4, 56] {
+            let mut bad = body.clone();
+            bad[at] = 255;
+            assert!(super::dns_v2::preflight(53, &bad).is_err());
+        }
+        let mut mixed = body.clone();
+        mixed[48..56].fill(0);
+        assert!(super::dns_v2::preflight(53, &mixed).is_err());
+        let mut old = body.clone();
+        old[1] = 1;
+        assert!(super::dns_v2::preflight(53, &old).is_err());
+        let mut header = [0; 128];
+        header[..8].copy_from_slice(b"YNKCAP01");
+        header[9] = 1;
+        header[11] = 53;
+        assert!(super::Header::decode(&header, 192).is_err());
+    }
     use super::*;
     #[test]
     fn udp_v2_independent_exact_vectors_and_preflight() {
