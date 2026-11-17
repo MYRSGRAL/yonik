@@ -442,7 +442,7 @@ fn reality_uri_rejects_unmapped_packet_encoding_and_transport_options() {
         "type=tcp&packetEncoding=xudp",
         "type=tcp&flow=xtls-rprx-vision&packetEncoding=packetaddr",
         "type=tcp&flow=xtls-rprx-vision&packetEncoding=",
-        "type=grpc&serviceName=svc&packetEncoding=xudp",
+        "type=grpc&serviceName=svc&packetEncoding=packetaddr",
         "type=grpc&serviceName=svc&flow=xtls-rprx-vision",
         "type=grpc&serviceName=svc&mode=multi",
         "type=xhttp&path=%2Fstream&flow=xtls-rprx-vision",
@@ -462,5 +462,91 @@ fn reality_uri_rejects_unmapped_packet_encoding_and_transport_options() {
             )
         ),
         Err(CompileError::UnsupportedOption)
+    );
+}
+
+#[test]
+fn third_subscription_reality_shapes_preserve_explicit_xudp() {
+    let base = format!(
+        "vless://{UUID}@secret.example:443?encryption=none&security=reality&sni=verify.example&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=ab12&packetEncoding=xudp"
+    );
+    let tcp = config(
+        Engine::Xray,
+        &format!("{base}&type=tcp&flow=xtls-rprx-vision"),
+    )
+    .unwrap();
+    assert!(tcp["outbounds"][0].get("mux").is_none());
+
+    for (shape, settings_key, settings) in [
+        (
+            "type=xhttp&mode=auto&path=%2Fstream",
+            "xhttpSettings",
+            json!({"host":"","path":"/stream","mode":"auto"}),
+        ),
+        (
+            "type=grpc&mode=gun&serviceName=sample&spx=%2Fprobe",
+            "grpcSettings",
+            json!({"serviceName":"sample"}),
+        ),
+    ] {
+        let uri = format!("{base}&{shape}&alpn=");
+        let value = config(Engine::Xray, &uri).unwrap();
+        let outbound = &value["outbounds"][0];
+        assert_eq!(
+            outbound["mux"],
+            json!({"enabled":true,"concurrency":-1,"xudpConcurrency":1})
+        );
+        assert_eq!(outbound["settings"]["vnext"][0]["users"][0]["flow"], "");
+        let stream = &outbound["streamSettings"];
+        assert_eq!(stream[settings_key], settings);
+        if settings_key == "grpcSettings" {
+            assert_eq!(stream["realitySettings"]["spiderX"], "/probe");
+        }
+        assert!(config(Engine::SingBox, &uri).is_err());
+        assert_eq!(
+            config(Engine::Xray, &format!("{uri}h2")),
+            Err(CompileError::UnsupportedOption)
+        );
+    }
+}
+
+#[test]
+fn hysteria2_uri_compiles_to_xray_quic_with_transport_auth() {
+    let uri = "hysteria2://unit:sample%40value@secret.example:8443?sni=verify.example";
+    let value = config(Engine::Xray, uri).unwrap();
+    assert_eq!(value["inbounds"][0]["listen"], "127.0.0.1");
+    assert_eq!(value["inbounds"][0]["settings"]["udp"], true);
+    assert_eq!(
+        value["outbounds"],
+        json!([{
+            "tag":"proxy","protocol":"hysteria",
+            "settings":{"version":2,"address":"secret.example","port":8443},
+            "streamSettings":{
+                "network":"hysteria","security":"tls",
+                "hysteriaSettings":{"version":2,"auth":"unit:sample@value"},
+                "tlsSettings":{"serverName":"verify.example","allowInsecure":false,"useSystemCA":true}
+            }
+        }])
+    );
+    assert_eq!(
+        config(Engine::SingBox, uri),
+        Err(CompileError::UnsupportedTransport)
+    );
+    for extra in [
+        "obfs=salamander",
+        "insecure=1",
+        "allowInsecure=0",
+        "type=quic",
+        "alpn=h3",
+        "security=tls",
+    ] {
+        assert_eq!(
+            config(Engine::Xray, &format!("{uri}&{extra}")),
+            Err(CompileError::UnsupportedOption)
+        );
+    }
+    assert_eq!(
+        config(Engine::Xray, &uri.replace("verify.example", "bad%0Aname")),
+        Err(CompileError::InvalidParameter)
     );
 }

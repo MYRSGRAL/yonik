@@ -25,6 +25,7 @@ pub enum Protocol {
     Shadowsocks,
     HttpConnect,
     Socks5,
+    Hysteria2,
 }
 
 impl Protocol {
@@ -36,6 +37,7 @@ impl Protocol {
             Self::Shadowsocks => "shadowsocks",
             Self::HttpConnect => "http_connect",
             Self::Socks5 => "socks5",
+            Self::Hysteria2 => "hysteria2",
         }
     }
 }
