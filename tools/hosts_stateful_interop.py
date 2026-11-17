@@ -20,6 +20,7 @@ def check_network_cleanup(trace: list[dict[str, object]]) -> int:
     required: dict[int, set[tuple[int, int]]] = {}
     acknowledged: set[tuple[int, int]] = set()
     closed = 0
+    permissions: set[int] = set()
 
     def number(body: bytes, offset: int) -> int:
         if len(body) < offset + 8:
@@ -42,6 +43,8 @@ def check_network_cleanup(trace: list[dict[str, object]]) -> int:
             pending[sequence] = (kind, body)
             if kind == 32 and body[:1] == b"\x03":
                 root = number(body, 4)
+                if root in permissions:
+                    continue
                 contexts = [
                     context for context, owner in roots.items() if owner == root
                 ]
@@ -53,6 +56,10 @@ def check_network_cleanup(trace: list[dict[str, object]]) -> int:
                         raise AssertionError(f"Close32 before cleanup ACK: {missing}")
                 closed += 1
             continue
+        if kind == 19 and body[:1] == b"\x01":
+            request = pending.get(reply)
+            if request is not None and request[0] == 42:
+                permissions.add(number(body, 4))
         if len(body) < 3 or body[2] != 1:
             continue
         request = pending.get(reply)

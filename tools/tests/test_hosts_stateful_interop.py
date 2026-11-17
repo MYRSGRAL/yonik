@@ -56,6 +56,29 @@ def cleanup_trace() -> list[dict[str, object]]:
 
 
 class CleanupBarrierTests(unittest.TestCase):
+    def test_numeric_permission_close_is_distinct_from_service_root(self) -> None:
+        trace = cleanup_trace()
+        request = bytearray.fromhex(str(trace[0]["packet"]))
+        request[10:12] = (42).to_bytes(2, "big")
+        request[16:24] = (100).to_bytes(8, "big")
+        answer = bytearray(184)
+        answer[:128] = request[:128]
+        answer[10:12] = (19).to_bytes(2, "big")
+        answer[12:16] = len(answer).to_bytes(4, "big")
+        answer[24:32] = (100).to_bytes(8, "big")
+        answer[128] = 1
+        answer[132:140] = (99).to_bytes(8, "big")
+        close = bytearray.fromhex(str(trace[-1]["packet"]))
+        close[132:140] = (99).to_bytes(8, "big")
+        prefix = [
+            {"side": "go", "packet": request.hex()},
+            {"side": "rust", "packet": answer.hex()},
+            {"side": "go", "packet": close.hex()},
+        ]
+        self.assertEqual(interop.check_network_cleanup(prefix + trace), 1)
+        with self.assertRaisesRegex(AssertionError, "without acquired context"):
+            interop.check_network_cleanup([prefix[0], prefix[2]] + trace)
+
     def test_joined_resource_and_all_namespaces_ack_before_service_close(self) -> None:
         self.assertEqual(interop.check_network_cleanup(cleanup_trace()), 1)
 

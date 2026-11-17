@@ -982,18 +982,28 @@ pub(super) struct NumericBinding {
     _memory: ByteLease,
 }
 /// Только checked_network_numeric создаёт этот private NETWORK variant.
+/// Binding удерживается immutable waiter/producer, а не копируется в permission.
+/// Их ID монотонны до overflow-denial, записи не заменяются и не удаляются.
+/// network_permission_live повторяет полный candidate/Source/transcript check
+/// по retained записям и сравнивает exact IDs, revision, selector/member/target.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct NetworkNumericProof {
     waiter: u64,
     producer: u64,
     reservation: u64,
-    binding: Binding,
     proof: u64,
     revision: u64,
     exchange: u64,
     selector: wire::dns_v2::BootstrapSelector,
     member: u16,
     target: Target,
+}
+#[cfg(test)]
+#[test]
+fn network_numeric_proof_retains_ids_instead_of_duplicate_binding() {
+    // Ограничение на реальные inline данные, а не только на budget debit.
+    assert!(std::mem::size_of::<NetworkNumericProof>() <= 512);
+    assert!(std::mem::size_of::<NetworkNumericProof>() < std::mem::size_of::<Binding>());
 }
 impl<A: Authority> Issuer<A> {
     fn network_numeric_candidate(
@@ -1058,7 +1068,6 @@ impl<A: Authority> Issuer<A> {
                 waiter,
                 producer: w.producer,
                 reservation: w.reservation,
-                binding,
                 proof: p.proof,
                 revision: p.revision,
                 exchange: p.exchange,
@@ -1107,7 +1116,6 @@ impl<A: Authority> Issuer<A> {
             .get_mut(&proof.waiter)
             .ok_or(ServiceError::Unavailable)?;
         if w.numeric_once.is_some()
-            || w.binding != proof.binding
             || w.reservation != proof.reservation
             || w.producer != proof.producer
         {

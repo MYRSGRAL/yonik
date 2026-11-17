@@ -613,9 +613,7 @@ impl BootstrapDnsTranscript for BootstrapBinding {
             return Err(ServiceError::InvalidRequest);
         }
         let (id, expires) = {
-            let _scratch = self.budget.dynamic.reserve(2048).map_err(unavailable)?;
-            let mut path = [(0, 0); 256];
-            let (root, id, selector, original, count, expires) = {
+            let (root, id, selector, original, path, _scratch, expires) = {
                 let queries = self.queries.lock().map_err(unavailable)?;
                 let q = queries
                     .iter()
@@ -667,13 +665,24 @@ impl BootstrapDnsTranscript for BootstrapBinding {
                 {
                     return Err(ServiceError::InvalidRequest);
                 }
-                path[..q.path.len()].copy_from_slice(&q.path);
+                // Оплачивается только фактически копируемый immutable path,
+                // без максимального буфера, живущего одновременно с planner.
+                let credit = self
+                    .budget
+                    .dynamic
+                    .reserve(
+                        std::mem::size_of::<Vec<(u16, u8)>>()
+                            + q.path.len() * std::mem::size_of::<(u16, u8)>(),
+                    )
+                    .map_err(unavailable)?;
+                let path = q.path.to_vec();
                 (
                     q.root,
                     q.id,
                     q.selector,
                     q.original,
-                    q.path.len(),
+                    path,
+                    credit,
                     q.expires.min(r.binding.expires),
                 )
             };
@@ -684,7 +693,7 @@ impl BootstrapDnsTranscript for BootstrapBinding {
                     query: id,
                     selector,
                     original: original.wire(),
-                    path: &path[..count],
+                    path: &path,
                 },
                 self.owner.reference()?,
                 r.binding.qtype,

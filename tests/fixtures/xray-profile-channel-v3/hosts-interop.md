@@ -1,5 +1,19 @@
 # PURE_STATEFUL_INTEROP: HOSTS
 
+Актуальный результат после root `febd859` и Numeric memory correction:
+все7 cases GREEN, включая NETWORK Publish→Waiter→Numeric→fake original open→
+Known cleanup. Убрана retained копия immutable Binding из Numeric proof;
+observed копирует полный path в exact-length credited Vec вместо максимального
+буфера. Source/transcript reparsing сохранён, caps/fixture limits не повышены.
+Positive: routes=5 суммарно в ledger, original permission=1,
+original factory=1, DNS factory/write/
+close=1, retained routes/services/contexts=0, receiver consumed-close=1.
+Close32 Numeric permission определяется только по actual pending42→Allow19,
+отдельно от service roots: для обоих service Close проверяются все cleanup ACK.
+Предыдущий раздел RED ниже — история диагностики, исправленная этим результатом.
+Evidence: `/home/myrs/projects/yonik/local/orchestration/evidence/p5-numeric-memory`.
+Production Go1e65 ELF переиспользован по hash; protected pins не менялись.
+
 `hosts-interop-bridge_test.go` — test-only Go overlay, компилируемый в пакет
 `common/yonikbroker` из exact root-retained native source archive. Production
 patch/source не изменяются. Rust endpoint — named test
