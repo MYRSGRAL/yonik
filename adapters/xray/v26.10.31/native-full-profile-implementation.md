@@ -1520,6 +1520,70 @@ neighbor isolation и sticky Unknown. OS/proof/socket wrappers не исполн
 CODEC4/layout/schema/corpus, Hosts/R9/R14/UDP guards, protected records,
 registry/builder/allowlists/public/capture flags не менялись; gates false.
 
+### NETWORK DirectSystem transport: consuming raw owner и два ACK barriers
+
+Actual `profilePrepareNetworkBootstrap` после Exchange Reserved36 вызывает
+private `profileDNSDialSystem`. Это отдельный typed binding внутри существующего
+`profileDNSDirect`: `network != nil`, `bundle == nil`. USER receipt/bundle/scope
+для DNS не фабрикуются. Runtime/query/context/resolver/terminal physical scope
+берутся из retained BootstrapService context. Exchange carrier остаётся carrier
+original parent; Physical35 и raw DNSPHY02 используют отдельный captured numeric
+resolver carrier. Source options/question/full frontier/epoch и оригинальный
+System Known deadline сохраняются, ACK/queue/renew не продлевают их.
+
+До Physical Reserve, socket factory и duplicate резервируются existing12
+pending/history,128KiB и2 FD из общих ledgers. Постоянный RX16FD/1pending/66048B
+не debit-ится повторно, новый reader не создаётся. Exchange reservation уже
+принадлежит constructor; consuming transport единолично выполняет её retirement,
+constructor не посылает дублирующий Cancel7. Сначала ACK Physical Reserve36,
+затем existing private `profileDNSCreateOwnedSocket`, raw duplicate/inspection,
+Physical52→ACK37, Logical38→ACK39. До ACK39 connection не публикуется даже внутри
+constructor; никакого DNS plaintext/crypto handshake нет до этих barriers.
+
+Production IO остаётся exhaustive consuming TCP/connected UDP factory, без
+caller Conn/factory, File/SyscallConn/FD exports и external controllers. Peer,
+protocol/type/flags/raw tuple проверяет existing `profileDNSDuplicateDirect`;
+namespace сравнивается с retained actual accepted ingress proof через existing
+kernel namespace wrapper. Та же независимая kernel проверка нового socket с
+retained actual ingress proof выполняется до Connect, до возможного SYN/UDP
+route effect, и повторяется для exported duplicate. Отсутствующий proof закрывает
+factory до effects;
+TUN/peerless/loopback/stub формы без такого seam Unsupported. Raw proof отправляет
+existing sole proof actor:192 bytes DNSPHY02 без Header128, один actual duplicate
+и credentials, exact launch/query/context/reservation/peer/carrier/scope. Rust
+обязан независимо проверять socket/netns/route, Go cookie/metadata это не заменяет.
+
+`ProfilePhysicalGate` признаёт NETWORK factory только по private owner key,
+exact live parent grant/receipt/runtime и retained context; service root не даёт
+generic USER transport или original endpoint permission. Existing USER path и
+R9 custody остаются отдельными. Общий open helper сохраняет late factory custody,
+sealed product validation и actual Close→duplicate Close→socket/task joins.
+NETWORK Read/Write пока явно Unsupported даже после ACK39: transcript capture,
+answers/Publish/waiter/Numeric для NETWORK этим transport unit не открыты.
+Constructor подтверждённый connection сразу закрывает, наружу возвращает deny.
+
+Retirement после localDone/joins идёт Proof45/46 → Resource45/46 → Physical
+reservation Cancel7 → Exchange reservation Cancel7 → Exchange Cancel2 → context
+Cancel8. Только после consuming owner release constructor снимает свои refs и
+credits. R64 `constructing=true` с creation до defer под c.mu сохранён: monitor
+может принять cancel ACK, но не освобождает parent/service/context до выхода
+constructor. Failed/uncertain close/ACK остаётся sticky Unknown с custody; один
+owner cancel не отменяет соседний flow. Late ACK после Known cancel не revive-ит
+resource. Source/parent/epoch/lease/revision повторно проверяются до публикации.
+
+**Counterpart/production limits:** текущие Rust `native_dns_transport.rs`
+`match_dns_physical` и `logical_dns` явно отвергают `binding.bootstrap`;
+`native_dns_roots.rs` создаёт `DirectSystemTransportPermit { ticket: None }`.
+Для будущего runtime включения issuer должен иметь отдельно проверенный
+resolver-only captured/static либо durable route permit до Physical Reserved36
+и socket connect, а затем legitimate protected CODEC4 consuming producer для
+Physical/Logical/retirement. Fake authenticated ACK в pure tests подтверждает
+consumer protocol, не эти issuer/kernel facts. Старый USER Direct schema3 record
+не повышается до4. Новый protected source contract обязан покрывать actual
+parent/snapshot/peer binding, raw factory ownership, ACK barriers и consuming
+close/all-task joins; root source/pin review требуется отдельно. Capture flag,
+public gates/allowlists, canonical wire/schema/corpus и Rust не менялись.
+
 R64: constructor удерживает отдельный in-flight barrier до выхода. Tick может
 закрыть context и обработать cancellation ACK, но не освобождает references и
 pending credits во время передачи Probe/context/reservation в constructor.

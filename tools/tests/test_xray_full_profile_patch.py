@@ -34,7 +34,31 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertIn("profileNetworkBootstrapPending = 4", section)
         self.assertNotIn("dns4CaptureReviewed = true", section)
         self.assertNotIn("net.DefaultResolver", section)
-        self.assertIn("Physical52/Logical38 service runner ещё закрыт", section)
+        self.assertIn("Transcript/answer publication остаются закрыты", section)
+
+    def test_network_transport_uses_consuming_owner_without_user_bundle(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "profileDNSDialSystem(n)",
+            "return profileDNSOpenDirect(t, false)",
+            "n.transport = t",
+            "c.profileFDUsed()+2 > 64",
+            "t.network != nil",
+            "t.runtime().admission.launch",
+            "query, context, resolver, scope := t.bindingIDs()",
+            "if !n.transport.released",
+            "n.constructing = false",
+        ):
+            self.assertIn(anchor, patch)
+        section = patch.split(
+            "+++ b/common/yonikbroker/profile_dns_direct_linux.go\n", 1
+        )[1].split("diff --git ", 1)[0]
+        self.assertIn("network: n", section)
+        self.assertNotIn("dns4CaptureReviewed = true", section)
+        self.assertLess(
+            section.index("profileKernelSocketNamespace(control.proof, fd)"),
+            section.index("unix.Connect("),
+        )
 
     def test_hosts_waiter_numeric_keeps_two_private_physical_authorities(self) -> None:
         patch = (ADAPTER / "native-full-profile.patch").read_text()

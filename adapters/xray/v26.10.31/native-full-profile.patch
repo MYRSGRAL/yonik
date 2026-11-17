@@ -11668,7 +11668,7 @@ diff --git a/common/yonikbroker/profile_transport_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux.go
-@@ -0,0 +1,1147 @@
+@@ -0,0 +1,1164 @@
 +//go:build linux
 +
 +package nativehooks
@@ -12500,6 +12500,23 @@ new file mode 100644
 +func ProfilePhysicalGate(ctx context.Context) error {
 +	if ctx == nil {
 +		return errProfile
++	}
++	if t, _ := ctx.Value(profileDNSFactoryKey{}).(*profileDNSDirect); t != nil && t.network != nil {
++		n := t.network
++		parent, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++		if profileRuntime(ctx) != n.runtime || parent != n.parent || profileReceiptFrom(ctx) != n.parent.receipt || profileDNSExchangeFrom(ctx) != nil || ctx.Err() != nil || !n.runtime.flowFresh() {
++			return errProfile
++		}
++		c := n.runtime.flow
++		c.mu.Lock()
++		defer c.mu.Unlock()
++		if n.runtime.dnsDirectIO == nil && (n.parent.receipt.association == nil || n.parent.receipt.association.proof == nil) {
++			return errProfile
++		}
++		if !c.dnsDirectLive(t) || !t.factory || t.physicalReservation == 0 {
++			return errProfile
++		}
++		return nil
 +	}
 +	if permission, _ := ctx.Value(profileBootstrapPermissionKey{}).(*profileBootstrapPhysicalPermission); permission != nil {
 +		if profileBootstrapGate(ctx, permission) != nil {
@@ -30346,7 +30363,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux.go
-@@ -0,0 +1,1855 @@
+@@ -0,0 +1,1873 @@
 +//go:build linux
 +
 +package nativehooks
@@ -31697,6 +31714,7 @@ new file mode 100644
 +// Constructor custody, не socket permit. Даже successful Reserved36 этого cut
 +// не публикует Conn, request bytes, RRset или BootstrapPhysicalPermission.
 +type profileNetworkBootstrap struct {
++	transport                                                                *profileDNSDirect
 +	constructing                                                             bool
 +	runtime                                                                  *ProfileRuntime
 +	ctx                                                                      context.Context
@@ -31883,8 +31901,14 @@ new file mode 100644
 +	if err = p.flowRPC(op); err != nil {
 +		return err
 +	}
-+	// DirectSystemTransportPermit принадлежит issuer context. Нет подмены его
-+	// USER bundle/freedom scope: Physical52/Logical38 service runner ещё закрыт.
++	conn, err := profileDNSDialSystem(n)
++	if err != nil {
++		return err
++	}
++	if err = conn.Close(); err != nil {
++		return err
++	}
++	// Только transport admission. Transcript/answer publication остаются закрыты.
 +	return ErrProfileUnsupported
 +}
 +
@@ -32055,6 +32079,17 @@ new file mode 100644
 +		if n.cancelSequence != 0 && !n.cancelAck {
 +			continue
 +		}
++		if n.transport != nil {
++			if n.transport.unknown {
++				n.unknown = true
++				continue
++			}
++			if !n.transport.released {
++				continue
++			}
++			// Consuming owner подтвердил Proof/Resource и обе reservation barriers.
++			n.closeAck = true
++		}
 +		if n.reservation != 0 && !n.closeAck {
 +			if n.closeSequence == 0 {
 +				seq, err := c.dnsCancel(7, n.reservation)
@@ -32206,7 +32241,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux_test.go b/common/yoni
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux_test.go
-@@ -0,0 +1,1670 @@
+@@ -0,0 +1,1700 @@
 +//go:build linux
 +
 +package nativehooks
@@ -32363,6 +32398,36 @@ new file mode 100644
 +	}
 +	if err := <-done; err == nil {
 +		t.Fatal("service denial opened original endpoint")
++	}
++}
++
++func TestProfileNetworkBootstrapActualReservedReachesPhysicalTransport(t *testing.T) {
++	f, ctx := networkBootstrapFixture(t, 1, false)
++	op, done := networkBootstrapReserve(t, f, ctx)
++	// Только закрытый fake IO: ни socket, ни duplicate OS wrapper не исполняется.
++	f.p.dnsDirectIO = &profileDNSDirectIO{create: func(context.Context, profileDestinationValue) (*profileDNSOwnedSocket, error) { return nil, errProfile }, duplicate: func(*profileDNSOwnedSocket, profileDestinationValue) (profileProofFD, error) { return nil, errProfile }, send: func([]byte, profileProofFD) error { return errProfile }}
++	if f.c.dispatch(op) != nil || f.c.accept(networkBootstrapReserved(op)) != nil {
++		t.Fatal("Exchange ACK")
++	}
++	select {
++	case err := <-done:
++		t.Fatal("NETWORK returned before Physical Reserve", err)
++	case physical := <-f.p.flowQueue:
++		if physical.kind != 35 || physical.body[2] != 2 || physical.body[76] != 17 || u64(physical.body, 88) != 1101 {
++			t.Fatal("physical binding")
++		}
++		if f.c.dispatch(physical) != nil {
++			t.Fatal("Physical dispatch")
++		}
++		reply := make([]byte, 64)
++		be.PutUint16(reply, 2)
++		reply[2] = 2
++		_ = f.c.accept(profilePacket{kind: 36, reply: physical.sequence, body: reply})
++	case <-time.After(time.Second):
++		t.Fatal("missing Physical Reserve")
++	}
++	if err := <-done; err == nil {
++		t.Fatal("denied transport allowed")
 +	}
 +}
 +
@@ -37945,7 +38010,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_linux_test.go b/common/yonikb
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux_test.go
-@@ -0,0 +1,1722 @@
+@@ -0,0 +1,2150 @@
 +//go:build linux
 +
 +package nativehooks
@@ -38727,6 +38792,434 @@ new file mode 100644
 +	conn net.Conn
 +	err  error
 +}
++
++type networkTransportHarness struct {
++	f        *flowFixture
++	n        *profileNetworkBootstrap
++	done     <-chan error
++	factory  chan struct{}
++	proof    chan []byte
++	conn     *dnsDirectFakeConn
++	fd       *proofFakeFD
++	socket   *profileDNSOwnedSocket
++	physical *profileOperation
++}
++
++func networkTransportStart(t *testing.T, mode byte, tcp bool, inspect error, block <-chan struct{}) *networkTransportHarness {
++	t.Helper()
++	f, ctx := networkBootstrapFixture(t, mode, tcp)
++	op, done := networkBootstrapReserve(t, f, ctx)
++	h := &networkTransportHarness{f: f, n: op.networkBootstrap, done: done, factory: make(chan struct{}), proof: make(chan []byte, 1), conn: &dnsDirectFakeConn{}, fd: &proofFakeFD{}}
++	f.p.dnsDirectIO = &profileDNSDirectIO{create: func(ctx context.Context, want profileDestinationValue) (*profileDNSOwnedSocket, error) {
++		if !ProfileDNSDirectFactory(ctx) || want != h.n.peer {
++			return nil, errProfile
++		}
++		close(h.factory)
++		if block != nil {
++			<-block
++		}
++		owner := ctx.Value(profileDNSFactoryKey{}).(*profileDNSDirect)
++		life, cancel := context.WithCancel(owner.ctx)
++		h.socket = &profileDNSOwnedSocket{ctx: life, cancel: cancel, destination: want, fd: &proofFakeFD{}, readIO: h.conn.Read, writeIO: h.conn.Write, closeFD: h.conn.Close, waitIO: func(context.Context, bool, time.Time) error { return errProfile }}
++		return h.socket, nil
++	}, duplicate: func(s *profileDNSOwnedSocket, want profileDestinationValue) (profileProofFD, error) {
++		if s != h.socket || want != h.n.peer {
++			return nil, errProfile
++		}
++		return h.fd, inspect
++	}, send: func(raw []byte, fd profileProofFD) error {
++		if fd != h.fd || !profileDNSV2Envelope(f.p.admission.launch, raw, false, 1, 1, 0) {
++			return errProfile
++		}
++		h.proof <- append([]byte(nil), raw...)
++		return nil
++	}}
++	if f.c.dispatch(op) != nil || f.c.accept(networkBootstrapReserved(op)) != nil {
++		t.Fatal("Exchange ACK")
++	}
++	h.physical = h.next(t, 35)
++	select {
++	case <-h.factory:
++		t.Fatal("factory before Physical Reserve ACK")
++	default:
++	}
++	return h
++}
++func (h *networkTransportHarness) next(t *testing.T, kind uint16) *profileOperation {
++	t.Helper()
++	select {
++	case op := <-h.f.p.flowQueue:
++		if op.kind != kind {
++			t.Fatal("phase", op.kind, kind)
++		}
++		if h.f.c.dispatch(op) != nil {
++			t.Fatal("dispatch")
++		}
++		return op
++	case err := <-h.done:
++		t.Fatal("early transport", err)
++	case <-time.After(time.Second):
++		t.Fatal("missing transport phase", kind)
++	}
++	return nil
++}
++func networkTransportReply(op *profileOperation) profilePacket {
++	t := op.dnsDirect.owner
++	q, context, _, _ := t.bindingIDs()
++	b := make([]byte, 64)
++	be.PutUint16(b, 2)
++	b[2] = 1
++	kind := op.dnsDirect.expected
++	if kind == 36 {
++		for _, v := range []struct {
++			at int
++			v  uint64
++		}{{8, 1201}, {16, q}, {24, context}, {32, t.exchangeReservation}, {40, t.epoch}, {48, uint64(op.deadline.Sub(op.sent))}} {
++			be.PutUint64(b[v.at:], v.v)
++		}
++		be.PutUint16(b[56:], 18)
++		be.PutUint16(b[58:], 1)
++		b[60] = 2
++	} else if kind == 37 {
++		for _, v := range []struct {
++			at int
++			v  uint64
++		}{{8, t.physicalReservation}, {16, 1202}, {24, q}, {32, context}, {40, t.epoch}, {48, uint64(op.deadline.Sub(op.sent))}} {
++			be.PutUint64(b[v.at:], v.v)
++		}
++	} else if kind == 39 {
++		for _, v := range []struct {
++			at int
++			v  uint64
++		}{{8, t.exchange}, {16, 1203}, {24, q}, {32, context}, {40, 1}, {48, uint64(op.deadline.Sub(op.sent))}} {
++			be.PutUint64(b[v.at:], v.v)
++		}
++		be.PutUint16(b[56:], 1)
++		b[58] = 1
++	}
++	return profilePacket{kind: kind, reply: op.sequence, body: b}
++}
++func (h *networkTransportHarness) ready(t *testing.T) *profileDNSDirect {
++	t.Helper()
++	if h.physical.body[76] != h.n.peer.network || u64(h.physical.body, 88) != 1101 || h.n.op.body[76] != h.n.frontier.carrier || h.n.frontier.target.address != "Physical.INVALID" {
++		t.Fatal("parent/resolver binding conflated")
++	}
++	if h.f.c.accept(networkTransportReply(h.physical)) != nil {
++		t.Fatal("Physical reserved")
++	}
++	proof := h.next(t, 52)
++	raw := <-h.proof
++	if len(raw) != 192 || string(raw[:8]) != "DNSPHY02" || proof.sequence != h.physical.sequence || u64(raw, 128) != 1101 || u64(raw, 144) != 1100 || u64(raw, 152) != 1201 || raw[164] != h.n.peer.network {
++		t.Fatal("raw Physical layout")
++	}
++	owner := proof.dnsDirect.owner
++	if owner.bundle != nil || owner.network != h.n || owner.proof != 0 || h.conn.writes != 0 {
++		t.Fatal("fake USER bundle/premature use")
++	}
++	if h.f.c.accept(networkTransportReply(proof)) != nil {
++		t.Fatal("Physical ACK")
++	}
++	logical := h.next(t, 38)
++	if owner.proof != 0 || h.conn.writes != 0 {
++		t.Fatal("Logical before ACK")
++	}
++	if h.f.c.accept(networkTransportReply(logical)) != nil {
++		t.Fatal("Logical ACK")
++	}
++	return owner
++}
++func TestProfileNetworkTransportActualCallerRawAdmissionAndRetirement(t *testing.T) {
++	for _, mode := range []byte{1, 2} {
++		for _, tcp := range []bool{false, true} {
++			t.Run(strconv.Itoa(int(mode))+strconv.FormatBool(tcp), func(t *testing.T) {
++				h := networkTransportStart(t, mode, tcp, nil, nil)
++				owner := h.ready(t)
++				if err := <-h.done; err == nil {
++					t.Fatal("transport admission published answer")
++				}
++				if !owner.localDone || owner.localError != nil || h.conn.closes != 1 || h.conn.writes != 0 || !h.fd.closed || owner.released || h.n.released || h.n.constructing {
++					t.Fatal("close/join ownership")
++				}
++				for step := 0; step < 5; step++ {
++					if h.f.c.dnsTick() != nil {
++						t.Fatal("retirement tick")
++					}
++					op := owner.requests[owner.used-1]
++					if step < 2 {
++						if op.kind != 45 || op.body[2] != byte(4-step) || h.n.context.closeSequence != 0 {
++							t.Fatal("Proof/Resource order")
++						}
++						if h.f.c.accept(dnsFactoryRetired(op, 1)) != nil {
++							t.Fatal("Retired")
++						}
++					} else {
++						want := []uint64{1201, 1101, 1102}[step-2]
++						if op.kind != 47 || u64(op.body, 8) != want {
++							t.Fatal("reservation/exchange retirement order")
++						}
++						body := make([]byte, 32)
++						be.PutUint16(body, 2)
++						body[2] = 1
++						be.PutUint64(body[8:], want)
++						be.PutUint64(body[16:], h.f.c.lastSent)
++						if h.f.c.accept(profilePacket{kind: 48, reply: op.sequence, body: body}) != nil {
++							t.Fatal("Cancel ACK")
++						}
++					}
++				}
++				if h.f.c.dnsTick() != nil || !owner.released || h.f.c.dnsTick() != nil || h.n.context.closeSequence == 0 {
++					t.Fatal("context before resource retirement")
++				}
++				body := make([]byte, 32)
++				be.PutUint16(body, 2)
++				body[2] = 1
++				be.PutUint64(body[8:], 1100)
++				be.PutUint64(body[16:], h.f.c.lastSent)
++				if h.f.c.accept(profilePacket{kind: 48, reply: h.n.context.closeSequence, body: body}) != nil || h.f.c.dnsTick() != nil || h.f.c.dnsTick() != nil || !h.n.released || h.f.c.operations != 0 || h.f.c.dnsFDUsed != profileRXFD {
++					t.Fatal("credit/ref release")
++				}
++			})
++		}
++	}
++}
++
++func TestProfileNetworkTransportCancelledFactoryJoinsWithoutNeighborRevocation(t *testing.T) {
++	resume := make(chan struct{})
++	h := networkTransportStart(t, 1, false, nil, resume)
++	if h.f.c.accept(networkTransportReply(h.physical)) != nil {
++		t.Fatal("Physical Reserve")
++	}
++	<-h.factory
++	neighbor := h.f.granted(t, h.f.admittedReceipt(t, "neighbor.invalid"))
++	h.n.cancel()
++	if h.f.c.dnsTick() != nil || h.n.context.closeSequence != 0 || h.n.closeSequence != 0 || h.n.transport.localDone || h.n.transport.released {
++		t.Fatal("factory/constructor custody released")
++	}
++	close(resume)
++	if err := <-h.done; err == nil {
++		t.Fatal("late factory published")
++	}
++	if !h.n.transport.localDone || h.conn.closes != 1 || h.conn.writes != 0 || h.f.p.ctx.Err() != nil || !h.f.c.grantLive(neighbor) {
++		t.Fatal("late result cleanup/neighbor isolation")
++	}
++	select {
++	case <-h.proof:
++		t.Fatal("cancelled factory sent proof")
++	default:
++	}
++}
++func TestProfileNetworkTransportDelayedCloseAndUnknownRetainCustody(t *testing.T) {
++	for _, unknown := range []bool{false, true} {
++		t.Run(strconv.FormatBool(unknown), func(t *testing.T) {
++			h := networkTransportStart(t, 1, true, nil, nil)
++			h.conn.closeEntered = make(chan struct{})
++			h.conn.closeRelease = make(chan struct{})
++			if unknown {
++				h.conn.closeError = errors.New("uncertain close")
++			}
++			owner := h.ready(t)
++			<-h.conn.closeEntered
++			if h.f.c.dnsTick() != nil || owner.localDone || owner.released || h.n.context.closeSequence != 0 || h.n.closeSequence != 0 || !h.n.constructing {
++				t.Fatal("retire before consuming close join")
++			}
++			close(h.conn.closeRelease)
++			if err := <-h.done; err == nil {
++				t.Fatal("answer publication")
++			}
++			if !owner.localDone || h.n.constructing {
++				t.Fatal("Close not joined")
++			}
++			if h.f.c.dnsTick() != nil {
++				t.Fatal("tick")
++			}
++			if unknown {
++				if !owner.unknown || owner.released || h.n.released || h.f.c.dnsFDUsed != profileRXFD+2 {
++					t.Fatal("Unknown lost custody")
++				}
++				if h.f.c.dnsTick() != nil || !h.n.unknown || owner.released {
++					t.Fatal("Unknown was reset")
++				}
++			} else if owner.requests[owner.used-1].kind != 45 {
++				t.Fatal("missing proof retirement")
++			}
++		})
++	}
++}
++func TestProfileNetworkTransportWrongInspectionAndACKNeverPublishes(t *testing.T) {
++	for _, fault := range []string{"peer", "namespace", "root", "query", "epoch", "resource", "proof", "revision", "expired", "cancel"} {
++		t.Run(fault, func(t *testing.T) {
++			var inspection error
++			if fault == "peer" || fault == "namespace" {
++				inspection = errors.New(fault)
++			}
++			h := networkTransportStart(t, 1, false, inspection, nil)
++			if h.f.c.accept(networkTransportReply(h.physical)) != nil {
++				t.Fatal("Physical Reserve")
++			}
++			if inspection != nil {
++				if err := <-h.done; err == nil || h.conn.closes != 1 || !h.fd.closed {
++					t.Fatal("inspection bypass")
++				}
++				select {
++				case <-h.proof:
++					t.Fatal("unverified FD exported")
++				default:
++				}
++				return
++			}
++			proof := h.next(t, 52)
++			<-h.proof
++			reply := networkTransportReply(proof)
++			if fault == "proof" || fault == "revision" {
++				if h.f.c.accept(reply) != nil {
++					t.Fatal("Physical ACK")
++				}
++				proof = h.next(t, 38)
++				reply = networkTransportReply(proof)
++				if fault == "proof" {
++					be.PutUint64(reply.body[16:], 0)
++				} else {
++					be.PutUint64(reply.body[40:], 2)
++				}
++			} else {
++				switch fault {
++				case "root":
++					be.PutUint64(reply.body[32:], 42)
++				case "query":
++					reply.body[24] ^= 1
++				case "epoch":
++					reply.body[40] ^= 1
++				case "resource":
++					be.PutUint64(reply.body[16:], 0)
++				case "expired":
++					h.f.now = proof.deadline
++				case "cancel":
++					h.n.cancel()
++				}
++			}
++			_ = h.f.c.accept(reply)
++			if err := <-h.done; err == nil || h.conn.writes != 0 || h.conn.closes != 1 || !h.fd.closed || h.n.released {
++				t.Fatal("invalid ACK published or lost custody")
++			}
++		})
++	}
++}
++func TestProfileNetworkTransportSharedBudgetRefusesBeforeSocketFactory(t *testing.T) {
++	for _, fault := range []string{"FD", "pending", "memory"} {
++		t.Run(fault, func(t *testing.T) {
++			h := networkTransportStart(t, 1, false, nil, nil)
++			// Owner уже удерживает свои credits; следующий Physical ACK/cleanup RX
++			// не debit-ит их повторно даже при исчерпании оставшегося shared ledger.
++			owner := h.physical.dnsDirect.owner
++			if h.f.c.dnsFDUsed != profileRXFD+2 {
++				t.Fatal("FD precredit")
++			}
++			if fault == "FD" {
++				h.f.c.physicalFDs = 64 - h.f.c.profileFDUsed()
++			}
++			if fault == "pending" {
++				h.f.c.operations += 64 - h.f.c.profilePendingUsed()
++			}
++			if fault == "memory" {
++				h.f.c.buffered = uint64(h.f.c.manifest.caps[4]) - h.f.c.manifest.memoryCredit
++			}
++			release, err := h.f.p.leaseProfileRX()
++			if err != nil {
++				t.Fatal("owner starved ACK/cleanup receive")
++			}
++			release(true)
++			h.n.cancel()
++			if h.f.c.accept(networkTransportReply(h.physical)) != nil {
++				t.Fatal("late Physical Reserve")
++			}
++			if err := <-h.done; err == nil || !owner.localDone {
++				t.Fatal("cancel publication")
++			}
++			select {
++			case <-h.factory:
++				t.Fatal("factory after cancellation")
++			default:
++			}
++		})
++	}
++}
++
++func TestProfileNetworkTransportAdmissionCapsBeforePhysicalReserve(t *testing.T) {
++	for _, fault := range []string{"FD", "pending", "memory"} {
++		t.Run(fault, func(t *testing.T) {
++			f, ctx := networkBootstrapFixture(t, 1, false)
++			op, done := networkBootstrapReserve(t, f, ctx)
++			f.p.dnsDirectIO = &profileDNSDirectIO{create: func(context.Context, profileDestinationValue) (*profileDNSOwnedSocket, error) {
++				t.Error("factory after exhausted admission")
++				return nil, errProfile
++			}, duplicate: func(*profileDNSOwnedSocket, profileDestinationValue) (profileProofFD, error) { return nil, errProfile }, send: func([]byte, profileProofFD) error { return errProfile }}
++			if fault == "FD" {
++				f.c.physicalFDs = 64 - f.c.profileFDUsed()
++			}
++			if fault == "pending" {
++				f.c.operations += 64 - f.c.profilePendingUsed()
++			}
++			if fault == "memory" {
++				f.c.buffered = uint64(f.c.manifest.caps[4]) - f.c.manifest.memoryCredit
++			}
++			if f.c.dispatch(op) != nil || f.c.accept(networkBootstrapReserved(op)) != nil {
++				t.Fatal("Exchange ACK")
++			}
++			select {
++			case err := <-done:
++				if err == nil {
++					t.Fatal("admission allowed")
++				}
++			case next := <-f.p.flowQueue:
++				f.c.abort(next)
++				<-done
++				t.Fatal("Physical effects before credits")
++			case <-time.After(time.Second):
++				t.Fatal("admission hung")
++			}
++			if op.networkBootstrap.transport != nil || f.c.dnsDirectUsed != 0 || f.p.ctx.Err() != nil {
++				t.Fatal("refused owner retained effect")
++			}
++			release, err := f.p.leaseProfileRX()
++			if err != nil {
++				t.Fatal("no receive after local denial")
++			}
++			release(true)
++		})
++	}
++}
++
++func TestProfileNetworkTransportKnownCancelFencesLateLogicalACK(t *testing.T) {
++	h := networkTransportStart(t, 1, false, nil, nil)
++	if h.f.c.accept(networkTransportReply(h.physical)) != nil {
++		t.Fatal("Physical Reserve")
++	}
++	proof := h.next(t, 52)
++	<-h.proof
++	if h.f.c.accept(networkTransportReply(proof)) != nil {
++		t.Fatal("Physical ACK")
++	}
++	logical := h.next(t, 38)
++	h.n.cancel()
++	if h.f.c.dnsTick() != nil || logical.dnsDirect.cancelSequence == 0 {
++		t.Fatal("cancel pending logical")
++	}
++	body := make([]byte, 32)
++	be.PutUint16(body, 2)
++	body[2] = 1
++	be.PutUint64(body[8:], logical.sequence)
++	be.PutUint64(body[16:], h.f.c.lastSent)
++	if h.f.c.accept(profilePacket{kind: 48, reply: logical.dnsDirect.cancelSequence, body: body}) != nil {
++		t.Fatal("Known cancel ACK")
++	}
++	if h.f.c.accept(networkTransportReply(logical)) == nil || !h.n.transport.unknown {
++		t.Fatal("late Logical ACK resurrected permission")
++	}
++	if err := <-h.done; err == nil || h.conn.writes != 0 || !h.fd.closed || h.n.released {
++		t.Fatal("late grant publication/custody")
++	}
++}
++
 +type dnsDirectHarness struct {
 +	f       *flowFixture
 +	ctx     context.Context
@@ -39672,7 +40165,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux.go
-@@ -0,0 +1,1416 @@
+@@ -0,0 +1,1530 @@
 +//go:build linux
 +
 +package nativehooks
@@ -39979,7 +40472,7 @@ new file mode 100644
 +	life, cancel := context.WithCancel(t.ctx)
 +	s := &profileDNSOwnedSocket{ctx: life, cancel: cancel, fd: fd, destination: want, remote: profileDNSOwnedAddress{network, net.JoinHostPort(want.address, strconv.Itoa(int(want.port)))}, closeFD: fd.Close}
 +	s.gateIO = func() error {
-+		c := t.bundle.exchange.query.runtime.flow
++		c := t.runtime().flow
 +		c.mu.Lock()
 +		defer c.mu.Unlock()
 +		if !c.dnsDirectLive(t) {
@@ -40008,6 +40501,22 @@ new file mode 100644
 +	}
 +	if err != nil {
 +		return s, err
++	}
++	if t.network != nil {
++		// Kernel scope fence до Connect, не только перед экспортом duplicate.
++		// Cookie сравнивается с retained actual ingress object, не child DATA.
++		c := t.runtime().flow
++		c.mu.Lock()
++		control := t.network.parent.receipt.association
++		if !c.dnsDirectLive(t) || control == nil || control.proof == nil {
++			err = ErrProfileUnsupported
++		} else {
++			err = profileKernelSocketNamespace(control.proof, fd)
++		}
++		c.mu.Unlock()
++		if err != nil {
++			return s, err
++		}
 +	}
 +	if domain == unix.AF_INET6 {
 +		if err = unix.SetsockoptInt(n, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1); err != nil {
@@ -40077,6 +40586,7 @@ new file mode 100644
 +	cleanup             bool
 +}
 +type profileDNSDirect struct {
++	network                                                             *profileNetworkBootstrap
 +	wireMu                                                              sync.Mutex
 +	wireRequest                                                         [514]byte
 +	wireResponse                                                        [32770]byte
@@ -40148,13 +40658,30 @@ new file mode 100644
 +}
 +
 +func (c *profileFlowControl) dnsDirectLive(t *profileDNSDirect) bool {
++	if t != nil && t.network != nil {
++		n := t.network
++		return !t.closed && !t.unknown && t.ctx.Err() == nil && n.transport == t && c.networkBootstrapLive(n) && c.dnsContext4Live(n.context) && n.replied && n.reservation == t.exchangeReservation && n.exchange == t.exchange && t.epoch == n.context.source.epoch && c.clock().Before(t.deadline)
++	}
 +	return t != nil && !t.closed && !t.unknown && t.ctx.Err() == nil && c.dnsBundleLive(t.bundle) && t.epoch == t.bundle.exchange.query.runtime.admission.launch.epoch && c.clock().Before(t.deadline)
++}
++func (t *profileDNSDirect) runtime() *ProfileRuntime {
++	if t.network != nil {
++		return t.network.runtime
++	}
++	return t.bundle.exchange.query.runtime
++}
++func (t *profileDNSDirect) bindingIDs() (uint64, uint64, uint16, uint16) {
++	if t.network != nil {
++		n := t.network
++		return n.context.source.query, n.context.identity.id, n.resolver, n.frontier.scope
++	}
++	return t.bundle.queryID, t.bundle.id, t.bundle.resolver, t.bundle.path[0].scope
 +}
 +func (c *profileFlowControl) dnsDirectNew(ctx context.Context, b *profileDNSBundle, io profileDNSDirectIO) (*profileDNSDirect, error) {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
 +	for _, other := range c.dnsDirect[:c.dnsDirectUsed] {
-+		if other.bundle.exchange == b.exchange {
++		if other.bundle != nil && other.bundle.exchange == b.exchange {
 +			return nil, ErrProfileUnsupported
 +		}
 +	}
@@ -40202,6 +40729,21 @@ new file mode 100644
 +	return op, nil
 +}
 +func (c *profileFlowControl) dnsDirectReserve(t *profileDNSDirect, physical bool) (*profileOperation, error) {
++	if t.network != nil {
++		if !physical {
++			return nil, ErrProfileUnsupported
++		}
++		c.mu.Lock()
++		if !c.dnsDirectLive(t) {
++			c.mu.Unlock()
++			return nil, errProfile
++		}
++		body := append([]byte(nil), t.network.op.body...)
++		body[2], body[76] = 2, t.destination.network
++		be.PutUint64(body[88:], t.exchangeReservation)
++		c.mu.Unlock()
++		return c.dnsDirectRequest(t, 35, 36, body, true)
++	}
 +	e := t.bundle.exchange
 +	c.mu.Lock()
 +	if !c.dnsDirectLive(t) {
@@ -40259,7 +40801,7 @@ new file mode 100644
 +			op.deadline = t.cleanupDeadline
 +		}
 +	}
-+	if !op.dnsDirect.cleanup && t.bundle.deadline.Before(op.deadline) {
++	if !op.dnsDirect.cleanup && t.bundle != nil && t.bundle.deadline.Before(op.deadline) {
 +		op.deadline = t.bundle.deadline
 +	}
 +	if !op.sent.Before(op.deadline) {
@@ -40282,7 +40824,7 @@ new file mode 100644
 +		op.sent = op.dnsDirect.request.sent
 +		op.deadline = op.dnsDirect.request.deadline
 +		op.submitted = true
-+		if t.duplicate == nil || !profileDNSV2Envelope(t.bundle.exchange.query.runtime.admission.launch, op.body, false, 1, 1, 0) {
++		if t.duplicate == nil || !profileDNSV2Envelope(t.runtime().admission.launch, op.body, false, 1, 1, 0) {
 +			t.unknown = true
 +			c.dnsNotify(op, errProfile)
 +			return errProfile
@@ -40325,7 +40867,7 @@ new file mode 100644
 +			if !op.submitted || f.reply != op.sequence || f.kind != r.expected {
 +				continue
 +			}
-+			if r.received {
++			if r.received || t.network != nil && r.cancelAck {
 +				t.unknown = true
 +				return true, errProfile
 +			}
@@ -40338,13 +40880,13 @@ new file mode 100644
 +				return true, nil
 +			}
 +			b := f.body
-+			e := t.bundle.exchange
++			query, context, _, _ := t.bindingIDs()
 +			// Parse IDs даже после cancellation: late Allow удерживается для cleanup,
 +			// но не возобновляет consumer и не публикует соединение.
 +			valid := true
 +			switch f.kind {
 +			case 36:
-+				valid = !c.hostsReservationUsed(u64(b, 8)) && u64(b, 16) == e.id && u64(b, 24) == t.bundle.id && u64(b, 40) == e.query.runtime.admission.launch.epoch && b[60] == op.body[2]
++				valid = !c.hostsReservationUsed(u64(b, 8)) && u64(b, 16) == query && u64(b, 24) == context && u64(b, 40) == t.epoch && b[60] == op.body[2] && u16(b, 58) == 1
 +				if r.physical {
 +					valid = valid && u64(b, 32) == t.exchangeReservation && u16(b, 56) >= 2
 +					t.physicalReservation = u64(b, 8)
@@ -40358,10 +40900,10 @@ new file mode 100644
 +					t.exchangeReservation, t.exchange = u64(b, 8), u64(b, 32)
 +				}
 +			case 37:
-+				valid = u64(b, 8) == t.physicalReservation && u64(b, 24) == e.id && u64(b, 32) == t.bundle.id && u64(b, 40) == e.query.runtime.admission.launch.epoch
++				valid = u64(b, 8) == t.physicalReservation && u64(b, 24) == query && u64(b, 32) == context && u64(b, 40) == t.epoch
 +				t.resource = u64(b, 16)
 +			case 39:
-+				valid = u64(b, 8) == t.exchange && u64(b, 24) == e.id && u64(b, 32) == t.bundle.id && u64(b, 40) == 1 && u16(b, 56) == 1 && b[58] == 1
++				valid = u64(b, 8) == t.exchange && u64(b, 24) == query && u64(b, 32) == context && u64(b, 40) == 1 && u16(b, 56) == 1 && b[58] == 1
 +				t.proof, t.revision = u64(b, 16), u64(b, 40)
 +			case 46:
 +				valid = b[3] == op.body[2] && u64(b, 8) == u64(op.body, 8) && u64(b, 16) == u64(op.body, 16)
@@ -40421,7 +40963,8 @@ new file mode 100644
 +		c.mu.Unlock()
 +		return nil, errProfile
 +	}
-+	r := t.bundle.exchange.query.runtime.admission.launch
++	r := t.runtime().admission.launch
++	query, context, resolver, scope := t.bindingIDs()
 +	body := make([]byte, 192)
 +	copy(body, "DNSPHY02")
 +	be.PutUint16(body[8:], 2)
@@ -40433,11 +40976,11 @@ new file mode 100644
 +	be.PutUint64(body[88:], r.epoch)
 +	copy(body[96:], r.nonce[:])
 +	be.PutUint64(body[128:], t.exchangeReservation)
-+	be.PutUint64(body[136:], t.bundle.queryID)
-+	be.PutUint64(body[144:], t.bundle.id)
++	be.PutUint64(body[136:], query)
++	be.PutUint64(body[144:], context)
 +	be.PutUint64(body[152:], t.physicalReservation)
-+	be.PutUint16(body[160:], t.bundle.resolver)
-+	be.PutUint16(body[162:], t.bundle.path[0].scope)
++	be.PutUint16(body[160:], resolver)
++	be.PutUint16(body[162:], scope)
 +	body[164], body[165], body[166] = t.destination.network, 1, r.mode
 +	if body[164] == 17 {
 +		body[165] = 2
@@ -40456,6 +40999,7 @@ new file mode 100644
 +}
 +func (c *profileFlowControl) dnsDirectLogical(t *profileDNSDirect) (*profileOperation, error) {
 +	c.mu.Lock()
++	query, context, _, _ := t.bindingIDs()
 +	body := make([]byte, 72)
 +	be.PutUint16(body, 2)
 +	body[2] = 1
@@ -40463,7 +41007,7 @@ new file mode 100644
 +	for _, v := range []struct {
 +		at    int
 +		value uint64
-+	}{{8, t.exchangeReservation}, {16, t.bundle.queryID}, {24, t.bundle.id}, {32, t.exchange}, {48, 1}, {56, uint64(t.deadline.Sub(c.clock()))}, {64, t.resource}} {
++	}{{8, t.exchangeReservation}, {16, query}, {24, context}, {32, t.exchange}, {48, 1}, {56, uint64(t.deadline.Sub(c.clock()))}, {64, t.resource}} {
 +		be.PutUint64(body[v.at:], v.value)
 +	}
 +	c.mu.Unlock()
@@ -40505,6 +41049,61 @@ new file mode 100644
 +	if err != nil {
 +		return nil, err
 +	}
++	return profileDNSOpenDirect(t, true)
++}
++
++// Один consuming owner для двух distinct typed bindings. USER bundle не
++// фабрикуется из Bootstrap context; callbacks/FD не экспортируются callers.
++func profileDNSDialSystem(n *profileNetworkBootstrap) (net.Conn, error) {
++	p := n.runtime
++	io := p.dnsDirectIO
++	if io == nil {
++		if p.proofs == nil || !p.proofs.live() || n.parent.receipt == nil || n.parent.receipt.association == nil {
++			return nil, ErrProfileUnsupported
++		}
++		source := n.parent.receipt.association
++		p.flow.mu.Lock()
++		proved := source.proof != nil
++		p.flow.mu.Unlock()
++		if !proved {
++			return nil, ErrProfileUnsupported
++		}
++		io = &profileDNSDirectIO{create: profileDNSCreateOwnedSocket, duplicate: func(conn *profileDNSOwnedSocket, want profileDestinationValue) (profileProofFD, error) {
++			fd, err := profileDNSDuplicateDirect(conn, want)
++			if err != nil || fd == nil {
++				return fd, errors.Join(errProfile, err)
++			}
++			p.flow.mu.Lock()
++			defer p.flow.mu.Unlock()
++			if source.proof == nil {
++				return fd, ErrProfileUnsupported
++			}
++			return fd, profileKernelSocketNamespace(source.proof, fd)
++		}, send: p.sendDNSPhysical}
++	}
++	c := p.flow
++	c.mu.Lock()
++	if !c.networkBootstrapLive(n) || !c.dnsContext4Live(n.context) || !n.replied || n.reservation == 0 || n.exchange == 0 || n.transport != nil || io.create == nil || io.duplicate == nil || io.send == nil || c.dnsDirectUsed >= len(c.dnsDirect) || c.profilePendingUsed()+profileDNSDirectPending > min(64, int(c.manifest.caps[3])) || c.profileFDUsed()+2 > 64 || c.buffered+c.manifest.memoryCredit+profileDNSDirectCredit > uint64(c.manifest.caps[4]) || !c.dnsReserveHistory(profileDNSDirectPending) {
++		c.mu.Unlock()
++		return nil, ErrProfileUnsupported
++	}
++	// До Physical Reserve/socket: тот же общий ledger, без нового RX reader.
++	c.operations += profileDNSDirectPending
++	c.dnsFDUsed += 2
++	c.buffered += profileDNSDirectCredit
++	child, cancel := context.WithDeadline(n.ctx, n.deadline)
++	t := &profileDNSDirect{network: n, ctx: child, cancel: cancel, destination: n.peer, deadline: n.deadline, cleanupDeadline: n.cleanupDeadline, io: *io, epoch: n.context.source.epoch, exchangeReservation: n.reservation, exchange: n.exchange, started: c.clock(), publishDone: make(chan struct{})}
++	n.transport = t
++	c.dnsDirect[c.dnsDirectUsed] = t
++	c.dnsDirectUsed++
++	c.mu.Unlock()
++	return profileDNSOpenDirect(t, false)
++}
++
++func profileDNSOpenDirect(t *profileDNSDirect, reserveExchange bool) (net.Conn, error) {
++	p := t.runtime()
++	c := p.flow
++	var err error
 +	// Cancellation перед factory не освобождает slot: factory может вернуть
 +	// поздний nonnil resource. Cleanup ждёт завершения именно этого owner.
 +	var owned *profileDNSDirectConn
@@ -40521,12 +41120,15 @@ new file mode 100644
 +			}
 +		}
 +	}()
-+	reserve, err := c.dnsDirectReserve(t, false)
-+	if err != nil {
-+		return nil, err
-+	}
-+	if err = p.flowRPC(reserve); err != nil {
-+		return nil, err
++	if reserveExchange {
++		reserve, e := c.dnsDirectReserve(t, false)
++		if e != nil {
++			err = e
++			return nil, err
++		}
++		if err = p.flowRPC(reserve); err != nil {
++			return nil, err
++		}
 +	}
 +	physical, err := c.dnsDirectReserve(t, true)
 +	if err != nil {
@@ -40613,7 +41215,7 @@ new file mode 100644
 +
 +func (s *profileDNSDirectConn) gate() error {
 +	t := s.owner
-+	c := t.bundle.exchange.query.runtime.flow
++	c := t.runtime().flow
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
 +	if !c.dnsDirectLive(t) || t.proof == 0 || t.revision != 1 || t.resource == 0 {
@@ -40622,6 +41224,9 @@ new file mode 100644
 +	return nil
 +}
 +func (s *profileDNSDirectConn) begin(write bool) error {
++	if s.owner.network != nil {
++		return ErrProfileUnsupported
++	}
 +	s.mu.Lock()
 +	defer s.mu.Unlock()
 +	if s.closing || s.gate() != nil {
@@ -40764,7 +41369,7 @@ new file mode 100644
 +}
 +
 +func (s *profileDNSDirectConn) boundedDeadline(requested time.Time) time.Time {
-+	c := s.owner.bundle.exchange.query.runtime.flow
++	c := s.owner.runtime().flow
 +	c.mu.Lock()
 +	deadline := s.owner.deadline
 +	c.mu.Unlock()
@@ -40817,7 +41422,7 @@ new file mode 100644
 +		s.closing = true
 +		s.mu.Unlock()
 +		t := s.owner
-+		c := t.bundle.exchange.query.runtime.flow
++		c := t.runtime().flow
 +		c.mu.Lock()
 +		t.closed = true
 +		t.cancel()
@@ -41061,8 +41666,10 @@ new file mode 100644
 +		c.dnsFDUsed -= 2
 +		// Retained IDs/request bytes остаются в оплаченной history до session end.
 +		c.buffered -= profileDNSDirectCredit / 2
-+		t.bundle.exchange.query.refs--
-+		t.bundle.exchange.query.releaseLocked()
++		if t.bundle != nil {
++			t.bundle.exchange.query.refs--
++			t.bundle.exchange.query.releaseLocked()
++		}
 +	}
 +	return nil
 +}
