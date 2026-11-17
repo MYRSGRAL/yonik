@@ -1,4 +1,162 @@
 use super::*;
+fn raw_system_intent(host: &str) -> yonik_engine::native_profile::ProfileIntent {
+    yonik_engine::native_profile::ProfileIntent::decode(&serde_json::json!({"version":1,"graph":{"outbounds":[{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":host,"port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]}}).to_string()).unwrap()
+}
+#[test]
+fn system_hostname_prepare_driver_selects_captured_hosts_or_network_routes() {
+    let intent = raw_system_intent("physical.invalid");
+    for (nss, resolv, expected) in [
+        (
+            b"hosts: files dns\n".as_slice(),
+            b"nameserver 127.0.0.53\n".as_slice(),
+            vec![],
+        ),
+        (
+            b"hosts: dns files\n".as_slice(),
+            b"nameserver 192.0.2.53\n".as_slice(),
+            vec!["192.0.2.53:53".parse::<SocketAddr>().unwrap()],
+        ),
+    ] {
+        let snapshot = lookup_fixture(nss, resolv, Some(b"192.0.2.80 physical.invalid\n"));
+        let mut plan = SystemPhysicalPlan::build(&intent, Some(snapshot.reference())).unwrap();
+        plan.bind_resolver(&snapshot).unwrap();
+        assert_eq!(plan.resolver_peers(), expected);
+        assert!(plan.numeric().is_empty());
+        assert_eq!(plan.deferred_count(), 1);
+    }
+    let snapshot = lookup_fixture(b"hosts: dns\n", b"nameserver 127.0.0.53\n", None);
+    let mut plan = SystemPhysicalPlan::build(&intent, Some(snapshot.reference())).unwrap();
+    assert!(plan.bind_resolver(&snapshot).is_err());
+}
+#[tokio::test]
+async fn system_hostname_prepare_driver_retains_frontier_without_numeric_authority() {
+    for order in [1, 2] {
+        let intent = raw_system_intent("physical.invalid");
+        let reference = crate::profile_channel::SnapshotRef {
+            source: [order; 32],
+            asset: [3; 32],
+            bytes: 170,
+            flags: 0,
+        };
+        let mut sources = 0;
+        let plan = SystemPhysicalPlan::capture_checked(&intent, || {
+            sources += 1;
+            Ok(Some(reference))
+        })
+        .unwrap();
+        assert_eq!(sources, 2);
+        assert_eq!(plan.numeric().len(), 0);
+        assert_eq!(plan.deferred_count(), 1);
+        let parent = crate::profile_channel::Destination {
+            family: 3,
+            protocol: 6,
+            port: 8443,
+            bytes: b"physical.invalid",
+        };
+        assert!(plan.deferred_parent_shape(parent));
+        assert!(
+            !plan.deferred_parent_shape(crate::profile_channel::Destination {
+                port: 8444,
+                ..parent
+            })
+        );
+        assert!(
+            !plan.deferred_parent_shape(crate::profile_channel::Destination {
+                bytes: b"foreign.invalid",
+                ..parent
+            })
+        );
+        assert_eq!(
+            plan.deferred[0].path(),
+            &[(
+                "b".to_owned(),
+                yonik_engine::native_profile::WireNetwork::Tcp,
+                false
+            )]
+        );
+        assert!(plan.member_shape(8443, crate::TransportProtocol::Tcp));
+        assert!(!plan.member_shape(53, crate::TransportProtocol::Tcp));
+        assert!(!plan.member_shape(8443, crate::TransportProtocol::Udp));
+        let (_keep, cancel) = Cancellation::new();
+        let captured = plan
+            .capture_routes::<()>(997, 42, &cancel, async |_, _| {
+                panic!("hostname не route query до Numeric")
+            })
+            .await
+            .unwrap();
+        assert_eq!(captured.transports().unwrap().count(), 0);
+        assert!(
+            plan.check_binding(
+                FullProfileSources::digest(&intent).unwrap(),
+                Some(reference)
+            )
+            .is_ok()
+        );
+        assert!(plan.check_binding([9; 32], Some(reference)).is_err());
+        let mut changed = reference;
+        changed.asset = [4; 32];
+        assert!(
+            plan.check_binding(FullProfileSources::digest(&intent).unwrap(), Some(changed))
+                .is_err()
+        );
+        let mut reads = 0;
+        assert!(
+            SystemPhysicalPlan::capture_checked(&intent, || {
+                reads += 1;
+                Ok(Some(if reads == 1 { reference } else { changed }))
+            })
+            .is_err()
+        );
+        assert!(SystemPhysicalPlan::build(&intent, None).is_err());
+    }
+}
+#[tokio::test]
+async fn system_hostname_prepare_driver_numeric_baseline_cancel_and_backend_failure() {
+    let intent = raw_system_intent("192.0.2.80");
+    let plan = SystemPhysicalPlan::capture_checked(&intent, || Ok(None)).unwrap();
+    assert_eq!(plan.deferred_count(), 0);
+    let (keep, cancel) = Cancellation::new();
+    let mut calls = 0;
+    let captured = plan
+        .capture_routes(997, 42, &cancel, async |endpoint, protocol| {
+            calls += 1;
+            assert_eq!(endpoint, "192.0.2.80:8443".parse().unwrap());
+            assert_eq!(
+                protocol,
+                crate::managed_network::firewall::TransportProtocol::Tcp
+            );
+            Ok((7, 17u8))
+        })
+        .await
+        .unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(captured.into_snapshots().unwrap(), vec![17]);
+    assert!(
+        plan.capture_routes::<()>(997, 42, &cancel, async |_, _| Err(EgressError::Stale))
+            .await
+            .is_err()
+    );
+    let (late, late_cancel) = Cancellation::new();
+    assert!(
+        plan.capture_routes::<()>(997, 42, &late_cancel, async |_, _| {
+            late.send(true).unwrap();
+            Ok((7, ()))
+        })
+        .await
+        .is_err()
+    );
+    let mut effects = 0;
+    keep.send(true).unwrap();
+    assert!(
+        plan.capture_routes::<()>(997, 42, &cancel, async |_, _| {
+            effects += 1;
+            Ok((7, ()))
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(effects, 0);
+}
 #[test]
 fn native_delivery_total_includes_snapshot_and_rejects_overflow_before_staging() {
     assert!(delivery_preflight([1; 16]).is_ok());
@@ -1204,6 +1362,7 @@ fn lookup_prepared(hostname: bool) -> PreparedFullProfile {
     )
     .unwrap();
     PreparedFullProfile {
+        intent_digest: FullProfileSources::digest(&intent).unwrap(),
         retained,
         resolver,
         capsule: std::sync::Arc::new(capsule),

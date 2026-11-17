@@ -432,6 +432,7 @@ pub(super) async fn check_actual_boundaries_with_synthetic_inputs(
         invalid: std::sync::atomic::AtomicBool::new(false),
         installed: None,
         full_profile: None,
+        physical: None,
         owner,
         routes: vec![super::ProfileRoute {
             dns: false,
@@ -567,6 +568,7 @@ pub(super) async fn check_actual_boundaries_with_synthetic_inputs(
         invalid: std::sync::atomic::AtomicBool::new(false),
         installed: None,
         full_profile: None,
+        physical: None,
         owner,
         routes: artifact.routes.clone(),
         bundle: artifact.bundle,

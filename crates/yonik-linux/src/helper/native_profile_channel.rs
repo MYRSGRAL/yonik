@@ -5621,7 +5621,7 @@ struct ConsumerPlan;
 impl ConsumerPlan {
     fn derive(
         intent: &yonik_engine::native_profile::ProfileIntent,
-        mode: Mode,
+        _mode: Mode,
     ) -> Result<Self, ServiceError> {
         consumer_planning_available()?;
         if !intent.is_raw_tcp_consumer_subset() {
@@ -5645,11 +5645,6 @@ impl ConsumerPlan {
             || egress.physical()[0].protocol()
                 != yonik_engine::native_profile::TransportProtocol::Tcp
         {
-            return Err(ServiceError::Unsupported);
-        }
-        // System static route capture ещё требует numeric leaves. Не выдаём
-        // prepare-ready для hostname до independent route/provenance bridge.
-        if mode.required() && egress.physical()[0].requires_bootstrap() {
             return Err(ServiceError::Unsupported);
         }
         if let Ok(ip) = egress.physical()[0].host().parse::<std::net::IpAddr>() {
@@ -5728,7 +5723,7 @@ fn prepare_consumer<T>(
     load(plan)
 }
 
-fn consumer_resolver_peers(peers: &[std::net::SocketAddr]) -> Result<(), ServiceError> {
+pub(super) fn consumer_resolver_peers(peers: &[std::net::SocketAddr]) -> Result<(), ServiceError> {
     if peers.is_empty()
         || peers
             .iter()
@@ -5819,6 +5814,7 @@ mod subset_readiness_tests {
             ("physical.invalid", Mode::Local),
             ("192.0.2.80", Mode::Local),
             ("192.0.2.80", Mode::System),
+            ("physical.invalid", Mode::System),
         ] {
             let intent = intent(host, |_| {});
             let scopes = [
@@ -5897,15 +5893,6 @@ mod subset_readiness_tests {
             );
             assert_eq!(effects, 0);
         }
-        let mut effects = 0;
-        assert!(
-            prepare_consumer(&intent("physical.invalid", |_| {}), Mode::System, |_| {
-                effects += 1;
-                Ok(())
-            })
-            .is_err()
-        );
-        assert_eq!(effects, 0);
     }
 }
 

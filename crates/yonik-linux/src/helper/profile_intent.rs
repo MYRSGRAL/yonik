@@ -85,6 +85,7 @@ impl FullProfileRequest {
             .validate_ingress_mapping(&plan)
             .map_err(|_| EgressError::InvalidBinding)?;
         sources.revalidate(&self.intent, cancel)?;
+        let intent_digest = sources.intent_digest;
         let FullProfileSources {
             resources,
             resolver,
@@ -114,6 +115,7 @@ impl FullProfileRequest {
         )
         .map_err(|_| EgressError::InvalidBinding)?;
         let prepared = PreparedFullProfile {
+            intent_digest,
             retained,
             resources,
             resolver,
@@ -333,6 +335,7 @@ fn delivery_preflight(lengths: impl IntoIterator<Item = u64>) -> Result<(), Egre
 /// Один результат compile и actual source custody: provider credentials не
 /// реконструируются при seal/handoff; capsule builder получает тот же intent.
 pub struct PreparedFullProfile {
+    intent_digest: [u8; 32],
     retained: RetainedSystemProfile,
     resources: NativeResourceSet,
     resolver: Option<PinnedResolverSnapshot>,
@@ -1454,9 +1457,6 @@ impl PinnedResolverSnapshot {
             budget,
         )
     }
-    pub(crate) fn server_endpoints(&self) -> &[SocketAddr] {
-        &self.servers
-    }
     pub fn capture(cancel: &Cancellation) -> Result<Self, EgressError> {
         check_cancel(cancel)?;
         let memory = super::memory::config_budget()
@@ -1910,6 +1910,214 @@ fn resolver_nss_order(nss: &str) -> Result<u8, EgressError> {
     })
 }
 /// Отдельно от DNS: resolver requirement не становится firewall exception.
+/// Retained DATA frontier: никогда не содержит numeric member/BoundTransport.
+pub(crate) struct SystemPhysicalPlan {
+    numeric: Vec<PhysicalEndpoint>,
+    deferred: Vec<yonik_engine::native_profile::PhysicalBootstrapFrontier>,
+    resolver_peers: Vec<SocketAddr>,
+    intent: [u8; 32],
+    snapshot: Option<crate::profile_channel::SnapshotRef>,
+}
+impl SystemPhysicalPlan {
+    pub(crate) async fn capture_routes<T>(
+        &self,
+        worker_uid: u32,
+        mark: u32,
+        cancel: &Cancellation,
+        mut capture: impl std::ops::AsyncFnMut(
+            SocketAddr,
+            TransportProtocol,
+        ) -> Result<(u32, T), EgressError>,
+    ) -> Result<CapturedPhysicalRoutes<T>, EgressError> {
+        check_cancel(cancel)?;
+        if worker_uid == 0 || worker_uid == u32::MAX || mark == 0 {
+            return Err(EgressError::InvalidBinding);
+        }
+        // Deferred frontier намеренно не передаётся callback: DNS ещё не дал IP.
+        let mut routes = Vec::with_capacity(self.numeric.len());
+        for endpoint in &self.numeric {
+            check_cancel(cancel)?;
+            let address = numeric(endpoint)?;
+            let protocol = match endpoint.protocol() {
+                yonik_engine::native_profile::TransportProtocol::Tcp => TransportProtocol::Tcp,
+                yonik_engine::native_profile::TransportProtocol::Udp => TransportProtocol::Udp,
+            };
+            let (index, snapshot) =
+                capture(SocketAddr::new(address, endpoint.port()), protocol).await?;
+            check_cancel(cancel)?;
+            let bound =
+                BoundTransport::new(address, protocol, endpoint.port(), index, worker_uid, mark)
+                    .map_err(|_| EgressError::InvalidBinding)?;
+            routes.push((bound, snapshot));
+        }
+        Ok(CapturedPhysicalRoutes {
+            routes,
+            invalid: false,
+        })
+    }
+    pub(crate) fn capture(
+        intent: &yonik_engine::native_profile::ProfileIntent,
+        sources: &FullProfileSources,
+        cancel: &Cancellation,
+    ) -> Result<Self, EgressError> {
+        let mut plan = Self::capture_checked(intent, || {
+            sources.revalidate(intent, cancel)?;
+            Ok(sources.snapshot().map(PinnedResolverSnapshot::reference))
+        })?;
+        if !plan.deferred.is_empty() {
+            plan.bind_resolver(sources.snapshot().ok_or(EgressError::BootstrapRequired)?)?;
+        }
+        sources.revalidate(intent, cancel)?;
+        Ok(plan)
+    }
+    fn capture_checked(
+        intent: &yonik_engine::native_profile::ProfileIntent,
+        mut source: impl FnMut() -> Result<Option<crate::profile_channel::SnapshotRef>, EgressError>,
+    ) -> Result<Self, EgressError> {
+        let plan = Self::build(intent, source()?)?;
+        if !plan.same_snapshot(source()?) {
+            return Err(EgressError::Stale);
+        }
+        Ok(plan)
+    }
+    fn build(
+        intent: &yonik_engine::native_profile::ProfileIntent,
+        snapshot: Option<crate::profile_channel::SnapshotRef>,
+    ) -> Result<Self, EgressError> {
+        if !intent.is_raw_tcp_consumer_subset() {
+            return Err(EgressError::InvalidBinding);
+        }
+        let graph = intent.validate().map_err(|_| EgressError::Encoding)?;
+        let requirements = PhysicalRequirements::new(graph.egress())?;
+        let mut numeric_routes = Vec::with_capacity(requirements.endpoints().len());
+        let mut deferred = Vec::new();
+        for endpoint in requirements.endpoints() {
+            if !endpoint.requires_bootstrap() {
+                numeric(endpoint)?;
+                numeric_routes.push(endpoint.clone());
+                continue;
+            }
+            if snapshot.is_none()
+                || endpoint.protocol() != yonik_engine::native_profile::TransportProtocol::Tcp
+            {
+                return Err(EgressError::BootstrapRequired);
+            }
+            let subject = graph
+                .subjects()
+                .first()
+                .ok_or(EgressError::InvalidBinding)?;
+            let frontier = intent
+                .physical_bootstrap_frontier(
+                    subject,
+                    yonik_engine::native_profile::WireNetwork::Tcp,
+                    endpoint.port(),
+                    &[false],
+                )
+                .map_err(|_| EgressError::InvalidBinding)?
+                .ok_or(EgressError::InvalidBinding)?;
+            if frontier.endpoint() != endpoint {
+                return Err(EgressError::InvalidBinding);
+            }
+            deferred.push(frontier);
+        }
+        if deferred.is_empty() {
+            requirements.validate_numeric()?;
+        }
+        Ok(Self {
+            numeric: numeric_routes,
+            deferred,
+            resolver_peers: Vec::new(),
+            intent: FullProfileSources::digest(intent)?,
+            snapshot,
+        })
+    }
+    pub(crate) fn numeric(&self) -> &[PhysicalEndpoint] {
+        &self.numeric
+    }
+    pub(crate) fn deferred_count(&self) -> usize {
+        self.deferred.len()
+    }
+    fn bind_resolver(&mut self, snapshot: &PinnedResolverSnapshot) -> Result<(), EgressError> {
+        if !self.same_snapshot(Some(snapshot.reference())) {
+            return Err(EgressError::Stale);
+        }
+        for frontier in &self.deferred {
+            // Только первый supported lookup. HOSTS не открывает DNS exception;
+            // DNS-first fallback/вторая question не становятся новым authority.
+            let lookup = snapshot.retained_lookup_data(
+                frontier.endpoint().host(),
+                1,
+                LookupFamily::Any,
+                super::memory::config_budget(),
+            )?;
+            match lookup.steps().first() {
+                Some(LookupStep::Hosts(_)) => {}
+                Some(LookupStep::Network(network)) => {
+                    super::native_profile_channel::consumer_resolver_peers(network.peers())
+                        .map_err(|_| EgressError::InvalidEndpoint)?;
+                    self.resolver_peers.extend_from_slice(network.peers());
+                }
+                None => return Err(EgressError::BootstrapRequired),
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn resolver_peers(&self) -> &[SocketAddr] {
+        &self.resolver_peers
+    }
+    /// Logical parent DATA match; не numeric route и не physical permission.
+    pub(crate) fn deferred_parent_shape(
+        &self,
+        destination: crate::profile_channel::Destination<'_>,
+    ) -> bool {
+        destination.family == 3
+            && destination.protocol == 6
+            && self.deferred.iter().any(|f| {
+                f.endpoint().host().as_bytes() == destination.bytes
+                    && f.endpoint().port() == destination.port
+            })
+    }
+    /// Только shape; member authority приходит исключительно из checked Numeric
+    /// issuer + live manifest/scope и durable backend, не из этого predicate.
+    pub(crate) fn member_shape(&self, port: u16, protocol: crate::TransportProtocol) -> bool {
+        protocol == crate::TransportProtocol::Tcp
+            && self.deferred.iter().any(|f| f.endpoint().port() == port)
+    }
+    fn same_snapshot(&self, snapshot: Option<crate::profile_channel::SnapshotRef>) -> bool {
+        match (self.snapshot, snapshot) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.source == b.source
+                    && a.asset == b.asset
+                    && a.bytes == b.bytes
+                    && a.flags == b.flags
+            }
+            _ => false,
+        }
+    }
+    pub(crate) fn revalidate(
+        &self,
+        profile: &PreparedFullProfile,
+        cancel: &Cancellation,
+    ) -> Result<(), EgressError> {
+        profile.revalidate(cancel)?;
+        self.check_binding(
+            profile.intent_digest,
+            profile.resolver().map(PinnedResolverSnapshot::reference),
+        )
+    }
+    fn check_binding(
+        &self,
+        intent: [u8; 32],
+        snapshot: Option<crate::profile_channel::SnapshotRef>,
+    ) -> Result<(), EgressError> {
+        if self.intent != intent || !self.same_snapshot(snapshot) {
+            return Err(EgressError::Stale);
+        }
+        Ok(())
+    }
+}
+
 pub struct PhysicalRequirements<'a> {
     plan: &'a EgressPlan,
 }
@@ -2015,6 +2223,16 @@ pub struct CapturedPhysicalRoutes<T> {
     invalid: bool,
 }
 impl<T> CapturedPhysicalRoutes<T> {
+    pub(crate) fn into_snapshots(self) -> Result<Vec<T>, EgressError> {
+        if self.invalid {
+            return Err(EgressError::Stale);
+        }
+        Ok(self
+            .routes
+            .into_iter()
+            .map(|(_, snapshot)| snapshot)
+            .collect())
+    }
     pub fn revalidate(
         &mut self,
         cancel: &Cancellation,

@@ -1793,19 +1793,42 @@ Desktop native preflight загружает protected snapshot до port allocat
 legacy fallback. System helper независимо проверяет свой protected snapshot;
 frontend image не является authority для helper.
 
-**Конкретное оставшееся ограничение System hostname**: session_host.rs
-prepare_full_profile всё ещё строит static numeric ProfileRoute и вызывает
-PhysicalRequirements::validate_numeric/capture_numeric. Поэтому System plan
-отвергает requires_bootstrap до attestation/network/listen, numeric raw TCP
-остаётся eligible. Для System HOSTS/NETWORK нужен отдельный integration bridge:
-retained CapturedPhysicalRoutes должен различать static numeric route и pending
-bootstrap frontier; Source/Waiter/Numeric permission должен добавить exact
-numeric route через durable RouteAuthority, затем retire эту запись вместе с
-SessionArtifact (prepare/apply/start/active stale fences). Нельзя пропустить
-validate_numeric или превратить hostname в исключение. API profile_intent.rs
-capture_numeric прямо запрещает такой bridge сейчас; файл вне текущего scope.
+**System hostname integration (SOURCE/PURE)**: `SystemPhysicalPlan::capture`
+сохраняет из того же typed intent отдельно numeric leaves и deferred physical
+frontier; последний содержит original hostname/port/carrier/full path, а не IP.
+Его binding включает intent digest и exact retained SnapshotRef. Source FD custody
+остаётся в PreparedFullProfile, удерживаемом SessionArtifact и WorkerPayload.
+`prepare_full_profile` проверяет этот план до attestation/listen, передаёт только
+numeric leaves в `capture_routes` и сохраняет план в SessionArtifact. Старые
+PhysicalRequirements::validate_numeric/capture_numeric не ослаблены.
+
+Первый captured lookup HOSTS не создаёт resolver exception; NETWORK сохраняет
+только actual выбранные nonloopback numeric resolver peers. Их route capture и
+durable policy входят в прежний prepare/apply/start/active lifecycle. Независимый
+`ProfileRoutes::check_bootstrap_dns` требует exact captured route/kernel facts и
+resolver-only permit до Reserved36/Go Connect; original destination этого права
+не даёт. Default app-DNS declaration не открывает USER DNS capability.
+
+Checked USER Static hostname допускается backend только как exact retained
+logical parent и возвращает **None ticket**, без kernel lookup/rule. Перед этим
+сохраняются fresh Known/scope/manifest/session/source fences. Actual consuming
+producer независимо требует одновременно live parent и typed bootstrap Numeric
+permission. Hosts/NETWORK Numeric issuer проверяет selected member/source/full
+frontier, затем `ProfileRoutes::service(Direct)` устанавливает отдельный numeric
+ticket через прежний durable journal/policy; post-backend/send fences и retirement
+сохраняются. Backend дополнительно ограничивает этот member carrier/port retained
+frontier. Ни hostname, ни DATA predicate не дают numeric route заранее.
+
+`SessionArtifact::revalidate_routes` проверяет intent/snapshot/Source и все actual
+captured numeric/resolver routes; ошибка sticky-invalid. Dynamic tickets/refs
+удерживаются прежним ProfileRoutes/NativeRuntime до KnownClosed; Unknown не
+освобождает custody. Aggregate firewall cap128, shared memory/owner expiry и
+cancel namespace не меняются. TLS/mux/chain/UDP/loopback и Direct USER CODEC4
+остаются Unsupported. Это узкая prepare интеграция, не runtime acceptance.
 
 Pure tests проверяют настоящий Local prepare до injected capture boundary (без
-/etc/exec) и общий System planning dispatcher с injected record scopes. Успех
-полной System/Local OS preparation/runtime этими тестами не заявляется. Existing
-Source/digest/cancel/owner tests остаются отдельными regression filters.
+/etc/exec), общий System planning dispatcher с injected protected scopes, новый
+System route-capture callback (deferred никогда не query), HOSTS/NETWORK выбор
+из synthetic snapshot и actual serialized CODEC4 issuer drivers. Production
+prepare/route callers compile-only: real capture/kernel/backend/runtime не
+исполнялись. Полная System/Local OS preparation этими тестами не заявляется.

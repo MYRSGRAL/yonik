@@ -343,6 +343,7 @@ pub(super) struct SessionArtifact {
     invalid: std::sync::atomic::AtomicBool,
     installed: Option<crate::helper::native_profile::VerifiedStaticInstalledImage>,
     full_profile: Option<Arc<crate::helper::profile_intent::PreparedFullProfile>>,
+    physical: Option<crate::helper::profile_intent::SystemPhysicalPlan>,
     routes: Vec<ProfileRoute>,
     owner: Ownership,
     pub(super) bundle: Option<crate::helper::service::BundleDigests>,
@@ -415,7 +416,11 @@ impl SessionArtifact {
                 .map_err(|_| ServiceError::Unsupported)?;
         }
         if let Some(profile) = &self.full_profile {
-            profile.revalidate(cancel).map_err(unavailable)?;
+            self.physical
+                .as_ref()
+                .ok_or_else(stale)?
+                .revalidate(profile, cancel)
+                .map_err(unavailable)?;
         }
         let mut transports = Vec::with_capacity(self.routes.len());
         let mut dns = Vec::new();
@@ -627,6 +632,26 @@ impl ProfileRoutes {
                 },
                 RouteRequest::Direct(d) => (d, false, true),
             };
+            if destination.family==3 {
+                // Только checked USER logical parent. Ни IP, ни transport rule
+                // здесь не создаются. Source Numeric выдаёт отдельный ticket;
+                // consuming producer требует ОБА live разрешения перед open.
+                if !dns && !dynamic && matches!(evidence,ProfileRouteEvidence::User(..))
+                    && artifact.physical.as_ref().is_some_and(|p| p.deferred_parent_shape(destination)) {
+                    return Ok(None);
+                }
+                return Err(ServiceError::Unsupported);
+            }
+            // Не authority: issuer уже проверил exact Source/member/parent.
+            // Backend дополнительно связывает service member с retained frontier.
+            if matches!(evidence, ProfileRouteEvidence::Service(_)) && dynamic {
+                if let Some(plan)=&artifact.physical {
+                    if plan.deferred_count()>0 && !plan.member_shape(destination.port,
+                        match destination.protocol {6=>crate::TransportProtocol::Tcp,17=>crate::TransportProtocol::Udp,_=>return Err(ServiceError::Unsupported)}) {
+                        return Err(ServiceError::Unsupported);
+                    }
+                }
+            }
             let endpoint = match destination.family {
                 4 if destination.bytes.len() == 4 => IpAddr::V4(std::net::Ipv4Addr::from(
                     <[u8; 4]>::try_from(destination.bytes).map_err(unavailable)?,
@@ -1069,9 +1094,7 @@ impl Backend {
         request: crate::helper::profile_intent::FullProfileRequest,
         cancel: &mut Cancellation,
     ) -> Result<GuardArtifact, ServiceError> {
-        use yonik_engine::native_profile::{
-            OwnedIngress, OwnedRuntimePlan, TransportProtocol as NativeProtocol,
-        };
+        use yonik_engine::native_profile::{OwnedIngress, OwnedRuntimePlan};
         request.preflight(cancel)?;
         // Exact graph/image/scope guard до listen/check/worker. Тот же sealed
         // snapshot передаётся WorkerPayload; повторная image selection запрещена.
@@ -1081,6 +1104,24 @@ impl Backend {
                 crate::profile_channel::Mode::System,
             )?;
         cancel.check().map_err(|_| ServiceError::Cancelled)?;
+        let graph = request
+            .intent()
+            .validate()
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        let sources = request
+            .capture_sources(cancel)
+            .map_err(|_| ServiceError::Unsupported)?;
+        crate::helper::native_profile_channel::validate_consumer_sources(
+            request.intent(),
+            &sources,
+            cancel,
+        )?;
+        let physical = crate::helper::profile_intent::SystemPhysicalPlan::capture(
+            request.intent(),
+            &sources,
+            cancel,
+        )
+        .map_err(unavailable)?;
         let installed = crate::helper::native_bootstrap::load_static_preflight(
             std::time::Instant::now() + Duration::from_secs(3),
         )
@@ -1098,18 +1139,6 @@ impl Backend {
         if worker_uid == uid {
             return Err(ServiceError::Unsupported);
         }
-        let graph = request
-            .intent()
-            .validate()
-            .map_err(|_| ServiceError::InvalidRequest)?;
-        let physical = crate::helper::profile_intent::PhysicalRequirements::new(graph.egress())
-            .map_err(unavailable)?;
-        physical
-            .validate_numeric()
-            .map_err(|_| ServiceError::Unsupported)?;
-        let sources = request
-            .capture_sources(cancel)
-            .map_err(|_| ServiceError::Unsupported)?;
         let owner = self.owner(uid)?;
         let context = self.context(uid)?;
         let stamp = self.snapshot()?.stamp;
@@ -1162,86 +1191,76 @@ impl Backend {
             WorkerPayload::new_full_profile(consumer_image, Arc::clone(&prepared), cancel)
                 .map_err(unavailable)?,
         );
-        let mut routes = Vec::with_capacity(physical.endpoints().len());
-        for endpoint in physical.endpoints() {
-            let address: IpAddr = endpoint
-                .host()
-                .parse()
-                .map_err(|_| ServiceError::Unsupported)?;
-            let protocol = match endpoint.protocol() {
-                NativeProtocol::Tcp => crate::TransportProtocol::Tcp,
-                NativeProtocol::Udp => crate::TransportProtocol::Udp,
-            };
-            let query = RouteQuery::new(address, worker_uid)
-                .with_mark(plan.socket_mark())
-                .with_transport(protocol, None, Some(endpoint.port()));
-            let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
-                .await
-                .map_err(unavailable)?;
-            checked_route(&route, owner, plan.routing_table())?;
-            routes.push(ProfileRoute {
-                dns: false,
-                endpoint: address,
-                port: endpoint.port(),
-                protocol,
-                route,
-                capture,
-            });
+        physical
+            .revalidate(&prepared, cancel)
+            .map_err(unavailable)?;
+        let capture_cancel = cancel.clone();
+        let captured = physical
+            .capture_routes(
+                worker_uid,
+                plan.socket_mark(),
+                &capture_cancel,
+                async |endpoint, transport| {
+                    let protocol = match transport {
+                        crate::managed_network::firewall::TransportProtocol::Tcp => {
+                            crate::TransportProtocol::Tcp
+                        }
+                        crate::managed_network::firewall::TransportProtocol::Udp => {
+                            crate::TransportProtocol::Udp
+                        }
+                    };
+                    let address = endpoint.ip();
+                    let query = RouteQuery::new(address, worker_uid)
+                        .with_mark(plan.socket_mark())
+                        .with_transport(protocol, None, Some(endpoint.port()));
+                    let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
+                        .await
+                        .map_err(|_| crate::helper::profile_intent::EgressError::Stale)?;
+                    let index = checked_route(&route, owner, plan.routing_table())
+                        .map_err(|_| crate::helper::profile_intent::EgressError::InvalidBinding)?;
+                    Ok((
+                        index,
+                        ProfileRoute {
+                            dns: false,
+                            endpoint: address,
+                            port: endpoint.port(),
+                            protocol,
+                            route,
+                            capture,
+                        },
+                    ))
+                },
+            )
+            .await
+            .map_err(unavailable)?;
+        let mut routes = captured.into_snapshots().map_err(unavailable)?;
+        if routes.len() != physical.numeric().len() {
+            return Err(stale());
         }
-        let system_dns = graph
-            .egress()
-            .system_resolvers()
-            .iter()
-            .any(|r| r.subject().is_none());
-        let peer_count = graph
-            .egress()
-            .resolvers()
-            .iter()
-            .filter(|r| r.subject().is_none())
-            .count()
-            + if system_dns {
-                prepared
-                    .resolver()
-                    .ok_or(ServiceError::Unsupported)?
-                    .server_endpoints()
-                    .len()
-                    * 2
-            } else {
-                0
-            };
-        if routes.len().saturating_add(peer_count) > 128 {
+        // Только выбранный captured NETWORK step; HOSTS и implicit app-DNS
+        // declaration не требуют transport exception. Ни hostname, ни resolver
+        // configuration сами по себе не становятся route authority.
+        let peer_count = physical.resolver_peers().len() * 2;
+        if routes
+            .len()
+            .saturating_add(peer_count)
+            .saturating_add(physical.deferred_count())
+            > 128
+        {
             return Err(ServiceError::Unsupported);
         }
         let mut peers = Vec::with_capacity(peer_count);
-        for resolver in graph
-            .egress()
-            .resolvers()
-            .iter()
-            .filter(|r| r.subject().is_none())
-        {
-            let endpoint = resolver.endpoint();
-            let address: IpAddr = endpoint
-                .host()
-                .parse()
-                .map_err(|_| ServiceError::Unsupported)?;
-            let protocol = match endpoint.protocol() {
-                NativeProtocol::Tcp => crate::TransportProtocol::Tcp,
-                NativeProtocol::Udp => crate::TransportProtocol::Udp,
-            };
-            peers.push((address, endpoint.port(), protocol));
-        }
-        if system_dns {
-            for server in prepared
-                .resolver()
-                .ok_or(ServiceError::Unsupported)?
-                .server_endpoints()
-            {
-                for protocol in [crate::TransportProtocol::Tcp, crate::TransportProtocol::Udp] {
-                    peers.push((server.ip(), server.port(), protocol));
-                }
+        for server in physical.resolver_peers() {
+            for protocol in [crate::TransportProtocol::Tcp, crate::TransportProtocol::Udp] {
+                peers.push((server.ip(), server.port(), protocol));
             }
         }
-        if routes.len().saturating_add(peers.len()) > 128 {
+        if routes
+            .len()
+            .saturating_add(peers.len())
+            .saturating_add(physical.deferred_count())
+            > 128
+        {
             return Err(ServiceError::Unsupported);
         }
         for (address, port, protocol) in peers {
@@ -1326,6 +1345,7 @@ impl Backend {
             invalid: std::sync::atomic::AtomicBool::new(false),
             installed: Some(installed),
             full_profile: Some(prepared),
+            physical: Some(physical),
             routes,
             owner,
             bundle: None,
@@ -1721,6 +1741,7 @@ impl Backend {
             invalid: std::sync::atomic::AtomicBool::new(false),
             installed: None,
             full_profile: None,
+            physical: None,
             owner,
             routes: vec![ProfileRoute {
                 dns: false,

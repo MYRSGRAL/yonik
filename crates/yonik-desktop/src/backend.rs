@@ -1216,7 +1216,7 @@ mod full_profile_review_tests {
             &report.entries[0],
             super::ConnectionMode::Local
         ));
-        assert!(!super::native_subset_plannable(
+        assert!(super::native_subset_plannable(
             &report.entries[0],
             super::ConnectionMode::System
         ));
