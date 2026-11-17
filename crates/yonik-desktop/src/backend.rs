@@ -1314,10 +1314,20 @@ mod full_profile_review_tests {
             include_bytes!("../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
         )
         .unwrap();
-        for entry in report.entries {
-            for mode in [super::ConnectionMode::Local, super::ConnectionMode::System] {
-                assert!(!super::native_subset_plannable(&entry, mode));
-            }
+        assert_eq!(report.entries.len(), 7);
+        for mode in [super::ConnectionMode::Local, super::ConnectionMode::System] {
+            let plannable = report
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    let yonik_import::ProfileEntry::Xray(profile) = entry else {
+                        panic!("Ожидался полный профиль Xray");
+                    };
+                    super::native_subset_plannable(entry, mode).then_some(profile.name())
+                })
+                .collect::<Vec<_>>();
+            // FranceSS достигает независимой проверки exact image для TCP и UDP.
+            assert_eq!(plannable, ["FranceSS"]);
         }
     }
     #[test]

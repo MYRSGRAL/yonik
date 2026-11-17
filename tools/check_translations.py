@@ -198,7 +198,7 @@ SCOPED_UI = (
     ('SettingsRow { objectName: "settingsScheduleButton"', "\n"),
     (
         'SmallLabel { objectName: "routingDiagnosticsScope"',
-        '// Конец блока проверки маршрутов.',
+        "// Конец блока проверки маршрутов.",
     ),
     ("        id: schedulePanel", "        id: appearancePanel"),
 )

@@ -371,6 +371,14 @@
       "retryable": false
     },
     {
+      "code": "ENGINE_UNAVAILABLE",
+      "message_key": "engine_unavailable",
+      "ru": "Sing-box пока недоступен. Выберите Xray в настройках подключения.",
+      "en": "Sing-box is currently unavailable. Select Xray in connection settings.",
+      "stage": "operation",
+      "retryable": false
+    },
+    {
       "code": "BROAD",
       "message_key": "broad",
       "ru": "Подтвердите правило для любого трафика",
