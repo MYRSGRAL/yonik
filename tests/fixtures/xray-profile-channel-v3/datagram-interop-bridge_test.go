@@ -18,6 +18,52 @@ import (
 	"time"
 )
 
+// Unit regression: actual factory/Physical constructor, ACK fixtures здесь
+// только seed unit harness; в joint stdio pair все ACK выдаёт другой SUT.
+func TestPurePhysicalPathRowUsesPositionNotScope(t *testing.T) {
+	for _, tcp := range []bool{false, true} {
+		t.Run(fmt.Sprint(tcp), func(t *testing.T) {
+			h := datagramNetworkTransportStart(t, 1, tcp, nil, nil)
+			t.Cleanup(func() {
+				h.f.p.cancel()
+				select {
+				case <-h.done:
+				case <-time.After(time.Second):
+					t.Error("unit caller did not join")
+				}
+			})
+			if h.n.frontier.scope != 1 || h.n.frontier.count != 1 {
+				t.Fatal("regression must distinguish scope1 from path0")
+			}
+			if e := h.f.c.accept(networkTransportReply(h.physical)); e != nil {
+				t.Fatal(e)
+			}
+			h.next(t, 52)
+			select {
+			case raw := <-h.proof:
+				protocol := byte(17)
+				if tcp {
+					protocol = 6
+				}
+				if len(raw) != 192 || u16(raw, 162) != 0 || raw[164] != protocol {
+					t.Fatalf("actual PhysicalBind pathRow=%d, scope=%d, carrier=%d", u16(raw, 162), h.n.frontier.scope, raw[164])
+				}
+			case <-time.After(time.Second):
+				t.Fatal("actual PhysicalBind missing")
+			}
+		})
+	}
+	for _, scope := range []uint16{1, 7, 511} {
+		bundle := &profileDNSBundle{count: 1}
+		bundle.path[0].scope = scope
+		direct := &profileDNSDirect{bundle: bundle}
+		_, _, _, row := direct.bindingIDs()
+		if row != 0 || bundle.path[0].scope != scope {
+			t.Fatal("Direct count1 path position must not alias scope", row, scope)
+		}
+	}
+}
+
 // Только новый test member: production actor/encoder/consumer не заменяются.
 func TestPureStatefulDatagramHostsStdioBridge(t *testing.T) {
 	runPureDatagramHosts(t, nil)

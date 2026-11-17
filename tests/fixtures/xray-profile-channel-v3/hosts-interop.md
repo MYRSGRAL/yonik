@@ -1,5 +1,53 @@
 # PURE_STATEFUL_INTEROP: HOSTS
 
+## NETWORK UDP после namespace correction8bdac3c: joint GREEN
+
+Base `1ccad0fcad12b70b9a8bad5eb77948a49e76f512`, exact production patch
+`6e1e0f0ee6c0e48f7b77a1e858e594277a8f515d8267c0bdff2f47e7d8a24791`.
+Один изменённый native member относительно2619814, всего1307. Go `bindingIDs`
+возвращает terminal **position**, Rust exact `physical_hop` guard не менялся.
+Production patch/pins не изменены этим harness commit; новая исполняемая
+регрессия помещена в test-only overlay, чтобы сохранить exact6e1 source pin.
+
+`TestPurePhysicalPathRowUsesPositionNotScope` реально получает Raw192 из
+NETWORK constructor при frontier.scope1/count1 для resolver6/17 и проверяет
+pathRow0. Отдельно выполняет тот же Direct getter с count1 и scopes1/7/511;
+это DATA getter regression, не выдача Direct USER capability. На старом28a
+producer оба Raw cases и Direct case RED; на6e1 GREEN. Unit ACK fixtures только
+инициализируют этот отдельный unit test; в joint stdio cases ACK не scripted.
+
+NETWORK Local/System × captured resolver TCP6/UDP17 проходят весь actual путь
+57/58→service/context→Physical/Logical→private DNS exchange→strict Publish→
+independent parent/service/context/waiter→Numeric17→actual SS Client.Process→
+один fake connected UDP send→consuming close/task join→Known cleanup.
+Original SS carrier17 отделён от resolver transport. System injected socket
+facts используют mark42 из synthetic System plan, Local — mark0; прежний
+stdio leaf ошибочно задавал0 обоим modes. Authorizer mark guard не ослаблен.
+
+Матрица21 cases: четыре NETWORK positives, wrong question/member, original USER
+parent cancellation, второй packet в том же SS caller, delayed actual Resource
+ACK, плюс все12 прежних cases. Wrong question останавливается до Publish/DATA;
+foreign member — до original permission/factory. После original-parent cancel
+retired также исходная USER seed route, остальные cases оставляют её явно live.
+Source/Transcript/Release — отдельные factory5 views с injected reviewed records.
+Actual peer/image/USER/Consumed/kernel/route/I/O/manager admission по-прежнему
+test leaves; успешный pair не является actual System admission или OS proof.
+
+Cleanup oracle проверяет actual Proof ACK перед Resource Retire, zero-ref/joined
+Retired ACK, reservation/exchange/context/binding9 ACK перед service Close32.
+Late-ACK case удерживает полученный от Rust Resource46 в Go bridge, проверяет
+custody через три normal ticks, затем передаёт **тот же** packet actual accept.
+No fake ACK/KnownClosed, no caps/fixture budget increase, no original deadline
+renewal. `transport.started == Exchange Reserve.sent` проверяется actual Go
+state; conservative issuer Reservation anchor и transcript recheck сохранены.
+
+Evidence `/home/myrs/projects/yonik/local/orchestration/evidence/p5-udp-network-retry`
+содержит RED regression, exact native source/compiler/test ELFs до execution,
+joint traces, commands и commit binding. Также собран fresh production main ELF
+`xray.compile-only` из exact6e1 source, **никогда не исполнявшийся**. Это не builder
+candidate/install record и не authority. Protected5 pins/FranceSS readiness и
+runtime/public gates не расширены. Ниже сохранена история предшествующего RED.
+
 ## UDP NETWORK2619814: actual pair RED на PhysicalBind.pathRow
 
 Base `bafe4b4550879eb8e5d2f55f0797aac92a3f6ba5`; producer

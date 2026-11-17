@@ -201,7 +201,7 @@ impl Channel for Stdio {
                 self.dns_protocol,
                 (4, 5),
             )
-            .with_test_mark(0);
+            .with_test_mark(if self.record.mode.required() { 42 } else { 0 });
             let incoming = super::super::super::super::dns_transport::Incoming::fake(
                 raw,
                 self.negotiated
