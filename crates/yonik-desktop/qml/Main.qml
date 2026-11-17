@@ -56,7 +56,6 @@ ApplicationWindow {
     property var desiredSourceId: null
     readonly property bool selectionConfirmed: (desiredProfileId === null || state.selected_profile === desiredProfileId && state.selected_kind === desiredProfileKind && state.selected_catalog_page === desiredProfilePage)
         && (desiredSourceId === null || state.source_id === desiredSourceId)
-    property bool sourceOptions: false
     property bool subscriptionImport: false
     property var subscriptionImportPreviousSource: null
     property bool handledCleanImport: false
@@ -78,6 +77,15 @@ ApplicationWindow {
         return importNotice
     }
     property bool searchQueued: false
+    readonly property var sourceNameCounts: {
+        const counts = Object.create(null)
+        for (const source of state.sources) counts[source.name] = (counts[source.name] || 0) + 1
+        return counts
+    }
+    function subscriptionName(source) {
+        return sourceNameCounts[source.name] > 1
+            ? source.name + " · #" + source.id : source.name
+    }
     function openAdd(localNetwork = false) {
         addDialog.localNetwork = localNetwork
         addDialog.open()
@@ -121,7 +129,6 @@ ApplicationWindow {
     function back() {
         if (page === 2 && settingsSection !== "") settingsSection = ""
         else if (page === 2) page = settingsOrigin
-        else if (page === 1 && sourceOptions) sourceOptions = false
         else if (page === 1) page = 0
     }
     property string parseError: ""
@@ -473,7 +480,7 @@ ApplicationWindow {
     onVisibleChanged: backend.dispatch(JSON.stringify({command: "subscription_visibility", visible: window.visible}))
     Shortcut {
         sequence: "Escape"
-        enabled: !addDialog.visible && !configImportDialog.visible && !reviewDialog.visible && !renameDialog.visible && !deleteDialog.visible
+        enabled: !noticesDialog.visible && !subscriptionOptionsDialog.visible && !addDialog.visible && !configImportDialog.visible && !reviewDialog.visible && !renameDialog.visible && !deleteDialog.visible
         onActivated: window.back()
     }
 
@@ -550,7 +557,7 @@ ApplicationWindow {
         property string symbol: ""
         property bool network: false
         Layout.fillWidth: true
-        implicitHeight: Math.max(64, contentItem.implicitHeight + 20)
+        implicitHeight: Math.max(55, contentItem.implicitHeight + 14)
         leftPadding: 16; rightPadding: 16
         contentItem: RowLayout {
             spacing: 14
@@ -594,6 +601,60 @@ ApplicationWindow {
         contentWidth: availableWidth
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         Component.onCompleted: contentItem.boundsBehavior = Flickable.StopAtBounds
+    }
+    component MintSwitch: Switch {
+        id: control
+        Layout.fillWidth: true
+        implicitHeight: Math.max(38, contentItem.implicitHeight + 12)
+        spacing: 10
+        indicator: Rectangle {
+            implicitWidth: 38
+            implicitHeight: 22
+            radius: 11
+            x: control.width - width
+            y: (control.height - height) / 2
+            color: control.checked ? "#18362e" : window.color
+            border.color: control.activeFocus ? window.accent : control.checked ? window.mint : window.line
+            Rectangle {
+                width: 14
+                height: 14
+                radius: 7
+                y: 4
+                x: control.checked ? parent.width - width - 4 : 4
+                color: control.checked ? window.mint : window.muted
+            }
+        }
+        contentItem: PlainLabel {
+            rightPadding: control.indicator.width + control.spacing
+            text: control.text
+            color: control.enabled ? window.ink : window.muted
+            verticalAlignment: Text.AlignVCenter
+        }
+    }
+    component SettingsTabs: RowLayout {
+        id: tabs
+        required property var pages
+        property int currentIndex: 0
+        Layout.fillWidth: true
+        spacing: 5
+        Repeater {
+            model: tabs.pages
+            delegate: ActionButton {
+                required property int index
+                required property var modelData
+                objectName: modelData.id
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                implicitHeight: 36
+                leftPadding: 5
+                rightPadding: 5
+                text: modelData.label
+                highlighted: tabs.currentIndex === index
+                Accessible.checkable: true
+                Accessible.checked: highlighted
+                onClicked: tabs.currentIndex = index
+            }
+        }
     }
     component SettingsGroup: Rectangle {
         default property alias rows: groupContent.data
@@ -816,20 +877,6 @@ ApplicationWindow {
                 RowLayout {
                     SectionTitle { Layout.fillWidth: true; text: window.tr("Серверы", "Servers") }
                     ActionButton { objectName: "addSourceButton"; highlighted: true; text: window.tr("Добавить", "Add"); leftPadding: 8; rightPadding: 8; enabled: window.state.ready && !window.state.busy && !window.state.pending; onClicked: window.openAdd() }
-                    ActionButton {
-                        objectName: "importMenuButton"
-                        text: "⌄"
-                        Accessible.name: window.tr("Другие действия с серверами", "More server actions")
-                        leftPadding: 8; rightPadding: 8
-                        enabled: window.state.ready && !window.state.busy && !window.state.pending
-                        onClicked: serverImportMenu.open()
-                        Menu {
-                            id: serverImportMenu
-                            MenuItem { objectName: "localSubscriptionAction"; text: window.tr("Подписка из локальной сети", "Local-network subscription"); onTriggered: window.openAdd(true) }
-                            MenuItem { objectName: "configImportAction"; text: window.tr("Импорт конфигурации", "Import configuration"); onTriggered: configImportDialog.open() }
-                            MenuItem { objectName: "manualEntryButton"; text: window.tr("Добавить сервер вручную", "Add a server manually"); onTriggered: manualEntry.open() }
-                        }
-                    }
                 }
                 RowLayout {
                     ChoiceBox {
@@ -838,14 +885,35 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         model: window.state.sources; textRole: "name"; valueRole: "id"
                         currentIndex: { for (let i = 0; i < window.state.sources.length; ++i) if (window.state.sources[i].id === window.state.source_id) return i; return -1 }
-                        displayText: currentIndex < 0 ? window.tr("Нет подписок", "No subscriptions") : currentText
-                        delegate: ItemDelegate { id: sourceOption; required property var modelData; width: overviewSources.width; contentItem: PlainLabel { text: sourceOption.modelData.name; maximumLineCount: 1; elide: Text.ElideRight } }
+                        displayText: {
+                            const activeSource = window.state.sources.find(source => source.id === window.state.source_id)
+                            return activeSource ? window.subscriptionName(activeSource)
+                                : window.state.source_name || window.tr("Нет подписок", "No subscriptions")
+                        }
+                        delegate: ItemDelegate {
+                            id: sourceOption
+                            required property var modelData
+                            required property int index
+                            readonly property bool selectedSource: modelData.id === window.state.source_id
+                            objectName: "subscriptionChoice_" + modelData.id
+                            width: overviewSources.width
+                            height: 42
+                            highlighted: overviewSources.highlightedIndex === index
+                            background: Rectangle {
+                                color: sourceOption.selectedSource ? window.selectedSurface
+                                    : sourceOption.highlighted || sourceOption.hovered ? "#24202c" : window.surface
+                            }
+                            contentItem: RowLayout {
+                                PlainLabel { Layout.fillWidth: true; text: window.subscriptionName(sourceOption.modelData); maximumLineCount: 1; elide: Text.ElideRight }
+                                PlainLabel { visible: sourceOption.selectedSource; text: "✓"; color: window.mint; Accessible.name: window.tr("Выбрана", "Selected") }
+                            }
+                        }
                         onActivated: window.selectSource(currentValue)
                         enabled: window.state.ready && !window.state.busy && count > 0
-                        Accessible.name: window.tr("Источник серверов", "Server source")
+                        Accessible.name: window.tr("Подписка", "Subscription")
                     }
                     ActionButton { objectName: "refreshSourceButton"; text: "↻"; Accessible.name: window.tr("Обновить подписку", "Refresh subscription"); enabled: window.state.ready && window.state.source_local === false && window.state.source_id !== null && !window.state.busy && !window.state.pending; onClicked: window.send({command: "refresh"}) }
-                    ActionButton { objectName: "sourceOptionsButton"; text: "⋯"; leftPadding: 8; rightPadding: 8; Accessible.name: window.tr("Параметры подписки", "Source options"); checkable: true; checked: window.sourceOptions; enabled: window.state.source_id !== null; onClicked: window.sourceOptions = !window.sourceOptions }
+                    ActionButton { objectName: "sourceOptionsButton"; text: "⋯"; leftPadding: 8; rightPadding: 8; Accessible.name: window.tr("Параметры подписки", "Source options"); enabled: window.state.ready && !window.state.pending; onClicked: subscriptionOptionsDialog.open() }
                 }
                 SmallLabel { objectName: "localSourceLabel"; visible: window.state.source_local === true; text: window.tr("Локальный источник", "Local source") }
                 RowLayout {
@@ -853,20 +921,6 @@ ApplicationWindow {
                     SmallLabel { Layout.fillWidth: true; text: window.tr("Подписки: ", "Subscriptions: ") + (window.state.sources_offset + 1) + "–" + (window.state.sources_offset + window.state.sources.length) + " / " + window.state.sources_total }
                     ActionButton { objectName: "sourcePreviousButton"; text: "‹"; enabled: !window.state.busy && window.state.sources_offset > 0; onClicked: window.send({command: "source_page", offset: Math.max(0, window.state.sources_offset - 64)}) }
                     ActionButton { objectName: "sourceNextButton"; text: "›"; enabled: !window.state.busy && window.state.sources_offset + window.state.sources.length < window.state.sources_total; onClicked: window.send({command: "source_page", offset: window.state.sources_offset + 64}) }
-                }
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    visible: window.sourceOptions && window.state.source_id !== null
-                    RowLayout {
-                    Layout.fillWidth: true
-                    CheckBox { objectName: "subscriptionHwidChoice"; Layout.fillWidth: true; text: window.tr("Отправлять ID устройства", "Send device ID"); checked: window.state.source_hwid_enabled === true; enabled: window.state.ready && window.state.source_local === false && !window.state.busy && !window.state.pending; onToggled: window.send({command: "set_source_hwid", enabled: checked}) }
-                    HelpButton { explanation: window.tr("Отправляет провайдеру случайный стабильный ID, без данных оборудования. Изменение повторно загружает подписку.", "Sends a random stable ID without hardware data. Changing it refreshes the subscription.") }
-                    }
-                    RowLayout {
-                    Layout.fillWidth: true
-                    ActionButton { Layout.fillWidth: true; objectName: "renameSourceButton"; text: window.tr("Переименовать", "Rename"); enabled: !window.state.busy && !window.state.pending; onClicked: { renameInput.text = window.state.source_name || overviewSources.currentText; renameDialog.sourceId = window.state.source_id; renameDialog.open() } }
-                    ActionButton { Layout.fillWidth: true; objectName: "deleteSourceButton"; text: window.tr("Удалить", "Delete"); leftPadding: 8; rightPadding: 8; enabled: !window.state.busy && !window.state.pending; onClicked: { deleteDialog.sourceId = window.state.source_id; deleteDialog.sourceName = window.state.source_name || overviewSources.currentText; deleteDialog.open() } }
-                    }
                 }
                 RowLayout {
                     visible: window.sourceFeedbackText() !== "" || !!window.parseError || (window.state.busy && window.localImportActive)
@@ -881,12 +935,12 @@ ApplicationWindow {
                 }
                     Rectangle {
                         Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        color: "#1a1720"
-                        border.color: "#36303f"
-                        radius: 12
-                        Layout.minimumHeight: 172
-                        Layout.preferredHeight: 220
+                        Layout.fillHeight: window.state.profiles.length === 0
+                        Layout.minimumHeight: window.state.profiles.length ? 48 : 172
+                        Layout.preferredHeight: window.state.profiles.length
+                            ? Math.min(window.state.profiles.length * 51 + 2, Math.max(155, serversScroll.availableHeight - 162))
+                            : 172
+                        color: "transparent"
                         ListView {
                             id: profileList
                             objectName: "profileList"
@@ -895,6 +949,7 @@ ApplicationWindow {
                             clip: true
                             model: window.state.profiles
                             reuseItems: true
+                            spacing: 5
                             onCountChanged: if (count === 0) positionViewAtBeginning()
                             Connections {
                                 target: window
@@ -920,14 +975,15 @@ ApplicationWindow {
                                 required property var modelData
                                 required property int index
                                 width: ListView.view.width
-                                height: 54
+                                height: 46
+                                topPadding: 3
+                                bottomPadding: 3
                                 highlighted: window.state.selected_kind === modelData.kind && window.state.selected_profile === modelData.id
                                 background: Rectangle {
                                     color: profileRow.highlighted ? window.selectedSurface : profileRow.hovered ? "#24202c" : window.surface
-                                    border.color: profileRow.activeFocus ? window.accent : "transparent"
+                                    border.color: profileRow.activeFocus || profileRow.highlighted ? window.accent : window.line
                                     radius: 8
                                     Rectangle { width: 2; height: parent.height / 2; anchors.verticalCenter: parent.verticalCenter; radius: 1; color: window.accent; visible: profileRow.highlighted }
-                                    Rectangle { height: 1; anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; color: window.line }
                                 }
                                 enabled: window.state.ready && !window.state.busy
                                 Accessible.name: modelData.name + ", " + (modelData.kind === "xray" ? window.tr("Полный профиль Xray", "Full Xray profile") : modelData.host)
@@ -936,11 +992,14 @@ ApplicationWindow {
                                 Keys.onEnterPressed: if (enabled) clicked()
                                 contentItem: RowLayout {
                                     spacing: 12
-                                    ColumnLayout {
+                                    PlainLabel {
                                         Layout.fillWidth: true
-                                        spacing: 3
-                                        PlainLabel { text: profileRow.modelData.name; Layout.fillWidth: true; elide: Text.ElideRight; maximumLineCount: 1; font.weight: Font.Medium }
-                                        SmallLabel { text: profileRow.modelData.kind === "xray" ? window.tr("Полный профиль Xray", "Full Xray profile") : profileRow.modelData.host + ":" + profileRow.modelData.port + " · " + profileRow.modelData.protocol; Layout.fillWidth: true; elide: Text.ElideRight; maximumLineCount: 1 }
+                                        text: profileRow.modelData.name
+                                        elide: Text.ElideRight
+                                        maximumLineCount: 1
+                                        font.weight: profileRow.highlighted ? Font.DemiBold : Font.Medium
+                                        ToolTip.visible: truncated && profileRow.hovered
+                                        ToolTip.text: text
                                     }
                                     SmallLabel {
                                         visible: !profileRow.modelData.available
@@ -948,16 +1007,20 @@ ApplicationWindow {
                                         color: window.warning
                                     }
                                     SmallLabel {
-                                        visible: profileRow.highlighted && profileRow.modelData.available
+                                        visible: profileRow.highlighted
                                         text: "✓"
-                                        color: window.accent
+                                        color: window.mint
                                         Accessible.name: window.tr("Выбран", "Selected")
                                     }
                                     ToolButton {
                                         id: favoriteButton
                                         objectName: "profileFavorite_" + profileRow.modelData.kind + "_" + profileRow.modelData.id
                                         Layout.preferredWidth: 36
-                                        Layout.preferredHeight: 38
+                                        Layout.preferredHeight: 36
+                                        background: Rectangle {
+                                            radius: 8
+                                            color: favoriteButton.hovered || favoriteButton.activeFocus ? "#372a45" : "transparent"
+                                        }
                                         text: profileRow.modelData.favorite ? "★" : "☆"
                                         font.pixelSize: 19
                                         palette.buttonText: profileRow.modelData.favorite ? window.accent : window.muted
@@ -987,6 +1050,8 @@ ApplicationWindow {
                     }
 
 
+                Item { Layout.fillHeight: true; visible: window.state.profiles.length > 0 }
+
             }
             }
             ColumnLayout {
@@ -1002,7 +1067,7 @@ ApplicationWindow {
                     clip: true
                     ColumnLayout {
                         width: settingsIndexScroll.availableWidth
-                        spacing: 10
+                        spacing: 5
                         SettingsRow { objectName: "settingsRoutingButton"; text: window.tr("Маршрутизация", "Routing"); description: window.tr("Сохранённые личные правила", "Saved personal rules"); symbol: "⇄"; onClicked: window.settingsSection = "routing" }
                         SettingsRow { objectName: "settingsConnectionButton"; text: window.tr("Подключение", "Connection"); description: window.tr("Ядро и локальный прокси", "Engine and local proxy"); symbol: "◎"; network: true; onClicked: window.settingsSection = "connection" }
                         SettingsRow { objectName: "settingsDiagnosticsButton"; text: window.tr("Диагностика", "Diagnostics"); description: window.tr("Доступность TCP и проверка HTTPS", "TCP reachability and HTTPS check"); symbol: "≋"; network: true; onClicked: window.settingsSection = "diagnostics" }
@@ -1043,197 +1108,269 @@ ApplicationWindow {
     }
     Component {
         id: routingPanel
-        PanelScroll {
-            id: routingScroll
-            ColumnLayout {
-                id: editor
-                Layout.minimumWidth: 0
-                objectName: "routingEditor"
-                enabled: window.state.selected_kind !== "xray" && window.state.ready && !window.state.closed && !window.routingPending
-                property double catalogExpectedId: 0
-                property bool catalogRequestLimit: false
-                readonly property var displayedCatalog: catalogExpectedId > 0 && window.state.routing_catalog && window.state.routing_catalog.request_id === catalogExpectedId ? window.state.routing_catalog : null
-                function invalidateCatalog() { catalogExpectedId = 0 }
-                function requestCatalog(offset) {
-                    invalidateCatalog()
-                    const id = window.nextCatalogRequestId()
-                    catalogRequestLimit = id === 0
-                    if (!id) return
-                    catalogExpectedId = id
-                    window.send({command: "routing_catalog", request_id: id, processes: processCatalog.checked, query: catalogQuery.text, offset: offset})
-                }
-                property var formRevision: window.state.routing_revision
-                property double pendingRequest: 0
-                property string saveError: ""
-                function settle() {
-                    const ack = window.routingFeedback
-                    if (!pendingRequest || !ack || ack.request_id !== pendingRequest) return
-                    pendingRequest = 0
-                    saveError = ack.error || ""
-                    if (!saveError) {
-                        selectedId = ack.saved_id
-                        formRevision = window.state.routing_revision
-                    }
-                }
-                Connections { target: window; function onRoutingFeedbackChanged() { editor.settle() } }
-                width: routingScroll.availableWidth
-                spacing: 12
-                property bool advanced: false
-                property double selectedId: 0
-                property var transport: undefined
-                property var platformSources: undefined
-                function resetPlatformSources() { platformSources = undefined }
-                property int simpleGroup: 0
-                function values(text) { return text.split("\n").map(s => s.trim()).filter(s => s.length > 0) }
-                function load(rule) {
-                    transport = rule.transport === undefined ? undefined : JSON.parse(JSON.stringify(rule.transport))
-                    protocolInput.text = transport && transport.transport_protocols ? transport.transport_protocols.join(",") : ""
-                    portInput.text = transport && transport.destination_ports ? transport.destination_ports.map(p => p[0] === p[1] ? String(p[0]) : p[0] + "-" + p[1]).join(",") : ""
-                    platformSources = rule.platform_sources === undefined ? undefined : JSON.parse(JSON.stringify(rule.platform_sources))
-                    selectedId = rule.id
-                    formRevision = window.state.routing_revision
-                    saveError = ""
-                    executableInput.text = rule.executables.join("\n")
-                    domainInput.text = rule.domains.join("\n")
-                    cidrInput.text = rule.destinations.join("\n")
-                    actionInput.currentIndex = ["proxy", "direct", "block"].indexOf(rule.action)
-                    enabledInput.checked = rule.enabled
-                    broadInput.checked = false
-                }
-                function order(id, delta, remove) {
-                    let ids = window.state.routing.rules.map(r => r.id)
-                    let index = ids.indexOf(id)
-                    if (remove) {
-                        window.sendRouting({command: "routing_delete", id: id})
-                        return
-                    }
-                    if (index + delta >= 0 && index + delta < ids.length) {
-                        let other = ids[index + delta]; ids[index + delta] = id; ids[index] = other
-                    }
-                    window.sendRouting({command: "routing_order", ids: ids})
-                }
-                SectionTitle { Layout.fillWidth: true; text: window.tr("Маршрутизация", "Routing") }
-                PresetPanel {
-                    Layout.fillWidth: true
+        ColumnLayout {
+            spacing: 10
+            SectionTitle { Layout.fillWidth: true; text: window.tr("Маршрутизация", "Routing") }
+            SettingsTabs {
+                id: routingTabs
+                pages: [
+                    {id: "routingRulesTab", label: window.tr("Правила", "Rules")},
+                    {id: "routingEditorTab", label: window.tr("Редактор", "Editor")},
+                    {id: "routingListsTab", label: window.tr("Списки", "Lists")},
+                    {id: "routingCheckTab", label: window.tr("Проверка", "Check")}
+                ]
+                onCurrentIndexChanged: if (routingScroll.contentItem) routingScroll.contentItem.contentY = 0
+            }
+            PanelScroll {
+                id: routingScroll
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                objectName: "routingScroll"
+                ColumnLayout {
+                    id: editor
                     Layout.minimumWidth: 0
-                    snapshot: window.state.presets || ({})
-                    routing: window.state.routing || ({})
-                    routingRevision: window.state.routing_revision
-                    language: window.language
-                    onCommand: payload => window.send(payload)
-                }
-                SmallLabel { Layout.fillWidth: true; text: window.tr("Черновик сохраняется в зашифрованной БД. Первое подходящее правило имеет приоритет. VPN/LAN и пресеты здесь не редактируются.", "Draft is saved in the encrypted database. First matching rule wins. VPN/LAN and presets are not editable here.") }
-                ActionButton { objectName: "routingModeButton"; text: editor.advanced ? window.tr("Простой режим", "Simple mode") : window.tr("Расширенный режим", "Advanced mode"); onClicked: editor.advanced = !editor.advanced }
-                SmallLabel { Layout.fillWidth: true; text: window.tr("Условия групп: И; строки внутри группы: ИЛИ. Составные правила сохраняются при смене режима.", "Groups use AND; lines within a group use OR. Switching mode preserves compound rules.") }
-                SmallLabel { objectName: "routingDiagnosticsScope"; Layout.fillWidth: true; text: window.tr("Ограниченная диагностика сохранённой ревизии ", "Limited diagnostics for saved revision ") + window.state.routing_revision + window.tr(". Отсутствие предупреждений не доказывает совместимость. VPN/LAN здесь не настроены.", ". No warnings does not prove compatibility. VPN/LAN are not configured here.") }
-                SmallLabel { objectName: "routingDiagnosticsIncomplete"; Layout.fillWidth: true; visible: !!window.state.routing_diagnostics && window.state.routing_diagnostics.incomplete; text: window.state.routing_diagnostics && window.isUnsupportedSelector(window.state.routing_diagnostics.error) ? window.tr("Правило #", "Rule #") + window.state.routing_diagnostics.rule_id + window.tr(": селектор неприменим на Linux", ": selector is unsupported on Linux") : window.state.routing_diagnostics && window.state.routing_diagnostics.stale ? window.tr("Отчёт устарел: черновик изменился. Требуется актуальный снимок.", "Report is stale: the draft changed. A current snapshot is required.") : window.tr("Анализ неполный: достигнут лимит или вход не поддерживается.", "Analysis is incomplete: a limit was reached or input is unsupported.") }
-                Repeater {
-                    model: window.state.routing_diagnostics ? window.state.routing_diagnostics.warnings : []
-                    delegate: SmallLabel {
-                        required property var modelData
-                        Layout.fillWidth: true
-                        text: "#" + modelData.rule_id + " ← " + modelData.earlier + (modelData.kind === "shadowed" ? window.tr(" · условия перекрыты старшим правилом", " · conditions shadowed by an earlier rule") : window.tr(" · возможное пересечение; существование потока не доказано", " · possible overlap; existence of a flow is unproven"))
+                    objectName: "routingEditor"
+                    enabled: window.state.selected_kind !== "xray" && window.state.ready && !window.state.closed && !window.routingPending
+                    property double catalogExpectedId: 0
+                    property bool catalogRequestLimit: false
+                    readonly property var displayedCatalog: catalogExpectedId > 0 && window.state.routing_catalog && window.state.routing_catalog.request_id === catalogExpectedId ? window.state.routing_catalog : null
+                    function invalidateCatalog() { catalogExpectedId = 0 }
+                    function requestCatalog(offset) {
+                        invalidateCatalog()
+                        const id = window.nextCatalogRequestId()
+                        catalogRequestLimit = id === 0
+                        if (!id) return
+                        catalogExpectedId = id
+                        window.send({command: "routing_catalog", request_id: id, processes: processCatalog.checked, query: catalogQuery.text, offset: offset})
                     }
-                }
-                TextField { id: explainTarget; objectName: "routingExplainTarget"; Layout.fillWidth: true; placeholderText: window.tr("Почему такой маршрут: IP или домен (синтетический ввод)", "Explain route: IP or domain (synthetic input)"); maximumLength: 253 }
-                ActionButton { objectName: "routingExplainButton"; text: window.tr("Проверить правило", "Explain saved draft"); onClicked: window.sendRouting({command: "routing_explain", target: explainTarget.text}) }
-                PlainLabel {
-                    objectName: "routingExplanation"
-                    Layout.fillWidth: true
-                    property var explanation: window.state.routing_explanation
-                    visible: !!explanation && explanation.revision === window.state.routing_revision && explanation.request_id === window.routingRequestId
-                    text: !explanation ? "" : explanation.result.status === "fixture" ? window.tr("Предварительный расчёт: ", "Preliminary evaluation: ") + explanation.result.action + " · " + explanation.result.origin : window.tr("Неизвестно: ", "Unknown: ") + (explanation.result.reason === "application_witness_missing" ? window.tr("нет подтверждённой атрибуции приложения", "no verified application attribution") : (explanation.result.reason === "dns_witness_missing" || explanation.result.reason === "dns_missing") ? window.tr("нет подтверждённых DNS-данных", "no verified DNS evidence") : window.isUnsupportedSelector(explanation.result.reason) ? window.tr("неприменимый селектор правила #", "unsupported selector in rule #") + explanation.result.rule_id : explanation.result.reason === "evaluation_rejected" ? window.tr("вход отклонён вычислителем", "input rejected by evaluator") : window.tr("причина недоступна", "reason unavailable")) + window.tr(". Это не проверка применения.", ". This does not verify application of routing.")
-                }
-                RowLayout {
-                    objectName: "routingDefaultRow"
-                    PlainLabel { text: window.tr("Остальной трафик", "Other traffic") }
-                    ChoiceBox { model: ["Proxy", "Direct", "Block"]; currentIndex: window.state.routing ? ["proxy", "direct", "block"].indexOf(window.state.routing.default_action) : 0; onActivated: window.sendRouting({command: "routing_default", action: ["proxy", "direct", "block"][currentIndex]}) }
-                }
-                Repeater {
-                    model: window.state.routing ? window.state.routing.rules : []
-                    delegate: ColumnLayout {
-                        id: ruleRow
-                        required property var modelData
+                    property var formRevision: window.state.routing_revision
+                    property double pendingRequest: 0
+                    property string saveError: ""
+                    function settle() {
+                        const ack = window.routingFeedback
+                        if (!pendingRequest || !ack || ack.request_id !== pendingRequest) return
+                        pendingRequest = 0
+                        saveError = ack.error || ""
+                        if (!saveError) {
+                            selectedId = ack.saved_id
+                            formRevision = window.state.routing_revision
+                        }
+                    }
+                    Connections { target: window; function onRoutingFeedbackChanged() { editor.settle() } }
+                    width: routingScroll.availableWidth
+                    spacing: 12
+                    property bool advanced: false
+                    property double selectedId: 0
+                    property var transport: undefined
+                    property var platformSources: undefined
+                    function newRule() {
+                        resetPlatformSources()
+                        transport = undefined
+                        selectedId = 0
+                        formRevision = window.state.routing_revision
+                        saveError = ""
+                        executableInput.clear()
+                        domainInput.clear()
+                        cidrInput.clear()
+                        protocolInput.clear()
+                        portInput.clear()
+                        actionInput.currentIndex = 0
+                        enabledInput.checked = true
+                        broadInput.checked = false
+                    }
+                    function resetPlatformSources() { platformSources = undefined }
+                    property int simpleGroup: 0
+                    function values(text) { return text.split("\n").map(s => s.trim()).filter(s => s.length > 0) }
+                    function load(rule) {
+                        transport = rule.transport === undefined ? undefined : JSON.parse(JSON.stringify(rule.transport))
+                        protocolInput.text = transport && transport.transport_protocols ? transport.transport_protocols.join(",") : ""
+                        portInput.text = transport && transport.destination_ports ? transport.destination_ports.map(p => p[0] === p[1] ? String(p[0]) : p[0] + "-" + p[1]).join(",") : ""
+                        platformSources = rule.platform_sources === undefined ? undefined : JSON.parse(JSON.stringify(rule.platform_sources))
+                        selectedId = rule.id
+                        formRevision = window.state.routing_revision
+                        saveError = ""
+                        executableInput.text = rule.executables.join("\n")
+                        domainInput.text = rule.domains.join("\n")
+                        cidrInput.text = rule.destinations.join("\n")
+                        actionInput.currentIndex = ["proxy", "direct", "block"].indexOf(rule.action)
+                        enabledInput.checked = rule.enabled
+                        broadInput.checked = false
+                    }
+                    function order(id, delta, remove) {
+                        let ids = window.state.routing.rules.map(r => r.id)
+                        let index = ids.indexOf(id)
+                        if (remove) {
+                            window.sendRouting({command: "routing_delete", id: id})
+                            return
+                        }
+                        if (index + delta >= 0 && index + delta < ids.length) {
+                            let other = ids[index + delta]; ids[index + delta] = id; ids[index] = other
+                        }
+                        window.sendRouting({command: "routing_order", ids: ids})
+                    }
+                    ColumnLayout {
+                        visible: routingTabs.currentIndex === 0
                         Layout.fillWidth: true
-                        PlainLabel { Layout.fillWidth: true; text: "#" + ruleRow.modelData.id + " · " + ruleRow.modelData.action + (ruleRow.modelData.enabled ? "" : window.tr(" · выключено", " · disabled")) }
-                        SmallLabel { Layout.fillWidth: true; text: (ruleRow.modelData.transport ? window.tr("Транспортное условие (активация недоступна) · ", "Transport condition (activation unavailable) · ") : "") + (ruleRow.modelData.platform_sources && ruleRow.modelData.platform_sources.length ? window.tr("Платформенный селектор неприменим на Linux", "Platform selector is unsupported on Linux") : (ruleRow.modelData.executables.concat(ruleRow.modelData.domains, ruleRow.modelData.destinations).join(" ∧/∨ ") || window.tr("Любой трафик: перекрывает последующие правила", "Any traffic: shadows following rules"))) }
+                        Layout.minimumWidth: 0
+                        spacing: 8
+                        ActionButton { Layout.fillWidth: true; text: window.tr("Новое правило", "New rule"); highlighted: true; onClicked: { editor.newRule(); routingTabs.currentIndex = 1 } }
                         RowLayout {
-                            ActionButton { objectName: "routingEdit" + ruleRow.modelData.id; text: window.tr("Изменить", "Edit"); onClicked: editor.load(ruleRow.modelData) }
-                            ActionButton { objectName: "routingUp" + ruleRow.modelData.id; text: "↑"; Accessible.name: window.tr("Выше", "Move up"); onClicked: editor.order(ruleRow.modelData.id, -1, false) }
-                            ActionButton { text: "↓"; Accessible.name: window.tr("Ниже", "Move down"); onClicked: editor.order(ruleRow.modelData.id, 1, false) }
-                            ActionButton { text: "×"; Accessible.name: window.tr("Удалить", "Delete"); onClicked: editor.order(ruleRow.modelData.id, 0, true) }
+                            objectName: "routingDefaultRow"
+                            PlainLabel { text: window.tr("Остальной трафик", "Other traffic") }
+                            ChoiceBox { model: ["Proxy", "Direct", "Block"]; currentIndex: window.state.routing ? ["proxy", "direct", "block"].indexOf(window.state.routing.default_action) : 0; onActivated: window.sendRouting({command: "routing_default", action: ["proxy", "direct", "block"][currentIndex]}) }
                         }
-                        ActionButton { objectName: "routingDuplicate" + ruleRow.modelData.id; text: window.tr("Дублировать", "Duplicate"); onClicked: { editor.load(ruleRow.modelData); editor.selectedId = 0; editor.formRevision = window.state.routing_revision } }
-                        Divider {}
+                        Repeater {
+                            model: window.state.routing ? window.state.routing.rules : []
+                            delegate: ColumnLayout {
+                                id: ruleRow
+                                required property var modelData
+                                Layout.fillWidth: true
+                                PlainLabel { Layout.fillWidth: true; text: "#" + ruleRow.modelData.id + " · " + ruleRow.modelData.action + (ruleRow.modelData.enabled ? "" : window.tr(" · выключено", " · disabled")) }
+                                SmallLabel { Layout.fillWidth: true; text: (ruleRow.modelData.transport ? window.tr("Транспортное условие (активация недоступна) · ", "Transport condition (activation unavailable) · ") : "") + (ruleRow.modelData.platform_sources && ruleRow.modelData.platform_sources.length ? window.tr("Платформенный селектор неприменим на Linux", "Platform selector is unsupported on Linux") : (ruleRow.modelData.executables.concat(ruleRow.modelData.domains, ruleRow.modelData.destinations).join(" ∧/∨ ") || window.tr("Любой трафик: перекрывает последующие правила", "Any traffic: shadows following rules"))) }
+                                RowLayout {
+                                    ActionButton { objectName: "routingEdit" + ruleRow.modelData.id; text: window.tr("Изменить", "Edit"); onClicked: { editor.load(ruleRow.modelData); routingTabs.currentIndex = 1 } }
+                                    ActionButton { objectName: "routingUp" + ruleRow.modelData.id; text: "↑"; Accessible.name: window.tr("Выше", "Move up"); onClicked: editor.order(ruleRow.modelData.id, -1, false) }
+                                    ActionButton { text: "↓"; Accessible.name: window.tr("Ниже", "Move down"); onClicked: editor.order(ruleRow.modelData.id, 1, false) }
+                                    ActionButton { text: "×"; Accessible.name: window.tr("Удалить", "Delete"); onClicked: editor.order(ruleRow.modelData.id, 0, true) }
+                                }
+                                ActionButton { objectName: "routingDuplicate" + ruleRow.modelData.id; text: window.tr("Дублировать", "Duplicate"); onClicked: { editor.load(ruleRow.modelData); editor.selectedId = 0; editor.formRevision = window.state.routing_revision; routingTabs.currentIndex = 1 } }
+                                Divider {}
+                            }
+                        }
+                        ActionButton {
+                            objectName: "routingApplyButton"
+                            text: window.tr("Применить к сети", "Apply to network")
+                            enabled: window.state.selected_kind !== "xray" && window.state.ready && !window.state.busy && !window.routingPending && window.state.engine === "xray" && window.state.connection_mode === "system" && window.state.system_tun_available && !window.state.system_busy && !window.state.can_stop && !window.state.system_recovery_pending && !!window.state.selected_profile && window.state.source_generation !== null
+                            onClicked: window.sendRouting({command: "routing_apply", source_generation: window.state.source_generation, snapshot_revision: window.state.revision, selected_profile_id: window.state.selected_profile})
+                        }
+                        SmallLabel { Layout.fillWidth: true; text: window.tr("Для применения правил системный помощник должен подтвердить доступ. Проверка правил сама по себе не проверяет подключение и привязку приложений.", "The system helper must confirm access before applying rules. Rule validation alone does not verify connectivity or application attribution.") }
                     }
-                }
-                ChoiceBox { visible: !editor.advanced; model: [window.tr("Программа", "Executable"), window.tr("Домен", "Domain"), "IP / CIDR"]; onActivated: editor.simpleGroup = currentIndex }
-                TextField { id: catalogQuery; objectName: "routingCatalogQuery"; onTextChanged: editor.invalidateCatalog(); Layout.fillWidth: true; placeholderText: window.tr("Поиск программы", "Search applications") }
-                CheckBox { id: processCatalog; objectName: "routingCatalogProcesses"; onCheckedChanged: editor.invalidateCatalog(); text: window.tr("Запущенные процессы", "Running processes") }
-                ActionButton { objectName: "routingCatalogLoad"; text: window.tr("Загрузить каталог", "Load catalog"); onClicked: editor.requestCatalog(0) }
-                SmallLabel { objectName: "routingCatalogLimit"; Layout.fillWidth: true; visible: editor.catalogRequestLimit; text: window.tr("Исчерпан счётчик запросов каталога. Перезапустите приложение.", "Catalog request counter exhausted. Restart the application.") }
-                SmallLabel { Layout.fillWidth: true; text: window.tr("Каталог читается только по запросу. Wrapper/интерпретатор может быть неподдержан. PID — диагностика; выбор сохраняет только точный executable для следующих запусков.", "Catalog is read on demand. Wrappers/interpreters may be unsupported. PID is diagnostic; selection saves only the exact executable for future launches.") }
-                SmallLabel { Layout.fillWidth: true; visible: !!editor.displayedCatalog && editor.displayedCatalog.incomplete; text: window.tr("Каталог неполный: достигнут лимит или нет доступа", "Incomplete catalog: limit reached or access denied") }
-                Repeater {
-                    objectName: "routingCatalogRows"
-                    model: editor.displayedCatalog ? editor.displayedCatalog.items : []
-                    delegate: ActionButton {
-                        required property var modelData
+                    ColumnLayout {
+                        visible: routingTabs.currentIndex === 1
                         Layout.fillWidth: true
-                        text: modelData.name + (modelData.pid ? " · PID " + modelData.pid : "") + (modelData.executable ? " · " + modelData.executable : window.tr(" · не поддерживается: ", " · unsupported: ") + modelData.unsupported)
-                        enabled: !!modelData.executable
-                        onClicked: executableInput.text = modelData.executable
+                        Layout.minimumWidth: 0
+                        spacing: 8
+                        ActionButton { objectName: "routingModeButton"; text: editor.advanced ? window.tr("Простой режим", "Simple mode") : window.tr("Расширенный режим", "Advanced mode"); onClicked: editor.advanced = !editor.advanced }
+                        SmallLabel { visible: editor.advanced; Layout.fillWidth: true; text: window.tr("Совпасть должны все группы. Внутри группы достаточно одной строки.", "All groups must match. Within each group, one matching line is enough.") }
+                        ChoiceBox { visible: !editor.advanced; model: [window.tr("Программа", "Executable"), window.tr("Домен", "Domain"), "IP / CIDR"]; onActivated: editor.simpleGroup = currentIndex }
+                        PlainLabel { objectName: "routingRuleIdentity"; text: editor.selectedId ? window.tr("Редактирование #", "Editing #") + editor.selectedId : window.tr("Новое правило", "New rule") }
+                        SmallLabel { visible: editor.advanced || editor.simpleGroup === 0; Layout.fillWidth: true; text: window.tr("Путь к исполняемому файлу", "Path to the executable") }
+                        TextArea { visible: editor.advanced || editor.simpleGroup === 0; id: executableInput; objectName: "routingExecutable"; Layout.fillWidth: true; placeholderText: "/usr/bin/browser"; wrapMode: TextEdit.Wrap; selectByMouse: true }
+                        ActionButton {
+                            id: catalogToggle
+                            objectName: "routingCatalogToggle"
+                            visible: editor.advanced || editor.simpleGroup === 0
+                            checkable: true
+                            text: checked ? window.tr("Скрыть каталог программ", "Hide applications")
+                                          : window.tr("Выбрать программу…", "Choose an application…")
+                        }
+                        SettingsGroup {
+                            visible: catalogToggle.visible && catalogToggle.checked
+                            TextField { id: catalogQuery; objectName: "routingCatalogQuery"; onTextChanged: editor.invalidateCatalog(); Layout.fillWidth: true; placeholderText: window.tr("Поиск программы", "Search applications") }
+                            CheckBox { id: processCatalog; objectName: "routingCatalogProcesses"; onCheckedChanged: editor.invalidateCatalog(); text: window.tr("Запущенные процессы", "Running processes") }
+                            ActionButton { objectName: "routingCatalogLoad"; text: window.tr("Загрузить каталог", "Load catalog"); onClicked: editor.requestCatalog(0) }
+                            SmallLabel { objectName: "routingCatalogLimit"; Layout.fillWidth: true; visible: editor.catalogRequestLimit; text: window.tr("Исчерпан счётчик запросов каталога. Перезапустите приложение.", "Catalog request counter exhausted. Restart the application.") }
+                            SmallLabel { Layout.fillWidth: true; text: window.tr("Выберите программу, чтобы подставить её путь. PID нужен только для справки.", "Select an application to insert its path. The PID is shown for reference only.") }
+                            SmallLabel { Layout.fillWidth: true; visible: !!editor.displayedCatalog && editor.displayedCatalog.incomplete; text: window.tr("Каталог неполный: достигнут лимит или нет доступа", "Incomplete catalog: limit reached or access denied") }
+                            Repeater {
+                                objectName: "routingCatalogRows"
+                                model: editor.displayedCatalog ? editor.displayedCatalog.items : []
+                                delegate: ActionButton {
+                                    required property var modelData
+                                    Layout.fillWidth: true
+                                    text: modelData.name + (modelData.pid ? " · PID " + modelData.pid : "") + (modelData.executable ? " · " + modelData.executable : window.tr(" · не поддерживается: ", " · unsupported: ") + modelData.unsupported)
+                                    enabled: !!modelData.executable
+                                    onClicked: { executableInput.text = modelData.executable; catalogToggle.checked = false }
+                                }
+                            }
+                            RowLayout {
+                                visible: !!editor.displayedCatalog && editor.displayedCatalog.total > 32
+                                ActionButton { objectName: "routingCatalogPrevious"; text: window.tr("Назад", "Previous"); enabled: !!editor.displayedCatalog && editor.displayedCatalog.offset > 0; onClicked: editor.requestCatalog(Math.max(0, editor.displayedCatalog.offset - 32)) }
+                                ActionButton { objectName: "routingCatalogNext"; text: window.tr("Далее", "Next"); enabled: !!editor.displayedCatalog && editor.displayedCatalog.offset + 32 < editor.displayedCatalog.total; onClicked: editor.requestCatalog(editor.displayedCatalog.offset + 32) }
+                            }
+                        }
+                        SmallLabel { visible: editor.advanced || editor.simpleGroup === 1; text: window.tr("Домен или *.суффикс", "Domain or *.suffix") }
+                        TextArea { visible: editor.advanced || editor.simpleGroup === 1; id: domainInput; objectName: "routingDomain"; Layout.fillWidth: true; placeholderText: "example.org"; wrapMode: TextEdit.Wrap; selectByMouse: true }
+                        SmallLabel { visible: editor.advanced || editor.simpleGroup === 2; text: window.tr("IP или канонический CIDR", "IP or canonical CIDR") }
+                        TextArea { visible: editor.advanced || editor.simpleGroup === 2; id: cidrInput; objectName: "routingCidr"; Layout.fillWidth: true; placeholderText: "192.0.2.0/24"; wrapMode: TextEdit.Wrap; selectByMouse: true }
+                        SmallLabel { visible: editor.advanced; Layout.fillWidth: true; text: window.tr("По одному значению на строку. Process name, UID, cgroup и PID не поддерживаются текущей моделью.", "One value per line. Process names, UID, cgroup and PID are unsupported by the current model.") }
+                        SettingsGroup {
+                            visible: editor.advanced || editor.transport !== undefined
+                            SmallLabel { Layout.fillWidth: true; text: window.tr("Транспорт: TCP или UDP. До 16 диапазонов портов назначения (1–65535). Активация пока недоступна.", "Transport: TCP or UDP. Up to 16 destination port ranges (1–65535). Activation is unavailable.") }
+                            TextField { id: protocolInput; objectName: "routingProtocols"; Layout.fillWidth: true; maximumLength: 7; placeholderText: "tcp,udp" }
+                            TextField { id: portInput; objectName: "routingPorts"; Layout.fillWidth: true; maximumLength: 191; placeholderText: "443,8000-8080" }
+                        }
+                        ChoiceBox { id: actionInput; model: ["Proxy", "Direct", "Block"] }
+                        CheckBox { id: enabledInput; objectName: "routingEnabled"; checked: true; text: window.tr("Правило включено", "Rule enabled") }
+                        CheckBox { id: broadInput; text: window.tr("Разрешить для всего трафика", "Confirm matching all traffic") }
+                        RowLayout {
+                            ActionButton {
+                                objectName: "routingSaveRule"
+                                text: window.tr("Подтвердить", "Confirm")
+                                onClicked: {
+                                    const protocols = protocolInput.text.trim()
+                                    const ports = portInput.text.trim()
+                                    if (protocols.length > 7 || ports.length > 191 || (protocols && !/^(tcp|udp)(,(tcp|udp))?$/.test(protocols)) || (ports && !/^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$/.test(ports))) { editor.saveError = "transport_input"; return }
+                                    editor.transport = protocols || ports || editor.transport !== undefined ? {} : undefined
+                                    if (protocols) editor.transport.transport_protocols = protocols.split(",")
+                                    if (ports) editor.transport.destination_ports = ports.split(",").map(s => { const p = s.split("-").map(Number); return [p[0], p.length === 1 ? p[0] : p[1]] })
+                                    const rules = window.state.routing.rules
+                                    const id = editor.selectedId || (rules.reduce((n, r) => Math.max(n, r.id), 0) + 1)
+                                    editor.saveError = ""
+                                    editor.pendingRequest = window.sendRouting({command: "edit_routing", expected_revision: editor.formRevision, create: editor.selectedId === 0, confirm_broad: broadInput.checked, rule: {id: id, transport: editor.transport, platform_sources: editor.platformSources, enabled: enabledInput.checked, executables: editor.values(executableInput.text), domains: editor.values(domainInput.text), destinations: editor.values(cidrInput.text), action: ["proxy", "direct", "block"][actionInput.currentIndex]}})
+                                    editor.settle()
+                                }
+                            }
+                            ActionButton { text: window.tr("Как новое", "As new"); onClicked: { editor.resetPlatformSources(); editor.selectedId = 0; editor.formRevision = window.state.routing_revision; editor.saveError = "" } }
+                        }
+                        PlainLabel { objectName: "routingSaveError"; Layout.fillWidth: true; visible: !!editor.saveError || !!(window.routingFeedback && window.routingFeedback.error); text: window.errorText(editor.saveError || (window.routingFeedback ? window.routingFeedback.error : "")) }
                     }
-                }
-                RowLayout {
-                    ActionButton { objectName: "routingCatalogPrevious"; text: window.tr("Назад", "Previous"); enabled: !!editor.displayedCatalog && editor.displayedCatalog.offset > 0; onClicked: editor.requestCatalog(Math.max(0, editor.displayedCatalog.offset - 32)) }
-                    ActionButton { objectName: "routingCatalogNext"; text: window.tr("Далее", "Next"); enabled: !!editor.displayedCatalog && editor.displayedCatalog.offset + 32 < editor.displayedCatalog.total; onClicked: editor.requestCatalog(editor.displayedCatalog.offset + 32) }
-                }
-                PlainLabel { objectName: "routingRuleIdentity"; text: editor.selectedId ? window.tr("Редактирование #", "Editing #") + editor.selectedId : window.tr("Новое правило", "New rule") }
-                SmallLabel { visible: editor.advanced || editor.simpleGroup === 0; Layout.fillWidth: true; text: window.tr("Точный путь программы (для следующих запусков, без наследования дочерними процессами)", "Exact executable path (future launches, no child process inheritance)") }
-                TextArea { visible: editor.advanced || editor.simpleGroup === 0; id: executableInput; objectName: "routingExecutable"; Layout.fillWidth: true; placeholderText: "/usr/bin/browser"; wrapMode: TextEdit.Wrap; selectByMouse: true }
-                SmallLabel { visible: editor.advanced || editor.simpleGroup === 1; text: window.tr("Домен или *.суффикс", "Domain or *.suffix") }
-                TextArea { visible: editor.advanced || editor.simpleGroup === 1; id: domainInput; objectName: "routingDomain"; Layout.fillWidth: true; placeholderText: "example.org"; wrapMode: TextEdit.Wrap; selectByMouse: true }
-                SmallLabel { visible: editor.advanced || editor.simpleGroup === 2; text: window.tr("IP или канонический CIDR", "IP or canonical CIDR") }
-                TextArea { visible: editor.advanced || editor.simpleGroup === 2; id: cidrInput; objectName: "routingCidr"; Layout.fillWidth: true; placeholderText: "192.0.2.0/24"; wrapMode: TextEdit.Wrap; selectByMouse: true }
-                SmallLabel { visible: editor.advanced; Layout.fillWidth: true; text: window.tr("По одному значению на строку. Process name, UID, cgroup и PID не поддерживаются текущей моделью.", "One value per line. Process names, UID, cgroup and PID are unsupported by the current model.") }
-                SmallLabel { Layout.fillWidth: true; text: window.tr("Транспорт: TCP или UDP. До 16 диапазонов портов назначения (1–65535). Активация пока недоступна.", "Transport: TCP or UDP. Up to 16 destination port ranges (1–65535). Activation is unavailable.") }
-                TextField { id: protocolInput; objectName: "routingProtocols"; maximumLength: 7; placeholderText: "tcp,udp" }
-                TextField { id: portInput; objectName: "routingPorts"; maximumLength: 191; placeholderText: "443,8000-8080" }
-                ChoiceBox { id: actionInput; model: ["Proxy", "Direct", "Block"] }
-                CheckBox { id: enabledInput; objectName: "routingEnabled"; checked: true; text: window.tr("Правило включено", "Rule enabled") }
-                CheckBox { id: broadInput; text: window.tr("Разрешить для всего трафика", "Confirm matching all traffic") }
-                RowLayout {
-                    ActionButton {
-                        objectName: "routingSaveRule"
-                        text: window.tr("Подтвердить", "Confirm")
-                        onClicked: {
-                            const protocols = protocolInput.text.trim()
-                            const ports = portInput.text.trim()
-                            if (protocols.length > 7 || ports.length > 191 || (protocols && !/^(tcp|udp)(,(tcp|udp))?$/.test(protocols)) || (ports && !/^\d{1,5}(-\d{1,5})?(,\d{1,5}(-\d{1,5})?)*$/.test(ports))) { editor.saveError = "transport_input"; return }
-                            editor.transport = protocols || ports || editor.transport !== undefined ? {} : undefined
-                            if (protocols) editor.transport.transport_protocols = protocols.split(",")
-                            if (ports) editor.transport.destination_ports = ports.split(",").map(s => { const p = s.split("-").map(Number); return [p[0], p.length === 1 ? p[0] : p[1]] })
-                            const rules = window.state.routing.rules
-                            const id = editor.selectedId || (rules.reduce((n, r) => Math.max(n, r.id), 0) + 1)
-                            editor.saveError = ""
-                            editor.pendingRequest = window.sendRouting({command: "edit_routing", expected_revision: editor.formRevision, create: editor.selectedId === 0, confirm_broad: broadInput.checked, rule: {id: id, transport: editor.transport, platform_sources: editor.platformSources, enabled: enabledInput.checked, executables: editor.values(executableInput.text), domains: editor.values(domainInput.text), destinations: editor.values(cidrInput.text), action: ["proxy", "direct", "block"][actionInput.currentIndex]}})
-                            editor.settle()
+                    ColumnLayout {
+                        visible: routingTabs.currentIndex === 2
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        spacing: 8
+                        PresetPanel {
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            snapshot: window.state.presets || ({})
+                            routing: window.state.routing || ({})
+                            routingRevision: window.state.routing_revision
+                            language: window.language
+                            onCommand: payload => window.send(payload)
                         }
                     }
-                    ActionButton { text: window.tr("Как новое", "As new"); onClicked: { editor.resetPlatformSources(); editor.selectedId = 0; editor.formRevision = window.state.routing_revision; editor.saveError = "" } }
+                    ColumnLayout {
+                        visible: routingTabs.currentIndex === 3
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        spacing: 8
+                        SmallLabel { objectName: "routingDiagnosticsScope"; Layout.fillWidth: true; text: window.tr("Ограниченная диагностика сохранённой ревизии ", "Limited diagnostics for saved revision ") + window.state.routing_revision + window.tr(". Отсутствие предупреждений не доказывает совместимость. VPN/LAN здесь не настроены.", ". No warnings does not prove compatibility. VPN/LAN are not configured here.") }
+                        SmallLabel { objectName: "routingDiagnosticsIncomplete"; Layout.fillWidth: true; visible: !!window.state.routing_diagnostics && window.state.routing_diagnostics.incomplete; text: window.state.routing_diagnostics && window.isUnsupportedSelector(window.state.routing_diagnostics.error) ? window.tr("Правило #", "Rule #") + window.state.routing_diagnostics.rule_id + window.tr(": селектор неприменим на Linux", ": selector is unsupported on Linux") : window.state.routing_diagnostics && window.state.routing_diagnostics.stale ? window.tr("Отчёт устарел: черновик изменился. Требуется актуальный снимок.", "Report is stale: the draft changed. A current snapshot is required.") : window.tr("Анализ неполный: достигнут лимит или вход не поддерживается.", "Analysis is incomplete: a limit was reached or input is unsupported.") }
+                        Repeater {
+                            model: window.state.routing_diagnostics ? window.state.routing_diagnostics.warnings : []
+                            delegate: SmallLabel {
+                                required property var modelData
+                                Layout.fillWidth: true
+                                text: "#" + modelData.rule_id + " ← " + modelData.earlier + (modelData.kind === "shadowed" ? window.tr(" · условия перекрыты старшим правилом", " · conditions shadowed by an earlier rule") : window.tr(" · возможное пересечение; существование потока не доказано", " · possible overlap; existence of a flow is unproven"))
+                            }
+                        }
+                        TextField { id: explainTarget; objectName: "routingExplainTarget"; Layout.fillWidth: true; placeholderText: window.tr("IP или домен", "IP or domain"); maximumLength: 253 }
+                        ActionButton { objectName: "routingExplainButton"; text: window.tr("Проверить правило", "Explain saved draft"); onClicked: window.sendRouting({command: "routing_explain", target: explainTarget.text}) }
+                        PlainLabel {
+                            objectName: "routingExplanation"
+                            Layout.fillWidth: true
+                            property var explanation: window.state.routing_explanation
+                            visible: !!explanation && explanation.revision === window.state.routing_revision && explanation.request_id === window.routingRequestId
+                            text: !explanation ? "" : explanation.result.status === "fixture" ? window.tr("Предварительный расчёт: ", "Preliminary evaluation: ") + explanation.result.action + " · " + explanation.result.origin : window.tr("Неизвестно: ", "Unknown: ") + (explanation.result.reason === "application_witness_missing" ? window.tr("нет подтверждённой атрибуции приложения", "no verified application attribution") : (explanation.result.reason === "dns_witness_missing" || explanation.result.reason === "dns_missing") ? window.tr("нет подтверждённых DNS-данных", "no verified DNS evidence") : window.isUnsupportedSelector(explanation.result.reason) ? window.tr("неприменимый селектор правила #", "unsupported selector in rule #") + explanation.result.rule_id : explanation.result.reason === "evaluation_rejected" ? window.tr("вход отклонён вычислителем", "input rejected by evaluator") : window.tr("причина недоступна", "reason unavailable")) + window.tr(". Это не проверка применения.", ". This does not verify application of routing.")
+                        }
+                        // Конец блока проверки маршрутов.
+                    }
                 }
-                PlainLabel { objectName: "routingSaveError"; Layout.fillWidth: true; visible: !!editor.saveError || !!(window.routingFeedback && window.routingFeedback.error); text: window.errorText(editor.saveError || (window.routingFeedback ? window.routingFeedback.error : "")) }
-                ActionButton {
-                    objectName: "routingApplyButton"
-                    text: window.tr("Применить к сети", "Apply to network")
-                    enabled: window.state.selected_kind !== "xray" && window.state.ready && !window.state.busy && !window.routingPending && window.state.engine === "xray" && window.state.connection_mode === "system" && window.state.system_tun_available && !window.state.system_busy && !window.state.can_stop && !window.state.system_recovery_pending && !!window.state.selected_profile && window.state.source_generation !== null
-                    onClicked: window.sendRouting({command: "routing_apply", source_generation: window.state.source_generation, snapshot_revision: window.state.revision, selected_profile_id: window.state.selected_profile})
-                }
-                SmallLabel { Layout.fillWidth: true; text: window.tr("Для применения правил системный помощник должен подтвердить доступ. Проверка правил сама по себе не проверяет подключение и привязку приложений.", "The system helper must confirm access before applying rules. Rule validation alone does not verify connectivity or application attribution.") }
             }
         }
     }
+
     Component {
         id: connectionPanel
         PanelScroll {
@@ -1315,72 +1452,96 @@ ApplicationWindow {
     }
     Component {
         id: schedulePanel
-        PanelScroll {
-            id: startupScroll
-            ColumnLayout {
-                width: startupScroll.availableWidth
-                spacing: 18
-                PlainLabel { text: window.tr("Запуск приложения", "Application startup"); font.pixelSize: 19; font.weight: Font.DemiBold }
-                CheckBox {
-                    objectName: "autostartIntoTray"
-                    enabled: window.state.ready && !window.startupPending && !window.state.preferences_warning
-                    text: window.tr("Автозапуск в трей при входе", "Start in tray at login")
-                    checked: !!window.state.startup && window.state.startup.autostart_into_tray
-                    onClicked: window.saveStartup(false, checked, window.state.startup.autoconnect)
+        ColumnLayout {
+            spacing: 10
+            PlainLabel { text: window.tr("Запуск и обновления", "Startup and updates"); font.pixelSize: 19; font.weight: Font.DemiBold }
+            SettingsTabs {
+                id: scheduleTabs
+                pages: [
+                    {id: "startupTab", label: window.tr("Запуск", "Startup")},
+                    {id: "updatesTab", label: window.tr("Подписки", "Subscriptions")}
+                ]
+                onCurrentIndexChanged: if (startupScroll.contentItem) startupScroll.contentItem.contentY = 0
+            }
+            PanelScroll {
+                id: startupScroll
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                ColumnLayout {
+                    width: startupScroll.availableWidth
+                    spacing: 10
+                    SettingsGroup {
+                        visible: scheduleTabs.currentIndex === 0
+                        MintSwitch {
+                            objectName: "autostartIntoTray"
+                            enabled: window.state.ready && !window.startupPending && !window.state.preferences_warning
+                            text: window.tr("Автозапуск в трей при входе", "Start in tray at login")
+                            checked: !!window.state.startup && window.state.startup.autostart_into_tray
+                            onClicked: window.saveStartup(false, checked, window.state.startup.autoconnect)
+                        }
+                        MintSwitch {
+                            objectName: "startupAutoconnect"
+                            enabled: window.state.ready && !window.startupPending && !window.state.preferences_warning
+                            text: window.tr("Автоподключение при запуске", "Connect at startup")
+                            checked: !!window.state.startup && window.state.startup.autoconnect
+                            onClicked: window.saveStartup(false, window.state.startup.autostart_into_tray, checked)
+                        }
+                        PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.state.startup && window.state.startup.target ? window.tr("Цель: ", "Target: ") + window.state.startup.target : window.tr("Цель не подтверждена", "No confirmed target") }
+                        PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Выбрано: ", "Selected: ") + (window.state.selected_name || "—") + " · " + (window.state.engine || "—") + " · " + (window.state.connection_mode || "—") }
+                        ActionButton {
+                            objectName: "confirmStartupTarget"
+                            text: window.tr("Подтвердить текущую цель", "Confirm current target")
+                            enabled: window.state.selected_kind !== "xray" && window.state.ready && !!window.state.selected_profile && !window.state.ephemeral && !window.startupPending && !window.state.preferences_warning
+                            onClicked: window.saveStartup(true, false, false)
+                        }
+                        PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Подтвердите сервер и параметры для следующих запусков. Приложение подключится при запуске, если включено автоподключение.", "Confirm the server and settings for future launches. The app connects at startup when autoconnect is enabled.") }
+                        PlainLabel {
+                            Layout.fillWidth: true; wrapMode: Text.Wrap; color: window.warning
+                            text: window.startupPending ? window.tr("Сохранение…", "Saving…") : window.state.startup && window.state.startup.xdg === "error" ? window.errorText("startup_xdg") : window.state.startup && window.state.startup.error ? window.errorText(window.state.startup.error) : window.state.startup && (window.state.startup.save === "durability_unknown" || window.state.startup.xdg === "durability_unknown") ? window.tr("Файл опубликован, надёжность записи неизвестна. Автоматические действия не выполняются.", "File published; durability unknown. No automatic actions performed.") : window.state.startup && window.state.startup.attempt === "blocked" ? window.tr("Автоподключение заблокировано до следующего запуска.", "Autoconnect blocked until the next launch.") : window.state.startup && window.state.startup.save === "durable" ? window.tr("Настройки сохранены", "Settings saved") : ""
+                        }
+                    }
+                    SettingsGroup {
+                        visible: scheduleTabs.currentIndex === 1
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        PlainLabel { text: window.tr("Обновления подписок", "Subscription updates"); font.pixelSize: 19; font.weight: Font.DemiBold }
+                        PlainLabel { text: window.tr("Интервал в часах (не менее 24)", "Interval in hours (at least 24)") }
+                        SpinBox {
+                            id: scheduleHours
+                            objectName: "subscriptionInterval"
+                            enabled: window.state.source_local === false
+                            from: 24; to: 1193046
+                            value: Math.ceil((window.state.subscription_interval_seconds || 86400) / 3600)
+                            editable: true
+                            onValueModified: window.send({command: "set_subscription_schedule", interval_seconds: value * 3600, background: window.state.subscription_background === true})
+                            Accessible.name: window.tr("Интервал обновлений в часах", "Update interval in hours")
+                        }
+                        MintSwitch {
+                            objectName: "subscriptionBackground"
+                            enabled: window.state.source_local === false
+                            text: window.tr("Разрешить обновления в фоне", "Allow background updates")
+                            checked: window.state.subscription_background === true
+                            onClicked: window.send({command: "set_subscription_schedule", interval_seconds: window.state.subscription_interval_seconds || 86400, background: checked})
+                        }
+                        PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Общее фоновое окно — 60 секунд. В неизвестной или лимитной сети и при экономии энергии обновления отложены. Отчёт обновления требует подтверждения.", "The shared background window is 60 seconds. Updates are deferred on unknown or metered networks and in power saving mode. The update report requires confirmation.") }
+                        PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; visible: window.connectionError === "preferences_write"; color: window.warning; text: visible ? window.errorText(window.connectionError) : "" }
+                    }
                 }
-                CheckBox {
-                    objectName: "startupAutoconnect"
-                    enabled: window.state.ready && !window.startupPending && !window.state.preferences_warning
-                    text: window.tr("Автоподключение при запуске", "Connect at startup")
-                    checked: !!window.state.startup && window.state.startup.autoconnect
-                    onClicked: window.saveStartup(false, window.state.startup.autostart_into_tray, checked)
-                }
-                PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.state.startup && window.state.startup.target ? window.tr("Цель: ", "Target: ") + window.state.startup.target : window.tr("Цель не подтверждена", "No confirmed target") }
-                PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Выбрано: ", "Selected: ") + (window.state.selected_name || "—") + " · " + (window.state.engine || "—") + " · " + (window.state.connection_mode || "—") }
-                ActionButton {
-                    objectName: "confirmStartupTarget"
-                    text: window.tr("Подтвердить текущую цель", "Confirm current target")
-                    enabled: window.state.selected_kind !== "xray" && window.state.ready && !!window.state.selected_profile && !window.state.ephemeral && !window.startupPending && !window.state.preferences_warning
-                    onClicked: window.saveStartup(true, false, false)
-                }
-                PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Подтверждается текущий выбранный профиль, ядро, режим и ревизия маршрутизации. Сохранение не начинает соединение. Обычный запуск остаётся видимым; без готового трея окно всегда видно.", "Confirms the currently selected profile, core, mode and routing revision. Saving does not connect. Normal launches stay visible; without a ready tray the window remains visible.") }
-                PlainLabel {
-                    Layout.fillWidth: true; wrapMode: Text.Wrap; color: window.warning
-                    text: window.startupPending ? window.tr("Сохранение…", "Saving…") : window.state.startup && window.state.startup.xdg === "error" ? window.errorText("startup_xdg") : window.state.startup && window.state.startup.error ? window.errorText(window.state.startup.error) : window.state.startup && (window.state.startup.save === "durability_unknown" || window.state.startup.xdg === "durability_unknown") ? window.tr("Файл опубликован, надёжность записи неизвестна. Автоматические действия не выполняются.", "File published; durability unknown. No automatic actions performed.") : window.state.startup && window.state.startup.attempt === "blocked" ? window.tr("Автоподключение заблокировано до следующего запуска.", "Autoconnect blocked until the next launch.") : window.state.startup && window.state.startup.save === "durable" ? window.tr("Настройки сохранены", "Settings saved") : ""
-                }
-                PlainLabel { text: window.tr("Обновления подписок", "Subscription updates"); font.pixelSize: 19; font.weight: Font.DemiBold }
-                PlainLabel { text: window.tr("Интервал в часах (не менее 24)", "Interval in hours (at least 24)") }
-                SpinBox {
-                    id: scheduleHours
-                    objectName: "subscriptionInterval"
-                    enabled: window.state.source_local === false
-                    from: 24; to: 1193046
-                    value: Math.ceil((window.state.subscription_interval_seconds || 86400) / 3600)
-                    editable: true
-                    onValueModified: window.send({command: "set_subscription_schedule", interval_seconds: value * 3600, background: window.state.subscription_background === true})
-                    Accessible.name: window.tr("Интервал обновлений в часах", "Update interval in hours")
-                }
-                CheckBox {
-                    objectName: "subscriptionBackground"
-                    enabled: window.state.source_local === false
-                    text: window.tr("Разрешить обновления в фоне", "Allow background updates")
-                    checked: window.state.subscription_background === true
-                    onClicked: window.send({command: "set_subscription_schedule", interval_seconds: window.state.subscription_interval_seconds || 86400, background: checked})
-                }
-                PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Общее фоновое окно — 60 секунд. В неизвестной или лимитной сети и при экономии энергии обновления отложены. Отчёт обновления требует подтверждения.", "The shared background window is 60 seconds. Updates are deferred on unknown or metered networks and in power saving mode. The update report requires confirmation.") }
-                PlainLabel { Layout.fillWidth: true; wrapMode: Text.Wrap; visible: window.connectionError === "preferences_write"; color: window.warning; text: visible ? window.errorText(window.connectionError) : "" }
             }
         }
     }
+
     Component {
         id: appearancePanel
         ColumnLayout {
             spacing: 18
             PlainLabel { text: window.tr("Интерфейс", "Appearance"); font.pixelSize: 19; font.weight: Font.DemiBold }
-            RowLayout {
+            SettingsGroup {
+                RowLayout {
                 PlainLabel { Layout.fillWidth: true; text: window.tr("Язык", "Language") }
                 ChoiceBox { objectName: "languageChoice"; model: ["Русский", "English"]; currentIndex: window.state.language === "en" ? 1 : 0; onActivated: window.send({command: "set_language", language: currentIndex === 0 ? "ru" : "en"}); Accessible.name: window.tr("Язык интерфейса", "Interface language") }
-                HelpButton { explanation: window.tr("Язык сохраняется и применяется после перезапуска.", "The language is saved and restored after restarting.") }
+                HelpButton { explanation: window.tr("Язык меняется сразу и сохраняется для следующих запусков.", "The language changes immediately and is remembered for future launches.") }
+            }
             }
             PlainLabel { objectName: "appearanceSaveError"; Layout.fillWidth: true; wrapMode: Text.Wrap; visible: window.connectionError === "preferences_write"; color: window.warning; text: visible ? window.errorText(window.connectionError) : "" }
             Item { Layout.fillHeight: true }
@@ -1409,7 +1570,7 @@ ApplicationWindow {
                     PlainLabel { Layout.fillWidth: true; text: window.tr("Закрытие и трей", "Window and tray") }
                     HelpButton { explanation: window.tr("С доступным треем закрытие скрывает окно; выход — в меню трея. Без трея окно остаётся открытым для управления.", "With a tray, closing hides the window; quit from the tray menu. Without a tray, the window stays open for control.") }
                 }
-                NoticesView { Layout.fillWidth: true; english: window.state.language === "en" }
+                ActionButton { objectName: "openNoticesButton"; Layout.fillWidth: true; text: window.tr("Лицензии компонентов", "Component licenses"); onClicked: noticesDialog.open() }
                 ActionButton { text: window.tr("Перечитать состояние", "Reload state"); enabled: window.state.ready && !window.state.busy; onClicked: window.send({command: "reload"}) }
                 Item { Layout.fillHeight: true }
             }
@@ -1417,216 +1578,323 @@ ApplicationWindow {
     }
     Component {
         id: diagnosticsPanel
-        PanelScroll {
-            id: diagnosticsScroll
-            objectName: "diagnosticsScroll"
-            ColumnLayout {
-                width: diagnosticsScroll.availableWidth; spacing: 14
-                LogsView { Layout.fillWidth: true; backend: window.backendForDiagnostics; english: window.state.language === "en"; response: window.state.logs || null }
-                DiagnosticsExport { Layout.fillWidth: true; backend: window.backendForDiagnostics; english: window.state.language === "en" }
-                PlainLabel { Layout.fillWidth: true; visible: !!window.connectionError || !!window.parseError; color: window.warning; text: window.parseError || (window.connectionError ? window.errorText(window.connectionError) : "") }
-                    Rectangle {
+        ColumnLayout {
+            spacing: 10
+            SectionTitle { Layout.fillWidth: true; text: window.tr("Диагностика", "Diagnostics") }
+            SettingsTabs {
+                id: diagnosticsTabs
+                pages: [
+                    {id: "diagnosticsTcpTab", label: window.tr("TCP", "TCP")},
+                    {id: "diagnosticsHttpsTab", label: window.tr("HTTPS", "HTTPS")},
+                    {id: "diagnosticsLogsTab", label: window.tr("Журнал", "Logs")}
+                ]
+                onCurrentIndexChanged: if (diagnosticsScroll.contentItem) diagnosticsScroll.contentItem.contentY = 0
+            }
+            PanelScroll {
+                id: diagnosticsScroll
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                objectName: "diagnosticsScroll"
+                ColumnLayout {
+                    width: diagnosticsScroll.availableWidth; spacing: 14
+                    ColumnLayout {
+                        visible: diagnosticsTabs.currentIndex === 0
                         Layout.fillWidth: true
-                        implicitHeight: tcpLayout.implicitHeight + 24
-                        color: "#1a1720"
-                        border.color: "#36303f"
-                        radius: 6
-                        ColumnLayout {
-                            id: tcpLayout
-                            anchors.fill: parent
-                            anchors.margins: 12
-                            spacing: 5
-                            RowLayout {
+                        Layout.minimumWidth: 0
+                        spacing: 8
+                        PlainLabel { Layout.fillWidth: true; visible: !!window.connectionError || !!window.parseError; color: window.warning; text: window.parseError || (window.connectionError ? window.errorText(window.connectionError) : "") }
+                            Rectangle {
                                 Layout.fillWidth: true
-                                PlainLabel {
-                                    Layout.fillWidth: true
-                                    text: "TCP"
-                                    font.weight: Font.DemiBold
-                                }
-                                HelpButton { explanation: window.tr("Три прямые TCP-пробы через обычную сеть. Не проверяет HTTPS, авторизацию или скорость. DNS и TCP вместе — до 5 секунд. После смены сети повторите проверку.", "Three direct TCP samples over the regular network. Does not check HTTPS, authentication or throughput. DNS and TCP together take up to 5 seconds. Rerun after network changes.") + "\n" + window.networkObservationText() }
-                            }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                ActionButton {
-                                    objectName: "tcpCheckButton"
-                                    text: window.tr("Проверить TCP", "Check TCP")
-                                    enabled: window.state.selected_kind !== "xray" && window.state.ready && window.state.selected_profile !== null && !window.state.busy && !window.state.tcp_busy
-                                    onClicked: window.send({command: "check_tcp"})
-                                }
-                                ActionButton {
-                                    objectName: "tcpCancelButton"
-                                    visible: !!window.state.tcp_busy
-                                    text: window.tr("Отменить", "Cancel")
-                                    enabled: !!window.state.tcp_busy
-                                    onClicked: window.send({command: "cancel_tcp"})
-                                }
-                            }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                ActionButton {
-                                    objectName: "batchCheckButton"
-                                    text: window.tr("Проверить источник", "Check source")
-                                    enabled: window.state.ready && window.state.source_id !== null && !window.state.busy && !(window.state.batch && window.state.batch.busy)
-                                    onClicked: window.send({command: "check_batch"})
-                                }
-                                ActionButton {
-                                    objectName: "batchCancelButton"
-                                    text: window.tr("Отменить серию", "Cancel batch")
-                                    visible: !!window.state.batch && window.state.batch.busy
-                                    onClicked: window.send({command: "cancel_batch"})
-                                }
-                            }
-                            SmallLabel {
-                                objectName: "batchProgress"
-                                Layout.fillWidth: true
-                                text: window.state.batch ? (window.state.batch.invalidated ? window.tr("Результаты устарели", "Results invalidated") : window.state.batch.completed + " / " + window.state.batch.total + (window.state.batch.cancelled ? window.tr(" · отменено", " · cancelled") : "")) : ""
-                            }
-                            Repeater {
-                                model: window.state.batch ? window.state.batch.rows : []
-                                delegate: SmallLabel {
-                                    required property var modelData
-                                    Layout.fillWidth: true
-                                    text: modelData.name + " · " + modelData.host + ":" + modelData.port + " · " + window.tcpStatusText(modelData.status) + (modelData.connect_ms !== null ? " · " + modelData.connect_ms + " ms" : "")
-                                    wrapMode: Text.Wrap
-                                }
-                            }
-                            RowLayout {
-                                visible: !!window.state.batch && window.state.batch.completed > 32
-                                ActionButton {
-                                    text: "←"
-                                    enabled: window.state.batch && window.state.batch.offset > 0
-                                    onClicked: window.send({command: "batch_page", offset: Math.max(0, window.state.batch.offset - 32)})
-                                }
-                                ActionButton {
-                                    text: "→"
-                                    enabled: window.state.batch && window.state.batch.offset + 32 < window.state.batch.completed
-                                    onClicked: window.send({command: "batch_page", offset: window.state.batch.offset + 32})
-                                }
-                            }
-                            SmallLabel {
-                                Layout.fillWidth: true
-                                visible: !!window.state.tcp_busy
-                                text: window.tr("Проверяется: ", "Checking: ") + (window.state.tcp_name || "")
-                                maximumLineCount: 2
-                                elide: Text.ElideRight
-                            }
-                            PlainLabel {
-                                Layout.fillWidth: true
-                                visible: !!window.state.tcp_result
-                                text: window.state.tcp_result ? window.tcpStatusText(window.state.tcp_result.status) : ""
-                                font.weight: Font.Medium
-                            }
-                            SmallLabel {
-                                Layout.fillWidth: true
-                                visible: !!window.state.tcp_result
-                                text: window.tcpEndpointText(window.state.tcp_result)
-                                maximumLineCount: 2
-                                elide: Text.ElideRight
-                            }
-                            SmallLabel {
-                                Layout.fillWidth: true
-                                visible: !!window.state.tcp_result
-                                text: window.tcpTimingText(window.state.tcp_result)
-                            }
-                            SmallLabel {
-                                Layout.fillWidth: true
-                                visible: !!window.state.tcp_result
-                                text: window.tcpCheckedAtText(window.state.tcp_result)
-                            }
-                            PlainLabel {
-                                Layout.fillWidth: true
-                                visible: !!window.state.tcp_invalidated
-                                text: window.tr("Обнаружено изменение сети: TCP-проверка отменена, прежний результат сброшен. Запустите проверку заново вручную.", "A network change was detected: the TCP check was cancelled and the previous result cleared. Run a new check manually.")
-                            }
-                            SmallLabel {
-                                Layout.fillWidth: true
-                                visible: !!window.state.tcp_result && !window.state.tcp_result.network_observed
-                                text: window.tr("Во время TCP-проверки наблюдение за изменениями сети было неполным. Её результат относится к моменту проверки.", "Network change monitoring was incomplete during the TCP check. Its result applies to the time of the check.")
-                            }
+                                implicitHeight: tcpLayout.implicitHeight + 24
+                                color: "#1a1720"
+                                border.color: "#36303f"
+                                radius: 6
+                                ColumnLayout {
+                                    id: tcpLayout
+                                    anchors.fill: parent
+                                    anchors.margins: 12
+                                    spacing: 5
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        PlainLabel {
+                                            Layout.fillWidth: true
+                                            text: "TCP"
+                                            font.weight: Font.DemiBold
+                                        }
+                                        HelpButton { explanation: window.tr("Три прямые TCP-пробы через обычную сеть. Не проверяет HTTPS, авторизацию или скорость. DNS и TCP вместе — до 5 секунд. После смены сети повторите проверку.", "Three direct TCP samples over the regular network. Does not check HTTPS, authentication or throughput. DNS and TCP together take up to 5 seconds. Rerun after network changes.") + "\n" + window.networkObservationText() }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        ActionButton {
+                                            objectName: "tcpCheckButton"
+                                            text: window.tr("Проверить TCP", "Check TCP")
+                                            enabled: window.state.selected_kind !== "xray" && window.state.ready && window.state.selected_profile !== null && !window.state.busy && !window.state.tcp_busy
+                                            onClicked: window.send({command: "check_tcp"})
+                                        }
+                                        ActionButton {
+                                            objectName: "tcpCancelButton"
+                                            visible: !!window.state.tcp_busy
+                                            text: window.tr("Отменить", "Cancel")
+                                            enabled: !!window.state.tcp_busy
+                                            onClicked: window.send({command: "cancel_tcp"})
+                                        }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        ActionButton {
+                                            objectName: "batchCheckButton"
+                                            text: window.tr("Проверить источник", "Check source")
+                                            enabled: window.state.ready && window.state.source_id !== null && !window.state.busy && !(window.state.batch && window.state.batch.busy)
+                                            onClicked: window.send({command: "check_batch"})
+                                        }
+                                        ActionButton {
+                                            objectName: "batchCancelButton"
+                                            text: window.tr("Отменить серию", "Cancel batch")
+                                            visible: !!window.state.batch && window.state.batch.busy
+                                            onClicked: window.send({command: "cancel_batch"})
+                                        }
+                                    }
+                                    SmallLabel {
+                                        objectName: "batchProgress"
+                                        Layout.fillWidth: true
+                                        text: window.state.batch ? (window.state.batch.invalidated ? window.tr("Результаты устарели", "Results invalidated") : window.state.batch.completed + " / " + window.state.batch.total + (window.state.batch.cancelled ? window.tr(" · отменено", " · cancelled") : "")) : ""
+                                    }
+                                    Repeater {
+                                        model: window.state.batch ? window.state.batch.rows : []
+                                        delegate: SmallLabel {
+                                            required property var modelData
+                                            Layout.fillWidth: true
+                                            text: modelData.name + " · " + modelData.host + ":" + modelData.port + " · " + window.tcpStatusText(modelData.status) + (modelData.connect_ms !== null ? " · " + modelData.connect_ms + " ms" : "")
+                                            wrapMode: Text.Wrap
+                                        }
+                                    }
+                                    RowLayout {
+                                        visible: !!window.state.batch && window.state.batch.completed > 32
+                                        ActionButton {
+                                            text: "←"
+                                            enabled: window.state.batch && window.state.batch.offset > 0
+                                            onClicked: window.send({command: "batch_page", offset: Math.max(0, window.state.batch.offset - 32)})
+                                        }
+                                        ActionButton {
+                                            text: "→"
+                                            enabled: window.state.batch && window.state.batch.offset + 32 < window.state.batch.completed
+                                            onClicked: window.send({command: "batch_page", offset: window.state.batch.offset + 32})
+                                        }
+                                    }
+                                    SmallLabel {
+                                        Layout.fillWidth: true
+                                        visible: !!window.state.tcp_busy
+                                        text: window.tr("Проверяется: ", "Checking: ") + (window.state.tcp_name || "")
+                                        maximumLineCount: 2
+                                        elide: Text.ElideRight
+                                    }
+                                    PlainLabel {
+                                        Layout.fillWidth: true
+                                        visible: !!window.state.tcp_result
+                                        text: window.state.tcp_result ? window.tcpStatusText(window.state.tcp_result.status) : ""
+                                        font.weight: Font.Medium
+                                    }
+                                    SmallLabel {
+                                        Layout.fillWidth: true
+                                        visible: !!window.state.tcp_result
+                                        text: window.tcpEndpointText(window.state.tcp_result)
+                                        maximumLineCount: 2
+                                        elide: Text.ElideRight
+                                    }
+                                    SmallLabel {
+                                        Layout.fillWidth: true
+                                        visible: !!window.state.tcp_result
+                                        text: window.tcpTimingText(window.state.tcp_result)
+                                    }
+                                    SmallLabel {
+                                        Layout.fillWidth: true
+                                        visible: !!window.state.tcp_result
+                                        text: window.tcpCheckedAtText(window.state.tcp_result)
+                                    }
+                                    PlainLabel {
+                                        Layout.fillWidth: true
+                                        visible: !!window.state.tcp_invalidated
+                                        text: window.tr("Обнаружено изменение сети: TCP-проверка отменена, прежний результат сброшен. Запустите проверку заново вручную.", "A network change was detected: the TCP check was cancelled and the previous result cleared. Run a new check manually.")
+                                    }
+                                    SmallLabel {
+                                        Layout.fillWidth: true
+                                        visible: !!window.state.tcp_result && !window.state.tcp_result.network_observed
+                                        text: window.tr("Во время TCP-проверки наблюдение за изменениями сети было неполным. Её результат относится к моменту проверки.", "Network change monitoring was incomplete during the TCP check. Its result applies to the time of the check.")
+                                    }
 
-                        }
+                                }
+                            }
                     }
-                        Divider {}
-                        RowLayout {
-                            PlainLabel { Layout.fillWidth: true; text: window.tr("Проверка HTTPS", "HTTPS check"); font.pixelSize: 18; font.weight: Font.DemiBold }
-                            HelpButton { explanation: window.tr("Проверяет HTTPS через локальный прокси при подключении. TLS проверяется, редиректы не принимаются. Меняется после отключения и применяется со следующего подключения. URL очищается после отправки.", "Checks HTTPS through the local proxy when connecting. TLS is verified; redirects are rejected. Change after disconnecting; applies to the next connection. The URL is cleared after sending.") }
-                        }
-                        SmallLabel {
-                            Layout.fillWidth: true
-                            text: (window.state.probe_custom ? window.tr("Применена своя проверка", "Custom check applied") : window.tr("Стандартная проверка: gstatic", "Default check: gstatic"))
-                                + window.tr(" · ожидается HTTP ", " · expected HTTP ") + window.state.probe_expected_status
-                                + (window.state.probe_persistent === false ? window.tr(" · URL с параметрами действует до выхода", " · URL with parameters applies until exit") : "")
-                        }
-                        SmallLabel {
-                            objectName: "probeResultLabel"
-                            Layout.fillWidth: true
-                            visible: window.state.can_stop && !!window.state.probe_result
-                            text: window.state.probe_result ? window.tr("Проверка активной сессии: ", "Active session check: ") + window.probeResultText(window.state.probe_result) : ""
-                        }
-                        SmallLabel {
-                            objectName: "probeNetworkWarning"
-                            Layout.fillWidth: true
-                            visible: window.state.can_stop && !!window.state.probe_result && !window.state.probe_result.network_observed
-                            text: window.tr("Во время HTTPS-проверки наблюдение за изменениями сети было неполным. Её результат относится к моменту проверки.", "Network change monitoring was incomplete during the HTTPS check. Its result applies to the time of the check.")
-                        }
-                        PlainLabel { text: window.tr("HTTPS URL новой проверки", "New check HTTPS URL") }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            TextField {
-                                id: probeUrl
-                                objectName: "probeUrlInput"
-                                Layout.fillWidth: true
-                                maximumLength: 2048
-                                placeholderText: "https://www.gstatic.com/generate_204"
-                                echoMode: revealProbe.checked ? TextInput.Normal : TextInput.Password
-                                selectByMouse: true
-                                enabled: window.canEditProbe
-                                inputMethodHints: Qt.ImhUrlCharactersOnly | Qt.ImhNoPredictiveText | Qt.ImhSensitiveData
-                                Accessible.name: window.tr("Секретный HTTPS URL проверки", "Secret check HTTPS URL")
-                            }
-                            CheckBox { id: revealProbe; objectName: "revealProbeUrl"; text: window.tr("Показать", "Show"); enabled: window.canEditProbe }
-                        }
-                        RowLayout {
-                            PlainLabel { Layout.fillWidth: true; text: window.tr("Ожидаемый HTTP-статус", "Expected HTTP status") }
-                            SpinBox {
-                                id: probeExpectedStatus
-                                objectName: "probeExpectedStatus"
-                                from: 200
-                                to: 299
-                                value: window.state.probe_expected_status || 204
-                                enabled: window.canEditProbe
-                                Accessible.name: window.tr("Ожидаемый HTTP-статус проверки", "Expected check HTTP status")
-                            }
-                        }
-                        RowLayout {
-                            ActionButton {
-                                objectName: "applyProbeTargetButton"
-                                text: window.tr("Применить", "Apply")
-                                enabled: window.canEditProbe && probeUrl.text.trim().length > 0
-                                onClicked: {
-                                    window.send({command: "set_probe_target", url: probeUrl.text.trim(), expected_status: probeExpectedStatus.value})
-                                    probeUrl.clear()
-                                    revealProbe.checked = false
+                    ColumnLayout {
+                        visible: diagnosticsTabs.currentIndex === 1
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        spacing: 8
+                                RowLayout {
+                                    PlainLabel { Layout.fillWidth: true; text: window.tr("Проверка HTTPS", "HTTPS check"); font.pixelSize: 18; font.weight: Font.DemiBold }
+                                    HelpButton { explanation: window.tr("Проверяет HTTPS через локальный прокси при подключении. TLS проверяется, редиректы не принимаются. Меняется после отключения и применяется со следующего подключения. URL очищается после отправки.", "Checks HTTPS through the local proxy when connecting. TLS is verified; redirects are rejected. Change after disconnecting; applies to the next connection. The URL is cleared after sending.") }
                                 }
-                            }
-                            ActionButton {
-                                objectName: "resetProbeTargetButton"
-                                text: window.tr("Сбросить проверку", "Reset check")
-                                enabled: window.canEditProbe
-                                onClicked: {
-                                    window.send({command: "reset_probe_target"})
-                                    probeUrl.clear()
-                                    revealProbe.checked = false
-                                    probeExpectedStatus.value = 204
+                                SmallLabel {
+                                    Layout.fillWidth: true
+                                    text: (window.state.probe_custom ? window.tr("Применена своя проверка", "Custom check applied") : window.tr("Стандартная проверка: gstatic", "Default check: gstatic"))
+                                        + window.tr(" · ожидается HTTP ", " · expected HTTP ") + window.state.probe_expected_status
+                                        + (window.state.probe_persistent === false ? window.tr(" · URL с параметрами действует до выхода", " · URL with parameters applies until exit") : "")
                                 }
-                            }
-                        }
-                Item { Layout.preferredHeight: 12 }
+                                SmallLabel {
+                                    objectName: "probeResultLabel"
+                                    Layout.fillWidth: true
+                                    visible: window.state.can_stop && !!window.state.probe_result
+                                    text: window.state.probe_result ? window.tr("Проверка активной сессии: ", "Active session check: ") + window.probeResultText(window.state.probe_result) : ""
+                                }
+                                SmallLabel {
+                                    objectName: "probeNetworkWarning"
+                                    Layout.fillWidth: true
+                                    visible: window.state.can_stop && !!window.state.probe_result && !window.state.probe_result.network_observed
+                                    text: window.tr("Во время HTTPS-проверки наблюдение за изменениями сети было неполным. Её результат относится к моменту проверки.", "Network change monitoring was incomplete during the HTTPS check. Its result applies to the time of the check.")
+                                }
+                                PlainLabel { text: window.tr("HTTPS URL новой проверки", "New check HTTPS URL") }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    TextField {
+                                        id: probeUrl
+                                        objectName: "probeUrlInput"
+                                        Layout.fillWidth: true
+                                        maximumLength: 2048
+                                        placeholderText: "https://www.gstatic.com/generate_204"
+                                        echoMode: revealProbe.checked ? TextInput.Normal : TextInput.Password
+                                        selectByMouse: true
+                                        enabled: window.canEditProbe
+                                        inputMethodHints: Qt.ImhUrlCharactersOnly | Qt.ImhNoPredictiveText | Qt.ImhSensitiveData
+                                        Accessible.name: window.tr("Секретный HTTPS URL проверки", "Secret check HTTPS URL")
+                                    }
+                                    CheckBox { id: revealProbe; objectName: "revealProbeUrl"; text: window.tr("Показать", "Show"); enabled: window.canEditProbe }
+                                }
+                                RowLayout {
+                                    PlainLabel { Layout.fillWidth: true; text: window.tr("Ожидаемый HTTP-статус", "Expected HTTP status") }
+                                    SpinBox {
+                                        id: probeExpectedStatus
+                                        objectName: "probeExpectedStatus"
+                                        from: 200
+                                        to: 299
+                                        value: window.state.probe_expected_status || 204
+                                        enabled: window.canEditProbe
+                                        Accessible.name: window.tr("Ожидаемый HTTP-статус проверки", "Expected check HTTP status")
+                                    }
+                                }
+                                RowLayout {
+                                    ActionButton {
+                                        objectName: "applyProbeTargetButton"
+                                        text: window.tr("Применить", "Apply")
+                                        enabled: window.canEditProbe && probeUrl.text.trim().length > 0
+                                        onClicked: {
+                                            window.send({command: "set_probe_target", url: probeUrl.text.trim(), expected_status: probeExpectedStatus.value})
+                                            probeUrl.clear()
+                                            revealProbe.checked = false
+                                        }
+                                    }
+                                    ActionButton {
+                                        objectName: "resetProbeTargetButton"
+                                        text: window.tr("Сбросить проверку", "Reset check")
+                                        enabled: window.canEditProbe
+                                        onClicked: {
+                                            window.send({command: "reset_probe_target"})
+                                            probeUrl.clear()
+                                            revealProbe.checked = false
+                                            probeExpectedStatus.value = 204
+                                        }
+                                    }
+                                }
+                    }
+                    ColumnLayout {
+                        visible: diagnosticsTabs.currentIndex === 2
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        spacing: 8
+                        LogsView { Layout.fillWidth: true; backend: window.backendForDiagnostics; english: window.state.language === "en"; response: window.state.logs || null }
+                        DiagnosticsExport { Layout.fillWidth: true; backend: window.backendForDiagnostics; english: window.state.language === "en" }
+                    }
+                    Item { Layout.preferredHeight: 12 }
+                }
             }
         }
     }
+
     Timer { id: importNoticeTimer; interval: 4500; onTriggered: window.importNotice = "" }
     Timer { id: searchDelay; interval: 200; repeat: false; onTriggered: { if (!window.state.busy) window.query(0) } }
+    DarkDialog {
+        id: noticesDialog
+        anchors.centerIn: parent
+        width: Math.min(window.width - 28, 570)
+        height: Math.min(window.height - 48, 620)
+        title: window.tr("Лицензии компонентов", "Component licenses")
+        modal: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        contentItem: NoticesView { english: window.language === "en" }
+    }
+    DarkDialog {
+        id: subscriptionOptionsDialog
+        objectName: "subscriptionOptionsDialog"
+        width: Math.min(window.width - 28, 420)
+        anchors.centerIn: parent
+        modal: true
+        title: window.state.source_id === null ? window.tr("Импорт", "Import") : window.tr("Параметры подписки", "Subscription settings")
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        contentItem: ColumnLayout {
+            spacing: 8
+            SmallLabel {
+                visible: window.state.source_id !== null
+                Layout.fillWidth: true
+                text: overviewSources.displayText
+                color: window.mint
+            }
+            SettingsGroup {
+                visible: window.state.source_id !== null
+                RowLayout {
+                    Layout.fillWidth: true
+                    MintSwitch {
+                        objectName: "subscriptionHwidChoice"
+                        Layout.fillWidth: true
+                        text: window.tr("Отправлять ID устройства", "Send device ID")
+                        checked: window.state.source_hwid_enabled === true
+                        enabled: window.state.ready && window.state.source_local === false && !window.state.busy && !window.state.pending
+                        onToggled: {
+                            subscriptionOptionsDialog.close()
+                            window.send({command: "set_source_hwid", enabled: checked})
+                        }
+                    }
+                    HelpButton { explanation: window.tr("Передаёт провайдеру случайный постоянный ID. Данные устройства не передаются.", "Sends a random persistent ID. Hardware details are not sent.") }
+                }
+                Divider {}
+                ActionButton {
+                    objectName: "renameSourceButton"
+                    Layout.fillWidth: true
+                    text: window.tr("Переименовать", "Rename")
+                    enabled: !window.state.busy && !window.state.pending
+                    onClicked: {
+                        renameInput.text = window.state.source_name || overviewSources.currentText
+                        renameDialog.sourceId = window.state.source_id
+                        renameDialog.open()
+                    }
+                }
+                ActionButton {
+                    objectName: "deleteSourceButton"
+                    Layout.fillWidth: true
+                    text: window.tr("Удалить подписку", "Delete subscription")
+                    enabled: !window.state.busy && !window.state.pending
+                    onClicked: {
+                        deleteDialog.sourceId = window.state.source_id
+                        deleteDialog.sourceName = window.state.source_name || overviewSources.currentText
+                        deleteDialog.open()
+                    }
+                }
+            }
+            SmallLabel { visible: window.state.source_id !== null; text: window.tr("Импорт", "Import") }
+            ActionButton { objectName: "configImportAction"; Layout.fillWidth: true; text: window.tr("Импорт конфигурации", "Import configuration"); enabled: window.editable; onClicked: { subscriptionOptionsDialog.close(); configImportDialog.open() } }
+            ActionButton { objectName: "manualEntryButton"; Layout.fillWidth: true; text: window.tr("Добавить сервер вручную", "Add a server manually"); enabled: window.editable; onClicked: { subscriptionOptionsDialog.close(); manualEntry.open() } }
+            ActionButton { objectName: "localSubscriptionAction"; Layout.fillWidth: true; text: window.tr("Подписка из локальной сети", "Local-network subscription"); enabled: !window.state.busy; onClicked: { subscriptionOptionsDialog.close(); window.openAdd(true) } }
+            ActionButton { objectName: "closeSourceOptionsButton"; Layout.alignment: Qt.AlignRight; text: window.tr("Готово", "Done"); onClicked: subscriptionOptionsDialog.close() }
+        }
+    }
     DarkDialog {
         id: renameDialog
         objectName: "renameSourceDialog"
@@ -1656,7 +1924,7 @@ ApplicationWindow {
             SmallLabel { Layout.fillWidth: true; text: window.tr("Подписка и её серверы будут удалены с этого устройства. Для повторного добавления понадобится ссылка.", "This subscription and its servers will be removed from this device. You will need its link to add it again.") }
             RowLayout {
                 ActionButton { objectName: "deleteSourceCancelButton"; text: window.tr("Отмена", "Cancel"); onClicked: deleteDialog.close() }
-                ActionButton { objectName: "deleteSourceConfirmButton"; text: window.tr("Удалить", "Delete"); enabled: !window.state.busy; onClicked: { window.desiredProfileId = null; window.desiredSourceId = null; window.send({command: "delete_source", id: deleteDialog.sourceId}); deleteDialog.close() } }
+                ActionButton { objectName: "deleteSourceConfirmButton"; text: window.tr("Удалить", "Delete"); enabled: !window.state.busy; onClicked: { window.desiredProfileId = null; window.desiredSourceId = null; window.send({command: "delete_source", id: deleteDialog.sourceId}); deleteDialog.close(); subscriptionOptionsDialog.close() } }
             }
         }
     }

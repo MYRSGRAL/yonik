@@ -67,7 +67,7 @@ def main() -> None:
                         },
                         "ui": {
                             "action": "key",
-                            "object": "routingModeButton",
+                            "object": "routingRulesTab",
                             "key": "Tab",
                         },
                     },
@@ -88,6 +88,7 @@ def main() -> None:
                         when={"routing": initial, "routing_revision": 1},
                     ),
                     ui("click", "routingSaveRule"),
+                    ui("click", "routingRulesTab"),
                     ui(
                         "click",
                         "routingEdit42",

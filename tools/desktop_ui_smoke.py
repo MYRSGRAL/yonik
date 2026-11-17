@@ -46,10 +46,9 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     page = 0
     settings_origin = 0
     settings_section = ""
-    source_options = False
 
     def click(target: str, **kwargs: Any) -> None:
-        nonlocal page, settings_origin, settings_section, source_options
+        nonlocal page, settings_origin, settings_section
         steps.append(ui("click", target, **kwargs))
         if target == "settingsButton":
             settings_origin, page, settings_section = page, 2, ""
@@ -59,16 +58,12 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
                     settings_section = ""
                 else:
                     page = settings_origin
-            elif source_options:
-                source_options = False
             else:
                 page = 0
         elif target == "serverPickerButton":
             page = 1
         elif target.startswith("settings") and target.endswith("Button"):
             settings_section = target
-        elif target == "sourceOptionsButton":
-            source_options = not source_options
         elif target == "sourceAddConfirmButton":
             page = 1
 
@@ -136,7 +131,7 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
             capture="paste-preview.png",
         )
     )
-    click("importMenuButton")
+    click("sourceOptionsButton")
     click("localSubscriptionAction")
     click("pasteSourceButton", expect={"window": {"page": 1}})
     steps.append(ui("text", "sourceNameInput", value="Тест А"))
@@ -168,37 +163,37 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     click(
         "refreshSourceButton",
         when={"pending": False, "busy": False},
-        expect={"subscriptionHwidChoice": {"checked": True}},
     )
     click(
         "approveRefreshButton",
         when={"pending": True, "busy": False, "source_hwid_enabled": True},
     )
     click(
-        "renameSourceButton",
+        "sourceOptionsButton",
         when={"pending": False, "busy": False, "profiles_count": 2},
+    )
+    click(
+        "renameSourceButton",
+        expect={"subscriptionHwidChoice": {"checked": True}},
+        capture="subscription-options.png",
     )
     steps.append(ui("text", "renameSourceInput", value="Переименованная А"))
     click("renameSourceConfirmButton")
-    steps.append(
-        ui(
-            "key",
-            "sourceOptionsButton",
-            key="Escape",
-            when={
-                "source_name": "Переименованная А",
-                "source_hwid_enabled": True,
-                "profiles_count": 2,
-            },
-            expect={"profileSourceFilter": {"currentText": "Переименованная А"}},
-        )
+    click(
+        "closeSourceOptionsButton",
+        when={
+            "source_name": "Переименованная А",
+            "source_hwid_enabled": True,
+            "profiles_count": 2,
+        },
+        expect={
+            "subscriptionOptionsDialog": {"visible": True},
+            "profileSourceFilter": {"displayText": "Переименованная А"},
+        },
     )
-    source_options = False
-    click("sourceOptionsButton", expect={"window": {"sourceOptions": False}})
-    click("homeButton", expect={"window": {"sourceOptions": True}})
     click(
         "refreshSourceButton",
-        expect={"window": {"sourceOptions": False}},
+        expect={"subscriptionOptionsDialog": {"visible": False}},
         capture="servers.png",
     )
     # Пока сервер держит ответ, навигация остаётся доступной, Cancel сохраняет профили.
@@ -228,6 +223,12 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     )
     click("profileSelect_1", when={"profiles_count": 2})
     page = 0
+    navigate(1, when={"selected_profile": 1})
+    click(
+        "homeButton",
+        expect={"profileSelect_1": {"highlighted": True}},
+        capture="selected-server.png",
+    )
     click(
         "mainConnectButton",
         when={"selected_profile": 1, "can_connect": True},
@@ -245,20 +246,13 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     )
     click("homeButton")
     click("settingsDiagnosticsButton", expect={"window": {"settingsSection": ""}})
-    steps.append(ui("wheel", "diagnosticsScroll", delta=-1200))
-    steps.append(
-        ui(
-            "wheel",
-            "diagnosticsScroll",
-            delta=1200,
-            expect={"diagnosticsScroll": {"atEnd": True, "moving": False}},
-            capture="diagnostics-bottom.png",
-        )
-    )
+    click("diagnosticsLogsTab")
+    click("diagnosticsTcpTab", capture="diagnostics-logs.png")
     click(
         "tcpCheckButton",
         expect={"diagnosticsScroll": {"atStart": True, "moving": False}},
     )
+    click("diagnosticsHttpsTab")
     steps.append(
         ui(
             "text",
@@ -304,6 +298,7 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     )
     click("settingsButton")
     click("settingsDiagnosticsButton")
+    click("diagnosticsHttpsTab")
     click(
         "resetProbeTargetButton",
         when={"probe_custom": True, "probe_expected_status": 200},
@@ -342,7 +337,7 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     # Второй источник добавляется через карточку Home; импорт сбрасывает фильтр.
     navigate(0)
     navigate(1)
-    click("importMenuButton")
+    click("sourceOptionsButton")
     click("localSubscriptionAction")
     steps.append(ui("text", "sourceUrlInput", value=url + "-second"))
     steps.append(ui("text", "sourceNameInput", value="Тест Б"))
@@ -381,6 +376,7 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     click("deleteSourceCancelButton", expect={"deleteSourceDialog": {"visible": True}})
     click("deleteSourceButton", when={"sources_total": 2, "profiles_count": 2})
     click("deleteSourceConfirmButton")
+    click("sourceOptionsButton", when={"sources_total": 1})
     click(
         "deleteSourceButton",
         when={"sources_total": 1, "source_name": "Тест Б", "profiles_count": 2},

@@ -33,7 +33,7 @@ def main() -> None:
         for case_number, (index, transport) in enumerate(cases):
             steps.extend(
                 [
-                    ui("click", "importMenuButton", when={"pending": False}),
+                    ui("click", "sourceOptionsButton", when={"pending": False}),
                     ui("click", "manualEntryButton"),
                 ]
             )

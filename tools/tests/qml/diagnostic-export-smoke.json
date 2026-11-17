@@ -18,6 +18,12 @@
     {
       "ui": {
         "action": "click",
+        "object": "diagnosticsLogsTab"
+      }
+    },
+    {
+      "ui": {
+        "action": "click",
         "object": "copyDiagnosticsButton"
       }
     },

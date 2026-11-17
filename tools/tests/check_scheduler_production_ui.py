@@ -89,6 +89,7 @@ Item {
   }
   if(step===1) { click("settingsDiagnosticsButton"); step++; return }
   if(step===2 || step===7) {
+   click("diagnosticsLogsTab")
    const locale=LOCALE
    require(state.language===locale && window.language===locale, "real language")
    require(state.error_contexts && state.error_contexts.length===CONTEXT_COUNT && state.error_contexts.every(c=>c.reason===REASON), "context after preferences lifecycle")
