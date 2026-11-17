@@ -423,13 +423,7 @@ fn reserve(f: &Facts, hosts: bool, role: u8, query: u64) -> Vec<u8> {
     b[74..80].copy_from_slice(&[
         if hosts { 3 } else { 2 },
         if hosts { 2 } else { 1 },
-        if hosts {
-            f.carrier
-        } else if role == 2 {
-            17
-        } else {
-            6
-        },
+        if role == 2 { 17 } else { f.carrier },
         3,
         2,
         branch,
@@ -454,7 +448,7 @@ fn service(issuer: &mut Issuer<Fake>, f: &Facts) -> u64 {
             &wire::Message::Probe {
                 purpose: 2,
                 index: f.endpoint,
-                subject: 1,
+                subject: f.subject,
                 resolver: 1,
             },
         )
@@ -2111,7 +2105,7 @@ fn bootstrap_publish(f: &Facts) -> Vec<u8> {
     b[1] = 2;
     for (at, v) in [
         (4, 1u16),
-        (6, 1),
+        (6, f.subject),
         (8, f.endpoint),
         (10, 1),
         (108, 16),
@@ -2135,7 +2129,7 @@ fn bootstrap_publish(f: &Facts) -> Vec<u8> {
     b[112..116].copy_from_slice(&(r.len() as u32).to_be_bytes());
     b[136] = 2;
     b[137] = 1;
-    b[142] = 6;
+    b[142] = f.carrier;
     b.extend_from_slice(b"physical.invalid");
     b.extend_from_slice(&q);
     b.extend_from_slice(&r);

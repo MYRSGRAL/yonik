@@ -80,7 +80,11 @@ fn dns_rrset_queue_credit_precedes_materialization_and_rx_bound_is_fixed() {
 }
 
 // Весь driver below — in-memory: ни OS endpoint, ни runtime wrappers.
+type PacketObserver = Box<dyn Fn(&[u8])>;
 pub(super) struct BundleIo {
+    pub(super) datagram_wire: Option<Arc<dns_datagram::NetworkWire>>,
+    pub(super) datagram_release: Option<Arc<dns_datagram::NetworkRelease>>,
+    pub(super) after_packet: Option<PacketObserver>,
     pub(super) datagram_producer: Option<Arc<dns_datagram::Producer>>,
     pub(super) bootstrap_transcript: Option<Arc<dyn BootstrapDnsTranscript>>,
     pub(super) bootstrap_producer: Option<Arc<VerifiedBootstrapDnsProducer>>,
@@ -154,6 +158,9 @@ impl BundleIo {
     }
     pub(super) fn new(record: LaunchRecord, requests: Vec<Vec<u8>>) -> Self {
         Self {
+            datagram_wire: None,
+            datagram_release: None,
+            after_packet: None,
             datagram_producer: None,
             bootstrap_transcript: None,
             bootstrap_producer: None,
@@ -179,6 +186,18 @@ impl BundleIo {
     }
 }
 impl Channel for BundleIo {
+    fn bootstrap_datagram_wire(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dns_datagram::NetworkWire>>, ServiceError> {
+        Ok(self.datagram_wire.clone())
+    }
+    fn bootstrap_datagram_release(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dns_datagram::NetworkRelease>>, ServiceError> {
+        Ok(self.datagram_release.clone())
+    }
     fn bootstrap_datagram_producer(
         &self,
         _: LaunchRecord,
@@ -287,6 +306,9 @@ impl Channel for BundleIo {
             };
             dns_bundle::decode(b, &neg, wire::dns_v2::Direction::Issuer)?;
             self.output.borrow_mut().push(b.to_vec());
+            if let Some(action) = &self.after_packet {
+                action(b);
+            }
             if let Some(action) = &self.after_sent {
                 action(self.output.borrow().len());
             }

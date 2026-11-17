@@ -581,6 +581,9 @@ impl<A: Authority> Issuer<A> {
         {
             return Err(ServiceError::InvalidRequest);
         }
+        if binding.parent_carrier == 17 {
+            return self.datagram_response_observed(receipt);
+        }
         self.bootstrap_transcript
             .as_ref()
             .ok_or(ServiceError::Unsupported)?

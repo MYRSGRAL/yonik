@@ -3336,6 +3336,18 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn bootstrap_datagram_wire(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dns_datagram::NetworkWire>>, ServiceError> {
+        Ok(None)
+    }
+    fn bootstrap_datagram_release(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dns_datagram::NetworkRelease>>, ServiceError> {
+        Ok(None)
+    }
     fn bootstrap_datagram_producer(
         &self,
         _: LaunchRecord,
@@ -5286,6 +5298,8 @@ fn run_issuer<A: Authority>(
                 issuer.dns_wire = socket.dns_wire_producer(issuer.record)?;
                 issuer.bootstrap_source = socket.bootstrap_source(issuer.record)?;
                 issuer.datagrams.producer = socket.bootstrap_datagram_producer(issuer.record)?;
+                issuer.datagrams.wire = socket.bootstrap_datagram_wire(issuer.record)?;
+                issuer.datagrams.release = socket.bootstrap_datagram_release(issuer.record)?;
                 issuer.bootstrap_dns = socket.bootstrap_dns_producer(issuer.record)?;
                 issuer.bootstrap_transcript = socket.bootstrap_dns_transcript(issuer.record)?;
                 issuer.dns_logical = socket.dns_logical_producer(issuer.record)?;

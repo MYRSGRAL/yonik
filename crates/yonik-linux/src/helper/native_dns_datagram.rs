@@ -2,7 +2,102 @@
 use super::*;
 
 pub(super) const REVIEWED_DATAGRAM_PATCH: Option<&str> = None;
+const REVIEWED_NETWORK_WIRE_PATCH: Option<&str> = None;
+const REVIEWED_NETWORK_RELEASE_PATCH: Option<&str> = None;
 const CONTRACT: &[u8] = b"udp-bootstrap-consumed-parent-member-send-v1\0";
+
+/// Три независимых scope5: Source/parent не создаёт wire или release authority.
+struct NetworkScope {
+    launch: LaunchRecord,
+    schema: [u8; 32],
+    contract: [u8; 32],
+    patch: String,
+}
+impl NetworkScope {
+    fn check(
+        &self,
+        launch: LaunchRecord,
+        contract: &[u8],
+        reviewed: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let accepted = reviewed == Some(self.patch.as_str());
+        #[cfg(test)]
+        let accepted = accepted || self.patch == "cfgtest-reviewed-network5";
+        if !accepted
+            || self.launch != launch
+            || self.schema != <[u8; 32]>::from(Sha256::digest(wire::dns_v2::DATAGRAM_SCHEMA))
+            || self.contract != <[u8; 32]>::from(Sha256::digest(contract))
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    fn fake(launch: LaunchRecord, contract: &[u8]) -> Self {
+        Self {
+            launch,
+            schema: Sha256::digest(wire::dns_v2::DATAGRAM_SCHEMA).into(),
+            contract: Sha256::digest(contract).into(),
+            patch: "cfgtest-reviewed-network5".into(),
+        }
+    }
+}
+const NETWORK_WIRE: &[u8] = b"udp-bootstrap-bound-dns-transcript-v1\0";
+const NETWORK_RELEASE: &[u8] = b"udp-bootstrap-dns-consuming-close-join-v1\0";
+pub(super) struct NetworkWire {
+    scope: NetworkScope,
+    transcript: Arc<dyn BootstrapDnsTranscript>,
+}
+pub(super) struct NetworkRelease {
+    scope: NetworkScope,
+}
+impl NetworkWire {
+    fn check(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
+        self.scope
+            .check(launch, NETWORK_WIRE, REVIEWED_NETWORK_WIRE_PATCH)
+    }
+    fn observed(
+        &self,
+        launch: LaunchRecord,
+        receipt: BootstrapDnsReceipt<'_>,
+    ) -> Result<Instant, ServiceError> {
+        self.check(launch)?;
+        if !receipt.binding.bootstrap
+            || receipt.binding.proxied
+            || receipt.binding.parent_carrier != 17
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        let anchor = receipt.lifetime_anchor;
+        let observed = self.transcript.observed(launch, receipt)?;
+        if observed != anchor {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(anchor)
+    }
+    #[cfg(test)]
+    pub(super) fn fake(
+        launch: LaunchRecord,
+        transcript: Arc<dyn BootstrapDnsTranscript>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            scope: NetworkScope::fake(launch, NETWORK_WIRE),
+            transcript,
+        })
+    }
+}
+impl NetworkRelease {
+    fn check(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
+        self.scope
+            .check(launch, NETWORK_RELEASE, REVIEWED_NETWORK_RELEASE_PATCH)
+    }
+    #[cfg(test)]
+    pub(super) fn fake(launch: LaunchRecord) -> Arc<Self> {
+        Arc::new(Self {
+            scope: NetworkScope::fake(launch, NETWORK_RELEASE),
+        })
+    }
+}
 
 /// Закрытый scope5. Production constructor отсутствует до protected record/pin;
 /// Source4/descriptor/child metadata не могут создать этот тип.
@@ -109,6 +204,8 @@ struct ParentBinding {
 }
 pub(super) struct Datagrams {
     pub(super) producer: Option<Arc<Producer>>,
+    pub(super) wire: Option<Arc<NetworkWire>>,
+    pub(super) release: Option<Arc<NetworkRelease>>,
     parents: BTreeMap<u64, Box<ParentBinding>>,
     queries: BTreeMap<u64, u64>,
     next: u64,
@@ -117,6 +214,8 @@ impl Datagrams {
     pub(super) fn new() -> Self {
         Self {
             producer: None,
+            wire: None,
+            release: None,
             parents: BTreeMap::new(),
             queries: BTreeMap::new(),
             next: 0,
@@ -124,6 +223,33 @@ impl Datagrams {
     }
 }
 impl<A: Authority> Issuer<A> {
+    pub(super) fn datagram_network_ready(&self, query: u64) -> Result<(), ServiceError> {
+        self.datagram_query(query)?;
+        self.datagrams
+            .wire
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?
+            .check(self.record)?;
+        self.datagram_network_release()
+    }
+    pub(super) fn datagram_network_release(&self) -> Result<(), ServiceError> {
+        self.datagrams
+            .release
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?
+            .check(self.record)
+    }
+    pub(super) fn datagram_response_observed(
+        &self,
+        receipt: BootstrapDnsReceipt<'_>,
+    ) -> Result<Instant, ServiceError> {
+        self.datagram_network_ready(receipt.binding.query)?;
+        self.datagrams
+            .wire
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?
+            .observed(self.record, receipt)
+    }
     pub(super) fn datagram_parent_live(
         &self,
         id: u64,

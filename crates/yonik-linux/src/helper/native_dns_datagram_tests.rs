@@ -4,10 +4,21 @@ use super::super::super::super::{
     SourceFlow, Target, UdpBinding, UdpIngressRecord, dns_datagram, send_message,
 };
 use super::*;
+#[path = "native_dns_datagram_network_tests.rs"]
+mod network;
 
 fn fixture5(mode: Mode) -> (Issuer<Fake>, Arc<Facts>) {
-    let (mut issuer, f) =
-        fixture_carrier(mode, "203.0.113.80".parse().unwrap(), 1, true, [3; 32], 17);
+    fixture5_order(mode, 1)
+}
+fn fixture5_order(mode: Mode, order: u8) -> (Issuer<Fake>, Arc<Facts>) {
+    let (mut issuer, f) = fixture_carrier(
+        mode,
+        "203.0.113.80".parse().unwrap(),
+        order,
+        true,
+        [3; 32],
+        17,
+    );
     issuer.authority.owner_forbidden = false;
     let mut tuple = match issuer_tests::open(mode, 32001) {
         wire::Message::OpenIngress { tuple, .. } => tuple,

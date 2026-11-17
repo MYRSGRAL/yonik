@@ -701,7 +701,10 @@ impl Reply {
     }
 }
 impl<A: Authority> Issuer<A> {
-    fn bootstrap_producer(&self) -> Result<(), ServiceError> {
+    fn bootstrap_producer(&self, binding: Binding) -> Result<(), ServiceError> {
+        if binding.parent_carrier == 17 {
+            return self.datagram_network_release();
+        }
         self.bootstrap_dns
             .as_ref()
             .ok_or(ServiceError::Unsupported)?
@@ -723,7 +726,7 @@ impl<A: Authority> Issuer<A> {
         Ok(route)
     }
     fn check_bootstrap_transport_permit(&mut self, binding: Binding) -> Result<(), ServiceError> {
-        self.bootstrap_producer()?;
+        self.bootstrap_producer(binding)?;
         let route = self.bootstrap_route(binding)?;
         self.authority.check_bootstrap_permit(route)?;
         if self.authority.now() >= binding.expires
@@ -769,7 +772,7 @@ impl<A: Authority> Issuer<A> {
         let count = p.kind.resources().len();
         resources[..count].copy_from_slice(p.kind.resources());
         match &p.kind {
-            ProofKind::BootstrapDirect(_) => self.bootstrap_producer()?,
+            ProofKind::BootstrapDirect(_) => self.bootstrap_producer(binding)?,
             ProofKind::Direct(_) => self
                 .dns_wire
                 .as_ref()
@@ -988,7 +991,7 @@ impl<A: Authority> Issuer<A> {
         if result.is_none() && !self.unknown {
             let proxy = r.binding.proxied;
             let anchor = if r.binding.bootstrap {
-                self.bootstrap_producer()
+                self.bootstrap_producer(r.binding)
             } else if proxy {
                 self.dns_logical
                     .as_ref()
@@ -1384,7 +1387,7 @@ impl<A: Authority> Issuer<A> {
         let binding = reservation.binding;
         let reservation_expires = reservation.expires;
         if binding.bootstrap {
-            self.bootstrap_producer()?;
+            self.bootstrap_producer(binding)?;
         }
         let parent = self
             .transport
@@ -1518,7 +1521,7 @@ impl<A: Authority> Issuer<A> {
         }
         let binding = p.binding;
         if binding.bootstrap {
-            self.bootstrap_producer()?;
+            self.bootstrap_producer(binding)?;
         }
         let exchange = p.exchange;
         if (b[2] == 2) != binding.proxied {

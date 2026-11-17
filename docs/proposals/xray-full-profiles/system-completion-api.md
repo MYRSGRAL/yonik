@@ -1937,7 +1937,54 @@ SCM/kernel/Go5/runtime acceptance эти тесты не доказывают.
 
 Remaining: Go consuming57/58→private UDP parent/member/send/retire conjunction,
 reviewed independent protected scope5 record/factory и exact image/launch mint;
-NETWORK UDP требует отдельно reviewed transcript/consuming-close scope5, поэтому
+NETWORK UDP требует отдельно reviewed transcript/consuming-close scope5. Без них
 `bootstrap_binding` отклоняет carrier17 ДО transport binding/Connect. Старые TCP
 wire/release contracts не переиспользуются. FranceSS readiness/public flags остаются
 Unsupported/false; SS UDP не вырезан из graph/config и не заменён TCP permission.
+
+### NETWORK UDP: независимые scope5 wire/release и serialized lifecycle
+
+Wire/schema/corpus CODEC5 не меняются. `Datagrams::wire` и `Datagrams::release` —
+разные private types `NetworkWire`/`NetworkRelease`, отдельно от Source5/parent.
+Оба reviewed pins остаются None; constructors только cfg(test), production Channel
+views по умолчанию None. Будущий protected factory обязан независимо связать
+каждый record с exact retained image/config/manifest/launch/schema5; descriptor,
+Source5, old Bootstrap4 release или child transcript этого не делают.
+
+Private contract identities (SHA256 exact name + NUL):
+
+- `udp-bootstrap-bound-dns-transcript-v1`:
+  `6a71b24b6ab9d42be2e8d554bfe4deda946f88b39dccb1bb3897a61345beceb9`;
+- `udp-bootstrap-dns-consuming-close-join-v1`:
+  `d4242926ad2a820fe0ea081a2d165e9c03f13b33ff7456b6948040e9e9c65c83`.
+
+Actual ADMIT/setup получает оба views через `Channel::bootstrap_datagram_wire`
+и `bootstrap_datagram_release`. `bootstrap_binding` для parent carrier17 требует
+live57/58 USER/Consumed lineage и оба scope5 proofs. Reserve35 проверяет resolver-only
+permit ДО Allow36: DNS socket factory не получает Connect authority из original
+SS UDP destination. Physical52/ACK37 и Logical38/39 сохраняют actual numeric peer,
+kernel protocol/namespace/FD facts, full parent frontier и proof revision отдельно.
+Original carrier17 не подставляется вместо protocol6/17 resolver resource.
+
+`bootstrap_response_observed` выбирает только `NetworkWire` для carrier17. Receipt
+связывает exact binding/proof/revision/exchange/producer sequence/request/response;
+anchor обязан равняться private `Reservation.started`, не Publish now/child clock.
+Повторный transcript/Source check возвращает тот же anchor. Strict DNS parser и
+absolute TTL остаются прежними; Source5/schema5 не позволяют старому Wire4 capture
+повысить authority. Published DATA не является waiter/USER/member разрешением.
+
+Независимый query/57/58/context/reservation/waiter затем использует существующий
+checked NETWORK Numeric42: exact immutable member и Source проверены до history/
+packet spent CAS; mandatory durable member route — до GRANT19. TCP permission не
+alias для protocol17. Close/join выбирает только Release5 для UDP parent, но cleanup
+не требует свежего USER Known: прежнее исходное window≤1s не продлевается. Proof→
+Resource→reservations→contexts/parents→service Close32 соблюдают existing barriers;
+Unknown сохраняет custody, повтор raw close не выполняется.
+
+Pure driver использует Source/DNS capture/owner/kernel/route fakes; fake resource
+factory вызывается только после реального SUT Allow36. Physical37, Logical39,
+Published41, Waiter54, Numeric19 и cleanup ACK создаёт actual serialized issuer.
+Проверены Local/System и resolver UDP peer17; TCP mismatch не превращается в UDP
+member authority. No sockets/SCM/kernel/Go5 pair/runtime admission исполнялись.
+Регрессии HOSTS/USER/Proxy/CODEC4 сохраняются. Protected scope5 mint и Go NETWORK
+counterpart требуют отдельного source review; production pins/readiness не открыты.

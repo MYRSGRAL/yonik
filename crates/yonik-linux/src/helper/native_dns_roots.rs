@@ -764,10 +764,8 @@ impl<A: Authority> Issuer<A> {
     ) -> Result<super::super::dns_transport::Binding, ServiceError> {
         let b = self.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
         let c = b.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
-        // Scope5 parent/member contract не повышает CODEC4 wire/release scopes.
-        // NETWORK для datagram требует отдельного reviewed producer counterpart.
         if c.original.protocol == 17 {
-            return Err(ServiceError::Unsupported);
+            self.datagram_network_ready(b.query)?;
         }
         let permit = c.permit.as_ref().ok_or(ServiceError::Unsupported)?;
         let terminal = b.hops.last().ok_or(ServiceError::Unavailable)?;
