@@ -1362,6 +1362,52 @@ Bootstrap/Hosts Publish, Waiter/Numeric и actual parent-open conjunction ост
 следующим unit. Public readiness/Connect/require_consumer и production mint
 по-прежнему закрыты; OS wrappers и runtime acceptance не исполнялись.
 
+### CODEC4 Hosts Publish и независимый Waiter: SOURCE/PURE cut после R61
+
+`run_issuer → dns_bundle::dispatch → dns_rrset::dispatch` теперь принимает Hosts
+Publish40/DNHOST02 и WaiterBind53. `roots::publish_hosts` сверяет prefix/tail с
+ACKed retained observation: query/epoch/source/asset/row/key, точный ordered
+member-index vector, immutable original port/carrier и полный physical path.
+Ранее проверенный Source повторно проверяет actual parent, held snapshot и
+выбор row/members до публикации. Foreign fields отклоняются до Source callbacks;
+ошибка проверенного source делает только соответствующий context sticky-invalid,
+сохраняя R61 renewal ordering. Один observation выпускает не больше одного DATA
+producer; replay/late-cancel не возвращают его в исходное состояние.
+
+`HostsProducer` и `HostsWaiter` — отдельные retained records, без фиктивного DNS
+`Binding`, resolver peer, packets, TTL или TransportProof. Их ID allocators общие
+с network RRset/waiter namespaces; kind41 остаётся DATA-only, exchange0.
+SourceObservation/reservation/context/producer/waiter не alias-ятся по raw ID.
+Publish remaining ограничен исходными observation/context/source/session и
+request deadline; revalidation, cache hit и заблокированный send не продлевают его.
+
+Первый и каждый следующий waiter требуют собственный ACKed HostsPath context с
+новым query и fresh metadata Reserve35 role3. Publisher reservation не является
+waiter authority. `bind_hosts_waiter` проверяет exact waiter query/root0/flow0/
+revision0, одинаковую source/asset/row/member/key/full-frontier DATA identity и
+собственную live source/parent revalidation. Context не переиспользуется для
+второго waiter даже после cancel. Kind54 возвращает отдельный WaiterReceiptId,
+sourceKind2/purpose3; deadline — min(DATA, own observation/context/source/session,
+pending Bind). Никаких USER owner calls, service grants или numeric routes.
+
+Readiness при drain различает ACKed SourceObservation и ACKed network proof:
+Hosts не подставляет proof0. Pending Publish/Bind cancel обрабатывается до ACK;
+write error делает issuer Unknown и удерживает DATA, observation/context и pending
+credit. Typed cancel5 отзывает DATA derivatives; cancel6 только свой waiter;
+cancel7/8 своего waiter reservation/context не убивает соседний context. Общие
+history/pending/memory caps оплачиваются до capture/allocation; terminal records
+не compact/reuse. Wire/schema/CODEC4 corpus не изменены.
+
+Завершён Publish+Waiter cut. Numeric42 use2 пока Unsupported: индексы observation
+не являются independent numeric-member proof или BootstrapPhysicalPermission.
+Следующий unit должен связать actual held member, mandatory numeric route и
+live original-parent conjunction на consuming open, не повышая flow0 до USER.
+`Channel::bootstrap_source` по-прежнему None до legitimate reviewed CODEC4
+producer binding; Direct3/wire/release records не наследуются. Positive tests
+используют injected source facts через настоящий issuer loop. Go R60 source
+прочитан для shapes; stateful Rust↔Go execution/runtime acceptance не проводились.
+Network Bootstrap transport/close, production pins и public gates остаются закрыты.
+
 `dns_transport_binding` выводит из всего live checked bundle два разных target:
 logical resolver peer и actual numeric physical frontier. Последний следует
 carrier→nextInput через manifest path; Physical Reserve/SCM сверяет terminal
