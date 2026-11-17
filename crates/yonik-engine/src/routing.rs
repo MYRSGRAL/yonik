@@ -10,6 +10,8 @@ use crate::{CompileError, CompiledConfig, Engine};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyMode {
     Names,
+    /// Сопоставляет имя или IP, который уже передан во входящий запрос SOCKS.
+    Observed,
     IpOnly,
 }
 impl std::str::FromStr for PolicyMode {
@@ -684,6 +686,19 @@ fn validate_policy(
             .filter(|rule| rule.enabled)
     };
     match mode {
+        PolicyMode::Observed
+            if !policy.lan.is_empty()
+                || !policy.private_networks.is_empty()
+                || !policy.private_domains.is_empty()
+                || rules().any(|rule| {
+                    !rule.conditions.destinations.is_empty()
+                        && (rule.action != Action::Direct || !rule.conditions.domains.is_empty())
+                }) =>
+        {
+            Err(PolicyCompileError::Unsupported(
+                PolicyCapability::RequiredRealResolution,
+            ))
+        }
         PolicyMode::Names
             if !policy.lan.is_empty()
                 || !policy.private_networks.is_empty()

@@ -248,3 +248,64 @@ fn transport_system_refuses_enabled_while_local_lowers_and_disabled_preserved() 
         );
     }
 }
+
+#[test]
+fn observed_routing_accepts_domain_and_literal_ip_bypasses() {
+    let policy = Policy {
+        user_rules: vec![
+            Rule {
+                id: 1,
+                enabled: true,
+                conditions: Conditions {
+                    domains: vec![DomainPattern::Suffix("example.org".parse().unwrap())],
+                    ..Default::default()
+                },
+                action: Action::Direct,
+            },
+            Rule {
+                id: 2,
+                enabled: true,
+                conditions: Conditions {
+                    destinations: vec!["192.0.2.0/24".parse().unwrap()],
+                    ..Default::default()
+                },
+                action: Action::Direct,
+            },
+        ],
+        ..Default::default()
+    };
+    for engine in [Engine::Xray, Engine::SingBox] {
+        let config = compile(engine, &policy, PolicyMode::Observed).unwrap();
+        let rules = if engine == Engine::Xray {
+            &config["routing"]["rules"]
+        } else {
+            &config["route"]["rules"]
+        };
+        assert!(rules[2].to_string().contains("example.org"));
+        assert!(rules[3].to_string().contains("192.0.2.0/24"));
+    }
+}
+
+#[test]
+fn observed_names_do_not_weaken_ip_block() {
+    let policy = Policy {
+        user_rules: vec![Rule {
+            id: 1,
+            enabled: true,
+            conditions: Conditions {
+                destinations: vec!["192.0.2.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+            action: Action::Block,
+        }],
+        ..Default::default()
+    };
+    for engine in [Engine::Xray, Engine::SingBox] {
+        assert_eq!(
+            compile(engine, &policy, PolicyMode::Observed),
+            Err(PolicyCompileError::Unsupported(
+                PolicyCapability::RequiredRealResolution
+            )),
+        );
+    }
+}

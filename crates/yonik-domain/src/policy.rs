@@ -75,10 +75,27 @@ pub struct Conditions {
     pub domains: Vec<DomainPattern>,
 }
 
+/// Имя процесса записывается отдельно от абсолютного пути.
+pub fn process_name_selector(value: &str) -> Option<&str> {
+    value.strip_prefix("name:").filter(|name| {
+        !name.is_empty()
+            && name.len() <= 255
+            && !matches!(*name, "." | "..")
+            && !name.contains(['/', '\\'])
+            && !name.chars().any(char::is_control)
+    })
+}
+
 impl Conditions {
     pub(crate) fn matches_source(&self, executable: Option<&str>) -> bool {
         self.executables.is_empty()
-            || executable.is_some_and(|path| self.executables.iter().any(|p| p == path))
+            || executable.is_some_and(|path| {
+                self.executables.iter().any(|selector| {
+                    process_name_selector(selector).map_or(selector == path, |name| {
+                        path.rsplit('/').next() == Some(name)
+                    })
+                })
+            })
     }
 }
 

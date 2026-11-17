@@ -50,8 +50,8 @@ mod network;
 pub use network::{
     IpPrefix, KernelRoute, LinuxAddress, LinuxLink, LinuxNexthop, LinuxRoute, LinuxRule,
     LinuxTopology, LookupIncomplete, NetworkAttribute, NetworkNamespace, NetworkReadError,
-    NexthopMember, RouteKind, RouteNexthop, RouteQuery, TransportProtocol, lookup_route,
-    read_topology,
+    NexthopMember, RouteKind, RouteNexthop, RouteQuery, TransportProtocol, local_vpn_split_cidrs,
+    lookup_route, read_topology,
 };
 #[cfg(target_os = "linux")]
 mod resolver;

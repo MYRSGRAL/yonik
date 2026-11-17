@@ -13,7 +13,7 @@ pub use evaluation::{
 };
 pub use policy::{
     Action, AndroidPackageId, Conditions, Decision, Flow, PlatformSource, Policy, PrivateNetwork,
-    Route, Rule, RuleOrigin,
+    Route, Rule, RuleOrigin, process_name_selector,
 };
 
 mod dns_policy;

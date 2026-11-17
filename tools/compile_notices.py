@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -24,17 +25,16 @@ def collect(root: Path) -> tuple[list[dict], dict[str, bytes]]:
     total_bytes = 0
 
     def add(
-        name: str, version: str, scope: str, refs: list[dict], folder: Path
+        name: str, version: str, scope: str, refs: Iterable[tuple[str, Path]]
     ) -> None:
         nonlocal total_bytes
         if len(entries) >= MAX_ENTRIES:
             raise ValueError("Превышен предел записей notices")
         hashes = []
-        for ref in refs:
-            digest = ref["sha256"]
+        for digest, path in refs:
             if not re.fullmatch(r"[0-9a-f]{64}", digest):
                 raise ValueError("Некорректный hash notices")
-            data = read_bounded(folder / digest, root)
+            data = read_bounded(path, root)
             if hashlib.sha256(data).hexdigest() != digest or not data.strip():
                 raise ValueError("Hash notices не совпал или текст пуст")
             data.decode("utf-8")
@@ -46,22 +46,36 @@ def collect(root: Path) -> tuple[list[dict], dict[str, bytes]]:
             hashes.append(digest)
         entries.append(dict(name=name, version=version, scope=scope, hashes=hashes))
 
+    def content_paths(refs: list[dict], folder: Path) -> Iterable[tuple[str, Path]]:
+        return ((ref["sha256"], folder / ref["sha256"]) for ref in refs)
+
     for package in inventory["packages"]:
         add(
             package["name"],
             package["version"],
             "Rust",
-            package["license_files"] + package["notice_files"],
-            base / "texts",
+            content_paths(
+                package["license_files"] + package["notice_files"], base / "texts"
+            ),
         )
     for module in go["records"]:
         add(
             module["module"],
             module["version"],
             "Go / external cores",
-            module["texts"],
-            base / "composition/texts",
+            content_paths(module["texts"], base / "composition/texts"),
         )
+    add(
+        "kyoresuas/ru-direct",
+        "7e14508232595bac5881aa25d31202843a3f6021",
+        "Routing data",
+        [
+            (
+                "1126322e2cc8d165adc4c792eeb195717de2bcc7b39be1ce77959d78e87ef685",
+                root / "crates/yonik-desktop/assets/ru-direct/LICENSE",
+            )
+        ],
+    )
     if len(entries) > MAX_ENTRIES or sum(map(len, texts.values())) > MAX_TOTAL:
         raise ValueError("Превышен предел notices")
     return entries, texts
