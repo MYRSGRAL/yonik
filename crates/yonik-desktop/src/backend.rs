@@ -698,7 +698,7 @@ fn compile_local_connect(
     port: NonZeroU16,
     probe_port: NonZeroU16,
     draft: &crate::editor::Draft,
-) -> Result<yonik_engine::CompiledConfig> {
+) -> Result<SessionConfig> {
     // Без resource-bound session нельзя терять сохранённые refs и их OR-группы.
     if draft
         .ru_direct
@@ -716,19 +716,22 @@ fn compile_local_connect(
         .iter()
         .chain(&policy.preset_rules)
         .any(|rule| rule.enabled && !rule.conditions.domains.is_empty());
-    yonik_engine::compile_policy(
-        server,
-        engine,
-        port,
-        probe_port,
-        &policy,
-        if names {
-            yonik_engine::PolicyMode::Names
-        } else {
-            yonik_engine::PolicyMode::IpOnly
-        },
-    )
-    .map_err(|_| DesktopError("engine_config"))
+    let mode = if names {
+        yonik_engine::PolicyMode::Names
+    } else {
+        yonik_engine::PolicyMode::IpOnly
+    };
+    match yonik_engine::compile_policy(server, engine, port, probe_port, &policy, mode) {
+        Ok(config) => Ok(SessionConfig::Server(config)),
+        Err(yonik_engine::PolicyCompileError::Server(
+            yonik_engine::CompileError::UnsupportedOption,
+        )) if engine == Engine::Xray => yonik_engine::PendingXrayRealityH2::compile_policy(
+            server, port, probe_port, &policy, mode,
+        )
+        .map(SessionConfig::ServerRealityH2)
+        .map_err(|_| DesktopError("engine_config")),
+        Err(_) => Err(DesktopError("engine_config")),
+    }
 }
 
 fn persisted_local_draft(
@@ -1761,6 +1764,65 @@ fn available_port(requested: u16) -> Result<NonZeroU16> {
     Err(DesktopError("listen_port_busy"))
 }
 
+fn available_distinct_local_port(
+    excluded: &[NonZeroU16],
+    mut candidate: impl FnMut() -> Result<NonZeroU16>,
+) -> Result<NonZeroU16> {
+    for _ in 0..16 {
+        let port = candidate()?;
+        if !excluded.contains(&port) {
+            return Ok(port);
+        }
+    }
+    Err(DesktopError("listen_port_busy"))
+}
+
+fn native_local_runtime_plan(
+    intent: &yonik_engine::native_profile::ProfileIntent,
+    port: NonZeroU16,
+    mut candidate: impl FnMut() -> Result<NonZeroU16>,
+) -> Result<yonik_engine::native_profile::OwnedRuntimePlan> {
+    use yonik_engine::native_profile::{OwnedIngress, OwnedRuntimePlan, ProviderIngressProtocol};
+
+    let graph = intent
+        .validate()
+        .map_err(|_| DesktopError("engine_config"))?;
+    let ingresses = graph.ingresses();
+    let has_http = ingresses
+        .iter()
+        .any(|ingress| ingress.protocol() == ProviderIngressProtocol::Http);
+    if has_http
+        && (ingresses.len() != 2
+            || !ingresses
+                .iter()
+                .any(|ingress| ingress.protocol() == ProviderIngressProtocol::Socks))
+    {
+        return Err(DesktopError("engine_config"));
+    }
+    let probe = if has_http {
+        available_distinct_local_port(&[port], &mut candidate)?
+    } else {
+        candidate()?
+    };
+    let mut plan = OwnedRuntimePlan::new(port, probe).map_err(|_| DesktopError("engine_config"))?;
+    if has_http {
+        let http = available_distinct_local_port(&[port, probe], candidate)?;
+        plan = plan
+            .with_local_http(http)
+            .map_err(|_| DesktopError("engine_config"))?;
+    }
+    for ingress in ingresses {
+        let owned = match ingress.protocol() {
+            ProviderIngressProtocol::Socks => OwnedIngress::Local,
+            ProviderIngressProtocol::Http => OwnedIngress::LocalHttp,
+        };
+        plan = plan
+            .map_ingress(ingress.tag(), owned)
+            .map_err(|_| DesktopError("engine_config"))?;
+    }
+    Ok(plan)
+}
+
 #[derive(Debug)]
 struct ContextFailure {
     error: DesktopError,
@@ -2033,7 +2095,7 @@ impl Actor {
         Ok((inline, revision))
     }
 
-    async fn local_connect_config(&self) -> Result<yonik_engine::CompiledConfig> {
+    async fn local_connect_config(&self) -> Result<(SessionConfig, NonZeroU16)> {
         let selected = self
             .selected
             .as_ref()
@@ -2071,6 +2133,7 @@ impl Actor {
             available_probe_port(port)?,
             &draft,
         )
+        .map(|config| (config, port))
     }
 
     async fn save_routing(
@@ -4413,8 +4476,10 @@ struct TcpRunning {
 
 enum SessionConfig {
     Server(yonik_engine::CompiledConfig),
+    ServerRealityH2(yonik_engine::PendingXrayRealityH2),
     FullProfile(Box<NativeSessionConfig>),
 }
+
 struct NativeSessionConfig {
     intent: yonik_engine::native_profile::ProfileIntent,
     plan: yonik_engine::native_profile::OwnedRuntimePlan,
@@ -4455,7 +4520,7 @@ async fn session(
     }
     let native_image = match &mut config {
         SessionConfig::FullProfile(native) => native.image.take(),
-        SessionConfig::Server(_) => None,
+        SessionConfig::Server(_) | SessionConfig::ServerRealityH2(_) => None,
     };
     let Ok(session) = LocalSession::new() else {
         let _ = updates
@@ -4490,7 +4555,11 @@ async fn session(
         cancel.check().map_err(|_| "cancelled")?;
         let path = engine_dir.join(relative);
         let native = matches!(config, SessionConfig::FullProfile(..));
+        let reality_h2 = matches!(config, SessionConfig::ServerRealityH2(..));
         let binary = if native { native_image.ok_or("profile_unavailable")? } else {tokio::task::spawn_blocking(move || {
+            if reality_h2 {
+                return BinarySnapshot::load_xray_reality_h2(&engine_dir);
+            }
             BinarySnapshot::load(
                 &path,
                 digest.parse().map_err(|_| HostError::BinaryHash)?,
@@ -4503,6 +4572,7 @@ async fn session(
         cancel.check().map_err(|_| "cancelled")?;
         let checked = match config {
             SessionConfig::Server(config) => CheckedConfig::validate(binary, config, &mut cancel).await,
+            SessionConfig::ServerRealityH2(config) => CheckedConfig::validate_xray_reality_h2(binary, config, &mut cancel).await,
             SessionConfig::FullProfile(native) => CheckedConfig::validate_full_profile(binary, native.intent, native.plan, &mut cancel).await,
         }
             .map_err(|e| {
@@ -5831,11 +5901,7 @@ async fn run(
                                     } else {
                                         match actor.prepare_port().and_then(|()| {
                                             let port = NonZeroU16::new(actor.state.port).ok_or(DesktopError("invalid_input"))?;
-                                            let probe = available_port(0)?;
-                                            let graph = intent.validate().map_err(|_| DesktopError("engine_config"))?;
-                                            let mut plan = yonik_engine::native_profile::OwnedRuntimePlan::new(port, probe).map_err(|_| DesktopError("engine_config"))?;
-                                            for ingress in graph.ingresses() { plan = plan.map_ingress(ingress.tag(), yonik_engine::native_profile::OwnedIngress::Local).map_err(|_| DesktopError("engine_config"))?; }
-                                            Ok(plan)
+                                            native_local_runtime_plan(&intent, port, || available_port(0))
                                         }).and_then(|plan| actor.probe_target().map(|target| (plan, target))) {
                                             Err(error) => Err(error.into()),
                                             Ok((plan, target)) => {
@@ -6089,13 +6155,13 @@ async fn run(
                             else {
                                 let Some(compiled) = await_current_schedule(actor.local_connect_config(), &control.generation, envelope.generation).await else { continue; };
                                 match (compiled, actor.probe_target()) {
-                                    (Ok(compiled), Ok(target)) => {
+                                    (Ok((compiled, listen_port)), Ok(target)) => {
                                         let (cancel, receiver) = Cancellation::new();
-                                        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, compiled.listen_port().get()));
+                                        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, listen_port.get()));
                                         session_generation = session_generation.saturating_add(1); actor.state.error_generation = session_generation;
                                         #[cfg(feature = "test-support")]
                                         let receiver = if let Some(gate) = config.lifecycle_gate.clone() { receiver.with_lifecycle_gate(gate, session_generation) } else { receiver };
-                                        let task = tokio::spawn(session(SessionConfig::Server(compiled), config.engine_dir.clone(), actor.state.engine.engine(), target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
+                                        let task = tokio::spawn(session(compiled, config.engine_dir.clone(), actor.state.engine.engine(), target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
                                         running = Some(Running { lease: (session_generation, endpoint), cancel, task }); actor.state.can_stop = true;
                                         actor.state.active_name = Some(profile.profile.name.clone()); actor.state.active_engine = Some(actor.state.engine);
                                         actor.state.probe_result = None; actor.state.status = "Preparing"; Ok(())
@@ -8368,13 +8434,16 @@ mod p07_connect_compiler_tests {
             b"vless://00112233-4455-6677-8899-aabbccddeeff@127.0.0.1:24443".to_vec(),
         )
         .unwrap();
-        compile_local_connect(
+        match compile_local_connect(
             &report.servers[0],
             engine,
             NonZeroU16::new(10808).unwrap(),
             NonZeroU16::new(probe).unwrap(),
             draft,
-        )
+        )? {
+            super::SessionConfig::Server(config) => Ok(config),
+            _ => panic!("Ожидался обычный конфиг сервера"),
+        }
     }
     fn value(config: &yonik_engine::CompiledConfig) -> Value {
         let mut bytes = Vec::new();
@@ -8494,5 +8563,61 @@ mod p07_connect_compiler_tests {
             compile(Engine::SingBox, &captured, 10809).unwrap_err().0,
             "unsupported_option"
         );
+    }
+}
+
+#[cfg(test)]
+mod local_native_port_tests {
+    use super::*;
+    use yonik_engine::native_profile::{OwnedIngress, ProfileIntent};
+
+    #[test]
+    fn http_port_selection_skips_socks_and_probe() {
+        let excluded = [10808, 10809].map(|port| NonZeroU16::new(port).unwrap());
+        let mut candidates = [10808, 10809, 10810].into_iter();
+        let picked = available_distinct_local_port(&excluded, || {
+            Ok(NonZeroU16::new(candidates.next().unwrap()).unwrap())
+        });
+        assert_eq!(picked.unwrap().get(), 10810);
+        assert_eq!(
+            available_distinct_local_port(&excluded, || Ok(excluded[0]))
+                .unwrap_err()
+                .0,
+            "listen_port_busy"
+        );
+    }
+
+    #[test]
+    fn native_local_mapping_keeps_socks_and_http_separate() {
+        for dual in [false, true] {
+            let mut graph = serde_json::json!({
+                "inbounds":[{"tag":"socks","protocol":"socks","settings":{"udp":true}}],
+                "outbounds":[{"tag":"direct","protocol":"freedom"}]
+            });
+            if dual {
+                graph["inbounds"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"tag":"http","protocol":"http"}));
+            }
+            let intent =
+                ProfileIntent::decode(&serde_json::json!({"version":1,"graph":graph}).to_string())
+                    .unwrap();
+            let mut candidates = [10809, 10810].into_iter();
+            let plan = native_local_runtime_plan(&intent, 10808.try_into().unwrap(), || {
+                Ok(candidates.next().unwrap().try_into().unwrap())
+            })
+            .unwrap();
+            assert_eq!(plan.probe_port().get(), 10809);
+            assert_eq!(
+                plan.local_http_port().map(NonZeroU16::get),
+                dual.then_some(10810)
+            );
+            let mut expected = vec![("socks", OwnedIngress::Local)];
+            if dual {
+                expected.insert(0, ("http", OwnedIngress::LocalHttp));
+            }
+            assert_eq!(plan.ingress_mappings().collect::<Vec<_>>(), expected);
+        }
     }
 }

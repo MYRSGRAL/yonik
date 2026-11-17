@@ -5,7 +5,7 @@ use yonik_domain::{Action, DomainPattern, Policy};
 use yonik_import::ParsedServer;
 
 use crate::resource_bundle::{BoundCompileError, Checkpoint};
-use crate::{CompileError, CompiledConfig, Engine, compile};
+use crate::{CompileError, CompiledConfig, Engine};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyMode {
@@ -223,6 +223,7 @@ pub(crate) fn compile_tun_policy_resources<C: crate::resource_bundle::VerifiedCa
         PolicyMode::IpOnly,
         true,
         Some(&resources),
+        false,
     )
 }
 
@@ -244,6 +245,7 @@ fn compile_policy_inner(
         mode,
         tun_sources,
         None,
+        false,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -257,9 +259,29 @@ pub(crate) fn compile_policy_resources(
     resources: Option<&dyn crate::resource_bundle::ResourceRoutes>,
 ) -> Result<CompiledConfig, PolicyCompileError> {
     compile_policy_resources_inner(
-        server, engine, port, probe_port, policy, mode, false, resources,
+        server, engine, port, probe_port, policy, mode, false, resources, false,
     )
 }
+pub(crate) fn compile_xray_reality_h2_policy(
+    server: &ParsedServer,
+    port: NonZeroU16,
+    probe_port: NonZeroU16,
+    policy: &Policy,
+    mode: PolicyMode,
+) -> Result<CompiledConfig, PolicyCompileError> {
+    compile_policy_resources_inner(
+        server,
+        Engine::Xray,
+        port,
+        probe_port,
+        policy,
+        mode,
+        false,
+        None,
+        true,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_policy_resources_inner(
     server: &ParsedServer,
@@ -270,6 +292,7 @@ fn compile_policy_resources_inner(
     mode: PolicyMode,
     tun_sources: bool,
     resources: Option<&dyn crate::resource_bundle::ResourceRoutes>,
+    require_reality_h2: bool,
 ) -> Result<CompiledConfig, PolicyCompileError> {
     if port == probe_port {
         return Err(PolicyCompileError::ProbePort);
@@ -311,6 +334,7 @@ fn compile_policy_resources_inner(
         tun_sources,
         resources,
         false,
+        require_reality_h2,
         &checkpoint,
     )
     .map_err(|error| match error {
@@ -357,6 +381,7 @@ pub(crate) fn compile_unadmitted_data(
         false,
         Some(resources),
         true,
+        false,
         checkpoint,
     )
 }
@@ -372,11 +397,13 @@ fn emit_policy(
     tun_sources: bool,
     resources: Option<&dyn crate::resource_bundle::ResourceRoutes>,
     data_only: bool,
+    require_reality_h2: bool,
     checkpoint: &Checkpoint<'_>,
 ) -> Result<CompiledConfig, BoundCompileError> {
     checkpoint.check()?;
     crate::validate_listener(server, probe_port).map_err(PolicyCompileError::Server)?;
-    let mut config = compile(server, engine, port).map_err(PolicyCompileError::Server)?;
+    let mut config = crate::compile_server(server, engine, port, require_reality_h2)
+        .map_err(PolicyCompileError::Server)?;
     let auth = ProbeCredentials::random()?;
     let inbound = match engine {
         Engine::Xray => {

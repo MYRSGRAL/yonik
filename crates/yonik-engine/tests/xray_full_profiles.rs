@@ -726,6 +726,119 @@ fn system_resolver_binding_rejects_empty_or_unbounded_snapshots() {
 }
 
 #[test]
+fn local_dual_ingress_preserves_provider_routes_and_separate_socks_probe() {
+    let mut fixtures = profiles();
+    let mut value = provider_shape(fixtures.remove(3));
+    value["outbounds"][0]["streamSettings"] = fixtures[1]["outbounds"][0]["streamSettings"].clone();
+    value["outbounds"][0]["mux"] = json!({"enabled":true,"concurrency":8,"xudpConcurrency":16});
+    value["routing"]["rules"][1]["inboundTag"] = json!(["fixture-dns-b", "fixture-http"]);
+    let native = profile(&value);
+    let graph = validate_profile(&native).unwrap();
+    let runtime = plan()
+        .bind_resources(&graph, &SyntheticBindings)
+        .unwrap()
+        .with_local_http(10810.try_into().unwrap())
+        .unwrap()
+        .map_ingress("fixture-socks", OwnedIngress::Local)
+        .unwrap()
+        .map_ingress("fixture-http", OwnedIngress::LocalHttp)
+        .unwrap();
+    ProfileIntent::from_profile(&native)
+        .unwrap()
+        .validate_ingress_mapping(&runtime)
+        .unwrap();
+    let compiled = compile_profile_local(&native, &runtime).unwrap();
+    assert_eq!(compiled.local_http_port().unwrap().get(), 10810);
+    let config = emitted(&compiled);
+    let inbounds = config["inbounds"].as_array().unwrap();
+    assert_eq!(inbounds.len(), 3);
+    for (index, port, protocol, tag) in [
+        (0, 10808, "socks", "yonik-owned-local"),
+        (1, 10809, "socks", "yonik-owned-probe"),
+        (2, 10810, "http", "yonik-owned-http"),
+    ] {
+        assert_eq!(inbounds[index]["listen"], "127.0.0.1");
+        assert_eq!(inbounds[index]["port"], port);
+        assert_eq!(inbounds[index]["protocol"], protocol);
+        assert_eq!(inbounds[index]["tag"], tag);
+        assert_eq!(
+            inbounds[index]["sniffing"],
+            value["inbounds"][0]["sniffing"]
+        );
+    }
+    assert_eq!(inbounds[0]["settings"]["udp"], true);
+    assert_eq!(inbounds[1]["settings"]["auth"], "password");
+    assert_eq!(
+        config["routing"]["rules"][2]["inboundTag"],
+        json!(["yonik-owned-local", "yonik-owned-http", "yonik-owned-probe"])
+    );
+    assert_eq!(config["routing"]["rules"][2]["port"], "53");
+    assert_eq!(
+        config["routing"]["rules"][1]["inboundTag"],
+        json!(["fixture-dns-b", "yonik-owned-http"])
+    );
+    assert_eq!(config["outbounds"], value["outbounds"]);
+    assert_eq!(config["dns"]["hosts"], value["dns"]["hosts"]);
+}
+
+#[test]
+fn local_dual_ingress_rejects_conflicting_ports_and_unowned_aliases() {
+    for occupied in [10808, 10809] {
+        assert!(matches!(
+            plan().with_local_http(occupied.try_into().unwrap()),
+            Err(ProfileCompileError::Ownership)
+        ));
+    }
+    let value = provider_shape(profiles().remove(3));
+    let native = profile(&value);
+    let graph = validate_profile(&native).unwrap();
+    assert!(matches!(
+        plan().map_ingress("fixture-http", OwnedIngress::LocalHttp),
+        Err(ProfileCompileError::Ownership)
+    ));
+    for (socks, http) in [
+        (OwnedIngress::LocalHttp, OwnedIngress::Local),
+        (OwnedIngress::Local, OwnedIngress::Local),
+    ] {
+        let runtime = plan()
+            .bind_resources(&graph, &SyntheticBindings)
+            .unwrap()
+            .with_local_http(10810.try_into().unwrap())
+            .unwrap()
+            .map_ingress("fixture-socks", socks)
+            .unwrap()
+            .map_ingress("fixture-http", http)
+            .unwrap();
+        assert!(matches!(
+            ProfileIntent::from_profile(&native)
+                .unwrap()
+                .validate_ingress_mapping(&runtime),
+            Err(ProfileCompileError::Ownership)
+        ));
+        assert!(matches!(
+            compile_profile_local(&native, &runtime),
+            Err(ProfileCompileError::Ownership)
+        ));
+    }
+    let mut conflicting = value;
+    conflicting["outbounds"][0]["settings"]["servers"][0]["address"] = json!("127.0.0.1");
+    conflicting["outbounds"][0]["settings"]["servers"][0]["port"] = json!(10810);
+    let runtime = plan()
+        .bind_resources(&graph, &SyntheticBindings)
+        .unwrap()
+        .with_local_http(10810.try_into().unwrap())
+        .unwrap()
+        .map_ingress("fixture-socks", OwnedIngress::Local)
+        .unwrap()
+        .map_ingress("fixture-http", OwnedIngress::LocalHttp)
+        .unwrap();
+    assert!(matches!(
+        compile_profile_local(&profile(&conflicting), &runtime),
+        Err(ProfileCompileError::Ownership)
+    ));
+}
+
+#[test]
 fn france_ss2022_keeps_full_provider_graph_through_intent_and_compile() {
     let source = include_str!("../../../tests/fixtures/xray-full-profile-france-synthetic.json");
     let mut original: Vec<Value> = serde_json::from_str(source).unwrap();

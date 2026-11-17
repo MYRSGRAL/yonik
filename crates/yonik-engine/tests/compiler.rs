@@ -550,3 +550,91 @@ fn hysteria2_uri_compiles_to_xray_quic_with_transport_auth() {
         Err(CompileError::InvalidParameter)
     );
 }
+
+#[test]
+fn legacy_reality_h2_requires_exact_xray_elf_and_uri_shape() {
+    use yonik_engine::{PendingXrayRealityH2, XrayRealityH2};
+
+    let port = NonZeroU16::new(10808).unwrap();
+    let base = format!(
+        "vless://{UUID}@secret.example:443?encryption=none&security=reality&sni=verify.example&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=ab12&packetEncoding=xudp"
+    );
+    let digest = XrayRealityH2::ELF_SHA256;
+    let mut unknown_digest = digest;
+    unknown_digest[0] ^= 1;
+    assert!(XrayRealityH2::for_snapshot(Engine::Xray, unknown_digest).is_none());
+    assert!(XrayRealityH2::for_snapshot(Engine::Xray, [0; 32]).is_none());
+    assert!(XrayRealityH2::for_snapshot(Engine::SingBox, digest).is_none());
+    let candidate = || XrayRealityH2::for_snapshot(Engine::Xray, digest).unwrap();
+
+    for shape in [
+        "type=xhttp&mode=auto&path=%2Fstream",
+        "type=grpc&mode=gun&serviceName=sample&spx=%2Fprobe",
+    ] {
+        let uri = format!("{base}&{shape}&alpn=h2");
+        let report = import_bytes(uri.as_bytes().to_vec()).unwrap();
+        assert!(report.issues.is_empty());
+        let server = &report.servers[0];
+        assert!(server.review_flags().is_empty());
+        assert_eq!(
+            compile(server, Engine::Xray, port).err(),
+            Some(CompileError::UnsupportedOption)
+        );
+        let pending = PendingXrayRealityH2::compile(server, port).unwrap();
+        assert_eq!(pending.listen_port(), port);
+        let mut bytes = Vec::new();
+        let compiled = pending.authorize(candidate());
+        assert!(compiled.requires_xray_reality_h2());
+        compiled.write_sensitive(&mut bytes).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let mut expected = config(Engine::Xray, &uri.replace("alpn=h2", "alpn=")).unwrap();
+        expected["outbounds"][0]["streamSettings"]["realitySettings"]["alpn"] = json!(["h2"]);
+        assert_eq!(value, expected);
+
+        let probe_port = NonZeroU16::new(10809).unwrap();
+        let mut policy = yonik_domain::Policy::default();
+        policy.user_rules.push(yonik_domain::Rule {
+            id: 71,
+            enabled: true,
+            action: yonik_domain::Action::Block,
+            conditions: yonik_domain::Conditions {
+                transport: yonik_domain::TransportConditions::parse(Some(&["udp"]), None).unwrap(),
+                ..Default::default()
+            },
+        });
+        let routed = PendingXrayRealityH2::compile_policy(
+            server,
+            port,
+            probe_port,
+            &policy,
+            yonik_engine::PolicyMode::IpOnly,
+        )
+        .unwrap()
+        .authorize(candidate());
+        assert!(routed.requires_xray_reality_h2());
+        assert_eq!(routed.probe_port(), probe_port);
+        assert!(routed.probe_auth().is_some());
+        let mut bytes = Vec::new();
+        routed.write_sensitive(&mut bytes).unwrap();
+        let routed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            routed["routing"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["network"] == "udp" && rule["outboundTag"] == "block")
+        );
+
+        for invalid in [
+            uri.replace("alpn=h2", "alpn="),
+            uri.replace("alpn=h2", "alpn=h2,http%2F1.1"),
+            uri.replace("alpn=h2", "alpn=http%2F1.1"),
+            uri.replace("fp=chrome", "fp=firefox"),
+            uri.replace("&packetEncoding=xudp", ""),
+            format!("{uri}&flow=xtls-rprx-vision"),
+        ] {
+            let report = import_bytes(invalid.into_bytes()).unwrap();
+            assert!(PendingXrayRealityH2::compile(&report.servers[0], port).is_err());
+        }
+    }
+}

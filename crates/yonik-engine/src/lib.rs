@@ -72,6 +72,7 @@ pub struct CompiledConfig {
     engine: Engine,
     port: NonZeroU16,
     probe_port: NonZeroU16,
+    local_http_port: Option<NonZeroU16>,
     probe_access: ProbeAccess,
 }
 impl CompiledConfig {
@@ -93,6 +94,9 @@ impl CompiledConfig {
     pub fn probe_port(&self) -> NonZeroU16 {
         self.probe_port
     }
+    pub fn local_http_port(&self) -> Option<NonZeroU16> {
+        self.local_http_port
+    }
     pub fn probe_auth(&self) -> Option<&ProbeCredentials> {
         self.probe_access.auth()
     }
@@ -101,6 +105,15 @@ impl CompiledConfig {
     }
     pub fn write_sensitive(&self, writer: impl Write) -> Result<(), serde_json::Error> {
         serde_json::to_writer(writer, &self.value)
+    }
+
+    /// Legacy writer проверяет capability повторно перед передачей JSON ядру.
+    pub fn requires_xray_reality_h2(&self) -> bool {
+        self.engine == Engine::Xray
+            && self
+                .value
+                .pointer("/outbounds/0/streamSettings/realitySettings/alpn")
+                .is_some()
     }
 }
 impl fmt::Debug for CompiledConfig {
@@ -116,8 +129,20 @@ pub fn compile(
     engine: Engine,
     port: NonZeroU16,
 ) -> Result<CompiledConfig, CompileError> {
+    compile_server(server, engine, port, false)
+}
+
+mod xray_reality_h2;
+pub use xray_reality_h2::{PendingXrayRealityH2, XrayRealityH2};
+
+fn compile_server(
+    server: &ParsedServer,
+    engine: Engine,
+    port: NonZeroU16,
+    require_reality_h2: bool,
+) -> Result<CompiledConfig, CompileError> {
     validate_listener(server, port)?;
-    let options = options::validate(server, engine)?;
+    let options = options::validate(server, engine, require_reality_h2)?;
     validate_credentials(server, engine)?;
     let value = match engine {
         Engine::Xray => json!({
@@ -138,6 +163,7 @@ pub fn compile(
         engine,
         port,
         probe_port: port,
+        local_http_port: None,
         probe_access: ProbeAccess::default(),
     })
 }
