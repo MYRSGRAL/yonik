@@ -890,6 +890,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   это не runtime/kernel/installed acceptance. System/NETWORK и queued-cancel/
   late-ACK interop остаются следующими проверками; public gates false.
 
+- R78 SOURCE/test review CLEAN: System HOSTS interop5fe783f интегрирован.
+  Общий System capsule/launch/source/preseed grantflow1/owner2:77/Known20ms;
+  actual противоположные SUT дают ACK. Positive route/factory1/1, fake-clock
+  expiry после Numeric ACK — route retired/factory0, owner lookups0, cleanup ACK.
+  Отрицательный case одновременно истекает Known-limited derived leases, не
+  изолирует parent conjunction. USER admission/HELLO/OS facts инъецированы;
+  real System/runtime/P5 PASS не заявляется. Production semantics/pins/Go3c156ca
+  unchanged; NETWORK/late-ACK interop ещё не закрыты, public gates false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
