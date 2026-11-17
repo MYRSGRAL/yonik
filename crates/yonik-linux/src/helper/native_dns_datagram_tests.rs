@@ -222,6 +222,87 @@ fn codec5_datagram_driver_hosts_member_route_permission_and_parent_cancel() {
     }
 }
 #[test]
+fn scope5_factory_hosts_local_system_uses_retained_planner_and_consumed_parent() {
+    for mode in [Mode::Local, Mode::System] {
+        let (mut issuer, f) = fixture5(mode);
+        let binding = super::super::super::super::bootstrap_binding::tests::datagram_binding(
+            issuer.capsule.clone(),
+            f.launch,
+            f.asset.clone(),
+            f.reference,
+            issuer.budget.clone(),
+            issuer.authority.now(),
+        );
+        let mut script = script5(&f);
+        // Payload DATA использует key того же captured planner; issuer проверит сам.
+        let peers = ["192.0.2.53:53".parse().unwrap()];
+        let plan = crate::helper::profile_intent::PinnedResolverSnapshot::fixture_lookup_data(
+            &f.asset,
+            &peers,
+            f.reference,
+            "physical.invalid",
+            f.launch.binding.epoch,
+            crate::helper::profile_intent::LookupFamily::Any,
+            &issuer.budget.dynamic,
+        )
+        .unwrap();
+        let key = plan.lookup_key().as_bytes();
+        let body = &mut script[3].1;
+        let old = usize::from(u16_at(body, 144 + 110));
+        let old_end = 144 + 128 + old;
+        body.splice(144 + 128..old_end, key.iter().copied());
+        let tail_len = (body.len() - 144) as u16;
+        body[144 + 10..144 + 12].copy_from_slice(&tail_len.to_be_bytes());
+        body[144 + 110..144 + 112].copy_from_slice(&(key.len() as u16).to_be_bytes());
+        drop(plan);
+        let mut io = io5(&f, &script);
+        io.datagram(binding.datagram_source(f.launch).unwrap().unwrap());
+        drive(&mut issuer, &io);
+        let out = io.output.borrow();
+        assert_eq!(out.len(), 9);
+        assert_eq!(
+            grant_status(&out[8], &f),
+            wire::Status::Allow,
+            "{:?}",
+            out.iter()
+                .map(|p| (u16_at(p, 10), p[130]))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+#[test]
+fn scope5_factory_reviewed_source_does_not_replace_consumed_lineage_or_user_ack() {
+    for fault in 0..3 {
+        let (mut issuer, f) = fixture5(Mode::System);
+        let binding = super::super::super::super::bootstrap_binding::tests::datagram_binding(
+            issuer.capsule.clone(),
+            f.launch,
+            f.asset.clone(),
+            f.reference,
+            issuer.budget.clone(),
+            issuer.authority.now(),
+        );
+        match fault {
+            0 => issuer.authority.datagram_bindings.clear(),
+            1 => {
+                issuer
+                    .authority
+                    .datagram_bindings
+                    .get_mut(&1)
+                    .unwrap()
+                    .0
+                    .nonce[0] ^= 1
+            }
+            _ => issuer.grants[&1].sent.store(false, Ordering::Release),
+        }
+        let mut io = io5(&f, &[(Operation::DatagramParentBind, parent(&f, 9))]);
+        io.datagram(binding.datagram_source(f.launch).unwrap().unwrap());
+        drive(&mut issuer, &io);
+        assert_eq!(io.output.borrow()[0][130], 2);
+        assert_eq!(issuer.authority.route_count, 1);
+    }
+}
+#[test]
 fn codec5_datagram_binding_exact_ss_parent_before_context() {
     let (mut issuer, f) = fixture5(Mode::Local);
     let d = wire::dns_v2::Negotiated::datagram_descriptor(f.launch).unwrap();

@@ -176,6 +176,31 @@ pub(in crate::helper::native_profile_channel) fn binding_fixture(
         v.root().unwrap(),
     )
 }
+pub(in crate::helper::native_profile_channel) fn binding5_fixture(
+    mode: Mode,
+    order: u8,
+) -> BindingFixture {
+    let (issuer, f) = fixture_carrier(
+        mode,
+        "203.0.113.80".parse().unwrap(),
+        order,
+        true,
+        [3; 32],
+        17,
+    );
+    let body = acquire(&f, false, 2, 9);
+    let root = View::<55>::decode(&body).unwrap().root().unwrap();
+    (
+        issuer.capsule.clone(),
+        f.launch,
+        f.asset.clone(),
+        f.reference,
+        f.path.clone(),
+        f.endpoint,
+        issuer.budget.clone(),
+        root,
+    )
+}
 fn fixture_address(mode: Mode, address: std::net::IpAddr) -> (Issuer<Fake>, Arc<Facts>) {
     fixture_order(mode, address, 1)
 }

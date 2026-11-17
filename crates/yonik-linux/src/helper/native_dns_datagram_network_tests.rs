@@ -49,6 +49,8 @@ impl BootstrapDnsTranscript for Capture {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fault {
     Good,
+    FactoryUdp,
+    FactoryTcp,
     NoWire,
     NoRelease,
     WrongLaunch,
@@ -83,8 +85,26 @@ fn waiter() -> Vec<u8> {
 }
 fn run(mode: Mode, fault: Fault) {
     let (mut issuer, f) = fixture5_order(mode, 2);
-    assert_eq!(service(&mut issuer, &f), 2);
-    assert_eq!(service(&mut issuer, &f), 3);
+    let installed = matches!(fault, Fault::FactoryUdp | Fault::FactoryTcp);
+    let tcp = fault == Fault::FactoryTcp;
+    let resolver = if tcp { 0u16 } else { 1 };
+    for expected in [2, 3] {
+        assert_eq!(
+            issuer
+                .service(
+                    50,
+                    0,
+                    &wire::Message::Probe {
+                        purpose: 2,
+                        index: f.endpoint,
+                        subject: f.subject,
+                        resolver
+                    }
+                )
+                .unwrap(),
+            expected
+        );
+    }
     let mut reserve1 = reserve(&f, false, 1, 9);
     reserve1[24..32].copy_from_slice(&2u64.to_be_bytes());
     let mut reserve2 = reserve(&f, false, 2, 9);
@@ -94,6 +114,23 @@ fn run(mode: Mode, fault: Fault) {
     reserve3[24..32].copy_from_slice(&3u64.to_be_bytes());
     let mut publish = bootstrap_publish(&f);
     publish[20..28].copy_from_slice(&2u64.to_be_bytes());
+    if installed {
+        let mut q = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+        q.extend_from_slice(b"\x08physical\x07invalid\0\0\x01\0\x01");
+        let mut r = q.clone();
+        r[2] = 0x81;
+        r[3] = 0x80;
+        r[7] = 1;
+        r.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 203, 0, 113, 80]);
+        let opt = [0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(&opt);
+        r.extend_from_slice(&opt);
+        publish.truncate(144 + 16);
+        publish[110..112].copy_from_slice(&(q.len() as u16).to_be_bytes());
+        publish[112..116].copy_from_slice(&(r.len() as u32).to_be_bytes());
+        publish.extend_from_slice(&q);
+        publish.extend_from_slice(&r);
+    }
     if fault == Fault::WrongResponse {
         let at = 144 + 16 + usize::from(u16_at(&publish, 110));
         publish[at] ^= 1;
@@ -116,7 +153,7 @@ fn run(mode: Mode, fault: Fault) {
         publish[12..20].copy_from_slice(&10u64.to_be_bytes());
     }
     let mut numeric = numeric_body(&f, 1, [203, 0, 113, 80]);
-    numeric[22..24].copy_from_slice(&1u16.to_be_bytes());
+    numeric[22..24].copy_from_slice(&resolver.to_be_bytes());
     if fault == Fault::MixedCarrier {
         numeric[25] = 6;
     }
@@ -156,7 +193,10 @@ fn run(mode: Mode, fault: Fault) {
         good[22..24].copy_from_slice(&1u16.to_be_bytes());
         script.push((Operation::NumericAuthorize, good));
     }
-    if matches!(fault, Fault::Good | Fault::UnknownClose) {
+    if matches!(
+        fault,
+        Fault::Good | Fault::FactoryUdp | Fault::FactoryTcp | Fault::UnknownClose
+    ) {
         script.extend([
             (Operation::Retire, retire(4, 1, 1)),
             (Operation::Retire, retire(3, 1, 0)),
@@ -168,6 +208,31 @@ fn run(mode: Mode, fault: Fault) {
             (Operation::Cancel, cancel_body(9, 1)),
             (Operation::Cancel, cancel_body(9, 2)),
         ]);
+    }
+    if installed {
+        for (op, b) in &mut script {
+            match op {
+                Operation::BundleAcquire => {
+                    b[54..56].copy_from_slice(&9u16.to_be_bytes());
+                    b[56..58].copy_from_slice(&1232u16.to_be_bytes());
+                    b[60..62].copy_from_slice(&resolver.to_be_bytes());
+                    b[78..80].copy_from_slice(&resolver.to_be_bytes());
+                }
+                Operation::Reserve => {
+                    b[64..66].copy_from_slice(&resolver.to_be_bytes());
+                    let base = 96 + usize::from(u16_at(b, 80)) + usize::from(u16_at(b, 82));
+                    b[base + 6..base + 8].copy_from_slice(&resolver.to_be_bytes());
+                    if b[2] != 2 {
+                        b[88..90].copy_from_slice(&9u16.to_be_bytes());
+                        b[90..92].copy_from_slice(&1232u16.to_be_bytes());
+                    } else if tcp {
+                        b[76] = 6;
+                    }
+                }
+                Operation::Publish => b[4..6].copy_from_slice(&resolver.to_be_bytes()),
+                _ => {}
+            }
+        }
     }
     let mut io = io5(&f, &script);
     io.after_reply.borrow_mut().insert(3, vec![]);
@@ -187,6 +252,19 @@ fn run(mode: Mode, fault: Fault) {
     } else {
         Some(dns_datagram::NetworkRelease::fake(launch))
     };
+    if installed {
+        let binding = super::super::super::super::super::bootstrap_binding::tests::datagram_binding(
+            issuer.capsule.clone(),
+            f.launch,
+            f.asset.clone(),
+            f.reference,
+            issuer.budget.clone(),
+            issuer.authority.now(),
+        );
+        io.datagram(binding.datagram_source(f.launch).unwrap().unwrap());
+        io.datagram_wire = binding.datagram_wire(f.launch).unwrap();
+        io.datagram_release = binding.datagram_release(f.launch).unwrap();
+    }
     // Old reviewed4 release должен оставаться бесполезным при отсутствии release5.
     io.bootstrap_producer = Some(Arc::new(VerifiedBootstrapDnsProducer {
         launch: f.launch,
@@ -203,7 +281,13 @@ fn run(mode: Mode, fault: Fault) {
         [(0, 0); 2],
     )
     .unwrap();
-    let raw = bootstrap_raw(&f);
+    let mut raw = bootstrap_raw(&f);
+    raw[160..162].copy_from_slice(&resolver.to_be_bytes());
+    if tcp {
+        raw[164] = 6;
+        raw[165] = 1;
+        raw[169] = 6;
+    }
     let slots = io.dns_slots().unwrap();
     let budget = issuer.budget.dynamic.clone();
     let facts = Arc::new(Mutex::new(
@@ -216,7 +300,7 @@ fn run(mode: Mode, fault: Fault) {
             }
             .parse()
             .unwrap(),
-            17,
+            if tcp { 6 } else { 17 },
             if fault == Fault::Namespace {
                 (4, 6)
             } else {
@@ -289,7 +373,10 @@ fn run(mode: Mode, fault: Fault) {
         io.stop_after = 3;
         io.after_reply.borrow_mut().truncate(2);
     }
-    if matches!(fault, Fault::Good | Fault::UnknownClose) {
+    if matches!(
+        fault,
+        Fault::Good | Fault::FactoryUdp | Fault::FactoryTcp | Fault::UnknownClose
+    ) {
         for (seq, id) in [(23, 2), (24, 3), (25, 1)] {
             append(&io, vec![legacy_close(&f, seq, id)]);
             io.stop_after += 1;
@@ -329,7 +416,10 @@ fn run(mode: Mode, fault: Fault) {
     ) {
         assert_eq!(out[6][130], 2, "{fault:?}");
     }
-    if fault == Fault::Good || fault == Fault::UnknownClose {
+    if matches!(
+        fault,
+        Fault::Good | Fault::FactoryUdp | Fault::FactoryTcp | Fault::UnknownClose
+    ) {
         assert_eq!(
             grant_status(&out[numeric_index], &f),
             wire::Status::Allow,
@@ -339,7 +429,7 @@ fn run(mode: Mode, fault: Fault) {
                 .collect::<Vec<_>>()
         );
         assert_eq!(factories.load(Ordering::Acquire), 1);
-        if fault == Fault::Good {
+        if matches!(fault, Fault::Good | Fault::FactoryUdp | Fault::FactoryTcp) {
             let expected = [
                 58, 56, 36, 36, 37, 39, 41, 58, 56, 36, 54, 19, 46, 46, 48, 48, 48, 48, 48, 48, 48,
                 34, 34, 34,
@@ -396,6 +486,14 @@ fn run(mode: Mode, fault: Fault) {
 fn codec5_network_udp_driver_publish_waiter_numeric_and_known_cleanup() {
     for mode in [Mode::Local, Mode::System] {
         run(mode, Fault::Good);
+    }
+}
+#[test]
+fn scope5_factory_network_local_system_tcp6_and_udp17_with_ss_udp_parent() {
+    for mode in [Mode::Local, Mode::System] {
+        for fault in [Fault::FactoryUdp, Fault::FactoryTcp] {
+            run(mode, fault);
+        }
     }
 }
 #[test]

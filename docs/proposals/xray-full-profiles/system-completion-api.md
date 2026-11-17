@@ -1891,7 +1891,7 @@ Numeric42 use2 уже кодирует protocol17, но CODEC4 context55 не с
 без изменения42/55/19. Legacy4 не принимает57/58/target9 и не downgrade-ится.
 
 `native_dns_datagram.rs::Producer` — закрытый независимый scope5
-`udp-bootstrap-consumed-parent-member-send-v1`; `REVIEWED_DATAGRAM_PATCH=None`.
+`udp-bootstrap-consumed-parent-member-send-v1`; production review5 остаётся None.
 `Channel::bootstrap_datagram_producer` по умолчанию None. Negotiation5 возможна
 только при проверенном exact launch/schema/contract producer, иначе fail before
 ACK. Старые Source4/Wire4/Release4/UDP ingress pins scope5 не mint-ят. Protected
@@ -1946,8 +1946,7 @@ Unsupported/false; SS UDP не вырезан из graph/config и не заме
 
 Wire/schema/corpus CODEC5 не меняются. `Datagrams::wire` и `Datagrams::release` —
 разные private types `NetworkWire`/`NetworkRelease`, отдельно от Source5/parent.
-Оба reviewed pins остаются None; constructors только cfg(test), production Channel
-views по умолчанию None. Будущий protected factory обязан независимо связать
+Оба reviewed pins остаются None; synthetic constructors только cfg(test). Protected factory связывает
 каждый record с exact retained image/config/manifest/launch/schema5; descriptor,
 Source5, old Bootstrap4 release или child transcript этого не делают.
 
@@ -1988,3 +1987,52 @@ Published41, Waiter54, Numeric19 и cleanup ACK создаёт actual serialized
 member authority. No sockets/SCM/kernel/Go5 pair/runtime admission исполнялись.
 Регрессии HOSTS/USER/Proxy/CODEC4 сохраняются. Protected scope5 mint и Go NETWORK
 counterpart требуют отдельного source review; production pins/readiness не открыты.
+
+### Scope5 protected factory Local/System
+
+`registry_datagram.rs` декодирует независимые optional slots schema2 manifest:
+`bootstrap_datagram` (Source + consumed parent/member/send contract41fc…4b1c),
+`bootstrap_datagram_dns_wire` (6a71…ceb9), `bootstrap_datagram_dns_release`
+(d424…5c83). Полные имена/digests — в разделах выше, schema5 c05c…ad03.
+Contract/version/hash/schema strict; неизвестный/crossschema slot отвергается.
+Main artifact build pin и три review pins5 остаются None. Old4/Direct3/UDP review
+не создаёт capability5; legacy records сохраняются. `DnsSchema::current` не менялся.
+
+`ImageContract::datagram_channel` выдаёт opaque role-specific capability только по
+reviewed record и exact retained image digest. `BootstrapBinding::prepare_datagram`
+использует общий `create_for`: authenticated Peer/consuming exec custody, exact
+final config/launch/capsule/manifest, SourceOwner mode и тот же retained snapshot
+role4/asset ref; до/после — revalidation со sticky invalidation. Local использует
+retained `Prepared`/FullProfileSources, System — SessionArtifact PreparedFullProfile.
+Нового capture, System artifact для Local, daemon или current-image measurement нет.
+
+Actual `SystemChannel::new` (используется и Local) создаёт schema4 и schema5 views
+отдельно, по selected raw SS hostname graph. Missing Source5 закрывает setup до
+negotiation; fallback4 для такого graph запрещён. `datagram_source/wire/release`
+mint installed views с retained Binding5. Каждый последующий check повторяет
+image/config/launch/source custody через typed record; standalone fake markers
+только cfg(test). Wire/Release5 не повышают Source5 и наоборот.
+
+Source17 parent опирается на independently reviewed consuming contract плюс
+immutable Consumed lineage в serialized issuer перед каждым Source lookup.
+Compiler graph проверяет соответствие frontier, но сам не доказывает live parent.
+Source factory не выдаёт USER authority и не снимает обязательный original parent
+conjunction при consuming send. Clock anchor по-прежнему issuer Reservation.started.
+
+Память: parent IDs — bounded contiguous nonreuse slots вместо двух BTreeMap;
+нет дублирующего query index/map nodes/Box на parent, каждый slot prepaid до grow.
+Query scan ограничен history256; ID lookup O(1), cancellation без nested scan.
+CaptureStamp создаётся lazy с precredit, хранит proof/revision/exchange/sequence,
+immutable transcript hashes и anchor. Полный Binding удерживается immutable
+TransportProof; issuer receipt всегда берётся из него, IDs не reuse/rebind.
+Query/root/selector/fullpath/peer/options/epoch повторно проверяются factory.
+Это удаление реально дублируемых данных, не снижение caps или отключение parser.
+
+Actual-driver positives с injected reviewed5 records используют этот factory и
+retained planner для HOSTS и NETWORK в обоих modes; resolver TCP row0/protocol6 и
+UDP row1/protocol17 проверены при оригинальном SS UDP carrier17. Production
+Kernel/Peer/Source wrappers не исполнялись; USER/Consumed и leaf custody — fakes.
+Builder пишет отдельный `native-profile-datagram-candidate.json` как compile-only
+review request с `install_authority=false` и `source_eligibility=false`; текущий
+PROFILE_PATCH не меняется и не получает новые scopes. Нужны новый reviewed Go pin,
+trusted installation и отдельная acceptance. FranceSS readiness не включена.

@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone)]
 pub(super) enum Sources {
     Local(Arc<crate::host::local_profile_channel::Prepared>),
     System(Arc<crate::helper::profile_intent::PreparedFullProfile>),
@@ -124,7 +125,8 @@ fn same_ref(a: wire::SnapshotRef, b: wire::SnapshotRef) -> bool {
     (a.source, a.asset, a.bytes, a.flags) == (b.source, b.asset, b.bytes, b.flags)
 }
 struct Query {
-    capture: Option<CaptureStamp>,
+    capture: Option<Box<CaptureStamp>>,
+    capture_memory: Option<crate::helper::memory::ByteLease>,
     id: u64,
     root: wire::dns_v2::Root,
     selector: wire::dns_v2::BootstrapSelector,
@@ -148,7 +150,9 @@ impl std::ops::DerefMut for QuerySlot {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CaptureStamp {
-    binding: super::dns_transport::Binding,
+    // Binding удерживает immutable TransportProof в native_dns_transport.
+    // Receipt строит только issuer из этого proof; IDs не reuse/rebind.
+    // Query/root/selector/path/peer/options/epoch проверены выше при каждом call.
     proof: u64,
     revision: u64,
     exchange: u64,
@@ -171,6 +175,7 @@ pub(super) struct BootstrapBinding {
     capsule: Arc<wire::OwnedCapsule>,
     launch: LaunchRecord,
     capabilities: [Option<BootstrapCapability>; 3],
+    datagram_caps: Option<Box<[Option<crate::helper::registry::DatagramCapability>; 3]>>,
     created: Instant,
     until: Instant,
     invalid: AtomicBool,
@@ -202,6 +207,32 @@ impl BootstrapBinding {
         launch: LaunchRecord,
         budget: Arc<ChannelBudget>,
     ) -> Result<Option<Arc<Self>>, ServiceError> {
+        Self::create_for(peer, owner, capsule, launch, budget, false)
+    }
+    pub(super) fn prepare_datagram(
+        peer: Arc<Peer>,
+        owner: Sources,
+        capsule: Arc<wire::OwnedCapsule>,
+        launch: LaunchRecord,
+        budget: Arc<ChannelBudget>,
+    ) -> Result<Option<Arc<Self>>, ServiceError> {
+        Self::create_for(
+            Arc::new(RetainedPeer(peer)),
+            Arc::new(owner),
+            capsule,
+            launch,
+            budget,
+            true,
+        )
+    }
+    fn create_for(
+        peer: Arc<dyn PeerCustody>,
+        owner: Arc<dyn SourceOwner>,
+        capsule: Arc<wire::OwnedCapsule>,
+        launch: LaunchRecord,
+        budget: Arc<ChannelBudget>,
+        datagram: bool,
+    ) -> Result<Option<Arc<Self>>, ServiceError> {
         let _fds = peer.validation_credit()?;
         peer.validate()?;
         launch.encode().map_err(unavailable)?;
@@ -219,18 +250,45 @@ impl BootstrapBinding {
         let Some(record) = peer.producer() else {
             return Ok(None);
         };
-        let capabilities = [
-            record
-                .bootstrap_channel(peer.image(), BootstrapScope::Source)
-                .map_err(unavailable)?,
-            record
-                .bootstrap_channel(peer.image(), BootstrapScope::Wire)
-                .map_err(unavailable)?,
-            record
-                .bootstrap_channel(peer.image(), BootstrapScope::Release)
-                .map_err(unavailable)?,
-        ];
-        if capabilities.iter().all(Option::is_none) {
+        if datagram && !Self::requires_datagram(&capsule, launch)? {
+            return Ok(None);
+        }
+        let capabilities = if datagram {
+            [None, None, None]
+        } else {
+            [
+                record
+                    .bootstrap_channel(peer.image(), BootstrapScope::Source)
+                    .map_err(unavailable)?,
+                record
+                    .bootstrap_channel(peer.image(), BootstrapScope::Wire)
+                    .map_err(unavailable)?,
+                record
+                    .bootstrap_channel(peer.image(), BootstrapScope::Release)
+                    .map_err(unavailable)?,
+            ]
+        };
+        use crate::helper::registry::DatagramScope as D;
+        let datagram_caps = if datagram {
+            Some([
+                record
+                    .datagram_channel(peer.image(), D::Source)
+                    .map_err(unavailable)?,
+                record
+                    .datagram_channel(peer.image(), D::Wire)
+                    .map_err(unavailable)?,
+                record
+                    .datagram_channel(peer.image(), D::Release)
+                    .map_err(unavailable)?,
+            ])
+        } else {
+            None
+        };
+        if capabilities.iter().all(Option::is_none)
+            && datagram_caps
+                .as_ref()
+                .is_none_or(|c| c.iter().all(Option::is_none))
+        {
             return Ok(None);
         }
         owner.validate()?;
@@ -246,10 +304,33 @@ impl BootstrapBinding {
             return Err(ServiceError::Unavailable);
         }
         let limit = (cap.limits()[7] as usize).min(256);
-        let memory = budget
-            .dynamic
-            .reserve(std::mem::size_of::<Self>() + limit * std::mem::size_of::<QuerySlot>() + 128)
-            .map_err(unavailable)?;
+        // Channel materializes каждый installed view один раз после ADMIT_ACK.
+        // Их Arc/header/record storage prepaid до любых constructor allocations.
+        let views = datagram_caps.as_ref().map_or(0, |c| {
+            usize::from(c[0].is_some())
+                * (std::mem::size_of::<super::dns_datagram::Producer>() + 32)
+                + usize::from(c[1].is_some())
+                    * (std::mem::size_of::<super::dns_datagram::NetworkWire>() + 32)
+                + usize::from(c[2].is_some())
+                    * (std::mem::size_of::<super::dns_datagram::NetworkRelease>() + 32)
+        });
+        let memory =
+            budget
+                .dynamic
+                .reserve(
+                    std::mem::size_of::<Self>()
+                        + limit * std::mem::size_of::<QuerySlot>()
+                        + 128
+                        + views
+                        + if datagram {
+                            std::mem::size_of::<
+                                [Option<crate::helper::registry::DatagramCapability>; 3],
+                            >()
+                        } else {
+                            0
+                        },
+                )
+                .map_err(unavailable)?;
         let created = peer.now();
         let until = created + Duration::from_millis(u64::from(cap.lease_ms));
         owner.validate()?;
@@ -260,6 +341,7 @@ impl BootstrapBinding {
             capsule,
             launch,
             capabilities,
+            datagram_caps: datagram_caps.map(Box::new),
             created,
             until,
             invalid: AtomicBool::new(false),
@@ -268,6 +350,35 @@ impl BootstrapBinding {
             budget,
             _memory: memory,
         })))
+    }
+    pub(super) fn requires_datagram(
+        capsule: &wire::OwnedCapsule,
+        launch: LaunchRecord,
+    ) -> Result<bool, ServiceError> {
+        let cap =
+            wire::Capsule::decode(capsule.bytes(), &launch.binding.digest).map_err(unavailable)?;
+        if cap.subject_kind(0).map_err(unavailable)? != 2 || cap.subject_kind(1).is_ok() {
+            return Ok(false);
+        }
+        let (s, mask) = cap.subject_scope(0, 17).map_err(unavailable)?;
+        let d = cap.dial_scope(s, 0).map_err(unavailable)?;
+        let (tcp, tm) = cap.subject_scope(0, 6).map_err(unavailable)?;
+        let t = cap.dial_scope(tcp, 0).map_err(unavailable)?;
+        if mask != 1
+            || tm != 1
+            || d.input != 17
+            || d.carrier != 17
+            || d.stream != u16::MAX
+            || d.next.is_some()
+            || d.action != 1
+            || t.input != 6
+            || t.carrier != 6
+            || t.next.is_some()
+            || cap.stream_shape(t.stream).map_err(unavailable)? != (1, 0)
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        Ok(d.endpoint.is_some_and(|endpoint| endpoint.family == 3))
     }
     fn scope_index(scope: BootstrapScope) -> usize {
         match scope {
@@ -287,11 +398,25 @@ impl BootstrapBinding {
         {
             return Err(ServiceError::Unavailable);
         }
-        self.capabilities[Self::scope_index(scope)]
-            .as_ref()
-            .ok_or(ServiceError::Unsupported)?
-            .check(self.peer.image(), scope)
-            .map_err(unavailable)?;
+        if let Some(caps) = &self.datagram_caps {
+            use crate::helper::registry::DatagramScope as D;
+            let d = match scope {
+                BootstrapScope::Source => D::Source,
+                BootstrapScope::Wire => D::Wire,
+                BootstrapScope::Release => D::Release,
+            };
+            caps[d.index()]
+                .as_ref()
+                .ok_or(ServiceError::Unsupported)?
+                .check(self.peer.image(), d)
+                .map_err(unavailable)?;
+        } else {
+            self.capabilities[Self::scope_index(scope)]
+                .as_ref()
+                .ok_or(ServiceError::Unsupported)?
+                .check(self.peer.image(), scope)
+                .map_err(unavailable)?;
+        }
         if self.invalid.load(Ordering::Acquire) || self.peer.now() >= self.until {
             return Err(ServiceError::Unavailable);
         }
@@ -318,6 +443,55 @@ impl BootstrapBinding {
             .as_ref()
             .map(|_| Arc::clone(self) as Arc<dyn Source>)
     }
+    pub(super) fn datagram_source(
+        self: &Arc<Self>,
+        launch: LaunchRecord,
+    ) -> Result<Option<Arc<super::dns_datagram::Producer>>, ServiceError> {
+        if self.datagram_caps.as_ref().is_none_or(|c| c[0].is_none()) {
+            return Ok(None);
+        }
+        self.check(BootstrapScope::Source, launch)?;
+        Ok(Some(super::dns_datagram::Producer::installed(
+            Arc::clone(self),
+            self.launch,
+        )))
+    }
+    pub(super) fn datagram_wire(
+        self: &Arc<Self>,
+        launch: LaunchRecord,
+    ) -> Result<Option<Arc<super::dns_datagram::NetworkWire>>, ServiceError> {
+        if self.datagram_caps.as_ref().is_none_or(|c| c[1].is_none()) {
+            return Ok(None);
+        }
+        self.check(BootstrapScope::Wire, launch)?;
+        Ok(Some(super::dns_datagram::NetworkWire::installed(
+            Arc::clone(self),
+            self.launch,
+        )))
+    }
+    pub(super) fn datagram_release(
+        self: &Arc<Self>,
+        launch: LaunchRecord,
+    ) -> Result<Option<Arc<super::dns_datagram::NetworkRelease>>, ServiceError> {
+        if self.datagram_caps.as_ref().is_none_or(|c| c[2].is_none()) {
+            return Ok(None);
+        }
+        self.check(BootstrapScope::Release, launch)?;
+        Ok(Some(super::dns_datagram::NetworkRelease::installed(
+            Arc::clone(self),
+            self.launch,
+        )))
+    }
+    pub(super) fn datagram_check(
+        &self,
+        scope: BootstrapScope,
+        launch: LaunchRecord,
+    ) -> Result<(), ServiceError> {
+        if self.datagram_caps.is_none() {
+            return Err(ServiceError::Unsupported);
+        }
+        self.check(scope, launch)
+    }
     pub(super) fn transcript(self: &Arc<Self>) -> Option<Arc<dyn BootstrapDnsTranscript>> {
         self.capabilities[1]
             .as_ref()
@@ -337,7 +511,11 @@ impl BootstrapBinding {
         // Проверка graph ниже не является независимым наблюдением Go operation.
         let p = p.checked()?;
         self.check(BootstrapScope::Source, p.launch)?;
-        if p.original.protocol != 6 || p.path.len() != 1 || p.path[0].1 != 0 {
+        let datagram = self.datagram_caps.is_some();
+        if p.original.protocol != if datagram { 17 } else { 6 }
+            || p.path.len() != 1
+            || p.path[0].1 != 0
+        {
             return Err(ServiceError::Unsupported);
         }
         let _scratch = self.budget.dynamic.reserve(2048).map_err(unavailable)?;
@@ -351,7 +529,11 @@ impl BootstrapBinding {
         let mut seen = [[false; 2]; 512];
         for (i, (scope, branch)) in p.path.iter().copied().enumerate() {
             let d = cap.dial_scope(scope, branch).map_err(unavailable)?;
-            if cap.stream_shape(d.stream).map_err(unavailable)? != (1, 0) {
+            if if datagram {
+                d.stream != u16::MAX || cap.subject_kind(d.subject).map_err(unavailable)? != 2
+            } else {
+                cap.stream_shape(d.stream).map_err(unavailable)? != (1, 0)
+            } {
                 return Err(ServiceError::Unsupported);
             }
             if seen[usize::from(scope)][usize::from(branch)]
@@ -393,6 +575,7 @@ impl BootstrapBinding {
             let until = self.until.min(self.peer.now() + Duration::from_secs(1));
             queries.push(QuerySlot(Box::new(Query {
                 capture: None,
+                capture_memory: None,
                 id: p.query,
                 root: p.root,
                 selector: p.selector,
@@ -721,7 +904,6 @@ impl BootstrapDnsTranscript for BootstrapBinding {
             )?;
         }
         let stamp = CaptureStamp {
-            binding: r.binding,
             proof: r.proof,
             revision: r.revision,
             exchange: r.exchange,
@@ -735,10 +917,18 @@ impl BootstrapDnsTranscript for BootstrapBinding {
             .iter_mut()
             .find(|q| q.id == id)
             .ok_or(ServiceError::Unavailable)?;
-        if q.capture.is_some_and(|old| old != stamp) || self.peer.now() >= expires {
+        if q.capture.as_deref().is_some_and(|old| *old != stamp) || self.peer.now() >= expires {
             return Err(ServiceError::InvalidRequest);
         }
-        q.capture = Some(stamp);
+        if q.capture.is_none() {
+            let credit = self
+                .budget
+                .dynamic
+                .reserve(std::mem::size_of::<CaptureStamp>() + 16)
+                .map_err(unavailable)?;
+            q.capture = Some(Box::new(stamp));
+            q.capture_memory = Some(credit);
+        }
         drop(queries);
         self.check(BootstrapScope::Wire, launch)?;
         if self.peer.now() >= expires {
@@ -750,6 +940,9 @@ impl BootstrapDnsTranscript for BootstrapBinding {
 
 #[cfg(test)]
 pub(super) mod tests {
+    mod datagram {
+        include!("native_bootstrap_datagram_tests.rs");
+    }
     use super::*;
     use std::sync::atomic::AtomicU64;
     pub(in crate::helper::native_profile_channel) fn interop_status(
@@ -855,6 +1048,41 @@ pub(super) mod tests {
             fail_plan: AtomicBool::new(false),
         });
         BootstrapBinding::create(peer, owner, capsule, launch, budget)
+            .unwrap()
+            .unwrap()
+    }
+    pub(in crate::helper::native_profile_channel) fn datagram_binding(
+        capsule: Arc<wire::OwnedCapsule>,
+        launch: LaunchRecord,
+        asset: Vec<u8>,
+        reference: wire::SnapshotRef,
+        budget: Arc<ChannelBudget>,
+        start: Instant,
+    ) -> Arc<BootstrapBinding> {
+        use crate::helper::registry::DatagramScope as D;
+        let peer = Arc::new(FakePeer {
+            record: launch,
+            image: [17; 32],
+            config: launch.binding.digest,
+            producer: Some(crate::helper::registry::fake_datagram_image(
+                [17; 32],
+                &[D::Source, D::Wire, D::Release],
+            )),
+            valid: AtomicBool::new(true),
+            clock: AtomicU64::new(0),
+            start,
+            fds: crate::helper::memory::ByteBudget::new(64),
+        });
+        let owner = Arc::new(FakeOwner {
+            mode: launch.mode,
+            capsule: capsule.clone(),
+            reference,
+            asset,
+            peers: vec!["192.0.2.53:53".parse().unwrap()],
+            valid: AtomicBool::new(true),
+            fail_plan: AtomicBool::new(false),
+        });
+        BootstrapBinding::create_for(peer, owner, capsule, launch, budget, true)
             .unwrap()
             .unwrap()
     }

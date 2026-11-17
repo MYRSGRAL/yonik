@@ -20,6 +20,28 @@ import build_native_adapter as builder  # noqa: E402
 
 
 class BuilderTests(unittest.TestCase):
+    def test_datagram_candidate_is_scope5_request_not_source_or_install_authority(
+        self,
+    ) -> None:
+        record = {"elf_sha256": "11" * 32, "patch_sha256": "44" * 32}
+        projected = builder.datagram_candidate(record)
+        self.assertFalse(projected["install_authority"])
+        self.assertFalse(projected["source_eligibility"])
+        candidate = projected["candidate_record"]
+        self.assertEqual(candidate["elf_sha256"], record["elf_sha256"])
+        self.assertEqual(candidate["patch_sha256"], record["patch_sha256"])
+        for slot in (
+            "bootstrap_datagram",
+            "bootstrap_datagram_dns_wire",
+            "bootstrap_datagram_dns_release",
+        ):
+            self.assertNotIn(slot, record)
+            self.assertEqual(
+                candidate[slot]["schema_sha256"],
+                hashlib.sha256(b"YONIK-DNS-V2-CODEC-5\0").hexdigest(),
+            )
+        self.assertNotIn("bootstrap_source", candidate)
+
     def test_bootstrap_candidate_is_independent_compile_only_metadata(self) -> None:
         original = {"elf_sha256": "11" * 32, "patch_sha256": "44" * 32}
         candidate = builder.bootstrap_candidate(original)

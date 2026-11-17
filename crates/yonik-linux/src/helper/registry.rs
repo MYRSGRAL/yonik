@@ -16,6 +16,11 @@ use super::memory::{ByteBudget, executable_budget};
 use crate::host::{BinarySnapshot, HostError, Sha256, SharedImage};
 
 const MAX_MANIFEST: u64 = 4096;
+#[path = "registry_datagram.rs"]
+mod datagram;
+#[cfg(test)]
+pub(crate) use datagram::fake_image as fake_datagram_image;
+pub(crate) use datagram::{DatagramCapability, DatagramScope};
 const FILE_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC)
     .union(OFlags::NOFOLLOW)
@@ -71,6 +76,12 @@ struct Entry {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProducerRecord {
+    #[serde(default)]
+    bootstrap_datagram: Option<DnsReleaseRecord>,
+    #[serde(default)]
+    bootstrap_datagram_dns_wire: Option<DnsReleaseRecord>,
+    #[serde(default)]
+    bootstrap_datagram_dns_release: Option<DnsReleaseRecord>,
     contract: String,
     version: u32,
     source_commit: String,
@@ -361,6 +372,7 @@ impl DnsCapability {
 }
 #[derive(Clone)]
 pub(crate) struct ImageContract {
+    datagram: [Option<datagram::Provenance>; 3],
     bootstrap: [Option<BootstrapProvenance>; 3],
     image: [u8; 32],
     udp_reviewed: bool,
@@ -460,6 +472,7 @@ impl ProducerRecord {
             || self.source_commit != "a4a3dff5b20c2faae567b742c172c7b95e75c083"
             || self.patch_sha256 != PRODUCER_PATCH
                 && Some(self.patch_sha256.as_str()) != BOOTSTRAP_BUILD_REVIEWED_PATCH
+                && Some(self.patch_sha256.as_str()) != datagram::BUILD_REVIEWED_PATCH
         {
             return Err(RegistryError::Version);
         }
@@ -515,6 +528,7 @@ impl ProducerRecord {
             }
         }
         Ok(ImageContract {
+            datagram: datagram::decode_slots(self)?,
             bootstrap: [
                 (&self.bootstrap_source, BootstrapScope::Source),
                 (&self.bootstrap_dns_wire, BootstrapScope::Wire),
@@ -589,6 +603,7 @@ pub(crate) fn fake_bootstrap_image(image: [u8; 32], scopes: &[BootstrapScope]) -
         })
     });
     ImageContract {
+        datagram: [None, None, None],
         image,
         bootstrap,
         udp_reviewed: false,
@@ -609,6 +624,7 @@ pub(crate) fn fake_dns4_image(image: [u8; 32]) -> ImageContract {
         DnsProvenance::decode(&record, contract, &patch, None, Some(&patch)).unwrap()
     };
     ImageContract {
+        datagram: [None, None, None],
         bootstrap: [None, None, None],
         image,
         udp_reviewed: false,

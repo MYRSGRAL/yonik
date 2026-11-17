@@ -3960,6 +3960,7 @@ struct DeliveryCredit {
     _slot: super::memory::ByteLease,
 }
 struct SystemChannel {
+    bootstrap_datagram: Option<Arc<bootstrap_binding::BootstrapBinding>>,
     bootstrap: Option<Arc<bootstrap_binding::BootstrapBinding>>,
     capsule: Arc<wire::OwnedCapsule>,
     budget: Arc<ChannelBudget>,
@@ -4038,11 +4039,28 @@ impl SystemChannel {
     ) -> Result<Self, ServiceError> {
         let bootstrap = bootstrap_binding::BootstrapBinding::prepare(
             Arc::clone(&peer),
+            sources.clone(),
+            Arc::clone(&capsule),
+            launch,
+            Arc::clone(&budget),
+        )?;
+        let bootstrap_datagram = bootstrap_binding::BootstrapBinding::prepare_datagram(
+            Arc::clone(&peer),
             sources,
             Arc::clone(&capsule),
             launch,
             Arc::clone(&budget),
         )?;
+        if bootstrap_binding::BootstrapBinding::requires_datagram(&capsule, launch)?
+            && bootstrap_datagram
+                .as_ref()
+                .map(|b| b.datagram_source(launch))
+                .transpose()?
+                .flatten()
+                .is_none()
+        {
+            return Err(ServiceError::Unsupported);
+        }
         if version != producer.setup(launch)?.2 {
             return Err(ServiceError::Unsupported);
         }
@@ -4092,6 +4110,7 @@ impl SystemChannel {
         };
         Ok(Self {
             bootstrap,
+            bootstrap_datagram,
             runtime,
             capsule,
             budget,
@@ -4420,6 +4439,30 @@ impl SystemChannel {
     }
 }
 impl Channel for SystemChannel {
+    fn bootstrap_datagram_producer(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<Option<Arc<dns_datagram::Producer>>, ServiceError> {
+        self.bootstrap_datagram
+            .as_ref()
+            .map_or(Ok(None), |b| b.datagram_source(record))
+    }
+    fn bootstrap_datagram_wire(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<Option<Arc<dns_datagram::NetworkWire>>, ServiceError> {
+        self.bootstrap_datagram
+            .as_ref()
+            .map_or(Ok(None), |b| b.datagram_wire(record))
+    }
+    fn bootstrap_datagram_release(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<Option<Arc<dns_datagram::NetworkRelease>>, ServiceError> {
+        self.bootstrap_datagram
+            .as_ref()
+            .map_or(Ok(None), |b| b.datagram_release(record))
+    }
     fn bootstrap_source(
         &self,
         record: LaunchRecord,
