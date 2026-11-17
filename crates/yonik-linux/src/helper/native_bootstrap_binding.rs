@@ -612,87 +612,90 @@ impl BootstrapDnsTranscript for BootstrapBinding {
         {
             return Err(ServiceError::InvalidRequest);
         }
-        let _scratch = self.budget.dynamic.reserve(2048).map_err(unavailable)?;
-        let mut path = [(0, 0); 256];
-        let (root, id, selector, original, count, expires) = {
-            let queries = self.queries.lock().map_err(unavailable)?;
-            let q = queries
-                .iter()
-                .find(|q| q.id == r.binding.query)
-                .ok_or(ServiceError::Unavailable)?;
-            if !matches!(q.root,wire::dns_v2::Root::BootstrapService(id) if id.get()==r.binding.root)
-                || q.selector.resolver != Some(r.binding.resolver)
-                || q.selector.endpoint != r.binding.physical_endpoint
-                || q.selector.subject != r.binding.subject
-                || q.original.protocol != r.binding.parent_carrier
-                || q.path.last() != Some(&(r.binding.scope, r.binding.branch))
-                || self.peer.now() >= q.expires
-            {
-                return Err(ServiceError::InvalidRequest);
-            }
-            let cap = wire::Capsule::decode(self.capsule.bytes(), &launch.binding.digest)
-                .map_err(unavailable)?;
-            let resolver = cap
-                .resolver_scope(r.binding.resolver)
-                .map_err(unavailable)?;
-            let mut base = [0; 8];
-            for (i, v) in [
-                2,
-                q.selector.endpoint,
-                q.selector.subject,
-                r.binding.resolver,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                base[i * 2..i * 2 + 2].copy_from_slice(&v.to_be_bytes());
-            }
-            if r.binding.base != <[u8; 32]>::from(Sha256::digest(base))
-                || r.binding.proxied
-                || r.binding.peer.wire() != resolver.peer
-                || r.binding.physical_peer != r.binding.peer
-                || resolver.source != self.owner.reference()?.source
-                || resolver.subject != u16::MAX
-                || resolver.scope.is_some()
-                || r.binding.physical_scope != r.binding.scope
-                || r.binding.physical_branch != r.binding.branch
-                || r.binding.physical_subject != r.binding.subject
-                || usize::from(r.binding.physical_hop) + 1 != q.path.len()
-                || r.binding.expires > q.expires
-                || r.binding.expires <= self.peer.now()
-                || [r.binding.bundle, r.binding.revision]
+        let (id, expires) = {
+            let _scratch = self.budget.dynamic.reserve(2048).map_err(unavailable)?;
+            let mut path = [(0, 0); 256];
+            let (root, id, selector, original, count, expires) = {
+                let queries = self.queries.lock().map_err(unavailable)?;
+                let q = queries
                     .iter()
-                    .any(|n| *n == 0 || *n == u64::MAX)
-            {
+                    .find(|q| q.id == r.binding.query)
+                    .ok_or(ServiceError::Unavailable)?;
+                if !matches!(q.root,wire::dns_v2::Root::BootstrapService(id) if id.get()==r.binding.root)
+                    || q.selector.resolver != Some(r.binding.resolver)
+                    || q.selector.endpoint != r.binding.physical_endpoint
+                    || q.selector.subject != r.binding.subject
+                    || q.original.protocol != r.binding.parent_carrier
+                    || q.path.last() != Some(&(r.binding.scope, r.binding.branch))
+                    || self.peer.now() >= q.expires
+                {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let cap = wire::Capsule::decode(self.capsule.bytes(), &launch.binding.digest)
+                    .map_err(unavailable)?;
+                let resolver = cap
+                    .resolver_scope(r.binding.resolver)
+                    .map_err(unavailable)?;
+                let mut base = [0; 8];
+                for (i, v) in [
+                    2,
+                    q.selector.endpoint,
+                    q.selector.subject,
+                    r.binding.resolver,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    base[i * 2..i * 2 + 2].copy_from_slice(&v.to_be_bytes());
+                }
+                if r.binding.base != <[u8; 32]>::from(Sha256::digest(base))
+                    || r.binding.proxied
+                    || r.binding.peer.wire() != resolver.peer
+                    || r.binding.physical_peer != r.binding.peer
+                    || resolver.source != self.owner.reference()?.source
+                    || resolver.subject != u16::MAX
+                    || resolver.scope.is_some()
+                    || r.binding.physical_scope != r.binding.scope
+                    || r.binding.physical_branch != r.binding.branch
+                    || r.binding.physical_subject != r.binding.subject
+                    || usize::from(r.binding.physical_hop) + 1 != q.path.len()
+                    || r.binding.expires > q.expires
+                    || r.binding.expires <= self.peer.now()
+                    || [r.binding.bundle, r.binding.revision]
+                        .iter()
+                        .any(|n| *n == 0 || *n == u64::MAX)
+                {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                path[..q.path.len()].copy_from_slice(&q.path);
+                (
+                    q.root,
+                    q.id,
+                    q.selector,
+                    q.original,
+                    q.path.len(),
+                    q.expires.min(r.binding.expires),
+                )
+            };
+            let question = self.question(
+                Parent {
+                    root,
+                    launch,
+                    query: id,
+                    selector,
+                    original: original.wire(),
+                    path: &path[..count],
+                },
+                self.owner.reference()?,
+                r.binding.qtype,
+                r.binding.options,
+                r.binding.payload,
+            )?;
+            if r.binding.name.wire().bytes != &question.bytes[..usize::from(question.len)] {
                 return Err(ServiceError::InvalidRequest);
             }
-            path[..q.path.len()].copy_from_slice(&q.path);
-            (
-                q.root,
-                q.id,
-                q.selector,
-                q.original,
-                q.path.len(),
-                q.expires.min(r.binding.expires),
-            )
+            (id, expires)
         };
-        let question = self.question(
-            Parent {
-                root,
-                launch,
-                query: id,
-                selector,
-                original: original.wire(),
-                path: &path[..count],
-            },
-            self.owner.reference()?,
-            r.binding.qtype,
-            r.binding.options,
-            r.binding.payload,
-        )?;
-        if r.binding.name.wire().bytes != &question.bytes[..usize::from(question.len)] {
-            return Err(ServiceError::InvalidRequest);
-        }
         {
             let _parser = self
                 .budget

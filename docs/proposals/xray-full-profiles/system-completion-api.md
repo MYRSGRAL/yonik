@@ -1720,3 +1720,17 @@ records с exact source/toolchain/build-input hashes. Candidate по-прежн�
 `install_authority=false`; образ не запускался и не устанавливался. Public gates,
 runtime readiness и installed registry не изменены. TLS/mux/chain/UDP physical
 bootstrap, loopback policy и остальные ранее обозначенные gaps этим pin не закрыты.
+
+### Root R82: последовательный scratch при проверке transcript
+
+Проверка path/question завершает собственный lease до strict DNS parser. Поля,
+повторные Source fences и общий бюджет сохранены. В совместном pure Go/Rust
+прогоне это устраняет Deny54: NETWORK достигает успешного WaiterBound54.
+Следующий Numeric42 пока получает Deny из-за нехватки parser scratch после
+удержания permission: used=41058, limit=58459, parser=17968, дефицит=567 байт.
+NETWORK positive остаётся RED; повышение лимита или обход transcript не внесены.
+
+Local/System HOSTS positive и negatives, NETWORK wrong-question и no-permit
+проходят на том же Rust ELF и Go SUT exact patch `1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05`.
+Это PURE_STATEFUL_INTEROP с injected OS/backend facts, без runtime/install допуска.
+Protected pins пока сохраняют прежний digest; joint GREEN не заявляется.
