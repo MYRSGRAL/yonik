@@ -18,13 +18,22 @@ pub(super) fn fixture5_digest(
     order: u8,
     digest: [u8; 32],
 ) -> (Issuer<Fake>, Arc<Facts>) {
-    let (mut issuer, f) = fixture_carrier(
+    fixture5_snapshot(mode, order, digest, 16)
+}
+pub(super) fn fixture5_snapshot(
+    mode: Mode,
+    order: u8,
+    digest: [u8; 32],
+    flags: u16,
+) -> (Issuer<Fake>, Arc<Facts>) {
+    let (mut issuer, f) = fixture_carrier_flags(
         mode,
         "203.0.113.80".parse().unwrap(),
         order,
         true,
         digest,
         17,
+        flags,
     );
     issuer.authority.owner_forbidden = false;
     let mut tuple = match issuer_tests::open(mode, 32001) {

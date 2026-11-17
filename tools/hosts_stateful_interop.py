@@ -13,7 +13,9 @@ from collections import deque
 from pathlib import Path
 
 
-def check_network_cleanup(trace: list[dict[str, object]]) -> int:
+def check_network_cleanup(
+    trace: list[dict[str, object]], user_grants: frozenset[int] = frozenset()
+) -> int:
     """Проверяет ACK-барьеры по реальным кадрам, не создавая ответов actor'ам."""
     pending: dict[int, tuple[int, bytes]] = {}
     roots: dict[int, int] = {}
@@ -21,6 +23,10 @@ def check_network_cleanup(trace: list[dict[str, object]]) -> int:
     acknowledged: set[tuple[int, int]] = set()
     closed = 0
     permissions: set[int] = set()
+    query_parents: dict[int, int] = {}
+    resource_contexts: dict[int, int] = {}
+    proof_contexts: dict[int, int] = {}
+    held: set[tuple[int, int]] = set()
 
     def number(body: bytes, offset: int) -> int:
         if len(body) < offset + 8:
@@ -28,6 +34,22 @@ def check_network_cleanup(trace: list[dict[str, object]]) -> int:
         return int.from_bytes(body[offset : offset + 8], "big")
 
     for event in trace:
+        if "event" in event:
+            detail = event["event"]
+            key = (int(detail["target"]), int(detail["id"]))
+            if detail["name"] == "ack_hold":
+                if key not in acknowledged or key in held:
+                    raise AssertionError("hold without actual ACK")
+                acknowledged.remove(key)
+                held.add(key)
+            elif detail["name"] == "ack_release":
+                if key not in held:
+                    raise AssertionError("release without actual held ACK")
+                held.remove(key)
+                acknowledged.add(key)
+            else:
+                raise AssertionError("unknown ACK event")
+            continue
         if "packet" not in event:
             continue
         packet = bytes.fromhex(str(event["packet"]))
@@ -41,9 +63,16 @@ def check_network_cleanup(trace: list[dict[str, object]]) -> int:
         body = packet[128:]
         if event["side"] == "go":
             pending[sequence] = (kind, body)
+            if kind == 45 and body[2] == 3:
+                context = resource_contexts.get(number(body, 8))
+                if context is None or any(
+                    c == context and (4, proof) not in acknowledged
+                    for proof, c in proof_contexts.items()
+                ):
+                    raise AssertionError("Resource retire before Proof ACK")
             if kind == 32 and body[:1] == b"\x03":
                 root = number(body, 4)
-                if root in permissions:
+                if root in permissions or root in user_grants:
                     continue
                 contexts = [
                     context for context, owner in roots.items() if owner == root
@@ -66,10 +95,14 @@ def check_network_cleanup(trace: list[dict[str, object]]) -> int:
         if request is None:
             continue
         request_kind, sent = request
-        if kind == 56 and request_kind == 55:
+        if kind == 58 and request_kind == 57:
+            query_parents[number(sent, 8)] = number(body, 8)
+        elif kind == 56 and request_kind == 55:
             context = number(body, 8)
             roots[context] = number(sent, 8)
             required[context] = {(8, context)}
+            if number(sent, 16) in query_parents:
+                required[context].add((9, query_parents[number(sent, 16)]))
         elif kind == 36 and request_kind == 35:
             context = number(body, 24)
             if context in required:
@@ -81,6 +114,9 @@ def check_network_cleanup(trace: list[dict[str, object]]) -> int:
             if context not in required:
                 raise AssertionError("transport ACK without context")
             required[context].add((3 if kind == 37 else 4, number(body, 16)))
+            (resource_contexts if kind == 37 else proof_contexts)[number(body, 16)] = (
+                context
+            )
         elif kind in (46, 48) and request_kind == (45 if kind == 46 else 47):
             target, identifier = sent[2], number(sent, 8)
             if number(body, 8) != identifier:
@@ -93,12 +129,16 @@ def check_network_cleanup(trace: list[dict[str, object]]) -> int:
             ):
                 raise AssertionError("Retired46 lacks joined/zero-ref evidence")
             acknowledged.add((target, identifier))
+    if held:
+        raise AssertionError("retained held ACK")
     if not closed:
         raise AssertionError("missing actual service Close32")
     return closed
 
 
-def check_datagram_cleanup(trace: list[dict[str, object]]) -> int:
+def check_datagram_cleanup(
+    trace: list[dict[str, object]], minimum_parents: int = 2
+) -> int:
     """Каждый real ACK58 требует cancel9 ACK после ACK собственных contexts."""
     pending: dict[int, tuple[int, bytes]] = {}
     parents: dict[int, int] = {}
@@ -163,7 +203,7 @@ def check_datagram_cleanup(trace: list[dict[str, object]]) -> int:
             if number(body, 8) != number(sent, 8):
                 raise AssertionError("UDP cancel ACK ID mismatch")
             acknowledged.add((sent[2], number(body, 8)))
-    if len(parents) != 2 or required - acknowledged:
+    if len(parents) < minimum_parents or required - acknowledged:
         raise AssertionError(f"missing UDP cleanup ACK: {required - acknowledged}")
     return len(required)
 
@@ -180,7 +220,7 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
         "go": [
             str(go),
             "-test.run=^TestPureStatefulDatagramHostsSSStdioBridge$"
-            if "udp-hosts-" in case
+            if "udp-hosts-" in case or "udp-network-" in case
             else "-test.run=^TestPureStatefulHostsStdioBridge$",
             "-test.v",
         ],
@@ -278,6 +318,9 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                         ):
                             raise ValueError("invalid virtual PhysicalBind")
                         trace.append({"side": side, field: packet.hex()})
+                    elif "event" in value:
+                        trace.append({"side": side, "event": value["event"]})
+                        continue
                     elif "init" in value:
                         if case.startswith("system-"):
                             launch = bytes.fromhex(value["init"]["launch"])
@@ -300,11 +343,24 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
         if any(codes.values()) or not all(s in done for s in children):
             raise AssertionError(f"counterpart failed: {codes}; trace={trace[-12:]}")
         network = case.startswith("network-")
-        datagram = "udp-hosts-" in case
+        datagram = "udp-hosts-" in case or "udp-network-" in case
         if datagram:
-            negative = case.endswith(("foreign-member", "parent-cancel"))
+            network = "udp-network-" in case
+            bad = case.endswith("wrong-question")
+            negative = case.endswith(
+                ("foreign-member", "parent-cancel", "wrong-question")
+            )
             expected = int(not negative)
             go_result, rust_result = done["go"], done["rust"]
+            prefix = (
+                (
+                    [57, 20, 55, 35, 35, 52, 38]
+                    if bad
+                    else [57, 20, 55, 35, 35, 52, 38, 40, 57, 20, 55, 35, 53, 42]
+                )
+                if network
+                else [57, 55, 35, 40, 57, 55, 35, 53, 42]
+            )
             if (
                 not go_result.get("cleanup")
                 or not go_result.get("ss_consumer")
@@ -314,11 +370,16 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                 or go_result.get("sends") != expected
                 or go_result.get("socket_closes") != expected
                 or go_result.get("tasks_joined") != 2 * expected
-                or go_result.get("kinds", [])[:9]
-                != [57, 55, 35, 40, 57, 55, 35, 53, 42]
+                or go_result.get("kinds", [])[: len(prefix)] != prefix
                 or not rust_result.get("rust_done")
                 or rust_result.get("routes")
-                != (1 if case.endswith("foreign-member") else 2)
+                != (
+                    (3 if bad else 5 if case.endswith("foreign-member") else 6)
+                    if network
+                    else 1
+                    if case.endswith("foreign-member")
+                    else 2
+                )
                 or rust_result.get("owners") != rust_result.get("preseed_owners")
                 or len(rust_result.get("retained_routes", []))
                 != int(not case.endswith("parent-cancel"))
@@ -329,6 +390,14 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                 and go_result.get("mode") != 2
                 or case.endswith("replay")
                 and not go_result.get("replay_rejected")
+                or network
+                and (
+                    rust_result.get("receiver_consumed_closes") != 1
+                    or go_result.get("resolver_protocol")
+                    != (6 if "-tcp-" in case else 17)
+                )
+                or case.endswith("late-ack")
+                and not go_result.get("late_ack")
             ):
                 raise AssertionError(f"incomplete UDP actor roundtrip: {done}")
             return {
@@ -337,7 +406,12 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                 "commands": commands,
                 "codes": codes,
                 "results": done,
-                "datagram_cleanup_barriers": check_datagram_cleanup(trace),
+                "datagram_cleanup_barriers": check_datagram_cleanup(
+                    trace, 1 if bad else 2
+                ),
+                "cleanup_service_barriers": check_network_cleanup(trace, frozenset({1}))
+                if network
+                else 0,
                 "trace": trace,
             }
         expected = int(case in ("positive", "system-positive", "network-positive"))
@@ -442,6 +516,15 @@ def main() -> None:
             "udp-hosts-foreign-member",
             "udp-hosts-parent-cancel",
             "udp-hosts-replay",
+            "udp-network-udp-positive",
+            "udp-network-tcp-positive",
+            "system-udp-network-udp-positive",
+            "system-udp-network-tcp-positive",
+            "udp-network-udp-wrong-question",
+            "udp-network-udp-foreign-member",
+            "udp-network-udp-parent-cancel",
+            "udp-network-udp-replay",
+            "udp-network-tcp-late-ack",
         ),
         default="positive",
     )

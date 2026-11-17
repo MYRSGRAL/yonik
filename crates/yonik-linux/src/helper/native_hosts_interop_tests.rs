@@ -58,6 +58,11 @@ struct Stdio {
     no_permit: bool,
     source: Option<Arc<dyn Source>>,
     datagram: Option<Arc<super::super::super::super::dns_datagram::Producer>>,
+    datagram_wire: Option<Arc<super::super::super::super::dns_datagram::NetworkWire>>,
+    datagram_release: Option<Arc<super::super::super::super::dns_datagram::NetworkRelease>>,
+    dns_protocol: u8,
+    descriptor: RefCell<Option<Vec<u8>>>,
+    negotiated: RefCell<Option<wire::dns_v2::Negotiated>>,
     // recvmsg заменён framed stdin; после read drain обязан видеть пустую очередь.
     before_reply: Cell<bool>,
     slots: Arc<SidebandCredits>,
@@ -86,6 +91,20 @@ impl super::super::super::super::BootstrapDnsTranscript for TraceTranscript {
     }
 }
 impl Channel for Stdio {
+    fn bootstrap_datagram_wire(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<super::super::super::super::dns_datagram::NetworkWire>>, ServiceError>
+    {
+        Ok(self.datagram_wire.clone())
+    }
+    fn bootstrap_datagram_release(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<super::super::super::super::dns_datagram::NetworkRelease>>, ServiceError>
+    {
+        Ok(self.datagram_release.clone())
+    }
     fn bootstrap_datagram_producer(
         &self,
         _: LaunchRecord,
@@ -144,9 +163,21 @@ impl Channel for Stdio {
             return Err(ServiceError::InvalidRequest);
         }
         out[..b.len()].copy_from_slice(&b);
+        *self.descriptor.borrow_mut() = Some(b.clone());
         Ok(Some(b.len()))
     }
     fn setup_write(&self, b: &[u8]) -> Result<bool, ServiceError> {
+        // Только actual descriptor/ACK противоположных actors, без ACK fixture.
+        let descriptor = self.descriptor.borrow();
+        let d = descriptor.as_ref().ok_or(ServiceError::InvalidRequest)?;
+        *self.negotiated.borrow_mut() = Some(
+            if self.datagram.is_some() {
+                wire::dns_v2::Negotiated::accept_datagram(d, b, self.record, [(0, 0); 2])
+            } else {
+                wire::dns_v2::Negotiated::accept(d, b, self.record, [(0, 0); 2])
+            }
+            .map_err(unavailable)?,
+        );
         self.before_reply.set(false);
         emit(serde_json::json!({"packet":hex(b)}));
         Ok(true)
@@ -167,13 +198,16 @@ impl Channel for Stdio {
             let facts = super::super::super::super::dns_transport::fake_facts(
                 "192.0.2.10:32001".parse().unwrap(),
                 "192.0.2.53:53".parse().unwrap(),
-                17,
+                self.dns_protocol,
                 (4, 5),
             )
             .with_test_mark(0);
             let incoming = super::super::super::super::dns_transport::Incoming::fake(
                 raw,
-                &issuer_tests::dns_neg(self.record),
+                self.negotiated
+                    .borrow()
+                    .as_ref()
+                    .ok_or(ServiceError::Unavailable)?,
                 &self.slots,
                 &self.budget.dynamic,
                 None,
@@ -181,7 +215,13 @@ impl Channel for Stdio {
                 Arc::new(AtomicBool::new(true)),
                 self.closed.clone(),
                 || {},
-            )?;
+            )
+            .inspect_err(|e| {
+                eprintln!(
+                    "interop virtual PhysicalBind: {e:?}; budget={}",
+                    self.budget.dynamic.used()
+                )
+            })?;
             self.inbox.borrow_mut().push_back(incoming);
             self.before_reply.set(true);
             return Ok(None);
@@ -233,7 +273,7 @@ fn pure_stateful_hosts_stdio_bridge() {
     }
     let digest: [u8; 32] = Sha256::digest(b"{}").into();
     let case = std::env::var("YONIK_INTEROP_CASE").unwrap_or_default();
-    if case.contains("udp-hosts-") {
+    if case.contains("udp-hosts-") || case.contains("udp-network-") {
         datagram::run(&case);
         return;
     }
@@ -280,6 +320,11 @@ fn pure_stateful_hosts_stdio_bridge() {
         diagnostic: binding.clone(),
         source: binding.source(),
         datagram: None,
+        datagram_wire: None,
+        datagram_release: None,
+        dns_protocol: 17,
+        descriptor: RefCell::new(None),
+        negotiated: RefCell::new(None),
         record: f.launch,
         budget: issuer.budget.clone(),
         inbox: Default::default(),
