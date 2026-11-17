@@ -16010,7 +16010,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,1238 @@
+@@ -0,0 +1,1277 @@
 +//go:build linux
 +
 +package nativehooks
@@ -16127,6 +16127,7 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	networkLate                             *profileGrant
 +	networkBootstrap                        *profileNetworkBootstrap
 +	bootstrap                               *profileBootstrapRPC
 +	hostsObservation                        *profileHostsObservation
@@ -16155,6 +16156,8 @@ new file mode 100644
 +	cancelled, completed, submitted, queued bool
 +}
 +type profileTombstone struct {
++	networkLate                                              *profileGrant
++	networkLateID                                            uint64
 +	association                                              uint64
 +	closeStatus                                              byte
 +	sequence, cancelSequence, objectCancelSequence, objectID uint64
@@ -16239,6 +16242,11 @@ new file mode 100644
 +	if ctx == nil || ctx.Err() != nil || len(body) > 1024 || !c.live() || !c.operationAvailable() {
 +		return nil, errProfile
 +	}
++	// Existing grant refresh: отдельный prepaid retained owner, не ID lookup.
++	networkLate := g != nil && g.networkCleanupRefs != 0 && object != 0 && object == g.id && (kind == 18 || kind == 20)
++	if networkLate && c.buffered+c.manifest.memoryCredit+32 > uint64(c.manifest.caps[4]) {
++		return nil, errProfileFlowBusy
++	}
 +	slot := -1
 +	if c.udpBudget != nil {
 +		slot = c.udpBudget.used
@@ -16253,6 +16261,10 @@ new file mode 100644
 +		g.pending++
 +	}
 +	op := &profileOperation{udpSlot: slot, ctx: ctx, receipt: r, grant: g, kind: kind, object: object, body: body, done: make(chan struct{})}
++	if networkLate {
++		op.networkLate = g
++		c.buffered += 32
++	}
 +	if r != nil && r.udp != nil && kind == 18 && object == 0 {
 +		op.fixedDeadline = r.udp.deadline
 +	}
@@ -16487,6 +16499,10 @@ new file mode 100644
 +		return
 +	}
 +	op.completed = true
++	if op.networkLate != nil {
++		c.buffered -= 32
++		op.networkLate = nil
++	}
 +	if c.udpBudget != nil && op.udpSlot >= 0 {
 +		c.udpBudget.entries[op.udpSlot].terminal = true
 +	}
@@ -16623,6 +16639,7 @@ new file mode 100644
 +	for i, t := range c.tombs {
 +		if t.sequence == 0 {
 +			entry := profileTombstone{sequence: op.sequence, deadline: op.deadline.Add(time.Second), kind: op.kind, replied: !cancelled, cancelled: cancelled}
++			entry.networkLate, entry.networkLateID = op.networkLate, op.object
 +			if op.receipt != nil && op.receipt.udp != nil {
 +				entry.association = op.receipt.udp.producer.association.id
 +			}
@@ -16641,6 +16658,7 @@ new file mode 100644
 +				}
 +			}
 +			c.tombs[i] = entry
++			op.networkLate = nil // prepaid ownership перенесено в tombstone.
 +			return nil
 +		}
 +	}
@@ -16955,6 +16973,21 @@ new file mode 100644
 +			return errProfile
 +		}
 +		id := u64(f.body, 4)
++		for i := range c.tombs {
++			t := &c.tombs[i]
++			if t.sequence != f.reply || t.networkLate == nil {
++				continue
++			}
++			g := t.networkLate
++			if target != 3 || id != t.networkLateID || g.id != id || f.body[1] != g.class || f.body[2] != 0 || f.body[3] != 0 || u64(f.body, 12) != 0 || u64(f.body, 24) != g.revision || !zero(f.body[32:]) || u32(f.body, 20) == 0 || u32(f.body, 20) > 1000 || !g.cancelSent && c.grants[g.slot] != g {
++				return errProfile
++			}
++			// Shared root уже принадлежит retained cleanup owner. Generic tick
++			// отправит один Close после barriers; late reply не создаёт новый ID.
++			c.closeGrant(g)
++			t.replied = true
++			return nil
++		}
 +		seq, e := c.cancelWire(target, id)
 +		if e != nil {
 +			return e
@@ -17051,7 +17084,7 @@ new file mode 100644
 +	now := c.clock()
 +	for i, t := range c.tombs {
 +		if c.udpBudget == nil && t.sequence != 0 && !now.Before(t.deadline) {
-+			c.tombs[i] = profileTombstone{}
++			c.clearTomb(i)
 +		}
 +	}
 +	for i, a := range c.accepted {
@@ -17179,10 +17212,16 @@ new file mode 100644
 +	}
 +	for i, t := range c.tombs {
 +		if t.sequence != 0 && t.sequence <= c.watermark {
-+			c.tombs[i] = profileTombstone{}
++			c.clearTomb(i)
 +		}
 +	}
 +	return nil
++}
++func (c *profileFlowControl) clearTomb(i int) {
++	if c.tombs[i].networkLate != nil {
++		c.buffered -= 32
++	}
++	c.tombs[i] = profileTombstone{}
 +}
 +func (c *profileFlowControl) revoke() {
 +	c.mu.Lock()
@@ -17652,7 +17691,7 @@ new file mode 100644
 +		t.Fatal("tombstone overflow allocated", allocations)
 +	}
 +	// Две private chain links включены в общий fixed metadata preflight.
-+	if unsafe.Sizeof(profileReceipt{}) > 256 || unsafe.Sizeof(profileGrant{}) > 272 || unsafe.Sizeof(profileTombstone{}) > 64 || unsafe.Sizeof(profileOperation{})+1024 > 2048 {
++	if unsafe.Sizeof(profileReceipt{}) > 256 || unsafe.Sizeof(profileGrant{}) > 272 || unsafe.Sizeof(profileTombstone{}) > 64+32 || unsafe.Sizeof(profileOperation{})+1024 > 2048 {
 +		t.Fatal("ledger sizing changed")
 +	}
 +}
@@ -38948,7 +38987,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_linux_test.go b/common/yonikb
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux_test.go
-@@ -0,0 +1,3138 @@
+@@ -0,0 +1,3244 @@
 +//go:build linux
 +
 +package nativehooks
@@ -39938,6 +39977,72 @@ new file mode 100644
 +		}
 +	}
 +}
++func TestProfileR80LateNetworkRefreshKeepsCleanupOwner(t *testing.T) {
++	for _, waiter := range []bool{false, true} {
++		for _, tomb := range []bool{false, true} {
++			t.Run(strconv.FormatBool(waiter)+strconv.FormatBool(tomb), func(t *testing.T) {
++				h, numeric := networkNumericStart(t, 1)
++				if h.f.c.dispatch(numeric) != nil || h.f.c.accept(networkNumericGrant(numeric)) != nil || <-h.done != nil {
++					t.Fatal("Numeric")
++				}
++				g := h.n.service
++				if waiter {
++					g = h.n.waiter.service
++				}
++				op, err := h.f.c.refreshServiceLocked(g)
++				if err != nil || h.f.c.dispatch(op) != nil {
++					t.Fatal("refresh", err)
++				}
++				reply := serviceReply(h.f, op)
++				if waiter {
++					h.f.c.networkWaiterClose(h.n.waiter)
++				} else {
++					h.f.c.networkBootstrapClose(h.n)
++				}
++				if tomb && h.f.c.tick() != nil {
++					t.Fatal("tomb tick")
++				}
++				if h.f.c.accept(reply) != nil || h.f.c.tick() != nil {
++					t.Fatal("late reply")
++				}
++				for _, packet := range h.f.writes {
++					if packet.kind == 32 && packet.body[0] == 3 && u64(packet.body, 4) == g.id {
++						t.Fatal("late refresh bypassed cleanup owner")
++					}
++				}
++			})
++		}
++	}
++}
++func TestProfileR80RefreshIdentityAndPrecredit(t *testing.T) {
++	h, numeric := networkNumericStart(t, 1)
++	if h.f.c.dispatch(numeric) != nil || h.f.c.accept(networkNumericGrant(numeric)) != nil || <-h.done != nil {
++		t.Fatal("Numeric")
++	}
++	c, g := h.f.c, h.n.service
++	before, operations := c.buffered, c.operations
++	c.buffered = uint64(c.manifest.caps[4]) - c.manifest.memoryCredit - 31
++	if _, err := c.refreshServiceLocked(g); err == nil || c.operations != operations || g.refresh != nil {
++		t.Fatal("unpaid late owner")
++	}
++	c.buffered = before
++	op, err := c.refreshServiceLocked(g)
++	if err != nil || c.buffered != before+32 || c.dispatch(op) != nil {
++		t.Fatal("owner precredit", err)
++	}
++	reply := serviceReply(h.f, op)
++	be.PutUint64(reply.body[4:], h.n.waiter.service.id)
++	reply.object = h.n.waiter.service.id
++	c.networkBootstrapClose(h.n)
++	if c.accept(reply) == nil {
++		t.Fatal("cross-grant refresh ID accepted")
++	}
++	for _, packet := range h.f.writes {
++		if packet.kind == 32 && packet.body[0] == 3 {
++			t.Fatal("foreign ID cleanup substituted")
++		}
++	}
++}
 +func TestProfileR79NetworkCloseErrorRetainsServiceRef(t *testing.T) {
 +	h := networkTransportStart(t, 1, false, nil, nil)
 +	h.conn.closeError = errors.New("uncertain consuming close")
@@ -40847,6 +40952,14 @@ new file mode 100644
 +}
 +
 +func TestProfileNetworkNumericRetiresBeforeProducerAndContexts(t *testing.T) {
++	profileR80NetworkRetirement(t, "")
++}
++func TestProfileR80LateRefreshRetirementSendsExactlyOneClose(t *testing.T) {
++	for _, branch := range []string{"active", "tomb"} {
++		t.Run(branch, func(t *testing.T) { profileR80NetworkRetirement(t, branch) })
++	}
++}
++func profileR80NetworkRetirement(t *testing.T, branch string) {
 +	h, op := networkNumericStart(t, 1)
 +	w := h.n.waiter
 +	b := &w.state
@@ -40863,7 +40976,28 @@ new file mode 100644
 +	if conn.Close() != nil {
 +		t.Fatal("Close")
 +	}
++	var replies []profilePacket
++	if branch != "" {
++		for _, service := range []*profileGrant{h.n.service, w.service} {
++			refresh, err := h.f.c.refreshServiceLocked(service)
++			if err != nil || h.f.c.dispatch(refresh) != nil {
++				t.Fatal("refresh", err)
++			}
++			replies = append(replies, serviceReply(h.f, refresh))
++		}
++	}
 +	h.f.c.networkWaiterClose(w)
++	if branch != "" {
++		h.f.c.networkBootstrapClose(h.n)
++		if branch == "tomb" && h.f.c.tick() != nil {
++			t.Fatal("tomb tick")
++		}
++		for _, reply := range replies {
++			if h.f.c.accept(reply) != nil {
++				t.Fatal("late refresh")
++			}
++		}
++	}
 +	if h.f.c.tick() != nil {
 +		t.Fatal("tick")
 +	}
@@ -40941,6 +41075,17 @@ new file mode 100644
 +	}
 +	if h.f.c.tick() != nil || h.f.c.operations != 0 {
 +		t.Fatal("double release")
++	}
++	for _, service := range []*profileGrant{h.n.service, w.service} {
++		count := 0
++		for _, packet := range h.f.writes {
++			if packet.kind == 32 && packet.body[0] == 3 && u64(packet.body, 4) == service.id {
++				count++
++			}
++		}
++		if count != 1 {
++			t.Fatal("service Close count", service.id, count)
++		}
 +	}
 +}
 +func TestProfileNetworkNumericOriginalAndPermissionBindingControls(t *testing.T) {

@@ -1772,3 +1772,27 @@ creation также проходит constructor settle; Unknown удержив�
 Повторный tick не освобождает ref второй раз и не повторяет uncertain Close.
 Новый patch digest требует bounded review/pin update. Rust scratch correction
 и совместный NETWORK pair здесь не аттестованы; flags/allowlists не меняются.
+
+### R80: late refresh сохраняет NETWORK cleanup owner
+
+Existing NETWORK refresh резервирует дополнительные 32 bytes из общего memory
+ledger до operation/effects. Operation удерживает private grant pointer и exact
+existing ID; tombstone получает эту ownership при переносе pending, без поиска
+по ID/переиспользуемому slot. До tomb transfer finish возвращает credit, после
+transfer — только tomb retirement/watermark/expiry; повторный clear не debit-ит
+дважды. Размер tomb увеличен в пределах этого дополнительного prepaid bound.
+
+Обе ветви late successful19 (active cancelled operation и cancelled tombstone)
+проверяют existing ID/class/flow0/owner0/revision/lease. Они закрывают usage через
+исходный grant, но не вызывают direct cancelWire: exactly-one service Close
+остаётся обязанностью generic tick после NETWORK cleanup refs/barriers. Если
+Close уже отправлен, late refresh того же ID не создаёт второй wire Close.
+Grant pointer в tombstone не подменяется новым occupant slot. Foreign refresh
+ID отвергается без Close чужого grant. Late INITIAL Probe не имеет existing
+ID/dependencies и сохраняет прежний immediate cleanup; legacy пути не меняются.
+
+Full-tick pure controls проходят оба late-response пути для producer и waiter,
+затем все permission/Resource/reservation/exchange/context ACK barriers и ровно
+один Close32 каждого service. Ошибка/Unknown не освобождает NETWORK refs.
+Новый digest требует bounded review; source contracts/UDP/corpus/wire/allowlists
+не меняются. Совместный Go/Rust NETWORK pair здесь не исполнялся.
