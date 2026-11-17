@@ -1855,3 +1855,56 @@ Unsupported, deadlines не продлеваются. Constructor handoff и lat
 и не публикует KnownClosed. History bounded/nonreuse, compaction не добавлена.
 Новый patch digest требует independent source review и отдельного protected pin;
 FranceSS/full P4/runtime acceptance этим SOURCE/PURE unit не объявляются.
+
+### CODEC5: consuming NETWORK bootstrap для того же USER datagram
+
+Actual SS `ProfilePrepareChain` после retained snapshot ordering направляет
+NETWORK к существующему `profilePrepareNetworkBootstrap`. До service Probe20
+producer получает собственный 57/58; independent waiter получает другой 57/58
+до своего Probe20/context55. Оба query/binding связываются с тем же immutable
+Consumed USER parent, но не заимствуют grant/context друг друга. HOSTS path,
+старые CODEC4 TCP callers и native SS caller не переписываются.
+
+Далее actual constructor исполняет context55/56 → Exchange Reserve35/36 →
+Physical Reserve35/36 → raw Physical52/37 → Logical38/39 → private exact DNS
+exchange → strict Publish40/41 → independent waiter root/context/Reserve35/36/Waiter53/54 →
+Numeric42 protocol17. Resolver peer protocol6/17 остаётся независимым от original
+SS carrier17. Raw DirectSystem owner открывает только captured numeric nonloopback
+resolver, не original USER destination и не SS target. Public DNS Read/Write,
+caller Conn factories/FD/payload и implicit live resolver fallback не вводятся.
+
+Allow36 обязан уже подтверждать helper resolver-only durable permit и оба
+independent scope5 proofs. Go не выводит их из Source ACK56 или descriptor:
+`udp-bootstrap-bound-dns-transcript-v1` и
+`udp-bootstrap-dns-consuming-close-join-v1` проверяются helper независимо от
+`udp-bootstrap-consumed-parent-member-send-v1`. Старые Wire4/Release4/Source4
+не повышаются до5. Protected future pins остаются None; новый digest требует
+bounded SOURCE review до любого pin update.
+
+Production raw factory/duplicate и каждый nonblocking DNS I/O проверяют namespace
+от retained actual UDP ingress duplicate и новый resolver resource. Перед
+Connect/read/write live parent/context/service/peer/epoch/deadline проверяются
+под flow mutex; unsupported namespace/receiver/proof закрывает путь. Buffers,
+pending, FD и history используют прежний shared precredit, нового RX reader нет.
+Для этого CODEC5 path transcript/absolute TTL anchor равен отправке исходного
+Exchange Reserve35 (`Reservation.started`), а не factory/Publish clock. Первый
+pinned question/family/peer поддерживается в прежнем закрытом subset; дальнейший
+search/retry/family advance без authority остаётся Unsupported.
+
+NETWORK Numeric создаёт тот же отдельный UDP permission type с explicit NETWORK
+origin. Он conjunct-ит live USER parent и оба parent bindings, producer/waiter
+contexts, retained RRset/member, query/selector, snapshot/epoch/full frontier,
+port/carrier и min original deadlines/System Known. NETWORK DATA/service root
+не становятся USER authority. SS lookup получает только этот private token;
+one-attempt connected datagram send и consuming task/I/O joins остаются общими
+с проверенным HOSTS owner. TCP physical permission здесь не фабрикуется.
+
+Cleanup удерживает NETWORK service refs до consuming SS close/join, permission,
+waiter/reservation/context и binding9 ACK; producer затем проходит DATA,
+DNS socket/duplicate close+join, Proof→Resource, exchange/reservations,
+producer context/binding9 и service Close32. Delayed Resource ACK не выпускает
+refs; Unknown/error не освобождает custody и не повторяет uncertain close.
+Original USER parent остаётся удержан обоими binding owners до их retirement.
+Wire/schema/canonical corpus, frozen ingress proof/ABI, registry/builder и public
+gates не меняются. OS wrappers/main только компилируются; pure positives используют
+authenticated fake counterpart и не доказывают runtime/pair/FranceSS readiness.
