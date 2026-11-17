@@ -12,6 +12,67 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_codec5_uses_exact_canonical_corpus_without_upgrading_codec4(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        section = patch.split(
+            "+++ b/common/yonikbroker/profile-dns-v2-codec5.json\n", 1
+        )[1].split("diff --git ", 1)[0]
+        embedded = (
+            "\n".join(line[1:] for line in section.splitlines() if line.startswith("+"))
+            + "\n"
+        ).encode()
+        self.assertEqual(
+            hashlib.sha256(embedded).hexdigest(),
+            "a9f2e5f5517b72c97e4b7243a4dac9e590e885b50913a44249a393f0270d6116",
+        )
+        for anchor in (
+            "ops.codec5 = profileNeedsDatagramCodec(p.admission.capsule)",
+            "profileDNSV5Negotiate(r, descriptor[:], packet.body, 0, 0)",
+            "TestProfileDNSCodec5CanonicalParityAndMixedSchemaDenied",
+        ):
+            self.assertTrue(anchor in patch, anchor)
+
+    def test_datagram_hosts_actor_requires_two_private_parent_bindings(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "type profileDatagramParent struct",
+            "profileBindDatagramParent(child, root, frontier, deadline)",
+            "profileBindDatagramParent(h.ctx, h.root, h.frontier, h.deadline)",
+            "c.dnsCancel(9, b.id)",
+            "c.datagramOwnsGrant(g)",
+            "c.datagramOwnsReceipt(r)",
+            "TestProfileDatagramHostsActualCallerRequiresParentBind",
+            "TestProfileDatagramHostsConstructorCancelKeepsHandoffCustody",
+            "TestProfileDatagramHostsKnownRetirementAndParentIsolation",
+        ):
+            self.assertTrue(anchor in patch, anchor)
+
+    def test_native_ss_consuming_datagram_has_no_retry_or_early_retirement(
+        self,
+    ) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "type profileBootstrapDatagramPermission struct",
+            "ProfileDialBootstrapDatagram(ctx, dest)",
+            "ProfileBootstrapDatagramPayloadSize(ctx, destination)",
+            "ProfileRunBootstrapDatagramTasks(ctx, conn, requestDone, responseDoneAndCloseWriter)",
+            "s.managed.Add(2)",
+            "s.managed.Wait()",
+            "profileKernelSocketNamespace(source, fd)",
+            "case <-d.conn.done:",
+            "TestProfileDatagramHostsNoReadBeforeSendAndManagedJoin",
+            "TestProfileDatagramHostsDelayedFactoryCannotPublishAfterCancel",
+        ):
+            self.assertTrue(anchor in patch, anchor)
+        descriptor = json.loads((ADAPTER / "native-full-profile.json").read_text())
+        for key in (
+            "builder_apply_enabled",
+            "runtime_hooks_connected",
+            "authority_issuer_connected",
+            "physical_resolver_proof_connected",
+        ):
+            self.assertFalse(descriptor[key], key)
+
     def test_late_network_refresh_retains_exact_cleanup_owner(self) -> None:
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         for anchor in (
@@ -466,6 +527,7 @@ class FullProfilePatchTests(unittest.TestCase):
                     "common/yonikbroker/routing.go",
                     "app/proxyman/inbound/worker.go",
                     "proxy/socks/server.go",
+                    "proxy/shadowsocks/client.go",
                     "proxy/socks/yonik_udp_v2_test.go",
                     "proxy/http/server.go",
                     "proxy/tun/handler.go",

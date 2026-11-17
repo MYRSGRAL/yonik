@@ -10970,7 +10970,7 @@ diff --git a/common/yonikbroker/profile_transport_other.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_other.go
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,52 @@
 +//go:build !linux
 +
 +package nativehooks
@@ -10987,6 +10987,16 @@ new file mode 100644
 +
 +func ProfileBootstrapRawContext(ctx context.Context, _ bool) context.Context { return ctx }
 +func ProfileBootstrapPhysicalRequired(context.Context) bool                  { return false }
++func ProfileDialBootstrapDatagram(context.Context, xnet.Destination) (net.Conn, bool, error) {
++	return nil, false, nil
++}
++func ProfileBindBootstrapDatagramContext(context.Context, net.Conn) error { return nil }
++func ProfileRunBootstrapDatagramTasks(context.Context, net.Conn, ...func() error) error {
++	return errProfile
++}
++func ProfileBootstrapDatagramPayloadSize(context.Context, xnet.Destination) (int, bool, error) {
++	return 0, false, nil
++}
 +func ProfileDialBootstrap(context.Context, xnet.Destination, func(context.Context, xnet.Destination) (net.Conn, error)) (net.Conn, error) {
 +	return nil, errProfile
 +}
@@ -13756,7 +13766,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	}
  
  	if config.SenderSettings != nil {
-@@ -175,11 +222,102 @@
+@@ -175,11 +222,109 @@
  }
  
  // Dispatch implements proxy.Outbound.Dispatch.
@@ -13834,6 +13844,13 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
 +		next, release, e := nativehooks.ProfileAuthorizeHandler(ctx, h.tag, ob.Target, mux)
 +		if e == nil {
 +			raw := !mux && internet.ProfileNumericRawSettings(h.streamSettings) && (h.senderSettings == nil || h.senderSettings.Via == nil)
++			if ob.Target.Network == net.Network_UDP {
++				if ss, ok := h.proxy.(interface{ ProfileBootstrapDatagramSource() bool }); ok && ss.ProfileBootstrapDatagramSource() {
++					// Native SS UDP не использует TCP/TLS transport settings. Но
++					// FinalMask, source bind и sockopt этот raw owner не подменяет.
++					raw = !mux && (h.senderSettings == nil || h.senderSettings.Via == nil) && (h.streamSettings == nil || h.streamSettings.FinalMask == nil && (h.streamSettings.SocketSettings == nil || proto.Size(h.streamSettings.SocketSettings) == 0))
++				}
++			}
 +			next = nativehooks.ProfileBootstrapRawContext(next, raw)
 +			e = nativehooks.ProfilePrepareChain(next, h.profileBranch)
 +		}
@@ -13859,7 +13876,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  		strategy := h.senderSettings.TargetStrategy
  		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
  			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
-@@ -204,38 +342,41 @@
+@@ -204,38 +349,41 @@
  		link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  		link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  	}
@@ -13923,7 +13940,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	err := h.proxy.Process(ctx, link, h)
  	var errC error
  	if err != nil {
-@@ -266,6 +407,9 @@
+@@ -266,6 +414,9 @@
  
  // Dial implements internet.Dialer.
  func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
@@ -16010,7 +16027,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,1277 @@
+@@ -0,0 +1,1297 @@
 +//go:build linux
 +
 +package nativehooks
@@ -16127,6 +16144,7 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	datagramParent                          *profileDatagramParent
 +	networkLate                             *profileGrant
 +	networkBootstrap                        *profileNetworkBootstrap
 +	bootstrap                               *profileBootstrapRPC
@@ -16167,6 +16185,8 @@ new file mode 100644
 +	replied, cancelled                                       bool
 +}
 +type profileFlowControl struct {
++	datagramParents                                [64]*profileDatagramParent
++	datagramParentUsed                             int
 +	networkBootstraps                              [64]*profileNetworkBootstrap
 +	networkBootstrapUsed                           int
 +	hostsObservations                              [64]*profileHostsObservation
@@ -16388,6 +16408,9 @@ new file mode 100644
 +	var g *profileGrant
 +	var object uint64
 +	if refresh != nil {
++		if c.datagramOwnsGrant(refresh) {
++			return nil, nil, ErrProfileUnsupported
++		}
 +		if !c.grantLive(refresh) || refresh.receipt != r || refresh.scope != scope || refresh.branch != branch || refresh.effective != effective {
 +			return nil, nil, errProfile
 +		}
@@ -16450,6 +16473,11 @@ new file mode 100644
 +	}
 +}
 +func (c *profileFlowControl) finish(op *profileOperation, e error) {
++	if op.datagramParent != nil {
++		c.datagramParentClose(op.datagramParent)
++		c.dnsNotify(op, e)
++		return
++	}
 +	if op.networkBootstrap != nil {
 +		c.networkBootstrapClose(op.networkBootstrap)
 +		c.dnsNotify(op, e)
@@ -16670,6 +16698,9 @@ new file mode 100644
 +	return c.dispatchLocked(op)
 +}
 +func (c *profileFlowControl) dispatchLocked(op *profileOperation) error {
++	if op.datagramParent != nil {
++		return c.datagramParentDispatch(op)
++	}
 +	if op.networkBootstrap != nil {
 +		return c.networkBootstrapDispatch(op)
 +	}
@@ -16768,6 +16799,9 @@ new file mode 100644
 +	defer c.mu.Unlock()
 +	if !c.live() {
 +		return errProfile
++	}
++	if handled, err := c.datagramParentAccept(f); handled {
++		return err
 +	}
 +	if handled, err := c.bootstrapAccept(f); handled {
 +		return err
@@ -17135,7 +17169,7 @@ new file mode 100644
 +				}
 +			}
 +		}
-+		if !g.closed && g.id != 0 && g.refresh == nil && c.receiptLive(g.receipt) && g.deadline.Sub(now) <= 250*time.Millisecond {
++		if !g.closed && !c.datagramOwnsGrant(g) && g.id != 0 && g.refresh == nil && c.receiptLive(g.receipt) && g.deadline.Sub(now) <= 250*time.Millisecond {
 +			if g.class == 3 {
 +				continue
 +			}
@@ -17148,7 +17182,7 @@ new file mode 100644
 +			}
 +		}
 +		if g.closed {
-+			if g.networkCleanupRefs != 0 {
++			if g.networkCleanupRefs != 0 || c.datagramOwnsGrant(g) {
 +				continue
 +			}
 +			if g.id != 0 && !g.cancelSent {
@@ -17177,6 +17211,9 @@ new file mode 100644
 +			c.closeReceipt(r)
 +		}
 +		if r.closed {
++			if c.datagramOwnsReceipt(r) {
++				continue
++			}
 +			if r.id != 0 && !r.cancelSent {
 +				if _, e := c.cancel(2, r.id); e != nil {
 +					if e == errProfileFlowBusy {
@@ -18525,7 +18562,7 @@ diff --git a/common/yonikbroker/profile_launch_linux.go b/common/yonikbroker/pro
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_launch_linux.go
-@@ -0,0 +1,768 @@
+@@ -0,0 +1,785 @@
 +//go:build linux
 +
 +package nativehooks
@@ -18564,6 +18601,8 @@ new file mode 100644
 +// ProfileRuntime не содержит FlowGrant. Constructor доступен только через
 +// потребление sealed record и authenticated channel. Владение FD однократное.
 +type ProfileRuntime struct {
++	datagramIO func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error)
++	dnsCodec5  bool
 +	// Negotiated DATA-ready не разрешает capture effects. Source capability
 +	// принадлежит конкретному ACK56 context, а не runtime/session.
 +	dns4Metadata                *profileDNSMetadata4
@@ -18700,12 +18739,22 @@ new file mode 100644
 +	return p.sendObject(kind, reply, 0, body)
 +}
 +func (p *ProfileRuntime) sendObject(kind uint16, reply, object uint64, body []byte) error {
-+	dns := profileDNSV2Operation(kind)
++	if kind == 58 || kind == 57 && !p.dnsCodec5 {
++		return ErrProfileUnsupported
++	}
++	if kind == 57 && (len(body) != 64 || u64(body, 40) != p.admission.launch.epoch) {
++		return errProfile
++	}
++	dns := profileDNSV2Operation(kind) || p.dnsCodec5 && kind == 57
 +	if dns {
-+		if kind != 55 && kind != 47 && kind != 35 && kind != 38 && kind != 45 {
++		if kind != 55 && kind != 47 && kind != 35 && kind != 38 && kind != 45 && !(p.dnsCodec5 && kind == 57) {
 +			return ErrProfileUnsupported
 +		}
-+		if !p.dnsV2 || p.tx >= ^uint64(0)-1 || reply != 0 || object != 0 || !profileDNSV2Body(kind, body) {
++		valid := profileDNSV2Body(kind, body)
++		if p.dnsCodec5 {
++			valid = profileDNSV5Body(kind, body)
++		}
++		if !p.dnsV2 || p.tx >= ^uint64(0)-1 || reply != 0 || object != 0 || !valid {
 +			return errProfile
 +		}
 +		if epoch, ok := profileDNSV2Epoch(kind, body); ok && epoch != p.admission.launch.epoch {
@@ -19061,7 +19110,12 @@ new file mode 100644
 +			return
 +		}
 +		p.rx++
-+		if profileDNSV2Operation(frame.kind) && (!p.dnsV2 || !profileDNSV2Envelope(a.launch, raw, true, 0, 0, frame.reply)) {
++		dnsFrame := profileDNSV2Operation(frame.kind) || frame.kind == 57 || frame.kind == 58
++		dnsValid := profileDNSV2Envelope(a.launch, raw, true, 0, 0, frame.reply)
++		if p.dnsCodec5 {
++			dnsValid = profileDNSV5Envelope(a.launch, raw, true, 0, 0, frame.reply)
++		}
++		if dnsFrame && (!p.dnsV2 || !dnsValid) {
 +			return
 +		}
 +		if frame.kind == 33 {
@@ -30442,7 +30496,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux.go
-@@ -0,0 +1,2452 @@
+@@ -0,0 +1,2557 @@
 +//go:build linux
 +
 +package nativehooks
@@ -30486,6 +30540,8 @@ new file mode 100644
 +	key     string
 +}
 +type profileHostsObservation struct {
++	datagramConstructing                                    bool
++	datagram                                                *profileBootstrapDatagramPermission
 +	sourceCapability                                        *profileDNSSourceCapability
 +	bootstrap                                               *profileBootstrapState
 +	raw                                                     bool
@@ -30673,7 +30729,15 @@ new file mode 100644
 +		root = root.parent
 +	}
 +	frontier, deadline, err := c.hostsParentFrontier(root)
-+	if err != nil || !c.dnsSourceFrontierReady(root, frontier) || !c.hostsSnapshotLive(p, p.snapshot) || ctx.Err() != nil || profileReceiptFrom(ctx) != root.receipt || c.nextDNSQuery >= ^uint64(0)-1 {
++	udp := p.dnsCodec5 && c.datagramFrontierReady(root, frontier)
++	if udp {
++		raw, _ := ctx.Value(profileBootstrapRawKey{}).(bool)
++		if !raw {
++			c.mu.Unlock()
++			return ErrProfileUnsupported
++		}
++	}
++	if err != nil || !c.dnsSourceFrontierReady(root, frontier) && !udp || !c.hostsSnapshotLive(p, p.snapshot) || ctx.Err() != nil || profileReceiptFrom(ctx) != root.receipt || c.nextDNSQuery >= ^uint64(0)-1 {
 +		c.mu.Unlock()
 +		return ErrProfileUnsupported
 +	}
@@ -30681,19 +30745,22 @@ new file mode 100644
 +	// DATA или USER grant в resolver transport authority.
 +	if p.snapshot.order == 2 || p.snapshot.order == 4 || p.snapshot.order == 3 && len(p.snapshot.files(frontier.target.address, true, true)) == 0 {
 +		c.mu.Unlock()
++		if udp {
++			return ErrProfileUnsupported
++		}
 +		return profilePrepareNetworkBootstrap(ctx, root)
 +	}
 +	raw, _ := ctx.Value(profileBootstrapRawKey{}).(bool)
 +	raw = raw && frontier.count == 1 && frontier.branch == 0 && frontier.carrier == 6 && root.receipt.original.network == 6 && c.manifest.rows[8][root.scope][2] == 6 && root.stream != 65535 && c.manifest.rows[3][root.stream][0] == 1
 +	for _, other := range c.hostsObservations[:c.hostsObservationUsed] {
-+		if raw && other.root == root && other.bootstrap != nil {
++		if other.root == root && (raw && other.bootstrap != nil || udp && other.datagram != nil) {
 +			c.mu.Unlock()
 +			return ErrProfileUnsupported
 +		}
 +	}
 +	pendingCredit := profileHostsObservationPending
 +	credit := uint64(profileHostsObservationCredit)
-+	if raw {
++	if raw || udp {
 +		pendingCredit += 10
 +		credit += 64 * 1024
 +	}
@@ -30705,7 +30772,10 @@ new file mode 100644
 +	c.buffered += credit
 +	base := context.WithValue(ctx, profileGrantKey{}, root)
 +	child, cancel := context.WithCancel(base)
-+	h := &profileHostsObservation{raw: raw, pendingCredit: pendingCredit, runtime: p, ctx: child, cancel: cancel, root: root, frontier: frontier, snapshot: p.snapshot, deadline: deadline, cleanupDeadline: deadline.Add(time.Second)}
++	h := &profileHostsObservation{datagramConstructing: udp, raw: raw, pendingCredit: pendingCredit, runtime: p, ctx: child, cancel: cancel, root: root, frontier: frontier, snapshot: p.snapshot, deadline: deadline, cleanupDeadline: deadline.Add(time.Second)}
++	if udp {
++		h.datagram = &profileBootstrapDatagramPermission{owner: h}
++	}
 +	if c.sessionDeadline.Before(h.cleanupDeadline) {
 +		h.cleanupDeadline = c.sessionDeadline
 +	}
@@ -30716,16 +30786,36 @@ new file mode 100644
 +	c.mu.Unlock()
 +	retained := false
 +	defer func() {
++		c.mu.Lock()
++		h.datagramConstructing = false
 +		if !retained {
-+			c.mu.Lock()
 +			c.hostsObservationClose(h)
-+			c.mu.Unlock()
 +		}
++		c.mu.Unlock()
 +	}()
 +	if err != nil {
 +		return err
 +	}
 +	source := &profileDNSCapture4{runtime: p, parent: root, frontier: frontier, snapshot: h.snapshot, query: query, epoch: p.admission.launch.epoch, resolver: 65535, hosts: true, deadline: deadline}
++	if udp {
++		binding, e := profileBindDatagramParent(child, root, frontier, deadline)
++		if e != nil {
++			return e
++		}
++		source.datagram = binding
++		source.query = binding.query
++		query = binding.query
++		c.mu.Lock()
++		if binding.deadline.Before(h.deadline) {
++			h.deadline = binding.deadline
++		}
++		if binding.cleanupDeadline.Before(h.cleanupDeadline) {
++			h.cleanupDeadline = binding.cleanupDeadline
++		}
++		source.deadline = h.deadline
++		h.datagram.producerParent = binding
++		c.mu.Unlock()
++	}
 +	captured := context.WithValue(child, profileDNSCapture4Key{}, source)
 +	metadata, release, err := ProfileDNSAcquirePhysicalContext(captured)
 +	if err != nil {
@@ -30774,7 +30864,7 @@ new file mode 100644
 +	if err = profilePublishHostsObservation(h); err != nil {
 +		return err
 +	}
-+	if !h.raw {
++	if !h.raw && h.datagram == nil {
 +		return ErrProfileUnsupported
 +	}
 +	if err = profileAcquireBootstrapPermission(h); err != nil {
@@ -30782,6 +30872,9 @@ new file mode 100644
 +	}
 +	c.mu.Lock()
 +	valid := c.bootstrapPermissionLive(h.bootstrap.permission)
++	if h.datagram != nil {
++		valid = c.datagramPermissionLive(h.datagram)
++	}
 +	if valid {
 +		root.prepared = true
 +	}
@@ -31124,7 +31217,7 @@ new file mode 100644
 +					c.hostsObservationClose(h)
 +				}
 +			}
-+			if b.permission.id != 0 && !c.bootstrapPermissionLive(b.permission) {
++			if b.datagram != nil && b.datagram.id != 0 && !c.datagramPermissionLive(b.datagram) || b.permission != nil && b.permission.id != 0 && !c.bootstrapPermissionLive(b.permission) {
 +				c.hostsObservationClose(h)
 +			}
 +		}
@@ -31135,6 +31228,10 @@ new file mode 100644
 +			c.hostsObservationClose(h)
 +		}
 +		if !h.closed {
++			continue
++		}
++		// Pending57/context handoff ещё может передать custody constructor-у.
++		if h.datagramConstructing {
 +			continue
 +		}
 +		if !c.clock().Before(h.cleanupDeadline) {
@@ -31340,6 +31437,7 @@ new file mode 100644
 +	cancelSequence     uint64
 +}
 +type profileBootstrapState struct {
++	datagram                                                               *profileBootstrapDatagramPermission
 +	sourceCapability                                                       *profileDNSSourceCapability
 +	opening                                                                bool
 +	context                                                                *profileDNSContext4
@@ -31354,7 +31452,7 @@ new file mode 100644
 +}
 +
 +func (c *profileFlowControl) bootstrapBaseLive(h *profileHostsObservation) bool {
-+	if h == nil || !h.raw || !c.hostsProducerDataLive(h.data) || h.frontier.count != 1 || h.frontier.branch != 0 || h.frontier.carrier != 6 || h.root.parent != nil {
++	if h == nil || (!h.raw || h.frontier.carrier != 6) && h.datagram == nil || !c.hostsProducerDataLive(h.data) || h.frontier.count != 1 || h.frontier.branch != 0 || h.root.parent != nil {
 +		return false
 +	}
 +	b := h.bootstrap
@@ -31398,16 +31496,37 @@ new file mode 100644
 +func profileAcquireBootstrapPermission(h *profileHostsObservation) error {
 +	c := h.runtime.flow
 +	c.mu.Lock()
-+	if h.bootstrap != nil || !h.raw || !c.hostsProducerDataLive(h.data) || c.nextDNSQuery >= ^uint64(0)-1 {
++	if h.bootstrap != nil || !h.raw && h.datagram == nil || !c.hostsProducerDataLive(h.data) || c.nextDNSQuery >= ^uint64(0)-1 {
 +		c.mu.Unlock()
 +		return ErrProfileUnsupported
 +	}
 +	b := &profileBootstrapState{permission: &profileBootstrapPhysicalPermission{owner: h}}
++	if h.datagram != nil {
++		b.permission = nil
++		b.datagram = h.datagram
++	}
 +	h.bootstrap = b
 +	s := h.context.source
 +	s.query = c.nextDNSQuery + 1
 +	s.deadline = h.deadline
 +	c.mu.Unlock()
++	if h.datagram != nil {
++		binding, e := profileBindDatagramParent(h.ctx, h.root, h.frontier, h.deadline)
++		if e != nil {
++			return e
++		}
++		s.datagram = binding
++		s.query = binding.query
++		c.mu.Lock()
++		h.datagram.waiterParent = binding
++		if binding.deadline.Before(s.deadline) {
++			s.deadline = binding.deadline
++		}
++		if binding.cleanupDeadline.Before(h.cleanupDeadline) {
++			h.cleanupDeadline = binding.cleanupDeadline
++		}
++		c.mu.Unlock()
++	}
 +	metadata, release, err := ProfileDNSAcquirePhysicalContext(context.WithValue(h.ctx, profileDNSCapture4Key{}, &s))
 +	if err != nil {
 +		return err
@@ -31457,8 +31576,13 @@ new file mode 100644
 +		c.mu.Unlock()
 +		return ErrProfileUnsupported
 +	}
-+	b.permission.target = target
-+	b.permission.member = member
++	if b.datagram != nil {
++		b.datagram.target = target
++		b.datagram.member = member
++	} else {
++		b.permission.target = target
++		b.permission.member = member
++	}
 +	body = make([]byte, 24)
 +	be.PutUint16(body, 2)
 +	be.PutUint16(body[2:], member)
@@ -31655,12 +31779,16 @@ new file mode 100644
 +						}
 +					}
 +				case 19:
-+					p := b.permission
-+					p.id = u64(data, 4)
-+					if data[1] != 3 || data[2] != 0 || data[3] != 0 || !profileDNSV2ID(p.id) || f.object != p.id || u64(data, 12) != 0 || u32(data, 20) < 1 || u32(data, 20) > 1000 || u64(data, 24) != c.manifest.policy || !zero(data[32:]) || p.id <= c.highestGrant {
++					id := u64(data, 4)
++					if b.datagram != nil {
++						b.datagram.id = id
++					} else {
++						b.permission.id = id
++					}
++					if data[1] != 3 || data[2] != 0 || data[3] != 0 || !profileDNSV2ID(id) || f.object != id || u64(data, 12) != 0 || u32(data, 20) < 1 || u32(data, 20) > 1000 || u64(data, 24) != c.manifest.policy || !zero(data[32:]) || id <= c.highestGrant {
 +						return bad()
 +					}
-+					c.highestGrant = p.id
++					c.highestGrant = id
 +					remaining = uint64(u32(data, 20)) * uint64(time.Millisecond)
 +				}
 +				if remaining == 0 || remaining > uint64(op.deadline.Sub(op.sent)) {
@@ -31674,7 +31802,11 @@ new file mode 100644
 +					b.receiptDeadline = until
 +				}
 +				if f.kind == 19 {
-+					b.permission.deadline = until
++					if b.datagram != nil {
++						b.datagram.deadline = until
++					} else {
++						b.permission.deadline = until
++					}
 +				}
 +				if !c.bootstrapBaseLive(h) || !c.clock().Before(op.deadline) || !c.clock().Before(until) {
 +					c.hostsObservationClose(h)
@@ -31702,7 +31834,7 @@ new file mode 100644
 +			}
 +		}
 +		if f.kind == 34 && b.grantClose != 0 && f.reply == b.grantClose {
-+			if b.grantAck != 0 || !profileCloseACK(f, 3, b.permission.id) || !c.clock().Before(h.cleanupDeadline) {
++			if b.grantAck != 0 || !profileCloseACK(f, 3, b.permissionID()) || !c.clock().Before(h.cleanupDeadline) {
 +				h.unknown = true
 +				return true, errProfile
 +			}
@@ -31742,6 +31874,33 @@ new file mode 100644
 +	return c.bootstrapCleanupState(h.bootstrap, &h.unknown)
 +}
 +func (c *profileFlowControl) bootstrapCleanupState(b *profileBootstrapState, unknown *bool) (bool, error) {
++	if d := b.datagram; d != nil {
++		if d.creating {
++			return false, nil
++		}
++		if d.conn != nil {
++			d.conn.requestClose()
++			select {
++			case <-d.conn.done:
++				if d.conn.result != nil {
++					*unknown = true
++					return false, nil
++				}
++			default:
++				return false, nil
++			}
++		}
++		if d.credited {
++			if d.conn == nil {
++				*unknown = true
++				return false, nil
++			}
++			d.credited = false
++			c.physicalFDs--
++			c.operations -= profileDatagramSocketPending
++			c.buffered -= profileDatagramSocketCredit
++		}
++	}
 +	if b.opening {
 +		return false, nil
 +	}
@@ -31782,11 +31941,11 @@ new file mode 100644
 +			return false, nil
 +		}
 +	}
-+	if b.permission.id != 0 && b.grantAck == 0 {
++	if b.permissionID() != 0 && b.grantAck == 0 {
 +		if b.grantClose == 0 {
 +			body := make([]byte, 12)
 +			body[0] = 3
-+			be.PutUint64(body[4:], b.permission.id)
++			be.PutUint64(body[4:], b.permissionID())
 +			seq, err := c.write(32, 0, body)
 +			b.grantClose = seq
 +			if seq > c.lastSent {
@@ -34740,7 +34899,7 @@ diff --git a/common/yonikbroker/profile_dns_setup_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_setup_linux.go
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,97 @@
 +//go:build linux
 +
 +package nativehooks
@@ -34754,6 +34913,7 @@ new file mode 100644
 +)
 +
 +type profileDNSSetupOps struct {
++	codec5  bool
 +	send    func([]byte) error
 +	receive func(time.Time) (profileProofPacket, error)
 +	reject  func(profileProofPacket) error
@@ -34763,12 +34923,13 @@ new file mode 100644
 +
 +// Только negotiated DATA. Ни Source, ни transcript/release permission.
 +type profileDNSMetadata4 struct {
++	codec5  bool
 +	runtime *ProfileRuntime
 +	launch  profileLaunch
 +}
 +
 +func (p *ProfileRuntime) dns4MetadataReady() bool {
-+	return p != nil && p.dnsV2 && p.dns4Metadata != nil && p.dns4Metadata.runtime == p && p.dns4Metadata.launch == p.admission.launch && p.ctx != nil && p.ctx.Err() == nil
++	return p != nil && p.dnsV2 && p.dns4Metadata != nil && p.dns4Metadata.codec5 == p.dnsCodec5 && p.dns4Metadata.runtime == p && p.dns4Metadata.launch == p.admission.launch && p.ctx != nil && p.ctx.Err() == nil
 +}
 +
 +// Единственный setup owner до monitor. Descriptor/ACK — не runtime frame.
@@ -34778,6 +34939,9 @@ new file mode 100644
 +	}
 +	live := func() bool { return ctx.Err() == nil && ops.now().Before(deadline) && ops.alive() }
 +	descriptor, e := profileDNSV2Descriptor(record)
++	if ops.codec5 {
++		descriptor, e = profileDNSV5Descriptor(record)
++	}
 +	if e != nil || !live() {
 +		return errProfile
 +	}
@@ -34790,7 +34954,11 @@ new file mode 100644
 +	}
 +	packet, e := ops.receive(deadline)
 +	defer func() { result = errors.Join(result, ops.reject(packet)) }()
-+	if e != nil || !live() || packet.invalid || packet.count != 0 || packet.rightsMessages != 0 || packet.credentials != 1 || !profileSenderValid(r, packet.pid, packet.uid, localUID) || !profileDNSV2Negotiate(r, descriptor[:], packet.body, 0, 0) {
++	negotiated := profileDNSV2Negotiate(r, descriptor[:], packet.body, 0, 0)
++	if ops.codec5 {
++		negotiated = profileDNSV5Negotiate(r, descriptor[:], packet.body, 0, 0)
++	}
++	if e != nil || !live() || packet.invalid || packet.count != 0 || packet.rightsMessages != 0 || packet.credentials != 1 || !profileSenderValid(r, packet.pid, packet.uid, localUID) || !negotiated {
 +		return errors.Join(errProfile, e)
 +	}
 +	return nil
@@ -34820,11 +34988,13 @@ new file mode 100644
 +	if p.admission.deadline.Before(deadline) {
 +		deadline = p.admission.deadline
 +	}
++	ops.codec5 = profileNeedsDatagramCodec(p.admission.capsule)
 +	if e := profileDNSSetup(p.ctx, p.admission.launch, record, deadline, uid, ops); e != nil {
 +		return e
 +	}
 +	p.dnsV2 = true
-+	p.dns4Metadata = &profileDNSMetadata4{runtime: p, launch: p.admission.launch}
++	p.dnsCodec5 = ops.codec5
++	p.dns4Metadata = &profileDNSMetadata4{runtime: p, launch: p.admission.launch, codec5: ops.codec5}
 +	return nil
 +}
 diff --git a/common/yonikbroker/profile_dns_setup_linux_test.go b/common/yonikbroker/profile_dns_setup_linux_test.go
@@ -36333,7 +36503,7 @@ diff --git a/common/yonikbroker/profile_dns_bundle_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_bundle_linux.go
-@@ -0,0 +1,1507 @@
+@@ -0,0 +1,1537 @@
 +//go:build linux
 +
 +package nativehooks
@@ -36385,6 +36555,7 @@ new file mode 100644
 +// Private DATA от actual capture/choice seam; не network/USER permission.
 +// Public setup не создаёт этот объект и не выдаёт Source capability.
 +type profileDNSCapture4 struct {
++	datagram                          *profileDatagramParent
 +	runtime                           *ProfileRuntime
 +	parent, service                   *profileGrant
 +	frontier                          profileDNSFrontier
@@ -36468,7 +36639,8 @@ new file mode 100644
 +		return false
 +	}
 +	// SOURCE-reviewed subset: один actual raw TCP leaf и original USER parent.
-+	if !c.dnsSourceFrontierReady(s.parent, f) {
++	udp := f.carrier == 17 && s.runtime.dnsCodec5 && s.datagram != nil && s.datagram.query == s.query && s.datagram.parent == s.parent && s.datagram.frontier == f && c.datagramParentLive(s.datagram)
++	if !c.dnsSourceFrontierReady(s.parent, f) && !udp {
 +		return false
 +	}
 +	// Повторный graph walk использует сохранённые actual branch decisions.
@@ -36519,7 +36691,7 @@ new file mode 100644
 +		return nil, nil, errProfile
 +	}
 +	if renew == nil {
-+		if s.query <= c.nextDNSQuery {
++		if s.query <= c.nextDNSQuery && (s.datagram == nil || s.datagram.query != s.query || s.datagram.claimed || !c.datagramParentLive(s.datagram)) {
 +			return nil, nil, errProfile
 +		}
 +		for _, x := range c.dnsContexts4[:c.dnsContext4Used] {
@@ -36550,7 +36722,13 @@ new file mode 100644
 +	c.operations += pending
 +	c.buffered += credit
 +	if renew == nil {
-+		c.nextDNSQuery = s.query
++		if s.query > c.nextDNSQuery {
++			c.nextDNSQuery = s.query
++		}
++		if s.datagram != nil {
++			s.datagram.claimed = true
++			s.datagram.contexts++
++		}
 +	}
 +	x := renew
 +	if x == nil {
@@ -36819,6 +36997,10 @@ new file mode 100644
 +		}
 +		if x.pending == nil && x.hostReferences == 0 && (x.identity.id == 0 || x.closeAck) {
 +			x.released = true
++			if b := x.source.datagram; b != nil {
++				b.contexts--
++				c.datagramParentClose(b)
++			}
 +			c.operations--
 +			if x.source.service != nil {
 +				x.source.service.pending--
@@ -37552,6 +37734,9 @@ new file mode 100644
 +	return errProfile
 +}
 +func (c *profileFlowControl) dnsTick() error {
++	if err := c.datagramParentTick(); err != nil {
++		return err
++	}
 +	if err := c.networkBootstrapTick(); err != nil {
 +		return err
 +	}
@@ -37618,6 +37803,16 @@ new file mode 100644
 +}
 +
 +func (c *profileFlowControl) dnsFloor(floor uint64) uint64 {
++	for _, b := range c.datagramParents[:c.datagramParentUsed] {
++		if b.released {
++			continue
++		}
++		for _, seq := range []uint64{b.op.sequence, b.cancelSequence, b.closeSequence} {
++			if seq != 0 && seq < floor {
++				floor = seq
++			}
++		}
++	}
 +	floor = c.networkBootstrapFloor(floor)
 +	floor = c.hostsObservationFloor(floor)
 +	floor = c.dnsContext4Floor(floor)
@@ -37654,6 +37849,11 @@ new file mode 100644
 +func (c *profileFlowControl) dnsCleanupResult() error {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
++	for _, b := range c.datagramParents[:c.datagramParentUsed] {
++		if !b.released || b.unknown {
++			return ErrProfileCleanupUnknown
++		}
++	}
 +	for _, n := range c.networkBootstraps[:c.networkBootstrapUsed] {
 +		if !n.released || n.unknown {
 +			return ErrProfileCleanupUnknown
@@ -46618,6 +46818,2004 @@ new file mode 100644
 +      "numericBodyHex": "0002000000000000000007d300580101000000000000000201000000ffff000000000000030601bb001000004f726967696e616c2e494e56414c4944030601bb001000004f726967696e616c2e494e56414c4944ffff000000000000000000000000000000000000040601bb040000cb007109"
 +    }
 +  ]
++}
+diff --git a/proxy/shadowsocks/client.go b/proxy/shadowsocks/client.go
+--- a/proxy/shadowsocks/client.go
++++ b/proxy/shadowsocks/client.go
+@@ -13,6 +13,7 @@
+ 	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/common/signal"
+ 	"github.com/xtls/xray-core/common/task"
++	nativehooks "github.com/xtls/xray-core/common/yonikbroker"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/policy"
+ 	"github.com/xtls/xray-core/transport"
+@@ -26,6 +27,15 @@
+ 	policyManager policy.Manager
+ }
+ 
++// Actual native SS packet path. Это отрицательный shape gate, не authority.
++func (c *Client) ProfileBootstrapDatagramSource() bool {
++	if c.server == nil || c.server.User == nil {
++		return false
++	}
++	a, ok := c.server.User.Account.(*MemoryAccount)
++	return ok && a.Cipher != nil
++}
++
+ // NewClient create a new Shadowsocks client.
+ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
+ 	if config.Server == nil {
+@@ -60,16 +70,45 @@
+ 	dest := server.Destination
+ 	dest.Network = network
+ 	var conn stat.Connection
+-
+-	err := retry.ExponentialBackoff(5, 100).On(func() error {
+-		rawConn, err := dialer.Dial(ctx, dest)
++	if size, owned, e := nativehooks.ProfileBootstrapDatagramPayloadSize(ctx, destination); owned {
++		if e != nil {
++			return e
++		}
++		account, ok := server.User.Account.(*MemoryAccount)
++		if !ok || account.Cipher == nil {
++			return errors.New("invalid owned Shadowsocks account")
++		}
++		header := 7
++		switch destination.Address.Family() {
++		case net.AddressFamilyIPv6:
++			header = 19
++		case net.AddressFamilyDomain:
++			header = 4 + len(destination.Address.Domain())
++		}
++		// Native EncodeUDPPacket использует fixed buf.Size и AEAD tag16. Не
++		// допускаем silent Buffer.Write truncation до consuming physical open.
++		if size+header+int(account.Cipher.IVSize())+16 > buf.Size {
++			return errors.New("owned Shadowsocks datagram exceeds native packet buffer")
++		}
++	}
++
++	owned, handled, err := nativehooks.ProfileDialBootstrapDatagram(ctx, dest)
++	if handled {
+ 		if err != nil {
+ 			return err
+ 		}
+-		conn = rawConn
+-
+-		return nil
+-	})
++		conn = owned
++	} else {
++		err = retry.ExponentialBackoff(5, 100).On(func() error {
++			rawConn, err := dialer.Dial(ctx, dest)
++			if err != nil {
++				return err
++			}
++			conn = rawConn
++
++			return nil
++		})
++	}
+ 	if err != nil {
+ 		return errors.New("failed to find an available destination").Base(err)
+ 	}
+@@ -97,12 +136,18 @@
+ 
+ 	var newCtx context.Context
+ 	var newCancel context.CancelFunc
+-	if session.TimeoutOnlyFromContext(ctx) {
++	if session.TimeoutOnlyFromContext(ctx) && !nativehooks.ProfileSession(ctx) {
+ 		newCtx, newCancel = context.WithCancel(context.Background())
+ 	}
+ 
+ 	sessionPolicy := c.policyManager.ForLevel(user.Level)
+ 	ctx, cancel := context.WithCancel(ctx)
++	if handled {
++		if err := nativehooks.ProfileBindBootstrapDatagramContext(ctx, conn); err != nil {
++			cancel()
++			return err
++		}
++	}
+ 	timer := signal.CancelAfterInactivity(ctx, func() {
+ 		cancel()
+ 		if newCancel != nil {
+@@ -184,7 +229,13 @@
+ 		}
+ 
+ 		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
+-		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
++		run := func() error { return task.Run(ctx, requestDone, responseDoneAndCloseWriter) }
++		if handled {
++			run = func() error {
++				return nativehooks.ProfileRunBootstrapDatagramTasks(ctx, conn, requestDone, responseDoneAndCloseWriter)
++			}
++		}
++		if err := run(); err != nil {
+ 			return errors.New("connection ends").Base(err)
+ 		}
+ 
+diff --git a/common/yonikbroker/profile-dns-v2-codec5.json b/common/yonikbroker/profile-dns-v2-codec5.json
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile-dns-v2-codec5.json
+@@ -0,0 +1,250 @@
++{
++  "contract": "DNS_V2-CODEC-5",
++  "negotiations": [
++    {
++      "mode": 1,
++      "launchHex": "594e4b4c4f433031000100c00000000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e900000000000000000000002a000000000000000003030303030303030303030303030303030303030303030303030303030303030000000000000000",
++      "descriptorHex": "444e534e454730320002011000000000594e4b4c4f433031000100c00000000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e900000000000000000000002a000000000000000003030303030303030303030303030303030303030303030303030303030303030000000000000000c05c312d47ed27ef93db80158cb7bc78f10c6b319d5d4407929885cb192ead030004000b00800000004000400040010001000000000000000000000000000000",
++      "ackHex": "444e5341434b303289af70fdd5f378478348344b23dfeb025a27ea718e2c6fdf8a41044469a1d5c0"
++    },
++    {
++      "mode": 2,
++      "launchHex": "594e4b4558543031000100c00001000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e9000007d2000000000000002a000000000000002b03030303030303030303030303030303030303030303030303030303030303030000000000000000",
++      "descriptorHex": "444e534e454730320002011000000000594e4b4558543031000100c00001000004040404040404040404040404040404040404040404040404040404040404040101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300000000000000050000000000000007000003e9000007d2000000000000002a000000000000002b03030303030303030303030303030303030303030303030303030303030303030000000000000000c05c312d47ed27ef93db80158cb7bc78f10c6b319d5d4407929885cb192ead030004000b00800000004000400040010001000000000000000000000000000000",
++      "ackHex": "444e5341434b3032ca8ee59aaa927769e5e83db22dfcc13fc91734627bc950ee09605f201fc11c72"
++    }
++  ],
++  "vectors": [
++    {
++      "name": "bind",
++      "kind": 57,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          8,
++          "u64",
++          31
++        ],
++        [
++          16,
++          "u64",
++          21
++        ],
++        [
++          24,
++          "u64",
++          11
++        ],
++        [
++          32,
++          "u64",
++          1
++        ],
++        [
++          40,
++          "u64",
++          7
++        ],
++        [
++          48,
++          "u16",
++          1
++        ],
++        [
++          50,
++          "u8",
++          0
++        ],
++        [
++          52,
++          "u32",
++          20
++        ]
++      ],
++      "bodyHex": "0002000000000000000000000000001f0000000000000015000000000000000b0000000000000001000000000000000700010000000000140000000000000000",
++      "frameHex": "594e4b434150303100010039000000c0000000000000000900000000000000000202020202020202020202020202020203030303030303030303030303030303010101010101010101010101010101010101010101010101010101010101010100000000000000050000000000000007000000000000000000000000000000000002000000000000000000000000001f0000000000000015000000000000000b0000000000000001000000000000000700010000000000140000000000000000",
++      "rights": 0,
++      "credentials": 0
++    },
++    {
++      "name": "bound",
++      "kind": 58,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          1
++        ],
++        [
++          8,
++          "u64",
++          41
++        ],
++        [
++          16,
++          "u64",
++          21
++        ],
++        [
++          24,
++          "u64",
++          11
++        ],
++        [
++          32,
++          "u64",
++          31
++        ],
++        [
++          40,
++          "u64",
++          7
++        ],
++        [
++          48,
++          "u32",
++          15
++        ],
++        [
++          52,
++          "u16",
++          1
++        ],
++        [
++          54,
++          "u8",
++          0
++        ]
++      ],
++      "bodyHex": "000201000000000000000000000000290000000000000015000000000000000b000000000000001f00000000000000070000000f000100000000000000000000",
++      "frameHex": "594e4b43415030310001003a000000c0000000000000000a0000000000000009020202020202020202020202020202020303030303030303030303030303030301010101010101010101010101010101010101010101010101010101010101010000000000000005000000000000000700000000000000000000000000000000000201000000000000000000000000290000000000000015000000000000000b000000000000001f00000000000000070000000f000100000000000000000000",
++      "rights": 0,
++      "credentials": 0
++    },
++    {
++      "name": "deny",
++      "kind": 58,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          2
++        ]
++      ],
++      "bodyHex": "00020200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "frameHex": "594e4b43415030310001003a000000c0000000000000000a000000000000000902020202020202020202020202020202030303030303030303030303030303030101010101010101010101010101010101010101010101010101010101010101000000000000000500000000000000070000000000000000000000000000000000020200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "rights": 0,
++      "credentials": 0
++    },
++    {
++      "name": "unknown",
++      "kind": 58,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          3
++        ]
++      ],
++      "bodyHex": "00020300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "frameHex": "594e4b43415030310001003a000000c0000000000000000a000000000000000902020202020202020202020202020202030303030303030303030303030303030101010101010101010101010101010101010101010101010101010101010101000000000000000500000000000000070000000000000000000000000000000000020300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++      "rights": 0,
++      "credentials": 0
++    },
++    {
++      "name": "cancel-parent",
++      "kind": 47,
++      "fields": [
++        [
++          0,
++          "u16",
++          2
++        ],
++        [
++          2,
++          "u8",
++          9
++        ],
++        [
++          8,
++          "u64",
++          41
++        ]
++      ],
++      "bodyHex": "000209000000000000000000000000290000000000000000",
++      "frameHex": "594e4b43415030310001002f0000009800000000000000090000000000000000020202020202020202020202020202020303030303030303030303030303030301010101010101010101010101010101010101010101010101010101010101010000000000000005000000000000000700000000000000000000000000000000000209000000000000000000000000290000000000000000",
++      "rights": 0,
++      "credentials": 0
++    }
++  ],
++  "rejectedBodies": [
++    {
++      "kind": 57,
++      "bodyHex": "0002010000000000000000000000001f0000000000000015000000000000000b0000000000000001000000000000000700010000000000140000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "000200000000000000000000000000000000000000000015000000000000000b0000000000000001000000000000000700010000000000140000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "0002000000000000000000000000001fffffffffffffffff000000000000000b0000000000000001000000000000000700010000000000140000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "0002000000000000000000000000001f000000000000001500000000000000000000000000000001000000000000000700010000000000140000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "0002000000000000000000000000001f0000000000000015000000000000000b0000000000000000000000000000000700010000000000140000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "0002000000000000000000000000001f0000000000000015000000000000000b0000000000000001000000000000000000010000000000140000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "0002000000000000000000000000001f0000000000000015000000000000000b0000000000000001000000000000000702000000000000140000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "0002000000000000000000000000001f0000000000000015000000000000000b0000000000000001000000000000000700010200000000140000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "0002000000000000000000000000001f0000000000000015000000000000000b0000000000000001000000000000000700010001000000140000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "0002000000000000000000000000001f0000000000000015000000000000000b0000000000000001000000000000000700010000000000000000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "0002000000000000000000000000001f0000000000000015000000000000000b0000000000000001000000000000000700010000000003e90000000000000000"
++    },
++    {
++      "kind": 57,
++      "bodyHex": "0002000000000000000000000000001f0000000000000015000000000000000b0000000000000001000000000000000700010000000000140100000000000000"
++    }
++  ],
++  "codec4BasisSha256": "fe4ad88a6f519ee00051b7a02192c04e7a795ff869dd3ff3ebc2f6cffebf06a5"
++}
+diff --git a/common/yonikbroker/profile_dns_datagram_codec.go b/common/yonikbroker/profile_dns_datagram_codec.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_dns_datagram_codec.go
+@@ -0,0 +1,114 @@
++package nativehooks
++
++import (
++	"bytes"
++	"crypto/sha256"
++)
++
++func profileNeedsDatagramCodec(m profileCapsule) bool {
++	for _, s := range m.rows[8] {
++		if len(s) < 24 || s[2] != 17 || s[4] != 17 || s[20] != 1 || u16(s, 12) != 65535 {
++			continue
++		}
++		subject, endpoint := int(u16(s, 0)), int(u16(s, 8))
++		if subject >= len(m.rows[0]) || endpoint >= len(m.rows[1]) {
++			continue
++		}
++		t := m.rows[0][subject]
++		v, ok := profileDecodedDestination(m.rows[1][endpoint])
++		if len(t) >= 8 && t[len(t)-8] == 2 && ok && v.family == 3 && v.network == 17 {
++			return true
++		}
++	}
++	return false
++}
++
++// CODEC5 DATA не повышает CODEC4 Source/UDP ingress до datagram scope.
++func profileDNSV5Descriptor(launch []byte) ([272]byte, error) {
++	d, err := profileDNSV2Descriptor(launch)
++	if err != nil {
++		return d, err
++	}
++	h := sha256.Sum256([]byte("YONIK-DNS-V2-CODEC-5\x00"))
++	copy(d[208:240], h[:])
++	return d, nil
++}
++func profileDNSV5Negotiate(r profileLaunch, descriptor, ack []byte, rights, credentials int) bool {
++	if len(descriptor) != 272 || len(ack) != 40 || rights != 0 || credentials != 0 {
++		return false
++	}
++	launch, err := decodeProfileLaunch(descriptor[16:208])
++	if err != nil || launch != r {
++		return false
++	}
++	exact, err := profileDNSV5Descriptor(descriptor[16:208])
++	h := sha256.Sum256(descriptor)
++	return err == nil && bytes.Equal(exact[:], descriptor) && string(ack[:8]) == "DNSACK02" && bytes.Equal(ack[8:], h[:])
++}
++func profileDNSV5Body(kind uint16, b []byte) bool {
++	if kind == 57 {
++		return len(b) == 64 && u16(b, 0) == 2 && zero(b[2:8]) && profileDNSV2ID(u64(b, 8)) && profileDNSV2ID(u64(b, 16)) && profileDNSV2ID(u64(b, 24)) && profileDNSV2ID(u64(b, 32)) && profileDNSV2ID(u64(b, 40)) && u16(b, 48) < 512 && b[50] <= 1 && b[51] == 0 && u32(b, 52) >= 1 && u32(b, 52) <= 1000 && zero(b[56:])
++	}
++	if kind == 58 {
++		if len(b) != 64 || u16(b, 0) != 2 || b[2] < 1 || b[2] > 3 {
++			return false
++		}
++		if b[2] != 1 {
++			return zero(b[3:])
++		}
++		return zero(b[3:8]) && profileDNSV2ID(u64(b, 8)) && profileDNSV2ID(u64(b, 16)) && profileDNSV2ID(u64(b, 24)) && profileDNSV2ID(u64(b, 32)) && profileDNSV2ID(u64(b, 40)) && u32(b, 48) >= 1 && u32(b, 48) <= 1000 && u16(b, 52) < 512 && b[54] <= 1 && zero(b[55:])
++	}
++	if kind == 47 && len(b) == 24 && b[2] == 9 {
++		return u16(b, 0) == 2 && zero(b[3:8]) && profileDNSV2ID(u64(b, 8)) && zero(b[18:])
++	}
++	return profileDNSV2Body(kind, b)
++}
++func profileDNSV5ParentBound(request, reply []byte) bool {
++	return profileDNSV5Body(57, request) && profileDNSV5Body(58, reply) && reply[2] == 1 && u64(reply, 16) == u64(request, 16) && u64(reply, 24) == u64(request, 24) && u64(reply, 32) == u64(request, 8) && u64(reply, 40) == u64(request, 40) && u32(reply, 48) <= u32(request, 52) && u16(reply, 52) == u16(request, 48) && reply[54] == request[50]
++}
++func profileDNSV5Envelope(r profileLaunch, b []byte, issuer bool, rights, credentials int, reply uint64) bool {
++	if len(b) == 192 && string(b[:8]) == "DNSPHY02" {
++		return profileDNSV2Envelope(r, b, issuer, rights, credentials, reply)
++	}
++	if len(b) < 128 || len(b) > 65536 || rights != 0 || credentials != 0 || !profileDNSV2ID(u64(b, 16)) {
++		return false
++	}
++	p, err := r.decodePacket(b, u64(b, 16))
++	if err != nil || p.object != 0 || p.kind == 52 || !profileDNSV5Body(p.kind, p.body) {
++		return false
++	}
++	isReply := p.kind == 58 || profileDNSV2Reply(p.kind)
++	if issuer != isReply || issuer && (!profileDNSV2ID(reply) || p.reply != reply) || !issuer && p.reply != 0 {
++		return false
++	}
++	if p.kind == 57 || p.kind == 58 && p.body[2] == 1 {
++		return u64(p.body, 40) == r.epoch
++	}
++	epoch, has := profileDNSV2Epoch(p.kind, p.body)
++	return !has || epoch == r.epoch
++}
++
++// Caller оплачивает output до encoder. Ни allocation, ни admission authority.
++func profileDNSV5Encode(r profileLaunch, kind uint16, sequence, reply uint64, body, out []byte) (int, error) {
++	if kind != 57 && kind != 58 && !(kind == 47 && len(body) == 24 && body[2] == 9) {
++		return profileDNSV2Encode(r, kind, sequence, reply, body, out)
++	}
++	if !profileDNSV5Body(kind, body) || len(out) < 128+len(body) || !profileDNSV2ID(sequence) || (kind == 58) != (reply != 0) || reply != 0 && !profileDNSV2ID(reply) || (kind == 57 || kind == 58 && body[2] == 1) && u64(body, 40) != r.epoch {
++		return 0, errProfile
++	}
++	n := 128 + len(body)
++	copy(out[128:n], body)
++	clear(out[:128])
++	copy(out, "YNKCAP01")
++	be.PutUint16(out[8:], 1)
++	be.PutUint16(out[10:], kind)
++	be.PutUint32(out[12:], uint32(n))
++	be.PutUint64(out[16:], sequence)
++	be.PutUint64(out[24:], reply)
++	copy(out[32:], r.session[:])
++	copy(out[48:], r.invocation[:])
++	copy(out[64:], r.digest[:])
++	be.PutUint64(out[96:], r.generation)
++	be.PutUint64(out[104:], r.epoch)
++	return n, nil
++}
+diff --git a/common/yonikbroker/profile_dns_datagram_codec_test.go b/common/yonikbroker/profile_dns_datagram_codec_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_dns_datagram_codec_test.go
+@@ -0,0 +1,97 @@
++package nativehooks
++
++import (
++	"bytes"
++	"crypto/sha256"
++	_ "embed"
++	"encoding/hex"
++	"encoding/json"
++	"testing"
++)
++
++//go:embed profile-dns-v2-codec5.json
++var profileDNSV5Golden []byte
++
++func TestProfileDNSCodec5CanonicalParityAndMixedSchemaDenied(t *testing.T) {
++	var corpus struct {
++		Negotiations []struct{ LaunchHex, DescriptorHex, AckHex string }
++		Vectors      []struct {
++			Name                string
++			Kind                uint16
++			BodyHex, FrameHex   string
++			Rights, Credentials int
++		}
++		RejectedBodies []struct {
++			Kind    uint16
++			BodyHex string
++		}
++	}
++	if json.Unmarshal(profileDNSV5Golden, &corpus) != nil {
++		t.Fatal("corpus")
++	}
++	h := sha256.Sum256(profileDNSV5Golden)
++	if hex.EncodeToString(h[:]) != "a9f2e5f5517b72c97e4b7243a4dac9e590e885b50913a44249a393f0270d6116" {
++		t.Fatal("pin")
++	}
++	decode := func(s string) []byte {
++		b, e := hex.DecodeString(s)
++		if e != nil {
++			t.Fatal(e)
++		}
++		return b
++	}
++	for _, v := range corpus.Negotiations {
++		launch, descriptor, ack := decode(v.LaunchHex), decode(v.DescriptorHex), decode(v.AckHex)
++		r, err := decodeProfileLaunch(launch)
++		got, e := profileDNSV5Descriptor(launch)
++		if err != nil || e != nil || !bytes.Equal(got[:], descriptor) || !profileDNSV5Negotiate(r, descriptor, ack, 0, 0) || profileDNSV2Negotiate(r, descriptor, ack, 0, 0) {
++			t.Fatal("negotiation/mixed schema")
++		}
++		old, _ := profileDNSV2Descriptor(launch)
++		if profileDNSV5Negotiate(r, old[:], ack, 0, 0) {
++			t.Fatal("fallback4")
++		}
++	}
++	var request, bound []byte
++	for _, v := range corpus.Vectors {
++		t.Run(v.Name, func(t *testing.T) {
++			b, frame := decode(v.BodyHex), decode(v.FrameHex)
++			r := profileLaunch{generation: 5, epoch: 7}
++			copy(r.session[:], frame[32:48])
++			copy(r.invocation[:], frame[48:64])
++			copy(r.digest[:], frame[64:96])
++			if !profileDNSV5Body(v.Kind, b) || profileDNSV2Body(v.Kind, b) {
++				t.Fatal("body/schema")
++			}
++			out := make([]byte, len(frame))
++			n, err := profileDNSV5Encode(r, v.Kind, u64(frame, 16), u64(frame, 24), b, out)
++			if err != nil || n != len(frame) || !bytes.Equal(out, frame) || !profileDNSV5Envelope(r, frame, v.Kind == 58, 0, 0, u64(frame, 24)) {
++				t.Fatal("frame parity", err)
++			}
++			if profileDNSV5Envelope(r, frame, v.Kind == 58, 1, 0, u64(frame, 24)) {
++				t.Fatal("unexpected rights")
++			}
++			if v.Kind == 57 {
++				request = b
++			}
++			if v.Name == "bound" {
++				bound = b
++			}
++		})
++	}
++	if !profileDNSV5ParentBound(request, bound) {
++		t.Fatal("pending binding")
++	}
++	for _, at := range []int{16, 24, 32, 40, 52, 54} {
++		bad := append([]byte(nil), bound...)
++		bad[at] ^= 1
++		if profileDNSV5ParentBound(request, bad) {
++			t.Fatal("foreign binding", at)
++		}
++	}
++	for _, v := range corpus.RejectedBodies {
++		if profileDNSV5Body(v.Kind, decode(v.BodyHex)) {
++			t.Fatal("negative corpus")
++		}
++	}
++}
+diff --git a/common/yonikbroker/profile_bootstrap_datagram_linux.go b/common/yonikbroker/profile_bootstrap_datagram_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_bootstrap_datagram_linux.go
+@@ -0,0 +1,294 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"crypto/sha256"
++	"time"
++)
++
++// Отдельный nonreuse namespace. ACK58 не является Source/DNS/physical grant.
++type profileDatagramParent struct {
++	runtime                                     *ProfileRuntime
++	parent                                      *profileGrant
++	flow                                        *profileUDPFlow
++	frontier                                    profileDNSFrontier
++	ctx                                         context.Context
++	cancel                                      context.CancelFunc
++	query, id, epoch                            uint64
++	op                                          *profileOperation
++	hash                                        [32]byte
++	deadline, cleanupDeadline                   time.Time
++	closed, unknown, released, replied, claimed bool
++	contexts                                    int
++	cancelSequence, closeSequence               uint64
++	cancelAck, closeAck                         bool
++}
++
++func (c *profileFlowControl) datagramLineageLive(b *profileDatagramParent) bool {
++	if b == nil || b.runtime == nil || !b.runtime.dnsCodec5 || !b.runtime.dns4MetadataReady() || !c.live() || b.epoch != b.runtime.admission.launch.epoch || b.ctx.Err() != nil || !c.clock().Before(b.deadline) || !c.grantLive(b.parent) {
++		return false
++	}
++	g, u := b.parent, b.flow
++	if g.receipt == nil {
++		return false
++	}
++	if b.op != nil && (u64(b.op.body, 16) != g.id || u64(b.op.body, 24) != g.receipt.id || u64(b.op.body, 32) != g.revision || u16(b.op.body, 48) != g.scope || b.op.body[50] != g.branch) {
++		return false
++	}
++	if g.receipt == nil || g.receipt.udp != u || g.receipt.provenance != 3 || g.receipt.original.network != 17 || g.class > 1 || g.parent != nil || u == nil || !u.matched.Load() || u.ctx.Err() != nil || u.receipt != g.receipt || u.original != g.receipt.original || u.tuple != g.receipt.tuple || u.producer == nil || u.producer.association == nil || u.producer.runtime != b.runtime || u.cookie != u.producer.association.cookie || u.packet != u.producer.association.lastPacket || u.permit != u.producer.association.lastPermit {
++		return false
++	}
++	if c.mode == 2 && (g.ownerKind < 1 || g.ownerKind > 2 || !profileDNSV2ID(g.ownerID) || !c.clock().Before(g.ownerDeadline)) {
++		return false
++	}
++	if c.mode == 1 && (g.ownerKind != 0 || g.ownerID != 0) {
++		return false
++	}
++	f, _, err := c.hostsParentFrontier(g)
++	return err == nil && f == b.frontier && c.datagramFrontierReady(g, f)
++}
++func (c *profileFlowControl) datagramParentLive(b *profileDatagramParent) bool {
++	return b != nil && !b.closed && !b.unknown && !b.released && profileDNSV2ID(b.id) && c.datagramLineageLive(b)
++}
++func (c *profileFlowControl) datagramFrontierReady(g *profileGrant, f profileDNSFrontier) bool {
++	if g == nil || g.receipt == nil || int(g.scope) >= len(c.manifest.rows[8]) || f.scope != g.scope || f.path[0].scope != g.scope || f.count != 1 || f.carrier != 17 || f.branch != 0 || g.stream != 65535 || g.receipt.original.network != 17 || int(f.subject) >= len(c.manifest.rows[0]) {
++		return false
++	}
++	s := c.manifest.rows[8][g.scope]
++	return s[2] == 17 && s[4] == 17 && s[20] == 1 && c.manifest.rows[0][f.subject][len(c.manifest.rows[0][f.subject])-8] == 2
++}
++func profileBindDatagramParent(ctx context.Context, g *profileGrant, f profileDNSFrontier, deadline time.Time) (*profileDatagramParent, error) {
++	p := profileRuntime(ctx)
++	if p == nil || !p.dnsCodec5 {
++		return nil, ErrProfileUnsupported
++	}
++	c := p.flow
++	c.mu.Lock()
++	if g == nil || g.receipt == nil || g.receipt.udp == nil || g.refresh != nil || !c.datagramFrontierReady(g, f) || c.datagramParentUsed >= len(c.datagramParents) || c.nextDNSQuery >= ^uint64(0)-1 || c.dnsHistoryUsed+3 > min(int(c.manifest.caps[7]), 256) || c.profilePendingUsed()+3 > min(64, int(c.manifest.caps[3])) || c.buffered+c.manifest.memoryCredit+8192 > uint64(c.manifest.caps[4]) {
++		c.mu.Unlock()
++		return nil, ErrProfileUnsupported
++	}
++	probe := profileDatagramParent{runtime: p, parent: g, flow: g.receipt.udp, frontier: f, ctx: ctx, query: c.nextDNSQuery + 1, epoch: p.admission.launch.epoch, deadline: deadline}
++	for _, until := range []time.Time{g.deadline, g.receipt.udp.deadline, c.sessionDeadline} {
++		if until.Before(probe.deadline) {
++			probe.deadline = until
++		}
++	}
++	if c.mode == 2 && g.ownerDeadline.Before(probe.deadline) {
++		probe.deadline = g.ownerDeadline
++	}
++	probe.cleanupDeadline = probe.deadline.Add(time.Second)
++	if !c.datagramLineageLive(&probe) || !c.dnsReserveHistory(3) {
++		c.mu.Unlock()
++		return nil, errProfile
++	}
++	c.operations += 3
++	c.buffered += 8192
++	child, cancel := context.WithCancel(ctx)
++	b := new(profileDatagramParent)
++	*b = probe
++	b.ctx = child
++	b.cancel = cancel
++	c.nextDNSQuery = b.query
++	g.pending++
++	c.datagramParents[c.datagramParentUsed] = b
++	c.datagramParentUsed++
++	body := make([]byte, 64)
++	be.PutUint16(body, 2)
++	for _, v := range [][2]uint64{{8, b.query}, {16, g.id}, {24, g.receipt.id}, {32, g.revision}, {40, b.epoch}} {
++		be.PutUint64(body[v[0]:], v[1])
++	}
++	be.PutUint16(body[48:], g.scope)
++	body[50] = g.branch
++	be.PutUint32(body[52:], 1000)
++	op := &profileOperation{ctx: child, datagramParent: b, kind: 57, body: body, done: make(chan struct{})}
++	b.op = op
++	b.hash = sha256.Sum256(body)
++	c.mu.Unlock()
++	if err := p.flowRPC(op); err != nil {
++		c.mu.Lock()
++		c.datagramParentClose(b)
++		c.mu.Unlock()
++		return nil, err
++	}
++	return b, nil
++}
++func (c *profileFlowControl) datagramParentClose(b *profileDatagramParent) {
++	if !b.closed {
++		b.closed = true
++		b.cancel()
++	}
++}
++func (c *profileFlowControl) datagramParentDispatch(op *profileOperation) error {
++	b := op.datagramParent
++	if op.submitted || op.completed {
++		return nil
++	}
++	if b.closed || b.unknown || !c.datagramLineageLive(b) || b.hash != sha256.Sum256(op.body) {
++		c.datagramParentClose(b)
++		c.dnsNotify(op, errProfile)
++		return nil
++	}
++	op.sent = c.clock()
++	op.deadline = b.deadline
++	ms := op.deadline.Sub(op.sent) / time.Millisecond
++	if ms < 1 || ms > 1000 {
++		c.datagramParentClose(b)
++		c.dnsNotify(op, errProfile)
++		return nil
++	}
++	be.PutUint32(op.body[52:], uint32(ms))
++	b.hash = sha256.Sum256(op.body)
++	op.submitted = true
++	seq, err := c.write(57, 0, op.body)
++	op.sequence = seq
++	if seq > c.lastSent {
++		c.lastSent = seq
++	}
++	if err != nil || !profileDNSV2ID(seq) {
++		b.unknown = true
++		c.datagramParentClose(b)
++		c.dnsNotify(op, errProfile)
++		return errProfile
++	}
++	return nil
++}
++func (c *profileFlowControl) datagramParentAccept(f profilePacket) (bool, error) {
++	for _, b := range c.datagramParents[:c.datagramParentUsed] {
++		op := b.op
++		if f.kind == 58 && op.submitted && f.reply == op.sequence {
++			bad := func() (bool, error) {
++				b.unknown = true
++				c.datagramParentClose(b)
++				c.dnsNotify(op, errProfile)
++				return true, errProfile
++			}
++			if b.replied || b.cancelAck || f.object != 0 || !profileDNSV5Body(58, f.body) || b.hash != sha256.Sum256(op.body) {
++				return bad()
++			}
++			b.replied = true
++			if f.body[2] != 1 {
++				if f.body[2] == 3 {
++					b.unknown = true
++				}
++				c.datagramParentClose(b)
++				c.dnsNotify(op, errProfile)
++				return true, nil
++			}
++			if !profileDNSV5ParentBound(op.body, f.body) {
++				return bad()
++			}
++			id := u64(f.body, 8)
++			for _, other := range c.datagramParents[:c.datagramParentUsed] {
++				if other != b && other.id == id {
++					return bad()
++				}
++			}
++			b.id = id
++			until := op.sent.Add(time.Duration(u32(f.body, 48)) * time.Millisecond)
++			if until.Before(b.deadline) {
++				b.deadline = until
++			}
++			if b.closed || !c.datagramLineageLive(b) {
++				c.datagramParentClose(b)
++				c.dnsNotify(op, errProfile)
++				return true, nil
++			}
++			c.dnsNotify(op, nil)
++			return true, nil
++		}
++		if f.kind == 48 && f.reply != 0 && (f.reply == b.cancelSequence || f.reply == b.closeSequence) {
++			if b.unknown || f.object != 0 || !profileDNSV2Body(48, f.body) || !c.clock().Before(b.cleanupDeadline) {
++				b.unknown = true
++				return true, errProfile
++			}
++			if f.body[2] != 1 {
++				b.unknown = true
++				return true, nil
++			}
++			id := b.id
++			ack := &b.closeAck
++			if f.reply == b.cancelSequence {
++				id = op.sequence
++				ack = &b.cancelAck
++			}
++			if *ack || u64(f.body, 8) != id {
++				b.unknown = true
++				return true, errProfile
++			}
++			*ack = true
++			return true, nil
++		}
++	}
++	return false, nil
++}
++func (c *profileFlowControl) datagramParentTick() error {
++	for _, b := range c.datagramParents[:c.datagramParentUsed] {
++		if b.released || b.unknown {
++			continue
++		}
++		if !c.datagramLineageLive(b) {
++			c.datagramParentClose(b)
++		}
++		if !b.closed {
++			continue
++		}
++		if !c.clock().Before(b.cleanupDeadline) {
++			b.unknown = true
++			continue
++		}
++		op := b.op
++		if !b.replied && op.submitted {
++			c.dnsNotify(op, errProfile)
++			if b.cancelSequence == 0 {
++				seq, err := c.dnsCancel(1, op.sequence)
++				b.cancelSequence = seq
++				if err != nil {
++					b.unknown = true
++					return err
++				}
++			}
++			if !b.cancelAck || c.clock().Before(op.deadline) {
++				continue
++			}
++			b.replied = true
++		}
++		if b.contexts != 0 {
++			continue
++		}
++		if b.id != 0 && !b.closeAck {
++			if b.closeSequence == 0 {
++				seq, err := c.dnsCancel(9, b.id)
++				b.closeSequence = seq
++				if err != nil {
++					b.unknown = true
++					return err
++				}
++			}
++			continue
++		}
++		c.dnsNotify(op, errProfile)
++		b.released = true
++		b.parent.pending--
++		c.operations -= 3
++	}
++	return nil
++}
++func (c *profileFlowControl) datagramOwnsGrant(g *profileGrant) bool {
++	for _, b := range c.datagramParents[:c.datagramParentUsed] {
++		if !b.released && b.parent == g {
++			return true
++		}
++	}
++	return false
++}
++func (c *profileFlowControl) datagramOwnsReceipt(r *profileReceipt) bool {
++	for _, b := range c.datagramParents[:c.datagramParentUsed] {
++		if !b.released && b.parent.receipt == r {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/common/yonikbroker/profile_bootstrap_datagram_socket_linux.go b/common/yonikbroker/profile_bootstrap_datagram_socket_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_bootstrap_datagram_socket_linux.go
+@@ -0,0 +1,444 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"golang.org/x/sys/unix"
++	"net"
++	"net/netip"
++	"strconv"
++	"sync"
++	"time"
++)
++
++const profileDatagramSocketPending = 4
++const profileDatagramSocketCredit = 131072 + 8192
++
++// Не TCP permission и не FlowGrant. Один Consumed source → одна effectful send.
++type profileBootstrapDatagramPermission struct {
++	owner                        *profileHostsObservation
++	producerParent, waiterParent *profileDatagramParent
++	id                           uint64
++	deadline                     time.Time
++	target                       profileDestinationValue
++	member                       uint16
++	attempted                    bool
++	conn                         *profileBootstrapDatagramConn
++	creating, credited           bool
++}
++type profileBootstrapDatagramConn struct {
++	permission                                           *profileBootstrapDatagramPermission
++	socket                                               *profileDNSOwnedSocket
++	ctx                                                  context.Context
++	mu                                                   sync.Mutex
++	tasks                                                sync.WaitGroup
++	sent, closing                                        bool
++	once                                                 sync.Once
++	request                                              sync.Once
++	done                                                 chan struct{}
++	result                                               error
++	readActive, writeActive, managedStarted, sendSuccess bool
++	sendDone                                             chan struct{}
++	ready                                                sync.Once
++	managed                                              sync.WaitGroup
++}
++
++func (s *profileBootstrapDatagramConn) requestClose() {
++	s.request.Do(func() { go func() { _ = s.Close() }() })
++}
++func (b *profileBootstrapState) permissionID() uint64 {
++	if b.datagram != nil {
++		return b.datagram.id
++	}
++	if b.permission != nil {
++		return b.permission.id
++	}
++	return 0
++}
++func (c *profileFlowControl) datagramPermissionLive(d *profileBootstrapDatagramPermission) bool {
++	if d == nil || d.owner == nil || d.owner.datagram != d || d.owner.bootstrap == nil || d.owner.bootstrap.datagram != d || !profileDNSV2ID(d.id) || !c.clock().Before(d.deadline) || !c.bootstrapBaseLive(d.owner) || !c.datagramParentLive(d.producerParent) || !c.datagramParentLive(d.waiterParent) || d.producerParent == d.waiterParent {
++		return false
++	}
++	target, member, ok := profileBootstrapMember(d.owner)
++	return ok && target == d.target && member == d.member && target.network == 17 && d.waiterParent.query == d.owner.bootstrap.context.source.query && d.producerParent.query == d.owner.context.source.query
++}
++func (s *profileBootstrapDatagramConn) gate() error {
++	d := s.permission
++	c := d.owner.runtime.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if s.ctx.Err() != nil || !c.datagramPermissionLive(d) || d.owner.root.receipt.udp != d.producerParent.flow {
++		return errProfile
++	}
++	return nil
++}
++func (s *profileBootstrapDatagramConn) begin(write bool) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closing {
++		return errProfile
++	}
++	if write && s.writeActive || !write && s.readActive {
++		return errProfileFlowBusy
++	}
++	if err := s.gate(); err != nil {
++		return err
++	}
++	s.tasks.Add(1)
++	if write {
++		s.writeActive = true
++	} else {
++		s.readActive = true
++	}
++	return nil
++}
++func (s *profileBootstrapDatagramConn) end(write bool) {
++	s.mu.Lock()
++	if write {
++		s.writeActive = false
++	} else {
++		s.readActive = false
++	}
++	s.mu.Unlock()
++	s.tasks.Done()
++}
++func (s *profileBootstrapDatagramConn) signalSend() { s.ready.Do(func() { close(s.sendDone) }) }
++func (s *profileBootstrapDatagramConn) Read(b []byte) (int, error) {
++	if err := s.begin(false); err != nil {
++		return 0, err
++	}
++	defer s.end(false)
++	select {
++	case <-s.sendDone:
++	case <-s.ctx.Done():
++		return 0, s.ctx.Err()
++	}
++	s.mu.Lock()
++	sent := s.sendSuccess && !s.closing
++	s.mu.Unlock()
++	if !sent {
++		return 0, errProfile
++	}
++	n, e := s.socket.Read(b)
++	if err := s.gate(); err != nil {
++		return 0, errors.Join(err, e)
++	}
++	return n, e
++}
++func (s *profileBootstrapDatagramConn) Write(b []byte) (int, error) {
++	if len(b) == 0 || len(b) > 65507 {
++		return 0, ErrProfileUnsupported
++	}
++	if err := s.begin(true); err != nil {
++		return 0, err
++	}
++	defer s.end(true)
++	s.mu.Lock()
++	if s.sent {
++		s.mu.Unlock()
++		return 0, ErrProfileUnsupported
++	}
++	s.sent = true
++	s.mu.Unlock()
++	defer s.signalSend()
++	// Даже uncertain/partial effect расходует единственную попытку, retry нет.
++	n, e := s.socket.Write(b)
++	if n != len(b) || e != nil {
++		s.permission.owner.cancel()
++		return n, errors.Join(errProfile, e)
++	}
++	if err := s.gate(); err != nil {
++		return n, err
++	}
++	s.mu.Lock()
++	if s.closing {
++		s.mu.Unlock()
++		return n, errProfile
++	}
++	s.sendSuccess = true
++	s.mu.Unlock()
++	return n, nil
++}
++func (s *profileBootstrapDatagramConn) Close() error {
++	s.once.Do(func() {
++		s.mu.Lock()
++		s.closing = true
++		s.mu.Unlock()
++		s.signalSend()
++		// Downstream callback может ждать USER link, а не raw socket. Отзываем
++		// только этот packet до join, иначе Close ожидал бы собственный cancel.
++		s.permission.producerParent.flow.cancel()
++		s.permission.owner.cancel()
++		s.result = s.socket.Close()
++		s.tasks.Wait()
++		s.managed.Wait()
++		close(s.done)
++	})
++	return s.result
++}
++
++// task.Run legacy возвращает первый error до join остальных tasks. Owned SS
++// использует отдельную consuming группу: cancel только этого USER packet.
++func ProfileRunBootstrapDatagramTasks(ctx context.Context, conn net.Conn, tasks ...func() error) error {
++	s, ok := conn.(*profileBootstrapDatagramConn)
++	if !ok || len(tasks) != 2 {
++		return ErrProfileUnsupported
++	}
++	if ctx == nil || profileReceiptFrom(ctx) != s.permission.owner.root.receipt || tasks[0] == nil || tasks[1] == nil {
++		return errProfile
++	}
++	s.mu.Lock()
++	if s.closing || s.managedStarted || s.gate() != nil {
++		s.mu.Unlock()
++		return errProfile
++	}
++	s.managedStarted = true
++	s.managed.Add(2)
++	s.mu.Unlock()
++	done := make(chan error, 2)
++	for _, task := range tasks {
++		go func(f func() error) { defer s.managed.Done(); done <- f() }(task)
++	}
++	stop := func() { s.permission.producerParent.flow.cancel(); s.permission.owner.cancel(); s.requestClose() }
++	wait := ctx.Done()
++	var result error
++	for i := 0; i < 2; {
++		select {
++		case err := <-done:
++			i++
++			result = errors.Join(result, err)
++			if err != nil {
++				stop()
++			}
++		case <-wait:
++			result = errors.Join(result, ctx.Err())
++			wait = nil
++			stop()
++		}
++	}
++	return result
++}
++func ProfileBindBootstrapDatagramContext(ctx context.Context, conn net.Conn) error {
++	s, ok := conn.(*profileBootstrapDatagramConn)
++	if !ok {
++		return nil
++	}
++	if ctx == nil || profileReceiptFrom(ctx) != s.permission.owner.root.receipt {
++		return errProfile
++	}
++	context.AfterFunc(ctx, s.requestClose)
++	if ctx.Err() != nil {
++		s.requestClose()
++		return ctx.Err()
++	}
++	return nil
++}
++
++// Только размер retained Consumed payload после permission, не caller bytes.
++func ProfileBootstrapDatagramPayloadSize(ctx context.Context, target xnet.Destination) (int, bool, error) {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return 0, false, nil
++	}
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if g == nil || g.receipt == nil || g.receipt.udp == nil {
++		return 0, false, nil
++	}
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		if h.root == g && h.datagram != nil {
++			v, err := profileValue(target)
++			if err != nil || v != g.effective || !c.datagramPermissionLive(h.datagram) {
++				return 0, true, errProfile
++			}
++			return len(h.datagram.producerParent.flow.payload), true, nil
++		}
++	}
++	return 0, false, nil
++}
++func (s *profileBootstrapDatagramConn) LocalAddr() net.Addr           { return s.socket.LocalAddr() }
++func (s *profileBootstrapDatagramConn) RemoteAddr() net.Addr          { return s.socket.RemoteAddr() }
++func (s *profileBootstrapDatagramConn) SetDeadline(t time.Time) error { return s.socket.SetDeadline(t) }
++func (s *profileBootstrapDatagramConn) SetReadDeadline(t time.Time) error {
++	return s.socket.SetReadDeadline(t)
++}
++func (s *profileBootstrapDatagramConn) SetWriteDeadline(t time.Time) error {
++	return s.socket.SetWriteDeadline(t)
++}
++
++// Actual SS caller не получает factory/FD и не меняет original destination.
++func ProfileDialBootstrapDatagram(ctx context.Context, original xnet.Destination) (net.Conn, bool, error) {
++	p := profileRuntime(ctx)
++	if p == nil {
++		return nil, false, nil
++	}
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if g == nil || g.receipt == nil || g.receipt.udp == nil {
++		return nil, false, nil
++	}
++	c := p.flow
++	c.mu.Lock()
++	var d *profileBootstrapDatagramPermission
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		if h.root == g && h.datagram != nil {
++			d = h.datagram
++			break
++		}
++	}
++	if d == nil {
++		c.mu.Unlock()
++		if original.Address != nil && original.Address.Family().IsIP() {
++			return nil, false, nil
++		}
++		return nil, true, ErrProfileUnsupported
++	}
++	v, e := profileValue(original)
++	if e != nil || v != d.owner.frontier.target || profileReceiptFrom(ctx) != g.receipt || !c.datagramPermissionLive(d) || d.attempted || c.profileFDUsed()+1 > 64 || c.profilePendingUsed()+profileDatagramSocketPending > min(64, int(c.manifest.caps[3])) || c.buffered+c.manifest.memoryCredit+profileDatagramSocketCredit > uint64(c.manifest.caps[4]) {
++		c.mu.Unlock()
++		return nil, true, ErrProfileUnsupported
++	}
++	d.attempted = true
++	d.creating = true
++	d.credited = true
++	c.physicalFDs++
++	c.operations += profileDatagramSocketPending
++	c.buffered += profileDatagramSocketCredit
++	c.mu.Unlock()
++	create := p.datagramIO
++	if create == nil {
++		create = profileCreateBootstrapDatagramSocket
++	}
++	socket, err := create(d)
++	c.mu.Lock()
++	d.creating = false
++	live := c.datagramPermissionLive(d)
++	if socket != nil {
++		d.conn = &profileBootstrapDatagramConn{permission: d, socket: socket, ctx: d.owner.ctx, done: make(chan struct{}), sendDone: make(chan struct{})}
++	}
++	owned := d.conn
++	if socket == nil {
++		if err == nil {
++			err = errProfile
++		}
++		d.owner.unknown = true
++	}
++	c.mu.Unlock()
++	if owned == nil {
++		return nil, true, err
++	}
++	context.AfterFunc(d.owner.ctx, func() { _ = owned.Close() })
++	if err != nil || !live {
++		ce := owned.Close()
++		return nil, true, errors.Join(errProfile, err, ce)
++	}
++	return owned, true, nil
++}
++
++func profileCreateBootstrapDatagramSocket(d *profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++	h := d.owner
++	p := h.runtime
++	c := p.flow
++	c.mu.Lock()
++	live := c.datagramPermissionLive(d)
++	c.mu.Unlock()
++	if !live {
++		return nil, errProfile
++	}
++	u := d.producerParent.flow
++	r, ok := u.producer.association.receiver.(*profileOSUDPReceiver)
++	if !ok {
++		return nil, ErrProfileUnsupported
++	}
++	r.mu.Lock()
++	source := r.fd
++	closed := r.closed
++	r.mu.Unlock()
++	if closed || source == nil {
++		return nil, ErrProfileUnsupported
++	}
++	ip, err := netip.ParseAddr(d.target.address)
++	if err != nil || ip.IsLoopback() || d.target.network != 17 {
++		return nil, ErrProfileUnsupported
++	}
++	domain := unix.AF_INET
++	var peer unix.Sockaddr
++	if ip.Is4() {
++		peer = &unix.SockaddrInet4{Port: int(d.target.port), Addr: ip.As4()}
++	} else {
++		domain = unix.AF_INET6
++		peer = &unix.SockaddrInet6{Port: int(d.target.port), Addr: ip.As16()}
++	}
++	n, err := unix.Socket(domain, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, unix.IPPROTO_UDP)
++	if n < 0 {
++		return nil, err
++	}
++	fd := profileDNSOwnFD(n)
++	life, cancel := context.WithDeadline(h.ctx, d.deadline)
++	s := &profileDNSOwnedSocket{ctx: life, cancel: cancel, fd: fd, destination: d.target, remote: profileDNSOwnedAddress{"udp", net.JoinHostPort(d.target.address, strconv.Itoa(int(d.target.port)))}, closeFD: fd.Close}
++	s.gateIO = func() error {
++		c.mu.Lock()
++		live := c.datagramPermissionLive(d)
++		c.mu.Unlock()
++		if !live {
++			return errProfile
++		}
++		return profileKernelSocketNamespace(source, fd)
++	}
++	s.waitIO = func(ctx context.Context, w bool, until time.Time) error {
++		return profileDNSWaitOwned(fd, ctx, w, until)
++	}
++	s.readIO = func(b []byte) (count int, e error) {
++		c.mu.Lock()
++		defer c.mu.Unlock()
++		if !c.datagramPermissionLive(d) {
++			return 0, errProfile
++		}
++		if e = profileKernelSocketNamespace(source, fd); e != nil {
++			return
++		}
++		e = fd.withFD(func(n int) error {
++			var x error
++			count, _, x = unix.Recvfrom(n, b, unix.MSG_DONTWAIT|unix.MSG_TRUNC)
++			return x
++		})
++		return
++	}
++	s.writeIO = func(b []byte) (count int, e error) {
++		c.mu.Lock()
++		defer c.mu.Unlock()
++		if !c.datagramPermissionLive(d) {
++			return 0, errProfile
++		}
++		if e = profileKernelSocketNamespace(source, fd); e != nil {
++			return
++		}
++		e = fd.withFD(func(n int) error {
++			var x error
++			count, x = unix.SendmsgN(n, b, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
++			return x
++		})
++		return
++	}
++	if err != nil {
++		return s, err
++	}
++	if err = s.gateIO(); err != nil {
++		return s, err
++	}
++	c.mu.Lock()
++	if !c.datagramPermissionLive(d) {
++		err = errProfile
++	} else if err = profileKernelSocketNamespace(source, fd); err == nil {
++		err = fd.withFD(func(n int) error { return unix.Connect(n, peer) })
++	}
++	c.mu.Unlock()
++	if err == nil {
++		err = s.gateIO()
++	}
++	return s, err
++}
+diff --git a/common/yonikbroker/profile_bootstrap_datagram_linux_test.go b/common/yonikbroker/profile_bootstrap_datagram_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_bootstrap_datagram_linux_test.go
+@@ -0,0 +1,654 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"context"
++	"crypto/sha256"
++	"errors"
++	xnet "github.com/xtls/xray-core/common/net"
++	"io"
++	"runtime"
++	"sync"
++	"testing"
++	"time"
++)
++
++// Actual Consume/Match + private USER grant; только kernel/issuer IO — fakes.
++func TestProfileDatagramHostsConstructorCancelKeepsHandoffCustody(t *testing.T) {
++	f, ctx := datagramHostsFixture(t)
++	done := make(chan error, 1)
++	go func() { done <- ProfilePrepareChain(ctx, nil) }()
++	op := <-f.p.flowQueue
++	if op.kind != 57 || f.c.dispatch(op) != nil {
++		t.Fatal("57")
++	}
++	f.c.mu.Lock()
++	h := f.c.hostsObservations[0]
++	cost := h.pendingCredit
++	before := f.c.operations
++	h.cancel()
++	if err := f.c.hostsObservationTick(); err != nil {
++		t.Fatal(err)
++	}
++	if h.released || f.c.operations < before || !h.datagramConstructing {
++		t.Fatal("constructor custody released before handoff", cost)
++	}
++	f.c.mu.Unlock()
++	if f.c.accept(datagramBound(op, 10)) != nil {
++		t.Fatal("late bound")
++	}
++	if err := <-done; err == nil {
++		t.Fatal("cancelled caller succeeded")
++	}
++	f.c.mu.Lock()
++	if h.datagramConstructing {
++		t.Fatal("constructor did not settle")
++	}
++	f.c.mu.Unlock()
++	if err := f.c.tick(); err != nil {
++		t.Fatal(err)
++	}
++	if !h.released {
++		t.Fatal("settled empty constructor retained credits")
++	}
++}
++
++func datagramHostsFixture(t *testing.T, modes ...byte) (*flowFixture, context.Context) {
++	t.Helper()
++	var f *flowFixture
++	var a *profileUDPAssociation
++	var receiver *udpReceiveFake
++	if len(modes) != 0 && modes[0] == 1 {
++		// Local PF002 runtime gate не расширяем. Для consumer controls только
++		// authenticated bootstrap/FD leaf preseed, затем actual Consume/Match.
++		f = newFlowFixture(t, 1)
++		f.c.buffered += profileUDPBudgetCredit
++		f.c.udpBudget = &profileUDPBudget{fdSlots: 1, launch: f.p.admission.launch}
++		raw := []byte{0, 0, 0, 1, 198, 51, 100, 7, 0, 53, 0xaa, 0xbb}
++		tuple := fakeFlowTuple(17)
++		be.PutUint16(tuple[6:], 49152)
++		receiver = &udpReceiveFake{raw: raw, got: profileUDPReceiveResult{n: len(raw), tuple: tuple, cookie: 3, queueBytes: 65536, bound: profileDestinationValue{family: 4, network: 17, port: 49152, address: "127.0.0.1"}}}
++		var e error
++		a, e = profileNewUDPAssociation(f.c, f.p.admission.launch, f.p.ctx, udpDelivery(t, f.p.admission.launch, 1, 3, 2), func() (profileUDPReceiver, error) { return receiver, nil })
++		if e != nil {
++			t.Fatal(e)
++		}
++		t.Cleanup(func() { a.CloseAndJoin() })
++	} else {
++		f, a, receiver = udpStateFixture(t)
++	}
++	if a.BeginPeek(f.now.Add(time.Second)) != nil || a.Permit(udpPermit(t, a, receiver, 1, 1)) != nil || a.ConsumePermit() != nil {
++		t.Fatal("Consume")
++	}
++	accepted := &profileAccepted{runtime: f.p, ctx: f.p.ctx, index: 0, provenance: 3, tuple: receiver.got.tuple}
++	r, open, err := f.c.open(f.p.ctx, 0, 3, receiver.got.tuple, a.original, accepted)
++	if err != nil || f.c.dispatch(open) != nil {
++		t.Fatal("OPEN", err)
++	}
++	if _, err = a.Consumed(open.sequence); err != nil {
++		t.Fatal(err)
++	}
++	if a.Match(udpMatch(t, a, 1)) != nil {
++		t.Fatal("Match")
++	}
++	p := &profileUDPProducer{runtime: f.p, association: a}
++	u := &profileUDPFlow{producer: p, receipt: r, ctx: f.p.ctx, cancel: func() {}, tuple: r.tuple, original: r.original, payload: append([]byte(nil), a.buffers[0][a.header:a.length]...), credit: true, cookie: a.cookie, deadline: f.now.Add(time.Second), packet: 1, permit: 1}
++	p.current = u
++	r.udp = u
++	u.matched.Store(true)
++	if f.c.accept(f.ingressReply(open)) != nil {
++		t.Fatal("USER OPEN")
++	}
++	f.c.manifest.mapping = 4
++	physical := profileDestinationValue{family: 3, network: 17, address: "Physical.INVALID", port: 8443}
++	f.c.manifest.rows[1] = [][]byte{physical.encode()}
++	scope := f.c.manifest.rows[8][1]
++	scope[20] = 1
++	be.PutUint16(scope[8:], 0)
++	be.PutUint16(scope[12:], 65535)
++	subject := f.c.manifest.rows[0][0]
++	subject[len(subject)-8] = 2
++	b, _ := syntheticProfileSnapshot()
++	b = b[:len(b)-2]
++	b = append(b, 0, 1)
++	name := []byte("physical.invalid.")
++	field := make([]byte, 2)
++	be.PutUint16(field, uint16(len(name)))
++	b = append(b, field...)
++	b = append(b, name...)
++	b = append(b, 0, 1, 4, 203, 0, 113, 7)
++	be.PutUint32(b[12:], uint32(len(b)))
++	asset := snapshotAsset(b)
++	f.p.snapshot, err = decodeProfileSnapshot(b, asset)
++	if err != nil {
++		t.Fatal(err)
++	}
++	row := make([]byte, 76)
++	copy(row, asset.source[:])
++	digest := sha256.Sum256(b)
++	copy(row[32:], digest[:])
++	be.PutUint32(row[64:], uint32(len(b)))
++	be.PutUint16(row[68:], 1)
++	be.PutUint32(row[72:], 4)
++	f.c.manifest.rows[10] = [][]byte{row}
++	f.p.admission.capsule = f.c.manifest
++	dnsMetadata4Fixture(t, f)
++	g, authorize, err := f.c.authorize(f.p.ctx, r, 1, 0, a.original, nil)
++	if err != nil || f.c.dispatch(authorize) != nil || f.c.accept(f.grantReply(authorize, 2)) != nil {
++		t.Fatal("USER grant", err)
++	}
++	ctx := context.WithValue(context.WithValue(context.WithValue(f.p.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r), profileGrantKey{}, g)
++	return f, ProfileBootstrapRawContext(ctx, true)
++}
++
++func datagramBound(op *profileOperation, id uint64) profilePacket {
++	b := make([]byte, 64)
++	be.PutUint16(b, 2)
++	b[2] = 1
++	for _, v := range [][2]uint64{{8, id}, {16, u64(op.body, 16)}, {24, u64(op.body, 24)}, {32, u64(op.body, 8)}, {40, u64(op.body, 40)}} {
++		be.PutUint64(b[v[0]:], v[1])
++	}
++	be.PutUint32(b[48:], u32(op.body, 52))
++	be.PutUint16(b[52:], u16(op.body, 48))
++	b[54] = op.body[50]
++	return profilePacket{kind: 58, reply: op.sequence, body: b}
++}
++func datagramHostsPrepared(t *testing.T, modes ...byte) (*flowFixture, context.Context, *profileHostsObservation) {
++	t.Helper()
++	f, ctx := datagramHostsFixture(t, modes...)
++	done := make(chan error, 1)
++	go func() { done <- ProfilePrepareChain(ctx, nil) }()
++	kinds := []uint16{57, 55, 35, 40, 57, 55, 35, 53, 42}
++	for step, kind := range kinds {
++		var op *profileOperation
++		select {
++		case op = <-f.p.flowQueue:
++		case err := <-done:
++			t.Fatal("early caller", step, err)
++		case <-time.After(time.Second):
++			t.Fatal("missing frame", kind)
++		}
++		if op.kind != kind || f.c.dispatch(op) != nil {
++			t.Fatal("dispatch", step, op.kind)
++		}
++		var reply profilePacket
++		switch step {
++		case 0:
++			reply = datagramBound(op, 10)
++		case 1:
++			reply = dnsBundleReply(op, 100, 1)
++		case 2:
++			reply = hostsReserveReply(op)
++		case 3:
++			reply = hostsPublishReply(op, 903)
++		case 4:
++			reply = datagramBound(op, 20)
++		case 5:
++			reply = dnsBundleReply(op, 200, 1)
++		case 6:
++			reply = hostsReserveReply(op)
++			be.PutUint64(reply.body[8:], 904)
++			be.PutUint64(reply.body[32:], 905)
++		case 7:
++			b := make([]byte, 64)
++			be.PutUint16(b, 2)
++			b[2] = 1
++			for _, v := range [][2]uint64{{8, 906}, {16, 903}, {24, 904}, {32, u64(op.body, 32)}, {40, f.p.admission.launch.epoch}, {48, u64(op.body, 56)}} {
++				be.PutUint64(b[v[0]:], v[1])
++			}
++			be.PutUint16(b[56:], 1)
++			b[58], b[59] = 2, 3
++			reply = profilePacket{kind: 54, reply: op.sequence, body: b}
++		case 8:
++			if op.body[14] != 2 || op.body[15] != 3 || u64(op.body, 4) != 906 || op.body[25] != 17 {
++				t.Fatal("Numeric UDP/member namespace")
++			}
++			reply = hostsBootstrapGrant(op)
++		}
++		if f.c.accept(reply) != nil {
++			t.Fatal("reply", step)
++		}
++	}
++	if err := <-done; err != nil {
++		t.Fatal("constructor", err)
++	}
++	h := f.c.hostsObservations[0]
++	if h.bootstrap.permission != nil || h.datagram == nil || h.datagram.id != 1000 || h.context.source.query == h.bootstrap.context.source.query || h.datagram.producerParent == h.datagram.waiterParent {
++		t.Fatal("TCP alias/borrowed parent")
++	}
++	return f, ctx, h
++}
++func TestProfileDatagramHostsLocalHasNoSystemOwnerAuthority(t *testing.T) {
++	f, ctx, h := datagramHostsPrepared(t, 1)
++	if h.root.ownerKind != 0 || h.root.ownerID != 0 || f.p.admission.launch.mode != 1 {
++		t.Fatal("Local borrowed System owner proof")
++	}
++	f.p.datagramIO = func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++		return datagramFakeSocket(h, func() error { return nil }), nil
++	}
++	conn, handled, err := ProfileDialBootstrapDatagram(ctx, profileNumericDestination(h.frontier.target))
++	if !handled || err != nil {
++		t.Fatal(err)
++	}
++	if _, err = conn.Write([]byte("ciphertext")); err != nil {
++		t.Fatal(err)
++	}
++	if conn.Close() != nil {
++		t.Fatal("Close")
++	}
++}
++func TestProfileDatagramHostsActualNumericAndOneShotSend(t *testing.T) {
++	f, ctx, h := datagramHostsPrepared(t)
++	creates, writes, closes := 0, 0, 0
++	f.p.datagramIO = func(d *profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++		creates++
++		if !f.c.datagramPermissionLive(d) || d.target.address != "203.0.113.7" || d.target.network != 17 || d.target.port != 8443 {
++			t.Fatal("physical target")
++		}
++		life, cancel := context.WithCancel(h.ctx)
++		return &profileDNSOwnedSocket{ctx: life, cancel: cancel, destination: d.target, gateIO: func() error {
++			f.c.mu.Lock()
++			defer f.c.mu.Unlock()
++			if !f.c.datagramPermissionLive(d) {
++				return errProfile
++			}
++			return nil
++		}, writeIO: func(b []byte) (int, error) { writes++; return len(b), nil }, readIO: func([]byte) (int, error) { return 0, io.EOF }, closeFD: func() error { closes++; return nil }}, nil
++	}
++	original := profileNumericDestination(h.frontier.target)
++	conn, handled, err := ProfileDialBootstrapDatagram(ctx, original)
++	if !handled || err != nil || creates != 1 {
++		t.Fatal("SS dial", err)
++	}
++	if n, err := conn.Write([]byte("SS ciphertext")); err != nil || n != 13 || writes != 1 {
++		t.Fatal("send", n, err)
++	}
++	if _, err = conn.Write([]byte("second")); err == nil || writes != 1 {
++		t.Fatal("second packet sent")
++	}
++	if _, _, err = ProfileDialBootstrapDatagram(ctx, original); err == nil || creates != 1 {
++		t.Fatal("second physical open")
++	}
++	if conn.Close() != nil || conn.Close() != nil || closes != 1 {
++		t.Fatal("consuming Close")
++	}
++	if h.frontier.target.address != "Physical.INVALID" || h.root.effective == h.frontier.target || h.root.receipt.original.network != 17 {
++		t.Fatal("original USER destination overwritten")
++	}
++}
++func TestProfileDatagramHostsDeniedBeforePermission(t *testing.T) {
++	f, ctx := datagramHostsFixture(t)
++	creates := 0
++	f.p.datagramIO = func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++		creates++
++		return nil, errors.New("unexpected")
++	}
++	if _, handled, err := ProfileDialBootstrapDatagram(ctx, xnet.UDPDestination(xnet.ParseAddress("Physical.INVALID"), 8443)); !handled || err == nil || creates != 0 {
++		t.Fatal("dial before57/58/55/Numeric")
++	}
++}
++func datagramFakeSocket(h *profileHostsObservation, closeFD func() error) *profileDNSOwnedSocket {
++	life, cancel := context.WithCancel(h.ctx)
++	return &profileDNSOwnedSocket{ctx: life, cancel: cancel, destination: h.datagram.target, closeFD: closeFD, writeIO: func(b []byte) (int, error) { return len(b), nil }, readIO: func([]byte) (int, error) { return 0, io.EOF }}
++}
++func TestProfileDatagramHostsBindingMemberAndCancelFences(t *testing.T) {
++	for _, fault := range []string{"cookie", "tuple", "packet", "permit", "unmatched", "member", "target", "port", "carrier", "expired", "cancel", "namespace"} {
++		t.Run(fault, func(t *testing.T) {
++			f, ctx, h := datagramHostsPrepared(t)
++			d := h.datagram
++			calls, closes := 0, 0
++			f.p.datagramIO = func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++				calls++
++				return datagramFakeSocket(h, func() error { closes++; return nil }), errProfileUDPNamespace
++			}
++			switch fault {
++			case "cookie":
++				d.producerParent.flow.cookie++
++			case "tuple":
++				d.producerParent.flow.tuple[4] ^= 1
++			case "packet":
++				d.producerParent.flow.packet++
++			case "permit":
++				d.producerParent.flow.permit++
++			case "unmatched":
++				d.producerParent.flow.matched.Store(false)
++			case "member":
++				d.member++
++			case "target":
++				d.target.address = "203.0.113.8"
++			case "port":
++				d.target.port++
++			case "carrier":
++				d.target.network = 6
++			case "expired":
++				f.now = d.deadline
++			case "cancel":
++				h.cancel()
++			}
++			conn, handled, err := ProfileDialBootstrapDatagram(ctx, profileNumericDestination(h.frontier.target))
++			if conn != nil || !handled || err == nil {
++				t.Fatal("invalid physical permission accepted")
++			}
++			if fault == "namespace" {
++				if calls != 1 || closes != 1 {
++					t.Fatal("namespace cleanup")
++				}
++			} else if calls != 0 {
++				t.Fatal("factory before exact permission")
++			}
++		})
++	}
++}
++func TestProfileDatagramHostsCloseJoinBeforePermissionRetirement(t *testing.T) {
++	for _, failure := range []bool{false, true} {
++		t.Run(fmtBool(failure), func(t *testing.T) {
++			f, ctx, h := datagramHostsPrepared(t)
++			entered, resume := make(chan struct{}), make(chan struct{})
++			var once sync.Once
++			closes := 0
++			f.p.datagramIO = func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++				s := datagramFakeSocket(h, func() error {
++					closes++
++					if failure {
++						return errors.New("uncertain close")
++					}
++					return nil
++				})
++				s.writeIO = func(b []byte) (int, error) { once.Do(func() { close(entered) }); <-resume; return len(b), nil }
++				return s, nil
++			}
++			conn, _, err := ProfileDialBootstrapDatagram(ctx, profileNumericDestination(h.frontier.target))
++			if err != nil {
++				t.Fatal(err)
++			}
++			writeDone := make(chan error, 1)
++			go func() { _, err := conn.Write([]byte("ciphertext")); writeDone <- err }()
++			<-entered
++			h.cancel()
++			if f.c.tick() != nil || h.bootstrap.grantClose != 0 || !h.datagram.credited {
++				t.Fatal("retired before consuming send join")
++			}
++			close(resume)
++			<-writeDone
++			closeErr := conn.Close()
++			if (closeErr != nil) != failure || closes != 1 {
++				t.Fatal("close result")
++			}
++			if f.c.tick() != nil {
++				t.Fatal("tick")
++			}
++			if failure {
++				if !h.unknown || h.bootstrap.grantClose != 0 || !h.datagram.credited || !f.c.datagramOwnsGrant(h.root) {
++					t.Fatal("Unknown lost custody")
++				}
++				_ = conn.Close()
++				if closes != 1 {
++					t.Fatal("retry uncertain Close")
++				}
++			} else if h.bootstrap.grantClose == 0 || h.datagram.credited {
++				t.Fatal("joined physical owner not retired")
++			}
++		})
++	}
++}
++func fmtBool(b bool) string {
++	if b {
++		return "error"
++	}
++	return "success"
++}
++func TestProfileDatagramHostsKnownRetirementAndParentIsolation(t *testing.T) {
++	f, ctx, h := datagramHostsPrepared(t)
++	f.p.datagramIO = func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++		return datagramFakeSocket(h, func() error { return nil }), nil
++	}
++	conn, _, err := ProfileDialBootstrapDatagram(ctx, profileNumericDestination(h.frontier.target))
++	if err != nil || conn.Close() != nil {
++		t.Fatal("physical close", err)
++	}
++	if f.c.tick() != nil {
++		t.Fatal("tick")
++	}
++	b := h.bootstrap
++	if b.grantClose == 0 || h.producerCloseSequence != 0 {
++		t.Fatal("permission before DATA")
++	}
++	body := make([]byte, 12)
++	body[0], body[1] = 3, 1
++	be.PutUint64(body[4:], 1000)
++	if f.c.accept(profilePacket{kind: 34, reply: b.grantClose, body: body}) != nil {
++		t.Fatal("permission ACK")
++	}
++	ack := func(seq, id uint64) {
++		t.Helper()
++		x := make([]byte, 32)
++		be.PutUint16(x, 2)
++		x[2] = 1
++		be.PutUint64(x[8:], id)
++		be.PutUint64(x[16:], f.c.lastSent)
++		if seq == 0 || f.c.accept(profilePacket{kind: 48, reply: seq, body: x}) != nil {
++			t.Fatal("ACK", seq, id)
++		}
++	}
++	for _, item := range []struct {
++		id       uint64
++		sequence func() uint64
++	}{{906, func() uint64 { return b.waiterClose }}, {904, func() uint64 { return b.reserveClose }}, {200, func() uint64 { return b.context.closeSequence }}} {
++		if f.c.tick() != nil {
++			t.Fatal("retirement tick")
++		}
++		ack(item.sequence(), item.id)
++	}
++	if f.c.tick() != nil || f.c.tick() != nil || h.producerCloseSequence == 0 || h.datagram.waiterParent.closeSequence == 0 {
++		t.Fatal("waiter/producer barriers")
++	}
++	ack(h.datagram.waiterParent.closeSequence, 20)
++	ack(h.producerCloseSequence, 903)
++	if f.c.tick() != nil {
++		t.Fatal("producer reservation")
++	}
++	ack(h.closeSequence, 901)
++	if f.c.tick() != nil || h.context.closeSequence == 0 {
++		t.Fatal("producer context")
++	}
++	ack(h.context.closeSequence, 100)
++	if f.c.tick() != nil || f.c.tick() != nil || h.datagram.producerParent.closeSequence == 0 {
++		t.Fatal("parent binding")
++	}
++	if f.c.dnsCleanupResult() == nil {
++		t.Fatal("runtime declared KnownClosed before binding ACK")
++	}
++	ack(h.datagram.producerParent.closeSequence, 10)
++	if f.c.tick() != nil || !h.datagram.producerParent.released || !h.datagram.waiterParent.released || f.c.datagramOwnsGrant(h.root) || f.c.operations != 0 {
++		t.Fatal("retained parent refs/credits")
++	}
++	if err := f.c.dnsCleanupResult(); err != nil {
++		t.Fatal("binding cleanup did not settle", err)
++	}
++	if f.p.ctx.Err() != nil {
++		t.Fatal("retirement cancelled neighbor/session")
++	}
++}
++func TestProfileDatagramHostsParentReplyCannotPromoteForeignOrLateData(t *testing.T) {
++	for _, fault := range []string{"grant", "flow", "query", "epoch", "scope", "branch", "lease", "cancel", "late", "unknown"} {
++		t.Run(fault, func(t *testing.T) {
++			f, ctx := datagramHostsFixture(t)
++			done := make(chan error, 1)
++			go func() { done <- ProfilePrepareChain(ctx, nil) }()
++			op := <-f.p.flowQueue
++			if op.kind != 57 || f.c.dispatch(op) != nil {
++				t.Fatal("57")
++			}
++			reply := datagramBound(op, 10)
++			switch fault {
++			case "grant":
++				reply.body[23] ^= 1
++			case "flow":
++				reply.body[31] ^= 1
++			case "query":
++				reply.body[39] ^= 1
++			case "epoch":
++				reply.body[47] ^= 1
++			case "scope":
++				reply.body[53] ^= 1
++			case "branch":
++				reply.body[54] ^= 1
++			case "lease":
++				be.PutUint32(reply.body[48:], u32(op.body, 52)+1)
++			case "cancel":
++				f.c.datagramParentClose(op.datagramParent)
++			case "late":
++				f.now = op.deadline
++			case "unknown":
++				clear(reply.body[3:])
++				reply.body[2] = 3
++			}
++			_ = f.c.accept(reply)
++			if <-done == nil || len(f.p.flowQueue) != 0 || f.c.dnsContext4Used != 0 {
++				t.Fatal("invalid58 created context/effects")
++			}
++		})
++	}
++}
++func TestProfileDatagramHostsBindingPreflightSharesBudgets(t *testing.T) {
++	for _, fault := range []string{"pending", "memory", "history", "query"} {
++		t.Run(fault, func(t *testing.T) {
++			f, ctx := datagramHostsFixture(t)
++			g := ctx.Value(profileGrantKey{}).(*profileGrant)
++			frontier, deadline, err := f.c.hostsParentFrontier(g)
++			if err != nil {
++				t.Fatal(err)
++			}
++			switch fault {
++			case "pending":
++				f.c.operations += 64 - f.c.profilePendingUsed()
++			case "memory":
++				f.c.buffered = uint64(f.c.manifest.caps[4]) - f.c.manifest.memoryCredit - 8191
++			case "history":
++				f.c.udpBudget.used = min(int(f.c.manifest.caps[7]), 256) - 2
++			case "query":
++				f.c.nextDNSQuery = ^uint64(0) - 1
++			}
++			history, query, writes := f.c.udpBudget.used, f.c.nextDNSQuery, len(f.writes)
++			if _, err := profileBindDatagramParent(ctx, g, frontier, deadline); err == nil || f.c.datagramParentUsed != 0 || f.c.udpBudget.used != history || f.c.nextDNSQuery != query || len(f.writes) != writes {
++				t.Fatal("preflight consumed history/effects")
++			}
++		})
++	}
++}
++func TestProfileDatagramHostsDelayedFactoryCannotPublishAfterCancel(t *testing.T) {
++	f, ctx, h := datagramHostsPrepared(t)
++	entered, resume := make(chan struct{}), make(chan struct{})
++	closes := 0
++	f.p.datagramIO = func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++		close(entered)
++		<-resume
++		return datagramFakeSocket(h, func() error { closes++; return nil }), nil
++	}
++	done := make(chan error, 1)
++	go func() {
++		_, _, err := ProfileDialBootstrapDatagram(ctx, profileNumericDestination(h.frontier.target))
++		done <- err
++	}()
++	<-entered
++	h.cancel()
++	if f.c.tick() != nil || h.bootstrap.grantClose != 0 || !h.datagram.creating {
++		t.Fatal("factory custody released early")
++	}
++	close(resume)
++	if <-done == nil || closes != 1 {
++		t.Fatal("late factory result published")
++	}
++	if f.c.tick() != nil || h.bootstrap.grantClose == 0 {
++		t.Fatal("late known Close not retired")
++	}
++}
++func TestProfileDatagramHostsNoReadBeforeSendAndManagedJoin(t *testing.T) {
++	f, ctx, h := datagramHostsPrepared(t)
++	readIO := make(chan struct{})
++	f.p.datagramIO = func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++		s := datagramFakeSocket(h, func() error { return nil })
++		s.readIO = func([]byte) (int, error) { close(readIO); return 0, io.EOF }
++		return s, nil
++	}
++	conn, _, err := ProfileDialBootstrapDatagram(ctx, profileNumericDestination(h.frontier.target))
++	if err != nil {
++		t.Fatal(err)
++	}
++	s := conn.(*profileBootstrapDatagramConn)
++	readDone := make(chan error, 1)
++	go func() { _, e := conn.Read(make([]byte, 16)); readDone <- e }()
++	active := false
++	for i := 0; i < 10000; i++ {
++		s.mu.Lock()
++		active = s.readActive
++		s.mu.Unlock()
++		if active {
++			break
++		}
++		runtime.Gosched()
++	}
++	if !active {
++		t.Fatal("Read not admitted")
++	}
++	select {
++	case <-readIO:
++		t.Fatal("unsolicited response before send")
++	default:
++	}
++	if _, err = conn.Write([]byte("ciphertext")); err != nil {
++		t.Fatal(err)
++	}
++	<-readDone
++	entered, resume := make(chan struct{}), make(chan struct{})
++	runDone := make(chan error, 1)
++	go func() {
++		runDone <- ProfileRunBootstrapDatagramTasks(ctx, conn, func() error { close(entered); <-resume; return nil }, func() error { <-entered; return errors.New("other task failed") })
++	}()
++	<-entered
++	// Source отменён, но первый managed task ещё держит consuming ownership.
++	for i := 0; i < 10000; i++ {
++		if h.ctx.Err() != nil {
++			break
++		}
++		runtime.Gosched()
++	}
++	if h.ctx.Err() == nil || f.c.tick() != nil || h.bootstrap.grantClose != 0 || !h.datagram.credited {
++		t.Fatal("unjoined native task released permission")
++	}
++	close(resume)
++	if <-runDone == nil {
++		t.Fatal("managed error lost")
++	}
++	if conn.Close() != nil {
++		t.Fatal("Close")
++	}
++	if f.c.tick() != nil || h.bootstrap.grantClose == 0 {
++		t.Fatal("managed join not observed")
++	}
++}
++func TestProfileDatagramHostsActualCallerRequiresParentBind(t *testing.T) {
++	f, ctx := datagramHostsFixture(t)
++	done := make(chan error, 1)
++	go func() { done <- ProfilePrepareChain(ctx, nil) }()
++	select {
++	case op := <-f.p.flowQueue:
++		if op.kind != 57 || f.c.dispatch(op) != nil {
++			t.Fatal("missing exact DatagramParentBind")
++		}
++		if len(f.p.flowQueue) != 0 {
++			t.Fatal("context before ACK58")
++		}
++		deny := make([]byte, 64)
++		be.PutUint16(deny, 2)
++		deny[2] = 2
++		if f.c.accept(profilePacket{kind: 58, reply: op.sequence, body: deny}) != nil || <-done == nil {
++			t.Fatal("parent Deny allowed effects")
++		}
++	case err := <-done:
++		t.Fatal("actual UDP HOSTS caller stopped before57", err)
++	case <-time.After(time.Second):
++		t.Fatal("missing57")
++	}
 +}
 diff --git a/common/yonikbroker/profile-dns-v2-codec4.json b/common/yonikbroker/profile-dns-v2-codec4.json
 new file mode 100644
