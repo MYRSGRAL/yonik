@@ -13,6 +13,84 @@ from collections import deque
 from pathlib import Path
 
 
+def check_network_cleanup(trace: list[dict[str, object]]) -> int:
+    """Проверяет ACK-барьеры по реальным кадрам, не создавая ответов actor'ам."""
+    pending: dict[int, tuple[int, bytes]] = {}
+    roots: dict[int, int] = {}
+    required: dict[int, set[tuple[int, int]]] = {}
+    acknowledged: set[tuple[int, int]] = set()
+    closed = 0
+
+    def number(body: bytes, offset: int) -> int:
+        if len(body) < offset + 8:
+            raise AssertionError("truncated cleanup field")
+        return int.from_bytes(body[offset : offset + 8], "big")
+
+    for event in trace:
+        if "packet" not in event:
+            continue
+        packet = bytes.fromhex(str(event["packet"]))
+        if packet[:8] != b"YNKCAP01":
+            continue
+        if len(packet) < 128 or int.from_bytes(packet[12:16], "big") != len(packet):
+            raise AssertionError("invalid cleanup frame")
+        kind = int.from_bytes(packet[10:12], "big")
+        sequence = number(packet, 16)
+        reply = number(packet, 24)
+        body = packet[128:]
+        if event["side"] == "go":
+            pending[sequence] = (kind, body)
+            if kind == 32 and body[:1] == b"\x03":
+                root = number(body, 4)
+                contexts = [
+                    context for context, owner in roots.items() if owner == root
+                ]
+                if not contexts:
+                    raise AssertionError("service Close32 without acquired context")
+                for context in contexts:
+                    missing = required[context] - acknowledged
+                    if missing:
+                        raise AssertionError(f"Close32 before cleanup ACK: {missing}")
+                closed += 1
+            continue
+        if len(body) < 3 or body[2] != 1:
+            continue
+        request = pending.get(reply)
+        if request is None:
+            continue
+        request_kind, sent = request
+        if kind == 56 and request_kind == 55:
+            context = number(body, 8)
+            roots[context] = number(sent, 8)
+            required[context] = {(8, context)}
+        elif kind == 36 and request_kind == 35:
+            context = number(body, 24)
+            if context in required:
+                required[context].add((7, number(body, 8)))
+                if body[60] == 1:
+                    required[context].add((2, number(body, 32)))
+        elif kind in (37, 39):
+            context = number(body, 32)
+            if context not in required:
+                raise AssertionError("transport ACK without context")
+            required[context].add((3 if kind == 37 else 4, number(body, 16)))
+        elif kind in (46, 48) and request_kind == (45 if kind == 46 else 47):
+            target, identifier = sent[2], number(sent, 8)
+            if number(body, 8) != identifier:
+                raise AssertionError("cleanup ACK identifier mismatch")
+            if kind == 46 and (
+                body[3] != target
+                or number(body, 16) != number(sent, 16)
+                or body[24:28] != bytes(4)
+                or body[28] != 1
+            ):
+                raise AssertionError("Retired46 lacks joined/zero-ref evidence")
+            acknowledged.add((target, identifier))
+    if not closed:
+        raise AssertionError("missing actual service Close32")
+    return closed
+
+
 def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
     env = os.environ | {"YONIK_PURE_INTEROP": "1", "YONIK_INTEROP_CASE": case}
     commands = {
@@ -177,14 +255,28 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
             )
         ):
             raise AssertionError(f"incomplete actor roundtrip: {done}")
-        if network and go_result.get("cleanup") and rust_result.get("retained_routes"):
+        if (
+            network
+            and go_result.get("cleanup")
+            and (
+                rust_result.get("retained_routes")
+                or rust_result.get("contexts") != 0
+                or rust_result.get("services")
+                or rust_result.get("unknown")
+                or rust_result.get("receiver_consumed_closes") != 1
+            )
+        ):
             raise AssertionError(f"counterpart route custody mismatch: {done}")
+        cleanup_barriers = (
+            check_network_cleanup(trace) if network and go_result.get("cleanup") else 0
+        )
         return {
             "classification": "PURE_STATEFUL_INTEROP",
             "case": case,
             "commands": commands,
             "codes": codes,
             "results": done,
+            "cleanup_service_barriers": cleanup_barriers,
             "trace": trace,
         }
     except Exception as error:

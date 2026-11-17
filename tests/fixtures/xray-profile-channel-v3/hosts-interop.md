@@ -110,19 +110,31 @@ Public NETWORK Read/Write и generic DATA/IP APIs дополнительно п�
 закрытые. Positive должен получить одну original physical permission/open;
 resolver/service tickets считаются отдельно и retired через actual actor barriers.
 
-### Текущий blocker полного NETWORK positive
+### Повтор после R79/R81: Publish проходит, WaiterBound остаётся RED
 
-На frozen production source actual service/context/Reserve/Physical/Logical
-roundtrip проходит, peer bytes проходят оба strict parsers. Publish остаётся
-RED: `native_dns_rrset.rs::publish_dns` удерживает SCRATCH и producer storage,
-затем `native_bootstrap_binding.rs::observed` делает второй reserve
-`SCRATCH+2048`. Для этого minimal fixture при входе во view used=52118,
-dynamic limit=58459, requested=20016: deficit=13675. Peer/source valid,
-sticky-invalid=false, один clock origin и исходный Reservation.started сохранены.
-Ни лимит8MiB, ни production accounting/authorization здесь не меняются.
-`network-positive` намеренно не переименован в PASS или xfail: root должен
-устранить одновременный double-scratch accounting под тем же общим budget,
-сохранив independent transcript checks; затем этот же harness продолжит waiter.
+Base `2ff7c6c90d7243d98244dd052892c0e0b08e7c71`; actual Go patch
+`1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05`.
+Source получен обратным применением старого profile patch к сохранённому
+native-source3c, затем чистым применением нового patch; codec/base сохранены.
+Из1299 production members изменились ровно6 файлов, перечисленных в evidence
+`fresh-apply.json`; оба overlay добавляют только новые `_test.go` файлы.
+
+Root scratch correction устранила прежний отказ Publish: реальный Published41
+Allow получен. Далее actual Bind53 создаёт waiter, но preparation ответа54
+повторно вызывает `rrset_reply→bootstrap_rrset_live→observed`. В этой точке
+used=39370, limit=58459, суммарный scratch=20016, deficit=927. Предыдущая проверка того
+же transcript до waiter storage успешно проходит при used=38274. Source/peer
+valid, sticky-invalid=false, deadline/epoch/anchor не изменены. Поэтому actual
+issuer возвращает Deny54, actual Go caller завершается с admission denied.
+`network-positive` остаётся строгим RED, не xfail. Production budget, fixture
+capacity, Source/transcript/parser checks и protected pins не менялись.
+
+Exact anchors: `native_dns_rrset.rs::bind_dns_waiter` резервирует retained
+`size_of::<Waiter>()+80` перед reply; `rrset_reply` повторяет source check уже с
+этим retained storage; `native_bootstrap_binding.rs::observed` удерживает2048
+path scratch и отдельно запрашивает SCRATCH=17968 для strict capture parser
+(всего20016 поверх used на входе во view).
+Это новый ограниченный production accounting blocker, а не Go wire mismatch.
 
 `network-no-permit` не требует fake KnownClosed: actual Go Direct consumer
 консервативно делает sticky Unknown при Deny36 и удерживает свои operations.
@@ -131,12 +143,22 @@ Harness сообщает Unknown/custody и проверяет zero DNS/original
 отклоняет такой результат как `counterpart route custody mismatch`, а не
 обнуляет backend ledger. Failure evidence содержит весь bounded packet trace.
 
-Wrong-question также оставлен строгим regression target: после actual Proof46
-Go legacy tick может послать service Close32 до Resource retirement. Frozen
-Rust `cancel_grant→cancel_dns_root→transport.cancel_bundle` тогда отзывает весь
-issuer с Unknown и retained route/resource custody. Harness не выдаёт fake ACK
-и не требует receiver-close counter=1 при Unknown. Полный known cleanup и
-NETWORK positive не заявляются до root correction/review frozen producer/issuer.
+Wrong-question теперь GREEN с completed Known cleanup: actual Proof46 Allow,
+Resource46 Allow (zero refs/joined), оба reservation48, exchange48, context48
+получены **до** service Close32. Fake DNS factory/write/close=1, original
+factory=0, Published/Numeric отсутствуют, routes=2 (service/resolver отдельно),
+retained routes/context/services=0, receiver consumed-close=1. Анализатор trace
+проверяет каждый выданный resource/proof/reservation/exchange/context ID и
+соответствующий ACK до Close32, а не только итоговые счётчики; пропуск resource
+ACK либо перенос Close32 перед context ACK отклоняется отдельными unit tests.
+No-permit и все4 HOSTS regressions также GREEN. Full NETWORK positive/Waiter/
+Numeric cleanup пока не подтверждены из-за Deny54. Late refresh active/tomb
+не покрыт этим bounded run; production R81 source здесь не изменялся.
+
+Evidence: `/home/myrs/projects/yonik/local/orchestration/evidence/p5-network-joint`.
+Все результаты классифицированы PURE_STATEFUL_INTEROP; это не runtime, kernel,
+protected install или current-image measurement. Сборка нового test ELF не
+является новым protected producer build record; registry/builder остаются3c.
 
 R77: stdin и stdout nonblocking, selector обслуживает чтение и очередь частичных
 записей с тем же absolute deadline. Pending write budget≤8MiB; stop frame проходит
