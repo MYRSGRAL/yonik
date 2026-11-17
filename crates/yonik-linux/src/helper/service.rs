@@ -25,7 +25,7 @@ pub const SERVICE_NAME: &str = "cloud.highpriority.yonik.Network1";
 pub const SERVICE_PATH: &str = "/cloud/highpriority/yonik/Network";
 pub const SERVICE_INTERFACE: &str = SERVICE_NAME;
 const MAX_WIRE_BYTES: usize = 64 * 1024;
-const INTROSPECTION: &str = r#"<node><interface name="cloud.highpriority.yonik.Network1"><method name="Prepare"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="ApplyOutputV1"><arg name="request" type="s" direction="in"/><arg name="output" type="ah" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="Apply"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="Stop"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="Unlock"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="State"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="Capabilities"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="NativePrepareEligibilityV1"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="BundleCapabilitiesV1"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="PrepareBundleV1"><arg name="request" type="s" direction="in"/><arg name="canonical" type="ah" direction="in"/><arg name="response" type="s" direction="out"/></method></interface><interface name="org.freedesktop.DBus.Introspectable"><method name="Introspect"><arg name="xml" type="s" direction="out"/></method></interface></node>"#;
+const INTROSPECTION: &str = r#"<node><interface name="cloud.highpriority.yonik.Network1"><method name="PrepareFullProfileV1"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="Prepare"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="ApplyOutputV1"><arg name="request" type="s" direction="in"/><arg name="output" type="ah" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="Apply"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="Stop"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="Unlock"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="State"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="Capabilities"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="NativePrepareEligibilityV1"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="BundleCapabilitiesV1"><arg name="request" type="s" direction="in"/><arg name="response" type="s" direction="out"/></method><method name="PrepareBundleV1"><arg name="request" type="s" direction="in"/><arg name="canonical" type="ah" direction="in"/><arg name="response" type="s" direction="out"/></method></interface><interface name="org.freedesktop.DBus.Introspectable"><method name="Introspect"><arg name="xml" type="s" direction="out"/></method></interface></node>"#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,6 +130,14 @@ pub struct BundleDigests {
 /// Единственный владелец привилегированных эффектов; dispatcher сериализует доступ.
 pub trait ProtectionHost: Send + 'static {
     type Artifact: PreparedArtifact;
+    fn prepare_full_profile(
+        &mut self,
+        _uid: u32,
+        _request: super::profile_intent::FullProfileRequest,
+        _cancel: Cancellation,
+    ) -> impl Future<Output = Result<(Self::Artifact, PreparedContext), ServiceError>> + Send {
+        async { Err(ServiceError::Unsupported) }
+    }
     fn native_prepare_eligibility(
         &mut self,
         cancel: Cancellation,
@@ -251,6 +259,7 @@ struct EmptyRequest {
 }
 
 enum Request {
+    PrepareFullProfile(Box<super::profile_intent::FullProfileRequest>),
     Prepare(bool),
     PrepareProfile(Box<SystemProfileRequest>),
     PrepareBundle(Box<SystemBundleRequest>),
@@ -287,6 +296,19 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
         return Ok(Request::ApplyOutput(handle, decoded.writers));
     }
     let body = message.body();
+    if header.member().map(|m| m.as_str()) == Some("PrepareFullProfileV1") {
+        if header.unix_fds().unwrap_or(0) != 0
+            || body.signature().as_ref().map(|s| s.as_str()) != Some("s")
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let (wire,): (&str,) = body
+            .deserialize()
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        return Ok(Request::PrepareFullProfile(Box::new(
+            super::profile_intent::FullProfileRequest::decode(wire)?,
+        )));
+    }
     if header.member().map(|m| m.as_str()) == Some("PrepareBundleV1") {
         if body.signature().as_ref().map(|s| s.as_str()) != Some("sah") {
             return Err(ServiceError::InvalidRequest);
@@ -541,6 +563,32 @@ async fn dispatch<H: ProtectionHost>(
             result.map_err(|_| ServiceError::Unavailable)??,
     };
     let value = match request {
+        Request::PrepareFullProfile(mut request) => {
+            request.preflight(&cancel)?;
+            let handle = broker
+                .prepare(message, Prompt::Allow, cancel.clone(), || async {
+                    let mut host = host.try_lock().map_err(|_| PreparedError::Capacity)?;
+                    // System required неизменяем: trusted peer нужен и без optional ACL.
+                    let presence = peers.track(&sender, uid)?;
+                    let pid = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        broker.authorizer().peer_pid(&sender, uid),
+                    )
+                    .await
+                    .map_err(|_| PreparedError::Unsupported)??;
+                    request
+                        .bind_peer(Arc::new(crate::attribution::PeerProcess::pending(
+                            crate::attribution::CapturedBusPeer::capture(presence.bind(pid)?)
+                                .map_err(|_| PreparedError::Unsupported)?,
+                        )))
+                        .map_err(as_prepared)?;
+                    host.prepare_full_profile(uid, *request, cancel.clone())
+                        .await
+                        .map_err(as_prepared)
+                })
+                .await?;
+            serde_json::json!({"version":1,"handle":handle.as_bytes()})
+        }
         Request::Introspect => return Ok(INTROSPECTION.to_owned()),
         Request::Capabilities => {
             serde_json::json!({"version":1,"public_protection":true,"system_tun":false,"allow_lan":false})
@@ -710,6 +758,58 @@ fn as_prepared(error: ServiceError) -> PreparedError {
         ServiceError::Unsupported => PreparedError::Unsupported,
         ServiceError::Cancelled => PreparedError::Cancelled,
         _ => PreparedError::Unavailable,
+    }
+}
+#[cfg(test)]
+fn deny_unadmitted_full_profile(
+    request: &super::profile_intent::FullProfileRequest,
+    cancel: &Cancellation,
+) -> Result<String, ServiceError> {
+    request.preflight(cancel)?;
+    // Native carrier и delivery source pins ещё не подключены. Никакого handle.
+    Err(ServiceError::Unsupported)
+}
+
+#[cfg(test)]
+mod full_profile_codec_tests {
+    use super::*;
+    fn frame() -> String {
+        let wire=serde_json::json!({"version":1,"graph":{"outbounds":[{"tag":"direct","protocol":"freedom"}]}}).to_string();
+        let intent = yonik_engine::native_profile::ProfileIntent::decode(&wire).unwrap();
+        let request =
+            crate::helper::profile_intent::FullProfileRequest::new(intent, 1, [3; 32], true)
+                .unwrap();
+        let mut bytes = Vec::new();
+        request.write_sensitive(&mut bytes).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+    fn message(wire: &str) -> Message {
+        Message::method(SERVICE_PATH, "PrepareFullProfileV1")
+            .unwrap()
+            .interface(SERVICE_INTERFACE)
+            .unwrap()
+            .build(&(wire,))
+            .unwrap()
+    }
+    #[test]
+    fn versioned_parse_revalidates_closed_graph_without_native_authority() {
+        let wire = frame();
+        let Request::PrepareFullProfile(request) = parse(&message(&wire)).unwrap() else {
+            panic!("typed branch")
+        };
+        let (_keep, cancel) = Cancellation::new();
+        assert!(request.preflight(&cancel).is_ok());
+        assert_eq!(
+            deny_unadmitted_full_profile(&request, &cancel),
+            Err(ServiceError::Unsupported)
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        value["intent"]["graph"]["outbounds"][0]["settings"] =
+            serde_json::json!({"path":"/tmp/denied"});
+        assert!(parse(&message(&value.to_string())).is_err());
+        assert!(parse(&message(&wire.replacen("{", "{\"uid\":0,", 1))).is_err());
+        assert!(parse(&message(&wire.replacen("{", "{\"version\":1,", 1))).is_err());
+        assert!(parse(&message(&" ".repeat(MAX_WIRE_BYTES))).is_err());
     }
 }
 async fn send_result(

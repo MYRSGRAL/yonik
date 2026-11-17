@@ -194,6 +194,9 @@ pub(crate) fn parse(text: &str) -> Result<ParsedServer, RecordError> {
     if scheme == "vmess" {
         return vmess(text, body);
     }
+    if scheme == "hysteria2" {
+        return hysteria2(text, body);
+    }
     if scheme == "ss" && !body.split('#').next().unwrap_or_default().contains('@') {
         return legacy_ss(text, body);
     }
@@ -310,7 +313,9 @@ pub(crate) fn parse(text: &str) -> Result<ParsedServer, RecordError> {
                 }
             }
         }
-        Protocol::Vmess => return Err((IssueCode::MalformedUri, Field::Source)),
+        Protocol::Vmess | Protocol::Hysteria2 => {
+            return Err((IssueCode::MalformedUri, Field::Source));
+        }
     };
     Ok(ParsedServer {
         protocol,
@@ -318,6 +323,39 @@ pub(crate) fn parse(text: &str) -> Result<ParsedServer, RecordError> {
         credentials,
         transport: network,
         security: tls,
+        parameters: SecretText::new(value.query().unwrap_or_default().to_owned()),
+        source: SecretText::new(text.to_owned()),
+        review_flags: flags,
+    })
+}
+
+fn hysteria2(text: &str, body: &str) -> Result<ParsedServer, RecordError> {
+    let value = url(text)?;
+    let authority = body.split(['/', '?', '#']).next().unwrap_or_default();
+    let (auth, _) = authority
+        .rsplit_once('@')
+        .filter(|(auth, _)| !auth.contains('@'))
+        .ok_or((IssueCode::InvalidCredentials, Field::Credentials))?;
+    // Весь userinfo передаётся как одна строка HTTP-заголовка Hysteria-Auth.
+    let auth = component(auth, Field::Credentials)?;
+    if auth.starts_with(' ') || auth.ends_with(' ') {
+        return Err((IssueCode::InvalidCredentials, Field::Credentials));
+    }
+    let credentials = Credentials::Password(credential(&auth)?);
+    let parameters = query(&value)?;
+    let mut flags = Vec::new();
+    if parameters.keys().any(|key| key != "sni") {
+        flags.push(ReviewFlag::UnknownParameter);
+    }
+    if !matches!(value.path(), "" | "/") {
+        flags.push(ReviewFlag::UnsupportedOption);
+    }
+    Ok(ParsedServer {
+        protocol: Protocol::Hysteria2,
+        endpoint: endpoint(&value, Some(443))?,
+        credentials,
+        transport: Transport::Quic,
+        security: Security::Tls,
         parameters: SecretText::new(value.query().unwrap_or_default().to_owned()),
         source: SecretText::new(text.to_owned()),
         review_flags: flags,

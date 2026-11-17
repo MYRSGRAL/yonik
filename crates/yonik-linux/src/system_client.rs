@@ -453,6 +453,34 @@ impl SystemClient {
         })
     }
     /// Только проверенное переносимое намерение; native config и пути не принимаются.
+    pub async fn prepare_full_profile(
+        &mut self,
+        request: &crate::helper::profile_intent::FullProfileRequest,
+        deadline: Instant,
+        cancel: Cancellation,
+    ) -> Result<Prepared, ClientError> {
+        let mut bytes = Vec::new();
+        request
+            .write_sensitive(&mut bytes)
+            .map_err(|_| ClientError::InvalidRequest)?;
+        let request = String::from_utf8(bytes).map_err(|_| ClientError::InvalidRequest)?;
+        let reply: PreparedReply = decode(
+            &self
+                .call("PrepareFullProfileV1", request, deadline, cancel)
+                .await?,
+        )?;
+        version(reply.version)?;
+        Ok(Prepared {
+            handle: reply.handle,
+            owner: self.owner.clone(),
+            peer: self
+                .connection
+                .unique_name()
+                .ok_or(ClientError::Unavailable)?
+                .to_string(),
+        })
+    }
+    /// Только проверенное переносимое намерение; native config и пути не принимаются.
     pub async fn prepare_profile(
         &mut self,
         server: &yonik_import::ServerIntent,

@@ -2,6 +2,55 @@ use super::{
     RecoveryFailure, RecoveryHost, ServiceError, endpoint, keep_after_stop, parse_worker_uid,
     recover_ordered, same_link_contract,
 };
+#[test]
+fn dns_proxy_static_route_facts_are_exact_and_never_uid_only() {
+    let facts = crate::helper::native_profile_channel::dns_transport::fake_facts(
+        "192.0.2.10:40001".parse().unwrap(),
+        "203.0.113.11:8443".parse().unwrap(),
+        6,
+        (4, 5),
+    );
+    let peer = "203.0.113.11".parse().unwrap();
+    let source = Some("192.0.2.10".parse().unwrap());
+    let check = |ip, port, protocol, source, uid, mark| {
+        crate::helper::native_profile_channel::dns_route_socket_matches(
+            ip, port, protocol, source, uid, mark, &facts,
+        )
+    };
+    assert!(check(
+        peer,
+        8443,
+        crate::TransportProtocol::Tcp,
+        source,
+        997,
+        42
+    ));
+    for (ip, port, protocol, source, uid, mark) in [
+        (
+            "192.0.2.53".parse().unwrap(),
+            8443,
+            crate::TransportProtocol::Tcp,
+            source,
+            997,
+            42,
+        ),
+        (peer, 53, crate::TransportProtocol::Tcp, source, 997, 42),
+        (peer, 8443, crate::TransportProtocol::Udp, source, 997, 42),
+        (peer, 8443, crate::TransportProtocol::Tcp, None, 997, 42),
+        (
+            peer,
+            8443,
+            crate::TransportProtocol::Tcp,
+            Some("192.0.2.11".parse().unwrap()),
+            997,
+            42,
+        ),
+        (peer, 8443, crate::TransportProtocol::Tcp, source, 998, 42),
+        (peer, 8443, crate::TransportProtocol::Tcp, source, 997, 0),
+    ] {
+        assert!(!check(ip, port, protocol, source, uid, mark));
+    }
+}
 
 fn actor_fixture() -> super::super::SystemProtectionHost {
     let monitor = crate::NetworkMonitor::start().unwrap();
@@ -9,6 +58,7 @@ fn actor_fixture() -> super::super::SystemProtectionHost {
         operations: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         stop_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         backend: std::sync::Arc::new(std::sync::Mutex::new(super::Backend {
+            profile_owner: None,
             path: "/run/yonik/unused-actor-test".into(),
             journal: None,
             watch: monitor.watch(),
@@ -260,6 +310,7 @@ fn hostname_and_unbound_transport_are_denied_before_effects() {
 async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_worker() {
     let monitor = crate::NetworkMonitor::start().unwrap();
     let mut backend = super::Backend {
+        profile_owner: None,
         path: "/run/yonik/unused-denied-session-test".into(),
         journal: None,
         watch: monitor.watch(),

@@ -13,7 +13,7 @@ use std::{
 use rustix::fs::{MemfdFlags, Mode, OFlags, SealFlags, fchmod, fcntl_add_seals, memfd_create};
 use sha2::{Digest, Sha256 as Hasher};
 use tokio::process::Command;
-use yonik_engine::Engine;
+use yonik_engine::{Engine, XrayRealityH2};
 
 use super::HostError;
 use crate::helper::memory::ByteLease;
@@ -49,6 +49,7 @@ impl FromStr for Sha256 {
 /// Один sealed inode используется для version/config-check/start. Исходный путь
 /// после копирования больше не читается; ни пути, ни содержимое не попадают в Debug.
 pub struct BinarySnapshot {
+    producer: Option<crate::helper::ImageContract>,
     pub(crate) file: File,
     pub(crate) engine: Engine,
     image: Arc<SharedImage>,
@@ -67,6 +68,13 @@ impl std::fmt::Debug for BinarySnapshot {
     }
 }
 impl BinarySnapshot {
+    pub(crate) fn with_producer(mut self, proof: Option<crate::helper::ImageContract>) -> Self {
+        self.producer = proof;
+        self
+    }
+    pub(crate) fn producer(&self) -> Option<crate::helper::ImageContract> {
+        self.producer.clone()
+    }
     pub(crate) const MAX_SIZE: u64 = 128 * 1024 * 1024;
     pub fn load(path: &Path, expected: Sha256, engine: Engine) -> Result<Self, HostError> {
         let source = OpenOptions::new()
@@ -75,6 +83,18 @@ impl BinarySnapshot {
             .open(path)
             .map_err(|_| HostError::BinaryIo)?;
         Self::load_file(source, expected, engine)
+    }
+
+    pub fn load_xray_reality_h2(engine_dir: &Path) -> Result<Self, HostError> {
+        Self::load(
+            &engine_dir.join(XrayRealityH2::RELATIVE_PATH),
+            Sha256(XrayRealityH2::ELF_SHA256),
+            Engine::Xray,
+        )
+    }
+
+    pub(crate) fn xray_reality_h2(&self) -> Option<XrayRealityH2> {
+        XrayRealityH2::for_snapshot(self.engine, self.trusted_hash())
     }
 
     /// Копирует уже открытый источник: helper не переоткрывает проверенный путь.
@@ -198,6 +218,7 @@ impl BinarySnapshot {
         }
         let file = image.file.try_clone().map_err(|_| HostError::Snapshot)?;
         Ok(Self {
+            producer: None,
             file,
             engine,
             image,

@@ -1,0 +1,272 @@
+use super::{OwnedIngress, OwnedRuntimePlan, ProfileCompileError as Error, ValidatedGraph};
+use crate::{CompiledConfig, Engine, ProbeAccess, ProbeCredentials};
+use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
+
+pub(super) fn emit(
+    graph: ValidatedGraph,
+    runtime: &OwnedRuntimePlan,
+    system: bool,
+) -> Result<(CompiledConfig, ValidatedGraph), Error> {
+    let http_port = runtime.local_http_port();
+    if system != runtime.tun.is_some() || system && http_port.is_some() {
+        return Err(Error::Ownership);
+    }
+    if graph.egress.requires_system_snapshot() && runtime.system_resolver.is_none() {
+        return Err(Error::ResourceRequired);
+    }
+    for endpoint in graph.egress.physical() {
+        if (endpoint.host().eq_ignore_ascii_case("localhost")
+            || endpoint
+                .host()
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback()))
+            && ([runtime.port.get(), runtime.probe_port.get()].contains(&endpoint.port())
+                || http_port.is_some_and(|port| port.get() == endpoint.port()))
+        {
+            return Err(Error::Ownership);
+        }
+    }
+    let mut mappings = HashMap::new();
+    let mut occupied = HashMap::new();
+    let mut signatures: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, rule) in graph.value["routing"]["rules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for tag in rule["inboundTag"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let signature = signatures.entry(tag).or_default();
+            if signature.last() != Some(&index) {
+                signature.push(index);
+            }
+        }
+    }
+    for i in graph.value["inbounds"].as_array().into_iter().flatten() {
+        let tag = i["tag"].as_str().ok_or(Error::Ownership)?;
+        let target = runtime.ingress.get(tag).ok_or(Error::Ownership)?;
+        if *target == OwnedIngress::System && !system {
+            return Err(Error::Ownership);
+        }
+        match (http_port, target) {
+            (Some(_), OwnedIngress::Local)
+                if i["protocol"] == "socks" && i["settings"]["udp"] == true => {}
+            (Some(_), OwnedIngress::LocalHttp) if i["protocol"] == "http" => {}
+            (None, OwnedIngress::Local | OwnedIngress::System) => {}
+            _ => return Err(Error::Ownership),
+        }
+        if let Some((previous, sniffing)) = occupied.insert(*target as u8, (tag, i.get("sniffing")))
+        {
+            if http_port.is_some()
+                || signatures.get(previous).map(Vec::as_slice).unwrap_or(&[])
+                    != signatures.get(tag).map(Vec::as_slice).unwrap_or(&[])
+                || sniffing != i.get("sniffing")
+            {
+                return Err(Error::Ownership);
+            }
+        }
+        mappings.insert(
+            tag.to_owned(),
+            match target {
+                OwnedIngress::Local => "yonik-owned-local",
+                OwnedIngress::System => "system-tun",
+                OwnedIngress::LocalHttp => "yonik-owned-http",
+            },
+        );
+    }
+    if mappings.len() != runtime.ingress.len() || http_port.is_some() && mappings.len() != 2 {
+        return Err(Error::Ownership);
+    }
+    // DNS tags являются внутренними ingress subjects и не заменяются listener.
+    let mut dns_tags = HashSet::new();
+    if let Some(t) = graph.value["dns"]["tag"].as_str() {
+        dns_tags.insert(t.to_owned());
+    }
+    for s in graph.value["dns"]["servers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(t) = s["tag"].as_str() {
+            dns_tags.insert(t.to_owned());
+        }
+    }
+    if dns_tags.iter().any(|tag| {
+        tag.starts_with("yonik-owned-") || tag == "system-tun" || mappings.contains_key(tag)
+    }) {
+        return Err(Error::Ownership);
+    }
+    let mut value = graph.value.clone();
+    // В pinned Xray proxySettings удалён. Только уже проверенные true-chain
+    // edges переводятся в owned sockopt; provider sockopt по-прежнему запрещён.
+    for outbound in value["outbounds"].as_array_mut().ok_or(Error::Schema)? {
+        if let Some(chain) = outbound
+            .as_object_mut()
+            .ok_or(Error::Schema)?
+            .remove("proxySettings")
+        {
+            let next = chain["tag"].as_str().ok_or(Error::Reference)?;
+            let stream = outbound
+                .as_object_mut()
+                .ok_or(Error::Schema)?
+                .entry("streamSettings")
+                .or_insert_with(|| json!({}));
+            stream
+                .as_object_mut()
+                .ok_or(Error::Schema)?
+                .insert("sockopt".into(), json!({"dialerProxy":next}));
+        }
+    }
+    if let Some(rules) = value
+        .get_mut("routing")
+        .and_then(|r| r.get_mut("rules"))
+        .and_then(Value::as_array_mut)
+    {
+        for rule in rules {
+            for key in ["domain", "ip"] {
+                if let Some(list) = rule.get_mut(key) {
+                    bind_resources(list, runtime, key == "ip")?;
+                }
+            }
+        }
+    }
+    if let Some(servers) = value
+        .get_mut("dns")
+        .and_then(|d| d.get_mut("servers"))
+        .and_then(Value::as_array_mut)
+    {
+        for server in servers {
+            if let Some(list) = server.get_mut("domains") {
+                bind_resources(list, runtime, false)?;
+            }
+        }
+    }
+    if let Some(rules) = value
+        .get_mut("routing")
+        .and_then(|r| r.get_mut("rules"))
+        .and_then(Value::as_array_mut)
+    {
+        for r in rules {
+            if let Some(tags) = r.get_mut("inboundTag").and_then(Value::as_array_mut) {
+                for t in tags {
+                    let tag = t.as_str().ok_or(Error::Reference)?;
+                    if let Some(mapped) = mappings.get(tag) {
+                        *t = json!(mapped);
+                    } else if !dns_tags.contains(tag) {
+                        return Err(Error::Ownership);
+                    }
+                }
+                // Aliases эквивалентны по membership каждого ordered rule.
+                // Удаляется только повтор имени, не rule или условие.
+                let mut seen = HashSet::new();
+                r["inboundTag"]
+                    .as_array_mut()
+                    .ok_or(Error::Reference)?
+                    .retain(|t| seen.insert(t.as_str().unwrap_or_default().to_owned()));
+            }
+        }
+    }
+    let auth = ProbeCredentials::random().map_err(|_| Error::Probe)?;
+    value["log"] = json!({"loglevel":"none"});
+    value["inbounds"] = json!([
+        {"tag":"yonik-owned-local","listen":"127.0.0.1","port":runtime.port.get(),"protocol":"socks","settings":{"auth":"noauth","udp":true,"ip":"127.0.0.1"}},
+        {"tag":"yonik-owned-probe","listen":"127.0.0.1","port":runtime.probe_port.get(),"protocol":"socks","settings":{"auth":"password","accounts":[{"user":auth.username(),"pass":auth.password()}]}}
+    ]);
+    if let Some(port) = http_port {
+        value["inbounds"]
+            .as_array_mut()
+            .ok_or(Error::Ownership)?
+            .push(json!({"tag":"yonik-owned-http","listen":"127.0.0.1","port":port.get(),"protocol":"http"}));
+    }
+    // Без override probe проходит ровно тот же ordered routing/default, что
+    // пользовательский Local ingress. Это сохраняет Auto вместо fixed proxy.
+    if let Some(rules) = value
+        .get_mut("routing")
+        .and_then(|r| r.get_mut("rules"))
+        .and_then(Value::as_array_mut)
+    {
+        for r in rules {
+            if let Some(tags) = r.get_mut("inboundTag").and_then(Value::as_array_mut) {
+                if tags.iter().any(|t| {
+                    t == if system {
+                        "system-tun"
+                    } else {
+                        "yonik-owned-local"
+                    }
+                }) {
+                    tags.push(json!("yonik-owned-probe"));
+                }
+            }
+        }
+    }
+    let mut config = CompiledConfig {
+        value,
+        engine: Engine::Xray,
+        port: runtime.port,
+        probe_port: runtime.probe_port,
+        local_http_port: http_port,
+        probe_access: ProbeAccess::native(auth),
+    };
+    if system {
+        config = crate::system_tun::attach(config, runtime.tun.as_ref().ok_or(Error::Ownership)?)
+            .map_err(|_| Error::Ownership)?;
+    }
+    // TUN attach вводит новый tag: provider selectors не должны получить новый
+    // outbound, поэтому outbounds сохраняют исходный порядок и имена.
+    for inbound in graph.value["inbounds"].as_array().into_iter().flatten() {
+        if let Some(sniffing) = inbound.get("sniffing") {
+            let mapped = mappings
+                .get(inbound["tag"].as_str().ok_or(Error::Ownership)?)
+                .ok_or(Error::Ownership)?;
+            for own in config.value["inbounds"]
+                .as_array_mut()
+                .ok_or(Error::Ownership)?
+            {
+                if own["tag"] == *mapped
+                    || (*mapped
+                        == if system {
+                            "system-tun"
+                        } else {
+                            "yonik-owned-local"
+                        }
+                        && own["tag"] == "yonik-owned-probe")
+                {
+                    own["sniffing"] = sniffing.clone();
+                }
+            }
+        }
+    }
+    Ok((config, graph))
+}
+fn bind_resources(value: &mut Value, runtime: &OwnedRuntimePlan, ip: bool) -> Result<(), Error> {
+    match value {
+        Value::String(s) => {
+            if let Some(requirement) = super::validate::resource(s, ip)? {
+                let (_, reference) = runtime
+                    .resources
+                    .iter()
+                    .find(|(r, _)| r == &requirement)
+                    .ok_or(Error::ResourceRequired)?;
+                *s = format!("ext:{}.dat:{}", reference.tag(), requirement.category());
+            }
+        }
+        Value::Array(a) => {
+            for v in a {
+                bind_resources(v, runtime, ip)?;
+            }
+        }
+        Value::Object(o) => {
+            for v in o.values_mut() {
+                bind_resources(v, runtime, ip)?;
+            }
+        }
+        _ => (),
+    }
+    Ok(())
+}

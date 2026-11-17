@@ -56,3 +56,68 @@ fn json_brackets_in_strings_do_not_consume_nesting_budget() {
     let report = import_bytes(text.into_bytes()).unwrap_or_else(|e| panic!("{e:?}"));
     assert!(report.native_json.is_some());
 }
+
+#[test]
+fn hysteria2_authority_is_one_auth_value_and_part_of_identity() {
+    use yonik_import::{ReviewFlag, Transport};
+
+    let report = import_bytes(
+        b"hysteria2://unit:sample%40value@127.0.0.1:8443?sni=verify.example#a\n\
+          hysteria2://unit%3Asample%40value@127.0.0.1:8443?sni=verify.example#b\n\
+          hysteria2://unit:changed@127.0.0.1:8443?sni=verify.example\n\
+          hysteria2://unit:sample%40value@127.0.0.1:8443?sni=other.example\n\
+          hysteria2://unit:sample%40value@127.0.0.1:8443?sni=verify.example&obfs=salamander"
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(report.issues.is_empty());
+    assert_eq!(report.servers.len(), 5);
+    let first = &report.servers[0];
+    assert_eq!(first.protocol().as_str(), "hysteria2");
+    assert_eq!(first.transport(), Transport::Quic);
+    assert_eq!(first.security(), Security::Tls);
+    assert!(first.review_flags().is_empty());
+    let Credentials::Password(auth) = first.credentials() else {
+        panic!("Ожидается один auth из authority");
+    };
+    assert_eq!(auth.expose(), "unit:sample@value");
+    assert!(!format!("{first:?}").contains("sample"));
+    let base = first.identity_material().unwrap();
+    assert_eq!(
+        base.expose(),
+        report.servers[1].identity_material().unwrap().expose()
+    );
+    for server in &report.servers[2..] {
+        assert_ne!(base.expose(), server.identity_material().unwrap().expose());
+    }
+    assert_eq!(
+        report.servers[4].review_flags(),
+        [ReviewFlag::UnknownParameter]
+    );
+}
+
+#[test]
+fn hysteria2_rejects_invalid_authority_and_duplicate_options() {
+    use yonik_import::IssueCode;
+
+    let report = import_bytes(
+        b"hysteria2://@127.0.0.1:8443?sni=verify.example\n\
+          hysteria2://unit%0Av@127.0.0.1:8443?sni=verify.example\n\
+          hysteria2://unit@127.0.0.1:8443?sni=a.example&sni=b.example"
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(report.servers.is_empty());
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .map(|issue| issue.code)
+            .collect::<Vec<_>>(),
+        [
+            IssueCode::InvalidCredentials,
+            IssueCode::InvalidCredentials,
+            IssueCode::DuplicateParameter
+        ]
+    );
+}

@@ -1,7 +1,7 @@
 //! Подготовка локального импорта вне UI-потока. Ничего не сохраняет и не активирует.
 use std::{fmt, fs::File, io::Read, path::PathBuf};
 use tokio::sync::watch;
-use yonik_import::{CancellableImportError, ImportReport, MAX_INPUT_BYTES};
+use yonik_import::{MAX_INPUT_BYTES, ProfileImportReport};
 
 /// Без исходного текста, системной ошибки и пути выбранного файла.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,17 +33,15 @@ fn check(cancel: &watch::Receiver<bool>) -> Result<(), PrepareError> {
     }
 }
 
-fn parse(bytes: Vec<u8>, cancel: &watch::Receiver<bool>) -> Result<ImportReport, PrepareError> {
+fn parse(
+    bytes: Vec<u8>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<ProfileImportReport, PrepareError> {
     check(cancel)?;
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(PrepareError::TooLarge);
     }
-    let report = yonik_import::import_bytes_cancellable(bytes, || check(cancel).is_ok()).map_err(
-        |error| match error {
-            CancellableImportError::Cancelled => PrepareError::Cancelled,
-            CancellableImportError::Import(_) => PrepareError::InvalidInput,
-        },
-    )?;
+    let report = yonik_import::import_profiles(bytes).map_err(|_| PrepareError::InvalidInput)?;
     check(cancel)?;
     Ok(report)
 }
@@ -52,7 +50,7 @@ fn parse(bytes: Vec<u8>, cancel: &watch::Receiver<bool>) -> Result<ImportReport,
 pub async fn prepare_text(
     bytes: Vec<u8>,
     cancel: watch::Receiver<bool>,
-) -> Result<ImportReport, PrepareError> {
+) -> Result<ProfileImportReport, PrepareError> {
     check(&cancel)?;
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(PrepareError::TooLarge);
@@ -66,7 +64,7 @@ pub async fn prepare_text(
 pub async fn prepare_file(
     path: PathBuf,
     cancel: watch::Receiver<bool>,
-) -> Result<ImportReport, PrepareError> {
+) -> Result<ProfileImportReport, PrepareError> {
     check(&cancel)?;
     tokio::task::spawn_blocking(move || {
         let bytes = read_file(path, &cancel)?;
@@ -133,13 +131,30 @@ mod tests {
             .await
             .expect("отчёт");
         assert_eq!(report.original().expose().as_bytes(), INPUT);
-        assert_eq!(report.servers.len(), 1);
+        assert_eq!(report.entries.len(), 1);
         sender.send_replace(true);
         assert_eq!(
             prepare_text(INPUT.to_vec(), receiver).await.err(),
             Some(PrepareError::Cancelled)
         );
         assert!(!format!("{:?}", PrepareError::File).contains("private-token"));
+    }
+
+    #[tokio::test]
+    async fn full_json_preserves_roots_instead_of_flattening_outbounds() {
+        let (_sender, receiver) = watch::channel(false);
+        let input =
+            br#"[{"remarks":"Auto","outbounds":[{"protocol":"vless"},{"protocol":"trojan"}]}]"#;
+        let report = prepare_text(input.to_vec(), receiver)
+            .await
+            .expect("профиль");
+        assert_eq!(report.original().expose().as_bytes(), input);
+        assert_eq!(report.entries.len(), 1);
+        let yonik_import::ProfileEntry::Xray(profile) = &report.entries[0] else {
+            panic!("полный профиль не должен превращаться в серверы");
+        };
+        assert_eq!(profile.name(), "Auto");
+        assert!(profile.source().expose().contains("trojan"));
     }
 
     #[tokio::test]

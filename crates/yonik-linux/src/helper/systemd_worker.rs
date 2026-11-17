@@ -489,6 +489,7 @@ type NativeAdmission = Result<(
     [u8; 512],
 )>;
 struct NativeRuntime {
+    profile: Option<super::native_profile_channel::ProfileRuntime>,
     _permit: Arc<Permit>,
     task_start: u64,
     stamp: Arc<std::sync::Mutex<Option<super::native_bootstrap::RuntimeScopeStamp>>>,
@@ -499,9 +500,25 @@ struct NativeRuntime {
     ready: std::sync::mpsc::Receiver<()>,
     attached: bool,
 }
+impl NativeRuntime {
+    fn revoke(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(profile) = &self.profile {
+            profile.revoke();
+        }
+        if let Some(scope) = self
+            .stamp
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            scope.revoke();
+        }
+    }
+}
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.revoke();
         if let Some(thread) = self.thread.take() {
             let _result = thread.join();
         }
@@ -520,6 +537,7 @@ pub struct SystemWorkerSupervisor {
     retained_copy: Option<Arc<WorkerPayload>>,
     fence: Box<dyn WorkerFence>,
     native_runtime: Option<NativeRuntime>,
+    retired_profile: Option<super::native_profile_channel::ProfileRuntime>,
     native_transfer: Option<JoinHandle<Result<WorkerAck>>>,
     native_admission: Option<JoinHandle<NativeAdmission>>,
     native_custody: Option<crate::worker::anchor_exchange::NamespaceRetention>,
@@ -531,6 +549,13 @@ pub struct SystemWorkerSupervisor {
 }
 impl Drop for SystemWorkerSupervisor {
     fn drop(&mut self) {
+        if let Some(runtime) = &self.native_runtime {
+            runtime.revoke();
+        }
+        if let Some(profile) = self.retired_profile.take() {
+            profile.revoke();
+            std::mem::forget(profile);
+        }
         if let Some(inspection) = self.peer_inspection.take() {
             std::mem::forget(inspection);
         }
@@ -613,6 +638,7 @@ impl SystemWorkerSupervisor {
                 retained_copy: None,
                 fence: Box::new(SystemFence),
                 native_runtime: None,
+                retired_profile: None,
                 native_transfer: None,
                 native_admission: None,
                 native_custody: None,
@@ -802,6 +828,7 @@ impl SystemWorkerSupervisor {
         journal: &crate::managed_network::Journal,
         topology: crate::LinuxTopology,
         epoch: u64,
+        routes: Option<Box<dyn super::native_profile_channel::RouteAuthority>>,
         output: Option<crate::output_transport::ValidatedWriters>,
         cancel: &mut Cancellation,
     ) -> Result<WorkerTicket> {
@@ -902,9 +929,26 @@ impl SystemWorkerSupervisor {
                 .map_err(unavailable)
         }));
         let remote = wait_owned(&mut self.native_lookup_transfer, cancel, deadline).await??;
-        let session =
+        let mut session =
             crate::attribution::native_session::Session::from_verified(issued.session, remote)
                 .map_err(unavailable)?;
+        let (profile, extension, delivery) = if let Some(prepared) = payload.full_profile() {
+            let profile_scope = issued.run.profile_scope()?;
+            let record = profile_scope.profile_launch_record(prepared.capsule())?;
+            let endpoint = session.owner_endpoint().map_err(unavailable)?;
+            let (runtime, channel, delivery) =
+                super::native_profile_channel::ProfileRuntime::start_system(
+                    profile_scope,
+                    endpoint,
+                    Arc::clone(&payload),
+                    uid,
+                    routes.ok_or(WorkerSupervisorError::Untrusted)?,
+                )
+                .map_err(unavailable)?;
+            (Some(runtime), Some((record, channel)), Some(delivery))
+        } else {
+            (None, None, None)
+        };
         let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -920,6 +964,7 @@ impl SystemWorkerSupervisor {
             .map_err(unavailable)?;
         let scope = Arc::new(std::sync::Mutex::new(None));
         self.native_runtime = Some(NativeRuntime {
+            profile,
             _permit: Arc::clone(&self.permit),
             task_start,
             stamp: Arc::clone(&scope),
@@ -931,24 +976,57 @@ impl SystemWorkerSupervisor {
         let permit = Arc::clone(&self.permit);
         self.native_transfer = Some(tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            crate::worker::role_handoff::handoff_verified_run(
-                issued.run,
-                &handoff,
-                roles,
-                &binding,
-                pid,
-                uid,
-                deadline.into_std(),
-                |stamp| {
-                    *scope
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stamp);
-                },
-            )
+            let exec_record = extension.as_ref().map(|(record, _)| *record);
+            let retain = |stamp| {
+                *scope
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stamp);
+            };
+            if extension.is_some() {
+                crate::worker::role_handoff::handoff_verified_profile_run(
+                    issued.run,
+                    &handoff,
+                    roles,
+                    &binding,
+                    pid,
+                    uid,
+                    deadline.into_std(),
+                    extension,
+                    retain,
+                )
+            } else {
+                crate::worker::role_handoff::handoff_verified_run(
+                    issued.run,
+                    &handoff,
+                    roles,
+                    &binding,
+                    pid,
+                    uid,
+                    deadline.into_std(),
+                    retain,
+                )
+            }
             .map_err(unavailable)?;
-            payload
+            let ack = payload
                 .send_output_before(&stream, WorkerMode::Run, output, deadline.into_std())
-                .map_err(unavailable)
+                .map_err(unavailable)?;
+            if let (Some(record), Some(delivery)) = (exec_record, delivery) {
+                crate::worker::role_handoff::receive_exec_delivery(
+                    &handoff,
+                    record,
+                    &payload,
+                    pid,
+                    uid,
+                    deadline.into_std(),
+                    |proof| {
+                        delivery
+                            .try_send(proof)
+                            .map_err(|_| crate::worker::WorkerError::Peer)
+                    },
+                )
+                .map_err(unavailable)?;
+            }
+            Ok(ack)
         }));
         let ack = wait_owned(&mut self.native_transfer, cancel, deadline).await??;
         if ack.status != WorkerStatus::Accepted || ack.pid != pid {
@@ -996,7 +1074,11 @@ impl SystemWorkerSupervisor {
                 Err(_) => return Err(WorkerSupervisorError::Protocol),
             }
         }
-        Ok(runtime.attached)
+        Ok(runtime.attached
+            && runtime
+                .profile
+                .as_ref()
+                .is_none_or(super::native_profile_channel::ProfileRuntime::ready))
     }
     pub async fn start(
         &mut self,
@@ -1139,6 +1221,7 @@ impl SystemWorkerSupervisor {
         deadline: Instant,
     ) -> Result<()> {
         if !self.clean
+            || self.retired_profile.is_some()
             || self.pending.is_some()
             || self.transfer.is_some()
             || self.current.is_some()
@@ -1298,6 +1381,9 @@ impl SystemWorkerSupervisor {
         binding.validate()
     }
     async fn cleanup(&mut self, cancel: &mut Cancellation, deadline: Instant) -> Result<()> {
+        if let Some(runtime) = &self.native_runtime {
+            runtime.revoke();
+        }
         self.clean = false;
         // Сначала запрет новой активации, затем завершение уже начатой передачи.
         for mode in [WorkerMode::Check, WorkerMode::Run] {
@@ -1355,6 +1441,15 @@ impl SystemWorkerSupervisor {
                 self.current = None;
                 self.clean = true;
                 self.retained_copy = None;
+                if let Some(runtime) = self.native_runtime.as_mut() {
+                    if runtime.profile.is_some() && self.retired_profile.is_some() {
+                        return Err(WorkerSupervisorError::RecoveryRequired);
+                    }
+                    if let Some(mut profile) = runtime.profile.take() {
+                        profile.worker_closed().map_err(unavailable)?;
+                        self.retired_profile = Some(profile);
+                    }
+                }
                 self.native_runtime = None;
                 self.native_custody = None;
                 self.native_remote = None;
@@ -1366,6 +1461,22 @@ impl SystemWorkerSupervisor {
             })
             .await?;
         }
+    }
+    /// Вызывает только backend после durable deny replacement/DesiredRules.
+    /// Empty cgroup отдельно не освобождает dynamic ledger или assets custody.
+    pub(crate) fn confirm_profile_rules_retired(&mut self) -> Result<()> {
+        if !self.clean
+            || self.current.is_some()
+            || self.pending.is_some()
+            || self.native_runtime.is_some()
+        {
+            return Err(WorkerSupervisorError::RecoveryRequired);
+        }
+        if let Some(profile) = self.retired_profile.as_mut() {
+            profile.rules_retired().map_err(unavailable)?;
+        }
+        self.retired_profile.take();
+        Ok(())
     }
     async fn unit_job(&self, method: &str, unit: &str) -> Result<()> {
         tokio::time::timeout(DEADLINE, async {

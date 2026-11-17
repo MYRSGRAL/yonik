@@ -8,7 +8,10 @@ pub mod fence;
 mod kernel_evidence;
 pub(crate) mod native_bootstrap;
 mod native_profile;
+pub(crate) mod native_profile_channel;
+pub mod profile_intent;
 mod protection_host;
+pub(crate) mod resolver_stub;
 mod session_network;
 pub use session_network::SessionNetworkPlan;
 pub(crate) mod run_authorization;
@@ -34,6 +37,7 @@ pub use prepared::{
 };
 
 mod registry;
+pub(crate) use registry::ImageContract;
 pub use registry::{RegistryError, TrustedRegistry};
 
 use std::{collections::HashMap, future::Future, time::Duration};

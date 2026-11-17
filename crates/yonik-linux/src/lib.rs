@@ -1,6 +1,16 @@
 //! Linux host локального SOCKS. Не меняет системные маршруты, proxy или DNS.
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Закрытый codec milestone; production channel callers подключаются следующим шагом"
+    )
+)]
+pub(crate) mod profile_channel;
+
+#[cfg(target_os = "linux")]
 pub mod managed_network;
 
 #[cfg(target_os = "linux")]

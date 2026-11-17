@@ -3,6 +3,7 @@ mod lifecycle_gate;
 #[cfg(feature = "test-support")]
 pub use lifecycle_gate::{LifecycleGate, LifecycleStage};
 mod binary;
+pub(crate) mod local_profile_channel;
 mod probe;
 mod process;
 mod session;
@@ -18,6 +19,55 @@ use std::fmt;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullProfileMode {
+    Local,
+    System,
+}
+
+/// DATA availability до binary/config/IPC effects; не выдаёт launch authority.
+/// Проверки image, источников и режима при подготовке остаются обязательными.
+pub fn full_profile_preflight(mode: FullProfileMode) -> Result<(), HostError> {
+    match mode {
+        FullProfileMode::Local | FullProfileMode::System => {
+            crate::helper::native_profile_channel::consumer_planning_available()
+                .map(|_| ())
+                .map_err(|_| HostError::Unsupported)
+        }
+    }
+}
+/// DATA selected-subset check; installed image/source проверяются в prepare.
+pub fn full_profile_plan_preflight(
+    mode: FullProfileMode,
+    intent: &yonik_engine::native_profile::ProfileIntent,
+) -> Result<(), HostError> {
+    crate::helper::native_profile_channel::consumer_profile_plan(intent, profile_mode(mode))
+        .map_err(|_| HostError::Unsupported)
+}
+pub fn full_profile_request_preflight(
+    mode: FullProfileMode,
+    request: &crate::helper::profile_intent::FullProfileRequest,
+) -> Result<(), HostError> {
+    crate::helper::native_profile_channel::consumer_request_plan(request, profile_mode(mode))
+        .map_err(|_| HostError::Unsupported)
+}
+fn profile_mode(mode: FullProfileMode) -> crate::profile_channel::Mode {
+    match mode {
+        FullProfileMode::Local => crate::profile_channel::Mode::Local,
+        FullProfileMode::System => crate::profile_channel::Mode::System,
+    }
+}
+/// Selected sealed image/scope preflight до port allocation/IPC. Не FlowGrant.
+pub fn full_profile_image_preflight(
+    mode: FullProfileMode,
+    intent: &yonik_engine::native_profile::ProfileIntent,
+    image: &BinarySnapshot,
+) -> Result<(), HostError> {
+    crate::helper::native_profile_channel::require_consumer(intent, profile_mode(mode), image)
+        .map(|_| ())
+        .map_err(|_| HostError::Unsupported)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostError {
     InvalidBinary,
     BinaryIo,
@@ -27,6 +77,7 @@ pub enum HostError {
     Version,
     Process,
     ConfigRejected,
+    Unsupported,
     Timeout,
     Cancelled,
     EngineExited,
@@ -46,6 +97,7 @@ impl fmt::Display for HostError {
             Self::Version => "Версия ядра не соответствует контракту",
             Self::Process => "Не удалось выполнить операцию процесса",
             Self::ConfigRejected => "Ядро отклонило конфигурацию",
+            Self::Unsupported => "Полный профиль недоступен для этого установленного ядра",
             Self::Timeout => "Превышено время операции",
             Self::Cancelled => "Операция отменена",
             Self::EngineExited => "Процесс ядра завершился",
@@ -153,6 +205,19 @@ impl Cancellation {
             Err(HostError::Cancelled)
         } else {
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod full_profile_preflight_tests {
+    #[test]
+    fn planning_is_available_without_claiming_effect_authority() {
+        for mode in [
+            super::FullProfileMode::Local,
+            super::FullProfileMode::System,
+        ] {
+            assert_eq!(super::full_profile_preflight(mode), Ok(()));
         }
     }
 }

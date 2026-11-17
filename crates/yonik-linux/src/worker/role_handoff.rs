@@ -83,6 +83,16 @@ fn send(
     bytes: &[u8; FRAME],
     fds: &[std::os::fd::BorrowedFd<'_>],
 ) -> Result<(), WorkerError> {
+    send_packet(socket, bytes, fds)
+}
+fn send_packet(
+    socket: &OwnedFd,
+    bytes: &[u8],
+    fds: &[std::os::fd::BorrowedFd<'_>],
+) -> Result<(), WorkerError> {
+    if bytes.is_empty() || bytes.len() > 256 || fds.len() > 2 {
+        return Err(WorkerError::Protocol);
+    }
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
     let mut ancillary = SendAncillaryBuffer::new(&mut space);
     if !fds.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(fds)) {
@@ -95,7 +105,7 @@ fn send(
         SendFlags::NOSIGNAL,
     )
     .map_err(|_| WorkerError::Io)?
-        != FRAME
+        != bytes.len()
     {
         return Err(WorkerError::Protocol);
     }
@@ -109,8 +119,21 @@ fn receive(
     count: usize,
     deadline: Instant,
 ) -> Result<Vec<OwnedFd>, WorkerError> {
+    receive_packet(socket, expected, pid, uid, count, deadline)
+}
+fn receive_packet(
+    socket: &OwnedFd,
+    expected: &[u8],
+    pid: u32,
+    uid: u32,
+    count: usize,
+    deadline: Instant,
+) -> Result<Vec<OwnedFd>, WorkerError> {
+    if expected.len() > 256 || count > 2 {
+        return Err(WorkerError::Protocol);
+    }
     setup(socket, deadline)?;
-    let mut bytes = [0; FRAME + 1];
+    let mut bytes = [0; 257];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2), ScmCredentials(1))];
     let mut ancillary = RecvAncillaryBuffer::new(&mut space);
     let msg = net::recvmsg(
@@ -123,6 +146,7 @@ fn receive(
     let mut fds = Vec::new();
     let mut cred = None;
     let mut rights = false;
+    let mut malformed = false;
     for part in ancillary.drain() {
         match part {
             RecvAncillaryMessage::ScmRights(r) if !rights => {
@@ -130,16 +154,23 @@ fn receive(
                 fds.extend(r);
             }
             RecvAncillaryMessage::ScmCredentials(c) if cred.is_none() => cred = Some(c),
-            _ => return Err(WorkerError::Protocol),
+            RecvAncillaryMessage::ScmRights(r) => {
+                malformed = true;
+                for fd in r {
+                    drop(fd);
+                }
+            }
+            _ => malformed = true,
         }
     }
     let c = cred.ok_or(WorkerError::Peer)?;
-    if Instant::now() >= deadline
-        || msg.bytes != FRAME
+    if malformed
+        || Instant::now() >= deadline
+        || msg.bytes != expected.len()
         || msg
             .flags
             .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
-        || bytes[..FRAME] != expected[..]
+        || bytes[..expected.len()] != expected[..]
         || fds.len() != count
         || c.pid.as_raw_pid() as u32 != pid
         || c.uid.as_raw() != uid
@@ -208,10 +239,264 @@ pub(crate) struct RunHandoff {
 struct VerifiedTransport {
     roles: Roles,
     binding: Binding,
+    profile: Option<ProfileExtension>,
+}
+
+struct ProfileExtension {
+    record: crate::profile_channel::LaunchRecord,
+    launch: std::fs::File,
+    channel: OwnedFd,
+    handoff: OwnedFd,
+}
+
+/// Consuming trusted exec delivery; не current-image и не owner/FlowGrant proof.
+pub(crate) struct VerifiedExecDelivery {
+    record: crate::profile_channel::ExecDelivery,
+    image: std::fs::File,
+    config: std::fs::File,
+    _credit: crate::helper::memory::ByteLease,
+}
+impl VerifiedExecDelivery {
+    pub(crate) fn producer_image(
+        &self,
+        launch: crate::profile_channel::LaunchRecord,
+    ) -> Result<[u8; 32], WorkerError> {
+        crate::profile_channel::ExecDelivery::decode(
+            &self.record.encode().map_err(|_| WorkerError::Protocol)?,
+            launch,
+        )
+        .map_err(|_| WorkerError::Peer)?;
+        Ok(self.record.image)
+    }
+    pub(crate) fn image_digest(&self) -> [u8; 32] {
+        self.record.image
+    }
+    pub(crate) fn config_digest(&self) -> [u8; 32] {
+        self.record.launch.binding.digest
+    }
+    pub(crate) fn files(
+        &self,
+        launch: crate::profile_channel::LaunchRecord,
+    ) -> Result<(std::fs::File, std::fs::File), WorkerError> {
+        crate::profile_channel::ExecDelivery::decode(
+            &self.record.encode().map_err(|_| WorkerError::Protocol)?,
+            launch,
+        )
+        .map_err(|_| WorkerError::Peer)?;
+        Ok((
+            self.image.try_clone().map_err(|_| WorkerError::Io)?,
+            self.config.try_clone().map_err(|_| WorkerError::Io)?,
+        ))
+    }
+}
+pub(crate) fn receive_exec_delivery(
+    socket: &OwnedFd,
+    launch: crate::profile_channel::LaunchRecord,
+    payload: &super::WorkerPayload,
+    pid: u32,
+    uid: u32,
+    deadline: Instant,
+    deliver: impl FnOnce(VerifiedExecDelivery) -> Result<(), WorkerError>,
+) -> Result<(), WorkerError> {
+    let expected = payload.exec_delivery(launch)?;
+    let credit = crate::helper::memory::executable_budget()
+        .reserve(expected.image_bytes as usize)
+        .map_err(|_| WorkerError::Protocol)?;
+    let fds = receive_packet(
+        socket,
+        &expected.encode().map_err(|_| WorkerError::Protocol)?,
+        pid,
+        uid,
+        2,
+        deadline,
+    )?;
+    let [image, config]: [OwnedFd; 2] = fds.try_into().map_err(|_| WorkerError::Protocol)?;
+    let image = std::fs::File::from(image);
+    let config = std::fs::File::from(config);
+    for (file, length, hash) in [
+        (&image, expected.image_bytes as usize, expected.image),
+        (
+            &config,
+            expected.config_bytes as usize,
+            launch.binding.digest,
+        ),
+    ] {
+        if rustix::fs::fcntl_getfl(file).map_err(|_| WorkerError::Peer)?
+            & rustix::fs::OFlags::ACCMODE
+            != rustix::fs::OFlags::RDONLY
+        {
+            return Err(WorkerError::Peer);
+        }
+        super::validate_file(file, length, hash)?;
+    }
+    if !rustix::fs::fcntl_get_seals(&image)
+        .map_err(|_| WorkerError::Peer)?
+        .contains(rustix::fs::SealFlags::EXEC)
+    {
+        return Err(WorkerError::Peer);
+    }
+    let verified = VerifiedExecDelivery {
+        record: expected,
+        image,
+        config,
+        _credit: credit,
+    };
+    // До ACK, разрешающего consuming exec: user expected hash/child record
+    // без protected install provenance не запускают full-profile image.
+    crate::helper::TrustedRegistry::system()
+        .map_err(|_| WorkerError::Peer)?
+        .producer_for_delivery(&verified, launch)
+        .map_err(|_| WorkerError::Peer)?;
+    deliver(verified)?;
+    setup(socket, deadline)?;
+    send_packet(
+        socket,
+        &expected.ack().map_err(|_| WorkerError::Protocol)?,
+        &[],
+    )
+}
+pub(crate) fn send_proof_bootstrap(
+    socket: &OwnedFd,
+    launch: crate::profile_channel::LaunchRecord,
+    producer: &crate::helper::native_profile_channel::VerifiedUdpProducer,
+    proof: &OwnedFd,
+    pid: u32,
+    uid: u32,
+    deadline: Instant,
+) -> Result<u8, WorkerError> {
+    let (record, ack, version) = producer.setup(launch).map_err(|_| WorkerError::Peer)?;
+    setup(socket, deadline)?;
+    send_packet(socket, &record, &[proof.as_fd()])?;
+    receive_packet(socket, &ack, pid, uid, 0, deadline)?;
+    Ok(version)
+}
+
+fn profile_binding(
+    record: crate::profile_channel::LaunchRecord,
+    challenge: &[u8; 128],
+    helper_pid: u32,
+    task_pid: u32,
+    task_start: u64,
+) -> Result<Binding, WorkerError> {
+    use crate::profile_channel::Mode;
+    if record.mode != Mode::System
+        || record.owner_pid != helper_pid
+        || record.child_pid != task_pid
+        || record.child_start != task_start
+        || record.nonce != challenge[8..40]
+        || record.binding.digest != challenge[40..72]
+        || record.binding.session != challenge[72..88]
+        || record.binding.generation.to_be_bytes() != challenge[88..96]
+        || record.binding.invocation != challenge[96..112]
+        || record.binding.epoch.to_be_bytes() != challenge[112..120]
+    {
+        return Err(WorkerError::Peer);
+    }
+    record.encode().map_err(|_| WorkerError::Protocol)?;
+    Ok(Binding {
+        nonce: record.nonce,
+        digest: record.binding.digest,
+        epoch: record.binding.epoch,
+        session: record.binding.session,
+        generation: record.binding.generation,
+        invocation: record.binding.invocation,
+        server_pid: record.owner_pid,
+        server_start: record.owner_start,
+    })
 }
 impl RunHandoff {
-    pub(crate) fn exec(self, command: &mut std::process::Command) -> Result<(), WorkerError> {
-        self.permit.exec_run(self.transport, command)
+    pub(crate) fn exec(
+        self,
+        command: &mut std::process::Command,
+        capsule: Option<&[u8]>,
+        config: &std::fs::File,
+        image: &std::fs::File,
+        assets: Option<&std::fs::File>,
+    ) -> Result<(), WorkerError> {
+        match (&self.transport.profile, capsule, assets) {
+            (Some(extension), Some(bytes), Some(_)) => {
+                let decoded = crate::profile_channel::Capsule::decode(
+                    bytes,
+                    &extension.record.binding.digest,
+                )
+                .map_err(|_| WorkerError::Protocol)?;
+                if decoded.mode != crate::profile_channel::Mode::System
+                    || decoded.manifest != extension.record.manifest
+                {
+                    return Err(WorkerError::Peer);
+                }
+                let length = config.metadata().map_err(|_| WorkerError::Io)?.len();
+                super::validate_file(
+                    config,
+                    usize::try_from(length).map_err(|_| WorkerError::Protocol)?,
+                    extension.record.binding.digest,
+                )?;
+                use std::os::{fd::AsRawFd, unix::fs::FileExt};
+                if command.get_program()
+                    != std::ffi::OsStr::new(&format!("/proc/self/fd/{}", image.as_raw_fd()))
+                    || command
+                        .get_args()
+                        .ne(["run", "-c", "stdin:"].map(std::ffi::OsStr::new))
+                {
+                    return Err(WorkerError::Peer);
+                }
+                let mut input = config.try_clone().map_err(|_| WorkerError::Io)?;
+                use std::io::Seek;
+                input
+                    .seek(std::io::SeekFrom::Start(0))
+                    .map_err(|_| WorkerError::Io)?;
+                command.stdin(std::process::Stdio::from(input));
+                let mut hash = sha2::Sha256::new();
+                use sha2::Digest;
+                let mut offset = 0;
+                let mut buffer = [0; 16384];
+                let size = image.metadata().map_err(|_| WorkerError::Io)?.len();
+                if size == 0 || size > crate::BinarySnapshot::MAX_SIZE {
+                    return Err(WorkerError::Limit);
+                }
+                while offset < size {
+                    let n = image
+                        .read_at(&mut buffer[..(size - offset).min(16384) as usize], offset)
+                        .map_err(|_| WorkerError::Io)?;
+                    if n == 0 {
+                        return Err(WorkerError::Peer);
+                    }
+                    hash.update(&buffer[..n]);
+                    offset += n as u64;
+                }
+                let record = crate::profile_channel::ExecDelivery {
+                    launch: extension.record,
+                    image: hash.finalize().into(),
+                    image_bytes: size,
+                    config_bytes: u32::try_from(length).map_err(|_| WorkerError::Limit)?,
+                };
+                let readonly_image =
+                    std::fs::File::open(format!("/proc/self/fd/{}", image.as_raw_fd()))
+                        .map_err(|_| WorkerError::Io)?;
+                let readonly_config =
+                    std::fs::File::open(format!("/proc/self/fd/{}", config.as_raw_fd()))
+                        .map_err(|_| WorkerError::Io)?;
+                super::validate_file(&readonly_image, size as usize, record.image)?;
+                let deadline = Instant::now() + std::time::Duration::from_secs(1);
+                setup(&extension.handoff, deadline)?;
+                send_packet(
+                    &extension.handoff,
+                    &record.encode().map_err(|_| WorkerError::Protocol)?,
+                    &[readonly_image.as_fd(), readonly_config.as_fd()],
+                )?;
+                receive_packet(
+                    &extension.handoff,
+                    &record.ack().map_err(|_| WorkerError::Protocol)?,
+                    extension.record.owner_pid,
+                    0,
+                    0,
+                    deadline,
+                )?;
+            }
+            (None, None, _) => {}
+            _ => return Err(WorkerError::Peer),
+        }
+        self.permit.exec_run(self.transport, command, assets)
     }
 }
 
@@ -311,9 +596,50 @@ fn receive_verified_transport(
     if size != FRAME {
         return Err(WorkerError::Protocol);
     }
+    let profile = if &record[..8] == b"YNKEXT01" {
+        let launch = crate::profile_channel::LaunchRecord::decode(
+            &record,
+            crate::profile_channel::Mode::System,
+        )
+        .map_err(|_| WorkerError::Protocol)?;
+        let pid = std::process::id();
+        let start = crate::helper::native_profile_channel::process_start(pid)
+            .map_err(|_| WorkerError::Peer)?;
+        let binding = profile_binding(launch, challenge, helper_pid, pid, start)?;
+        let mut rights = receive_packet(socket, &record, helper_pid, 0, 1, deadline)?;
+        let channel = rights.pop().ok_or(WorkerError::Protocol)?;
+        setup(&channel, deadline)?;
+        let peer = net::sockopt::socket_peercred(&channel).map_err(|_| WorkerError::Peer)?;
+        if peer.pid.as_raw_pid() as u32 != helper_pid || !peer.uid.is_root() {
+            return Err(WorkerError::Peer);
+        }
+        let sealed = super::sealed_config(&record)?;
+        send_packet(
+            socket,
+            &launch.ack().map_err(|_| WorkerError::Protocol)?,
+            &[],
+        )?;
+        let (size, _) =
+            net::recv(socket, &mut record, RecvFlags::PEEK).map_err(|_| WorkerError::Io)?;
+        if size != FRAME || record != binding.record()? {
+            return Err(WorkerError::Peer);
+        }
+        Some(ProfileExtension {
+            record: launch,
+            launch: sealed,
+            channel,
+            handoff: rustix::io::fcntl_dupfd_cloexec(socket, 3).map_err(|_| WorkerError::Io)?,
+        })
+    } else {
+        None
+    };
     let binding = bound_record(&record, challenge, helper_pid)?;
     let roles = receive_roles(socket, &binding, deadline)?;
-    Ok(VerifiedTransport { roles, binding })
+    Ok(VerifiedTransport {
+        roles,
+        binding,
+        profile,
+    })
 }
 
 /// Неподделываемый production gate: конструкторов и caller bool нет.
@@ -329,9 +655,14 @@ impl ProductionPermit {
         self,
         transport: VerifiedTransport,
         command: &mut std::process::Command,
+        assets: Option<&std::fs::File>,
     ) -> Result<(), WorkerError> {
         use std::os::{fd::AsRawFd, unix::process::CommandExt};
-        let VerifiedTransport { roles, binding } = transport;
+        let VerifiedTransport {
+            roles,
+            binding,
+            profile,
+        } = transport;
         if roles.record != binding.record()? {
             return Err(WorkerError::Protocol);
         }
@@ -352,6 +683,42 @@ impl ProductionPermit {
                 roles.server_pidfd.as_raw_fd().to_string(),
             )
             .env("YONIK_NATIVE_BROKER_BINDING", hex);
+        // Дополнительные locators принадлежат только authenticated full-profile
+        // ветке. Frozen роль и её прежние три переменные не меняются.
+        let profile_peer = if profile.is_some() {
+            Some(
+                rustix::io::fcntl_dupfd_cloexec(&roles.server_pidfd, 3)
+                    .map_err(|_| WorkerError::Io)?,
+            )
+        } else {
+            None
+        };
+        if let Some(extension) = &profile {
+            let root = assets.ok_or(WorkerError::Peer)?;
+            let peer = profile_peer.as_ref().ok_or(WorkerError::Peer)?;
+            command
+                .env("LANG", "C")
+                .env(
+                    "YONIK_PROFILE_CONTROL_FD",
+                    extension.channel.as_raw_fd().to_string(),
+                )
+                .env(
+                    "YONIK_PROFILE_LAUNCH_FD",
+                    extension.launch.as_raw_fd().to_string(),
+                )
+                .env("YONIK_PROFILE_PEER_PIDFD", peer.as_raw_fd().to_string())
+                .env("YONIK_PROFILE_ASSET_ROOT_FD", root.as_raw_fd().to_string());
+            for fd in [
+                extension.channel.as_fd(),
+                extension.launch.as_fd(),
+                peer.as_fd(),
+                root.as_fd(),
+            ] {
+                let flags = rustix::io::fcntl_getfd(fd).map_err(|_| WorkerError::Io)?;
+                rustix::io::fcntl_setfd(fd, flags & !rustix::io::FdFlags::CLOEXEC)
+                    .map_err(|_| WorkerError::Io)?;
+            }
+        }
         for fd in [&roles.channel, &roles.server_pidfd] {
             let flags = rustix::io::fcntl_getfd(fd).map_err(|_| WorkerError::Io)?;
             rustix::io::fcntl_setfd(fd, flags & !rustix::io::FdFlags::CLOEXEC)
@@ -384,6 +751,23 @@ pub(crate) fn handoff_verified_run(
     deadline: Instant,
     retain: impl FnOnce(crate::helper::native_bootstrap::RuntimeScopeStamp),
 ) -> Result<(), WorkerError> {
+    handoff_verified_profile_run(
+        run, socket, roles, binding, pid, uid, deadline, None, retain,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Отдельный extension не расширяет frozen роли.
+pub(crate) fn handoff_verified_profile_run(
+    run: crate::helper::native_bootstrap::RunRole,
+    socket: &OwnedFd,
+    roles: Roles,
+    binding: &Binding,
+    pid: u32,
+    uid: u32,
+    deadline: Instant,
+    extension: Option<(crate::profile_channel::LaunchRecord, OwnedFd)>,
+    retain: impl FnOnce(crate::helper::native_bootstrap::RuntimeScopeStamp),
+) -> Result<(), WorkerError> {
     run.validate().map_err(|_| WorkerError::Peer)?;
     let (nonce, session, generation, invocation, epoch, digest) =
         run.context().map_err(|_| WorkerError::Peer)?;
@@ -397,6 +781,35 @@ pub(crate) fn handoff_verified_run(
         return Err(WorkerError::Peer);
     }
     retain(run.into_guard());
+    if let Some((record, channel)) = extension {
+        if record.mode != crate::profile_channel::Mode::System
+            || record.owner_pid != binding.server_pid
+            || record.owner_start != binding.server_start
+            || record.child_pid != pid
+            || record.nonce != binding.nonce
+            || record.binding.digest != binding.digest
+            || record.binding.session != binding.session
+            || record.binding.invocation != binding.invocation
+            || record.binding.generation != binding.generation
+            || record.binding.epoch != binding.epoch
+        {
+            return Err(WorkerError::Peer);
+        }
+        setup(socket, deadline)?;
+        send_packet(
+            socket,
+            &record.encode().map_err(|_| WorkerError::Protocol)?,
+            &[channel.as_fd()],
+        )?;
+        receive_packet(
+            socket,
+            &record.ack().map_err(|_| WorkerError::Protocol)?,
+            pid,
+            uid,
+            0,
+            deadline,
+        )?;
+    }
     transport_send(socket, roles, binding, pid, uid, deadline)
 }
 fn transport_send(
@@ -427,6 +840,48 @@ fn transport_send(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_extension_binding_is_mode_task_and_epoch_exact() {
+        use crate::profile_channel::{Binding as ProfileBinding, LaunchRecord, Mode};
+        let record = LaunchRecord {
+            mode: Mode::System,
+            nonce: [1; 32],
+            binding: ProfileBinding {
+                session: [2; 16],
+                invocation: [3; 16],
+                digest: [4; 32],
+                generation: 5,
+                epoch: 6,
+            },
+            owner_pid: 7,
+            child_pid: 8,
+            owner_start: 9,
+            child_start: 10,
+            manifest: [11; 32],
+        };
+        let mut challenge = [0; 128];
+        challenge[8..40].copy_from_slice(&record.nonce);
+        challenge[40..72].copy_from_slice(&record.binding.digest);
+        challenge[72..88].copy_from_slice(&record.binding.session);
+        challenge[88..96].copy_from_slice(&record.binding.generation.to_be_bytes());
+        challenge[96..112].copy_from_slice(&record.binding.invocation);
+        challenge[112..120].copy_from_slice(&record.binding.epoch.to_be_bytes());
+        assert!(profile_binding(record, &challenge, 7, 8, 10).is_ok());
+        for i in 8..120 {
+            let mut bad = challenge;
+            bad[i] ^= 1;
+            assert!(profile_binding(record, &bad, 7, 8, 10).is_err());
+        }
+        for (helper, pid, start) in [(6, 8, 10), (7, 9, 10), (7, 8, 11)] {
+            assert!(profile_binding(record, &challenge, helper, pid, start).is_err());
+        }
+        let mut local = record;
+        local.mode = Mode::Local;
+        local.child_pid = 0;
+        local.child_start = 0;
+        assert!(local.encode().is_ok());
+        assert!(profile_binding(local, &challenge, 7, 8, 10).is_err());
+    }
     #[test]
     #[ignore = "Требуется разрешённый uid_map в собственном userns; отдельный runtime gate"]
     fn verified_transport_userns_roundtrip() {

@@ -7,6 +7,13 @@ use yonik_linux::{
     system_client::{ClientError, PreparedOutput, State, SystemClient},
 };
 
+pub(crate) fn ensure_engine_available(engine: Engine) -> Result<(), ClientError> {
+    match engine {
+        Engine::Xray => Ok(()),
+        Engine::SingBox => Err(ClientError::Unsupported),
+    }
+}
+
 /// Ревизии выдаёт GUI host при каждом изменении выбора или источника.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileRevision {
@@ -85,6 +92,7 @@ impl SystemSession {
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<(), ClientError> {
+        ensure_engine_available(engine)?;
         self.fence(revision)?;
         self.prepared = None;
         // Публичная блокировка не означает активную сессию: admission проверяет helper.
@@ -117,6 +125,7 @@ impl SystemSession {
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<(), ClientError> {
+        ensure_engine_available(engine)?;
         self.fence(revision)?;
         self.prepared = None;
         let legacy_available = self
@@ -140,6 +149,30 @@ impl SystemSession {
             .await?;
         self.prepared = Some(
             PreparedOutput::bind(prepared, engine, &self.log, revision.generation)
+                .map_err(|_| ClientError::Unavailable)?,
+        );
+        Ok(())
+    }
+    pub async fn prepare_full_profile(
+        &mut self,
+        revision: ProfileRevision,
+        request: &yonik_linux::helper::profile_intent::FullProfileRequest,
+        deadline: Instant,
+        cancel: Cancellation,
+    ) -> Result<(), ClientError> {
+        self.prepared = None;
+        self.fence(revision)?;
+        cancel.check().map_err(|_| ClientError::Cancelled)?;
+        yonik_linux::full_profile_request_preflight(yonik_linux::FullProfileMode::System, request)
+            .map_err(|_| ClientError::Unsupported)?;
+        let prepared = self
+            .client
+            .prepare_full_profile(request, deadline, cancel.clone())
+            .await?;
+        cancel.check().map_err(|_| ClientError::Cancelled)?;
+        self.fence(revision)?;
+        self.prepared = Some(
+            PreparedOutput::bind(prepared, Engine::Xray, &self.log, revision.generation)
                 .map_err(|_| ClientError::Unavailable)?,
         );
         Ok(())

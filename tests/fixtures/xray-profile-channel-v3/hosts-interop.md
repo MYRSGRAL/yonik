@@ -1,0 +1,522 @@
+# PURE_STATEFUL_INTEROP: HOSTS
+
+## R96 actual pair: nested parent проходит, Source Acquire12 RED
+
+Base669345e3, exact patch3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339.
+Actual pending после Published2 теперь43, independent waiter создан и parent57
+получает настоящий ACK58 (parent_used2, waiter_parent_bound=true). R95 Physical36
+slot до37 и Direct2/Publish1 settlement сохранены; Known producer/parent/waiter
+settlement и terminal counter assertions добавлены в test-only bridge.
+
+Следующий отказ — actual Rust Deny56 на Acquire55 query12/service7 для UDP waiter,
+после Probe→Grant7. Перед этим Source budget used42014/limit58419 Local, planner
+PLAN_BYTES16384 оставляет21 byte без новой query/context metadata. Peer/owner
+валидны, source epoch/deadline не изменялись. Source parent_lease создаёт новую
+prepaid query (native_bootstrap_binding.rs), question вызывает retained planner;
+новая metadata и16KiB не помещаются одновременно. Это не прежний Go cap64:
+после отказа pending54, parent binding уже ACKed. Production Rust/Go не менялись.
+
+Матрица47 выполнена на exact SUT: прежние35 GREEN сохранены, четыре positives
+и восемь downstream negatives/held-ACK остаются RED/unreached до waiter Reserve/
+Numeric17. Evidence p5-france-compose/current содержит actual55/Deny56 и Source
+budget snapshots всех четырёх Acquire, source/compiler/ELF preexecution hashes.
+Нужна отдельная scoped Source memory/lifetime correction без повышения caps/
+fixture limits и без удаления revalidation/planning. FranceReady/runtime PASS нет.
+
+## R95 actual pair: вложенный DatagramParent precredit RED
+
+Base9e995134, production patch3003bf774c389b2c804747239f078c2b4efdecd2763a9452476a857df3591b1b.
+Direct/Result setup settlement проверяется на actual36/37/39/41: Physical36
+не возвращает slot,37 даёт первый settled,39 второй; Publish даёт один.
+Terminal cleanup сохраняет settled2/1, повторные normal ticks не меняют нулевой
+operations. Frozen production source1307 members совпадает с R95 fresh apply;
+overlay только test-only, никакие ACK не scripted.
+
+Все прежние35 GREEN сохранены. Четыре positives достигают двух Published41;
+pending теперь55 вместо61. Затем actual network waiter создаётся (+9), но его
+вложенный profileBindDatagramParent требует ещё3: measured pending64/operations62,
+waiter_created=true, waiter_parent_bound=false, parent_used=1 (только producer
+parent). Ни второй57, ни waiter service/context/Reserve/Numeric не отправлены.
+Точный guard — profile_bootstrap_datagram_linux.go:69; caller —
+profile_dns_frontier_linux.go:1627 после waiter reservation:1604.
+
+Это новый bounded nested-credit gap: 55+9+3=67>64, не Rust memory refusal.
+Caps/history/memory/FD не увеличены; TCP не закрывался для освобождения credits.
+Двенадцать positives/downstream negative cases остаются RED/unreached, включая
+held-ACK/full same-session UDP Numeric/send. Evidence p5-france-final/current
+содержит47 traces, measured events и compiler/source/ELFs до execution.
+Нужна отдельная Go correction композиции precredits; production здесь не менялся.
+FranceReady/runtime/installed PASS отсутствуют.
+
+## FranceSS: обе ветки в одной session/CODEC5
+
+Base `f5ef5c88e1388a702a54fb22ced0d0cae2e236d3`, production Go patch
+`6e1e0f0ee6c0e48f7b77a1e858e594277a8f515d8267c0bdff2f47e7d8a24791`.
+Ни production Go/Rust semantics, ни registry/build pins не меняются. Overlay
+только добавляет новые tagged/test members; исходные1307 members byte-exact.
+
+`native_france_interop_tests` импортирует полный FranceSS из seven fixture,
+использует ОДИН compiler result (включая probe credentials), его config digest,
+capsule/manifest, launch/snapshot/source epoch для обоих carriers. Независимые
+TCP5 и Datagram5 protected records — явно injected test facts. Три view каждого
+scope создаёт actual BootstrapBinding/shared planner, Channel только доставляет
+их actual serialized run_issuer. Image/Peer/Source custody/route kernel facts
+здесь leaf fakes; это не protected install/current-image measurement.
+
+Go bridge имеет одну admission, actual DNSNEG02/DNSACK02 schema5 exchange и один
+ProfileRuntime/flow actor. TCP и UDP вызывают actual SS Client.Process с AES128GCM
+account/server из exact bound config. Thin policy/link/client constructor без
+core.New/NewClient; TCP Dialer interface заменяет только transport/raw IO и вызывает
+actual ProfileCheckDial/ProfileCheckTransport/ProfileDialBootstrap. Registered
+internet TCP transport/DefaultSystemDialer и реальные sockets НЕ исполняются.
+UDP использует actual private factory/managed tasks/member/send path. SS ciphertext
+не выдаётся за DNS transcript. Полный stream fingerprint6eef…053a сохранён.
+
+Пропущены USER admission/HELLO и kernel proof transport: общий explicit preseed
+даёт USER UDP(flow/grant1) и TCP(flow/grant2), distinct immutable originals/tuples,
+System Known20ms или Local ownerNone. USER ID watermark2 ОТДЕЛЬНО от runtime wire
+watermark2 после ADMIT_ACK; первая bootstrap sequence3. Их reserved request2 —
+preseed marker, не relayed AUTHORIZE. Ни один bootstrap ACK не scripted: 55/56,
+35/36,40/41,53/54,42/19,57/58 и cleanup выдаёт противоположный SUT.
+
+TCP SS второй payload ждёт полного UDP cleanup. Intermediate event допускается
+только после actual ACK9 всех UDP bindings, пока TCP permission не закрыта;
+затем actual SS write проходит native parent+permission gate. Один fake TCP open
+и один UDP send; USER close34, permission close34 и cancel48 namespaces проверяются
+отдельно. В конце обе USER seed routes также retired real ACKs, нет live routes/
+contexts/receipts/grants/tasks/association custody. History/metadata release только
+при завершении test process, compaction/long-lived readiness не заявлены.
+
+Cases для Local и System: france-hosts-positive, parent-cancel, second-send,
+missing-tcp-scope, missing-udp-scope (System prefix system-). Crossbranch attempts
+выполняются в каждом admitted case и не достигают IO. Missing TCP Source5:
+actual55 Deny, TCP open0, UDP сосед допустим. Missing UDP Source5: actual factory
+не mint producer, setup5 без ACK/no fallback; отказ ДО USER preseed/effects,
+0 permissions/opens/routes. Test control сообщает этот реальный отказ другому
+bridge, не создавая ACK. Positive namespace oracle проверяет один launch/admission/
+descriptor, full settings/fingerprint, distinct paths, own waiter query→member→
+carrier и все observed cleanup barriers. Три независимых pins5 не открываются.
+
+## FranceSS NETWORK same-session: production memory RED
+
+### Следующий memory cut (после000c485)
+
+Исторический Deny41 ниже устранён production Rust representation/lifetime fix.
+Producer хранит exact-length members и destinations, не максимальные массивы;
+capture удерживает только request/response. Lease оплачивает копию до allocation,
+пик fixed Answer→compact учитывает оба buffers. Query original хранится как
+immutable exact bytes с Arc lifetime и оплаченной Arc metadata. Parser разделяет
+CNAME ownership phase и заполнение Answer; Source/transcript reparse не удалён.
+Перед вторым Publish used теперь40709 вместо46414 при том же limit58419 Local.
+
+Actual pair теперь получает **два Allow41**, но positive joint всё ещё RED по
+новому Go blocker: после второго Publish read-only event показывает operations59,
+profilePendingUsed61/cap64. Следующий profileAcquireNetworkWaiter требует9,
+61+9=70>64 (profile_dns_frontier_linux.go:1600). Memory995536+5900364+32768
+помещается в8388608, history68 также не исчерпан. Frozen Go не изменялся; event
+из overlay только читает state после настоящего ACK. Artificial release/early
+close/credits override не выполняются. Для завершения второго waiter/Numeric
+требуется отдельная Go pending representation/lifetime correction с сохранением
+precredits cleanup/cancel; версия wire/caps не меняется.
+
+Foreign-member oracle теперь требует actual UDP Numeric42 и Deny19, поэтому
+ранний unrelated Unsupported не засчитывается как проверка чужого member.
+После Go correction повторить все47 selectors. ROOT memory RED и новый Go RED
+хранятся отдельно; evidence нового cut — p5-france-memory/current. Это не полный
+same-session NETWORK GREEN и не FranceReady/runtime acceptance.
+
+Base a2f93b3e130a4fea17e4d578e6d07d61d61384af. Production Go по-прежнему exact6e1,
+1307 members неизменны; production Rust также неизменён. Семантика теста такая
+же, как HOSTS выше, но snapshot DNS-first: обе ветки используют actual NETWORK
+service/context→Physical/Logical→captured exchange→Publish→own waiter→Numeric.
+Resolver TCP6 и UDP17 независимы от original carriers6/17.
+
+Leaf IO теперь имеет два фиксированных exchange-owned slots. Capacity проверяется
+до create; каждый slot удерживает собственные socket/duplicate/response и sent
+fence. Duplicate lookup выполняется по exact socket identity; send по exact
+duplicate identity, повторный send запрещён. Runtime credits до factory остаются
+production. Строка fr.example.invalid. проверяется только внутри fake DNS peer;
+никаких issuer ACK в leaf/relay нет. Rust fake kernel producer выдаёт собственный
+bounded monotonic cookie/local endpoint каждому socket, не выводя их из child
+PhysicalBind. Исходный cookie101 для обоих sockets корректно отвергался guard
+native_dns_transport.rs; этот harness RED и исправление сохранены отдельно.
+
+Четыре positives (Local/System × resolverTCP/UDP) сейчас **RED**, не acceptance:
+TCP branch получает actual Published/Waiter/Numeric, открывает fake TCP; UDP
+branch получает own57/58/service/context/Physical/Logical, но второй Publish40
+получает Deny41. До Publish dynamic used46414, limit58419(Local)/58399(System).
+SCRATCH17968 уже даёт64382, то есть не помещается даже без нового Producer credit.
+Production publish_dns одновременно резервирует Producer+BootstrapPublication+
+capture (native_dns_rrset.rs:710–722) и parser scratch (:724). Парсер валидных
+request/response сам по себе PASS; grants/Source checks не удалялись. Первый TCP
+owner намеренно остаётся live для независимой соседней ветки. Бюджеты/caps/fixture
+limits НЕ увеличены. Точный минимальный production вопрос — убрать лишнее
+удержание/дублирование либо изменить законный lifetime оплаченных данных, сохранив
+оба live permissions и все Source/transcript/parser/revalidation fences. Это
+вне test-only ownership; production исправление здесь не выполняется.
+
+Четыре wrong-question cases проходят: испорчен только ответ второго fake DNS
+peer. Production Go strict parser не отправляет второй Publish; нет UDP DATA/
+waiter/member permission/open/send. TCP сосед выполняет второй actual SS write
+после real UDP context/binding cleanup, затем обе branches/USER seeds закрываются
+с нулевой active custody. Oracle независимо проверяет два Physical/Logical,
+own proof/revision/query и настоящие Proof/Resource/reservation/context/parent/
+service ACK barriers. Исходные31 cases проходят на тех же финальных test ELF.
+
+Новые selectors: [system-]france-network-{tcp,udp}-{positive,wrong-question};
+test-only ветки foreign-member/parent-cancel/second-send/late-ack также реализованы,
+но их финальная проверка блокируется более ранним вторым Publish. Held Resource
+ACK берётся только от Rust, удерживается через normal ticks, проверяет custody
+и отдаётся тому же production accept; до устранения RED покрытие НЕ заявлено.
+Crossbranch permission attempts сохранены; положительная same-session NETWORK
+acceptance и полный FranceReady отсутствуют.
+
+Evidence `/home/myrs/projects/yonik/local/orchestration/evidence/p5-france-network`
+содержит current source/compiler/test ELFs до execution,39 traces/results,
+red-cookie и red-second-publish. Повтор (после production correction):
+`python tools/hosts_stateful_interop.py --rust <current/rust.test> --go
+<current/go.test> --case france-network-udp-positive --output <result.json>`.
+Обычный HOSTS case использует те же ELF. Classification PURE_STATEFUL_INTEROP;
+USER/HELLO/Consumed/kernel/route/IO facts остаются injected, install/runtime PASS нет.
+
+## NETWORK UDP после namespace correction8bdac3c: joint GREEN
+
+Base `1ccad0fcad12b70b9a8bad5eb77948a49e76f512`, exact production patch
+`6e1e0f0ee6c0e48f7b77a1e858e594277a8f515d8267c0bdff2f47e7d8a24791`.
+Один изменённый native member относительно2619814, всего1307. Go `bindingIDs`
+возвращает terminal **position**, Rust exact `physical_hop` guard не менялся.
+Production patch/pins не изменены этим harness commit; новая исполняемая
+регрессия помещена в test-only overlay, чтобы сохранить exact6e1 source pin.
+
+`TestPurePhysicalPathRowUsesPositionNotScope` реально получает Raw192 из
+NETWORK constructor при frontier.scope1/count1 для resolver6/17 и проверяет
+pathRow0. Отдельно выполняет тот же Direct getter с count1 и scopes1/7/511;
+это DATA getter regression, не выдача Direct USER capability. На старом28a
+producer оба Raw cases и Direct case RED; на6e1 GREEN. Unit ACK fixtures только
+инициализируют этот отдельный unit test; в joint stdio cases ACK не scripted.
+
+NETWORK Local/System × captured resolver TCP6/UDP17 проходят весь actual путь
+57/58→service/context→Physical/Logical→private DNS exchange→strict Publish→
+independent parent/service/context/waiter→Numeric17→actual SS Client.Process→
+один fake connected UDP send→consuming close/task join→Known cleanup.
+Original SS carrier17 отделён от resolver transport. System injected socket
+facts используют mark42 из synthetic System plan, Local — mark0; прежний
+stdio leaf ошибочно задавал0 обоим modes. Authorizer mark guard не ослаблен.
+
+Матрица21 cases: четыре NETWORK positives, wrong question/member, original USER
+parent cancellation, второй packet в том же SS caller, delayed actual Resource
+ACK, плюс все12 прежних cases. Wrong question останавливается до Publish/DATA;
+foreign member — до original permission/factory. После original-parent cancel
+retired также исходная USER seed route, остальные cases оставляют её явно live.
+Source/Transcript/Release — отдельные factory5 views с injected reviewed records.
+Actual peer/image/USER/Consumed/kernel/route/I/O/manager admission по-прежнему
+test leaves; успешный pair не является actual System admission или OS proof.
+
+Cleanup oracle проверяет actual Proof ACK перед Resource Retire, zero-ref/joined
+Retired ACK, reservation/exchange/context/binding9 ACK перед service Close32.
+Late-ACK case удерживает полученный от Rust Resource46 в Go bridge, проверяет
+custody через три normal ticks, затем передаёт **тот же** packet actual accept.
+No fake ACK/KnownClosed, no caps/fixture budget increase, no original deadline
+renewal. `transport.started == Exchange Reserve.sent` проверяется actual Go
+state; conservative issuer Reservation anchor и transcript recheck сохранены.
+
+Evidence `/home/myrs/projects/yonik/local/orchestration/evidence/p5-udp-network-retry`
+содержит RED regression, exact native source/compiler/test ELFs до execution,
+joint traces, commands и commit binding. Также собран fresh production main ELF
+`xray.compile-only` из exact6e1 source, **никогда не исполнявшийся**. Это не builder
+candidate/install record и не authority. Protected5 pins/FranceSS readiness и
+runtime/public gates не расширены. Ниже сохранена история предшествующего RED.
+
+## UDP NETWORK2619814: actual pair RED на PhysicalBind.pathRow
+
+Base `bafe4b4550879eb8e5d2f55f0797aac92a3f6ba5`; producer
+`2619814825cbf97591c3c87974637d0d1a9392bd`, patch SHA256
+`28a5644ab84d2a2972db6c04f6da81b6a358d242c053fa122e2df4780c681f24`.
+1307 exact native members:1302 byte-exact к предыдущему1305-member HOSTS tree,
+три reviewed shared files изменены, два NETWORK files добавлены. Overlay только
+добавляет пять прежних test destinations, existing members не заменяются.
+
+Новые strict cases `udp-network-{udp,tcp}-positive` и оба `system-` варианта
+исполняют real57/58→Probe20→55/56→Exchange35/36→Physical35/36→raw52.
+Далее joint pipeline **не проходит**: raw192.pathRow@162=1, helper retained
+physical_hop=0. Go `profileDNSDirect.bindingIDs` возвращает `n.frontier.scope`
+(`common/yonikbroker/profile_dns_direct_linux.go:548`), `dnsDirectPhysical`
+записывает это в@162. Rust `bootstrap_binding` в `native_dns_roots.rs` сохраняет
+`terminal.index`, а `native_dns_transport.rs::match_dns_physical` сравнивает
+@162 с этим retained index. Single SS UDP scope=1, checked path position=0;
+прежний VLESS TCP scope=0 маскировал несовпадение namespaces.
+
+Все четыре actual NETWORK positives сохраняют RED на этом guard до ACK37,
+Logical38, private exchange/Publish, independent waiter/Numeric/send. Нельзя
+считать следующие этапы покрытыми, если peer ещё не получил PhysicalAck.
+Helper получает actual Raw52 с virtual FD/kernel facts, вызывает actual
+factory5 Source/Wire/Release; ответ37 не фабрикуется. Caps не увеличены, packet
+не нормализуется, reference guard не убран. Root требуется согласованный scoped
+production fix producer/consumer namespace; ownership этого harness его не включает.
+Trace и exact source/compiler/ELFs сохранены в
+`/home/myrs/projects/yonik/local/orchestration/evidence/p5-udp-network-pair`.
+Unknown custody на отказе сохраняет USER/service/resolver routes; это не Known cleanup.
+
+Для продолжения после fix готовы test-only adapters: actual SS consuming caller,
+factory5 retained planner со snapshot DNS-first, resolver TCP6 (`usevc`) либо UDP17,
+exact framed DNS peer IO, Source/transcript/release5 и actual-negotiation-bound
+Physical receiver. `Stdio` выводит retained context/hop/custody диагностику только
+после actual issuer result; не вмешивается в decision. Новые cases
+`udp-network-udp-{wrong-question,foreign-member,parent-cancel,replay}` и
+`udp-network-tcp-late-ack` остаются strict, не xfail; за Physical52 пока не покрыты.
+Поздний ACK helper уже реализован: удерживает **полученный** Resource46, проверяет
+custody через normal tick и затем передаёт тот же ACK actual Go accept. Анализатор
+проверяет Proof ACK до Resource retire и parent9 ACK до service Close32;
+hold/release события не пересылаются другому SUT и не создают ACK/authority.
+
+Все12 прежних cases (пять UDP HOSTS + семь TCP) GREEN на этом exact2619814 ELF.
+Это подтверждает сохранение их прежнего subset, но не NETWORK UDP readiness.
+Source5 pins/FranceSS/public readiness не меняются. Классификация только
+PURE_STATEFUL_INTEROP, без runtime/OS/socket/kernel/install acceptance.
+
+## UDP HOSTS: отдельный CODEC5 pair после R89
+
+База Rust `0641f995cc279c9c0f76a9a469bea06ad34218d8`; Go SUT — exact
+`04fda581e1c69b432d0196bf2b25b62da66b6315`, profile patch SHA256
+`6a0bd7327e27e20b64dc89922110816e0a27ea8c754b9648a2d6e3d9559b6e52`.
+1305 native members восстановлены из retained official tree с обратным применением
+1e65 patch и чистым применением 04fda patch. Все1299 прежних members и6 новых
+сопоставляются по hashes до/после overlay и test execution. Ни один existing
+native member не заменяется overlay; production Rust/Go, reviewed pins и gates
+не меняются. NETWORK UDP2619814 — следующий отдельный pair, не результат этого cut.
+
+Новые `datagram-interop-{bridge,external}_test.go` включаются только в test binary.
+`datagram-interop-ss.go` — **добавленный**, а не заменяющий source member, build tag
+`yonikpureinterop`, пакет shadowsocks. Он конструирует Client с fake policy/link
+без core.New/NewClient и вызывает неизменённый actual `Client.Process`: AES-GCM
+UDP encoder, `ProfileBootstrapDatagramPayloadSize`, private dial, context binding,
+две consuming tasks и deferred Close. External test package устраняет import cycle
+с private broker fixture. Tag не используется production builder.
+
+Новые overlay destinations относительно exact source:
+`common/yonikbroker/datagram-interop-bridge_test.go`,
+`common/yonikbroker/datagram-interop-external_test.go`,
+`proxy/shadowsocks/datagram-interop-ss.go`; сохраняются оба прежних overlay files.
+Compile-only команда с прежними offline/cache env и абсолютным overlay:
+`go test -p=1 -mod=readonly -tags=yonikpureinterop -overlay=... -c -o ... ./common/yonikbroker`.
+Relay автоматически выбирает named external test
+`TestPureStatefulDatagramHostsSSStdioBridge`, Rust endpoint прежний.
+
+Cases: `udp-hosts-positive`, `system-udp-hosts-positive`,
+`udp-hosts-foreign-member`, `udp-hosts-parent-cancel`, `udp-hosts-replay`.
+Positive выполняет real57/58→55/56→35/36→40/41→independent57/58→55/56→35/36→53/54→42/19,
+один fake connected UDP owner, один actual SS encoded send и join двух tasks.
+Replay подаёт второй packet в тот же открытый actual SS caller: второй Write
+отвергается, factory/send остаются1; второй physical open также отвергается.
+Foreign member мутирует только outbound Numeric42 DATA и получает actual Deny19
+до factory. Parent-cancel закрывает **исходный USER grant**, а не только derived
+waiter binding; consuming gate не допускает factory, actual Close32 USER ждёт
+оба cancel9 ACK. Остальные случаи сохраняют исходный USER seed как live neighbor.
+
+Rust использует общий production factory core `BootstrapBinding::create_for`,
+вызываемый `prepare_datagram`, с injected PeerCustody/SourceOwner/explicit reviewed5
+record. Реальные Local/System OS custody wrappers не вызываются. Planner,
+Source checks, launch/config/capsule/snapshot binding и serialized `run_issuer`
+не подменены. Descriptor5/ACK выдают противоположные SUT; fallback4 отсутствует.
+Source/Wire/Release5 review pins остаются None.
+
+Явно пропущены USER admission/HELLO, protected install/image OS custody и UDP
+control/kernel proof exchange. Общий preseed задаёт grant=flow=revision=1,
+original USER endpoint203.0.113.9:443/UDP, initiator192.0.2.1:32001→ingress127.0.0.1:1082,
+matched Consumed lineage; Go fixture leaf приводится к этим фактам **до**57.
+System Known owner2/id77/20ms — fake facts, не OS attribution. В Rust два owner calls
+относятся только к USER seed; flow0 Source не вызывает owner backend. USER effective
+остаётся requested logical destination, отдельно от SS physical hostname frontier.
+Actual USER authorization этого seed не проверяется данным pair.
+
+Fake datagram owner заменяет только connected socket create/read/write/consuming
+close; socket/netlink/ioctl/SCM/core/main/services не исполняются. Authority ACK,
+permission и KnownClosed не создаются harness. Каждая выдача context/reservation/
+producer/waiter/parent требует соответствующий actual terminal ACK. Анализатор
+отклоняет cancel9 до собственного context8 ACK и USER Close32 до обоих ACK9.
+После cleanup bootstrap routes/contexts/operations retired; единственная USER
+seed route остаётся live, кроме parent-cancel, который закрывает её actual frame.
+Preseed counts выводятся отдельно, не обнуляются ради cleanup assertion.
+
+Evidence: `/home/myrs/projects/yonik/local/orchestration/evidence/p5-udp-hosts-pair`.
+Классификация только PURE_STATEFUL_INTEROP: не runtime/kernel/installed/FranceSS PASS.
+Прежние7 TCP cases прогоняются на том же test ELF с явным descriptor4 selection.
+
+Актуальный результат после root `febd859` и Numeric memory correction:
+все7 cases GREEN, включая NETWORK Publish→Waiter→Numeric→fake original open→
+Known cleanup. Убрана retained копия immutable Binding из Numeric proof;
+observed копирует полный path в exact-length credited Vec вместо максимального
+буфера. Source/transcript reparsing сохранён, caps/fixture limits не повышены.
+Positive: routes=5 суммарно в ledger, original permission=1,
+original factory=1, DNS factory/write/
+close=1, retained routes/services/contexts=0, receiver consumed-close=1.
+Close32 Numeric permission определяется только по actual pending42→Allow19,
+отдельно от service roots: для обоих service Close проверяются все cleanup ACK.
+Предыдущий раздел RED ниже — история диагностики, исправленная этим результатом.
+Evidence: `/home/myrs/projects/yonik/local/orchestration/evidence/p5-numeric-memory`.
+Production Go1e65 ELF переиспользован по hash; protected pins не менялись.
+
+`hosts-interop-bridge_test.go` — test-only Go overlay, компилируемый в пакет
+`common/yonikbroker` из exact root-retained native source archive. Production
+patch/source не изменяются. Rust endpoint — named test
+`pure_stateful_hosts_stdio_bridge`, выполняющий настоящий `run_issuer`.
+
+Запуск после offline compile-only и сохранения source/compiler/test ELF:
+
+Rust compile command внутри собственного locked transient target:
+`cargo +1.85.1 test -p yonik-linux --lib --no-run --locked --offline -j1`.
+Go compile command внутри exact extracted native source, с
+`GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=0` и собственными
+`GOCACHE/GOTMPDIR`:
+`go test -p=1 -mod=readonly -overlay=/absolute/overlay.json -c -o /absolute/go.test ./common/yonikbroker`.
+Overlay JSON содержит только `Replace` одного нового absolute
+`common/yonikbroker/interop_overlay_test.go` на absolute repo fixture
+`hosts-interop-bridge_test.go`. Ни одного production replacement.
+
+```
+python3 -B tools/hosts_stateful_interop.py --rust /absolute/rust.test \
+  --go /absolute/go.test --output /absolute/evidence/result.json
+```
+
+Первый Rust JSON передаёт один canonical capsule/Local launch/snapshot fixture;
+capsule затем передаёт настоящий ADMIT frame. Go `admitProfile` проверяет config,
+capsule и snapshot и выпускает ADMIT_ACK. `setupDNSV2` и Rust setup обмениваются
+настоящими descriptor4/ACK. Relay не создаёт и не подменяет ACK.
+
+Go actual `ProfilePrepareChain` создаёт Source/context55/56, metadata Reserve,
+HOSTS Publish, отдельные waiter context/reservation/receipt и Numeric42.
+Rust serialized dispatch использует настоящую `BootstrapBinding`/shared planner,
+с test-only injected peer/source owner/reviewed Source record и durable backend.
+`ProfileDialBootstrap` требует обе authority gates и вызывает только fake
+`net.Conn` factory. После Close и explicit owner cancel обе стороны выполняют
+настоящий retirement protocol. Socket/syscall factory не используется.
+
+Пропущены HELLO/OS peer authentication, protected install/image validation и
+USER admission: исходный USER parent id=1 явно preseeded; Rust allocator имеет
+тот же watermark. Это условие harness, а не доказательство USER authority.
+Fixture — один raw TCP leaf, hostname `physical.invalid:8443`, один hosts member
+`203.0.113.80`; no TLS/mux/UDP/chain/network DNS. Public gates не меняются.
+
+Relay ограничен 64KiB packet, 140000-byte line, 512 events/8MiB transcript и
+absolute timeout≤60s. При ошибке завершает только собственные test processes.
+Результат классифицируется `PURE_STATEFUL_INTEROP`, не runtime/kernel/installed
+acceptance и не доказательство actual physical open.
+
+`--case foreign-member` меняет только numeric destination последнего42 wire
+packet после Go dispatch: `.80→.81`. Actual Rust issuer должен вернуть Deny,
+actual Go consumer — завершить caller без factory и выполнить cancel cleanup.
+До Numeric ACK положительный прогон также вызывает actual physical gate и
+проверяет отсутствие factory effects.
+
+## System HOSTS без System runtime
+
+`--case system-positive` использует System capsule/`YNKEXT01` с теми же
+snapshot/config/path на обеих сторонах. В init явно передаются USER grant/flow
+watermark=1, policy revision=1, owner kind=2/id=77 и исходный Known=20ms.
+Go проверяет совпадение всего preseed, использует fake proof-channel liveness и
+authenticated setup credentials UID0; actual peer/kernel/OS producers пропущены.
+Rust flow0 Source/backend по-прежнему не вызывает USER owner lookup.
+
+`--case system-parent-expired` сначала получает реальные ACK вплоть до Numeric
+permission. Пока fake clock неподвижен, проверяет live parent, Source capability
+и permission. Caller приостановлен до physical factory; fake clock сдвигается
+ровно к исходному Known expiry (20ms), без wallclock sleep/renewal. Actual
+`ProfileDialBootstrap` обязан отказать до factory; parent deadline не продлевается.
+Derived leases также ограничены исходным Known, поэтому тест не разделяет
+отдельные причины отказа conjunction. Permission/DATA pointers не являются
+authority после expiry. Одна ранее разрешённая route уже установлена и затем
+retired через Close/cancel ACK; ожидаются routes=1, factory=0, owner lookups=0.
+Это consumer-clock expiry test, не проверка kernel freshness и не System runtime.
+Fake Go clock использует фиксированный UTC epoch2100, чтобы real context timers
+не истекали от CPU contention. Known duration остаётся20ms, все actual control
+fences используют injected clock; expiry-сценарий сдвигает именно его.
+
+Queued cancellation/late ACK не добавлены в этот bounded System cut. Cleanup
+Unknown не преобразуется в KnownClosed: тест принимает только фактически
+полученные ответы issuer и проверяет terminal custody, как в Local прогоне.
+
+## Local NETWORK с virtual kernel facts
+
+`network-positive`, `network-wrong-question`, `network-no-permit` используют
+тот же stdio bridge, но snapshot order2 (DNS first), captured UDP peer
+`192.0.2.53:53`, исходный raw TCP hostname frontier `physical.invalid:8443`.
+Actual service20/context55, Exchange/Physical Reserve35, Physical52, Logical38,
+private DNS exchange, strict Publish40 и отдельный waiter/Numeric выполняются
+production actors. Все ответы — от противоположного SUT.
+
+Два новых leaf adapters только test-only: Go consuming socket callbacks
+create/duplicate/read/write/close и Rust `Incoming::fake` с независимыми facts
+local=`192.0.2.10:32001`, remote=`192.0.2.53:53`, UDP, uid997/mark0,
+netns=(4,5), cookie101/inode102. Raw192 передаётся как JSON `physical` event,
+не runtime frame/SCM. Это не actual FD/kernel/namespace custody proof.
+Go private `profileDNSNetworkExchange`, sealed socket owner, request/response
+capture и consuming-close/join actor не заменяются overlay-функциями.
+`network-interop-leaves_test.go` — второй новый virtual test file, production
+replacements в Go overlay отсутствуют. Shared factory использует три отдельно
+injected reviewed scopes и один fake clock origin с issuer; TTL anchor остаётся
+исходным Exchange Reservation.started, не временем Publish.
+
+Fake DNS peer строит A/IN response на настоящий request (ID/options/question),
+TTL30/member `.80`. Wrong-question меняет только DNS response question: Go strict
+parser должен остановить путь до Publish/DATA/Numeric/original factory.
+No-permit отзывает injected resolver permit до Physical Reserve dispatch:
+Reserved36 должен быть Deny до fake socket factory/Connect. Ранее оплаченные
+service/context routes всё равно требуют настоящего cleanup.
+Public NETWORK Read/Write и generic DATA/IP APIs дополнительно проверяются как
+закрытые. Positive должен получить одну original physical permission/open;
+resolver/service tickets считаются отдельно и retired через actual actor barriers.
+
+### Повтор после R79/R81: Publish проходит, WaiterBound остаётся RED
+
+Base `2ff7c6c90d7243d98244dd052892c0e0b08e7c71`; actual Go patch
+`1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05`.
+Source получен обратным применением старого profile patch к сохранённому
+native-source3c, затем чистым применением нового patch; codec/base сохранены.
+Из1299 production members изменились ровно6 файлов, перечисленных в evidence
+`fresh-apply.json`; оба overlay добавляют только новые `_test.go` файлы.
+
+Root scratch correction устранила прежний отказ Publish: реальный Published41
+Allow получен. Далее actual Bind53 создаёт waiter, но preparation ответа54
+повторно вызывает `rrset_reply→bootstrap_rrset_live→observed`. В этой точке
+used=39370, limit=58459, суммарный scratch=20016, deficit=927. Предыдущая проверка того
+же transcript до waiter storage успешно проходит при used=38274. Source/peer
+valid, sticky-invalid=false, deadline/epoch/anchor не изменены. Поэтому actual
+issuer возвращает Deny54, actual Go caller завершается с admission denied.
+`network-positive` остаётся строгим RED, не xfail. Production budget, fixture
+capacity, Source/transcript/parser checks и protected pins не менялись.
+
+Exact anchors: `native_dns_rrset.rs::bind_dns_waiter` резервирует retained
+`size_of::<Waiter>()+80` перед reply; `rrset_reply` повторяет source check уже с
+этим retained storage; `native_bootstrap_binding.rs::observed` удерживает2048
+path scratch и отдельно запрашивает SCRATCH=17968 для strict capture parser
+(всего20016 поверх used на входе во view).
+Это новый ограниченный production accounting blocker, а не Go wire mismatch.
+
+`network-no-permit` не требует fake KnownClosed: actual Go Direct consumer
+консервативно делает sticky Unknown при Deny36 и удерживает свои operations.
+Harness сообщает Unknown/custody и проверяет zero DNS/original factories.
+Если Go объявляет cleanup complete, но Rust сохраняет route tickets, relay
+отклоняет такой результат как `counterpart route custody mismatch`, а не
+обнуляет backend ledger. Failure evidence содержит весь bounded packet trace.
+
+Wrong-question теперь GREEN с completed Known cleanup: actual Proof46 Allow,
+Resource46 Allow (zero refs/joined), оба reservation48, exchange48, context48
+получены **до** service Close32. Fake DNS factory/write/close=1, original
+factory=0, Published/Numeric отсутствуют, routes=2 (service/resolver отдельно),
+retained routes/context/services=0, receiver consumed-close=1. Анализатор trace
+проверяет каждый выданный resource/proof/reservation/exchange/context ID и
+соответствующий ACK до Close32, а не только итоговые счётчики; пропуск resource
+ACK либо перенос Close32 перед context ACK отклоняется отдельными unit tests.
+No-permit и все4 HOSTS regressions также GREEN. Full NETWORK positive/Waiter/
+Numeric cleanup пока не подтверждены из-за Deny54. Late refresh active/tomb
+не покрыт этим bounded run; production R81 source здесь не изменялся.
+
+Evidence: `/home/myrs/projects/yonik/local/orchestration/evidence/p5-network-joint`.
+Все результаты классифицированы PURE_STATEFUL_INTEROP; это не runtime, kernel,
+protected install или current-image measurement. Сборка нового test ELF не
+является новым protected producer build record; registry/builder остаются3c.
+
+R77: stdin и stdout nonblocking, selector обслуживает чтение и очередь частичных
+записей с тем же absolute deadline. Pending write budget≤8MiB; stop frame проходит
+через ту же очередь. Нечитающий peer не блокирует timeout/finally. Отдельные pure
+Python проверки запускают собственные fake stdio peers и проверяют deadline и join.

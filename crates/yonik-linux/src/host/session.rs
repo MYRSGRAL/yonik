@@ -15,7 +15,7 @@ use tokio::{
 use yonik_application::{
     ConfigDigest, EnvironmentStamp, Event, Fault, Outcome, Session, State, Token,
 };
-use yonik_engine::{CompiledConfig, ProbeAccess};
+use yonik_engine::{CompiledConfig, PendingXrayRealityH2, ProbeAccess};
 
 use super::{BinarySnapshot, Cancellation, HostError, ProbeResult, ProbeTarget, probe, process};
 
@@ -55,11 +55,13 @@ impl Write for ConfigBuffer {
 }
 
 pub struct CheckedConfig {
+    profile: Option<std::sync::Arc<super::local_profile_channel::Prepared>>,
     binary: BinarySnapshot,
     bytes: Vec<u8>,
     digest: ConfigDigest,
     port: NonZeroU16,
     probe_port: NonZeroU16,
+    http_port: Option<NonZeroU16>,
     probe_access: ProbeAccess,
 }
 impl crate::helper::PreparedArtifact for CheckedConfig {
@@ -79,12 +81,45 @@ impl std::fmt::Debug for CheckedConfig {
     }
 }
 impl CheckedConfig {
+    pub async fn validate_full_profile(
+        binary: BinarySnapshot,
+        intent: yonik_engine::native_profile::ProfileIntent,
+        runtime: yonik_engine::native_profile::OwnedRuntimePlan,
+        cancel: &mut Cancellation,
+    ) -> Result<Self, HostError> {
+        if binary.engine != yonik_engine::Engine::Xray {
+            return Err(HostError::ConfigRejected);
+        }
+        let (profile, config) =
+            super::local_profile_channel::Prepared::prepare(&binary, intent, runtime, cancel)?;
+        let mut output = ConfigBuffer(Vec::new());
+        config
+            .write_sensitive(&mut output)
+            .map_err(|_| HostError::ConfigRejected)?;
+        process::verify_version(&binary, cancel).await?;
+        process::config_check_assets(&binary, &output.0, Some(profile.root_path()), cancel).await?;
+        profile.revalidate(cancel)?;
+        let digest = ConfigDigest::new(Sha256::digest(&output.0).into());
+        Ok(Self {
+            profile: Some(profile),
+            binary,
+            bytes: output.0,
+            digest,
+            port: config.listen_port(),
+            probe_port: config.probe_port(),
+            http_port: config.local_http_port(),
+            probe_access: config.into_probe_access(),
+        })
+    }
     pub async fn validate(
         binary: BinarySnapshot,
         config: CompiledConfig,
         cancel: &mut Cancellation,
     ) -> Result<Self, HostError> {
-        if binary.engine != config.engine() {
+        if binary.engine != config.engine()
+            || config.local_http_port().is_some()
+            || (config.requires_xray_reality_h2() && binary.xray_reality_h2().is_none())
+        {
             return Err(HostError::ConfigRejected);
         }
         let config = config.with_local_runtime_logging();
@@ -100,19 +135,31 @@ impl CheckedConfig {
         process::config_check(&binary, &bytes, cancel).await?;
         let digest = ConfigDigest::new(Sha256::digest(&bytes).into());
         Ok(Self {
+            profile: None,
             binary,
             bytes,
             digest,
             port,
             probe_port,
+            http_port: None,
             probe_access,
         })
+    }
+
+    pub async fn validate_xray_reality_h2(
+        binary: BinarySnapshot,
+        config: PendingXrayRealityH2,
+        cancel: &mut Cancellation,
+    ) -> Result<Self, HostError> {
+        let proof = binary.xray_reality_h2().ok_or(HostError::ConfigRejected)?;
+        Self::validate(binary, config.authorize(proof), cancel).await
     }
 }
 
 /// Один владелец сериализует start/check/stop. На Drop — аварийный kill_on_drop;
 /// подтверждение cleanup выдаётся только после явного stop().await.
 pub struct LocalSession {
+    profile: Option<crate::helper::native_profile_channel::ProfileRuntime>,
     #[cfg(feature = "test-support")]
     cleanup_fault: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     event_log: Option<crate::event_log::EventLog>,
@@ -123,6 +170,7 @@ pub struct LocalSession {
     binary: Option<BinarySnapshot>,
     port: Option<NonZeroU16>,
     probe_port: Option<NonZeroU16>,
+    http_port: Option<NonZeroU16>,
     probe_access: ProbeAccess,
 }
 impl std::fmt::Debug for LocalSession {
@@ -139,6 +187,7 @@ impl LocalSession {
             .map_err(|_| HostError::State)?;
         let id = NonZeroU64::new(id).ok_or(HostError::State)?;
         Ok(Self {
+            profile: None,
             #[cfg(feature = "test-support")]
             cleanup_fault: None,
             session: Session::new(id),
@@ -149,6 +198,7 @@ impl LocalSession {
             binary: None,
             port: None,
             probe_port: None,
+            http_port: None,
             probe_access: ProbeAccess::default(),
         })
     }
@@ -229,11 +279,16 @@ impl LocalSession {
         };
         self.port = Some(checked.port);
         self.probe_port = Some(checked.probe_port);
+        self.http_port = checked.http_port;
         self.probe_access = checked.probe_access;
         self.binary = Some(checked.binary);
         let result = async {
             let binary = self.binary.as_ref().ok_or(HostError::State)?;
-            self.child = Some(process::spawn(binary, false)?);
+            let mut launch=checked.profile.as_ref().map(|profile|profile.launch(*checked.digest.as_bytes(),cancel)).transpose()?;
+            self.child = Some(if let Some(launch)=launch.as_mut() {process::spawn_profile(binary,false,Some(launch),None)?}else{process::spawn(binary,false)?});
+            // Image/actual child проверены до чувствительного stdin. HELLO
+            // ожидается issuer thread после stdin: Go сначала читает config.
+            if let Some(launch)=launch {self.profile=Some(launch.start(self.child.as_ref().ok_or(HostError::State)?,binary,&checked.bytes)?);}
             self.readers = Some(process::RuntimeReaders::attach(
                 self.child.as_mut().ok_or(HostError::State)?, binary.engine, self.event_log.clone(),
             )?);
@@ -245,7 +300,16 @@ impl LocalSession {
             let readiness = async {
                 loop {
                     if child.try_wait().map_err(|_| HostError::Process)?.is_some() { return Err(HostError::EngineExited); }
-                    if listeners_owned(child.id().ok_or(HostError::EngineExited)?, checked.port.get(), checked.probe_port.get())? { return Ok(()); }
+                    if self.profile.as_ref().is_none_or(crate::helper::native_profile_channel::ProfileRuntime::ready)
+                        && listeners_owned(
+                            child.id().ok_or(HostError::EngineExited)?,
+                            checked.port.get(),
+                            checked.probe_port.get(),
+                            checked.http_port.map(NonZeroU16::get),
+                        )?
+                    {
+                        return Ok(());
+                    }
                     sleep(Duration::from_millis(50)).await;
                 }
             };
@@ -282,8 +346,9 @@ impl LocalSession {
         }
         let port = self.port.ok_or(HostError::State)?.get();
         let probe_port = self.probe_port.ok_or(HostError::State)?.get();
+        let http_port = self.http_port.map(NonZeroU16::get);
         let child = self.child.as_mut().ok_or(HostError::State)?;
-        if let Err(error) = verify_listener(child, port, probe_port) {
+        if let Err(error) = verify_listener(child, port, probe_port, http_port) {
             self.fail().await?;
             return Err(error);
         }
@@ -295,7 +360,7 @@ impl LocalSession {
         };
         match result {
             Ok(result) => {
-                if let Err(error) = verify_listener(child, port, probe_port) {
+                if let Err(error) = verify_listener(child, port, probe_port, http_port) {
                     self.fail().await?;
                     return Err(error);
                 }
@@ -329,6 +394,9 @@ impl LocalSession {
         self.release().await
     }
     async fn release(&mut self) -> Result<(), HostError> {
+        if let Some(profile) = &self.profile {
+            profile.revoke();
+        }
         if let Some(readers) = self.readers.take() {
             readers.stop().await;
         }
@@ -353,9 +421,13 @@ impl LocalSession {
         }
         self.log(crate::event_log::EventCode::CleanupConfirmed);
         self.child = None;
+        if let Some(mut profile) = self.profile.take() {
+            profile.confirmed_closed().map_err(|_| HostError::Cleanup)?;
+        }
         self.binary = None;
         self.port = None;
         self.probe_port = None;
+        self.http_port = None;
         self.probe_access = ProbeAccess::default();
         self.accept(Event::CleanupConfirmed)
     }
@@ -370,19 +442,57 @@ impl LocalSession {
     }
 }
 
-fn verify_listener(child: &mut Child, port: u16, probe_port: u16) -> Result<(), HostError> {
+fn verify_listener(
+    child: &mut Child,
+    port: u16,
+    probe_port: u16,
+    http_port: Option<u16>,
+) -> Result<(), HostError> {
     if child.try_wait().map_err(|_| HostError::Process)?.is_some() {
         return Err(HostError::EngineExited);
     }
-    if listeners_owned(child.id().ok_or(HostError::EngineExited)?, port, probe_port)? {
+    if listeners_owned(
+        child.id().ok_or(HostError::EngineExited)?,
+        port,
+        probe_port,
+        http_port,
+    )? {
         Ok(())
     } else {
         Err(HostError::Listener)
     }
 }
 
-fn listeners_owned(pid: u32, port: u16, probe_port: u16) -> Result<bool, HostError> {
-    Ok(listener_owned(pid, port)? && (port == probe_port || listener_owned(pid, probe_port)?))
+fn listeners_owned(
+    pid: u32,
+    port: u16,
+    probe_port: u16,
+    http_port: Option<u16>,
+) -> Result<bool, HostError> {
+    all_local_listeners(port, probe_port, http_port, |port| {
+        listener_owned(pid, port)
+    })
+}
+
+fn all_local_listeners(
+    port: u16,
+    probe_port: u16,
+    http_port: Option<u16>,
+    mut owned: impl FnMut(u16) -> Result<bool, HostError>,
+) -> Result<bool, HostError> {
+    for port in [
+        Some(port),
+        (probe_port != port).then_some(probe_port),
+        http_port,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !owned(port)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(super) fn listener_owned(pid: u32, port: u16) -> Result<bool, HostError> {

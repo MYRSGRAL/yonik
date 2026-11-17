@@ -20,6 +20,126 @@ import build_native_adapter as builder  # noqa: E402
 
 
 class BuilderTests(unittest.TestCase):
+    def test_france_projection_all_scopes_fit_protected_manifest_without_authority(
+        self,
+    ) -> None:
+        record = {
+            "contract": "yonik-xray-profile-udp-v2",
+            "version": 1,
+            "source_commit": builder.XRAY_COMMIT,
+            "patch_sha256": builder.PROFILE_PATCH,
+            **{
+                key: "12" * 32
+                for key in (
+                    "source_sha256",
+                    "builder_sha256",
+                    "toolchain_sha256",
+                    "build_inputs_sha256",
+                    "elf_sha256",
+                )
+            },
+        }
+        candidate = builder.france_candidate(record)
+        self.assertFalse(candidate["install_authority"])
+        raw = candidate["registry_projection"]
+        self.assertLessEqual(len(raw.encode()), 4096)
+
+        def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                self.assertNotIn(key, result)
+                result[key] = value
+            return result
+
+        projection = json.loads(raw, object_pairs_hook=unique)
+        self.assertEqual(projection["schema"], 2)
+        entry = projection["engines"][0]
+        self.assertEqual(entry["sha256"], record["elf_sha256"])
+        producer = entry["native_profile_producer"]
+        self.assertEqual(len(set(producer) - set(record)), 9)
+        self.assertNotIn("dns_wire", producer)
+        self.assertNotIn("dns_release", producer)
+        self.assertNotIn("path", entry)
+        self.assertEqual(set(record), set(producer) & set(record))
+        with self.assertRaises(builder.BuildError):
+            builder.france_candidate(record | {"oversize": "x" * 4096})
+
+    def test_tcp5_candidate_keeps_tcp_udp_source_reviews_separate(self) -> None:
+        original = {"elf_sha256": "11" * 32, "patch_sha256": "44" * 32}
+        candidate = builder.tcp5_candidate(original)
+        self.assertFalse(candidate["install_authority"])
+        self.assertFalse(candidate["source_eligibility"])
+        record = candidate["candidate_record"]
+        self.assertEqual(record["elf_sha256"], original["elf_sha256"])
+        self.assertEqual(record["patch_sha256"], original["patch_sha256"])
+        self.assertNotIn("bootstrap_source", record)
+        self.assertNotIn("bootstrap_datagram", record)
+        self.assertEqual(set(original), {"elf_sha256", "patch_sha256"})
+        for slot, contract in (
+            ("bootstrap_tcp5_source", "tcp-codec5-bootstrap-parent-member-v1"),
+            ("bootstrap_tcp5_dns_wire", "tcp-codec5-bootstrap-bound-dns-transcript-v1"),
+            (
+                "bootstrap_tcp5_dns_release",
+                "tcp-codec5-bootstrap-dns-consuming-close-join-v1",
+            ),
+        ):
+            self.assertEqual(
+                record[slot]["schema_sha256"],
+                hashlib.sha256(b"YONIK-DNS-V2-CODEC-5\0").hexdigest(),
+            )
+            self.assertEqual(
+                record[slot]["contract_sha256"],
+                hashlib.sha256(contract.encode() + b"\0").hexdigest(),
+            )
+
+    def test_datagram_candidate_is_scope5_request_not_source_or_install_authority(
+        self,
+    ) -> None:
+        record = {"elf_sha256": "11" * 32, "patch_sha256": "44" * 32}
+        projected = builder.datagram_candidate(record)
+        self.assertFalse(projected["install_authority"])
+        self.assertFalse(projected["source_eligibility"])
+        candidate = projected["candidate_record"]
+        self.assertEqual(candidate["elf_sha256"], record["elf_sha256"])
+        self.assertEqual(candidate["patch_sha256"], record["patch_sha256"])
+        for slot in (
+            "bootstrap_datagram",
+            "bootstrap_datagram_dns_wire",
+            "bootstrap_datagram_dns_release",
+        ):
+            self.assertNotIn(slot, record)
+            self.assertEqual(
+                candidate[slot]["schema_sha256"],
+                hashlib.sha256(b"YONIK-DNS-V2-CODEC-5\0").hexdigest(),
+            )
+        self.assertNotIn("bootstrap_source", candidate)
+
+    def test_bootstrap_candidate_is_independent_compile_only_metadata(self) -> None:
+        original = {"elf_sha256": "11" * 32, "patch_sha256": "44" * 32}
+        candidate = builder.bootstrap_candidate(original)
+        self.assertFalse(candidate["install_authority"])
+        self.assertTrue(candidate["requires_independent_scope_review"])
+        self.assertEqual(candidate["validation"], "COMPILE_ONLY_CANDIDATE")
+        record = candidate["candidate_record"]
+        self.assertEqual(record["elf_sha256"], original["elf_sha256"])
+        self.assertEqual(record["patch_sha256"], original["patch_sha256"])
+        for slot, contract in (
+            ("bootstrap_source", "captured-netgo-bootstrap-parent-member-v1"),
+            ("bootstrap_dns_wire", "bootstrap-direct-dns-bound-request-response-v1"),
+            ("bootstrap_dns_release", "bootstrap-direct-dns-consuming-close-join-v1"),
+        ):
+            self.assertNotIn(slot, original)
+            self.assertEqual(record[slot]["contract"], contract)
+            self.assertEqual(record[slot]["version"], 1)
+            self.assertEqual(
+                record[slot]["contract_sha256"],
+                hashlib.sha256(contract.encode() + b"\0").hexdigest(),
+            )
+            self.assertEqual(
+                record[slot]["schema_sha256"],
+                hashlib.sha256(b"YONIK-DNS-V2-CODEC-4\0").hexdigest(),
+            )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="yonik-builder-test-")
         self.addCleanup(self.temporary.cleanup)
@@ -118,7 +238,9 @@ class BuilderTests(unittest.TestCase):
             return original(runner, argv, cwd)
 
         with patch.object(builder.Runner, "run", autospec=True, side_effect=run):
-            result = builder.build(self.root, self.output, self.patch_file, "xray")
+            result = builder.build(
+                self.root, self.output, self.patch_file, "xray", compile_only=True
+            )
         manifest = json.loads(result.read_text())
         self.assertEqual(manifest["source_commit"], builder.XRAY_COMMIT)
         self.assertEqual(
@@ -132,8 +254,22 @@ class BuilderTests(unittest.TestCase):
         self.assertIn("-p=1", command)
         self.assertEqual(command[-1], "./main")
         self.assertFalse(any(argv[:2] == ["git", "apply"] for argv in self.commands))
+        self.assertFalse(
+            any(
+                argv and argv[0] == str(self.root / "build-native-adapter-xray")
+                for argv in self.commands
+            )
+        )
+        self.assertEqual(manifest["validation"], "COMPILE_ONLY")
+        self.assertFalse(manifest["binary_version_executed"])
 
     def test_codec_component_is_verified_without_feature_ack(self) -> None:
+        self.check_codec_component(compile_only=False)
+
+    def test_compile_only_codec_never_executes_tests_or_core(self) -> None:
+        self.check_codec_component(compile_only=True)
+
+    def check_codec_component(self, *, compile_only: bool) -> None:
         original = self.fake_run
 
         def run(runner: builder.Runner, argv: list[str], cwd: Path) -> str:
@@ -173,13 +309,29 @@ class BuilderTests(unittest.TestCase):
             patch.object(builder, "EXTRA_PATCHES", tuple(self.extra_patches)),
         ):
             result = builder.build(
-                self.root, self.output, self.patch_file, native_codec=True
+                self.root,
+                self.output,
+                self.patch_file,
+                native_codec=True,
+                compile_only=compile_only,
             )
         manifest = json.loads(result.read_text())
         self.assertFalse(manifest["native_codec_component"]["runtime_hooks_connected"])
         self.assertTrue(
             manifest["native_codec_component"]["routing_entry_guard_connected"]
         )
+        if compile_only:
+            tests = [argv for argv in self.commands if argv[:2] == ["go", "test"]]
+            self.assertEqual(len(tests), 3)
+            self.assertTrue(all("-c" in argv for argv in tests))
+            self.assertFalse(
+                any(
+                    argv and argv[0].startswith(str(self.root))
+                    for argv in self.commands
+                )
+            )
+            self.assertEqual(manifest["validation"], "COMPILE_ONLY")
+            return
         self.assertIn(["go", "test", "-p=1", "-mod=readonly", "./route"], self.commands)
         self.assertIn(
             ["go", "test", "-p=1", "-mod=readonly", "./protocol/tun"], self.commands
@@ -198,6 +350,127 @@ class BuilderTests(unittest.TestCase):
         with self.assertRaises(builder.BuildError):
             builder.build(self.root, self.output, self.patch_file, "other")
         self.assertFalse(self.commands)
+
+    def test_profile_evidence_refuses_non_compile_only_or_wrong_engine(self) -> None:
+        for engine, compile_only in (("xray", False), ("sing-box", True)):
+            with self.assertRaises(builder.BuildError):
+                builder.build(
+                    self.root,
+                    self.output,
+                    self.patch_file,
+                    engine,
+                    compile_only=compile_only,
+                    experimental_profile=True,
+                )
+        self.assertFalse(self.commands)
+
+    def test_profile_compile_only_emits_record_without_execution_or_install(
+        self,
+    ) -> None:
+        self.source = self.root / "build-source-xray"
+        self.source.mkdir()
+        (self.source / "go.mod").write_text("module fixture\n")
+        (self.source / "go.sum").write_text("fixture\n")
+        self.head = builder.XRAY_COMMIT
+        adapter = builder.DEFAULT_PATCH.parents[2] / "xray" / builder.XRAY_TAG
+        codec = json.loads((adapter / "native-broker-codec.json").read_text())
+        full = json.loads((adapter / "native-full-profile.json").read_text())
+        accepted_fixture_pin = full["patch_sha256"]
+        phase = False
+        original_hash = builder.sha256
+
+        def digest(path: Path) -> str:
+            metadata = full if phase else codec
+            pins = {
+                **{
+                    f"common/yonikbroker/{name}": value
+                    for name, value in metadata["package_files_sha256"].items()
+                },
+                **metadata.get("callsite_files_sha256", {}),
+            }
+            if (
+                path.is_relative_to(self.source)
+                and str(path.relative_to(self.source)) in pins
+            ):
+                return pins[str(path.relative_to(self.source))]
+            return original_hash(path)
+
+        def run(runner: builder.Runner, argv: list[str], cwd: Path) -> str:
+            nonlocal phase
+            if argv[:2] == ["git", "rev-parse"]:
+                self.commands.append(argv)
+                return builder.XRAY_COMMIT + "\n"
+            if argv[:2] == ["git", "apply"] and argv[-1].endswith(
+                "native-full-profile.patch"
+            ):
+                phase = True
+            result = self.fake_run(runner, argv, cwd)
+            if argv[:2] == ["go", "build"]:
+                Path(argv[argv.index("-o") + 1]).write_bytes(
+                    b"\x7fELFsynthetic: never execute"
+                )
+            return result
+
+        with (
+            patch.object(builder, "sha256", side_effect=digest),
+            patch.object(builder.Runner, "run", autospec=True, side_effect=run),
+            patch.object(builder, "toolchain_digest", return_value="15" * 32),
+            # Только fake reviewed pin; production allowlist не следует metadata.
+            patch.object(builder, "PROFILE_PATCH", accepted_fixture_pin),
+        ):
+            builder.build(
+                self.root,
+                self.output,
+                self.patch_file,
+                "xray",
+                compile_only=True,
+                experimental_profile=True,
+            )
+        record = json.loads((self.output / "native-profile-producer.json").read_text())
+        self.assertEqual(record["elf_sha256"], original_hash(self.output / "xray"))
+        self.assertEqual(record["patch_sha256"], accepted_fixture_pin)
+        candidate = json.loads(
+            (self.output / "native-profile-dns-release-candidate.json").read_text()
+        )
+        self.assertFalse(candidate["install_authority"])
+        self.assertTrue(candidate["requires_factory_ownership_review"])
+        self.assertEqual(
+            candidate["candidate_record"]["elf_sha256"], record["elf_sha256"]
+        )
+        self.assertEqual(
+            candidate["candidate_record"]["dns_release"]["schema_sha256"],
+            hashlib.sha256(b"YONIK-DNS-V2-CODEC-3\0").hexdigest(),
+        )
+        self.assertNotIn("dns_release", record)
+        self.assertEqual(
+            candidate["candidate_record"]["dns_wire"]["contract"],
+            "direct-dns-bound-request-response-v1",
+        )
+        self.assertEqual(
+            candidate["candidate_record"]["dns_wire"]["schema_sha256"],
+            hashlib.sha256(b"YONIK-DNS-V2-CODEC-3\0").hexdigest(),
+        )
+        self.assertNotIn("dns_wire", record)
+        bootstrap = json.loads(
+            (self.output / "native-profile-bootstrap-candidate.json").read_text()
+        )
+        self.assertFalse(bootstrap["install_authority"])
+        self.assertTrue(bootstrap["requires_independent_scope_review"])
+        for slot in ("bootstrap_source", "bootstrap_dns_wire", "bootstrap_dns_release"):
+            self.assertNotIn(slot, record)
+            self.assertEqual(
+                bootstrap["candidate_record"][slot]["schema_sha256"],
+                hashlib.sha256(b"YONIK-DNS-V2-CODEC-4\0").hexdigest(),
+            )
+        self.assertEqual(
+            bootstrap["candidate_record"]["elf_sha256"], record["elf_sha256"]
+        )
+        self.assertEqual(
+            record["builder_sha256"], original_hash(Path(builder.__file__))
+        )
+        self.assertFalse(
+            any(argv and argv[0].startswith(str(self.root)) for argv in self.commands)
+        )
 
     def test_unknown_patch_cannot_claim_strict_complete_feature(self) -> None:
         self.patch_file.write_text("unrelated README-only patch")
