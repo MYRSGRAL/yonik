@@ -827,3 +827,106 @@ fn local_dual_ingress_rejects_conflicting_ports_and_unowned_aliases() {
         Err(ProfileCompileError::Ownership)
     ));
 }
+
+#[test]
+fn france_ss2022_keeps_full_provider_graph_through_intent_and_compile() {
+    let source = include_str!("../../../tests/fixtures/xray-full-profile-france-synthetic.json");
+    let mut original: Vec<Value> = serde_json::from_str(source).unwrap();
+    let mut expected = original.remove(0);
+    let report = import_profiles(source.as_bytes().to_vec()).expect("Импорт массива France");
+    let [ProfileEntry::Xray(profile)] = report.entries.as_slice() else {
+        panic!("Ожидался один профиль Xray");
+    };
+    assert_eq!(profile.ordinal(), 0);
+    let graph = validate_profile(profile).expect("Валидация исходного France");
+    let intent = ProfileIntent::from_profile(profile).expect("Типизация исходного France");
+    let mut wire = Vec::new();
+    intent.write_sensitive(&mut wire).unwrap();
+    let envelope: Value = serde_json::from_slice(&wire).unwrap();
+    expected.as_object_mut().unwrap().remove("remarks");
+    assert_eq!(envelope["graph"], expected);
+    let decoded = ProfileIntent::decode(std::str::from_utf8(&wire).unwrap())
+        .expect("Декодирование и повторная валидация France");
+    let mut roundtrip = Vec::new();
+    decoded.write_sensitive(&mut roundtrip).unwrap();
+    assert_eq!(roundtrip, wire);
+
+    assert_eq!(graph.subjects(), ["edge", "direct", "block", "dns-out"]);
+    // Эти имена обозначают внутренний DNS ingress и сохраняются в правилах.
+    assert_eq!(
+        graph
+            .egress()
+            .resolvers()
+            .iter()
+            .map(|r| r.subject())
+            .collect::<Vec<_>>(),
+        [Some("dns-via-edge"), Some("dns-via-direct")]
+    );
+    assert_eq!(graph.egress().system_resolvers().len(), 1);
+    assert_eq!(graph.egress().system_resolvers()[0].subject(), None);
+    assert_eq!(
+        decoded
+            .branch_mask("edge", WireNetwork::Tcp, Some(443))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        decoded
+            .branch_mask("edge", WireNetwork::Udp, Some(443))
+            .unwrap(),
+        2
+    );
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    intent
+        .write_transport_sensitive("edge", &mut before)
+        .unwrap();
+    decoded
+        .write_transport_sensitive("edge", &mut after)
+        .unwrap();
+    assert_eq!(before, after);
+
+    for system in [false, true] {
+        let plan = bound_plan(&graph, system);
+        decoded.validate_ingress_mapping(&plan).unwrap();
+        let (config, owned_tag) = if system {
+            (
+                emitted(
+                    decoded
+                        .compile_system(&plan)
+                        .expect("Компиляция System")
+                        .config(),
+                ),
+                "system-tun",
+            )
+        } else {
+            (
+                emitted(&decoded.compile_local(&plan).expect("Компиляция Local")),
+                "yonik-owned-local",
+            )
+        };
+        assert_eq!(config["dns"], expected["dns"]);
+        let mut routing = expected["routing"].clone();
+        routing["rules"][2]["inboundTag"] = json!([owned_tag, "yonik-owned-probe"]);
+        assert_eq!(config["routing"], routing);
+
+        let mut outbounds = expected["outbounds"].clone();
+        if system {
+            for outbound in outbounds.as_array_mut().unwrap() {
+                if outbound["protocol"] != "blackhole" {
+                    outbound["streamSettings"]["sockopt"]["mark"] = json!(42);
+                }
+            }
+        }
+        assert_eq!(config["outbounds"], outbounds);
+        for tag in [owned_tag, "yonik-owned-probe"] {
+            let inbound = config["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|inbound| inbound["tag"] == tag)
+                .unwrap();
+            assert_eq!(inbound["sniffing"], expected["inbounds"][0]["sniffing"]);
+        }
+    }
+}
