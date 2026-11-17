@@ -793,6 +793,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   Numeric use2 и production Source binding остаются следующими переходами;
   stateful Go/Rust pair и runtime не запускались, public gates false.
 
+- Go network bootstrap c3657fe интегрирован с root-коррекцией R64P2: constructor
+  удерживает in-flight custody до handoff/выхода; tick обрабатывает cancel ACK,
+  но не снимает references/credits преждевременно. Pure interleaving воспроизводит
+  отмену между Probe и присвоением service, затем проверяет grant.pending=0 и
+  удаление grant slot. Остальной R64 scoped SOURCE review новых P1/P2 не выявил.
+  После Reserve36 transport ещё Unsupported; wire/pins authority/public gates
+  не расширены. Actual network/socket/runtime выполнение не проводилось.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение

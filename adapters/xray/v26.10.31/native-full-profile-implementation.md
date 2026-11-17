@@ -1519,3 +1519,11 @@ System expiry, replay/cancel/late Allow, namespace/capacity refusal, shared RX,
 neighbor isolation и sticky Unknown. OS/proof/socket wrappers не исполнялись.
 CODEC4/layout/schema/corpus, Hosts/R9/R14/UDP guards, protected records,
 registry/builder/allowlists/public/capture flags не менялись; gates false.
+
+R64: constructor удерживает отдельный in-flight barrier до выхода. Tick может
+закрыть context и обработать cancellation ACK, но не освобождает references и
+pending credits во время передачи Probe/context/reservation в constructor.
+Отмена между возвратом Probe и записью service не оставляет grant.pending:
+после завершения handoff обычный cleanup снимает обе ссылки и grant slot.
+Детерминированный pure interleaving проверяет custody до handoff и освобождение
+после него; actual concurrent OS/runtime выполнение этим тестом не аттестовано.
