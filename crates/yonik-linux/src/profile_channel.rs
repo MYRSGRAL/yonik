@@ -41,6 +41,8 @@ pub(crate) mod dns_v2 {
         WaiterBound = 54,
         BundleAcquire = 55,
         BundleGranted = 56,
+        DatagramParentBind = 57,
+        DatagramParentBound = 58,
     }
     impl TryFrom<u16> for Operation {
         type Error = Error;
@@ -65,6 +67,8 @@ pub(crate) mod dns_v2 {
                 54 => Self::WaiterBound,
                 55 => Self::BundleAcquire,
                 56 => Self::BundleGranted,
+                57 => Self::DatagramParentBind,
+                58 => Self::DatagramParentBound,
                 _ => return Err(Error::Schema),
             })
         }
@@ -82,6 +86,7 @@ pub(crate) mod dns_v2 {
                     | Self::Canceled
                     | Self::WaiterBound
                     | Self::BundleGranted
+                    | Self::DatagramParentBound
             )
         }
         pub(crate) fn rights(self) -> (usize, usize) {
@@ -129,7 +134,9 @@ pub(crate) mod dns_v2 {
         HostsPathContextId,
         ExportedContextId
     );
+    ids!(DatagramParentBindingId, DatagramUserParentGrantId);
     pub(crate) const SCHEMA: &[u8] = b"YONIK-DNS-V2-CODEC-4\0";
+    pub(crate) const DATAGRAM_SCHEMA: &[u8] = b"YONIK-DNS-V2-CODEC-5\0";
     /// DATA selector; наличие индексов не подтверждает graph/source authority.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct BootstrapSelector {
@@ -159,6 +166,32 @@ pub(crate) mod dns_v2 {
         };
     }
     view_id!(35, query, QueryId, 8);
+    view_id!(57, query, QueryId, 8);
+    view_id!(57, parent_grant, DatagramUserParentGrantId, 16);
+    view_id!(57, source_flow, SourceFlowId, 24);
+    view_id!(57, source_revision, FlowRevision, 32);
+    impl View<'_, 58> {
+        /// Только exact pending DATA; не capability или lifetime renewal.
+        pub(crate) fn checked_parent(
+            self,
+            pending: View<'_, 57>,
+        ) -> Result<DatagramParentBindingId> {
+            let b = self.bytes();
+            let p = pending.bytes();
+            if b[2] != 1
+                || n64(b, 16) != n64(p, 16)
+                || n64(b, 24) != n64(p, 24)
+                || n64(b, 32) != n64(p, 8)
+                || n64(b, 40) != n64(p, 40)
+                || n32(b, 48) > n32(p, 52)
+                || n16(b, 52) != n16(p, 48)
+                || b[54] != p[50]
+            {
+                return Err(Error::Binding);
+            }
+            DatagramParentBindingId::read(n64(b, 8))
+        }
+    }
     view_id!(35, bundle, DnsBundleId, 16);
     view_id!(35, grant, ServiceGrantId, 24);
     view_id!(35, source_flow, SourceFlowId, 32);
@@ -635,6 +668,8 @@ pub(crate) mod dns_v2 {
         WaiterBound(View<'a, 54>),
         BundleAcquire(View<'a, 55>),
         BundleGranted(View<'a, 56>),
+        DatagramParentBind(View<'a, 57>),
+        DatagramParentBound(View<'a, 58>),
     }
     impl<'a> Record<'a> {
         pub(crate) fn decode(op: Operation, b: &'a [u8]) -> Result<Self> {
@@ -658,6 +693,8 @@ pub(crate) mod dns_v2 {
                 Operation::WaiterBound => Self::WaiterBound(View::decode(b)?),
                 Operation::BundleAcquire => Self::BundleAcquire(View::decode(b)?),
                 Operation::BundleGranted => Self::BundleGranted(View::decode(b)?),
+                Operation::DatagramParentBind => Self::DatagramParentBind(View::decode(b)?),
+                Operation::DatagramParentBound => Self::DatagramParentBound(View::decode(b)?),
             })
         }
         pub(crate) fn operation(self) -> Operation {
@@ -681,6 +718,8 @@ pub(crate) mod dns_v2 {
                 Self::WaiterBound(_) => Operation::WaiterBound,
                 Self::BundleAcquire(_) => Operation::BundleAcquire,
                 Self::BundleGranted(_) => Operation::BundleGranted,
+                Self::DatagramParentBind(_) => Operation::DatagramParentBind,
+                Self::DatagramParentBound(_) => Operation::DatagramParentBound,
             }
         }
         pub(crate) fn bytes(self) -> &'a [u8] {
@@ -704,6 +743,8 @@ pub(crate) mod dns_v2 {
                 Self::WaiterBound(v) => v.bytes(),
                 Self::BundleAcquire(v) => v.bytes(),
                 Self::BundleGranted(v) => v.bytes(),
+                Self::DatagramParentBind(v) => v.bytes(),
+                Self::DatagramParentBound(v) => v.bytes(),
             }
         }
         pub(crate) fn encode(self, out: &mut [u8]) -> Result<usize> {
@@ -727,6 +768,8 @@ pub(crate) mod dns_v2 {
                 Operation::Published if b[2] == 1 => 24,
                 Operation::BundleAcquire => 24,
                 Operation::BundleGranted if b[2] == 1 => 32,
+                Operation::DatagramParentBind => 40,
+                Operation::DatagramParentBound if b[2] == 1 => 40,
                 _ => return None,
             };
             Some(n64(b, at))
@@ -737,15 +780,26 @@ pub(crate) mod dns_v2 {
     #[derive(Clone, Copy)]
     pub(crate) struct Negotiated {
         launch: super::LaunchRecord,
+        datagram: bool,
     }
     impl Negotiated {
         pub(crate) fn descriptor(launch: super::LaunchRecord) -> Result<[u8; 272]> {
+            Self::descriptor_for(launch, false)
+        }
+        pub(crate) fn datagram_descriptor(launch: super::LaunchRecord) -> Result<[u8; 272]> {
+            Self::descriptor_for(launch, true)
+        }
+        fn descriptor_for(launch: super::LaunchRecord, datagram: bool) -> Result<[u8; 272]> {
             let mut b = [0; 272];
             b[..8].copy_from_slice(b"DNSNEG02");
             super::put16(&mut b, 8, 2);
             super::put16(&mut b, 10, 272);
             b[16..208].copy_from_slice(&launch.encode()?);
-            b[208..240].copy_from_slice(&Sha256::digest(SCHEMA));
+            b[208..240].copy_from_slice(&Sha256::digest(if datagram {
+                DATAGRAM_SCHEMA
+            } else {
+                SCHEMA
+            }));
             for (at, n) in [
                 (240, 4),
                 (242, 11),
@@ -770,7 +824,9 @@ pub(crate) mod dns_v2 {
                 _ => return Err(Error::Schema),
             };
             let launch = super::LaunchRecord::decode(&descriptor[16..208], mode)?;
-            if Self::descriptor(launch)?.as_slice() != descriptor {
+            if Self::descriptor(launch)?.as_slice() != descriptor
+                && Self::datagram_descriptor(launch)?.as_slice() != descriptor
+            {
                 return Err(Error::Binding);
             }
             super::extension_ack(b"DNSACK02", descriptor)
@@ -787,7 +843,41 @@ pub(crate) mod dns_v2 {
             {
                 return Err(Error::Binding);
             }
-            Ok(Self { launch })
+            Ok(Self {
+                launch,
+                datagram: false,
+            })
+        }
+        pub(crate) fn accept_datagram(
+            descriptor: &[u8],
+            ack: &[u8],
+            launch: super::LaunchRecord,
+            ancillary: [(usize, usize); 2],
+        ) -> Result<Self> {
+            if ancillary != [(0, 0); 2]
+                || Self::datagram_descriptor(launch)?.as_slice() != descriptor
+                || Self::ack(descriptor)?.as_slice() != ack
+            {
+                return Err(Error::Binding);
+            }
+            Ok(Self {
+                launch,
+                datagram: true,
+            })
+        }
+        pub(crate) fn datagram(self) -> bool {
+            self.datagram
+        }
+        fn record_allowed(self, record: Record<'_>) -> Result<()> {
+            if !self.datagram()
+                && (matches!(
+                    record,
+                    Record::DatagramParentBind(_) | Record::DatagramParentBound(_)
+                ) || matches!(record, Record::Cancel(v) if v.bytes()[2]==9))
+            {
+                return Err(Error::Schema);
+            }
+            Ok(())
         }
     }
     #[derive(Clone, Copy)]
@@ -851,6 +941,7 @@ pub(crate) mod dns_v2 {
         }
 
         pub(crate) fn encode(&self, neg: &Negotiated, out: &mut [u8]) -> Result<usize> {
+            neg.record_allowed(self.record)?;
             let op = self.record.operation();
             if op == Operation::PhysicalBind {
                 return Err(Error::Schema);
@@ -929,6 +1020,7 @@ pub(crate) mod dns_v2 {
                 return Err(Error::Binding);
             }
             let record = Record::decode(op, &bytes[128..])?;
+            neg.record_allowed(record)?;
             if record
                 .source_epoch()
                 .is_some_and(|epoch| epoch != neg.launch.binding.epoch)
@@ -951,6 +1043,9 @@ pub(crate) mod dns_v2 {
 
     fn n16(b: &[u8], at: usize) -> u16 {
         u16::from_be_bytes([b[at], b[at + 1]])
+    }
+    fn n32(b: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
     }
     fn n64(b: &[u8], at: usize) -> u64 {
         u64::from_be_bytes([
@@ -1254,7 +1349,7 @@ pub(crate) mod dns_v2 {
                 if kind == 45 {
                     retire_target(b[2], n64(b, 16))
                 } else {
-                    if !matches!(b[2], 1..=8) {
+                    if !matches!(b[2], 1..=9) {
                         return Err(Error::Schema);
                     }
                     zero(&b[18..24])
@@ -1356,6 +1451,36 @@ pub(crate) mod dns_v2 {
                     }
                 }
                 Ok(())
+            }
+            57 => {
+                if b.len() != 64 {
+                    return Err(Error::Bounds);
+                }
+                zero(&b[2..8])?;
+                for at in [8, 16, 24, 32, 40] {
+                    id(n64(b, at))?;
+                }
+                if n16(b, 48) >= 512 || b[50] > 1 || !(1..=1000).contains(&n32(b, 52)) {
+                    return Err(Error::Reference);
+                }
+                zero(&b[51..52])?;
+                zero(&b[56..64])
+            }
+            58 => {
+                if b.len() != 64 || !matches!(b[2], 1..=3) {
+                    return Err(Error::Bounds);
+                }
+                if b[2] != 1 {
+                    return zero(&b[3..]);
+                }
+                zero(&b[3..8])?;
+                for at in [8, 16, 24, 32, 40] {
+                    id(n64(b, at))?;
+                }
+                if !(1..=1000).contains(&n32(b, 48)) || n16(b, 52) >= 512 || b[54] > 1 {
+                    return Err(Error::Reference);
+                }
+                zero(&b[55..64])
             }
             56 => {
                 if b.len() != 64 || !matches!(b[2], 1..=3) {
@@ -5543,6 +5668,132 @@ impl Sequence {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dns_v2_codec5_datagram_parent_goldens_no_codec4_downgrade() {
+        use super::dns_v2::*;
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/dns-v2-codec5.json"
+        ))
+        .unwrap();
+        for entry in corpus["negotiations"].as_array().unwrap() {
+            let mode = if entry["mode"] == 1 {
+                super::Mode::Local
+            } else {
+                super::Mode::System
+            };
+            let launch = super::LaunchRecord::decode(
+                &dns_v2_hex(entry["launchHex"].as_str().unwrap()),
+                mode,
+            )
+            .unwrap();
+            let d = dns_v2_hex(entry["descriptorHex"].as_str().unwrap());
+            let a = dns_v2_hex(entry["ackHex"].as_str().unwrap());
+            assert_eq!(
+                Negotiated::datagram_descriptor(launch).unwrap().as_slice(),
+                d
+            );
+            assert_eq!(Negotiated::ack(&d).unwrap().as_slice(), a);
+            assert!(Negotiated::accept(&d, &a, launch, [(0, 0); 2]).is_err());
+            let neg = Negotiated::accept_datagram(&d, &a, launch, [(0, 0); 2]).unwrap();
+            let legacy_d = Negotiated::descriptor(launch).unwrap();
+            let legacy_a = Negotiated::ack(&legacy_d).unwrap();
+            assert!(
+                Negotiated::accept_datagram(&legacy_d, &legacy_a, launch, [(0, 0); 2]).is_err()
+            );
+            assert!(Negotiated::accept_datagram(&d, &a, launch, [(1, 0), (0, 0)]).is_err());
+            let legacy = Negotiated::accept(&legacy_d, &legacy_a, launch, [(0, 0); 2]).unwrap();
+            for vector in corpus["vectors"].as_array().unwrap() {
+                let body = dns_v2_hex(vector["bodyHex"].as_str().unwrap());
+                let op = Operation::try_from(vector["kind"].as_u64().unwrap() as u16).unwrap();
+                let frame_bytes = dns_v2_hex(vector["frameHex"].as_str().unwrap());
+                let direction = if op.is_reply() {
+                    Direction::Issuer
+                } else {
+                    Direction::Producer
+                };
+                let reply = op.is_reply().then_some(9);
+                let frame = DnsFrame::decode(&frame_bytes, &neg, direction, 0, 0, reply).unwrap();
+                assert_eq!(frame.record.bytes(), body);
+                let mut encoded = vec![0; frame_bytes.len()];
+                assert_eq!(frame.encode(&neg, &mut encoded).unwrap(), frame_bytes.len());
+                assert_eq!(encoded, frame_bytes);
+                assert!(DnsFrame::decode(&frame_bytes, &legacy, direction, 0, 0, reply).is_err());
+                assert!(frame.encode(&legacy, &mut encoded).is_err());
+                assert!(DnsFrame::decode(&frame_bytes, &neg, direction, 1, 0, reply).is_err());
+                for length in 0..body.len() {
+                    assert!(Record::decode(op, &body[..length]).is_err());
+                }
+            }
+        }
+        for vector in corpus["rejectedBodies"].as_array().unwrap() {
+            assert!(
+                Record::decode(
+                    Operation::try_from(vector["kind"].as_u64().unwrap() as u16).unwrap(),
+                    &dns_v2_hex(vector["bodyHex"].as_str().unwrap())
+                )
+                .is_err()
+            );
+        }
+        let vectors = corpus["vectors"].as_array().unwrap();
+        let bind = dns_v2_hex(
+            vectors.iter().find(|v| v["name"] == "bind").unwrap()["bodyHex"]
+                .as_str()
+                .unwrap(),
+        );
+        let bound = dns_v2_hex(
+            vectors.iter().find(|v| v["name"] == "bound").unwrap()["bodyHex"]
+                .as_str()
+                .unwrap(),
+        );
+        assert_eq!(
+            View::<58>::decode(&bound)
+                .unwrap()
+                .checked_parent(View::<57>::decode(&bind).unwrap())
+                .unwrap()
+                .get(),
+            41
+        );
+        for at in [16, 24, 32, 40, 52, 54] {
+            let mut changed = bound.clone();
+            changed[at] ^= 1;
+            if let Ok(v) = View::<58>::decode(&changed) {
+                assert!(
+                    v.checked_parent(View::<57>::decode(&bind).unwrap())
+                        .is_err()
+                );
+            }
+        }
+    }
+    #[test]
+    fn dns_v2_codec4_numeric_use2_protocol17_is_data_not_parent_authority() {
+        use super::dns_v2::*;
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-profile-channel-v3/dns-v2-codec4.json"
+        ))
+        .unwrap();
+        let mut checked = 0;
+        for entry in corpus["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["kind"] == 42)
+        {
+            let mut body = dns_v2_hex(entry["bodyHex"].as_str().unwrap());
+            if body[14] != 2 {
+                continue;
+            }
+            let start = 16 + usize::from(u16::from_be_bytes([body[12], body[13]]));
+            body[start + 1] = 17;
+            let Record::NumericAuthorize(view) =
+                Record::decode(Operation::NumericAuthorize, &body).unwrap()
+            else {
+                panic!("numeric DATA")
+            };
+            assert_eq!(view.numeric_destination().protocol, 17);
+            checked += 1;
+        }
+        assert!(checked > 0);
+    }
     fn dns_v2_hex(value: &str) -> Vec<u8> {
         assert_eq!(value.len() % 2, 0);
         value
