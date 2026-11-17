@@ -1463,10 +1463,14 @@ enum PermissionState {
     Closed,
     Unknown,
 }
+enum PermissionOrigin {
+    Hosts(u16),
+    Network(Box<super::super::dns_rrset::NetworkNumericProof>),
+}
 pub(super) struct BootstrapPhysicalPermission {
     waiter: u64,
     member: u16,
-    source_index: u16,
+    origin: PermissionOrigin,
     target: Target,
     request: u64,
     expires: Instant,
@@ -1497,6 +1501,114 @@ fn target_ip(target: Target) -> Result<std::net::IpAddr, ServiceError> {
     }
 }
 impl<A: Authority> Issuer<A> {
+    pub(in crate::helper::native_profile_channel) fn network_numeric_original(
+        &self,
+        binding: super::super::dns_transport::Binding,
+        selector: wire::dns_v2::BootstrapSelector,
+    ) -> Result<Target, ServiceError> {
+        let b = self
+            .dns
+            .live
+            .get(&binding.bundle)
+            .ok_or(ServiceError::Unavailable)?;
+        let c = b.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
+        if !binding.bootstrap
+            || !matches!(b.root_kind, wire::dns_v2::Root::BootstrapService(_))
+            || selector.resolver.is_none()
+            || selector != c.selector
+            || self.bootstrap_binding(binding.bundle, b.expires)? != binding
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        Ok(c.original)
+    }
+    fn authorize_network_numeric(
+        &mut self,
+        request: u64,
+        v: View<'_, 42>,
+        session: Instant,
+    ) -> Result<u64, ServiceError> {
+        self.fence()?;
+        if self.retired.iter().any(|(n, _)| *n == request) {
+            return Err(ServiceError::Unavailable);
+        }
+        let started = self.authority.now();
+        if self.hosts_permission_count()
+            + self.grants.len()
+            + self.services.len()
+            + self.dns.live.len()
+            >= self.capsule()?.limits()[0] as usize
+        {
+            return Err(ServiceError::Busy);
+        }
+        let memory = self
+            .budget
+            .dynamic
+            .reserve(
+                std::mem::size_of::<BootstrapPhysicalPermission>()
+                    + std::mem::size_of::<super::super::dns_rrset::NetworkNumericProof>()
+                    + 80,
+            )
+            .map_err(unavailable)?;
+        let routes = self.budget.routes.reserve(1).map_err(unavailable)?;
+        self.bundle_history_available(1)?;
+        let (proof, until) = self.checked_network_numeric(v)?;
+        let waiter = v.waiter().map_err(unavailable)?.get();
+        let member = u16_at(v.bytes(), 2);
+        let target = Target::copy(v.numeric_destination())?;
+        let expires = until.min(session).min(started + Duration::from_secs(1));
+        if expires.saturating_duration_since(self.authority.now()) < Duration::from_millis(1) {
+            return Err(ServiceError::Unavailable);
+        }
+        self.bundle_history(1)?;
+        let id = Self::id(&mut self.next_grant)?;
+        self.consume_network_numeric(proof, request, id)?;
+        self.dns.permissions.insert(
+            id,
+            Box::new(BootstrapPhysicalPermission {
+                waiter,
+                member,
+                origin: PermissionOrigin::Network(Box::new(proof)),
+                target,
+                request,
+                expires,
+                state: PermissionState::Preparing,
+                acked: false,
+                ticket: None,
+                routes: Some(routes),
+                _memory: memory,
+            }),
+        );
+        match self
+            .authority
+            .service(self.record.manifest, RouteRequest::Direct(target.wire()))
+        {
+            Ok(ticket) => {
+                let p = self
+                    .dns
+                    .permissions
+                    .get_mut(&id)
+                    .ok_or(ServiceError::Unavailable)?;
+                p.ticket = ticket;
+                p.state = PermissionState::Active;
+            }
+            Err(error) => {
+                self.dns
+                    .permissions
+                    .get_mut(&id)
+                    .ok_or(ServiceError::Unavailable)?
+                    .state = PermissionState::Unknown;
+                self.unknown = true;
+                self.authority.revoke();
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.hosts_permission_live(id, false) {
+            self.close_hosts_permission(id)?;
+            return Err(error);
+        }
+        Ok(id)
+    }
     pub(in crate::helper::native_profile_channel) fn hosts_permission_count(&self) -> usize {
         self.dns
             .permissions
@@ -1577,6 +1689,9 @@ impl<A: Authority> Issuer<A> {
             .bootstrap_selector()
             .map_err(unavailable)?
             .ok_or(ServiceError::InvalidRequest)?;
+        if selector.resolver.is_some() {
+            return self.authorize_network_numeric(request, v, session);
+        }
         let w = self
             .dns
             .hosts_waiters
@@ -1651,7 +1766,7 @@ impl<A: Authority> Issuer<A> {
             Box::new(BootstrapPhysicalPermission {
                 waiter,
                 member,
-                source_index,
+                origin: PermissionOrigin::Hosts(source_index),
                 target,
                 request,
                 expires,
@@ -1703,20 +1818,34 @@ impl<A: Authority> Issuer<A> {
             .permissions
             .get(&id)
             .ok_or(ServiceError::Unavailable)?;
+        if p.state != PermissionState::Active
+            || acked && !p.acked
+            || self.authority.now() >= p.expires
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        let index = match &p.origin {
+            PermissionOrigin::Network(proof) => {
+                let until = self
+                    .network_permission_live(**proof, p.request, id, p.waiter, p.member, p.target)?
+                    .min(p.expires);
+                if self.authority.now() >= until {
+                    return Err(ServiceError::Unavailable);
+                }
+                return Ok(until);
+            }
+            PermissionOrigin::Hosts(index) => *index,
+        };
         let w = self
             .dns
             .hosts_waiters
             .get(&p.waiter)
             .ok_or(ServiceError::Unavailable)?;
-        if p.state != PermissionState::Active
-            || acked && !p.acked
-            || w.numeric_once != Some((p.request, id))
-            || self.authority.now() >= p.expires
-        {
+        if w.numeric_once != Some((p.request, id)) {
             return Err(ServiceError::Unavailable);
         }
-        let (selected, index) = self.host_member(p.waiter, p.member)?;
-        if index != p.source_index || selected.address != target_ip(p.target)? {
+        let (selected, actual_index) = self.host_member(p.waiter, p.member)?;
+        if actual_index != index || selected.address != target_ip(p.target)? {
             let context = self
                 .dns
                 .observations

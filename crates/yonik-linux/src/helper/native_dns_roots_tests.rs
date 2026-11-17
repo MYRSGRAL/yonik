@@ -1955,6 +1955,25 @@ enum BootstrapTransportFault {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NetworkFault {
+    NumericGood,
+    NumericWrongAddress,
+    NumericWrongMember,
+    NumericWrongResolver,
+    NumericWrongPort,
+    NumericWrongCarrier,
+    NumericReplay,
+    NumericCancelQueued,
+    NumericCancelAfterBackend,
+    NumericSiblingCancel,
+    NumericClose,
+    NumericSlowBackend,
+    NumericBackendFail,
+    NumericPartialCleanup,
+    NumericPostSend,
+    NumericExpired,
+    NumericCapacity,
+    NumericSourceChanged,
+    NumericQuestionChanged,
     Good,
     NoTranscript,
     WrongCapture,
@@ -1971,6 +1990,32 @@ enum NetworkFault {
     WaiterExpiry,
     WaiterReplay,
     CancelWaiter,
+}
+impl NetworkFault {
+    fn numeric(self) -> bool {
+        matches!(
+            self,
+            Self::NumericGood
+                | Self::NumericWrongAddress
+                | Self::NumericWrongMember
+                | Self::NumericWrongResolver
+                | Self::NumericWrongPort
+                | Self::NumericWrongCarrier
+                | Self::NumericReplay
+                | Self::NumericCancelQueued
+                | Self::NumericCancelAfterBackend
+                | Self::NumericSiblingCancel
+                | Self::NumericClose
+                | Self::NumericSlowBackend
+                | Self::NumericBackendFail
+                | Self::NumericPartialCleanup
+                | Self::NumericPostSend
+                | Self::NumericExpired
+                | Self::NumericCapacity
+                | Self::NumericSourceChanged
+                | Self::NumericQuestionChanged
+        )
+    }
 }
 fn bootstrap_publish(f: &Facts) -> Vec<u8> {
     let mut q = vec![0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
@@ -2064,18 +2109,24 @@ impl super::super::super::BootstrapDnsTranscript for CapturedBootstrapResponse {
     }
 }
 fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
-    let (mut issuer, f) = fixture(Mode::System);
+    let (mut issuer, mut f) = fixture(Mode::System);
+    if fault == BootstrapTransportFault::Publish(NetworkFault::NumericSlowBackend) {
+        Arc::get_mut(&mut f).unwrap().expiry = issuer.authority.now() + Duration::from_millis(20);
+    }
     service(&mut issuer, &f);
-    if matches!(
-        fault,
-        BootstrapTransportFault::Publish(
-            NetworkFault::TwoWaiters
-                | NetworkFault::WrongWaiterRoot
-                | NetworkFault::WaiterExpiry
-                | NetworkFault::WaiterReplay
-                | NetworkFault::CancelWaiter
+    if matches!(fault,BootstrapTransportFault::Publish(c) if c.numeric())
+        || matches!(
+            fault,
+            BootstrapTransportFault::Publish(
+                NetworkFault::NumericGood
+                    | NetworkFault::TwoWaiters
+                    | NetworkFault::WrongWaiterRoot
+                    | NetworkFault::WaiterExpiry
+                    | NetworkFault::WaiterReplay
+                    | NetworkFault::CancelWaiter
+            )
         )
-    ) {
+    {
         service(&mut issuer, &f);
         service(&mut issuer, &f);
     }
@@ -2174,14 +2225,16 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
             _ => {}
         }
         append(&io, vec![dns_packet(f.launch, 7, Operation::Publish, &b)]);
-        if matches!(
-            case,
-            NetworkFault::TwoWaiters
-                | NetworkFault::WrongWaiterRoot
-                | NetworkFault::WaiterExpiry
-                | NetworkFault::WaiterReplay
-                | NetworkFault::CancelWaiter
-        ) {
+        if case.numeric()
+            || matches!(
+                case,
+                NetworkFault::TwoWaiters
+                    | NetworkFault::WrongWaiterRoot
+                    | NetworkFault::WaiterExpiry
+                    | NetworkFault::WaiterReplay
+                    | NetworkFault::CancelWaiter
+            )
+        {
             let waiter = |reservation: u64, root: u64, query: u64| {
                 let mut b = vec![0; 64];
                 b[1] = 2;
@@ -2277,6 +2330,65 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
                     )],
                 );
             }
+            if case.numeric() {
+                io.stop_after = 13;
+                let mut b = numeric_body(&f, 1, [203, 0, 113, 80]);
+                b[22..24].copy_from_slice(&1u16.to_be_bytes());
+                match case {
+                    NetworkFault::NumericWrongAddress => *b.last_mut().unwrap() = 81,
+                    NetworkFault::NumericWrongMember => b[3] = 1,
+                    NetworkFault::NumericWrongResolver => b[23] = 0,
+                    NetworkFault::NumericWrongPort => b[27] ^= 1,
+                    NetworkFault::NumericWrongCarrier => b[25] = 17,
+                    _ => {}
+                }
+                let mut packet = vec![dns_packet(f.launch, 14, Operation::NumericAuthorize, &b)];
+                if case == NetworkFault::NumericCancelQueued {
+                    io.stop_after = 14;
+                    packet.push(dns_packet(
+                        f.launch,
+                        15,
+                        Operation::Cancel,
+                        &cancel_body(1, 14),
+                    ));
+                }
+                append(&io, packet);
+                let mut good = numeric_body(&f, 1, [203, 0, 113, 80]);
+                good[22..24].copy_from_slice(&1u16.to_be_bytes());
+                match case {
+                    NetworkFault::NumericWrongAddress | NetworkFault::NumericReplay => {
+                        io.stop_after = 14;
+                        append(
+                            &io,
+                            vec![dns_packet(f.launch, 15, Operation::NumericAuthorize, &good)],
+                        );
+                    }
+                    NetworkFault::NumericSiblingCancel => {
+                        io.stop_after = 15;
+                        append(
+                            &io,
+                            vec![dns_packet(
+                                f.launch,
+                                15,
+                                Operation::Cancel,
+                                &cancel_body(6, 1),
+                            )],
+                        );
+                        good[4..12].copy_from_slice(&2u64.to_be_bytes());
+                        append(
+                            &io,
+                            vec![dns_packet(f.launch, 16, Operation::NumericAuthorize, &good)],
+                        );
+                    }
+                    NetworkFault::NumericClose => {
+                        io.stop_after = 15;
+                        append(&io, vec![legacy_close(&f, 15, 4)]);
+                        append(&io, vec![legacy_close(&f, 16, 4)]);
+                    }
+                    NetworkFault::NumericCancelAfterBackend => io.stop_after = 14,
+                    _ => {}
+                }
+            }
         }
     }
     let raw = bootstrap_raw(&f);
@@ -2318,6 +2430,49 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
     let calls = factory_calls.clone();
     let source = f.clone();
     let clock = issuer.authority.elapsed.clone();
+    let route_budget = issuer.budget.routes.clone();
+    let held_capacity = Arc::new(std::sync::Mutex::new(None));
+    let capacity = held_capacity.clone();
+    if let BootstrapTransportFault::Publish(case) = fault {
+        if case == NetworkFault::NumericBackendFail {
+            issuer.authority.fail_route_at = Some(7);
+        }
+        if case == NetworkFault::NumericPartialCleanup {
+            issuer.authority.unknown_release = true;
+        }
+        if matches!(
+            case,
+            NetworkFault::NumericSlowBackend
+                | NetworkFault::NumericPartialCleanup
+                | NetworkFault::NumericCancelAfterBackend
+        ) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let source = f.clone();
+            let clock = clock.clone();
+            let deferred = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let arrival = deferred.clone();
+            let cancel = dns_packet(f.launch, 15, Operation::Cancel, &cancel_body(1, 14));
+            if case == NetworkFault::NumericCancelAfterBackend {
+                io.deferred = Some(deferred);
+            }
+            issuer.authority.service_hook = Some(Arc::new(move || {
+                if calls.fetch_add(1, Ordering::AcqRel) == 3 {
+                    match case {
+                        NetworkFault::NumericSlowBackend => {
+                            clock.fetch_add(25_000_000, Ordering::AcqRel);
+                        }
+                        NetworkFault::NumericPartialCleanup => {
+                            source.invalid_source.store(true, Ordering::Release)
+                        }
+                        NetworkFault::NumericCancelAfterBackend => {
+                            arrival.lock().unwrap().push(cancel.clone())
+                        }
+                        _ => {}
+                    }
+                }
+            }));
+        }
+    }
     let factory = move || {
         calls.fetch_add(1, Ordering::AcqRel);
         let incoming = super::super::super::dns_transport::Incoming::fake(
@@ -2334,10 +2489,19 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
         .unwrap();
         inbox.lock().unwrap().push_back(incoming);
     };
-    if fault == BootstrapTransportFault::Publish(NetworkFault::AfterSendSource) {
+    if matches!(
+        fault,
+        BootstrapTransportFault::Publish(
+            NetworkFault::AfterSendSource | NetworkFault::NumericPostSend
+        )
+    ) {
         let source = f.clone();
         io.after_sent = Some(Box::new(move |n| {
-            if n == 6 {
+            if n == if fault == BootstrapTransportFault::Publish(NetworkFault::NumericPostSend) {
+                13
+            } else {
+                6
+            } {
                 source.invalid_source.store(true, Ordering::Release);
             }
         }));
@@ -2356,6 +2520,21 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
         io.on_request = Some(Box::new(move |seq| {
             if seq == 10 && fault == BootstrapTransportFault::Publish(NetworkFault::WaiterExpiry) {
                 clock.fetch_add(2_000_000, Ordering::AcqRel);
+            }
+            if seq == 14 {
+                if fault == BootstrapTransportFault::Publish(NetworkFault::NumericSourceChanged) {
+                    source.invalid_source.store(true, Ordering::Release);
+                }
+                if fault == BootstrapTransportFault::Publish(NetworkFault::NumericQuestionChanged) {
+                    source.failed_operation.store(3, Ordering::Release);
+                }
+                if fault == BootstrapTransportFault::Publish(NetworkFault::NumericExpired) {
+                    clock.fetch_add(1_100_000_000, Ordering::AcqRel);
+                }
+                if fault == BootstrapTransportFault::Publish(NetworkFault::NumericCapacity) {
+                    *capacity.lock().unwrap() =
+                        Some(route_budget.reserve(4096 - route_budget.used()).unwrap());
+                }
             }
             if seq == 7 && fault == BootstrapTransportFault::ExpiredCleanup {
                 clock.fetch_add(1_100_000_000, Ordering::AcqRel);
@@ -2509,16 +2688,18 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
             fault == BootstrapTransportFault::UnknownClose
         );
     } else if let BootstrapTransportFault::Publish(case) = fault {
-        let allowed = matches!(
-            case,
-            NetworkFault::Good
-                | NetworkFault::AfterSendSource
-                | NetworkFault::TwoWaiters
-                | NetworkFault::WrongWaiterRoot
-                | NetworkFault::WaiterExpiry
-                | NetworkFault::WaiterReplay
-                | NetworkFault::CancelWaiter
-        );
+        let allowed = case.numeric()
+            || matches!(
+                case,
+                NetworkFault::Good
+                    | NetworkFault::NumericGood
+                    | NetworkFault::AfterSendSource
+                    | NetworkFault::TwoWaiters
+                    | NetworkFault::WrongWaiterRoot
+                    | NetworkFault::WaiterExpiry
+                    | NetworkFault::WaiterReplay
+                    | NetworkFault::CancelWaiter
+            );
         assert_eq!(
             out[5][130],
             if allowed { 1 } else { 2 },
@@ -2559,6 +2740,123 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
             assert_eq!(issuer.rrsets.producer_flags(), vec![false]);
             assert_eq!(io.dns_slots().unwrap().pending.used(), 1);
         }
+        if case.numeric() {
+            let numeric = &out[12];
+            let denied = matches!(
+                case,
+                NetworkFault::NumericWrongAddress
+                    | NetworkFault::NumericWrongMember
+                    | NetworkFault::NumericWrongResolver
+                    | NetworkFault::NumericWrongPort
+                    | NetworkFault::NumericWrongCarrier
+                    | NetworkFault::NumericCancelQueued
+                    | NetworkFault::NumericCancelAfterBackend
+                    | NetworkFault::NumericSlowBackend
+                    | NetworkFault::NumericExpired
+                    | NetworkFault::NumericCapacity
+                    | NetworkFault::NumericSourceChanged
+                    | NetworkFault::NumericQuestionChanged
+            );
+            let unknown = matches!(
+                case,
+                NetworkFault::NumericBackendFail | NetworkFault::NumericPartialCleanup
+            );
+            assert_eq!(
+                grant_status(numeric, &f),
+                if unknown {
+                    wire::Status::Unknown
+                } else if denied {
+                    wire::Status::Deny
+                } else {
+                    wire::Status::Allow
+                },
+                "case {}",
+                case as u8
+            );
+            let no_effect = matches!(
+                case,
+                NetworkFault::NumericWrongMember
+                    | NetworkFault::NumericWrongResolver
+                    | NetworkFault::NumericWrongPort
+                    | NetworkFault::NumericWrongCarrier
+                    | NetworkFault::NumericCancelQueued
+                    | NetworkFault::NumericExpired
+                    | NetworkFault::NumericCapacity
+                    | NetworkFault::NumericSourceChanged
+                    | NetworkFault::NumericQuestionChanged
+            );
+            if no_effect {
+                assert!(issuer.dns.permissions.is_empty());
+                assert_eq!(issuer.dns.history, 3 * f.path.len() + 15);
+                assert_eq!(issuer.authority.route_count, 6);
+            } else {
+                let p = &issuer.dns.permissions[&4];
+                let state = if unknown || case == NetworkFault::NumericPostSend {
+                    PermissionState::Unknown
+                } else if matches!(
+                    case,
+                    NetworkFault::NumericCancelAfterBackend
+                        | NetworkFault::NumericSlowBackend
+                        | NetworkFault::NumericSiblingCancel
+                        | NetworkFault::NumericClose
+                ) {
+                    PermissionState::Closed
+                } else {
+                    PermissionState::Active
+                };
+                assert_eq!(p.state, state);
+                assert!(matches!(p.origin, PermissionOrigin::Network(_)));
+                if state == PermissionState::Active {
+                    assert!(p.acked);
+                }
+                if state == PermissionState::Closed {
+                    assert!(p.routes.is_none() && p.ticket.is_none());
+                    assert!(issuer.authority.release_attempts >= 1);
+                }
+                if state == PermissionState::Unknown {
+                    assert!(issuer.unknown && p.routes.is_some());
+                }
+            }
+            match case {
+                NetworkFault::NumericGood => {
+                    assert!(matches!(
+                        wire::Frame::decode(numeric, f.launch.binding, f.launch.mode, true)
+                            .unwrap()
+                            .message,
+                        wire::Message::Grant {
+                            status: wire::Status::Allow,
+                            class: 3,
+                            required: false,
+                            grant: 4,
+                            flow: 0,
+                            fresh: 0,
+                            receipt: wire::Receipt {
+                                kind: wire::ReceiptKind::None,
+                                id: 0
+                            },
+                            ..
+                        }
+                    ));
+                    let p = &issuer.dns.permissions[&4];
+                    assert_eq!(p.target.port, 8443);
+                    assert_eq!(p.target.protocol, 6);
+                    assert!(!issuer.services.contains_key(&4));
+                }
+                NetworkFault::NumericWrongAddress => {
+                    assert_eq!(grant_status(&out[13], &f), wire::Status::Allow);
+                    assert_eq!(issuer.dns.history, 3 * f.path.len() + 16);
+                }
+                NetworkFault::NumericReplay => {
+                    assert_eq!(grant_status(&out[13], &f), wire::Status::Deny)
+                }
+                NetworkFault::NumericSiblingCancel => {
+                    assert_eq!(grant_status(&out[14], &f), wire::Status::Allow);
+                    assert_eq!(issuer.dns.permissions[&5].state, PermissionState::Active);
+                }
+                NetworkFault::NumericClose => assert_eq!(issuer.authority.release_attempts, 1),
+                _ => {}
+            }
+        }
         assert!(issuer.grants.is_empty());
     } else {
         assert_eq!(out.len(), 5);
@@ -2573,6 +2871,49 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
 #[test]
 fn codec4_bootstrap_rrset_driver_publish_data_not_user_authority() {
     bootstrap_transport_driver(BootstrapTransportFault::Publish(NetworkFault::Good));
+}
+#[test]
+fn codec4_network_numeric_driver_exact_member_to_durable_permission() {
+    bootstrap_transport_driver(BootstrapTransportFault::Publish(NetworkFault::NumericGood));
+}
+#[test]
+fn codec4_network_numeric_driver_invalid_fields_no_consume_history_or_route() {
+    for case in [
+        NetworkFault::NumericWrongAddress,
+        NetworkFault::NumericWrongMember,
+        NetworkFault::NumericWrongResolver,
+        NetworkFault::NumericWrongPort,
+        NetworkFault::NumericWrongCarrier,
+        NetworkFault::NumericCapacity,
+        NetworkFault::NumericExpired,
+        NetworkFault::NumericSourceChanged,
+        NetworkFault::NumericQuestionChanged,
+    ] {
+        bootstrap_transport_driver(BootstrapTransportFault::Publish(case));
+    }
+}
+#[test]
+fn codec4_network_numeric_driver_one_shot_cancel_close_and_neighbor_isolation() {
+    for case in [
+        NetworkFault::NumericReplay,
+        NetworkFault::NumericCancelQueued,
+        NetworkFault::NumericCancelAfterBackend,
+        NetworkFault::NumericSiblingCancel,
+        NetworkFault::NumericClose,
+    ] {
+        bootstrap_transport_driver(BootstrapTransportFault::Publish(case));
+    }
+}
+#[test]
+fn codec4_network_numeric_driver_backend_expiry_unknown_and_post_send_custody() {
+    for case in [
+        NetworkFault::NumericSlowBackend,
+        NetworkFault::NumericBackendFail,
+        NetworkFault::NumericPartialCleanup,
+        NetworkFault::NumericPostSend,
+    ] {
+        bootstrap_transport_driver(BootstrapTransportFault::Publish(case));
+    }
 }
 #[test]
 fn codec4_bootstrap_rrset_driver_closed_transcript_exact_source_question_and_ttl() {
