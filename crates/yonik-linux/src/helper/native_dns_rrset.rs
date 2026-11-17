@@ -697,7 +697,6 @@ impl<A: Authority> Issuer<A> {
             return Err(ServiceError::Unsupported);
         }
         let (_, started, _) = self.dns_publish_binding(n64(b, 120), n64(b, 128), n64(b, 28))?;
-        let _scratch = self.budget.dynamic.reserve(SCRATCH).map_err(unavailable)?;
         let memory = self
             .budget
             .dynamic
@@ -711,14 +710,17 @@ impl<A: Authority> Issuer<A> {
                     },
             )
             .map_err(unavailable)?;
-        let answer = parse(
-            &b[144 + q..144 + q + r],
-            &b[144 + q + r..],
-            &b[144..144 + q],
-            binding.qtype,
-            binding.options,
-            binding.payload,
-        )?;
+        let answer = {
+            let _scratch = self.budget.dynamic.reserve(SCRATCH).map_err(unavailable)?;
+            parse(
+                &b[144 + q..144 + q + r],
+                &b[144 + q + r..],
+                &b[144..144 + q],
+                binding.qtype,
+                binding.options,
+                binding.payload,
+            )?
+        };
         let observed = if binding.bootstrap {
             self.bootstrap_response_observed(binding, b)?
         } else {

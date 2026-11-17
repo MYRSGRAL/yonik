@@ -899,6 +899,16 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   real System/runtime/P5 PASS не заявляется. Production semantics/pins/Go3c156ca
   unchanged; NETWORK/late-ACK interop ещё не закрыты, public gates false.
 
+- NETWORK harness86987bd интегрирован как PARTIAL interop: proof/Logical/exchange
+  достижимы, no-permit и четыре HOSTS cases PASS. Совместная пара выявила R79:
+  перекрытие parser/planner scratch и premature service Close32 до Resource.
+  Root разделил Rust scratch lifetimes, сохранив Producer/Answer storage credit
+  и все проверки/лимиты. Повторная пара на прежнем tight budget получила Allow41;
+  полный NETWORK ещё FAIL на старом Go cleanup. Named Rust regressions/clippy
+  прошли, Go correction35b1fe9 ожидает narrow review и совместный rerun.
+  Старый compile-only3c156ca candidate не является NETWORK install/runtime-ready;
+  pins требуют обновления после проверки corrective digest, public gates false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение

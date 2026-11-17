@@ -612,11 +612,7 @@ impl BootstrapDnsTranscript for BootstrapBinding {
         {
             return Err(ServiceError::InvalidRequest);
         }
-        let _scratch = self
-            .budget
-            .dynamic
-            .reserve(super::dns_rrset::SCRATCH + 2048)
-            .map_err(unavailable)?;
+        let _scratch = self.budget.dynamic.reserve(2048).map_err(unavailable)?;
         let mut path = [(0, 0); 256];
         let (root, id, selector, original, count, expires) = {
             let queries = self.queries.lock().map_err(unavailable)?;
@@ -697,14 +693,21 @@ impl BootstrapDnsTranscript for BootstrapBinding {
         if r.binding.name.wire().bytes != &question.bytes[..usize::from(question.len)] {
             return Err(ServiceError::InvalidRequest);
         }
-        super::dns_rrset::verify_bootstrap_capture(
-            r.request,
-            r.response,
-            r.binding.name.wire().bytes,
-            r.binding.qtype,
-            r.binding.options,
-            r.binding.payload,
-        )?;
+        {
+            let _parser = self
+                .budget
+                .dynamic
+                .reserve(super::dns_rrset::SCRATCH)
+                .map_err(unavailable)?;
+            super::dns_rrset::verify_bootstrap_capture(
+                r.request,
+                r.response,
+                r.binding.name.wire().bytes,
+                r.binding.qtype,
+                r.binding.options,
+                r.binding.payload,
+            )?;
+        }
         let stamp = CaptureStamp {
             binding: r.binding,
             proof: r.proof,
