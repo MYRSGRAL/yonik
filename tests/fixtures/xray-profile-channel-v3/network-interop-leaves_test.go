@@ -26,11 +26,14 @@ func boolInt(b bool) int {
 	return 0
 }
 func interopNetworkIO(t *testing.T, f *flowFixture, pipe *interopPipe, bad bool, receive func(uint64) error, proofEvent func()) *interopDNSLeaf {
+	return interopNetworkProtocolIO(t, f, pipe, bad, 17, receive, proofEvent)
+}
+func interopNetworkProtocolIO(t *testing.T, f *flowFixture, pipe *interopPipe, bad bool, protocol byte, receive func(uint64) error, proofEvent func()) *interopDNSLeaf {
 	leaf := &interopDNSLeaf{duplicate: &proofFakeFD{}}
 	f.p.dnsID = func() uint16 { return 0x1234 }
 	f.p.dnsDirectIO = &profileDNSDirectIO{
 		create: func(ctx context.Context, want profileDestinationValue) (*profileDNSOwnedSocket, error) {
-			if !ProfileDNSDirectFactory(ctx) || want.address != "192.0.2.53" || want.port != 53 || want.network != 17 {
+			if !ProfileDNSDirectFactory(ctx) || want.address != "192.0.2.53" || want.port != 53 || want.network != protocol {
 				return nil, errProfile
 			}
 			leaf.factories++
@@ -40,6 +43,13 @@ func interopNetworkIO(t *testing.T, f *flowFixture, pipe *interopPipe, bad bool,
 			socket := &profileDNSOwnedSocket{ctx: life, cancel: cancel, destination: want, fd: &proofFakeFD{}, waitIO: func(context.Context, bool, time.Time) error { return errProfile }}
 			socket.writeIO = func(raw []byte) (int, error) {
 				leaf.writes++
+				length := len(raw)
+				if protocol == 6 {
+					if len(raw) < 2 || int(be.Uint16(raw)) != len(raw)-2 {
+						return 0, errProfile
+					}
+					raw = raw[2:]
+				}
 				var m dnsmessage.Message
 				if m.Unpack(raw) != nil || len(m.Questions) != 1 || m.Questions[0].Name.String() != "physical.invalid." {
 					return 0, errProfile
@@ -53,8 +63,13 @@ func interopNetworkIO(t *testing.T, f *flowFixture, pipe *interopPipe, bad bool,
 				if err != nil {
 					return 0, err
 				}
+				if protocol == 6 {
+					prefix := make([]byte, 2)
+					be.PutUint16(prefix, uint16(len(reply)))
+					reply = append(prefix, reply...)
+				}
 				response = bytes.NewReader(reply)
-				return len(raw), nil
+				return length, nil
 			}
 			socket.readIO = func(b []byte) (int, error) {
 				if response == nil {

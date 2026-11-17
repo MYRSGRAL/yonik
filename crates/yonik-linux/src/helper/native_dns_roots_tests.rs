@@ -232,6 +232,18 @@ fn fixture_carrier(
     digest: [u8; 32],
     carrier: u8,
 ) -> (Issuer<Fake>, Arc<Facts>) {
+    fixture_carrier_flags(mode, address, order, raw, digest, carrier, 16)
+}
+#[allow(clippy::too_many_arguments)] // Только immutable synthetic snapshot fixture.
+fn fixture_carrier_flags(
+    mode: Mode,
+    address: std::net::IpAddr,
+    order: u8,
+    raw: bool,
+    digest: [u8; 32],
+    carrier: u8,
+    flags: u16,
+) -> (Issuer<Fake>, Arc<Facts>) {
     use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent, VerifiedSystemResolver};
     struct Snapshot;
     impl VerifiedSystemResolver for Snapshot {
@@ -278,7 +290,7 @@ fn fixture_carrier(
         ndots: 1,
         attempts: 2,
         timeout_ms: 5000,
-        flags: 16,
+        flags,
         hostname: "fixture".into(),
         search: vec![],
         peers: vec!["192.0.2.53:53".parse().unwrap()],

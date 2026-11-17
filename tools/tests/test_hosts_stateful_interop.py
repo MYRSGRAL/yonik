@@ -38,6 +38,7 @@ def cleanup_trace() -> list[dict[str, object]]:
     reserved[60] = 1
     frame("rust", 36, 2, 2, reserved)
     frame("rust", 37, 3, 2, body(64, {16: 14, 32: 11}, 1))
+    frame("go", 38, 3, 0, body(72, {}))
     frame("rust", 39, 4, 3, body(64, {16: 15, 32: 11}, 1))
     for sequence, (target, identifier) in enumerate(
         [(4, 15), (3, 14), (7, 12), (2, 13), (8, 11)], 5
@@ -56,6 +57,25 @@ def cleanup_trace() -> list[dict[str, object]]:
 
 
 class CleanupBarrierTests(unittest.TestCase):
+    def test_resource_retire_requires_prior_actual_proof_ack(self) -> None:
+        trace = cleanup_trace()
+        del trace[8]
+        with self.assertRaisesRegex(AssertionError, "Resource retire before Proof ACK"):
+            interop.check_network_cleanup(trace)
+
+    def test_held_actual_resource_ack_blocks_service_until_release(self) -> None:
+        trace = cleanup_trace()
+        hold = {"side": "go", "event": {"name": "ack_hold", "target": 3, "id": 14}}
+        release = {
+            "side": "go",
+            "event": {"name": "ack_release", "target": 3, "id": 14},
+        }
+        trace.insert(11, hold)
+        with self.assertRaisesRegex(AssertionError, "Close32 before cleanup ACK"):
+            interop.check_network_cleanup(trace + [release])
+        trace.insert(-1, release)
+        self.assertEqual(interop.check_network_cleanup(trace), 1)
+
     def test_numeric_permission_close_is_distinct_from_service_root(self) -> None:
         trace = cleanup_trace()
         request = bytearray.fromhex(str(trace[0]["packet"]))
@@ -84,7 +104,7 @@ class CleanupBarrierTests(unittest.TestCase):
 
     def test_missing_resource_ack_cannot_hide_behind_final_cleanup(self) -> None:
         trace = cleanup_trace()
-        del trace[9]
+        del trace[10]
         with self.assertRaisesRegex(AssertionError, "Close32 before cleanup ACK"):
             interop.check_network_cleanup(trace)
 

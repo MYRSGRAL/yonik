@@ -1,5 +1,52 @@
 # PURE_STATEFUL_INTEROP: HOSTS
 
+## UDP NETWORK2619814: actual pair RED на PhysicalBind.pathRow
+
+Base `bafe4b4550879eb8e5d2f55f0797aac92a3f6ba5`; producer
+`2619814825cbf97591c3c87974637d0d1a9392bd`, patch SHA256
+`28a5644ab84d2a2972db6c04f6da81b6a358d242c053fa122e2df4780c681f24`.
+1307 exact native members:1302 byte-exact к предыдущему1305-member HOSTS tree,
+три reviewed shared files изменены, два NETWORK files добавлены. Overlay только
+добавляет пять прежних test destinations, existing members не заменяются.
+
+Новые strict cases `udp-network-{udp,tcp}-positive` и оба `system-` варианта
+исполняют real57/58→Probe20→55/56→Exchange35/36→Physical35/36→raw52.
+Далее joint pipeline **не проходит**: raw192.pathRow@162=1, helper retained
+physical_hop=0. Go `profileDNSDirect.bindingIDs` возвращает `n.frontier.scope`
+(`common/yonikbroker/profile_dns_direct_linux.go:548`), `dnsDirectPhysical`
+записывает это в@162. Rust `bootstrap_binding` в `native_dns_roots.rs` сохраняет
+`terminal.index`, а `native_dns_transport.rs::match_dns_physical` сравнивает
+@162 с этим retained index. Single SS UDP scope=1, checked path position=0;
+прежний VLESS TCP scope=0 маскировал несовпадение namespaces.
+
+Все четыре actual NETWORK positives сохраняют RED на этом guard до ACK37,
+Logical38, private exchange/Publish, independent waiter/Numeric/send. Нельзя
+считать следующие этапы покрытыми, если peer ещё не получил PhysicalAck.
+Helper получает actual Raw52 с virtual FD/kernel facts, вызывает actual
+factory5 Source/Wire/Release; ответ37 не фабрикуется. Caps не увеличены, packet
+не нормализуется, reference guard не убран. Root требуется согласованный scoped
+production fix producer/consumer namespace; ownership этого harness его не включает.
+Trace и exact source/compiler/ELFs сохранены в
+`/home/myrs/projects/yonik/local/orchestration/evidence/p5-udp-network-pair`.
+Unknown custody на отказе сохраняет USER/service/resolver routes; это не Known cleanup.
+
+Для продолжения после fix готовы test-only adapters: actual SS consuming caller,
+factory5 retained planner со snapshot DNS-first, resolver TCP6 (`usevc`) либо UDP17,
+exact framed DNS peer IO, Source/transcript/release5 и actual-negotiation-bound
+Physical receiver. `Stdio` выводит retained context/hop/custody диагностику только
+после actual issuer result; не вмешивается в decision. Новые cases
+`udp-network-udp-{wrong-question,foreign-member,parent-cancel,replay}` и
+`udp-network-tcp-late-ack` остаются strict, не xfail; за Physical52 пока не покрыты.
+Поздний ACK helper уже реализован: удерживает **полученный** Resource46, проверяет
+custody через normal tick и затем передаёт тот же ACK actual Go accept. Анализатор
+проверяет Proof ACK до Resource retire и parent9 ACK до service Close32;
+hold/release события не пересылаются другому SUT и не создают ACK/authority.
+
+Все12 прежних cases (пять UDP HOSTS + семь TCP) GREEN на этом exact2619814 ELF.
+Это подтверждает сохранение их прежнего subset, но не NETWORK UDP readiness.
+Source5 pins/FranceSS/public readiness не меняются. Классификация только
+PURE_STATEFUL_INTEROP, без runtime/OS/socket/kernel/install acceptance.
+
 ## UDP HOSTS: отдельный CODEC5 pair после R89
 
 База Rust `0641f995cc279c9c0f76a9a469bea06ad34218d8`; Go SUT — exact
