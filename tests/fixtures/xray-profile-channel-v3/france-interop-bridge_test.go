@@ -300,6 +300,32 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 			if e := f.c.accept(p); e != nil {
 				t.Fatalf("accept %d/%d: %v", p.kind, p.reply, e)
 			}
+			if network && len(p.body) >= 64 && p.body[2] == 1 && (p.kind == 37 || p.kind == 39 || p.kind == 36 && p.body[60] == 2) {
+				matched := 0
+				for _, n := range f.c.networkBootstraps[:f.c.networkBootstrapUsed] {
+					if n.transport == nil {
+						continue
+					}
+					transport := n.transport
+					id := transport.physicalReservation
+					expected := 0
+					if p.kind == 37 {
+						expected = 1
+					}
+					if p.kind == 39 {
+						id, expected = transport.exchange, 2
+					}
+					if id == u64(p.body, 8) {
+						matched++
+						if transport.setupSettled != expected {
+							t.Fatal("Physical36/37/Logical39 settlement mismatch")
+						}
+					}
+				}
+				if matched != 1 {
+					t.Fatal("transport settlement ACK not uniquely bound")
+				}
+			}
 			if network && p.kind == 41 && len(p.body) > 2 && p.body[2] == 1 {
 				// Только read-only диагностика после actual ACK; credits/owners
 				// не освобождаются и следующая операция не синтезируется.
@@ -398,6 +424,15 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 	second := strings.HasSuffix(caseName, "second-send")
 	go func() {
 		if e := ProfilePrepareChain(udpctx, nil); e != nil {
+			if network {
+				f.c.mu.Lock()
+				for _, n := range f.c.networkBootstraps[:f.c.networkBootstrapUsed] {
+					if n.parent == udp {
+						pipe.emit(map[string]any{"event": map[string]any{"name": "network_waiter_failure", "pending": f.c.profilePendingUsed(), "operations": f.c.operations, "waiter_created": n.waiter != nil, "waiter_parent_bound": n.waiter != nil && n.waiter.datagramParent != nil, "parent_used": f.c.datagramParentUsed}})
+					}
+				}
+				f.c.mu.Unlock()
+			}
 			if foreign || badQuestion {
 				udpDone <- nil
 				return
@@ -563,6 +598,23 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 			if !n.released || n.unknown || !n.context.released || n.transport.started != n.op.sent || n.peer.network != resolverProtocol {
 				t.Fatal("NETWORK custody/anchor")
 			}
+			if n.transport.setupSettled != 2 {
+				t.Fatal("Direct setup settlement not exact once")
+			}
+			expectedPublish := 1
+			if badQuestion && n.parent == udp {
+				expectedPublish = 0
+			}
+			if n.result.setupSettled != expectedPublish {
+				t.Fatal("Publish settlement not exact once")
+			}
+		}
+		// Повторные normal ticks не возвращают исторические credits второй раз.
+		for i := 0; i < 3; i++ {
+			tick()
+		}
+		if f.c.operations != 0 {
+			t.Fatal("settlement/release changed terminal operations", f.c.operations)
 		}
 		if lateACK && !delayed {
 			t.Fatal("missing actual held ACK")

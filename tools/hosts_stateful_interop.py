@@ -72,7 +72,12 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
     for e in trace:
         if "event" in e:
             detail = e["event"]
-            if detail["name"] in ("ack_hold", "ack_release", "network_credit_state"):
+            if detail["name"] in (
+                "ack_hold",
+                "ack_release",
+                "network_credit_state",
+                "network_waiter_failure",
+            ):
                 continue  # Отдельный cleanup oracle проверяет actual held ACK.
             if (
                 detail["name"] != "tcp_neighbor_after_udp_cleanup"
@@ -308,6 +313,7 @@ def check_network_cleanup(
             if detail["name"] in (
                 "tcp_neighbor_after_udp_cleanup",
                 "network_credit_state",
+                "network_waiter_failure",
             ):
                 continue
             key = (int(detail["target"]), int(detail["id"]))

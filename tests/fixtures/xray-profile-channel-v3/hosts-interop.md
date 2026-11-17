@@ -1,5 +1,30 @@
 # PURE_STATEFUL_INTEROP: HOSTS
 
+## R95 actual pair: вложенный DatagramParent precredit RED
+
+Base9e995134, production patch3003bf774c389b2c804747239f078c2b4efdecd2763a9452476a857df3591b1b.
+Direct/Result setup settlement проверяется на actual36/37/39/41: Physical36
+не возвращает slot,37 даёт первый settled,39 второй; Publish даёт один.
+Terminal cleanup сохраняет settled2/1, повторные normal ticks не меняют нулевой
+operations. Frozen production source1307 members совпадает с R95 fresh apply;
+overlay только test-only, никакие ACK не scripted.
+
+Все прежние35 GREEN сохранены. Четыре positives достигают двух Published41;
+pending теперь55 вместо61. Затем actual network waiter создаётся (+9), но его
+вложенный profileBindDatagramParent требует ещё3: measured pending64/operations62,
+waiter_created=true, waiter_parent_bound=false, parent_used=1 (только producer
+parent). Ни второй57, ни waiter service/context/Reserve/Numeric не отправлены.
+Точный guard — profile_bootstrap_datagram_linux.go:69; caller —
+profile_dns_frontier_linux.go:1627 после waiter reservation:1604.
+
+Это новый bounded nested-credit gap: 55+9+3=67>64, не Rust memory refusal.
+Caps/history/memory/FD не увеличены; TCP не закрывался для освобождения credits.
+Двенадцать positives/downstream negative cases остаются RED/unreached, включая
+held-ACK/full same-session UDP Numeric/send. Evidence p5-france-final/current
+содержит47 traces, measured events и compiler/source/ELFs до execution.
+Нужна отдельная Go correction композиции precredits; production здесь не менялся.
+FranceReady/runtime/installed PASS отсутствуют.
+
 ## FranceSS: обе ветки в одной session/CODEC5
 
 Base `f5ef5c88e1388a702a54fb22ced0d0cae2e236d3`, production Go patch
