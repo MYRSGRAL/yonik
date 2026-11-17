@@ -1510,6 +1510,42 @@ endpoint; wire/layout менять не требуется. Child ID/FD/hash/ACK
 Pure driver inject-ит отдельный logical token только как fake source fact;
 это не installed proof. Public gates и production mint остаются закрыты.
 
+### CODEC4 NETWORK bootstrap: resolver transport до Connect
+
+Serialized `run_issuer` теперь проводит network bootstrap через Reserve35/36,
+raw PhysicalBind52/ACK37 и LogicalBind38/39. Retained proof имеет отдельный
+`BootstrapDirect` variant; USER Direct/Proxy proof и их installed contracts
+не повышаются до bootstrap authority. Original physical parent/path/carrier
+остаются в live context; actual socket сверяется с отдельным numeric resolver
+peer/carrier из retained `DirectSystemTransportPermit`.
+
+R66 sequencing: Go Connect начинается после Physical Reserved36, до 52/38.
+Поэтому `check_bootstrap_transport_permit` проверяет live context/source и
+resolver-only backend route до reservation/FD credits/Allow36, затем повторяет
+проверку перед отправкой 36. `SystemAuthority` вызывает
+`ProfileRoutes::check_bootstrap_dns`: same retained capsule/source role4,
+full artifact fence и exact DNS route. При 52/37/39 добавляются kernel socket
+peer/protocol/source/UID/mark/netns/cookie и повторные expiry/source fences.
+Parent destination не заменяет resolver route. Local использует отдельный
+normal Host capsule fence без USER owner lookup; unproved namespace остаётся
+Unsupported. Wire, schema и corpus не меняются.
+
+Отдельный private `VerifiedBootstrapDnsProducer` связывает transport/close
+scope с exact launch и текущей CODEC4 schema. Production Channel factory
+возвращает None: reviewed bootstrap image/source/consuming-close record ещё
+не подключён. Это не current-image measurement. Pure driver inject-ит этот
+тип как fake source fact, отдельно от bootstrap Source; Direct3 capability,
+child ACK, FD или hash constructor его не создают.
+
+Retire Proof подтверждает consumer joins отдельным bootstrap release type;
+Retire Resource затем consuming-close receiver socket/netns ровно один раз.
+Unknown остаётся sticky с custody/credits, без повторного raw close.
+Cleanup window исходный, не более 1s; USER и service root с одинаковым числом
+не удерживают cleanup друг друга. Bundle route ticket освобождается отдельно
+после resource/reservation retirement. NETWORK Publish/Waiter/Numeric,
+loopback Stub policy и legitimate bootstrap Source/producer mint остаются
+следующими этапами. Публичные gates закрыты; runtime acceptance не заявляется.
+
 ### StubBind: bounded listener observation, не service authority
 
 `helper/resolver_stub.rs` отделяет retained sampled observation от policy issuer.

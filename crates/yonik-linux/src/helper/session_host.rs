@@ -741,6 +741,21 @@ impl ProfileRoutes {
     }
 }
 impl crate::helper::native_profile_channel::RouteAuthority for ProfileRoutes {
+    fn check_bootstrap_permit(
+        &mut self,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        route: crate::helper::native_profile_channel::BootstrapDnsRoute,
+    ) -> Result<(), ServiceError> {
+        self.check_bootstrap_dns(scope, route, None)
+    }
+    fn bootstrap_dns_socket(
+        &mut self,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        route: crate::helper::native_profile_channel::BootstrapDnsRoute,
+        facts: &crate::helper::native_profile_channel::dns_transport::Facts,
+    ) -> Result<(), ServiceError> {
+        self.check_bootstrap_dns(scope, route, Some(facts))
+    }
     fn dns_socket(
         &mut self,
         scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
@@ -852,6 +867,71 @@ impl crate::helper::native_profile_channel::RouteAuthority for ProfileRoutes {
             self.dynamic.remove(&bound);
             self.tickets.remove(&ticket);
             Ok(())
+        });
+        if result.is_err() {
+            self.unknown = true;
+            scope.revoke();
+            backend.native_owner.revoke();
+            backend.worker_uncertain = true;
+        }
+        result
+    }
+}
+impl ProfileRoutes {
+    fn check_bootstrap_dns(
+        &mut self,
+        scope: &crate::helper::native_bootstrap::RuntimeScopeStamp,
+        request: crate::helper::native_profile_channel::BootstrapDnsRoute,
+        facts: Option<&crate::helper::native_profile_channel::dns_transport::Facts>,
+    ) -> Result<(), ServiceError> {
+        let shared = self.backend.upgrade().ok_or(ServiceError::Unavailable)?;
+        let mut backend = shared.try_lock().map_err(unavailable)?;
+        let runtime = self.runtime.clone();
+        let result = runtime.block_on(async {
+            let (_keep, mut cancel) = fresh_cancel();
+            let artifact = self.fence(&mut backend, scope, &mut cancel).await?;
+            let profile = artifact
+                .full_profile
+                .as_ref()
+                .ok_or(ServiceError::Unsupported)?;
+            let cap = crate::profile_channel::Capsule::decode(
+                profile.capsule_bytes(),
+                profile.retained().digest(),
+            )
+            .map_err(unavailable)?;
+            request.validate(&cap)?;
+            let peer = request.peer();
+            let route = artifact
+                .routes
+                .iter()
+                .find(|r| {
+                    r.dns
+                        && r.port == peer.port
+                        && peer.protocol
+                            == match r.protocol {
+                                crate::TransportProtocol::Tcp => 6,
+                                crate::TransportProtocol::Udp => 17,
+                            }
+                        && match r.endpoint {
+                            IpAddr::V4(ip) => peer.family == 4 && peer.bytes == ip.octets(),
+                            IpAddr::V6(ip) => peer.family == 6 && peer.bytes == ip.octets(),
+                        }
+                })
+                .ok_or(ServiceError::Unavailable)?;
+            if let Some(facts) = facts {
+                if !crate::helper::native_profile_channel::dns_route_socket_matches(
+                    route.endpoint,
+                    route.port,
+                    route.protocol,
+                    route.route.preferred_source,
+                    artifact.worker_uid,
+                    artifact.plan.socket_mark(),
+                    facts,
+                ) {
+                    return Err(ServiceError::Unavailable);
+                }
+            }
+            scope.validate().map_err(unavailable)
         });
         if result.is_err() {
             self.unknown = true;

@@ -51,6 +51,21 @@ pub(super) fn dns_route_socket_matches(
         && facts.uid() == uid
 }
 pub(crate) trait RouteAuthority: Send {
+    fn check_bootstrap_permit(
+        &mut self,
+        _: &RuntimeScopeStamp,
+        _: BootstrapDnsRoute,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported)
+    }
+    fn bootstrap_dns_socket(
+        &mut self,
+        _: &RuntimeScopeStamp,
+        _: BootstrapDnsRoute,
+        _: &dns_transport::Facts,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported)
+    }
     fn dns_socket(
         &mut self,
         scope: &RuntimeScopeStamp,
@@ -79,6 +94,45 @@ pub(crate) enum RouteRequest<'a> {
     Chain,
     Direct(wire::Destination<'a>),
     Dns(wire::Destination<'a>),
+}
+/// Только issuer создаёт этот DATA binding после проверки live bootstrap permit.
+pub(crate) struct BootstrapDnsRoute {
+    manifest: [u8; 32],
+    source: [u8; 32],
+    resolver: u16,
+    peer: Target,
+}
+impl BootstrapDnsRoute {
+    pub(crate) fn peer(&self) -> wire::Destination<'_> {
+        self.peer.wire()
+    }
+    pub(crate) fn validate(&self, cap: &wire::Capsule<'_>) -> Result<(), ServiceError> {
+        let snapshot = cap.bootstrap_snapshot().map_err(unavailable)?;
+        let row = cap.resolver_scope(self.resolver).map_err(unavailable)?;
+        if cap.manifest != self.manifest
+            || !snapshot.bootstrap()
+            || snapshot.asset_reference().source != self.source
+            || row.source != self.source
+            || row.subject != u16::MAX
+            || row.scope.is_some()
+            || row.peer != self.peer.wire()
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        let ip = match self.peer.family {
+            4 => std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                <[u8; 4]>::try_from(self.peer.wire().bytes).map_err(unavailable)?,
+            )),
+            6 => std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(self.peer.wire().bytes).map_err(unavailable)?,
+            )),
+            _ => return Err(ServiceError::Unsupported),
+        };
+        if ip.is_loopback() {
+            return Err(ServiceError::Unsupported);
+        }
+        reject_unproved_stub(self.peer.wire())
+    }
 }
 
 struct ChannelBudget {
@@ -199,6 +253,16 @@ impl Subject {
     }
 }
 trait Authority: Send {
+    fn check_bootstrap_permit(&mut self, _: BootstrapDnsRoute) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported)
+    }
+    fn bootstrap_dns_socket(
+        &mut self,
+        _: BootstrapDnsRoute,
+        _: &dns_transport::Facts,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported)
+    }
     fn dns_socket(&mut self, _: Option<u64>, _: &dns_transport::Facts) -> Result<(), ServiceError> {
         Err(ServiceError::Unsupported)
     }
@@ -1137,6 +1201,23 @@ pub(super) struct VerifiedDnsProducer {
     capability: super::registry::DnsCapability,
     launch: LaunchRecord,
 }
+/// Независимый CODEC4 consuming transport/close contract, не USER Direct.
+/// Production mint отсутствует до reviewed bootstrap image/source record.
+pub(super) struct VerifiedBootstrapDnsProducer {
+    launch: LaunchRecord,
+    schema: [u8; 32],
+}
+impl VerifiedBootstrapDnsProducer {
+    fn bound(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
+        launch.encode().map_err(unavailable)?;
+        if self.launch != launch
+            || self.schema != <[u8; 32]>::from(Sha256::digest(wire::dns_v2::SCHEMA))
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        Ok(())
+    }
+}
 /// Отдельный audited producer contract: exact request/response actual bound peer.
 /// Consuming-close contract не создаёт этот token.
 pub(super) struct VerifiedDnsWireProducer {
@@ -1774,6 +1855,7 @@ impl<'a> RoutePlan<'a> {
     }
 }
 struct Issuer<A: Authority> {
+    bootstrap_dns: Option<Arc<VerifiedBootstrapDnsProducer>>,
     bootstrap_source: Option<Arc<dyn dns_bundle::roots::Source>>,
     rrsets: dns_rrset::State,
     dns_wire: Option<VerifiedDnsWireProducer>,
@@ -1816,6 +1898,7 @@ impl<A: Authority> Issuer<A> {
         let budget = ChannelBudget::new(&capsule, record.mode.required(), &record.binding.digest)?;
         let dns = dns_bundle::Bundles::new(&budget.dynamic)?;
         Ok(Self {
+            bootstrap_dns: None,
             authority,
             rrsets: dns_rrset::State::new(),
             dns_wire: None,
@@ -2390,6 +2473,21 @@ struct SystemAuthority {
     routes: Box<dyn RouteAuthority>,
 }
 impl Authority for SystemAuthority {
+    fn check_bootstrap_permit(&mut self, route: BootstrapDnsRoute) -> Result<(), ServiceError> {
+        self.fence()?;
+        self.routes.check_bootstrap_permit(&self.scope, route)?;
+        self.fence()
+    }
+    fn bootstrap_dns_socket(
+        &mut self,
+        route: BootstrapDnsRoute,
+        facts: &dns_transport::Facts,
+    ) -> Result<(), ServiceError> {
+        self.fence()?;
+        self.routes
+            .bootstrap_dns_socket(&self.scope, route, facts)?;
+        self.fence()
+    }
     fn dns_socket(
         &mut self,
         ticket: Option<u64>,
@@ -2566,6 +2664,41 @@ struct LocalAuthority {
     prepared: Arc<crate::host::local_profile_channel::Prepared>,
 }
 impl Authority for LocalAuthority {
+    fn check_bootstrap_permit(&mut self, route: BootstrapDnsRoute) -> Result<(), ServiceError> {
+        self.fence()?;
+        let cap = wire::Capsule::decode(self.prepared.capsule.bytes(), &self.peer.config_hash)
+            .map_err(unavailable)?;
+        route.validate(&cap)?;
+        self.fence()
+    }
+    fn bootstrap_dns_socket(
+        &mut self,
+        route: BootstrapDnsRoute,
+        facts: &dns_transport::Facts,
+    ) -> Result<(), ServiceError> {
+        self.fence()?;
+        let cap = wire::Capsule::decode(self.prepared.capsule.bytes(), &self.peer.config_hash)
+            .map_err(unavailable)?;
+        route.validate(&cap)?;
+        if facts.remote()
+            != SocketAddr::new(
+                match route.peer.family {
+                    4 => std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                        <[u8; 4]>::try_from(route.peer.wire().bytes).map_err(unavailable)?,
+                    )),
+                    6 => std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                        <[u8; 16]>::try_from(route.peer.wire().bytes).map_err(unavailable)?,
+                    )),
+                    _ => return Err(ServiceError::Unsupported),
+                },
+                route.peer.port,
+            )
+            || facts.protocol() != route.peer.protocol
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        self.dns_socket(None, facts)
+    }
     fn dns_socket(
         &mut self,
         ticket: Option<u64>,
@@ -3121,6 +3254,12 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn bootstrap_dns_producer(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<VerifiedBootstrapDnsProducer>>, ServiceError> {
+        Ok(None)
+    }
     fn bootstrap_source(
         &self,
         _: LaunchRecord,
@@ -4825,7 +4964,7 @@ fn run_issuer<A: Authority>(
         let mut expired_user = [0; 4096];
         let mut expired_count = 0;
         for (id, grant) in &issuer.grants {
-            if now >= grant.expires && !issuer.transport.holds_root_cleanup(*id, now) {
+            if now >= grant.expires && !issuer.transport.holds_root_cleanup(*id, false, now) {
                 *expired_user
                     .get_mut(expired_count)
                     .ok_or(ServiceError::Busy)? = *id;
@@ -4838,7 +4977,7 @@ fn run_issuer<A: Authority>(
         let mut expired = [0; 4096];
         let mut count = 0;
         for (id, grant) in &issuer.services {
-            if now >= grant.expires {
+            if now >= grant.expires && !issuer.transport.holds_root_cleanup(*id, true, now) {
                 *expired.get_mut(count).ok_or(ServiceError::Busy)? = *id;
                 count += 1;
             }
@@ -4986,6 +5125,7 @@ fn run_issuer<A: Authority>(
                 issuer.dns_release = socket.dns_producer(issuer.record)?;
                 issuer.dns_wire = socket.dns_wire_producer(issuer.record)?;
                 issuer.bootstrap_source = socket.bootstrap_source(issuer.record)?;
+                issuer.bootstrap_dns = socket.bootstrap_dns_producer(issuer.record)?;
                 issuer.dns_logical = socket.dns_logical_producer(issuer.record)?;
                 issuer.negotiated = Some(dns_bundle::negotiate(
                     issuer,

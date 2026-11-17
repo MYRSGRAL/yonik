@@ -340,6 +340,7 @@ struct Resource {
 }
 enum ProofKind {
     Direct(u64),
+    BootstrapDirect(u64),
     Proxied(Box<ProxyResources>),
 }
 struct ProxyResources {
@@ -355,12 +356,12 @@ struct LogicalLineage {
 impl ProofKind {
     fn resources(&self) -> &[u64] {
         match self {
-            Self::Direct(id) => std::slice::from_ref(id),
+            Self::Direct(id) | Self::BootstrapDirect(id) => std::slice::from_ref(id),
             Self::Proxied(p) => &p.resources[..p.count],
         }
     }
     fn kind(&self) -> u8 {
-        if matches!(self, Self::Direct(_)) {
+        if matches!(self, Self::Direct(_) | Self::BootstrapDirect(_)) {
             1
         } else {
             2
@@ -397,6 +398,26 @@ impl ProducerReleasedDirectDns {
     fn release_ref(self, proof: &mut TransportProof) -> Result<(), ServiceError> {
         if self.proof == 0
             || !matches!(proof.kind,ProofKind::Direct(id) if id==self.resource)
+            || self.binding != proof.binding
+            || self.revision != proof.revision
+            || !proof.acked
+            || proof.retired.is_some()
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        proof.retired = Some(true);
+        Ok(())
+    }
+}
+// Отдельный checked consuming-close scope: USER Direct3 сюда не конвертируется.
+struct ProducerReleasedBootstrapDns {
+    resource: u64,
+    binding: Binding,
+    revision: u64,
+}
+impl ProducerReleasedBootstrapDns {
+    fn release_ref(self, proof: &mut TransportProof) -> Result<(), ServiceError> {
+        if !matches!(proof.kind, ProofKind::BootstrapDirect(id) if id == self.resource)
             || self.binding != proof.binding
             || self.revision != proof.revision
             || !proof.acked
@@ -508,10 +529,10 @@ impl Transport {
             || self.resources.values().any(|v| v.binding.bundle == bundle)
             || self.incoming.values().any(|v| n64(&v.raw, 144) == bundle)
     }
-    pub(super) fn holds_root_cleanup(&self, root: u64, now: Instant) -> bool {
-        self.resources
-            .values()
-            .any(|r| r.binding.root == root && now < r.cleanup_until)
+    pub(super) fn holds_root_cleanup(&self, root: u64, bootstrap: bool, now: Instant) -> bool {
+        self.resources.values().any(|r| {
+            r.binding.root == root && r.binding.bootstrap == bootstrap && now < r.cleanup_until
+        })
     }
     pub(super) fn cancel_bundle(&mut self, bundle: u64) -> Result<(), ServiceError> {
         if self
@@ -675,6 +696,47 @@ impl Reply {
     }
 }
 impl<A: Authority> Issuer<A> {
+    fn bootstrap_producer(&self) -> Result<(), ServiceError> {
+        self.bootstrap_dns
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?
+            .bound(self.record)
+    }
+    fn bootstrap_route(&self, binding: Binding) -> Result<super::BootstrapDnsRoute, ServiceError> {
+        if !binding.bootstrap || binding.proxied {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let cap = self.capsule()?;
+        let row = cap.resolver_scope(binding.resolver).map_err(unavailable)?;
+        let route = super::BootstrapDnsRoute {
+            manifest: self.record.manifest,
+            source: row.source,
+            resolver: binding.resolver,
+            peer: binding.physical_peer,
+        };
+        route.validate(&cap)?;
+        Ok(route)
+    }
+    fn check_bootstrap_transport_permit(&mut self, binding: Binding) -> Result<(), ServiceError> {
+        self.bootstrap_producer()?;
+        let route = self.bootstrap_route(binding)?;
+        self.authority.check_bootstrap_permit(route)?;
+        if self.authority.now() >= binding.expires
+            || self.dns_transport_binding(binding.bundle)? != binding
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
+    fn check_dns_socket(&mut self, binding: Binding, facts: &Facts) -> Result<(), ServiceError> {
+        if binding.bootstrap {
+            self.check_bootstrap_transport_permit(binding)?;
+            let route = self.bootstrap_route(binding)?;
+            self.authority.bootstrap_dns_socket(route, facts)
+        } else {
+            self.authority.dns_socket(binding.ticket, facts)
+        }
+    }
     pub(super) fn host_reservation_id(&mut self) -> Result<u64, ServiceError> {
         Self::id(&mut self.transport.next_reservation)
     }
@@ -705,6 +767,7 @@ impl<A: Authority> Issuer<A> {
         let count = p.kind.resources().len();
         resources[..count].copy_from_slice(p.kind.resources());
         match &p.kind {
+            ProofKind::BootstrapDirect(_) => return Err(ServiceError::Unsupported),
             ProofKind::Direct(_) => self
                 .dns_wire
                 .as_ref()
@@ -814,9 +877,6 @@ impl<A: Authority> Issuer<A> {
             .resources
             .get(&resource)
             .ok_or(ServiceError::Unavailable)?;
-        if r.binding.bootstrap {
-            return Err(ServiceError::Unsupported);
-        }
         let until = if b[2] == 4 {
             let p = self
                 .transport
@@ -843,7 +903,9 @@ impl<A: Authority> Issuer<A> {
         let mut result = already;
         if result.is_none() && !self.unknown {
             let proxy = r.binding.proxied;
-            let anchor = if proxy {
+            let anchor = if r.binding.bootstrap {
+                self.bootstrap_producer()
+            } else if proxy {
                 self.dns_logical
                     .as_ref()
                     .ok_or(ServiceError::Unsupported)
@@ -900,21 +962,29 @@ impl<A: Authority> Issuer<A> {
                         return Ok(reply);
                     }
                 }
-                let released = ProducerReleasedDirectDns {
-                    proof: id,
-                    resource,
-                    binding: p.binding,
-                    revision,
-                };
+                let binding = p.binding;
                 let proof = self
                     .transport
                     .proofs
                     .get_mut(&id)
                     .ok_or(ServiceError::Unavailable)?;
-                if proxy {
+                if r.binding.bootstrap {
+                    ProducerReleasedBootstrapDns {
+                        resource,
+                        binding,
+                        revision,
+                    }
+                    .release_ref(proof)?;
+                } else if proxy {
                     proof.retired = Some(true);
                 } else {
-                    released.release_ref(proof)?;
+                    ProducerReleasedDirectDns {
+                        proof: id,
+                        resource,
+                        binding,
+                        revision,
+                    }
+                    .release_ref(proof)?;
                 }
                 result = Some(true);
             } else {
@@ -1049,6 +1119,10 @@ impl<A: Authority> Issuer<A> {
         }
         if self.transport.reservations.len() >= 64 {
             return Err(ServiceError::Busy);
+        }
+        if binding.bootstrap {
+            self.bundle_history_available(2)?;
+            self.check_bootstrap_transport_permit(binding)?;
         }
         let now = self.authority.now();
         let mut expires = binding
@@ -1193,7 +1267,7 @@ impl<A: Authority> Issuer<A> {
             }
             let binding = resource.binding;
             let expires = resource.expires;
-            self.authority.dns_socket(binding.ticket, &facts)?;
+            self.check_dns_socket(binding, &facts)?;
             // Backend fence может блокироваться: Known deadline не продлевается им.
             if self.authority.now() >= expires
                 || self.dns_transport_binding(binding.bundle)? != binding
@@ -1224,9 +1298,9 @@ impl<A: Authority> Issuer<A> {
         };
         let b = &incoming.raw;
         let binding = reservation.binding;
-        // Source/parent scope не наследует USER consuming wire/close scope.
+        let reservation_expires = reservation.expires;
         if binding.bootstrap {
-            return Err(ServiceError::Unsupported);
+            self.bootstrap_producer()?;
         }
         let parent = self
             .transport
@@ -1268,8 +1342,8 @@ impl<A: Authority> Issuer<A> {
         }) {
             return Err(ServiceError::InvalidRequest);
         }
-        self.authority.dns_socket(binding.ticket, &facts)?;
-        if self.authority.now() >= reservation.expires
+        self.check_dns_socket(binding, &facts)?;
+        if self.authority.now() >= reservation_expires
             || self.dns_transport_binding(binding.bundle)? != binding
         {
             return Err(ServiceError::Unavailable);
@@ -1360,7 +1434,7 @@ impl<A: Authority> Issuer<A> {
         }
         let binding = p.binding;
         if binding.bootstrap {
-            return Err(ServiceError::Unsupported);
+            self.bootstrap_producer()?;
         }
         let exchange = p.exchange;
         if (b[2] == 2) != binding.proxied {
@@ -1429,6 +1503,8 @@ impl<A: Authority> Issuer<A> {
                             producer_sequence: n64(b, 48),
                         },
                     }))
+                } else if binding.bootstrap {
+                    ProofKind::BootstrapDirect(resources[0])
                 } else {
                     ProofKind::Direct(resources[0])
                 },
@@ -1695,6 +1771,17 @@ pub(super) fn send_reply<A: Authority>(
             reply.body[2] = 3;
         }
         if let Some(binding) = reply.binding {
+            if binding.bootstrap
+                && reply.operation == Operation::Reserved
+                && reply.body[60] == 2
+                && issuer.check_bootstrap_transport_permit(binding).is_err()
+            {
+                if let Commit::Reserved(id) = reply.commit {
+                    issuer.transport.cancel_reservation(id)?;
+                }
+                reply = Reply::denied(Operation::Reserved, reply.request, reply.expires);
+                continue;
+            }
             if issuer.dns_transport_binding(binding.bundle)? != binding {
                 return Err(ServiceError::Unavailable);
             }
@@ -1940,11 +2027,11 @@ pub(super) fn progress<A: Authority>(
         let reply = match issuer.match_dns_physical(*id) {
             Ok(reply) => reply,
             Err(e) => {
-                let bootstrap = issuer.transport.incoming.get(id).is_some_and(|packet| {
-                    issuer
-                        .dns_transport_binding(n64(&packet.raw, 144))
-                        .is_ok_and(|binding| binding.bootstrap)
-                });
+                let bootstrap = issuer
+                    .transport
+                    .incoming
+                    .get(id)
+                    .is_some_and(|packet| issuer.dns.bootstrap_context(n64(&packet.raw, 144)));
                 if !bootstrap {
                     issuer.transport.incoming.remove(id);
                 }
