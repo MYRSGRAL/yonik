@@ -509,3 +509,44 @@ fn third_subscription_reality_shapes_preserve_explicit_xudp() {
         );
     }
 }
+
+#[test]
+fn hysteria2_uri_compiles_to_xray_quic_with_transport_auth() {
+    let uri = "hysteria2://unit:sample%40value@secret.example:8443?sni=verify.example";
+    let value = config(Engine::Xray, uri).unwrap();
+    assert_eq!(value["inbounds"][0]["listen"], "127.0.0.1");
+    assert_eq!(value["inbounds"][0]["settings"]["udp"], true);
+    assert_eq!(
+        value["outbounds"],
+        json!([{
+            "tag":"proxy","protocol":"hysteria",
+            "settings":{"version":2,"address":"secret.example","port":8443},
+            "streamSettings":{
+                "network":"hysteria","security":"tls",
+                "hysteriaSettings":{"version":2,"auth":"unit:sample@value"},
+                "tlsSettings":{"serverName":"verify.example","allowInsecure":false,"useSystemCA":true}
+            }
+        }])
+    );
+    assert_eq!(
+        config(Engine::SingBox, uri),
+        Err(CompileError::UnsupportedTransport)
+    );
+    for extra in [
+        "obfs=salamander",
+        "insecure=1",
+        "allowInsecure=0",
+        "type=quic",
+        "alpn=h3",
+        "security=tls",
+    ] {
+        assert_eq!(
+            config(Engine::Xray, &format!("{uri}&{extra}")),
+            Err(CompileError::UnsupportedOption)
+        );
+    }
+    assert_eq!(
+        config(Engine::Xray, &uri.replace("verify.example", "bad%0Aname")),
+        Err(CompileError::InvalidParameter)
+    );
+}

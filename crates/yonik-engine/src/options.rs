@@ -88,19 +88,19 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
     let protocol = server.protocol();
     let transport = server.transport();
     let security = server.security();
-    if !(matches!(
-        transport,
-        Transport::Tcp | Transport::WebSocket | Transport::Grpc
-    ) || transport == Transport::Xhttp && engine == Engine::Xray)
-    {
-        return Err(CompileError::UnsupportedTransport);
+    match (protocol, transport, engine) {
+        (Protocol::Hysteria2, Transport::Quic, Engine::Xray) => {}
+        (Protocol::Hysteria2, _, _) => return Err(CompileError::UnsupportedTransport),
+        (_, Transport::Tcp | Transport::WebSocket | Transport::Grpc, _)
+        | (_, Transport::Xhttp, Engine::Xray) => {}
+        _ => return Err(CompileError::UnsupportedTransport),
     }
     if security == Security::Unsupported {
         return Err(CompileError::UnsupportedSecurity);
     }
     if !matches!(
         protocol,
-        Protocol::Vless | Protocol::Vmess | Protocol::Trojan
+        Protocol::Vless | Protocol::Vmess | Protocol::Trojan | Protocol::Hysteria2
     ) && transport != Transport::Tcp
     {
         return Err(CompileError::UnsupportedTransport);
@@ -108,7 +108,7 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
     if matches!(protocol, Protocol::Shadowsocks | Protocol::Socks5) && security != Security::None {
         return Err(CompileError::UnsupportedSecurity);
     }
-    if protocol == Protocol::Trojan && security != Security::Tls {
+    if matches!(protocol, Protocol::Trojan | Protocol::Hysteria2) && security != Security::Tls {
         return Err(CompileError::UnsupportedSecurity);
     }
     // Xray 26.10.31 разрешает REALITY для RAW, gRPC и XHTTP.
