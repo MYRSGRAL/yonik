@@ -1756,3 +1756,19 @@ Pure tests используют authenticated fake channel/issuer через act
 context decoder и actual callers. Они не измеряют current executable, kernel
 proof, durable policy install или runtime acceptance. Wire/schema/corpus,
 frozen ABI, R9/R14/UDP/RX и R64 custody barriers не меняются.
+
+### R79: NETWORK service wire-close ownership
+
+Producer и waiter получают service через private `networkProbe`: отдельный
+`networkCleanupRefs` приобретается под тем же flow mutex, что и allocation Probe,
+до возврата/handoff. Generic tick немедленно закрывает usage/cancel ctx, но при
+этом ref не отправляет service Close32/target3 и не удаляет grant. Общий pending
+не используется как wire barrier; обычные USER/probe semantics не меняются.
+
+Ref освобождается ровно при завершении существующего NETWORK cleanup owner:
+после constructor exit, waiter/permission, local close/join, publication,
+Proof/Resource и reservation/exchange/context ACK barriers. Ошибка до context
+creation также проходит constructor settle; Unknown удерживает ref/custody.
+Повторный tick не освобождает ref второй раз и не повторяет uncertain Close.
+Новый patch digest требует bounded review/pin update. Rust scratch correction
+и совместный NETWORK pair здесь не аттестованы; flags/allowlists не меняются.
