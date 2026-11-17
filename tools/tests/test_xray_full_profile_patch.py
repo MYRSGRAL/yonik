@@ -34,7 +34,31 @@ class FullProfilePatchTests(unittest.TestCase):
         self.assertIn("profileNetworkBootstrapPending = 4", section)
         self.assertNotIn("dns4CaptureReviewed = true", section)
         self.assertNotIn("net.DefaultResolver", section)
-        self.assertIn("Transcript/answer publication остаются закрыты", section)
+        self.assertIn(
+            "Published — DATA, не waiter или original physical permission", section
+        )
+
+    def test_network_exchange_is_private_captured_and_publishes_data_only(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "profileDNSExchangeNetwork(n, conn)",
+            "type profileDNSNetworkExchange struct",
+            "s.beginExchange(false, cap)",
+            "s.beginExchange(true, cap)",
+            "requestHash: sha256.Sum256(request)",
+            "profileDNSPublishNetwork(n, cap)",
+            "o.networkPublishHash != sha256.Sum256(op.body)",
+            "records*(32*1024)",
+            "o.network != nil && o.network.constructing",
+            "t.network != nil && !o.released",
+        ):
+            self.assertIn(anchor, patch)
+        section = patch.split(
+            "+++ b/common/yonikbroker/profile_dns_rrset_linux.go\n", 1
+        )[1].split("diff --git ", 1)[0]
+        self.assertNotIn("dns4CaptureReviewed = true", section)
+        self.assertNotIn("net.DefaultResolver", section)
+        self.assertIn("body[136], body[137], body[142] = 2, 1, f.carrier", section)
 
     def test_network_transport_uses_consuming_owner_without_user_bundle(self) -> None:
         patch = (ADAPTER / "native-full-profile.patch").read_text()

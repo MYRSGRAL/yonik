@@ -1584,6 +1584,70 @@ parent/snapshot/peer binding, raw factory ownership, ACK barriers и consuming
 close/all-task joins; root source/pin review требуется отдельно. Capture flag,
 public gates/allowlists, canonical wire/schema/corpus и Rust не менялись.
 
+### NETWORK captured exchange и Publish DATA
+
+Actual constructor после LogicalACK39 вызывает `profileDNSExchangeNetwork` на
+том же consuming connection. Caller не передаёт request/response/IP/FD/factory.
+Request генерирует существующий pinned-netgo `dnsRequest` из первого retained
+snapshot question, A/qtype/options; case-preserved FQDN отделён от canonical
+lookup key и immutable original physical hostname. Crypto request ID не выдаёт
+authority; pure controls используют injected ID source без OS/network effects.
+
+`profileDNSNetworkExchange` — private one-shot capability с exact connection,
+owner и request hash. Public NETWORK Read/Write по-прежнему deny. Только private
+producer вызывает `readExchange`/`writeExchange`; foreign/inactive capability,
+новый wrapper или изменённый request не usable. Common consuming facade сохраняет
+pre/post I/O gates, исходный deadline, bounded framing и joined tasks. UDP — один
+connected datagram в captured payload limit; TCP — length2 и ровно declared body
+до32768, partial reads допустимы. Short/uncertain send не retry-ится. TC/negative
+response, search/family/peer retry требуют отдельного правильного runner и в этом
+single-exchange cut fail closed. Source/parent/root/context/epoch/transport proof
+и System Known20ms не продлеваются packet/ACK/queue/RTT.
+
+До DNS payload reserve оплачиваются existing6 pending/history и64KiB result
+owner; transport128KiB уже держит request514/response32770 buffers. Перед strict
+Unpack/maps/string canonicalization дополнительно резервируется conservative
+`64KiB + RRcount*32KiB` из общего8MiB с RRcount≤512; quota refusal происходит до
+allocation/parser/Publish. Temporary parser credit возвращается после parse,
+retained request/member/Publish storage остаётся prepaid. Новых RX/FD readers,
+deps/caps нет; R39 permanent RX credits не debit-ятся повторно.
+
+Strict parser grammar переиспользована через private metadata adapter без
+фиктивного USER exchange. ID/question/IN/type/flags/OPT, extent/backward pointers,
+TC/RCODE, CNAME membership/cycles/depth, ANSWER-only A/AAAA, TTL и member bounds
+остаются прежними. Additional-only IP не становится RRset member. После parser
+Source и original deadlines проверяются ещё раз. Canonical Publish144 содержит
+purpose2/source1, captured sourceDigest/assetHash, exact service root/query/epoch,
+ExchangeId/TransportProof/revision и parent endpoint/subject/frontier/carrier;
+DNS resolver carrier удерживается отдельно. Tail — canonical captured lookup key
+и exact actual request/response, без caller-supplied bytes и нового wire/layout.
+Publish body hash повторно сверяется actual actor перед send.
+
+Published41 проверяет pending sequence, ProducerRRset namespace, exchange/epoch/
+member count и min(DATA TTL/source/context/parent/session/original RTT lease).
+`ProfileDNSProducerData` NETWORK variant имеет `exchange=nil`, отдельный typed
+owner и не принимается USER cache/answer/waiter APIs. Ни DATA, ни class3/flow0
+root не USER grant/WaiterReceipt/original physical permission. Constructor после
+ACK закрывает actual socket/duplicate и возвращает deny, public IP/TTL не выдаёт;
+separate bootstrap waiter/Numeric handoff — следующий unit.
+
+Retirement теперь ждёт pending Publish Cancel1/ACK и Producer Cancel5/ACK до
+Proof→Resource и reservation/context retirement. R64 `constructing` удерживает
+также result metadata/credits до выхода producer/constructor: blocked read,
+cancel, late response и delayed Close не освобождают live owner. Unknown Publish
+или producer cleanup sticky, удерживает DATA/transport/FD/context custody и не
+отменяет соседний USER flow. Whole-session protocol replay/uncertain source
+остаётся fail closed. Original cleanup windows не продлеваются.
+
+**Production boundary:** legitimate protected CODEC4 NETWORK capture/consuming
+contract и resolver-only route permit до Physical Reserved36/Connect всё ещё
+обязательны; current records/capture flags/public gates/allowlists остаются false.
+Authenticated fake issuer ACK в tests не подтверждает установку route или kernel
+facts и не mint-ит production authority. Source review/pin update нового NETWORK
+wire producer требуется root; старый schema3 Direct record не повышается до4.
+Actual OS/socket/network/core/main не исполнялись. Rust/registry/builder/planner/
+compiler/policy/desktop, CODEC4 corpus/schema и frozen ABI не изменены.
+
 R64: constructor удерживает отдельный in-flight barrier до выхода. Tick может
 закрыть context и обработать cancellation ACK, но не освобождает references и
 pending credits во время передачи Probe/context/reservation в constructor.
