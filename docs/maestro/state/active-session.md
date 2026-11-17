@@ -909,6 +909,16 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   Старый compile-only3c156ca candidate не является NETWORK install/runtime-ready;
   pins требуют обновления после проверки corrective digest, public gates false.
 
+- R81 narrow SOURCE CLEAN: NETWORK cleanup correction35b1fe9+61ea29c
+  интегрирована. Atomic Probe cleanup ref и retained late-refresh/tomb ownership
+  оставляют единственный wire Close32 generic tick после cleanup barriers.
+  Digest1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05
+  source-eligible для прежних трёх contracts/UDP raw TCP subset; full joint pair
+  ещё не GREEN. Actual Rust scratchca0b616 уже дал Allow41 на tight budget;
+  следующий rerun должен проверить success и malformed-response cleanup со всеми
+  ACK до service Close. Protected pins/builder artifact пока прежние3c156ca,
+  их обновление отложено до joint GREEN; public gates/runtime/install false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
