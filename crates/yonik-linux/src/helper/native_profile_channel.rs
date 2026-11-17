@@ -5968,6 +5968,10 @@ pub(crate) fn validate_consumer_sources(
 }
 
 #[cfg(test)]
+pub(crate) fn fake_reviewed_france_image(hash: [u8; 32]) -> super::ImageContract {
+    super::registry::reviewed_france_image(hash)
+}
+#[cfg(test)]
 pub(crate) fn fake_consumer_image(hash: [u8; 32]) -> super::ImageContract {
     use super::registry::{BootstrapScope, fake_bootstrap_image};
     fake_bootstrap_image(
@@ -6001,6 +6005,9 @@ mod subset_readiness_tests {
             .unwrap();
         let intent = ProfileIntent::from_profile(profile).unwrap();
         for mode in [Mode::Local, Mode::System] {
+            let reviewed = crate::helper::registry::reviewed_france_image([17; 32]);
+            assert!(prepare_consumer(&intent, mode, |p| p.image(&reviewed, [17; 32])).is_ok());
+            assert!(prepare_consumer(&intent, mode, |p| p.image(&reviewed, [18; 32])).is_err());
             let mut image_checks = 0;
             let proof = crate::helper::registry::fake_datagram_image(
                 [17; 32],

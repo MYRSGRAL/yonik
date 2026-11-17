@@ -35,7 +35,7 @@ EXTRA_PATCHES = (
 XRAY_URL = "https://github.com/XTLS/Xray-core.git"
 XRAY_TAG = "v26.10.31"
 XRAY_COMMIT = "a4a3dff5b20c2faae567b742c172c7b95e75c083"
-PROFILE_PATCH = "1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05"
+PROFILE_PATCH = "3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339"
 LOG = logging.getLogger("yonik.native_adapter")
 COMMAND_TIMEOUT = 180
 BUILD_TIMEOUT = 900
@@ -139,6 +139,36 @@ def bootstrap_candidate(record: dict[str, object]) -> dict[str, object]:
         "requires_independent_scope_review": True,
         "subset": "single_raw_tcp_branch0",
         "candidate_record": candidate,
+    }
+
+
+def france_candidate(record: dict[str, object]) -> dict[str, object]:
+    """Все независимые slots одной image; candidate не становится install authority."""
+    candidate = bootstrap_candidate(
+        tcp5_candidate(datagram_candidate(record)["candidate_record"])[
+            "candidate_record"
+        ]
+    )["candidate_record"]
+    manifest = {
+        "schema": 2,
+        "engines": [
+            {
+                "engine": "xray",
+                "version": XRAY_TAG.removeprefix("v"),
+                "sha256": record["elf_sha256"],
+                "native_profile_producer": candidate,
+            }
+        ],
+    }
+    compact = json.dumps(manifest, separators=(",", ":")) + "\n"
+    if len(compact.encode()) > 4096:
+        raise BuildError("Protected registry projection превышает4096 bytes")
+    return {
+        "validation": "COMPILE_ONLY_CANDIDATE",
+        "install_authority": False,
+        "subset": "FranceSS_single_raw_tcp_udp_shared_codec5",
+        "candidate_record": candidate,
+        "registry_projection": compact,
     }
 
 
@@ -672,6 +702,8 @@ def build_locked(
             stream.write(json.dumps(datagram_candidate(record), indent=2) + "\n")
         with (output / "native-profile-tcp5-candidate.json").open("x") as stream:
             stream.write(json.dumps(tcp5_candidate(record), indent=2) + "\n")
+        with (output / "native-profile-france-candidate.json").open("x") as stream:
+            stream.write(json.dumps(france_candidate(record), indent=2) + "\n")
     destination = output / engine
     with binary.open("rb") as incoming, destination.open("xb") as outgoing:
         shutil.copyfileobj(incoming, outgoing)

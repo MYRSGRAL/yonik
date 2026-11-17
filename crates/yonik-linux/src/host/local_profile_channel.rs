@@ -498,6 +498,36 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn france_reviewed_image_reaches_actual_prepare_capture_boundary() {
+        let report = yonik_import::import_profiles(
+            include_bytes!("../../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
+        )
+        .unwrap();
+        let profile = report
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                yonik_import::ProfileEntry::Xray(p) if p.name() == "FranceSS" => Some(p),
+                _ => None,
+            })
+            .unwrap();
+        let intent = ProfileIntent::from_profile(profile).unwrap();
+        let binary = fixture_image();
+        let proof = issuer::fake_reviewed_france_image(binary.trusted_hash());
+        let binary = binary.with_producer(Some(proof));
+        let plan =
+            OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap()).unwrap();
+        let (_keep, cancel) = Cancellation::new();
+        let mut capture = 0;
+        let result = Prepared::prepare_with_sources(&binary, intent, plan, &cancel, |_, _| {
+            capture += 1;
+            // OS capture/staging отсутствуют: намеренная test leaf boundary.
+            Err(HostError::State)
+        });
+        assert!(matches!(result, Err(HostError::State)));
+        assert_eq!(capture, 1);
+    }
+    #[test]
     fn france_ss_actual_prepare_never_captures_with_tcp_only_bootstrap_capabilities() {
         let report = yonik_import::import_profiles(
             include_bytes!("../../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),

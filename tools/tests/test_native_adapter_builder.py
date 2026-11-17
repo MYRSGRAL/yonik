@@ -20,6 +20,50 @@ import build_native_adapter as builder  # noqa: E402
 
 
 class BuilderTests(unittest.TestCase):
+    def test_france_projection_all_scopes_fit_protected_manifest_without_authority(
+        self,
+    ) -> None:
+        record = {
+            "contract": "yonik-xray-profile-udp-v2",
+            "version": 1,
+            "source_commit": builder.XRAY_COMMIT,
+            "patch_sha256": builder.PROFILE_PATCH,
+            **{
+                key: "12" * 32
+                for key in (
+                    "source_sha256",
+                    "builder_sha256",
+                    "toolchain_sha256",
+                    "build_inputs_sha256",
+                    "elf_sha256",
+                )
+            },
+        }
+        candidate = builder.france_candidate(record)
+        self.assertFalse(candidate["install_authority"])
+        raw = candidate["registry_projection"]
+        self.assertLessEqual(len(raw.encode()), 4096)
+
+        def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                self.assertNotIn(key, result)
+                result[key] = value
+            return result
+
+        projection = json.loads(raw, object_pairs_hook=unique)
+        self.assertEqual(projection["schema"], 2)
+        entry = projection["engines"][0]
+        self.assertEqual(entry["sha256"], record["elf_sha256"])
+        producer = entry["native_profile_producer"]
+        self.assertEqual(len(set(producer) - set(record)), 9)
+        self.assertNotIn("dns_wire", producer)
+        self.assertNotIn("dns_release", producer)
+        self.assertNotIn("path", entry)
+        self.assertEqual(set(record), set(producer) & set(record))
+        with self.assertRaises(builder.BuildError):
+            builder.france_candidate(record | {"oversize": "x" * 4096})
+
     def test_tcp5_candidate_keeps_tcp_udp_source_reviews_separate(self) -> None:
         original = {"elf_sha256": "11" * 32, "patch_sha256": "44" * 32}
         candidate = builder.tcp5_candidate(original)

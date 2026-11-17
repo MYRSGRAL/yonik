@@ -1,5 +1,28 @@
 # Completion API: состояние реализации
 
+## R97: FranceSS source readiness и compile-only candidates
+
+Root принял exact patch `3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339`
+для прежнего raw FranceSS TCP+UDP subset: независимые TCP5 Source/Wire/Release,
+Datagram5 Source/Wire/Release, сохранённые Source4/Wire4/Release4 и legacy UDP
+compatibility. Pins обновлены независимо; это не install/runtime approval.
+Legacy producer/Direct3 DNS остаются `6e6abdbd…`, Direct USER4 и loopback policy
+не получают authority. Остальные шесть imported fixtures остаются Unsupported.
+
+`ConsumerPlan::ShadowsocksDual5` проверяет обе физические ветки одного intent,
+все шесть CODEC5 capabilities и отдельный `ImageContract::check` для UDP
+consuming eligibility. Predicate/config/fingerprint не изменены. Local проверяет
+тот же retained BinarySnapshot до capture/staging, System получает его только
+из protected registry; candidate JSON и UI caller не создают image authority.
+
+Builder выдаёт `native-profile-france-candidate.json`: combined девять typed
+slots и compact schema2 `registry_projection`, bounded4096 до публикации.
+Projection не содержит путей и не включает непринятые Direct DNS slots;
+`install_authority=false`. Trusted installation/rollback — отдельная операция.
+47 actor cases R97 — PURE_STATEFUL_INTEROP с injected USER/HELLO/Consumed/OS
+leaves, не installed image/runtime admission. Новые Xray/GUI ELF только собираются,
+не исполняются; public readiness flags от source pins автоматически не меняются.
+
 Это SOURCE/PURE codec milestone, не завершение P5 и не runtime acceptance.
 Production issuer, delivery/custody, versioned backend dispatch, native DAT
 delivery и dynamic firewall lifecycle — следующие части. Source producer DAT и

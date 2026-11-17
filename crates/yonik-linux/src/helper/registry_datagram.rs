@@ -4,10 +4,14 @@ use super::fake_bootstrap_image;
 use super::{DnsReleaseRecord, ImageContract, ProducerRecord, RegistryError, Sha256};
 use sha2::Digest;
 use std::str::FromStr;
-pub(super) const BUILD_REVIEWED_PATCH: Option<&str> = None;
-const SOURCE_REVIEWED_PATCH: Option<&str> = None;
-const WIRE_REVIEWED_PATCH: Option<&str> = None;
-const RELEASE_REVIEWED_PATCH: Option<&str> = None;
+pub(super) const BUILD_REVIEWED_PATCH: Option<&str> =
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339");
+const SOURCE_REVIEWED_PATCH: Option<&str> =
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339");
+const WIRE_REVIEWED_PATCH: Option<&str> =
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339");
+const RELEASE_REVIEWED_PATCH: Option<&str> =
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339");
 const REVIEWS: [Option<&str>; 3] = [
     SOURCE_REVIEWED_PATCH,
     WIRE_REVIEWED_PATCH,
@@ -36,8 +40,12 @@ impl DatagramScope {
     }
 }
 // Это отдельный review-запрос TCP6 под CODEC5, а не расширение UDP5/Source4.
-// Literal pins остаются закрыты до независимого принятия exact producer.
-const TCP_REVIEWS: [Option<&str>; 3] = [None, None, None];
+// R93/R96/R97: TCP5 принят независимо от datagram5, exact raw SS subset.
+const TCP_REVIEWS: [Option<&str>; 3] = [
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339"),
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339"),
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339"),
+];
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tcp5Scope {
     Source,
@@ -303,7 +311,7 @@ mod tests {
         let checked = record.validate(Sha256([17; 32])).unwrap();
         assert!(
             checked.tcp5_channel([17; 32], T::Source).unwrap().is_none(),
-            "TCP5 pins None"
+            "legacy artifact не наследует TCP5 review"
         );
         assert!(
             checked

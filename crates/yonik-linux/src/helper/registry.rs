@@ -129,18 +129,18 @@ const DNS_WIRE_REVIEWED_PATCH: Option<&str> =
 const PRODUCER_PATCH: &str = "6e6abdbdcedae5b7c4548e9225ae4f8531a4489b8788141a2b6b4cf64a083c7e";
 // Direct USER CODEC4 отдельно не принят; bootstrap review его не заменяет.
 const DNS_CODEC4_REVIEWED_PATCH: Option<&str> = None;
-// R81/R83: exact CODEC4 single raw TCP producer и независимые helper scopes.
+// R97: exact preserved CODEC4 raw TCP scopes; CODEC5 review отдельно.
 const BOOTSTRAP_BUILD_REVIEWED_PATCH: Option<&str> =
-    Some("1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05");
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339");
 const BOOTSTRAP_SOURCE_REVIEWED_PATCH: Option<&str> =
-    Some("1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05");
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339");
 const BOOTSTRAP_DNS_WIRE_REVIEWED_PATCH: Option<&str> =
-    Some("1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05");
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339");
 const BOOTSTRAP_DNS_RELEASE_REVIEWED_PATCH: Option<&str> =
-    Some("1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05");
-// R81: UDP совместимость нового patch принята отдельно от bootstrap scopes.
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339");
+// R97: UDP совместимость принята отдельно от bootstrap scopes.
 const UDP_ADDITIONAL_REVIEWED_PATCH: Option<&str> =
-    Some("1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05");
+    Some("3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339");
 const BOOTSTRAP_REVIEWED_PATCHES: [Option<&str>; 3] = [
     BOOTSTRAP_SOURCE_REVIEWED_PATCH,
     BOOTSTRAP_DNS_WIRE_REVIEWED_PATCH,
@@ -587,6 +587,32 @@ fn fake_dns_record(image: [u8; 32]) -> ProducerRecord {
             "contract_sha256":format!("{:x}",sha2::Sha256::digest(b"direct-dns-consuming-close-join-v1\0")),
             "schema_sha256":format!("{:x}",sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-3\0"))}});
     serde_json::from_value(value).unwrap()
+}
+
+/// Только injected protected record facts, без утверждения установленного image.
+#[cfg(test)]
+pub(crate) fn reviewed_france_image(image: [u8; 32]) -> ImageContract {
+    use sha2::Digest;
+    let mut record = fake_dns_record(image);
+    record.dns_release = None;
+    record.patch_sha256 = datagram::BUILD_REVIEWED_PATCH.unwrap().into();
+    let slot = |contract: &str, schema: &[u8]| DnsReleaseRecord {
+        contract: contract.into(),
+        version: 1,
+        contract_sha256: format!(
+            "{:x}",
+            sha2::Sha256::digest(format!("{contract}\0").as_bytes())
+        ),
+        schema_sha256: format!("{:x}", sha2::Sha256::digest(schema)),
+    };
+    let schema = crate::profile_channel::dns_v2::DATAGRAM_SCHEMA;
+    record.bootstrap_datagram = Some(slot(DatagramScope::Source.contract(), schema));
+    record.bootstrap_datagram_dns_wire = Some(slot(DatagramScope::Wire.contract(), schema));
+    record.bootstrap_datagram_dns_release = Some(slot(DatagramScope::Release.contract(), schema));
+    record.bootstrap_tcp5_source = Some(slot(Tcp5Scope::Source.contract(), schema));
+    record.bootstrap_tcp5_dns_wire = Some(slot(Tcp5Scope::Wire.contract(), schema));
+    record.bootstrap_tcp5_dns_release = Some(slot(Tcp5Scope::Release.contract(), schema));
+    record.validate(Sha256(image)).unwrap()
 }
 /// Отдельный synthetic CODEC4 source review. Не pin существующего Direct3/UDP.
 #[cfg(test)]
@@ -1132,6 +1158,33 @@ mod tests {
                 .check_dns(image.0)
                 .is_err()
         );
+    }
+    #[test]
+    fn reviewed_france_record_keeps_six_scopes_and_legacy_contracts_independent() {
+        use super::{DatagramScope as D, Tcp5Scope as T};
+        let image = super::reviewed_france_image([17; 32]);
+        assert!(image.check([17; 32]).is_ok());
+        assert!(image.check_dns([17; 32]).is_err());
+        assert!(
+            image
+                .bootstrap_channel([17; 32], super::BootstrapScope::Source)
+                .unwrap()
+                .is_none()
+        );
+        for s in [D::Source, D::Wire, D::Release] {
+            assert!(image.datagram_channel([17; 32], s).unwrap().is_some());
+            assert!(image.datagram_channel([18; 32], s).is_err());
+            let mut absent = image.clone();
+            absent.datagram[s.index()] = None;
+            assert!(absent.datagram_channel([17; 32], s).unwrap().is_none());
+        }
+        for s in [T::Source, T::Wire, T::Release] {
+            assert!(image.tcp5_channel([17; 32], s).unwrap().is_some());
+            assert!(image.tcp5_channel([18; 32], s).is_err());
+            let mut absent = image.clone();
+            absent.tcp5[s.index()] = None;
+            assert!(absent.tcp5_channel([17; 32], s).unwrap().is_none());
+        }
     }
     #[test]
     fn reviewed_bootstrap_build_requires_each_explicit_scope() {
