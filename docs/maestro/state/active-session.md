@@ -819,6 +819,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   counterpart ещё реализуется, capture/Source/public gates закрыты. NETWORK
   payload/answers и runtime не объявлены готовыми.
 
+- R67 SOURCE scoped CLEAN: Rust NETWORK transport20b5a0f интегрирован.
+  Resolver-only permit проверяется до Allow36 и перед отправкой PhysicalReserved;
+  BootstrapDirect proof/release не наследует USER Direct3. Retained kernel facts,
+  launch/schema/source/binding/expiry и Proof→Resource cleanup fences сохранены.
+  Production bootstrap producer/Source None; NETWORK Publish/Waiter/Numeric и
+  Go/Rust kernel/runtime acceptance остаются открытыми, public gates false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
