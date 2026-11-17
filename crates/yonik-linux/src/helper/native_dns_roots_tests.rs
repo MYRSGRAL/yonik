@@ -6,7 +6,10 @@ use super::super::super::{
 use super::*;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicUsize;
+#[path = "native_hosts_interop_tests.rs"]
+mod interop;
 struct Facts {
+    subject: u16,
     launch: LaunchRecord,
     reference: wire::SnapshotRef,
     asset: Vec<u8>,
@@ -83,7 +86,7 @@ impl Source for Facts {
             }
             || !(9..=12).contains(&p.query)
             || p.selector.endpoint != self.endpoint
-            || p.selector.subject != 1
+            || p.selector.subject != self.subject
             || p.path != self.path
             || p.original.bytes != b"physical.invalid"
             || p.original.port != 8443
@@ -182,6 +185,15 @@ fn fixture_shape(
     order: u8,
     raw: bool,
 ) -> (Issuer<Fake>, Arc<Facts>) {
+    fixture_digest(mode, address, order, raw, [3; 32])
+}
+fn fixture_digest(
+    mode: Mode,
+    address: std::net::IpAddr,
+    order: u8,
+    raw: bool,
+    digest: [u8; 32],
+) -> (Issuer<Fake>, Arc<Facts>) {
     use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent, VerifiedSystemResolver};
     struct Snapshot;
     impl VerifiedSystemResolver for Snapshot {
@@ -245,10 +257,9 @@ fn fixture_shape(
         bytes: asset.len() as u32,
         flags: 0,
     };
-    let capsule = Arc::new(
-        wire::OwnedCapsule::build(&intent, &plan, Some(reference), [3; 32], 1, 1).unwrap(),
-    );
-    let cap = wire::Capsule::decode(capsule.bytes(), &[3; 32]).unwrap();
+    let capsule =
+        Arc::new(wire::OwnedCapsule::build(&intent, &plan, Some(reference), digest, 1, 1).unwrap());
+    let cap = wire::Capsule::decode(capsule.bytes(), &digest).unwrap();
     let (mut scope, mut mask) = cap.subject_scope(0, 6).unwrap();
     let mut path = vec![];
     let endpoint = loop {
@@ -261,14 +272,16 @@ fn fixture_shape(
             break d.endpoint_index;
         }
     };
-    let launch = LaunchRecord {
+    let mut launch = LaunchRecord {
         manifest: cap.manifest,
         ..issuer_tests::issuer(mode).record
     };
+    launch.binding.digest = digest;
     let mut issuer = Issuer::new(Fake::new(mode), capsule, launch).unwrap();
     issuer.authority.service_trusted = true;
     issuer.authority.owner_forbidden = true;
     let facts = Arc::new(Facts {
+        subject: if raw { 0 } else { 1 },
         launch,
         reference,
         asset,

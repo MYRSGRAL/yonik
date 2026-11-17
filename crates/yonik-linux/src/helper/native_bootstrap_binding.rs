@@ -734,7 +734,7 @@ impl BootstrapDnsTranscript for BootstrapBinding {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
     struct FakePeer {
@@ -782,6 +782,41 @@ mod tests {
         peers: Vec<std::net::SocketAddr>,
         valid: AtomicBool,
         fail_plan: AtomicBool,
+    }
+    pub(in crate::helper::native_profile_channel) fn interop_source(
+        capsule: Arc<wire::OwnedCapsule>,
+        launch: LaunchRecord,
+        asset: Vec<u8>,
+        reference: wire::SnapshotRef,
+        budget: Arc<ChannelBudget>,
+    ) -> Arc<dyn Source> {
+        let peer = Arc::new(FakePeer {
+            record: launch,
+            image: [17; 32],
+            config: launch.binding.digest,
+            producer: Some(crate::helper::registry::fake_bootstrap_image(
+                [17; 32],
+                &[BootstrapScope::Source],
+            )),
+            valid: AtomicBool::new(true),
+            clock: AtomicU64::new(0),
+            start: Instant::now(),
+            fds: crate::helper::memory::ByteBudget::new(64),
+        });
+        let owner = Arc::new(FakeOwner {
+            mode: launch.mode,
+            capsule: capsule.clone(),
+            reference,
+            asset,
+            peers: vec!["192.0.2.53:53".parse().unwrap()],
+            valid: AtomicBool::new(true),
+            fail_plan: AtomicBool::new(false),
+        });
+        BootstrapBinding::create(peer, owner, capsule, launch, budget)
+            .unwrap()
+            .unwrap()
+            .source()
+            .unwrap()
     }
     impl SourceOwner for FakeOwner {
         fn mode(&self) -> Mode {
