@@ -1832,3 +1832,51 @@ System route-capture callback (deferred никогда не query), HOSTS/NETWOR
 из synthetic snapshot и actual serialized CODEC4 issuer drivers. Production
 prepare/route callers compile-only: real capture/kernel/backend/runtime не
 исполнялись. Полная System/Local OS preparation этими тестами не заявляется.
+
+### FranceSS: closed DATA prerequisite, full prepare ещё Unsupported
+
+`ProfileIntent::raw_tcp_consumer_shape()` читает private typed settings без нового
+JSON parsing и распознаёт `ShadowsocksAes128Gcm`: ровно один outbound/server,
+method aes-128-gcm, original address/port/password, без stream/mux/proxy/UoT settings.
+`is_raw_tcp_consumer_subset` — DATA wrapper, не readiness. Тип отдельно сообщает
+`requires_physical_udp()`: raw stream TCP у Shadowsocks НЕ означает TCP-only graph.
+Методы AES256/chacha/2022 и explicit extensions не промотируются этой selection.
+Parser/validate/compile/P3 не изменены; тесты используют сам FranceSS root из
+`tests/fixtures/xray-full-profile-seven.json`, не синтетический VLESS substitute.
+
+Read-only exact pinned Go1e65 source: `proxy/shadowsocks/client.go::Client.Process`
+берёт network из original destination, присваивает `dest.Network = network` и
+вызывает `dialer.Dial(ctx,dest)` ДО `WriteTCPRequest`/UDPWriter. SS encrypted payload
+не является DNS transcript. `app/proxyman/outbound/handler.go::Dispatch` выполняет
+actual native branch → ProfileAuthorizeHandler → ProfileBootstrapRawContext →
+ProfilePrepareChain, а `Handler.Dial` проверяет ProfileCheckDial перед internet.Dial.
+Таким образом, TCP SS использует существующий context/parent/physical bridge;
+нового protocol-specific обхода не требуется. Whole-image/final-config/manifest/
+exact launch остаются отдельными protected prerequisites, eligibility не mint proof.
+
+**Минимальный remaining counterpart**: full FranceSS сохраняет TCP И native UDP
+physical endpoint fr.example.invalid:443. `validate.rs` packet_endpoints и typed
+`project_branch(proxy,Udp,false)` это независимо подтверждают. Existing Go
+`dnsSourceFrontierReady` / `profilePrepareHostsObservation` и `profileNetworkRawEligible`
+требуют frontier.carrier==6, original network==6; Rust
+`native_bootstrap_binding.rs::parent_lease` требует original.protocol==6.
+Принятый Source/physical Numeric subset поэтому не выдаёт hostname UDP member
+permission. UDP ingress producer eligibility/v2 FD proof НЕ заменяет её.
+Нужна отдельно reviewed consuming UDP physical hostname association/use lineage:
+exact original UDP flow/parent/full frontier → selected Source member → durable
+UDP route → live permission и actual datagram send/retire fences, вместе с
+соответствующим accepted producer scope/pin. Простая замена6→17 недостаточна.
+Здесь wire/pins/records/Go/Source guards НЕ изменяются.
+
+`ConsumerPlan::derive` явно проверяет `requires_physical_udp` после validate и
+отказывает full FranceSS ДО image load/capture/staging/route/config-check. Local
+Prepared::prepare и System installed_consumer используют этот же dispatcher.
+Нельзя выдавать FranceSS за effectful ready, вырезать UDP, подставлять IP или
+использовать TCP permission для UDP. Остальные6 roots остаются Unsupported.
+Independent compile Local/System tests сохраняют exact SS settings и обе ветки;
+P5STRM01 default preimage остаётся `50355354524d303101000000`, fingerprint
+`6eef7fffac9bb760fff69a2c41df43aaad73104657c75088f69e2168e967053a`.
+Method/password связываются final config digest, а не transport fingerprint.
+Actual Local prepare fake boundary и общий Local/System dispatcher проверяют
+отказ с нулём capture/image effects даже с injected three-scope reviewed image.
+Это SOURCE/PURE prerequisite, не France runtime/installed readiness.

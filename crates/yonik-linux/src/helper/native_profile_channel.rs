@@ -5624,11 +5624,17 @@ impl ConsumerPlan {
         _mode: Mode,
     ) -> Result<Self, ServiceError> {
         consumer_planning_available()?;
-        if !intent.is_raw_tcp_consumer_subset() {
-            return Err(ServiceError::Unsupported);
-        }
+        let shape = intent
+            .raw_tcp_consumer_shape()
+            .ok_or(ServiceError::Unsupported)?;
         let graph = intent.validate().map_err(unavailable)?;
         let egress = graph.egress();
+        // SS default stream TCP не отменяет native UDP из того же intent.
+        // Bootstrap Source/physical permission текущего reviewed scope TCP-only;
+        // нельзя публиковать full-profile readiness для половины FranceSS.
+        if shape.requires_physical_udp() {
+            return Err(ServiceError::Unsupported);
+        }
         if graph.subjects().len() != 1
             || graph.probe().is_some()
             || !graph.selector_sets().is_empty()
@@ -5786,6 +5792,61 @@ mod subset_readiness_tests {
     use super::super::registry::{BootstrapScope, fake_bootstrap_image, fake_dns4_image};
     use super::*;
     use yonik_engine::native_profile::ProfileIntent;
+    #[test]
+    fn france_ss_readiness_preserves_stream_hash_and_denies_unproved_udp_before_effects() {
+        let report = yonik_import::import_profiles(
+            include_bytes!("../../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
+        )
+        .unwrap();
+        let profile = report
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                yonik_import::ProfileEntry::Xray(p) if p.name() == "FranceSS" => Some(p),
+                _ => None,
+            })
+            .unwrap();
+        let intent = ProfileIntent::from_profile(profile).unwrap();
+        assert_eq!(
+            intent.raw_tcp_consumer_shape(),
+            Some(yonik_engine::native_profile::RawTcpConsumerShape::ShadowsocksAes128Gcm)
+        );
+        let mut preimage = Vec::new();
+        intent
+            .write_transport_sensitive("proxy", &mut preimage)
+            .unwrap();
+        let mut hash = Sha256::new();
+        hash.update(b"YNKCAP-TRANSPORT-v1\0");
+        hash.update(&preimage);
+        assert_eq!(
+            format!("{:x}", hash.finalize()),
+            "6eef7fffac9bb760fff69a2c41df43aaad73104657c75088f69e2168e967053a"
+        );
+        for mode in [Mode::Local, Mode::System] {
+            let mut effects = 0;
+            let proof = fake_consumer_image([17; 32]);
+            assert!(
+                prepare_consumer(&intent, mode, |plan| {
+                    effects += 1;
+                    plan.image(&proof, [17; 32])
+                })
+                .is_err()
+            );
+            assert_eq!(
+                effects, 0,
+                "нет image/capture/stage/route effects для неполной UDP capability"
+            );
+        }
+        let graph = intent.validate().unwrap();
+        assert_eq!(graph.egress().physical().len(), 2);
+        assert!(
+            graph
+                .egress()
+                .physical()
+                .iter()
+                .any(|p| p.protocol() == yonik_engine::native_profile::TransportProtocol::Udp)
+        );
+    }
     #[test]
     fn subset_captured_network_requires_nonloopback_peer_policy() {
         assert!(consumer_resolver_peers(&["192.0.2.53:53".parse().unwrap()]).is_ok());

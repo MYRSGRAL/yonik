@@ -293,11 +293,27 @@ impl fmt::Debug for ProfileIntent {
         f.write_str("ProfileIntent(<скрыто>)")
     }
 }
+/// DATA protocol shape, не capability. SS сохраняет отдельный native UDP carrier,
+/// даже когда stream по умолчанию TCP; caller не может считать его TCP-only graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawTcpConsumerShape {
+    Vless,
+    ShadowsocksAes128Gcm,
+}
+impl RawTcpConsumerShape {
+    pub fn requires_physical_udp(self) -> bool {
+        matches!(self, Self::ShadowsocksAes128Gcm)
+    }
+}
 impl ProfileIntent {
     /// Только typed DATA shape текущего subset, не validator или grant.
     /// Caller отдельно обязан вызвать существующий validate до effects.
     /// Exhaustive patterns заставляют явно обработать новые typed settings.
     pub fn is_raw_tcp_consumer_subset(&self) -> bool {
+        self.raw_tcp_consumer_shape().is_some()
+    }
+    /// Консервативная typed selection: распознавание SS не разрешает его UDP.
+    pub fn raw_tcp_consumer_shape(&self) -> Option<RawTcpConsumerShape> {
         let Graph {
             log,
             inbounds,
@@ -312,11 +328,9 @@ impl ProfileIntent {
             || dns.is_some()
             || observatory.is_some()
         {
-            return false;
+            return None;
         }
-        let Some(List(outbounds)) = outbounds.as_ref() else {
-            return false;
-        };
+        let List(outbounds) = outbounds.as_ref()?;
         let [
             Outbound {
                 tag,
@@ -328,38 +342,62 @@ impl ProfileIntent {
             },
         ] = outbounds.as_slice()
         else {
-            return false;
+            return None;
         };
-        if tag.is_none()
-            || !matches!(protocol, Some(Protocol::Vless))
-            || stream_settings.is_some()
-            || mux.is_some()
-            || proxy_settings.is_some()
-        {
-            return false;
+        if tag.is_none() || stream_settings.is_some() || mux.is_some() || proxy_settings.is_some() {
+            return None;
         }
-        let Some(Settings {
+        let Settings {
             vnext,
             servers,
             address,
             port,
             version,
             domain_strategy,
-        }) = settings.as_ref()
-        else {
-            return false;
-        };
+        } = settings.as_ref()?;
+        if matches!(protocol, Some(Protocol::Shadowsocks)) {
+            if vnext.is_some()
+                || address.is_some()
+                || port.is_some()
+                || version.is_some()
+                || domain_strategy.is_some()
+            {
+                return None;
+            }
+            let List(servers) = servers.as_ref()?;
+            let [
+                Server {
+                    address,
+                    port,
+                    password,
+                    method,
+                    uot,
+                    uot_version,
+                },
+            ] = servers.as_slice()
+            else {
+                return None;
+            };
+            return (address.as_ref().is_some_and(|s| !s.is_empty())
+                && port.is_some_and(|p| (1..=65535).contains(&p))
+                && password.as_ref().is_some_and(|s| !s.is_empty())
+                && method.as_deref() == Some("aes-128-gcm")
+                && uot.is_none()
+                && uot_version.is_none())
+            .then_some(RawTcpConsumerShape::ShadowsocksAes128Gcm);
+        }
+        if !matches!(protocol, Some(Protocol::Vless)) {
+            return None;
+        }
         if servers.is_some()
             || address.is_some()
             || port.is_some()
             || version.is_some()
             || domain_strategy.is_some()
         {
-            return false;
+            return None;
         }
-        let Some(List(next)) = vnext.as_ref() else {
-            return false;
-        };
+        let List(next) = vnext.as_ref()?;
         let [
             Next {
                 address,
@@ -368,14 +406,12 @@ impl ProfileIntent {
             },
         ] = next.as_slice()
         else {
-            return false;
+            return None;
         };
         if address.is_none() || port.is_none() {
-            return false;
+            return None;
         }
-        let Some(List(users)) = users.as_ref() else {
-            return false;
-        };
+        let List(users) = users.as_ref()?;
         let [
             User {
                 id,
@@ -384,9 +420,10 @@ impl ProfileIntent {
             },
         ] = users.as_slice()
         else {
-            return false;
+            return None;
         };
-        id.is_some() && encryption.as_deref() == Some("none") && flow.is_none()
+        (id.is_some() && encryption.as_deref() == Some("none") && flow.is_none())
+            .then_some(RawTcpConsumerShape::Vless)
     }
     /// Проверка alias ownership без повторной компиляции/генерации credentials.
     pub fn validate_ingress_mapping(&self, runtime: &OwnedRuntimePlan) -> Result<(), Error> {
@@ -900,6 +937,198 @@ impl<'de> Visitor<'de> for Scan {
 
 #[cfg(test)]
 mod tests {
+    fn france_ss_fixture() -> super::ProfileIntent {
+        let report = yonik_import::import_profiles(
+            include_bytes!("../../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
+        )
+        .unwrap();
+        report
+            .entries
+            .into_iter()
+            .find_map(|entry| match entry {
+                yonik_import::ProfileEntry::Xray(profile) if profile.name() == "FranceSS" => {
+                    Some(super::ProfileIntent::from_profile(&profile).unwrap())
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+    #[test]
+    fn france_ss_raw_data_shape_keeps_tcp_and_udp_physical_semantics() {
+        let intent = france_ss_fixture();
+        assert!(
+            intent.is_raw_tcp_consumer_subset(),
+            "SS raw TCP DATA shape ещё не распознана"
+        );
+        let graph = intent.validate().unwrap();
+        assert_eq!(
+            intent.raw_tcp_consumer_shape(),
+            Some(super::RawTcpConsumerShape::ShadowsocksAes128Gcm)
+        );
+        assert!(
+            intent
+                .raw_tcp_consumer_shape()
+                .unwrap()
+                .requires_physical_udp()
+        );
+        assert_eq!(graph.egress().physical().len(), 2);
+        for (input, carrier) in [
+            (super::WireNetwork::Tcp, super::WireNetwork::Tcp),
+            (super::WireNetwork::Udp, super::WireNetwork::Udp),
+        ] {
+            let branch = intent.project_branch("proxy", input, false).unwrap();
+            assert_eq!(branch.dial(), Some(carrier));
+            assert_eq!(branch.carrier(), Some(carrier));
+            assert_eq!(branch.action(), super::WireAction::PhysicalStatic);
+            assert_eq!(branch.active_stream(), input == super::WireNetwork::Tcp);
+            let frontier = intent
+                .physical_bootstrap_frontier("proxy", input, 443, &[false])
+                .unwrap()
+                .unwrap();
+            assert_eq!(frontier.endpoint().host(), "fr.example.invalid");
+            assert_eq!(frontier.path(), &[("proxy".to_owned(), input, false)]);
+        }
+    }
+    #[test]
+    fn france_ss_data_shape_rejects_extensions_without_rewriting_settings() {
+        let intent = france_ss_fixture();
+        let mut bytes = Vec::new();
+        intent.write_sensitive(&mut bytes).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for (pointer, replacement) in [
+            (
+                "/graph/outbounds/0/settings/servers/0/method",
+                serde_json::json!("aes-256-gcm"),
+            ),
+            (
+                "/graph/outbounds/0/settings/servers/0/method",
+                serde_json::json!("chacha20-poly1305"),
+            ),
+            (
+                "/graph/outbounds/0/settings/servers/0/uot",
+                serde_json::json!(false),
+            ),
+            (
+                "/graph/outbounds/0/settings/servers/0/UoTVersion",
+                serde_json::json!(2),
+            ),
+            (
+                "/graph/outbounds/0/mux",
+                serde_json::json!({"enabled":false}),
+            ),
+            (
+                "/graph/outbounds/0/streamSettings",
+                serde_json::json!({"network":"tcp"}),
+            ),
+            (
+                "/graph/outbounds/0/streamSettings",
+                serde_json::json!({"network":"grpc"}),
+            ),
+        ] {
+            let mut changed = value.clone();
+            // Test-only mutation wire, не authority/повторный production parsing.
+            if let Some((parent, field)) = pointer.rsplit_once('/') {
+                changed.pointer_mut(parent).unwrap()[field] = replacement;
+            }
+            let candidate = super::ProfileIntent::decode(&changed.to_string()).unwrap();
+            let mut before = Vec::new();
+            candidate.write_sensitive(&mut before).unwrap();
+            assert!(candidate.raw_tcp_consumer_shape().is_none());
+            let mut after = Vec::new();
+            candidate.write_sensitive(&mut after).unwrap();
+            assert_eq!(before, after);
+        }
+        let mut chained = value.clone();
+        let mut newer = value.clone();
+        newer["graph"]["outbounds"][0]["settings"]["servers"][0]["method"] =
+            serde_json::json!("2022-blake3-aes-128-gcm");
+        newer["graph"]["outbounds"][0]["settings"]["servers"][0]["password"] =
+            serde_json::json!("AAAAAAAAAAAAAAAAAAAAAA==");
+        assert!(
+            super::ProfileIntent::decode(&newer.to_string())
+                .unwrap()
+                .raw_tcp_consumer_shape()
+                .is_none()
+        );
+        let mut unknown = value.clone();
+        unknown["graph"]["outbounds"][0]["settings"]["servers"][0]["method"] =
+            serde_json::json!("unknown");
+        assert!(super::ProfileIntent::decode(&unknown.to_string()).is_err());
+        unknown = value.clone();
+        unknown["graph"]["outbounds"][0]["settings"]["servers"][0]["plugin"] =
+            serde_json::json!("unknown");
+        assert!(super::ProfileIntent::decode(&unknown.to_string()).is_err());
+        let mut other = chained["graph"]["outbounds"][0].clone();
+        other["tag"] = serde_json::json!("other");
+        chained["graph"]["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .push(other);
+        chained["graph"]["outbounds"][0]["proxySettings"] =
+            serde_json::json!({"tag":"other","transportLayer":true});
+        assert!(
+            super::ProfileIntent::decode(&chained.to_string())
+                .unwrap()
+                .raw_tcp_consumer_shape()
+                .is_none()
+        );
+    }
+    #[test]
+    fn france_ss_compile_local_system_preserves_aead_and_udp_not_a_tcp_rewrite() {
+        struct Snapshot;
+        impl crate::native_profile::VerifiedSystemResolver for Snapshot {
+            fn snapshot_digest(&self) -> [u8; 32] {
+                [1; 32]
+            }
+            fn servers(&self) -> Vec<std::net::SocketAddr> {
+                vec!["192.0.2.53:53".parse().unwrap()]
+            }
+        }
+        let intent = france_ss_fixture();
+        let expected = intent.validate().unwrap().value["outbounds"][0]["settings"].clone();
+        let mut preimage = Vec::new();
+        intent
+            .write_transport_sensitive("proxy", &mut preimage)
+            .unwrap();
+        assert_eq!(preimage, [b"P5STRM01".as_slice(), &[1, 0, 0, 0]].concat());
+        for system in [false, true] {
+            let mut runtime = crate::native_profile::OwnedRuntimePlan::new(
+                1080.try_into().unwrap(),
+                1081.try_into().unwrap(),
+            )
+            .unwrap()
+            .bind_system_resolver(&Snapshot)
+            .unwrap();
+            if system {
+                runtime = runtime.with_system(
+                    crate::SystemTun::new(1, 1500, 42, vec!["198.18.0.1/30".parse().unwrap()])
+                        .unwrap(),
+                );
+            }
+            let compiled = if system {
+                intent.compile_system(&runtime).unwrap().into_config()
+            } else {
+                intent.compile_local(&runtime).unwrap()
+            };
+            let mut config = Vec::new();
+            compiled.write_sensitive(&mut config).unwrap();
+            let config: serde_json::Value = serde_json::from_slice(&config).unwrap();
+            let emitted = config["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["tag"] == "proxy")
+                .unwrap();
+            assert_eq!(emitted["protocol"], "shadowsocks");
+            assert_eq!(emitted["settings"], expected);
+            let mut after = Vec::new();
+            intent
+                .write_transport_sensitive("proxy", &mut after)
+                .unwrap();
+            assert_eq!(preimage, after);
+            assert_eq!(intent.validate().unwrap().egress().physical().len(), 2);
+        }
+    }
     #[test]
     fn raw_tcp_consumer_subset_is_read_only_and_rejects_typed_extensions() {
         let base = serde_json::json!({"version":1,"graph":{"outbounds":[{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":"physical.invalid","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]}});

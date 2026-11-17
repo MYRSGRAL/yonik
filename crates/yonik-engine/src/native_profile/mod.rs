@@ -4,8 +4,8 @@ mod graph;
 mod intent;
 mod validate;
 pub use intent::{
-    BranchProjection, MAX_INTENT_BYTES, PhysicalBootstrapFrontier, ProfileIntent, WireAction,
-    WireNetwork, WireSecurity, WireTransportKind,
+    BranchProjection, MAX_INTENT_BYTES, PhysicalBootstrapFrontier, ProfileIntent,
+    RawTcpConsumerShape, WireAction, WireNetwork, WireSecurity, WireTransportKind,
 };
 
 use crate::{CompiledConfig, SystemTun};
