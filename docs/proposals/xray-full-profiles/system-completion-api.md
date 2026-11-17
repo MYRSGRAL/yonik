@@ -1577,10 +1577,36 @@ source revalidation выполняется вокруг transcript checks и п�
 Cancel6 изолирует waiter; producer/context/source cancellation запрещает его
 derivatives. Shared namespaces/history/credits и USER/Hosts semantics сохранены.
 
-NETWORK Numeric42 use2 → BootstrapPhysicalPermission остаётся следующим
-отдельным unit: этот NETWORK waiter пока не принимается Hosts numeric path и
-не выдаёт generic class3/user grant. Production bootstrap Source/transcript
-mint и public gates закрыты. CODEC4 wire/schema/corpus/pins не изменены.
+### CODEC4 NETWORK Numeric: отдельный variant physical permission
+
+Serialized Numeric42 use2/class3 с resolver-bearing Probe8 теперь вызывает
+`checked_network_numeric` и получает private `NetworkNumericProof` только из
+live ACKed NETWORK waiter/producer DATA. Hosts и NETWORK разделены явным
+`PermissionOrigin`; NETWORK не вызывает Hosts row/member lookup, USER owner
+lookup или generic AUTHORIZE. IDs permissions остаются в отдельной retained
+map, не становятся service root или resolver transport permit.
+
+До Source/history/effects проверяются immutable selector, member/address и
+original physical port/carrier. Затем issuer повторяет full path/snapshot/
+captured question/options/root/epoch/source checks, DATA TTL/observation,
+reservation/waiter deadlines и frozen TransportProof revision/exchange.
+KnownClosed transport допустим только после actual release ACK; uncertain
+retirement не позволяет новый permission. Неверный member/address не расходует
+history и не потребляет waiter. Route/memory/history precredits предшествуют
+one-shot consume и mandatory durable `RouteRequest::Direct` backend call.
+
+Общий permission lifecycle выполняет повторные Source/parent/member fences
+после backend, drain и отправки GRANT19 class3/flow0/required0/owner0.
+Expiry не продлевается ни backend, ни RTT. Close32/34, Cancel1/5/6/7/8,
+dependent retirement и Unknown custody используют тот же explicit variant;
+Closed/Unknown waiter не переиспользуется. Каждый permission имеет свой ticket,
+который закрывается отдельно от resolver resource ACK и service root.
+
+Текущий bounded consumer cut — TCP physical leaf, как Hosts path; UDP physical
+open остаётся Unsupported. Permission не разрешает arbitrary write: actual open
+дополнительно обязан проверить live original consumer parent/full frontier.
+Production bootstrap Source/transcript/current CODEC4 mint и public gates
+закрыты. CODEC4 wire/schema/corpus/pins не изменены; runtime proof не заявляется.
 
 ### StubBind: bounded listener observation, не service authority
 

@@ -832,6 +832,31 @@ impl<A: Authority> Issuer<A> {
             .map(|p| p.producer_sequence)
             .ok_or(ServiceError::Unavailable)
     }
+    pub(super) fn dns_frozen_revision(
+        &self,
+        id: u64,
+        revision: u64,
+        exchange: u64,
+        binding: Binding,
+    ) -> Result<(), ServiceError> {
+        let p = self
+            .transport
+            .proofs
+            .get(&id)
+            .ok_or(ServiceError::Unavailable)?;
+        if p.binding != binding
+            || p.revision != revision
+            || p.exchange != exchange
+            || !p.acked
+            || !p.published
+            || p.pending_append.is_some()
+            || p.retired == Some(false)
+            || p.retired == Some(true) && !p.release_acked
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
     pub(super) fn dns_freeze_publish(&mut self, id: u64) -> Result<(), ServiceError> {
         let p = self
             .transport

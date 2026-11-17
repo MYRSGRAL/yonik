@@ -963,7 +963,166 @@ pub(super) struct NumericBinding {
     member: u16,
     _memory: ByteLease,
 }
+/// Только checked_network_numeric создаёт этот private NETWORK variant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct NetworkNumericProof {
+    waiter: u64,
+    producer: u64,
+    reservation: u64,
+    binding: Binding,
+    proof: u64,
+    revision: u64,
+    exchange: u64,
+    selector: wire::dns_v2::BootstrapSelector,
+    member: u16,
+    target: Target,
+}
 impl<A: Authority> Issuer<A> {
+    fn network_numeric_candidate(
+        &self,
+        waiter: u64,
+        member: u16,
+        target: Target,
+        selector: wire::dns_v2::BootstrapSelector,
+    ) -> Result<(NetworkNumericProof, Instant), ServiceError> {
+        self.fence()?;
+        let w = self
+            .rrsets
+            .waiters
+            .get(&waiter)
+            .ok_or(ServiceError::Unavailable)?;
+        let p = self
+            .rrsets
+            .producers
+            .get(&w.producer)
+            .ok_or(ServiceError::Unavailable)?;
+        if !w.acked
+            || w.revoked
+            || !p.acked
+            || p.revoked
+            || !w.binding.bootstrap
+            || !p.binding.bootstrap
+            || p.bootstrap.is_none()
+            || !same_data(w.binding, p.binding)
+            || w.binding.root == p.binding.root
+            || w.binding.source != 0
+            || w.binding.source_revision != 0
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let original = self.network_numeric_original(w.binding, selector)?;
+        if target.protocol != original.protocol
+            || target.port != original.port
+            || target.protocol != 6
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        // Все immutable поля/member/address проверены ДО Source и history debit.
+        self.numeric_member(waiter, member, target)?;
+        let (binding, reservation_until) = self.dns_waiter_binding(w.reservation)?;
+        if binding != w.binding {
+            return Err(ServiceError::Unavailable);
+        }
+        self.rrset_data_matches(binding, p.binding)?;
+        self.dns_frozen_revision(p.proof, p.revision, p.exchange, p.binding)?;
+        let until = w
+            .expires
+            .min(p.expires)
+            .min(reservation_until)
+            .min(binding.expires)
+            .min(self.bootstrap_rrset_live(p)?)
+            .min(self.bootstrap_dns_data(binding)?.1);
+        if self.authority.now() >= until {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok((
+            NetworkNumericProof {
+                waiter,
+                producer: w.producer,
+                reservation: w.reservation,
+                binding,
+                proof: p.proof,
+                revision: p.revision,
+                exchange: p.exchange,
+                selector,
+                member,
+                target,
+            },
+            until,
+        ))
+    }
+    pub(super) fn checked_network_numeric(
+        &self,
+        v: View<'_, 42>,
+    ) -> Result<(NetworkNumericProof, Instant), ServiceError> {
+        let b = v.bytes();
+        if b[14] != 2 || b[15] != 3 {
+            return Err(ServiceError::Unsupported);
+        }
+        let waiter = v.waiter().map_err(unavailable)?.get();
+        if self
+            .rrsets
+            .waiters
+            .get(&waiter)
+            .is_none_or(|w| w.numeric_once.is_some())
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.network_numeric_candidate(
+            waiter,
+            n16(b, 2),
+            Target::copy(v.numeric_destination())?,
+            v.bootstrap_selector()
+                .map_err(unavailable)?
+                .ok_or(ServiceError::InvalidRequest)?,
+        )
+    }
+    pub(super) fn consume_network_numeric(
+        &mut self,
+        proof: NetworkNumericProof,
+        request: u64,
+        id: u64,
+    ) -> Result<(), ServiceError> {
+        let w = self
+            .rrsets
+            .waiters
+            .get_mut(&proof.waiter)
+            .ok_or(ServiceError::Unavailable)?;
+        if w.numeric_once.is_some()
+            || w.binding != proof.binding
+            || w.reservation != proof.reservation
+            || w.producer != proof.producer
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        w.numeric_once = Some((request, id));
+        Ok(())
+    }
+    pub(super) fn network_permission_live(
+        &self,
+        proof: NetworkNumericProof,
+        request: u64,
+        id: u64,
+        waiter: u64,
+        member: u16,
+        target: Target,
+    ) -> Result<Instant, ServiceError> {
+        if (waiter, member, target) != (proof.waiter, proof.member, proof.target)
+            || self
+                .rrsets
+                .waiters
+                .get(&waiter)
+                .is_none_or(|w| w.numeric_once != Some((request, id)))
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        let (current, until) =
+            self.network_numeric_candidate(waiter, member, target, proof.selector)?;
+        if current != proof {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(until)
+    }
     fn numeric_parent(&self, waiter: u64) -> Result<(Binding, Instant), ServiceError> {
         self.fence()?;
         let w = self
