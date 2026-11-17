@@ -1796,3 +1796,62 @@ Full-tick pure controls проходят оба late-response пути для pr
 один Close32 каждого service. Ошибка/Unknown не освобождает NETWORK refs.
 Новый digest требует bounded review; source contracts/UDP/corpus/wire/allowlists
 не меняются. Совместный Go/Rust NETWORK pair здесь не исполнялся.
+
+### CODEC5: consuming HOSTS bootstrap для одного SS datagram
+
+Native `outbound.Handler` выбирает actual SS raw UDP branch отдельно от
+неиспользуемых этим branch TCP/TLS transport settings. Mux, source bind,
+FinalMask и непустые sockopt остаются Unsupported. Это отрицательный shape gate,
+не authority. `ProfilePrepareChain` достигает retained HOSTS constructor только
+с actual Consumed/Match USER receipt и полным singleton SS UDP frontier. Original
+USER destination сохраняется отдельно от physical SS hostname/port. NETWORK UDP,
+TLS/mux/chain и peerless формы этим unit не реализуются.
+
+Actual setup выбирает Descriptor272 CODEC5 по admitted SS UDP hostname scope.
+Требуется exact ACK40 schema5; downgrade к 4/3/2/1 запрещён. TCP-only scope
+сохраняет CODEC4. Metadata marker не создаёт Source capability. Canonical pin —
+`350b720321540e98fa8ba76f234ce3a5eb2e9e9a`, корпус `dns-v2-codec5.json`
+SHA256 `a9f2e5f5517b72c97e4b7243a4dac9e590e885b50913a44249a393f0270d6116`.
+Все прежние layouts/ABI/UDP proof bytes остаются прежними.
+
+Actual actor исполняет 57→58→55→56→35→36→40→41, затем отдельные
+57→58→55→56→35→36→53→54→42→19 для waiter. Каждый 57 получает собственный
+nonreuse QueryId, exact USER grant/source/revision/scope/branch/epoch и lease;
+58 связывается с pending request/hash и original deadline с RTT. Binding ID не
+context/grant/Observation/ProducerRRset/WaiterReceipt. SOURCE5 capability создаёт
+только проверенный ACK56 helper. Ни old Source4 proof, ни schema5 descriptor не
+заменяют independent protected `bootstrap_datagram` scope5. Pin этого scope
+остаётся **None**; producer production mint/public gates не открыты.
+
+Numeric protocol17 создаёт отдельный private `profileBootstrapDatagramPermission`,
+не TCP permission/USER grant/service. Guard проверяет одновременно оба binding,
+producer и waiter contexts, live original USER grant/receipt, packet/permit,
+association/cookie/tuple/Matched lineage, immutable snapshot/member/path/port/
+carrier/epoch и deadlines. System owner Known≤20ms не продлевается; Local не
+получает System owner proof. Local PF002 runtime gate не расширяется.
+
+Actual SS `Client.Process` вызывает `ProfileDialBootstrapDatagram` до legacy
+retry/dialer. Private factory не принимает caller Conn/FD/payload; открывает
+только connected numeric UDP member после permission. Kernel SO_NETNS_COOKIE
+сравнивает retained ingress duplicate и новый socket до Connect и каждого I/O.
+Неподдерживаемая проверка/ошибка закрывает путь. FD/pending/memory оплачены до
+factory; late result повторно проверяется и consuming Close сохраняет custody.
+SS encoder preflight учитывает retained payload, original header, IV и tag до
+physical open, чтобы fixed native buffer не обрезал packet.
+
+Отдельный owner допускает одну effectful send, без retry после uncertain/partial
+write. Read запрещён до успешной полной send. Existing private link передаёт
+ровно retained Consumed payload; native SS encoding сохраняет original target.
+Owned SS UDP использует `ProfileRunBootstrapDatagramTasks`: оба native callbacks
+зарегистрированы до запуска, cancel остаётся per-flow, Close ждёт raw I/O и обоих
+tasks. Legacy TCP/unowned UDP сохраняют прежнюю task.Run ветку. Actual OS socket/
+namespace/send/receive wrappers здесь только компилируются.
+
+Close permission→waiter→reservation→context→binding и producer DATA/reservation/
+context/binding проходит exact ACK barriers. Original USER/receipt wire close
+удерживается predicate по retained binding owner; refresh USER пока owned
+Unsupported, deadlines не продлеваются. Constructor handoff и late factory
+удерживают собственные refs; Unknown/error сохраняет custody/credits без retry
+и не публикует KnownClosed. History bounded/nonreuse, compaction не добавлена.
+Новый patch digest требует independent source review и отдельного protected pin;
+FranceSS/full P4/runtime acceptance этим SOURCE/PURE unit не объявляются.
