@@ -841,6 +841,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   retirement. NETWORK waiter/Numeric ещё реализуются; syscall/join/runtime
   совместной пары не аттестованы, capture/producer/public flags false.
 
+- R70 SOURCE scoped CLEAN: NETWORK Numeric1e1105c интегрирован. Explicit
+  PermissionOrigin::Network проверяет live waiter/member/Source/fullpath/frozen
+  revision, затем one-shot consume и отдельный durable ticket/GRANT19 flow0.
+  Source/backend/drain/send fences и Unknown lifecycle сохранены; неверные
+  immutable fields не расходуют waiter/history. TCP physical consumer требует
+  независимый live original-parent conjunction. Production Source/transcript/
+  CODEC4 mint None; runtime/public gates false, stateful pair не запускался.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
