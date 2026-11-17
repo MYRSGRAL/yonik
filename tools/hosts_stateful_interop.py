@@ -9,6 +9,7 @@ import os
 import selectors
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 
 
@@ -29,8 +30,21 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
     done: dict[str, object] = {}
     selector = selectors.DefaultSelector()
     buffers: dict[str, bytearray] = {}
+    writes: dict[str, deque[memoryview]] = {side: deque() for side in commands}
+    pending_bytes = dict.fromkeys(commands, 0)
     deadline = time.monotonic() + timeout
     total_bytes = 0
+
+    def queue_write(side: str, payload: bytes) -> None:
+        if sum(pending_bytes.values()) + len(payload) > 8 * 1024 * 1024:
+            raise ValueError("relay pending write budget exhausted")
+        stream = children[side].stdin
+        assert stream is not None
+        if not writes[side]:
+            selector.register(stream, selectors.EVENT_WRITE, (side, "write"))
+        writes[side].append(memoryview(payload))
+        pending_bytes[side] += len(payload)
+
     try:
         for side, command in commands.items():
             child = subprocess.Popen(
@@ -39,18 +53,37 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env=env,
+                bufsize=0,
             )
             children[side] = child
             assert child.stdout is not None
+            assert child.stdin is not None
             os.set_blocking(child.stdout.fileno(), False)
-            selector.register(child.stdout, selectors.EVENT_READ, side)
+            os.set_blocking(child.stdin.fileno(), False)
+            selector.register(child.stdout, selectors.EVENT_READ, (side, "read"))
             buffers[side] = bytearray()
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"interop deadline; trace={trace[-8:]}")
             for key, _ in selector.select(min(remaining, 1.0)):
-                side = key.data
+                side, operation = key.data
+                if operation == "write":
+                    view = writes[side][0]
+                    try:
+                        count = os.write(key.fd, view)
+                    except BlockingIOError:
+                        continue
+                    if count == 0:
+                        raise BrokenPipeError(f"{side} write made no progress")
+                    pending_bytes[side] -= count
+                    if count == len(view):
+                        writes[side].popleft()
+                    else:
+                        writes[side][0] = view[count:]
+                    if not writes[side]:
+                        selector.unregister(key.fileobj)
+                    continue
                 data = os.read(key.fd, 16384)
                 if not data:
                     selector.unregister(key.fileobj)
@@ -85,15 +118,9 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                         done[side] = value
                         trace.append({"side": side, "result": value})
                         if side == "go" and value.get("go_done"):
-                            stdin = children["rust"].stdin
-                            assert stdin is not None
-                            stdin.write(b'{"stop":true}\n')
-                            stdin.flush()
+                            queue_write("rust", b'{"stop":true}\n')
                         continue
-                    peer = children["go" if side == "rust" else "rust"]
-                    assert peer.stdin is not None
-                    peer.stdin.write(line + b"\n")
-                    peer.stdin.flush()
+                    queue_write("go" if side == "rust" else "rust", line + b"\n")
         codes = {
             side: child.wait(timeout=max(0.01, deadline - time.monotonic()))
             for side, child in children.items()

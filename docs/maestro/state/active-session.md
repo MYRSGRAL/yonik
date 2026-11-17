@@ -879,6 +879,17 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   r75-root-pin сохранён вне TTL. Public gates и installed app не изменены;
   runtime acceptance и полная поддержка всех transports/семи roots не заявлены.
 
+- Local HOSTS PURE_STATEFUL_INTEROP70c5509 интегрирован с root-коррекцией R77P2.
+  Actual Go actors и Rust factory/planner/run_issuer обмениваются ACK, relay их
+  не подставляет. Positive route/open1/1, foreign-member0/0; cleanup завершён.
+  Nonblocking read/write selector и bounded pending queue закрывают blocking
+  stdin deadline gap; pure fake nonreading peer RED→GREEN и stop/join regression
+  прошли. Root повторил обе пары сохранёнными hash-checked test ELF: PASS.
+  Python48 normal+2 optimized/Ruff PASS, production Go patch3c156ca unchanged.
+  USER parent preseed/HELLO skip/fake owner/source/kernel/backend явно сохранены:
+  это не runtime/kernel/installed acceptance. System/NETWORK и queued-cancel/
+  late-ACK interop остаются следующими проверками; public gates false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение

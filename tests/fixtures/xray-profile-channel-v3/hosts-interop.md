@@ -51,3 +51,8 @@ packet после Go dispatch: `.80→.81`. Actual Rust issuer должен ве
 actual Go consumer — завершить caller без factory и выполнить cancel cleanup.
 До Numeric ACK положительный прогон также вызывает actual physical gate и
 проверяет отсутствие factory effects.
+
+R77: stdin и stdout nonblocking, selector обслуживает чтение и очередь частичных
+записей с тем же absolute deadline. Pending write budget≤8MiB; stop frame проходит
+через ту же очередь. Нечитающий peer не блокирует timeout/finally. Отдельные pure
+Python проверки запускают собственные fake stdio peers и проверяют deadline и join.
