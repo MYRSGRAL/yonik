@@ -22,6 +22,7 @@ pub(crate) struct Options {
     pub spider_path: String,
     pub cipher: String,
     pub xudp_mux: bool,
+    pub reality_h2: bool,
 }
 
 type Parameters = BTreeMap<String, String>;
@@ -72,7 +73,11 @@ fn vmess_parameters(server: &ParsedServer) -> Result<Parameters, CompileError> {
     Ok(parameters)
 }
 
-pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options, CompileError> {
+pub(crate) fn validate(
+    server: &ParsedServer,
+    engine: Engine,
+    require_reality_h2: bool,
+) -> Result<Options, CompileError> {
     if server.review_flags().iter().any(|flag| {
         matches!(
             flag,
@@ -224,10 +229,20 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
                 }
             }
         } else {
-            // REALITY UClient берёт ALPN из uTLS fingerprint. Пустой список
-            // не задаёт переопределение, а непустой остаётся неподдерживаемым.
-            if engine == Engine::Xray && parameters.get("alpn").is_some_and(String::is_empty) {
-                parameters.remove("alpn");
+            // Пустой ALPN оставляет fingerprint по умолчанию. Явный h2
+            // остаётся в отложенном конфиге до проверки отдельного ELF.
+            if engine == Engine::Xray {
+                match parameters.remove("alpn").as_deref() {
+                    None | Some("") => {}
+                    Some("h2")
+                        if require_reality_h2
+                            && options.xudp_mux
+                            && options.fingerprint == "chrome" =>
+                    {
+                        options.reality_h2 = true;
+                    }
+                    _ => return Err(CompileError::UnsupportedOption),
+                }
             }
             options.public_key = take(&mut parameters, "pbk");
             if URL_SAFE_NO_PAD
@@ -332,7 +347,7 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
             return Err(CompileError::UnsupportedOption);
         }
     }
-    if !parameters.is_empty() {
+    if !parameters.is_empty() || require_reality_h2 != options.reality_h2 {
         return Err(CompileError::UnsupportedOption);
     }
     Ok(options)

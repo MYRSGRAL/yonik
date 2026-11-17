@@ -106,6 +106,15 @@ impl CompiledConfig {
     pub fn write_sensitive(&self, writer: impl Write) -> Result<(), serde_json::Error> {
         serde_json::to_writer(writer, &self.value)
     }
+
+    /// Legacy writer проверяет capability повторно перед передачей JSON ядру.
+    pub fn requires_xray_reality_h2(&self) -> bool {
+        self.engine == Engine::Xray
+            && self
+                .value
+                .pointer("/outbounds/0/streamSettings/realitySettings/alpn")
+                .is_some()
+    }
 }
 impl fmt::Debug for CompiledConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -120,8 +129,20 @@ pub fn compile(
     engine: Engine,
     port: NonZeroU16,
 ) -> Result<CompiledConfig, CompileError> {
+    compile_server(server, engine, port, false)
+}
+
+mod xray_reality_h2;
+pub use xray_reality_h2::{PendingXrayRealityH2, XrayRealityH2};
+
+fn compile_server(
+    server: &ParsedServer,
+    engine: Engine,
+    port: NonZeroU16,
+    require_reality_h2: bool,
+) -> Result<CompiledConfig, CompileError> {
     validate_listener(server, port)?;
-    let options = options::validate(server, engine)?;
+    let options = options::validate(server, engine, require_reality_h2)?;
     validate_credentials(server, engine)?;
     let value = match engine {
         Engine::Xray => json!({

@@ -4342,7 +4342,26 @@ struct TcpRunning {
 
 enum SessionConfig {
     Server(yonik_engine::CompiledConfig),
+    ServerRealityH2(yonik_engine::PendingXrayRealityH2),
     FullProfile(Box<NativeSessionConfig>),
+}
+
+impl SessionConfig {
+    fn legacy(
+        server: &yonik_import::ParsedServer,
+        engine: Engine,
+        port: NonZeroU16,
+    ) -> std::result::Result<(Self, NonZeroU16), yonik_engine::CompileError> {
+        match yonik_engine::compile(server, engine, port) {
+            Ok(config) => Ok((Self::Server(config), port)),
+            Err(yonik_engine::CompileError::UnsupportedOption) if engine == Engine::Xray => {
+                let pending = yonik_engine::PendingXrayRealityH2::compile(server, port)?;
+                let port = pending.listen_port();
+                Ok((Self::ServerRealityH2(pending), port))
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 struct NativeSessionConfig {
     intent: yonik_engine::native_profile::ProfileIntent,
@@ -4384,7 +4403,7 @@ async fn session(
     }
     let native_image = match &mut config {
         SessionConfig::FullProfile(native) => native.image.take(),
-        SessionConfig::Server(_) => None,
+        SessionConfig::Server(_) | SessionConfig::ServerRealityH2(_) => None,
     };
     let Ok(session) = LocalSession::new() else {
         let _ = updates
@@ -4419,7 +4438,11 @@ async fn session(
         cancel.check().map_err(|_| "cancelled")?;
         let path = engine_dir.join(relative);
         let native = matches!(config, SessionConfig::FullProfile(..));
+        let reality_h2 = matches!(config, SessionConfig::ServerRealityH2(..));
         let binary = if native { native_image.ok_or("profile_unavailable")? } else {tokio::task::spawn_blocking(move || {
+            if reality_h2 {
+                return BinarySnapshot::load_xray_reality_h2(&engine_dir);
+            }
             BinarySnapshot::load(
                 &path,
                 digest.parse().map_err(|_| HostError::BinaryHash)?,
@@ -4432,6 +4455,7 @@ async fn session(
         cancel.check().map_err(|_| "cancelled")?;
         let checked = match config {
             SessionConfig::Server(config) => CheckedConfig::validate(binary, config, &mut cancel).await,
+            SessionConfig::ServerRealityH2(config) => CheckedConfig::validate_xray_reality_h2(binary, config, &mut cancel).await,
             SessionConfig::FullProfile(native) => CheckedConfig::validate_full_profile(binary, native.intent, native.plan, &mut cancel).await,
         }
             .map_err(|e| {
@@ -6012,14 +6036,14 @@ async fn run(
                         else if let Some(profile) = actor.selected.as_ref() {
                             if actor.pending.is_some() { Err(DesktopError("review_required").into()) }
                             else {
-                                match (NonZeroU16::new(actor.state.port).and_then(|port| yonik_engine::compile(&profile.server, actor.state.engine.engine(), port).ok()), actor.probe_target()) {
-                                    (Some(compiled), Ok(target)) => {
+                                match (NonZeroU16::new(actor.state.port).and_then(|port| SessionConfig::legacy(&profile.server, actor.state.engine.engine(), port).ok()), actor.probe_target()) {
+                                    (Some((compiled, listen_port)), Ok(target)) => {
                                         let (cancel, receiver) = Cancellation::new();
-                                        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, compiled.listen_port().get()));
+                                        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, listen_port.get()));
                                         session_generation = session_generation.saturating_add(1); actor.state.error_generation = session_generation;
                                         #[cfg(feature = "test-support")]
                                         let receiver = if let Some(gate) = config.lifecycle_gate.clone() { receiver.with_lifecycle_gate(gate, session_generation) } else { receiver };
-                                        let task = tokio::spawn(session(SessionConfig::Server(compiled), config.engine_dir.clone(), actor.state.engine.engine(), target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
+                                        let task = tokio::spawn(session(compiled, config.engine_dir.clone(), actor.state.engine.engine(), target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
                                         running = Some(Running { lease: (session_generation, endpoint), cancel, task }); actor.state.can_stop = true;
                                         actor.state.active_name = Some(profile.profile.name.clone()); actor.state.active_engine = Some(actor.state.engine);
                                         actor.state.probe_result = None; actor.state.status = "Preparing"; Ok(())

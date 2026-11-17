@@ -13,7 +13,7 @@ use std::{
 use rustix::fs::{MemfdFlags, Mode, OFlags, SealFlags, fchmod, fcntl_add_seals, memfd_create};
 use sha2::{Digest, Sha256 as Hasher};
 use tokio::process::Command;
-use yonik_engine::Engine;
+use yonik_engine::{Engine, XrayRealityH2};
 
 use super::HostError;
 use crate::helper::memory::ByteLease;
@@ -83,6 +83,18 @@ impl BinarySnapshot {
             .open(path)
             .map_err(|_| HostError::BinaryIo)?;
         Self::load_file(source, expected, engine)
+    }
+
+    pub fn load_xray_reality_h2(engine_dir: &Path) -> Result<Self, HostError> {
+        Self::load(
+            &engine_dir.join(XrayRealityH2::RELATIVE_PATH),
+            Sha256(XrayRealityH2::ELF_SHA256),
+            Engine::Xray,
+        )
+    }
+
+    pub(crate) fn xray_reality_h2(&self) -> Option<XrayRealityH2> {
+        XrayRealityH2::for_snapshot(self.engine, self.trusted_hash())
     }
 
     /// Копирует уже открытый источник: helper не переоткрывает проверенный путь.
