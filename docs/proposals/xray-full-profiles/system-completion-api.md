@@ -1704,3 +1704,19 @@ unit contract/invocation, UID, retained cgroup2/netns identities, source epoch
 и указанные ограничения socket custody. Его наблюдение нужно повторно
 проверять вокруг полного census. Без этого private UnitEvidence не имеет
 production constructor; registry/packaging policy в данном cut не меняются.
+
+### Root acceptance R74–R76: отдельные CODEC4 producer pins
+
+После SOURCE review Go consumer/wiring и Local/System binding принят exact patch
+`3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec`
+для bootstrap build и трёх независимых Source/Wire/Release scopes single raw TCP
+branch0 subset. R76 отдельно подтвердил UDP compatibility этого digest. Старый
+`PRODUCER_PATCH` и Direct3 pins сохранены; Direct USER CODEC4 scope не добавлен.
+Каждый новый scope требует собственной protected record; отсутствие записи не
+восполняется другим scope, Source ACK или одним image digest.
+
+Compile-only builder на чистом официальном Xray v26.10.31 создал ELF и candidate
+records с exact source/toolchain/build-input hashes. Candidate по-прежнему имеет
+`install_authority=false`; образ не запускался и не устанавливался. Public gates,
+runtime readiness и installed registry не изменены. TLS/mux/chain/UDP physical
+bootstrap, loopback policy и остальные ранее обозначенные gaps этим pin не закрыты.

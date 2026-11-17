@@ -867,6 +867,18 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   subset. Source ACK не выдаёт transcript/release authority. Protected helper
   binding ещё реализуется; pins/public gates не открыты, runtime не запускался.
 
+- R75a/R75b SOURCE scoped CLEAN: Local/System binding35855c8 интегрирован.
+  Root принял independent bootstrap build/Source/Wire/Release literal pins на
+  reviewed3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec;
+  R76 отдельно принял UDP_ADDITIONAL_REVIEWED_PATCH того же digest. Legacy
+  PRODUCER_PATCH/Direct3 сохранены. 160 unique Rust pure, linux/desktop/nsfs
+  all-targets clippy, fmt, Python46 normal+46 optimized/Ruff PASS. Старый schema2
+  negative fixture исправлен на unknown schema3, поддержка schema2 не ослаблена.
+  На чистом official pinned Xray source compile-only builder создал ELF/manifest/
+  scope candidates с install_authority=false, без исполнения/установки. Evidence
+  r75-root-pin сохранён вне TTL. Public gates и installed app не изменены;
+  runtime acceptance и полная поддержка всех transports/семи roots не заявлены.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение

@@ -108,13 +108,20 @@ const DNS_WIRE_REVIEWED_PATCH: Option<&str> =
 // Семантический contract отдельно от artifact pin. Новый DNS patchset должен
 // пройти root source review и обновить allowlist до trusted install.
 const PRODUCER_PATCH: &str = "6e6abdbdcedae5b7c4548e9225ae4f8531a4489b8788141a2b6b4cf64a083c7e";
-// Отдельный review для CODEC4 отсутствует; Direct3 pin его не заменяет.
+// Direct USER CODEC4 отдельно не принят; bootstrap review его не заменяет.
 const DNS_CODEC4_REVIEWED_PATCH: Option<&str> = None;
-const BOOTSTRAP_BUILD_REVIEWED_PATCH: Option<&str> = None;
-const BOOTSTRAP_SOURCE_REVIEWED_PATCH: Option<&str> = None;
-const BOOTSTRAP_DNS_WIRE_REVIEWED_PATCH: Option<&str> = None;
-const BOOTSTRAP_DNS_RELEASE_REVIEWED_PATCH: Option<&str> = None;
-const UDP_ADDITIONAL_REVIEWED_PATCH: Option<&str> = None;
+// R74/R75: exact CODEC4 single raw TCP producer и независимые helper scopes.
+const BOOTSTRAP_BUILD_REVIEWED_PATCH: Option<&str> =
+    Some("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
+const BOOTSTRAP_SOURCE_REVIEWED_PATCH: Option<&str> =
+    Some("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
+const BOOTSTRAP_DNS_WIRE_REVIEWED_PATCH: Option<&str> =
+    Some("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
+const BOOTSTRAP_DNS_RELEASE_REVIEWED_PATCH: Option<&str> =
+    Some("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
+// R76: UDP совместимость принята отдельно от bootstrap scopes.
+const UDP_ADDITIONAL_REVIEWED_PATCH: Option<&str> =
+    Some("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
 const BOOTSTRAP_REVIEWED_PATCHES: [Option<&str>; 3] = [
     BOOTSTRAP_SOURCE_REVIEWED_PATCH,
     BOOTSTRAP_DNS_WIRE_REVIEWED_PATCH,
@@ -1093,6 +1100,44 @@ mod tests {
         );
     }
     #[test]
+    fn reviewed_bootstrap_build_requires_each_explicit_scope() {
+        use super::BootstrapScope;
+        use sha2::Digest;
+        let mut value = serde_json::json!({"contract":"yonik-xray-profile-udp-v2","version":1,"source_commit":"a4a3dff5b20c2faae567b742c172c7b95e75c083","source_sha256":"16".repeat(32),"patch_sha256":super::BOOTSTRAP_BUILD_REVIEWED_PATCH.unwrap(),"builder_sha256":"12".repeat(32),"toolchain_sha256":"13".repeat(32),"build_inputs_sha256":"14".repeat(32),"elf_sha256":"11".repeat(32)});
+        for (slot, scope) in [
+            ("bootstrap_source", BootstrapScope::Source),
+            ("bootstrap_dns_wire", BootstrapScope::Wire),
+            ("bootstrap_dns_release", BootstrapScope::Release),
+        ] {
+            value[slot] = serde_json::json!({"contract":scope.contract(),"version":1,"contract_sha256":format!("{:x}",sha2::Sha256::digest(format!("{}\0",scope.contract()).as_bytes())),"schema_sha256":format!("{:x}",sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-4\0"))});
+        }
+        for missing in [
+            None,
+            Some("bootstrap_source"),
+            Some("bootstrap_dns_wire"),
+            Some("bootstrap_dns_release"),
+        ] {
+            let mut record = value.clone();
+            if let Some(slot) = missing {
+                record.as_object_mut().unwrap().remove(slot);
+            }
+            let record: super::ProducerRecord = serde_json::from_value(record).unwrap();
+            let image = record.validate(crate::host::Sha256([17; 32])).unwrap();
+            assert!(image.check([17; 32]).is_ok());
+            for (slot, scope) in [
+                ("bootstrap_source", BootstrapScope::Source),
+                ("bootstrap_dns_wire", BootstrapScope::Wire),
+                ("bootstrap_dns_release", BootstrapScope::Release),
+            ] {
+                assert_eq!(
+                    image.bootstrap_channel([17; 32], scope).unwrap().is_some(),
+                    missing != Some(slot)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn producer_pin_matches_reviewed_adapter_metadata() {
         let metadata: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../adapters/xray/v26.10.31/native-full-profile.json"
@@ -1100,7 +1145,7 @@ mod tests {
         .expect("закреплённый adapter metadata");
         assert_eq!(
             metadata["patch_sha256"].as_str(),
-            Some(super::PRODUCER_PATCH)
+            super::BOOTSTRAP_BUILD_REVIEWED_PATCH
         );
     }
     #[test]
@@ -1555,7 +1600,7 @@ mod tests {
         wrong_hash["sha256"] = serde_json::json!("bad");
         for (manifest, error) in [
             (
-                serde_json::json!({"schema":2,"engines":[good.clone()]}),
+                serde_json::json!({"schema":3,"engines":[good.clone()]}),
                 RegistryError::Manifest,
             ),
             (
