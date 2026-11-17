@@ -484,6 +484,9 @@ fn emit_policy(
         } else if tun_sources {
             crate::source_selectors::apply(engine, &mut native, &rule.conditions.executables);
         }
+        if !tun_sources && !data_only {
+            crate::transport::apply_local(engine, &mut native, &rule.conditions.transport);
+        }
         rules.push(native);
     }
     rules.push(route_rule(engine, policy.default_action, None, None));
@@ -590,11 +593,23 @@ fn validate_policy(
     mode: PolicyMode,
     tun_sources: bool,
 ) -> Result<(), PolicyCompileError> {
-    if let Some(id) = policy.unsupported_transport() {
-        return Err(PolicyCompileError::UnsupportedTransport(id));
+    if tun_sources {
+        if let Some(id) = policy.unsupported_transport() {
+            return Err(PolicyCompileError::UnsupportedTransport(id));
+        }
     }
     if let Some(id) = policy.unsupported_selector() {
         return Err(PolicyCompileError::UnsupportedSelector(id));
+    }
+    let transport_ranges: usize = policy
+        .user_rules
+        .iter()
+        .chain(&policy.preset_rules)
+        .filter_map(|r| r.conditions.transport.ports())
+        .map(|ports| ports.ranges().len())
+        .sum();
+    if transport_ranges > 4096 {
+        return Err(PolicyCompileError::InvalidPolicy);
     }
     let mut selectors =
         policy.lan.len() + policy.private_networks.len() + policy.private_domains.len();

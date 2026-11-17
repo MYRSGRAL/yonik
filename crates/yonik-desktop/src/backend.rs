@@ -675,6 +675,93 @@ enum ConnectionMode {
     System,
 }
 
+// Только LocalSocks имеет доказанное software lowering transport, без process authority.
+fn unsupported_connect_policy(policy: &yonik_domain::Policy, mode: ConnectionMode) -> Option<u64> {
+    policy.unsupported_selector().or_else(|| {
+        if mode == ConnectionMode::System {
+            policy.unsupported_transport()
+        } else {
+            policy
+                .user_rules
+                .iter()
+                .chain(&policy.preset_rules)
+                .find(|rule| rule.enabled && !rule.conditions.executables.is_empty())
+                .map(|rule| rule.id)
+        }
+    })
+}
+
+/// Единственный compiler selection Local Connect; generic compile здесь недопустим.
+fn compile_local_connect(
+    server: &yonik_import::ParsedServer,
+    engine: Engine,
+    port: NonZeroU16,
+    probe_port: NonZeroU16,
+    draft: &crate::editor::Draft,
+) -> Result<yonik_engine::CompiledConfig> {
+    // Без resource-bound session нельзя терять сохранённые refs и их OR-группы.
+    if draft
+        .ru_direct
+        .as_ref()
+        .is_some_and(|reference| reference.enabled)
+    {
+        return Err(DesktopError("unsupported_option"));
+    }
+    let policy = draft.policy().map_err(DesktopError)?;
+    if unsupported_connect_policy(&policy, ConnectionMode::Local).is_some() {
+        return Err(DesktopError("unsupported_option"));
+    }
+    let names = policy
+        .user_rules
+        .iter()
+        .chain(&policy.preset_rules)
+        .any(|rule| rule.enabled && !rule.conditions.domains.is_empty());
+    yonik_engine::compile_policy(
+        server,
+        engine,
+        port,
+        probe_port,
+        &policy,
+        if names {
+            yonik_engine::PolicyMode::Names
+        } else {
+            yonik_engine::PolicyMode::IpOnly
+        },
+    )
+    .map_err(|_| DesktopError("engine_config"))
+}
+
+fn persisted_local_draft(
+    stored: Option<(i64, Zeroizing<Vec<u8>>)>,
+    expected_revision: Option<i64>,
+    current: &crate::editor::Draft,
+) -> Result<crate::editor::Draft> {
+    let (revision, draft) = match stored {
+        Some((revision, raw)) => (
+            revision,
+            crate::editor::Draft::parse(
+                std::str::from_utf8(&raw).map_err(|_| DesktopError("routing_storage"))?,
+            )
+            .map_err(|_| DesktopError("routing_storage"))?,
+        ),
+        None => (0, crate::editor::Draft::default()),
+    };
+    if expected_revision != Some(revision) || draft.json() != current.json() {
+        return Err(DesktopError("routing_stale"));
+    }
+    Ok(draft)
+}
+
+fn available_probe_port(listen: NonZeroU16) -> Result<NonZeroU16> {
+    for _ in 0..16 {
+        let probe = available_port(0)?;
+        if probe != listen {
+            return Ok(probe);
+        }
+    }
+    Err(DesktopError("listen_port_busy"))
+}
+
 struct Envelope {
     generation: u64,
     tcp_generation: u64,
@@ -1946,6 +2033,46 @@ impl Actor {
         Ok((inline, revision))
     }
 
+    async fn local_connect_config(&self) -> Result<yonik_engine::CompiledConfig> {
+        let selected = self
+            .selected
+            .as_ref()
+            .ok_or(DesktopError("profile_required"))?;
+        let fresh = self
+            .service()
+            .select_profile(selected.profile.id, selected.snapshot_revision)
+            .await
+            .map_err(|_| DesktopError("profile_unavailable"))?;
+        if self.state.selected_profile != Some(fresh.profile.id)
+            || self.state.source_id != Some(fresh.profile.source_id)
+            || self.state.revision != fresh.snapshot_revision
+            || self.state.source_generation != Some(fresh.source_generation)
+            || selected.source_generation != fresh.source_generation
+            || self
+                .service()
+                .schedule_generation(fresh.profile.source_id)
+                .await
+                .map_err(|_| DesktopError("profile_unavailable"))?
+                != Some(fresh.source_generation)
+        {
+            return Err(DesktopError("routing_stale"));
+        }
+        let stored = self
+            .routing_repository()
+            .routing_draft()
+            .await
+            .map_err(|_| DesktopError("routing_storage"))?;
+        let draft = persisted_local_draft(stored, self.routing_revision, &self.state.routing)?;
+        let port = NonZeroU16::new(self.state.port).ok_or(DesktopError("engine_config"))?;
+        compile_local_connect(
+            &fresh.server,
+            self.state.engine.engine(),
+            port,
+            available_probe_port(port)?,
+            &draft,
+        )
+    }
+
     async fn save_routing(
         &mut self,
         candidate: crate::editor::Draft,
@@ -2261,7 +2388,10 @@ impl Actor {
             && !self.state.can_stop
             && !self.state.system_busy
             && !self.state.busy
-            && self.state.pending.is_none();
+            && self.state.pending.is_none()
+            && self.state.routing.policy().is_ok_and(|policy| {
+                unsupported_connect_policy(&policy, self.state.connection_mode).is_none()
+            });
         self.state.emit(&self.callback);
     }
     async fn native_connect_preflight(
@@ -5926,7 +6056,7 @@ async fn run(
                     }
                     Command::Connect if actor.routing_revision.is_none() => Err(DesktopError("routing_storage").into()),
                     Command::Connect if actor.state.routing.policy().is_err() => Err(DesktopError("routing_storage").into()),
-                    Command::Connect if actor.state.routing.policy().ok().and_then(|p| p.unsupported_selector().or_else(|| p.unsupported_transport())).is_some() => Err(DesktopError("unsupported_option").into()),
+                    Command::Connect if actor.state.routing.policy().ok().and_then(|p| unsupported_connect_policy(&p, actor.state.connection_mode)).is_some() => Err(DesktopError("unsupported_option").into()),
                     command @ (Command::Connect | Command::RoutingApply { .. }) if actor.state.connection_mode == ConnectionMode::System => {
                         let request_id = if let Command::RoutingApply { request_id, .. } = &command { Some(*request_id) } else { None };
                         if let Err(error) = actor.check_routing_apply(&command).await { Err(error.into()) }
@@ -5957,8 +6087,9 @@ async fn run(
                         else if let Some(profile) = actor.selected.as_ref() {
                             if actor.pending.is_some() { Err(DesktopError("review_required").into()) }
                             else {
-                                match (NonZeroU16::new(actor.state.port).and_then(|port| yonik_engine::compile(&profile.server, actor.state.engine.engine(), port).ok()), actor.probe_target()) {
-                                    (Some(compiled), Ok(target)) => {
+                                let Some(compiled) = await_current_schedule(actor.local_connect_config(), &control.generation, envelope.generation).await else { continue; };
+                                match (compiled, actor.probe_target()) {
+                                    (Ok(compiled), Ok(target)) => {
                                         let (cancel, receiver) = Cancellation::new();
                                         let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, compiled.listen_port().get()));
                                         session_generation = session_generation.saturating_add(1); actor.state.error_generation = session_generation;
@@ -5970,7 +6101,7 @@ async fn run(
                                         actor.state.probe_result = None; actor.state.status = "Preparing"; Ok(())
                                     }
                                     (_, Err(error)) => Err(error.into()),
-                                    _ => Err(DesktopError("engine_config").into()),
+                                    (Err(error), _) => Err(error.into()),
                                 }
                             }
                         } else { Err(DesktopError("profile_required").into()) }
@@ -8169,3 +8300,199 @@ mod probe_context_tests {
 #[cfg(all(test, feature = "test-support"))]
 #[path = "disk_host_acceptance.rs"]
 mod disk_host_acceptance;
+
+#[cfg(test)]
+mod p07_local_transport_tests {
+    use super::{ConnectionMode, unsupported_connect_policy};
+    use yonik_domain::{Action, Conditions, Policy, Rule, TransportConditions};
+    #[test]
+    fn connect_gate_разделяет_local_и_system() {
+        let mut policy = Policy::default();
+        policy.user_rules.push(Rule {
+            id: 71,
+            enabled: true,
+            action: Action::Block,
+            conditions: Conditions {
+                transport: TransportConditions::parse(Some(&["udp"]), None).unwrap(),
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            unsupported_connect_policy(&policy, ConnectionMode::Local),
+            None
+        );
+        assert_eq!(
+            unsupported_connect_policy(&policy, ConnectionMode::System),
+            Some(71)
+        );
+        policy.user_rules[0]
+            .conditions
+            .executables
+            .push("/usr/bin/app".into());
+        assert_eq!(
+            unsupported_connect_policy(&policy, ConnectionMode::Local),
+            Some(71)
+        );
+        assert!(super::inline_policy_conversion::inline_policy(&policy).is_err());
+        policy.user_rules[0].enabled = false;
+        assert_eq!(
+            unsupported_connect_policy(&policy, ConnectionMode::Local),
+            None
+        );
+        assert_eq!(
+            unsupported_connect_policy(&policy, ConnectionMode::System),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod p07_connect_compiler_tests {
+    use super::compile_local_connect;
+    use serde_json::{Value, json};
+    use std::num::NonZeroU16;
+    use yonik_engine::Engine;
+
+    fn draft() -> crate::editor::Draft {
+        crate::editor::Draft::parse(&json!({"version":3,"default_action":"direct","rules":[{
+            "id":71,"enabled":true,"action":"block","executables":[],"domains":[],"destinations":[],"platform_sources":[],
+            "transport":{"transport_protocols":["udp"],"destination_ports":[[53,53],[8000,8010]]}
+        }]}).to_string()).unwrap()
+    }
+    fn compile(
+        engine: Engine,
+        draft: &crate::editor::Draft,
+        probe: u16,
+    ) -> super::Result<yonik_engine::CompiledConfig> {
+        let report = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@127.0.0.1:24443".to_vec(),
+        )
+        .unwrap();
+        compile_local_connect(
+            &report.servers[0],
+            engine,
+            NonZeroU16::new(10808).unwrap(),
+            NonZeroU16::new(probe).unwrap(),
+            draft,
+        )
+    }
+    fn value(config: &yonik_engine::CompiledConfig) -> Value {
+        let mut bytes = Vec::new();
+        config.write_sensitive(&mut bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    #[test]
+    fn connect_compiler_передаёт_udp_ports_block_и_private_probe_в_session_config() {
+        for engine in [Engine::Xray, Engine::SingBox] {
+            let config = compile(engine, &draft(), 10809).unwrap();
+            assert_eq!(config.listen_port().get(), 10808);
+            assert_eq!(config.probe_port().get(), 10809);
+            assert_eq!(config.probe_auth().unwrap().password().len(), 64);
+            let json = value(&config);
+            assert_eq!(json["inbounds"].as_array().unwrap().len(), 2);
+            let rules = &json[if engine == Engine::Xray {
+                "routing"
+            } else {
+                "route"
+            }]["rules"];
+            let rules = rules.as_array().unwrap();
+            let policy = &rules[rules.len() - 2];
+            if engine == Engine::Xray {
+                assert_eq!(policy["network"], "udp");
+                assert_eq!(policy["port"], "53,8000-8010");
+                assert_eq!(policy["outboundTag"], "block");
+                assert_eq!(rules[0]["inboundTag"], json!(["probe"]));
+                assert_eq!(rules.last().unwrap()["outboundTag"], "direct");
+            } else {
+                assert_eq!(policy["network"], json!(["udp"]));
+                assert_eq!(policy["port"], json!([53]));
+                assert_eq!(policy["port_range"], json!(["8000:8010"]));
+                assert_eq!(policy["action"], "reject");
+                assert_eq!(rules[0]["inbound"], json!(["probe"]));
+                assert_eq!(rules.last().unwrap()["outbound"], "direct");
+            }
+        }
+    }
+    #[test]
+    fn connect_compiler_не_делает_generic_или_inline_fallback() {
+        for engine in [Engine::Xray, Engine::SingBox] {
+            assert!(compile(engine, &draft(), 10808).is_err());
+            let mut draft = draft();
+            draft.ru_direct = Some(crate::editor::PresetReference {
+                snapshot: "a".repeat(64),
+                enabled: true,
+            });
+            assert_eq!(
+                compile(engine, &draft, 10809).unwrap_err().0,
+                "unsupported_option"
+            );
+            draft.ru_direct = None;
+            draft.rules[0].executables.push("/usr/bin/app".into());
+            assert_eq!(
+                compile(engine, &draft, 10809).unwrap_err().0,
+                "unsupported_option"
+            );
+            draft.rules[0].executables.clear();
+            draft.rules[0].domains.push("example.org".into());
+            let config = compile(engine, &draft, 10809).unwrap();
+            assert!(value(&config).to_string().contains("example.org"));
+            draft.rules[0].destinations.push("192.0.2.0/24".into());
+            assert!(compile(engine, &draft, 10809).is_err());
+        }
+    }
+    #[test]
+    fn persisted_capture_требует_revision_и_точное_содержимое() {
+        let draft = draft();
+        let raw = super::Zeroizing::new(draft.json().into_bytes());
+        assert!(super::persisted_local_draft(Some((7, raw.clone())), Some(7), &draft).is_ok());
+        assert_eq!(
+            super::persisted_local_draft(Some((7, raw.clone())), Some(6), &draft)
+                .err()
+                .unwrap()
+                .0,
+            "routing_stale"
+        );
+        assert_eq!(
+            super::persisted_local_draft(None, Some(7), &draft)
+                .err()
+                .unwrap()
+                .0,
+            "routing_stale"
+        );
+        assert_eq!(
+            super::persisted_local_draft(
+                Some((7, super::Zeroizing::new(b"broken".to_vec()))),
+                Some(7),
+                &draft
+            )
+            .err()
+            .unwrap()
+            .0,
+            "routing_storage"
+        );
+        let mut changed = draft.clone();
+        changed.rules[0].enabled = false;
+        assert_eq!(
+            super::persisted_local_draft(Some((7, raw)), Some(7), &changed)
+                .err()
+                .unwrap()
+                .0,
+            "routing_stale"
+        );
+        let mut resource = draft;
+        resource.ru_direct = Some(crate::editor::PresetReference {
+            snapshot: "a".repeat(64),
+            enabled: true,
+        });
+        let captured = super::persisted_local_draft(
+            Some((8, super::Zeroizing::new(resource.json().into_bytes()))),
+            Some(8),
+            &resource,
+        )
+        .unwrap();
+        assert_eq!(
+            compile(Engine::SingBox, &captured, 10809).unwrap_err().0,
+            "unsupported_option"
+        );
+    }
+}
