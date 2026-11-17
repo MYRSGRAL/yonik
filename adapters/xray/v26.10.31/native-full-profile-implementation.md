@@ -1456,3 +1456,66 @@ TLS/mux/chained parent, UDP, network bootstrap, Probe/service-parent и даль
 Physical/Proxy paths этим unit не заявлены: Unsupported. CODEC4/schema/corpus,
 Rust/registry/builder/protected allowlists не менялись. `dns4CaptureReviewed` и
 public gates false; новый patch требует отдельного root source/pin review.
+
+### NETWORK bootstrap: actual service/context/Exchange constructor
+
+Первый bounded NETWORK unit продолжает actual `ProfilePrepareChain` через
+существующий `profilePrepareHostsObservation`: DNS-only/DNS-first либо files→DNS
+miss выбирают `profilePrepareNetworkBootstrap`. Files hit сохраняет принятый
+Hosts path. Используется только retained YNKDNS snapshot role4 с exact source,
+asset hash/size/epoch, encoded source и actual parent frontier. Remote chained
+hostname не заменяет terminal physical hostname. Original hostname/case/port/
+carrier/full path и live private USER receipt остаются у исходного parent.
+
+Constructor выбирает первый pinned-netgo question и A family, первый/rotated
+captured peer по snapshot ordering; ndots/search/uppercase/.onion policy берутся
+из существующего pinned planner. Canonical question отделён от original bytes.
+RD/EDNS1232/trust-ad и use-vc→TCP выводятся из captured options. DNS carrier6/17
+не подменяет original physical carrier: Exchange35 сохраняет parent carrier,
+а numeric resolver peer хранится отдельно. Loopback/stub, subject-bound resolver,
+несовпавший source/port53/peer/carrier закрыты до service effects. Дальнейшие
+families/search/peer retries не выполняются без проверенного предыдущего ответа.
+
+Actual flowRPC actor сначала запрашивает purpose2 Probe20/GRANT19 с exact
+manifest endpoint/subject/resolver. Root class3/flow0/required0/owner0 не USER
+grant и не resource permission. Его request deadline ограничен original parent,
+System Known20ms и snapshot timeout. Затем новый private capture constructor
+вызывает `ProfileDNSAcquirePhysicalContext`55/56 с typed BootstrapService root,
+own query/source epoch, full actual path и exact options. ContextID не alias
+UserDns bundle/SourceObservation/DirectSystemTransportPermit. Parent и snapshot
+проверяются повторно; source/parent/question failure закрывает owner без revival.
+
+После ACK56 constructor отправляет Exchange Reserve35 role1: purpose2/source1,
+use2/class3, flow/revision0, original immutable, canonical first question, root
+service ID, context ID, query/epoch, terminal selector и Probe8 base. Reserved36
+сверяет exact pending sequence/query/context/epoch, FD0/pending1/role1, новые
+reservation/exchange IDs и исходный lease с полным RTT. Namespace collision
+checks взаимны с Direct/Hosts consumers; единственное изменение старого Direct
+accept — дополнительный отказ при ExchangeId, уже retained NETWORK owner.
+
+До effects резервируются4 общих pending/history и32KiB owner metadata; root
+operation и context actor оплачены своими existing ledgers, double debit нет.
+Новый reader/FD/socket/task не создаётся, R39 постоянные RX16FD/1pending/66048B
+не меняются. Успешный Reserved всё ещё возвращает Unsupported и начинает cleanup:
+pending Reserve Cancel1 ACK/late deadline → reservation Cancel7 ACK → retained
+context reference release/Cancel8 ACK → owner credit release. Service root
+удерживается отдельной pending reference до context retirement; его existing
+Close/tombstone path сохраняется. Lost/Unknown/late cleanup удерживает custody,
+credits/IDs не переиспользуются; отмена owner не отменяет соседний USER flow.
+
+**Точная оставшаяся integration:** `profile_dns_direct_linux.go::dnsDirectNew`,
+`dnsDirectReserve`, `dnsDirectPhysical`, `dnsDirectLogical` используют именно
+USER-backed `profileDNSBundle.exchange.query.receipt` и canonical class3 USER
+base. Их нельзя вызвать с BootstrapService ContextID или подложенным USER flow.
+Следующий unit должен добавить private DirectSystem context binding к consuming
+socket owner, отдельные Physical35/52→37 и Logical38→39, до factory удержать2FD
+и transport credits, до payload/handshake проверить все ACK и обе lineage.
+В текущем unit service kernel transport остаётся deny: DNS request/response,
+RRset/Publish/waiter/numeric NETWORK handoff и original physical open не добавлены.
+
+Pure injected issuer controls проходят через actual chain caller: оба режима,
+UDP/TCP resolver selection, search ordering, source/root/context/Reserve binding,
+System expiry, replay/cancel/late Allow, namespace/capacity refusal, shared RX,
+neighbor isolation и sticky Unknown. OS/proof/socket wrappers не исполнялись.
+CODEC4/layout/schema/corpus, Hosts/R9/R14/UDP guards, protected records,
+registry/builder/allowlists/public/capture flags не менялись; gates false.
