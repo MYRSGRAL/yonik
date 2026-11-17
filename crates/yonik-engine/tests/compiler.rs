@@ -373,3 +373,94 @@ fn shadowsocks_2022_preserves_exact_method_and_key() {
         Err(CompileError::UnsupportedOption)
     );
 }
+
+#[test]
+fn reality_uri_shapes_compile_for_local_xray() {
+    let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let base = format!(
+        "vless://{UUID}@secret.example:443?encryption=none&security=reality&sni=verify.example&fp=chrome&pbk={key}&sid=ab12"
+    );
+    let cases = [
+        (
+            "type=tcp&flow=xtls-rprx-vision&packetEncoding=xudp",
+            "tcp",
+            Value::Null,
+        ),
+        (
+            "type=grpc&serviceName=service%2Fa&mode=gun&authority=edge.example%3A8443",
+            "grpc",
+            json!({"serviceName":"service/a","authority":"edge.example:8443"}),
+        ),
+        (
+            "type=grpc&serviceName=svc",
+            "grpc",
+            json!({"serviceName":"svc"}),
+        ),
+        (
+            "type=xhttp&host=edge.example&path=%2Fstream%3Fa%3Db&mode=stream-up",
+            "xhttp",
+            json!({"host":"edge.example","path":"/stream?a=b","mode":"stream-up"}),
+        ),
+    ];
+    for (query, network, settings) in cases {
+        let uri = format!("{base}&{query}");
+        let value = config(Engine::Xray, &uri).unwrap();
+        assert_eq!(value["inbounds"][0]["listen"], "127.0.0.1");
+        assert_eq!(value["inbounds"][0]["settings"]["udp"], true);
+        let outbound = &value["outbounds"][0];
+        let user = &outbound["settings"]["vnext"][0]["users"][0];
+        assert_eq!(user["id"], UUID);
+        assert_eq!(user["encryption"], "none");
+        assert!(user.get("packetEncoding").is_none());
+        assert!(outbound.get("mux").is_none());
+        assert_eq!(
+            user["flow"],
+            if network == "tcp" {
+                "xtls-rprx-vision"
+            } else {
+                ""
+            }
+        );
+        let stream = &outbound["streamSettings"];
+        assert_eq!(stream["network"], network);
+        assert_eq!(stream["security"], "reality");
+        assert_eq!(
+            stream["realitySettings"],
+            json!({"serverName":"verify.example","fingerprint":"chrome","password":key,"shortId":"ab12"})
+        );
+        assert_eq!(stream[format!("{network}Settings")], settings);
+        assert!(config(Engine::SingBox, &uri).is_err(), "{query}");
+    }
+}
+
+#[test]
+fn reality_uri_rejects_unmapped_packet_encoding_and_transport_options() {
+    let base = format!(
+        "vless://{UUID}@secret.example:443?encryption=none&security=reality&sni=verify.example&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=ab12"
+    );
+    for query in [
+        "type=tcp&packetEncoding=xudp",
+        "type=tcp&flow=xtls-rprx-vision&packetEncoding=packetaddr",
+        "type=tcp&flow=xtls-rprx-vision&packetEncoding=",
+        "type=grpc&serviceName=svc&packetEncoding=xudp",
+        "type=grpc&serviceName=svc&flow=xtls-rprx-vision",
+        "type=grpc&serviceName=svc&mode=multi",
+        "type=xhttp&path=%2Fstream&flow=xtls-rprx-vision",
+        "type=xhttp&path=%2Fstream&extra=%7B%7D",
+        "type=ws&path=%2Fstream",
+    ] {
+        assert!(
+            config(Engine::Xray, &format!("{base}&{query}")).is_err(),
+            "{query}"
+        );
+    }
+    assert_eq!(
+        config(
+            Engine::Xray,
+            &format!(
+                "vless://{UUID}@secret.example:443?security=tls&flow=xtls-rprx-vision&packetEncoding=xudp"
+            )
+        ),
+        Err(CompileError::UnsupportedOption)
+    );
+}

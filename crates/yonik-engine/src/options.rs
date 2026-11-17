@@ -110,7 +110,12 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
     if protocol == Protocol::Trojan && security != Security::Tls {
         return Err(CompileError::UnsupportedSecurity);
     }
-    if security == Security::Reality && (protocol != Protocol::Vless || transport != Transport::Tcp)
+    // Xray 26.10.31 разрешает REALITY для RAW, gRPC и XHTTP.
+    if security == Security::Reality
+        && !(protocol == Protocol::Vless
+            && (transport == Transport::Tcp
+                || engine == Engine::Xray
+                    && matches!(transport, Transport::Grpc | Transport::Xhttp)))
     {
         return Err(CompileError::UnsupportedSecurity);
     }
@@ -167,6 +172,17 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
             || security == Security::None)
     {
         return Err(CompileError::UnsupportedOption);
+    }
+    if let Some(packet_encoding) = parameters.remove("packetEncoding") {
+        // VLESS outbound в Xray 26.10.31 сам включает XUDP для UDP с Vision.
+        // Оставляем нативную политику Vision для UDP/443 и не включаем отдельный mux.
+        if packet_encoding != "xudp"
+            || engine != Engine::Xray
+            || security != Security::Reality
+            || options.flow != "xtls-rprx-vision"
+        {
+            return Err(CompileError::UnsupportedOption);
+        }
     }
     if security != Security::None {
         options.sni = take(&mut parameters, "sni");
