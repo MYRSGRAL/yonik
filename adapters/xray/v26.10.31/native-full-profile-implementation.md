@@ -1756,3 +1756,43 @@ Pure tests используют authenticated fake channel/issuer через act
 context decoder и actual callers. Они не измеряют current executable, kernel
 proof, durable policy install или runtime acceptance. Wire/schema/corpus,
 frozen ABI, R9/R14/UDP/RX и R64 custody barriers не меняются.
+
+### R79: NETWORK service wire-close ownership
+
+Producer и waiter получают service через private `networkProbe`: отдельный
+`networkCleanupRefs` приобретается под тем же flow mutex, что и allocation Probe,
+до возврата/handoff. Generic tick немедленно закрывает usage/cancel ctx, но при
+этом ref не отправляет service Close32/target3 и не удаляет grant. Общий pending
+не используется как wire barrier; обычные USER/probe semantics не меняются.
+
+Ref освобождается ровно при завершении существующего NETWORK cleanup owner:
+после constructor exit, waiter/permission, local close/join, publication,
+Proof/Resource и reservation/exchange/context ACK barriers. Ошибка до context
+creation также проходит constructor settle; Unknown удерживает ref/custody.
+Повторный tick не освобождает ref второй раз и не повторяет uncertain Close.
+Новый patch digest требует bounded review/pin update. Rust scratch correction
+и совместный NETWORK pair здесь не аттестованы; flags/allowlists не меняются.
+
+### R80: late refresh сохраняет NETWORK cleanup owner
+
+Existing NETWORK refresh резервирует дополнительные 32 bytes из общего memory
+ledger до operation/effects. Operation удерживает private grant pointer и exact
+existing ID; tombstone получает эту ownership при переносе pending, без поиска
+по ID/переиспользуемому slot. До tomb transfer finish возвращает credit, после
+transfer — только tomb retirement/watermark/expiry; повторный clear не debit-ит
+дважды. Размер tomb увеличен в пределах этого дополнительного prepaid bound.
+
+Обе ветви late successful19 (active cancelled operation и cancelled tombstone)
+проверяют existing ID/class/flow0/owner0/revision/lease. Они закрывают usage через
+исходный grant, но не вызывают direct cancelWire: exactly-one service Close
+остаётся обязанностью generic tick после NETWORK cleanup refs/barriers. Если
+Close уже отправлен, late refresh того же ID не создаёт второй wire Close.
+Grant pointer в tombstone не подменяется новым occupant slot. Foreign refresh
+ID отвергается без Close чужого grant. Late INITIAL Probe не имеет existing
+ID/dependencies и сохраняет прежний immediate cleanup; legacy пути не меняются.
+
+Full-tick pure controls проходят оба late-response пути для producer и waiter,
+затем все permission/Resource/reservation/exchange/context ACK barriers и ровно
+один Close32 каждого service. Ошибка/Unknown не освобождает NETWORK refs.
+Новый digest требует bounded review; source contracts/UDP/corpus/wire/allowlists
+не меняются. Совместный Go/Rust NETWORK pair здесь не исполнялся.

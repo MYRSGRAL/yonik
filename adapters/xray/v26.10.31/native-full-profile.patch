@@ -7009,7 +7009,7 @@ diff --git a/common/yonikbroker/profile_service_linux.go b/common/yonikbroker/pr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_service_linux.go
-@@ -0,0 +1,412 @@
+@@ -0,0 +1,426 @@
 +//go:build linux
 +
 +package nativehooks
@@ -7123,6 +7123,20 @@ new file mode 100644
 +func (c *profileFlowControl) probe(ctx context.Context, purpose, index, subject, resolver uint16) (*profileGrant, *profileOperation, error) {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
++	return c.probeLocked(ctx, purpose, index, subject, resolver)
++}
++
++// Ref приобретается до unlock/возврата Probe: constructor handoff может ждать.
++func (c *profileFlowControl) networkProbe(ctx context.Context, index, subject, resolver uint16) (*profileGrant, *profileOperation, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	g, op, err := c.probeLocked(ctx, 2, index, subject, resolver)
++	if err == nil {
++		g.networkCleanupRefs++
++	}
++	return g, op, err
++}
++func (c *profileFlowControl) probeLocked(ctx context.Context, purpose, index, subject, resolver uint16) (*profileGrant, *profileOperation, error) {
 +	if int(subject) >= len(c.manifest.rows[0]) {
 +		return nil, nil, errProfile
 +	}
@@ -15996,7 +16010,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,1233 @@
+@@ -0,0 +1,1277 @@
 +//go:build linux
 +
 +package nativehooks
@@ -16089,6 +16103,8 @@ new file mode 100644
 +	openOperation                   *profileOperation
 +}
 +type profileGrant struct {
++	// Только NETWORK cleanup ownership; pending не является wire-close barrier.
++	networkCleanupRefs                  int
 +	numeric                             *profileNumeric
 +	dnsOwner                            *profileDNSExchange
 +	next                                *profileGrant
@@ -16111,6 +16127,7 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	networkLate                             *profileGrant
 +	networkBootstrap                        *profileNetworkBootstrap
 +	bootstrap                               *profileBootstrapRPC
 +	hostsObservation                        *profileHostsObservation
@@ -16139,6 +16156,8 @@ new file mode 100644
 +	cancelled, completed, submitted, queued bool
 +}
 +type profileTombstone struct {
++	networkLate                                              *profileGrant
++	networkLateID                                            uint64
 +	association                                              uint64
 +	closeStatus                                              byte
 +	sequence, cancelSequence, objectCancelSequence, objectID uint64
@@ -16223,6 +16242,11 @@ new file mode 100644
 +	if ctx == nil || ctx.Err() != nil || len(body) > 1024 || !c.live() || !c.operationAvailable() {
 +		return nil, errProfile
 +	}
++	// Existing grant refresh: отдельный prepaid retained owner, не ID lookup.
++	networkLate := g != nil && g.networkCleanupRefs != 0 && object != 0 && object == g.id && (kind == 18 || kind == 20)
++	if networkLate && c.buffered+c.manifest.memoryCredit+32 > uint64(c.manifest.caps[4]) {
++		return nil, errProfileFlowBusy
++	}
 +	slot := -1
 +	if c.udpBudget != nil {
 +		slot = c.udpBudget.used
@@ -16237,6 +16261,10 @@ new file mode 100644
 +		g.pending++
 +	}
 +	op := &profileOperation{udpSlot: slot, ctx: ctx, receipt: r, grant: g, kind: kind, object: object, body: body, done: make(chan struct{})}
++	if networkLate {
++		op.networkLate = g
++		c.buffered += 32
++	}
 +	if r != nil && r.udp != nil && kind == 18 && object == 0 {
 +		op.fixedDeadline = r.udp.deadline
 +	}
@@ -16471,6 +16499,10 @@ new file mode 100644
 +		return
 +	}
 +	op.completed = true
++	if op.networkLate != nil {
++		c.buffered -= 32
++		op.networkLate = nil
++	}
 +	if c.udpBudget != nil && op.udpSlot >= 0 {
 +		c.udpBudget.entries[op.udpSlot].terminal = true
 +	}
@@ -16607,6 +16639,7 @@ new file mode 100644
 +	for i, t := range c.tombs {
 +		if t.sequence == 0 {
 +			entry := profileTombstone{sequence: op.sequence, deadline: op.deadline.Add(time.Second), kind: op.kind, replied: !cancelled, cancelled: cancelled}
++			entry.networkLate, entry.networkLateID = op.networkLate, op.object
 +			if op.receipt != nil && op.receipt.udp != nil {
 +				entry.association = op.receipt.udp.producer.association.id
 +			}
@@ -16625,6 +16658,7 @@ new file mode 100644
 +				}
 +			}
 +			c.tombs[i] = entry
++			op.networkLate = nil // prepaid ownership перенесено в tombstone.
 +			return nil
 +		}
 +	}
@@ -16939,6 +16973,21 @@ new file mode 100644
 +			return errProfile
 +		}
 +		id := u64(f.body, 4)
++		for i := range c.tombs {
++			t := &c.tombs[i]
++			if t.sequence != f.reply || t.networkLate == nil {
++				continue
++			}
++			g := t.networkLate
++			if target != 3 || id != t.networkLateID || g.id != id || f.body[1] != g.class || f.body[2] != 0 || f.body[3] != 0 || u64(f.body, 12) != 0 || u64(f.body, 24) != g.revision || !zero(f.body[32:]) || u32(f.body, 20) == 0 || u32(f.body, 20) > 1000 || !g.cancelSent && c.grants[g.slot] != g {
++				return errProfile
++			}
++			// Shared root уже принадлежит retained cleanup owner. Generic tick
++			// отправит один Close после barriers; late reply не создаёт новый ID.
++			c.closeGrant(g)
++			t.replied = true
++			return nil
++		}
 +		seq, e := c.cancelWire(target, id)
 +		if e != nil {
 +			return e
@@ -17035,7 +17084,7 @@ new file mode 100644
 +	now := c.clock()
 +	for i, t := range c.tombs {
 +		if c.udpBudget == nil && t.sequence != 0 && !now.Before(t.deadline) {
-+			c.tombs[i] = profileTombstone{}
++			c.clearTomb(i)
 +		}
 +	}
 +	for i, a := range c.accepted {
@@ -17099,6 +17148,9 @@ new file mode 100644
 +			}
 +		}
 +		if g.closed {
++			if g.networkCleanupRefs != 0 {
++				continue
++			}
 +			if g.id != 0 && !g.cancelSent {
 +				if _, e := c.cancel(3, g.id); e != nil {
 +					if e == errProfileFlowBusy {
@@ -17160,10 +17212,16 @@ new file mode 100644
 +	}
 +	for i, t := range c.tombs {
 +		if t.sequence != 0 && t.sequence <= c.watermark {
-+			c.tombs[i] = profileTombstone{}
++			c.clearTomb(i)
 +		}
 +	}
 +	return nil
++}
++func (c *profileFlowControl) clearTomb(i int) {
++	if c.tombs[i].networkLate != nil {
++		c.buffered -= 32
++	}
++	c.tombs[i] = profileTombstone{}
 +}
 +func (c *profileFlowControl) revoke() {
 +	c.mu.Lock()
@@ -17633,7 +17691,7 @@ new file mode 100644
 +		t.Fatal("tombstone overflow allocated", allocations)
 +	}
 +	// Две private chain links включены в общий fixed metadata preflight.
-+	if unsafe.Sizeof(profileReceipt{}) > 256 || unsafe.Sizeof(profileGrant{}) > 272 || unsafe.Sizeof(profileTombstone{}) > 64 || unsafe.Sizeof(profileOperation{})+1024 > 2048 {
++	if unsafe.Sizeof(profileReceipt{}) > 256 || unsafe.Sizeof(profileGrant{}) > 272 || unsafe.Sizeof(profileTombstone{}) > 64+32 || unsafe.Sizeof(profileOperation{})+1024 > 2048 {
 +		t.Fatal("ledger sizing changed")
 +	}
 +}
@@ -30384,7 +30442,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux.go
-@@ -0,0 +1,2440 @@
+@@ -0,0 +1,2452 @@
 +//go:build linux
 +
 +package nativehooks
@@ -31787,6 +31845,7 @@ new file mode 100644
 +const profileNetworkWaiterPending = 9
 +
 +type profileNetworkWaiter struct {
++	serviceOperation                        *profileOperation
 +	producer                                *profileNetworkBootstrap
 +	ctx                                     context.Context
 +	cancel                                  context.CancelFunc
@@ -31900,12 +31959,13 @@ new file mode 100644
 +		c.mu.Unlock()
 +	}()
 +	f := n.frontier
-+	g, op, err := c.probe(w.ctx, 2, f.endpoint, f.subject, n.resolver)
++	g, op, err := c.networkProbe(w.ctx, f.endpoint, f.subject, n.resolver)
 +	if err != nil {
 +		return err
 +	}
 +	c.mu.Lock()
 +	w.service = g
++	w.serviceOperation = op
 +	g.pending++
 +	op.fixedDeadline = w.deadline
 +	c.mu.Unlock()
@@ -32230,9 +32290,13 @@ new file mode 100644
 +	if !ready {
 +		return nil
 +	}
++	if w.serviceOperation != nil && !w.serviceOperation.completed {
++		return nil
++	}
 +	if w.service != nil {
 +		c.closeGrant(w.service)
 +		w.service.pending--
++		w.service.networkCleanupRefs--
 +	}
 +	w.released = true
 +	c.operations -= profileNetworkWaiterPending
@@ -32242,6 +32306,7 @@ new file mode 100644
 +// Constructor custody, не socket permit. Даже successful Reserved36 этого cut
 +// не публикует Conn, request bytes, RRset или BootstrapPhysicalPermission.
 +type profileNetworkBootstrap struct {
++	serviceOperation                                                         *profileOperation
 +	sourceCapability                                                         *profileDNSSourceCapability
 +	waiter                                                                   *profileNetworkWaiter
 +	result                                                                   *profileDNSResultOwner
@@ -32358,12 +32423,13 @@ new file mode 100644
 +		n.deadline = until
 +	}
 +	c.mu.Unlock()
-+	g, op, err := c.probe(n.ctx, 2, f.endpoint, f.subject, n.resolver)
++	g, op, err := c.networkProbe(n.ctx, f.endpoint, f.subject, n.resolver)
 +	if err != nil {
 +		return err
 +	}
 +	c.mu.Lock()
 +	n.service = g
++	n.serviceOperation = op
 +	g.pending++
 +	op.fixedDeadline = n.deadline
 +	c.mu.Unlock()
@@ -32692,8 +32758,12 @@ new file mode 100644
 +			}
 +		}
 +		if n.service != nil {
++			if n.serviceOperation != nil && !n.serviceOperation.completed {
++				continue
++			}
 +			c.closeGrant(n.service)
 +			n.service.pending--
++			n.service.networkCleanupRefs--
 +		}
 +		n.released = true
 +		c.operations -= profileNetworkBootstrapPending
@@ -32829,7 +32899,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux_test.go b/common/yoni
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux_test.go
-@@ -0,0 +1,1833 @@
+@@ -0,0 +1,1836 @@
 +//go:build linux
 +
 +package nativehooks
@@ -33098,12 +33168,15 @@ new file mode 100644
 +	f.c.networkBootstraps[0], f.c.networkBootstrapUsed = n, 1
 +	f.c.operations += profileNetworkBootstrapPending
 +	f.c.buffered += profileNetworkBootstrapCredit
-+	g, op, err := f.c.probe(child, 2, frontier.endpoint, frontier.subject, 0)
++	g, op, err := f.c.networkProbe(child, frontier.endpoint, frontier.subject, 0)
 +	if err != nil {
 +		t.Fatal(err)
 +	}
 +	// Детерминированный interleaving: Probe уже вернулся, custody ещё не передана.
 +	cancel()
++	if f.c.tick() != nil || g.networkCleanupRefs != 1 || g.cancelSent {
++		t.Fatal("service wire close before constructor handoff")
++	}
 +	if err = f.c.networkBootstrapTick(); err != nil {
 +		t.Fatal(err)
 +	}
@@ -33117,7 +33190,7 @@ new file mode 100644
 +	if err = f.c.networkBootstrapTick(); err != nil {
 +		t.Fatal(err)
 +	}
-+	if !n.released || g.pending != 0 {
++	if !n.released || g.pending != 0 || g.networkCleanupRefs != 0 {
 +		t.Fatal("grant reference утекла после handoff", n.released, g.pending)
 +	}
 +	if err = f.c.tick(); err != nil {
@@ -38914,7 +38987,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_linux_test.go b/common/yonikb
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux_test.go
-@@ -0,0 +1,3095 @@
+@@ -0,0 +1,3244 @@
 +//go:build linux
 +
 +package nativehooks
@@ -39850,7 +39923,7 @@ new file mode 100644
 +					t.Fatal("close/join ownership")
 +				}
 +				for step := 0; step < 5; step++ {
-+					if h.f.c.dnsTick() != nil {
++					if h.f.c.tick() != nil {
 +						t.Fatal("retirement tick")
 +					}
 +					op := owner.requests[owner.used-1]
@@ -39876,7 +39949,7 @@ new file mode 100644
 +						}
 +					}
 +				}
-+				if h.f.c.dnsTick() != nil || !owner.released || h.f.c.dnsTick() != nil || h.n.context.closeSequence == 0 {
++				if h.f.c.tick() != nil || !owner.released || h.f.c.tick() != nil || h.n.context.closeSequence == 0 {
 +					t.Fatal("context before resource retirement")
 +				}
 +				body := make([]byte, 32)
@@ -39884,11 +39957,120 @@ new file mode 100644
 +				body[2] = 1
 +				be.PutUint64(body[8:], 1100)
 +				be.PutUint64(body[16:], h.f.c.lastSent)
-+				if h.f.c.accept(profilePacket{kind: 48, reply: h.n.context.closeSequence, body: body}) != nil || h.f.c.dnsTick() != nil || h.f.c.dnsTick() != nil || !h.n.released || h.f.c.operations != 0 || h.f.c.dnsFDUsed != profileRXFD {
++				if h.f.c.accept(profilePacket{kind: 48, reply: h.n.context.closeSequence, body: body}) != nil || h.f.c.tick() != nil || h.f.c.tick() != nil || !h.n.released || h.f.c.operations != 0 || h.f.c.dnsFDUsed != profileRXFD {
 +					t.Fatal("credit/ref release")
 +				}
 +			})
 +		}
++	}
++}
++func TestProfileR79NetworkServiceWireCloseWaitsResource(t *testing.T) {
++	h := networkTransportStart(t, 1, false, nil, nil)
++	h.ready(t)
++	<-h.done
++	if h.f.c.tick() != nil {
++		t.Fatal("tick")
++	}
++	for _, packet := range h.f.writes {
++		if packet.kind == 32 && packet.body[0] == 3 && u64(packet.body, 4) == h.n.service.id {
++			t.Fatal("service Close before Resource/context cleanup")
++		}
++	}
++}
++func TestProfileR80LateNetworkRefreshKeepsCleanupOwner(t *testing.T) {
++	for _, waiter := range []bool{false, true} {
++		for _, tomb := range []bool{false, true} {
++			t.Run(strconv.FormatBool(waiter)+strconv.FormatBool(tomb), func(t *testing.T) {
++				h, numeric := networkNumericStart(t, 1)
++				if h.f.c.dispatch(numeric) != nil || h.f.c.accept(networkNumericGrant(numeric)) != nil || <-h.done != nil {
++					t.Fatal("Numeric")
++				}
++				g := h.n.service
++				if waiter {
++					g = h.n.waiter.service
++				}
++				op, err := h.f.c.refreshServiceLocked(g)
++				if err != nil || h.f.c.dispatch(op) != nil {
++					t.Fatal("refresh", err)
++				}
++				reply := serviceReply(h.f, op)
++				if waiter {
++					h.f.c.networkWaiterClose(h.n.waiter)
++				} else {
++					h.f.c.networkBootstrapClose(h.n)
++				}
++				if tomb && h.f.c.tick() != nil {
++					t.Fatal("tomb tick")
++				}
++				if h.f.c.accept(reply) != nil || h.f.c.tick() != nil {
++					t.Fatal("late reply")
++				}
++				for _, packet := range h.f.writes {
++					if packet.kind == 32 && packet.body[0] == 3 && u64(packet.body, 4) == g.id {
++						t.Fatal("late refresh bypassed cleanup owner")
++					}
++				}
++			})
++		}
++	}
++}
++func TestProfileR80RefreshIdentityAndPrecredit(t *testing.T) {
++	h, numeric := networkNumericStart(t, 1)
++	if h.f.c.dispatch(numeric) != nil || h.f.c.accept(networkNumericGrant(numeric)) != nil || <-h.done != nil {
++		t.Fatal("Numeric")
++	}
++	c, g := h.f.c, h.n.service
++	before, operations := c.buffered, c.operations
++	c.buffered = uint64(c.manifest.caps[4]) - c.manifest.memoryCredit - 31
++	if _, err := c.refreshServiceLocked(g); err == nil || c.operations != operations || g.refresh != nil {
++		t.Fatal("unpaid late owner")
++	}
++	c.buffered = before
++	op, err := c.refreshServiceLocked(g)
++	if err != nil || c.buffered != before+32 || c.dispatch(op) != nil {
++		t.Fatal("owner precredit", err)
++	}
++	reply := serviceReply(h.f, op)
++	be.PutUint64(reply.body[4:], h.n.waiter.service.id)
++	reply.object = h.n.waiter.service.id
++	c.networkBootstrapClose(h.n)
++	if c.accept(reply) == nil {
++		t.Fatal("cross-grant refresh ID accepted")
++	}
++	for _, packet := range h.f.writes {
++		if packet.kind == 32 && packet.body[0] == 3 {
++			t.Fatal("foreign ID cleanup substituted")
++		}
++	}
++}
++func TestProfileR79NetworkCloseErrorRetainsServiceRef(t *testing.T) {
++	h := networkTransportStart(t, 1, false, nil, nil)
++	h.conn.closeError = errors.New("uncertain consuming close")
++	h.ready(t)
++	if <-h.done == nil {
++		t.Fatal("close error hidden")
++	}
++	for i := 0; i < 3; i++ {
++		if h.f.c.tick() != nil || h.n.service.cancelSent || h.n.service.networkCleanupRefs != 1 || h.n.released || !h.n.transport.unknown || h.conn.closes != 1 {
++			t.Fatal("Unknown released service/ retried close")
++		}
++	}
++}
++func TestProfileR79WaiterPermissionAndContextHoldServiceWireClose(t *testing.T) {
++	h, op := networkNumericStart(t, 1)
++	if h.f.c.dispatch(op) != nil || h.f.c.accept(networkNumericGrant(op)) != nil || <-h.done != nil {
++		t.Fatal("Numeric")
++	}
++	w := h.n.waiter
++	h.f.c.networkWaiterClose(w)
++	for i := 0; i < 3; i++ {
++		if h.f.c.tick() != nil || w.service.cancelSent || w.service.networkCleanupRefs != 1 || w.released || h.n.service.cancelSent {
++			t.Fatal("waiter Close32 bypassed permission/context retirement")
++		}
++	}
++	w.unknown = true
++	if h.f.c.tick() != nil || w.service.cancelSent || w.service.networkCleanupRefs != 1 || h.n.service.networkCleanupRefs != 1 {
++		t.Fatal("Unknown lost sibling/producer custody")
 +	}
 +}
 +
@@ -40770,6 +40952,14 @@ new file mode 100644
 +}
 +
 +func TestProfileNetworkNumericRetiresBeforeProducerAndContexts(t *testing.T) {
++	profileR80NetworkRetirement(t, "")
++}
++func TestProfileR80LateRefreshRetirementSendsExactlyOneClose(t *testing.T) {
++	for _, branch := range []string{"active", "tomb"} {
++		t.Run(branch, func(t *testing.T) { profileR80NetworkRetirement(t, branch) })
++	}
++}
++func profileR80NetworkRetirement(t *testing.T, branch string) {
 +	h, op := networkNumericStart(t, 1)
 +	w := h.n.waiter
 +	b := &w.state
@@ -40786,12 +40976,33 @@ new file mode 100644
 +	if conn.Close() != nil {
 +		t.Fatal("Close")
 +	}
++	var replies []profilePacket
++	if branch != "" {
++		for _, service := range []*profileGrant{h.n.service, w.service} {
++			refresh, err := h.f.c.refreshServiceLocked(service)
++			if err != nil || h.f.c.dispatch(refresh) != nil {
++				t.Fatal("refresh", err)
++			}
++			replies = append(replies, serviceReply(h.f, refresh))
++		}
++	}
 +	h.f.c.networkWaiterClose(w)
-+	if h.f.c.dnsTick() != nil {
++	if branch != "" {
++		h.f.c.networkBootstrapClose(h.n)
++		if branch == "tomb" && h.f.c.tick() != nil {
++			t.Fatal("tomb tick")
++		}
++		for _, reply := range replies {
++			if h.f.c.accept(reply) != nil {
++				t.Fatal("late refresh")
++			}
++		}
++	}
++	if h.f.c.tick() != nil {
 +		t.Fatal("tick")
 +	}
 +	<-b.conn.done
-+	if h.f.c.dnsTick() != nil || b.grantClose == 0 || h.n.result.cleanupSequence != 0 || h.n.context.closeSequence != 0 || h.n.transport.localDone {
++	if h.f.c.tick() != nil || b.grantClose == 0 || h.n.result.cleanupSequence != 0 || h.n.context.closeSequence != 0 || h.n.transport.localDone {
 +		t.Fatal("producer retired before permission")
 +	}
 +	grant := make([]byte, 12)
@@ -40811,23 +41022,23 @@ new file mode 100644
 +			t.Fatal("retirement ACK", id)
 +		}
 +	}
-+	if h.f.c.dnsTick() != nil {
++	if h.f.c.tick() != nil {
 +		t.Fatal("waiter")
 +	}
 +	ack(b.waiterClose, 1402)
-+	if h.f.c.dnsTick() != nil {
++	if h.f.c.tick() != nil {
 +		t.Fatal("reservation")
 +	}
 +	ack(b.reserveClose, 1401)
-+	if h.f.c.dnsTick() != nil || b.context.closeSequence == 0 || h.n.context.closeSequence != 0 || h.n.result.cleanupSequence != 0 {
++	if h.f.c.tick() != nil || b.context.closeSequence == 0 || h.n.context.closeSequence != 0 || h.n.result.cleanupSequence != 0 {
 +		t.Fatal("waiter context barrier")
 +	}
 +	ack(b.context.closeSequence, 1400)
-+	if h.f.c.dnsTick() != nil || h.f.c.dnsTick() != nil || !w.released || !h.n.closed || h.n.result.cleanupSequence == 0 || h.n.result.cleanupTarget != 5 || h.n.context.closeSequence != 0 {
++	if h.f.c.tick() != nil || h.f.c.tick() != nil || !w.released || !h.n.closed || h.n.result.cleanupSequence == 0 || h.n.result.cleanupTarget != 5 || h.n.context.closeSequence != 0 {
 +		t.Fatal("Producer/context order")
 +	}
 +	ack(h.n.result.cleanupSequence, 1300)
-+	if h.f.c.dnsTick() != nil || !h.n.result.released || h.n.context.closeSequence != 0 {
++	if h.f.c.tick() != nil || !h.n.result.released || h.n.context.closeSequence != 0 {
 +		t.Fatal("DATA barrier")
 +	}
 +	owner := h.n.transport
@@ -40836,7 +41047,7 @@ new file mode 100644
 +		t.Fatal("consuming close/join")
 +	}
 +	for step := 0; step < 5; step++ {
-+		if h.f.c.dnsTick() != nil {
++		if h.f.c.tick() != nil {
 +			t.Fatal("transport retirement")
 +		}
 +		op := owner.requests[owner.used-1]
@@ -40855,15 +41066,26 @@ new file mode 100644
 +			ack(op.sequence, want)
 +		}
 +	}
-+	if h.f.c.dnsTick() != nil || !owner.released || h.f.c.dnsTick() != nil || h.n.context.closeSequence == 0 {
++	if h.f.c.tick() != nil || !owner.released || h.f.c.tick() != nil || h.n.context.closeSequence == 0 {
 +		t.Fatal("producer context before transport retirement")
 +	}
 +	ack(h.n.context.closeSequence, 1100)
-+	if h.f.c.dnsTick() != nil || h.f.c.dnsTick() != nil || !h.n.released || h.f.c.operations != 0 || h.f.c.dnsFDUsed != profileRXFD {
++	if h.f.c.tick() != nil || h.f.c.tick() != nil || !h.n.released || h.f.c.operations != 0 || h.f.c.dnsFDUsed != profileRXFD {
 +		t.Fatal("final credit/reference release")
 +	}
-+	if h.f.c.dnsTick() != nil || h.f.c.operations != 0 {
++	if h.f.c.tick() != nil || h.f.c.operations != 0 {
 +		t.Fatal("double release")
++	}
++	for _, service := range []*profileGrant{h.n.service, w.service} {
++		count := 0
++		for _, packet := range h.f.writes {
++			if packet.kind == 32 && packet.body[0] == 3 && u64(packet.body, 4) == service.id {
++				count++
++			}
++		}
++		if count != 1 {
++			t.Fatal("service Close count", service.id, count)
++		}
 +	}
 +}
 +func TestProfileNetworkNumericOriginalAndPermissionBindingControls(t *testing.T) {

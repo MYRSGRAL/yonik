@@ -12,6 +12,18 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_late_network_refresh_retains_exact_cleanup_owner(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "entry.networkLate, entry.networkLateID = op.networkLate, op.object",
+            "op.networkLate = nil // prepaid ownership",
+            "id != t.networkLateID || g.id != id",
+            "c.clearTomb(i)",
+            "TestProfileR80LateRefreshRetirementSendsExactlyOneClose",
+            "TestProfileR80RefreshIdentityAndPrecredit",
+        ):
+            self.assertIn(anchor, patch)
+
     def test_source_capability_is_context_ack_bound_not_setup_authority(self) -> None:
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         self.assertNotIn("dns4CaptureReviewed", patch)
@@ -38,7 +50,7 @@ class FullProfilePatchTests(unittest.TestCase):
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         for anchor in (
             "profileAcquireNetworkWaiter(n)",
-            "c.probe(w.ctx, 2, f.endpoint, f.subject, n.resolver)",
+            "c.networkProbe(w.ctx, f.endpoint, f.subject, n.resolver)",
             "w.state.permission = &profileBootstrapPhysicalPermission{network: w",
             "c.networkWaiterRequest(w, 53, 54, body)",
             "c.networkWaiterRequest(w, 42, 19, body)",
@@ -62,7 +74,7 @@ class FullProfilePatchTests(unittest.TestCase):
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         for anchor in (
             "return profilePrepareNetworkBootstrap(ctx, root)",
-            "c.probe(n.ctx, 2, f.endpoint, f.subject, n.resolver)",
+            "c.networkProbe(n.ctx, f.endpoint, f.subject, n.resolver)",
             "op.fixedDeadline = n.deadline",
             "c.networkBootstrapDispatch(op)",
             "c.networkBootstrapAccept(f)",
