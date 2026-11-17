@@ -12,6 +12,7 @@ import (
 	xnet "github.com/xtls/xray-core/common/net"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -100,7 +101,9 @@ func TestPureStatefulHostsStdioBridge(t *testing.T) {
 	}
 	pipe.launch = r
 	snapshot := decode(init.Snapshot)
-	now := time.Now()
+	// Epoch в будущем исключает wallclock expiry context timer при fake clock.
+	// Все authority leases и Known20ms по-прежнему проверяет control.clock.
+	now := time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
 	admission, e := admitProfile(r, decode(init.Config), pipe, func(m *profileCapsule) error {
 		asset := snapshotAsset(snapshot)
 		row := m.rows[10][0]
@@ -115,6 +118,9 @@ func TestPureStatefulHostsStdioBridge(t *testing.T) {
 	}
 	pipe.rx = 1
 	f := newFlowFixture(t, r.mode)
+	f.now = now
+	f.c.sessionDeadline = now.Add(time.Minute)
+	f.p.admission.deadline = now.Add(time.Minute)
 	receipt := f.admittedReceipt(t, "parent.invalid")
 	parent := f.granted(t, receipt)
 	if parent.id != init.User.Grant || receipt.id != init.User.Flow || parent.revision != init.User.Revision || parent.ownerKind != init.User.OwnerKind || parent.ownerID != init.User.OwnerID || parent.ownerDeadline.Sub(f.now) != time.Duration(init.User.KnownNS) && r.mode == 2 {
@@ -166,6 +172,22 @@ func TestPureStatefulHostsStdioBridge(t *testing.T) {
 	kinds := []uint16{}
 	foreign := os.Getenv("YONIK_INTEROP_CASE") == "foreign-member"
 	expired := os.Getenv("YONIK_INTEROP_CASE") == "system-parent-expired"
+	network := strings.HasPrefix(os.Getenv("YONIK_INTEROP_CASE"), "network-")
+	networkBad := os.Getenv("YONIK_INTEROP_CASE") == "network-wrong-question"
+	noPermit := os.Getenv("YONIK_INTEROP_CASE") == "network-no-permit"
+	receiveReply := func(seq uint64) error {
+		response := pipe.packet()
+		pipe.rx++
+		packet, e := r.decodePacket(response, pipe.rx)
+		if e != nil {
+			return e
+		}
+		if profileDNSV2Operation(packet.kind) && !profileDNSV2Envelope(r, response, true, 0, 0, seq) {
+			return errProfile
+		}
+		replies = append(replies, packet)
+		return nil
+	}
 	f.c.write = func(kind uint16, object uint64, body []byte) (uint64, error) {
 		f.sequence++
 		seq := f.sequence
@@ -187,17 +209,11 @@ func TestPureStatefulHostsStdioBridge(t *testing.T) {
 			be.PutUint64(raw[112:], object)
 		}
 		pipe.emit(map[string]any{"packet": hex.EncodeToString(raw)})
-		response := pipe.packet()
-		pipe.rx++
-		packet, e := r.decodePacket(response, pipe.rx)
-		if e != nil {
-			return 0, e
-		}
-		if profileDNSV2Operation(packet.kind) && !profileDNSV2Envelope(r, response, true, 0, 0, seq) {
-			return 0, errProfile
-		}
-		replies = append(replies, packet)
-		return seq, nil
+		return seq, receiveReply(seq)
+	}
+	var dnsLeaf *interopDNSLeaf
+	if network {
+		dnsLeaf = interopNetworkIO(t, f, pipe, networkBad, receiveReply, func() { kinds = append(kinds, 52) })
 	}
 	accept := func() {
 		for len(replies) > 0 {
@@ -267,6 +283,22 @@ func TestPureStatefulHostsStdioBridge(t *testing.T) {
 			f.c.mu.Unlock()
 			close(allowOpen)
 		case op := <-f.p.flowQueue:
+			if network && op.kind == 40 {
+				data := op.dnsResult.owner.data
+				conn := op.dnsResult.owner.networkConn
+				if _, err := conn.Read(make([]byte, 1)); err == nil {
+					t.Fatal("public NETWORK Read enabled")
+				}
+				if _, err := conn.Write([]byte{1}); err == nil {
+					t.Fatal("public NETWORK Write enabled")
+				}
+				if ProfileDNSDataValid(ctx, data) {
+					t.Fatal("NETWORK DATA became USER authority")
+				}
+				if _, _, err := ProfileDNSDataAnswer(ctx, data); err == nil {
+					t.Fatal("NETWORK IP API enabled")
+				}
+			}
 			if op.kind == 42 {
 				frontier, _, err := f.c.hostsParentFrontier(parent)
 				if err != nil {
@@ -282,7 +314,7 @@ func TestPureStatefulHostsStdioBridge(t *testing.T) {
 			}
 			accept()
 		case err := <-done:
-			if (err != nil) != (foreign || expired) {
+			if (err != nil) != (foreign || expired || networkBad || noPermit) {
 				t.Fatal("actual caller", err)
 			}
 			running = false
@@ -291,7 +323,7 @@ func TestPureStatefulHostsStdioBridge(t *testing.T) {
 		}
 	}
 	expected := 1
-	if foreign || expired {
+	if foreign || expired || networkBad || noPermit {
 		expected = 0
 	}
 	if attempts != expected {
@@ -299,17 +331,57 @@ func TestPureStatefulHostsStdioBridge(t *testing.T) {
 	}
 	h := f.c.hostsObservations[0]
 	f.c.mu.Lock()
-	f.c.hostsObservationClose(h)
+	if network {
+		f.c.networkBootstrapClose(f.c.networkBootstraps[0])
+	} else {
+		f.c.hostsObservationClose(h)
+	}
 	f.c.mu.Unlock()
 	// Cleanup ACKs также выдаёт Rust actor, не test-only synthesized replies.
-	for i := 0; i < 16; i++ {
-		if e := f.c.dnsTick(); e != nil {
+	for i := 0; i < 64; i++ {
+		var e error
+		if network {
+			e = f.c.tick()
+		} else {
+			e = f.c.dnsTick()
+		}
+		if e != nil {
 			t.Fatal("cleanup", e)
 		}
 		accept()
 	}
-	if h == nil || !h.released || !h.context.released || !h.bootstrap.context.released || h.unknown || h.context.unknown || f.c.operations != 0 {
+	if network {
+		n := f.c.networkBootstraps[0]
+		if noPermit {
+			if n == nil || !n.unknown || n.released || n.transport == nil || !n.transport.unknown || f.c.operations == 0 {
+				t.Fatal("Deny36 must retain actual consumer Unknown custody")
+			}
+		} else if n == nil || !n.released || n.unknown || f.c.operations != 0 {
+			t.Fatal("NETWORK cleanup custody not KnownClosed")
+		}
+		if dnsLeaf.factories != boolInt(!noPermit) || dnsLeaf.writes != boolInt(!noPermit) || dnsLeaf.closes != boolInt(!noPermit) {
+			t.Fatal("DNS factory/IO/close counts", *dnsLeaf)
+		}
+		if networkBad || noPermit {
+			for _, k := range kinds {
+				if k == 40 || k == 42 {
+					t.Fatal("invalid exchange reached publication/permission")
+				}
+			}
+		}
+	} else if h == nil || !h.released || !h.context.released || !h.bootstrap.context.released || h.unknown || h.context.unknown || f.c.operations != 0 {
 		t.Fatal("cleanup custody not KnownClosed")
 	}
-	pipe.emit(map[string]any{"go_done": true, "attempts": attempts, "kinds": kinds, "cleanup": true, "denied": foreign || expired, "mode": r.mode, "parent_expired": expired, "permission_before_expiry": permissionBeforeExpiry})
+	result := map[string]any{"go_done": true, "attempts": attempts, "kinds": kinds, "cleanup": true, "denied": foreign || expired || networkBad || noPermit, "mode": r.mode, "parent_expired": expired, "permission_before_expiry": permissionBeforeExpiry, "network": network}
+	if network {
+		result["dns_factories"] = dnsLeaf.factories
+		result["dns_writes"] = dnsLeaf.writes
+		result["dns_closes"] = dnsLeaf.closes
+		result["unknown"] = f.c.networkBootstraps[0].unknown
+		result["retained_operations"] = f.c.operations
+		if noPermit {
+			result["cleanup"] = false
+		}
+	}
+	pipe.emit(result)
 }

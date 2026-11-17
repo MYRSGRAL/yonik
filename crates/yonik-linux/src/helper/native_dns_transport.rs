@@ -68,6 +68,11 @@ impl Facts {
         self.cookie = cookie;
         self
     }
+    #[cfg(test)]
+    pub(super) fn with_test_mark(mut self, mark: u32) -> Self {
+        self.mark = mark;
+        self
+    }
     pub(crate) fn local(&self) -> SocketAddr {
         self.local
     }

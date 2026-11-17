@@ -737,6 +737,32 @@ impl BootstrapDnsTranscript for BootstrapBinding {
 pub(super) mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+    pub(in crate::helper::native_profile_channel) fn interop_status(
+        b: &BootstrapBinding,
+        query: u64,
+    ) -> String {
+        let queries = b.queries.lock().unwrap();
+        format!(
+            "invalid={} now={:?} created={:?} until={:?} peer={:?} owner={:?} ids={:?} wanted={query} used={} limit={} requested={}",
+            b.invalid.load(Ordering::Acquire),
+            b.peer.now(),
+            b.created,
+            b.until,
+            b.peer.validate(),
+            b.owner.validate(),
+            queries
+                .iter()
+                .map(|q| (q.id, q.expires))
+                .collect::<Vec<_>>(),
+            b.budget.dynamic.used(),
+            wire::Capsule::decode(b.capsule.bytes(), &b.launch.binding.digest)
+                .unwrap()
+                .buffer_credit()
+                .unwrap()
+                - 128 * 1024,
+            super::super::dns_rrset::SCRATCH + 2048
+        )
+    }
     struct FakePeer {
         record: LaunchRecord,
         image: [u8; 32],
@@ -783,24 +809,25 @@ pub(super) mod tests {
         valid: AtomicBool,
         fail_plan: AtomicBool,
     }
-    pub(in crate::helper::native_profile_channel) fn interop_source(
+    pub(in crate::helper::native_profile_channel) fn interop_binding(
         capsule: Arc<wire::OwnedCapsule>,
         launch: LaunchRecord,
         asset: Vec<u8>,
         reference: wire::SnapshotRef,
         budget: Arc<ChannelBudget>,
-    ) -> Arc<dyn Source> {
+        scopes: &[BootstrapScope],
+        start: Instant,
+    ) -> Arc<BootstrapBinding> {
         let peer = Arc::new(FakePeer {
             record: launch,
             image: [17; 32],
             config: launch.binding.digest,
             producer: Some(crate::helper::registry::fake_bootstrap_image(
-                [17; 32],
-                &[BootstrapScope::Source],
+                [17; 32], scopes,
             )),
             valid: AtomicBool::new(true),
             clock: AtomicU64::new(0),
-            start: Instant::now(),
+            start,
             fds: crate::helper::memory::ByteBudget::new(64),
         });
         let owner = Arc::new(FakeOwner {
@@ -814,8 +841,6 @@ pub(super) mod tests {
         });
         BootstrapBinding::create(peer, owner, capsule, launch, budget)
             .unwrap()
-            .unwrap()
-            .source()
             .unwrap()
     }
     impl SourceOwner for FakeOwner {

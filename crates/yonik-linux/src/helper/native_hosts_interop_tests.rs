@@ -20,7 +20,7 @@ fn hex(b: &[u8]) -> String {
     }
     text
 }
-fn input() -> Result<Vec<u8>, ServiceError> {
+fn input() -> Result<(bool, Vec<u8>), ServiceError> {
     let mut line = String::new();
     std::io::stdin()
         .lock()
@@ -28,26 +28,83 @@ fn input() -> Result<Vec<u8>, ServiceError> {
         .read_line(&mut line)
         .map_err(unavailable)?;
     let value: serde_json::Value = serde_json::from_str(&line).map_err(unavailable)?;
-    let text = value["packet"].as_str().ok_or(ServiceError::Unavailable)?;
+    let physical = value.get("physical").is_some();
+    let text = value[if physical { "physical" } else { "packet" }]
+        .as_str()
+        .ok_or(ServiceError::Unavailable)?;
     if text.len() > 2 * RUNTIME_PACKET
         || text.len() % 2 != 0
         || !text.bytes().all(|b| b.is_ascii_hexdigit())
     {
         return Err(ServiceError::InvalidRequest);
     }
-    (0..text.len())
+    let bytes = (0..text.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(unavailable))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((physical, bytes))
 }
 struct Stdio {
+    diagnostic: Arc<super::super::super::super::bootstrap_binding::BootstrapBinding>,
+    record: LaunchRecord,
+    budget: Arc<super::super::super::super::ChannelBudget>,
+    inbox: RefCell<std::collections::VecDeque<super::super::super::super::dns_transport::Incoming>>,
+    transcript: Option<Arc<dyn super::super::super::super::BootstrapDnsTranscript>>,
+    producer: Option<Arc<super::super::super::super::VerifiedBootstrapDnsProducer>>,
+    closed: Arc<AtomicUsize>,
+    permit: Arc<AtomicBool>,
+    no_permit: bool,
     source: Arc<dyn Source>,
     // recvmsg заменён framed stdin; после read drain обязан видеть пустую очередь.
     before_reply: Cell<bool>,
     slots: Arc<SidebandCredits>,
     credits: RefCell<BTreeMap<u64, super::super::super::super::super::memory::ByteLease>>,
 }
+struct TraceTranscript(
+    Arc<dyn super::super::super::super::BootstrapDnsTranscript>,
+    Arc<super::super::super::super::bootstrap_binding::BootstrapBinding>,
+);
+impl super::super::super::super::BootstrapDnsTranscript for TraceTranscript {
+    fn observed(
+        &self,
+        launch: LaunchRecord,
+        receipt: super::super::super::super::BootstrapDnsReceipt<'_>,
+    ) -> Result<Instant, ServiceError> {
+        eprintln!(
+            "interop binding: {}",
+            super::super::super::super::bootstrap_binding::tests::interop_status(
+                &self.1,
+                receipt.binding.query
+            )
+        );
+        let result = self.0.observed(launch, receipt);
+        eprintln!("interop transcript observed: {result:?}");
+        result
+    }
+}
 impl Channel for Stdio {
+    fn bootstrap_dns_transcript(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dyn super::super::super::super::BootstrapDnsTranscript>>, ServiceError>
+    {
+        Ok(self.transcript.clone().map(|v| {
+            Arc::new(TraceTranscript(v, self.diagnostic.clone()))
+                as Arc<dyn super::super::super::super::BootstrapDnsTranscript>
+        }))
+    }
+    fn bootstrap_dns_producer(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<super::super::super::super::VerifiedBootstrapDnsProducer>>, ServiceError>
+    {
+        Ok(self.producer.clone())
+    }
+    fn take_dns(
+        &self,
+    ) -> Result<Option<super::super::super::super::dns_transport::Incoming>, ServiceError> {
+        Ok(self.inbox.borrow_mut().pop_front())
+    }
     fn bootstrap_source(&self, _: LaunchRecord) -> Result<Option<Arc<dyn Source>>, ServiceError> {
         Ok(Some(self.source.clone()))
     }
@@ -73,7 +130,10 @@ impl Channel for Stdio {
         _: u32,
         out: &mut [u8; RUNTIME_PACKET],
     ) -> Result<Option<usize>, ServiceError> {
-        let b = input()?;
+        let (physical, b) = input()?;
+        if physical {
+            return Err(ServiceError::InvalidRequest);
+        }
         out[..b.len()].copy_from_slice(&b);
         Ok(Some(b.len()))
     }
@@ -92,9 +152,53 @@ impl Channel for Stdio {
             return Ok(None);
         }
         let credit = self.slots.pending.reserve(1).map_err(unavailable)?;
-        let b = input()?;
+        let (physical, b) = input()?;
+        if physical {
+            let raw: [u8; 192] = b.try_into().map_err(|_| ServiceError::InvalidRequest)?;
+            let facts = super::super::super::super::dns_transport::fake_facts(
+                "192.0.2.10:32001".parse().unwrap(),
+                "192.0.2.53:53".parse().unwrap(),
+                17,
+                (4, 5),
+            )
+            .with_test_mark(0);
+            let incoming = super::super::super::super::dns_transport::Incoming::fake(
+                raw,
+                &issuer_tests::dns_neg(self.record),
+                &self.slots,
+                &self.budget.dynamic,
+                None,
+                Arc::new(std::sync::Mutex::new(facts)),
+                Arc::new(AtomicBool::new(true)),
+                self.closed.clone(),
+                || {},
+            )?;
+            self.inbox.borrow_mut().push_back(incoming);
+            self.before_reply.set(true);
+            return Ok(None);
+        }
         if b.len() < 128 {
             return Err(ServiceError::InvalidRequest);
+        }
+        if b[10..12] == 40u16.to_be_bytes() && b.get(265) == Some(&1) {
+            let body = &b[128..];
+            let q = usize::from(u16::from_be_bytes(body[108..110].try_into().unwrap()));
+            let r = usize::from(u16::from_be_bytes(body[110..112].try_into().unwrap()));
+            eprintln!(
+                "interop strict parser: {:?}; dynamic used={}",
+                super::super::super::super::dns_rrset::verify_bootstrap_capture(
+                    &body[144 + q..144 + q + r],
+                    &body[144 + q + r..],
+                    &body[144..144 + q],
+                    1,
+                    9,
+                    1232
+                ),
+                self.budget.dynamic.used()
+            );
+        }
+        if self.no_permit && b[10..12] == 35u16.to_be_bytes() && b.get(130) == Some(&2) {
+            self.permit.store(false, Ordering::Release);
         }
         self.credits.borrow_mut().insert(u64_at(&b, 16), credit);
         out[..b.len()].copy_from_slice(&b);
@@ -107,6 +211,9 @@ impl Channel for Stdio {
         Ok(true)
     }
     fn pause_until(&self, _: Instant) {
+        if !self.inbox.borrow().is_empty() {
+            return;
+        }
         panic!("interop bridge must not wait on OS");
     }
 }
@@ -117,12 +224,19 @@ fn pure_stateful_hosts_stdio_bridge() {
     }
     let digest: [u8; 32] = Sha256::digest(b"{}").into();
     let case = std::env::var("YONIK_INTEROP_CASE").unwrap_or_default();
+    let network = case.starts_with("network-");
     let mode = if case.starts_with("system-") {
         Mode::System
     } else {
         Mode::Local
     };
-    let (mut issuer, f) = fixture_digest(mode, "203.0.113.80".parse().unwrap(), 1, true, digest);
+    let (mut issuer, f) = fixture_digest(
+        mode,
+        "203.0.113.80".parse().unwrap(),
+        if network { 2 } else { 1 },
+        true,
+        digest,
+    );
     // Исходный USER grant id=1 preseeded на Go стороне; его issuer allocator
     // обязан иметь тот же watermark, иначе permission alias-ится с parent.
     issuer.next_grant = 1;
@@ -130,15 +244,36 @@ fn pure_stateful_hosts_stdio_bridge() {
         serde_json::json!({"init":{"launch":hex(&f.launch.encode().unwrap()),"snapshot":hex(&f.asset),"config":"7b7d","path":f.path,"subject":f.subject,
             "user":{"grant":1,"flow":1,"revision":1,"owner_kind":if mode.required(){2}else{0},"owner_id":if mode.required(){77}else{0},"known_ns":if mode.required(){20_000_000}else{0}}}}),
     );
-    let source = super::super::super::super::bootstrap_binding::tests::interop_source(
+    let scopes = if network {
+        vec![
+            crate::helper::registry::BootstrapScope::Source,
+            crate::helper::registry::BootstrapScope::Wire,
+            crate::helper::registry::BootstrapScope::Release,
+        ]
+    } else {
+        vec![crate::helper::registry::BootstrapScope::Source]
+    };
+    let binding = super::super::super::super::bootstrap_binding::tests::interop_binding(
         issuer.capsule.clone(),
         f.launch,
         f.asset.clone(),
         f.reference,
         issuer.budget.clone(),
+        &scopes,
+        issuer.authority.now(),
     );
+    let closed = Arc::new(AtomicUsize::new(0));
     let io = Stdio {
-        source,
+        diagnostic: binding.clone(),
+        source: binding.source().unwrap(),
+        record: f.launch,
+        budget: issuer.budget.clone(),
+        inbox: Default::default(),
+        transcript: binding.transcript(),
+        producer: binding.release(),
+        closed: closed.clone(),
+        permit: issuer.authority.bootstrap_permit_live.clone(),
+        no_permit: case == "network-no-permit",
         before_reply: Cell::new(false),
         slots: SidebandCredits::new(),
         credits: Default::default(),
@@ -152,18 +287,29 @@ fn pure_stateful_hosts_stdio_bridge() {
         &AtomicBool::new(false),
     );
     assert_eq!(issuer.authority.owner_count, 0);
-    let expected =
-        u64::from(std::env::var("YONIK_INTEROP_CASE").as_deref() != Ok("foreign-member"));
+    let expected = if network {
+        if case == "network-positive" { 5 } else { 2 }
+    } else {
+        u64::from(case != "foreign-member")
+    };
     assert_eq!(
         issuer.authority.route_count, expected,
         "ровно один durable physical attempt"
     );
-    assert!(
-        issuer.authority.live.is_empty(),
-        "route custody должна быть retired"
-    );
-    assert_eq!(issuer.authority.release_attempts, expected as usize);
+    if !network {
+        assert!(
+            issuer.authority.live.is_empty(),
+            "route custody должна быть retired"
+        );
+        assert_eq!(issuer.authority.release_attempts, expected as usize);
+    }
+    if !issuer.unknown {
+        assert_eq!(
+            closed.load(Ordering::Acquire),
+            usize::from(network && case != "network-no-permit")
+        );
+    }
     emit(
-        serde_json::json!({"rust_done":true,"routes":issuer.authority.route_count,"owners":issuer.authority.owner_count}),
+        serde_json::json!({"rust_done":true,"routes":issuer.authority.route_count,"owners":issuer.authority.owner_count,"retained_routes":issuer.authority.live,"release_attempts":issuer.authority.release_attempts,"contexts":issuer.dns.count(),"services":issuer.services.keys().copied().collect::<Vec<_>>(),"unknown":issuer.unknown,"receiver_consumed_closes":closed.load(Ordering::Acquire)}),
     );
 }

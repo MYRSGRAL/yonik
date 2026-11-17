@@ -107,11 +107,16 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                         trace.append({"side": side, "test_output": text})
                         continue
                     value = json.loads(text)
-                    if "packet" in value:
-                        packet = bytes.fromhex(value["packet"])
+                    if "packet" in value or "physical" in value:
+                        field = "physical" if "physical" in value else "packet"
+                        packet = bytes.fromhex(value[field])
                         if len(packet) > 65536:
                             raise ValueError("oversized packet")
-                        trace.append({"side": side, "packet": packet.hex()})
+                        if field == "physical" and (
+                            len(packet) != 192 or packet[:8] != b"DNSPHY02"
+                        ):
+                            raise ValueError("invalid virtual PhysicalBind")
+                        trace.append({"side": side, field: packet.hex()})
                     elif "init" in value:
                         if case.startswith("system-"):
                             launch = bytes.fromhex(value["init"]["launch"])
@@ -133,14 +138,33 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
         }
         if any(codes.values()) or not all(s in done for s in children):
             raise AssertionError(f"counterpart failed: {codes}; trace={trace[-12:]}")
-        expected = int(case in ("positive", "system-positive"))
-        expected_routes = int(case != "foreign-member")
+        network = case.startswith("network-")
+        expected = int(case in ("positive", "system-positive", "network-positive"))
+        expected_routes = (
+            (5 if case == "network-positive" else 2)
+            if network
+            else int(case != "foreign-member")
+        )
+        prefix = (
+            [20, 55, 35, 35, 52, 38, 40, 20, 55, 35, 53, 42]
+            if case == "network-positive"
+            else [20, 55, 35, 35]
+            if network
+            else [55, 35, 40, 55, 35, 53, 42]
+        )
         go_result, rust_result = done["go"], done["rust"]
         if (
             not go_result.get("go_done")
-            or not go_result.get("cleanup")
+            or (
+                not go_result.get("cleanup")
+                and not (
+                    case == "network-no-permit"
+                    and go_result.get("unknown")
+                    and go_result.get("retained_operations", 0) > 0
+                )
+            )
             or go_result.get("attempts") != expected
-            or go_result.get("kinds", [])[:7] != [55, 35, 40, 55, 35, 53, 42]
+            or go_result.get("kinds", [])[: len(prefix)] != prefix
             or not rust_result.get("rust_done")
             or rust_result.get("routes") != expected_routes
             or rust_result.get("owners") != 0
@@ -153,6 +177,8 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
             )
         ):
             raise AssertionError(f"incomplete actor roundtrip: {done}")
+        if network and go_result.get("cleanup") and rust_result.get("retained_routes"):
+            raise AssertionError(f"counterpart route custody mismatch: {done}")
         return {
             "classification": "PURE_STATEFUL_INTEROP",
             "case": case,
@@ -161,6 +187,9 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
             "results": done,
             "trace": trace,
         }
+    except Exception as error:
+        error.interop_trace = trace
+        raise
     finally:
         selector.close()
         for child in children.values():
@@ -190,6 +219,9 @@ def main() -> None:
             "foreign-member",
             "system-positive",
             "system-parent-expired",
+            "network-positive",
+            "network-wrong-question",
+            "network-no-permit",
         ),
         default="positive",
     )
@@ -211,6 +243,7 @@ def main() -> None:
                     "classification": "PURE_STATEFUL_INTEROP",
                     "pass": False,
                     "error": str(error),
+                    "trace": getattr(error, "interop_trace", []),
                 },
                 indent=2,
             )
