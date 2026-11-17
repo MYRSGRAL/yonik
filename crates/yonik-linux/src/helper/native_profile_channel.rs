@@ -13,6 +13,8 @@ use std::{
 const RUNTIME_PACKET: usize = 128 + 33679 + 1;
 // Постоянный RX metadata reserve сохраняется; payload очереди оплачивается по длине.
 const RX_BYTES: usize = 256 * 1024;
+#[path = "native_bootstrap_binding.rs"]
+mod bootstrap_binding;
 #[path = "native_dns_bundle.rs"]
 mod dns_bundle;
 #[path = "native_dns_rrset.rs"]
@@ -1206,10 +1208,17 @@ pub(super) struct VerifiedDnsProducer {
 pub(super) struct VerifiedBootstrapDnsProducer {
     launch: LaunchRecord,
     schema: [u8; 32],
+    proof: BootstrapReleaseProof,
+}
+enum BootstrapReleaseProof {
+    Installed(Arc<bootstrap_binding::BootstrapBinding>),
+    #[cfg(test)]
+    Injected,
 }
 /// Отдельный trusted capture endpoint; consuming-close token его не создаёт.
 /// Production provider отсутствует до reviewed CODEC4 image/launch/source scope.
 struct BootstrapDnsReceipt<'a> {
+    lifetime_anchor: Instant,
     binding: dns_transport::Binding,
     proof: u64,
     revision: u64,
@@ -1232,6 +1241,13 @@ impl VerifiedBootstrapDnsProducer {
             || self.schema != <[u8; 32]>::from(Sha256::digest(wire::dns_v2::SCHEMA))
         {
             return Err(ServiceError::Unsupported);
+        }
+        match &self.proof {
+            BootstrapReleaseProof::Installed(binding) => {
+                binding.check(super::registry::BootstrapScope::Release, launch)?
+            }
+            #[cfg(test)]
+            BootstrapReleaseProof::Injected => {}
         }
         Ok(())
     }
@@ -2956,6 +2972,7 @@ impl ProfileRuntime {
             None,
             Arc::clone(&prepared.capsule),
             Arc::clone(&issuer.budget),
+            bootstrap_binding::Sources::Local(Arc::clone(&prepared)),
         )?;
         let task = std::thread::Builder::new()
             .name("yonik-profile-local".into())
@@ -3117,6 +3134,12 @@ impl ProfileRuntime {
                         Some(owner),
                         Arc::clone(&capsule),
                         budget,
+                        bootstrap_binding::Sources::System(Arc::clone(
+                            resources
+                                .payload
+                                .full_profile()
+                                .ok_or(ServiceError::Unsupported)?,
+                        )),
                     )?);
                     resources
                         .proof_channel
@@ -3864,6 +3887,7 @@ struct DeliveryCredit {
     _slot: super::memory::ByteLease,
 }
 struct SystemChannel {
+    bootstrap: Option<Arc<bootstrap_binding::BootstrapBinding>>,
     capsule: Arc<wire::OwnedCapsule>,
     budget: Arc<ChannelBudget>,
     runtime: tokio::net::UnixDatagram,
@@ -3937,7 +3961,15 @@ impl SystemChannel {
         owner: Option<Arc<OwnerEndpoint>>,
         capsule: Arc<wire::OwnedCapsule>,
         budget: Arc<ChannelBudget>,
+        sources: bootstrap_binding::Sources,
     ) -> Result<Self, ServiceError> {
+        let bootstrap = bootstrap_binding::BootstrapBinding::prepare(
+            Arc::clone(&peer),
+            sources,
+            Arc::clone(&capsule),
+            launch,
+            Arc::clone(&budget),
+        )?;
         if version != producer.setup(launch)?.2 {
             return Err(ServiceError::Unsupported);
         }
@@ -3986,6 +4018,7 @@ impl SystemChannel {
             )
         };
         Ok(Self {
+            bootstrap,
             runtime,
             capsule,
             budget,
@@ -4313,6 +4346,45 @@ impl SystemChannel {
     }
 }
 impl Channel for SystemChannel {
+    fn bootstrap_source(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<Option<Arc<dyn dns_bundle::roots::Source>>, ServiceError> {
+        let Some(binding) = &self.bootstrap else {
+            return Ok(None);
+        };
+        let view = binding.source();
+        if view.is_some() {
+            binding.check(super::registry::BootstrapScope::Source, record)?;
+        }
+        Ok(view)
+    }
+    fn bootstrap_dns_transcript(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<Option<Arc<dyn BootstrapDnsTranscript>>, ServiceError> {
+        let Some(binding) = &self.bootstrap else {
+            return Ok(None);
+        };
+        let view = binding.transcript();
+        if view.is_some() {
+            binding.check(super::registry::BootstrapScope::Wire, record)?;
+        }
+        Ok(view)
+    }
+    fn bootstrap_dns_producer(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<Option<Arc<VerifiedBootstrapDnsProducer>>, ServiceError> {
+        let Some(binding) = &self.bootstrap else {
+            return Ok(None);
+        };
+        let view = binding.release();
+        if view.is_some() {
+            binding.check(super::registry::BootstrapScope::Release, record)?;
+        }
+        Ok(view)
+    }
     fn dns_wire_producer(
         &self,
         record: LaunchRecord,

@@ -138,7 +138,50 @@ impl Source for Facts {
 fn fixture(mode: Mode) -> (Issuer<Fake>, Arc<Facts>) {
     fixture_address(mode, "203.0.113.80".parse().unwrap())
 }
+pub(in crate::helper::native_profile_channel) type BindingFixture = (
+    Arc<wire::OwnedCapsule>,
+    LaunchRecord,
+    Vec<u8>,
+    wire::SnapshotRef,
+    Vec<(u16, u8)>,
+    u16,
+    Arc<super::super::super::ChannelBudget>,
+    wire::dns_v2::Root,
+);
+pub(in crate::helper::native_profile_channel) fn binding_fixture(
+    mode: Mode,
+    order: u8,
+) -> BindingFixture {
+    let (issuer, f) = fixture_shape(mode, "203.0.113.80".parse().unwrap(), order, true);
+    let a = acquire(&f, false, 1, 9);
+    let wire::dns_v2::Record::BundleAcquire(v) =
+        wire::dns_v2::Record::decode(wire::dns_v2::Operation::BundleAcquire, &a).unwrap()
+    else {
+        unreachable!()
+    };
+    (
+        issuer.capsule.clone(),
+        f.launch,
+        f.asset.clone(),
+        f.reference,
+        f.path.clone(),
+        f.endpoint,
+        issuer.budget.clone(),
+        v.root().unwrap(),
+    )
+}
 fn fixture_address(mode: Mode, address: std::net::IpAddr) -> (Issuer<Fake>, Arc<Facts>) {
+    fixture_order(mode, address, 1)
+}
+fn fixture_order(mode: Mode, address: std::net::IpAddr, order: u8) -> (Issuer<Fake>, Arc<Facts>) {
+    fixture_shape(mode, address, order, false)
+}
+fn fixture_shape(
+    mode: Mode,
+    address: std::net::IpAddr,
+    order: u8,
+    raw: bool,
+) -> (Issuer<Fake>, Arc<Facts>) {
     use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent, VerifiedSystemResolver};
     struct Snapshot;
     impl VerifiedSystemResolver for Snapshot {
@@ -149,7 +192,10 @@ fn fixture_address(mode: Mode, address: std::net::IpAddr) -> (Issuer<Fake>, Arc<
             vec!["192.0.2.53:53".parse().unwrap()]
         }
     }
-    let graph = serde_json::json!({"outbounds":[{"tag":"a","protocol":"shadowsocks","settings":{"servers":[{"address":"remote.invalid","port":8388,"method":"aes-128-gcm","password":"fixture"}]},"proxySettings":{"tag":"b","transportLayer":true}},{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":"physical.invalid","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]});
+    let mut graph = serde_json::json!({"outbounds":[{"tag":"a","protocol":"shadowsocks","settings":{"servers":[{"address":"remote.invalid","port":8388,"method":"aes-128-gcm","password":"fixture"}]},"proxySettings":{"tag":"b","transportLayer":true}},{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":"physical.invalid","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]});
+    if raw {
+        graph["outbounds"].as_array_mut().unwrap().remove(0);
+    }
     let intent =
         ProfileIntent::decode(&serde_json::json!({"version":1,"graph":graph}).to_string()).unwrap();
     let mut plan = OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap())
@@ -175,7 +221,7 @@ fn fixture_address(mode: Mode, address: std::net::IpAddr) -> (Issuer<Fake>, Arc<
         nss_hash: [1; 32],
         hosts_hash: [2; 32],
         resolv_hash: [3; 32],
-        order: 1,
+        order,
         ndots: 1,
         attempts: 2,
         timeout_ms: 5000,
@@ -474,6 +520,7 @@ fn codec4_roots_driver_actual_service_probe_then_network_roles_keep_dual_carrier
         io.source = Some(f.clone());
         io.bootstrap_producer = Some(Arc::new(
             super::super::super::VerifiedBootstrapDnsProducer {
+                proof: super::super::super::BootstrapReleaseProof::Injected,
                 launch: f.launch,
                 schema: Sha256::digest(wire::dns_v2::SCHEMA).into(),
             },
@@ -2173,6 +2220,7 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
     } else {
         Some(Arc::new(
             super::super::super::VerifiedBootstrapDnsProducer {
+                proof: super::super::super::BootstrapReleaseProof::Injected,
                 launch,
                 schema: if fault == BootstrapTransportFault::Schema3 {
                     [3; 32]

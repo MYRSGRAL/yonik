@@ -57,6 +57,11 @@ pub(crate) struct Prepared {
     _storage: crate::resource_fd_receiver::Reservation,
 }
 impl Prepared {
+    pub(crate) fn resolver_snapshot(
+        &self,
+    ) -> Option<&crate::helper::profile_intent::PinnedResolverSnapshot> {
+        self.sources.snapshot()
+    }
     pub(crate) fn prepare(
         intent: ProfileIntent,
         plan: OwnedRuntimePlan,

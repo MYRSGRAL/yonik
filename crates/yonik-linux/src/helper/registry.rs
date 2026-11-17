@@ -84,6 +84,12 @@ struct ProducerRecord {
     dns_release: Option<DnsReleaseRecord>,
     #[serde(default)]
     dns_wire: Option<DnsReleaseRecord>,
+    #[serde(default)]
+    bootstrap_source: Option<DnsReleaseRecord>,
+    #[serde(default)]
+    bootstrap_dns_wire: Option<DnsReleaseRecord>,
+    #[serde(default)]
+    bootstrap_dns_release: Option<DnsReleaseRecord>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +110,116 @@ const DNS_WIRE_REVIEWED_PATCH: Option<&str> =
 const PRODUCER_PATCH: &str = "6e6abdbdcedae5b7c4548e9225ae4f8531a4489b8788141a2b6b4cf64a083c7e";
 // Отдельный review для CODEC4 отсутствует; Direct3 pin его не заменяет.
 const DNS_CODEC4_REVIEWED_PATCH: Option<&str> = None;
+const BOOTSTRAP_BUILD_REVIEWED_PATCH: Option<&str> = None;
+const BOOTSTRAP_SOURCE_REVIEWED_PATCH: Option<&str> = None;
+const BOOTSTRAP_DNS_WIRE_REVIEWED_PATCH: Option<&str> = None;
+const BOOTSTRAP_DNS_RELEASE_REVIEWED_PATCH: Option<&str> = None;
+const UDP_ADDITIONAL_REVIEWED_PATCH: Option<&str> = None;
+const BOOTSTRAP_REVIEWED_PATCHES: [Option<&str>; 3] = [
+    BOOTSTRAP_SOURCE_REVIEWED_PATCH,
+    BOOTSTRAP_DNS_WIRE_REVIEWED_PATCH,
+    BOOTSTRAP_DNS_RELEASE_REVIEWED_PATCH,
+];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BootstrapScope {
+    Source,
+    Wire,
+    Release,
+}
+impl BootstrapScope {
+    fn index(self) -> usize {
+        match self {
+            Self::Source => 0,
+            Self::Wire => 1,
+            Self::Release => 2,
+        }
+    }
+    pub(crate) fn contract(self) -> &'static str {
+        match self {
+            Self::Source => "captured-netgo-bootstrap-parent-member-v1",
+            Self::Wire => "bootstrap-direct-dns-bound-request-response-v1",
+            Self::Release => "bootstrap-direct-dns-consuming-close-join-v1",
+        }
+    }
+}
+#[derive(Clone)]
+struct BootstrapProvenance {
+    scope: BootstrapScope,
+    schema: [u8; 32],
+    version: u32,
+    contract: [u8; 32],
+    patch: [u8; 32],
+    reviewed: Option<[u8; 32]>,
+}
+impl BootstrapProvenance {
+    fn decode(
+        r: &DnsReleaseRecord,
+        scope: BootstrapScope,
+        patch: &str,
+        review: Option<&str>,
+    ) -> Result<Self, RegistryError> {
+        use sha2::Digest;
+        let contract: [u8; 32] =
+            sha2::Sha256::digest(format!("{}\0", scope.contract()).as_bytes()).into();
+        let schema = DnsSchema::Codec4.digest();
+        let canonical = |s: &str| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if r.contract != scope.contract()
+            || r.version != 1
+            || Sha256::from_str(&r.contract_sha256).map(|v| v.0) != Ok(contract)
+            || !canonical(&r.contract_sha256)
+            || !canonical(&r.schema_sha256)
+            || Sha256::from_str(&r.schema_sha256).map(|v| v.0) != Ok(schema)
+        {
+            return Err(RegistryError::Version);
+        }
+        let patch = Sha256::from_str(patch)
+            .map_err(|_| RegistryError::Manifest)?
+            .0;
+        let reviewed = review
+            .and_then(|s| Sha256::from_str(s).ok())
+            .map(|v| v.0)
+            .filter(|p| *p == patch);
+        Ok(Self {
+            scope,
+            schema,
+            version: 1,
+            contract,
+            patch,
+            reviewed,
+        })
+    }
+}
+#[derive(Clone)]
+pub(crate) struct BootstrapCapability {
+    image: [u8; 32],
+    proof: BootstrapProvenance,
+}
+impl BootstrapCapability {
+    pub(crate) fn check(
+        &self,
+        image: [u8; 32],
+        scope: BootstrapScope,
+    ) -> Result<(), RegistryError> {
+        use sha2::Digest;
+        let contract: [u8; 32] =
+            sha2::Sha256::digest(format!("{}\0", scope.contract()).as_bytes()).into();
+        if self.image != image
+            || self.proof.scope != scope
+            || self.proof.version != 1
+            || self.proof.contract != contract
+            || self.proof.schema != DnsSchema::Codec4.digest()
+            || DnsSchema::current()? != DnsSchema::Codec4
+            || self.proof.reviewed != Some(self.proof.patch)
+        {
+            return Err(RegistryError::Version);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DnsSchema {
     Codec3,
@@ -238,12 +354,34 @@ impl DnsCapability {
 }
 #[derive(Clone)]
 pub(crate) struct ImageContract {
+    bootstrap: [Option<BootstrapProvenance>; 3],
     image: [u8; 32],
     udp_reviewed: bool,
     dns_release: Option<DnsProvenance>,
     dns_wire: Option<DnsProvenance>,
 }
 impl ImageContract {
+    pub(crate) fn bootstrap_channel(
+        &self,
+        image: [u8; 32],
+        scope: BootstrapScope,
+    ) -> Result<Option<BootstrapCapability>, RegistryError> {
+        if self.image != image {
+            return Err(RegistryError::HashMismatch);
+        }
+        let Some(proof) = self.bootstrap[scope.index()].as_ref() else {
+            return Ok(None);
+        };
+        if proof.reviewed.is_none() {
+            return Ok(None);
+        }
+        let capability = BootstrapCapability {
+            image: self.image,
+            proof: proof.clone(),
+        };
+        capability.check(image, scope)?;
+        Ok(Some(capability))
+    }
     #[cfg(test)]
     pub(crate) fn check_dns_wire(&self, image: [u8; 32]) -> Result<(), RegistryError> {
         self.dns_capability(image, DnsSchema::Codec3, DnsContract::Wire)
@@ -314,6 +452,7 @@ impl ProducerRecord {
             || self.version != 1
             || self.source_commit != "a4a3dff5b20c2faae567b742c172c7b95e75c083"
             || self.patch_sha256 != PRODUCER_PATCH
+                && Some(self.patch_sha256.as_str()) != BOOTSTRAP_BUILD_REVIEWED_PATCH
         {
             return Err(RegistryError::Version);
         }
@@ -369,8 +508,30 @@ impl ProducerRecord {
             }
         }
         Ok(ImageContract {
+            bootstrap: [
+                (&self.bootstrap_source, BootstrapScope::Source),
+                (&self.bootstrap_dns_wire, BootstrapScope::Wire),
+                (&self.bootstrap_dns_release, BootstrapScope::Release),
+            ]
+            .map(|(r, scope)| {
+                r.as_ref()
+                    .map(|r| {
+                        BootstrapProvenance::decode(
+                            r,
+                            scope,
+                            &self.patch_sha256,
+                            BOOTSTRAP_REVIEWED_PATCHES[scope.index()],
+                        )
+                    })
+                    .transpose()
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| RegistryError::Manifest)?,
             image: image.0,
-            udp_reviewed: true,
+            udp_reviewed: self.patch_sha256 == PRODUCER_PATCH
+                || Some(self.patch_sha256.as_str()) == UDP_ADDITIONAL_REVIEWED_PATCH,
             dns_release,
             dns_wire,
         })
@@ -396,6 +557,38 @@ fn fake_dns_record(image: [u8; 32]) -> ProducerRecord {
             "schema_sha256":format!("{:x}",sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-3\0"))}});
     serde_json::from_value(value).unwrap()
 }
+/// Отдельный synthetic CODEC4 source review. Не pin существующего Direct3/UDP.
+#[cfg(test)]
+pub(crate) fn fake_bootstrap_image(image: [u8; 32], scopes: &[BootstrapScope]) -> ImageContract {
+    use sha2::Digest;
+    let patch = "44".repeat(32);
+    let bootstrap = [
+        BootstrapScope::Source,
+        BootstrapScope::Wire,
+        BootstrapScope::Release,
+    ]
+    .map(|scope| {
+        scopes.contains(&scope).then(|| {
+            let r = DnsReleaseRecord {
+                contract: scope.contract().into(),
+                version: 1,
+                contract_sha256: format!(
+                    "{:x}",
+                    sha2::Sha256::digest(format!("{}\0", scope.contract()).as_bytes())
+                ),
+                schema_sha256: format!("{:x}", sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-4\0")),
+            };
+            BootstrapProvenance::decode(&r, scope, &patch, Some(&patch)).unwrap()
+        })
+    });
+    ImageContract {
+        image,
+        bootstrap,
+        udp_reviewed: false,
+        dns_release: None,
+        dns_wire: None,
+    }
+}
 /// Явный injected review отдельного synthetic source4 record; это не Direct3 pin.
 #[cfg(test)]
 pub(crate) fn fake_dns4_image(image: [u8; 32]) -> ImageContract {
@@ -409,6 +602,7 @@ pub(crate) fn fake_dns4_image(image: [u8; 32]) -> ImageContract {
         DnsProvenance::decode(&record, contract, &patch, None, Some(&patch)).unwrap()
     };
     ImageContract {
+        bootstrap: [None, None, None],
         image,
         udp_reviewed: false,
         dns_release: Some(record(DnsContract::Release)),
@@ -915,6 +1109,107 @@ mod tests {
             serde_json::json!({"schema":2,"engines":[{"engine":"xray","version":"26.10.31","sha256":"11".repeat(32),"native_profile_producer":null}]}),
         );
         assert!(parsed.is_ok());
+    }
+    #[test]
+    fn bootstrap_record_slots_parse_without_promoting_direct3_or_udp() {
+        use sha2::Digest;
+        let mut value = serde_json::json!({"contract":"yonik-xray-profile-udp-v2","version":1,"source_commit":"a4a3dff5b20c2faae567b742c172c7b95e75c083","source_sha256":"16".repeat(32),"patch_sha256":super::PRODUCER_PATCH,"builder_sha256":"12".repeat(32),"toolchain_sha256":"13".repeat(32),"build_inputs_sha256":"14".repeat(32),"elf_sha256":"11".repeat(32)});
+        for (slot, name) in [
+            (
+                "bootstrap_source",
+                "captured-netgo-bootstrap-parent-member-v1",
+            ),
+            (
+                "bootstrap_dns_wire",
+                "bootstrap-direct-dns-bound-request-response-v1",
+            ),
+            (
+                "bootstrap_dns_release",
+                "bootstrap-direct-dns-consuming-close-join-v1",
+            ),
+        ] {
+            value[slot] = serde_json::json!({"contract":name,"version":1,"contract_sha256":format!("{:x}",sha2::Sha256::digest(format!("{name}\0").as_bytes())),"schema_sha256":format!("{:x}",sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-4\0"))});
+        }
+        let record = serde_json::from_value::<super::ProducerRecord>(value);
+        assert!(
+            record.is_ok(),
+            "три независимых optional slots должны разбираться"
+        );
+        let image = record
+            .unwrap()
+            .validate(crate::host::Sha256([17; 32]))
+            .unwrap();
+        assert!(image.check([17; 32]).is_ok());
+        for scope in [
+            super::BootstrapScope::Source,
+            super::BootstrapScope::Wire,
+            super::BootstrapScope::Release,
+        ] {
+            assert!(image.bootstrap_channel([17; 32], scope).unwrap().is_none());
+        }
+    }
+    #[test]
+    fn bootstrap_record_contract_schema_scope_and_review_do_not_alias() {
+        use super::{BootstrapProvenance, BootstrapScope as S, DnsReleaseRecord};
+        use sha2::Digest;
+        let patch = "44".repeat(32);
+        for (scope, hash) in [
+            (
+                S::Source,
+                "3e7860519a0f3bd9d012ed5d739514ad45a387ecbd289c99a55d7761cf60004e",
+            ),
+            (
+                S::Wire,
+                "de8522b1473bd9a0c1cf6eb2ba6c0718baf4fd19a25ca8a02c4a5edde5c7d3b2",
+            ),
+            (
+                S::Release,
+                "ab218d837b1125c1f79cab94df388d8467e06e55a507338a348881da8b3382b4",
+            ),
+        ] {
+            assert_eq!(
+                format!(
+                    "{:x}",
+                    sha2::Sha256::digest(format!("{}\0", scope.contract()).as_bytes())
+                ),
+                hash
+            );
+            let r = DnsReleaseRecord {
+                contract: scope.contract().into(),
+                version: 1,
+                contract_sha256: hash.into(),
+                schema_sha256: format!("{:x}", sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-4\0")),
+            };
+            assert!(
+                BootstrapProvenance::decode(&r, scope, &patch, None)
+                    .unwrap()
+                    .reviewed
+                    .is_none()
+            );
+            for fault in 0..5 {
+                let mut r = r.clone();
+                match fault {
+                    0 => r.contract = "unknown".into(),
+                    1 => r.version = 2,
+                    2 => r.contract_sha256 = "11".repeat(32),
+                    3 => {
+                        r.schema_sha256 =
+                            format!("{:x}", sha2::Sha256::digest(b"YONIK-DNS-V2-CODEC-3\0"))
+                    }
+                    _ => r.schema_sha256 = r.schema_sha256.to_ascii_uppercase(),
+                };
+                assert!(BootstrapProvenance::decode(&r, scope, &patch, Some(&patch)).is_err());
+            }
+            let image = super::fake_bootstrap_image([17; 32], &[scope]);
+            assert!(image.check([17; 32]).is_err());
+            for wanted in [S::Source, S::Wire, S::Release] {
+                assert_eq!(
+                    image.bootstrap_channel([17; 32], wanted).unwrap().is_some(),
+                    scope == wanted
+                );
+            }
+            assert!(image.bootstrap_channel([18; 32], scope).is_err());
+        }
     }
     #[test]
     fn producer_record_exact_image_launch_and_negative_controls() {

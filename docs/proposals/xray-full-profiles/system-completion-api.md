@@ -1551,8 +1551,9 @@ loopback Stub policy и legitimate bootstrap Source/producer mint остаютс
 `native_dns_rrset::dispatch` обслуживает BootstrapDns Publish40/Published41
 через retained `BootstrapDirect` proof/revision/exchange и отдельный private
 `Channel::bootstrap_dns_transcript`. Последний по exact launch, binding,
-producer sequence, request и response подтверждает immutable response observation
-time. Его production factory возвращает None до reviewed CODEC4 capture scope;
+producer sequence, request и response подтверждает capture provenance. Production
+adapter возвращает private issuer-retained exchange Reservation.started anchor,
+не время Publish/recheck/child timestamp. Factory закрыта до reviewed CODEC4 scope;
 USER `dns_wire`, Direct3 и bootstrap consuming-close не конвертируются в него.
 Pure tests inject-ят только fake captured facts, без OS/image attestation.
 
@@ -1560,9 +1561,9 @@ Issuer сравнивает cheap immutable prefix/source metadata до Source/k
 revalidation, повторяет strict DNS parser, сверяет role4 SnapshotRef и pinned
 Source.question/options с полным исходным physical path. Parent carrier и DNS
 transport carrier остаются разными полями. Source question не заменяет original
-hostname/port. DATA expiry — min(observed response + actual parsed minimum TTL,
+hostname/port. DATA expiry — min(retained exchange start + parsed minimum TTL,
 original context/source/root/session deadlines); повторный receipt обязан иметь
-тот же observation time. Raw capture хранится с предварительным debit общего
+тот же conservative anchor. Raw capture хранится с предварительным debit общего
 8MiB ledger, максимум 64 producers; invalid Publish не расходует shared history.
 В этом bounded cut DATA дополнительно требует live исходный producer context;
 teardown этого context отзывает его derivatives, cache не переживает этот fence.
@@ -1607,6 +1608,62 @@ open остаётся Unsupported. Permission не разрешает arbitrary 
 дополнительно обязан проверить live original consumer parent/full frontier.
 Production bootstrap Source/transcript/current CODEC4 mint и public gates
 закрыты. CODEC4 wire/schema/corpus/pins не изменены; runtime proof не заявляется.
+
+### R71/R74: legitimate binding готов, literal pins остаются закрыты
+
+`native_bootstrap_binding::BootstrapBinding::prepare` — единственная private
+production factory. Она получает actual retained Peer, final capsule/config/
+exact launch и `Sources::Local(Arc<Prepared>)` либо
+`Sources::System(Arc<PreparedFullProfile>)`. Оба actual `ProfileRuntime::start_*`
+передают owning source в `SystemChannel::new`; все три Channel exports берут
+views из одного удерживаемого Arc. Нового System-only prepare или recapture для
+Local нет: accessor возвращает уже held snapshot, общий
+`PinnedResolverSnapshot::retained_lookup_data` использует прежний pinned planner
+и общий invocation ByteBudget. Existing source identity revalidation сохранена.
+
+Protected registry schema2 распознаёт отдельные `bootstrap_source`,
+`bootstrap_dns_wire`, `bootstrap_dns_release` с version1, exact semantic
+name+NUL hash, schema4, reviewed patch и actual retained image. Source не mint
+wire/release, Direct3 не повышается до4, bootstrap не повышает UDP eligibility.
+Missing record/pin возвращает None; image/config/manifest/launch/source mismatch
+отказывает. Profile без role4 не получает bootstrap views. Runtime HELLO,
+ADMIT_ACK и exact CODEC4 negotiation остаются обязательными.
+
+Source parent — доверие принятому consuming-parent/open-conjunction contract
+плюс static full binding matching; graph сам не доказывает live Go operation.
+Текущий R74 subset явно ограничен single raw TCP/branch0 без TLS/multi-hop/UDP.
+Полный path не усечён в DATA; остальные формы Unsupported. First applicable
+Hosts сохраняет row/member indices, DNS-first→Hosts negative и второй search
+question не выдумываются. Parent/query lease nonreuse≤256 не продлевается;
+ошибка owning source/peer revalidation sticky. До source validation резервируются
+16 transient FD из общего FD64 ledger; records/plans/capture scratch оплачиваются
+общим 8MiB budget до allocation. Unknown сохраняет owner/custody/credits.
+
+Transcript scope подтверждает actual-capture construction принятого exact
+producer, а не объявляет child bytes/ACK/hash самостоятельным proof. Private
+`BootstrapDnsReceipt.lifetime_anchor` выводится issuer из exact retained
+proof/revision/exchange; `BootstrapDnsTranscript::observed` возвращает тот же
+anchor, immutable lineage/bytes сопоставляются при recheck. Anchor≤actual
+response по ACK-before-exchange contract; timestamp в wire не добавлен.
+Release view удерживает отдельный opaque capability и общий sticky binding;
+existing Proof/Resource actor join и consuming-close barriers не ослаблены.
+
+Future literal-only update после helper review: в `registry.rs` отдельно
+`BOOTSTRAP_BUILD_REVIEWED_PATCH`, `BOOTSTRAP_SOURCE_REVIEWED_PATCH`,
+`BOOTSTRAP_DNS_WIRE_REVIEWED_PATCH`, `BOOTSTRAP_DNS_RELEASE_REVIEWED_PATCH`;
+все сейчас None. `UDP_ADDITIONAL_REVIEWED_PATCH` тоже None и требует собственного
+review; legacy `PRODUCER_PATCH`/Direct3 сохранены. Root отдельно координирует
+builder artifact pin и trusted protected install. R74 digest
+`3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec`
+SOURCE-eligible, здесь не allowlisted. Factory/owner/planner/view constructors
+реализованы; искусственного всегда-None constructor после принятия pins нет.
+Production records не устанавливались, public readiness/Connect gates false.
+
+Compile-only builder дополнительно сохраняет
+`native-profile-bootstrap-candidate.json`: три schema4 contract slots рядом с
+точными build/image inputs, `install_authority=false` и
+`requires_independent_scope_review=true`. Это отдельный candidate, а не поля
+actual producer record; старые builder/patch pins и install path не меняются.
 
 ### StubBind: bounded listener observation, не service authority
 

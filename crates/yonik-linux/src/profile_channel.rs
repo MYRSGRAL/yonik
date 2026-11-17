@@ -3671,6 +3671,11 @@ impl<'a> Capsule<'a> {
         let scope = scope_from(&self.tables, index)?;
         Ok((index, scope.mask))
     }
+    /// Borrowed DATA shape, не transport authority или Source capability.
+    pub(crate) fn stream_shape(&self, index: u16) -> Result<(u8, u8)> {
+        let row = self.tables[3].row(index)?;
+        Ok((row[0], row[1]))
+    }
     pub(crate) fn probe_scope(&self, index: u16, subject: u16) -> Result<ProbeScope<'_>> {
         self.validate_request(&Message::Probe {
             purpose: 1,
