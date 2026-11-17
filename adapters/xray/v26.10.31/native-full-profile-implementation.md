@@ -1919,3 +1919,16 @@ Owner хранит число погашенных setup slots; окончате
 NETWORK Direct возвращает два setup slots, Publish — один: для двух producers
 это шесть slots, необходимые для исходного pending61 + waiter9 при cap64.
 Это расчёт ledger; совместный FranceSS Go↔Rust pair остаётся отдельной проверкой.
+
+Вложенные NETWORK owners не заимствуют credits друг у друга. Waiter9 покрывает
+три пары request/cancel (Reserve35, Bind53, Numeric42) и три cleanup targets
+(permission, waiter, reservation); parent binding3 оплачивается отдельно.
+Producer4 покрывает пару Exchange Reserve35/cancel(request) и два cleanup targets
+(reservation, exchange). DatagramParent3 покрывает request57/cancel(request)
+и cancel9 binding. После валидированного live Known ACK соответствующая пара
+request/cancel больше не outstanding: producer возвращает2, parent возвращает2,
+waiter возвращает2 за каждый из трёх ACK. Source context уже возвращает свою
+пару через dnsContext4Settle, поэтому его ledger не меняется. Cleanup вычитает
+только оставшийся debit. Late/cancelled/Unknown/replay не погашают setup;
+retained history/memory/FD, context/binding9/service barriers остаются прежними.
+Direct Physical36/37 settlement из предыдущего исправления не меняется.

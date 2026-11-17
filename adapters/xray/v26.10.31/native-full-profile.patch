@@ -30496,7 +30496,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux.go
-@@ -0,0 +1,2630 @@
+@@ -0,0 +1,2643 @@
 +//go:build linux
 +
 +package nativehooks
@@ -32001,6 +32001,7 @@ new file mode 100644
 +const profileNetworkWaiterPending = 9
 +
 +type profileNetworkWaiter struct {
++	setupSettled                            int
 +	datagramParent                          *profileDatagramParent
 +	serviceOperation                        *profileOperation
 +	producer                                *profileNetworkBootstrap
@@ -32368,6 +32369,10 @@ new file mode 100644
 +					c.dnsNotify(op, errProfile)
 +					return true, nil
 +				}
++				// Три пары request/cancel оплачены в waiter9 отдельно от трёх
++				// cleanup targets. Known ACK исключает cancel этого request.
++				w.setupSettled += 2
++				c.operations -= 2
 +				c.dnsNotify(op, nil)
 +				return true, nil
 +			}
@@ -32497,13 +32502,14 @@ new file mode 100644
 +		w.service.networkCleanupRefs--
 +	}
 +	w.released = true
-+	c.operations -= profileNetworkWaiterPending
++	c.operations -= profileNetworkWaiterPending - w.setupSettled
 +	return nil
 +}
 +
 +// Constructor custody, не socket permit. Даже successful Reserved36 этого cut
 +// не публикует Conn, request bytes, RRset или BootstrapPhysicalPermission.
 +type profileNetworkBootstrap struct {
++	setupSettled                                                             bool
 +	datagramParent                                                           *profileDatagramParent
 +	serviceOperation                                                         *profileOperation
 +	sourceCapability                                                         *profileDNSSourceCapability
@@ -32836,6 +32842,9 @@ new file mode 100644
 +				c.dnsNotify(op, errProfile)
 +				return true, nil
 +			}
++			// Producer4: request/cancel + reservation/exchange cleanup.
++			n.setupSettled = true
++			c.operations -= 2
 +			c.dnsNotify(op, nil)
 +			return true, nil
 +		}
@@ -32998,7 +33007,11 @@ new file mode 100644
 +			n.service.networkCleanupRefs--
 +		}
 +		n.released = true
-+		c.operations -= profileNetworkBootstrapPending
++		remaining := profileNetworkBootstrapPending
++		if n.setupSettled {
++			remaining -= 2
++		}
++		c.operations -= remaining
 +	}
 +	return nil
 +}
@@ -47601,7 +47614,7 @@ diff --git a/common/yonikbroker/profile_bootstrap_datagram_linux.go b/common/yon
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_bootstrap_datagram_linux.go
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,303 @@
 +//go:build linux
 +
 +package nativehooks
@@ -47614,6 +47627,7 @@ new file mode 100644
 +
 +// Отдельный nonreuse namespace. ACK58 не является Source/DNS/physical grant.
 +type profileDatagramParent struct {
++	setupSettled                                bool
 +	runtime                                     *ProfileRuntime
 +	parent                                      *profileGrant
 +	flow                                        *profileUDPFlow
@@ -47800,6 +47814,10 @@ new file mode 100644
 +				c.dnsNotify(op, errProfile)
 +				return true, nil
 +			}
++			// Known ACK58 завершает request57 и исключает будущий cancel(request).
++			// Отдельный cancel9 binding остаётся prepaid до terminal cleanup.
++			b.setupSettled = true
++			c.operations -= 2
 +			c.dnsNotify(op, nil)
 +			return true, nil
 +		}
@@ -47876,7 +47894,11 @@ new file mode 100644
 +		c.dnsNotify(op, errProfile)
 +		b.released = true
 +		b.parent.pending--
-+		c.operations -= 3
++		remaining := 3
++		if b.setupSettled {
++			remaining -= 2
++		}
++		c.operations -= remaining
 +	}
 +	return nil
 +}
@@ -59495,7 +59517,7 @@ diff --git a/common/yonikbroker/profile_bootstrap_datagram_network_linux_test.go
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_bootstrap_datagram_network_linux_test.go
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,666 @@
 +//go:build linux
 +
 +package nativehooks
@@ -59509,6 +59531,52 @@ new file mode 100644
 +	"testing"
 +	"time"
 +)
++
++func TestProfileDatagramNetworkNestedPendingComposition(t *testing.T) {
++	for _, tcp := range []bool{false, true} {
++		h, numeric := datagramNetworkNumericWithCarrier(t, 1, tcp)
++		w := h.n.waiter
++		if w.datagramParent == nil || w.datagramParent.id == 0 {
++			t.Fatal("nested57 не завершён")
++		}
++		before := h.f.c.operations
++		if err := h.f.c.dispatch(numeric); err != nil {
++			t.Fatal(err)
++		}
++		if err := h.f.c.accept(networkNumericGrant(numeric)); err != nil {
++			t.Fatal(err)
++		}
++		if err := <-h.done; err != nil {
++			t.Fatal(err)
++		}
++		if h.f.c.operations != before-2 {
++			t.Fatal("Numeric ACK не погасил request/cancel пару")
++		}
++	}
++}
++
++func TestProfileDatagramNetworkNestedParentUnknownKeepsPending(t *testing.T) {
++	h, logical := datagramNetworkExchangeStart(t, 1, false, nil, true)
++	publish := networkExchangePublish(t, h, logical)
++	if h.f.c.dispatch(publish) != nil || h.f.c.accept(networkPublished(publish)) != nil {
++		t.Fatal("Publish")
++	}
++	parent := h.next(t, 57)
++	packet := datagramBound(parent, 20)
++	clear(packet.body[2:])
++	packet.body[2] = 3
++	before := h.f.c.operations
++	err := h.f.c.accept(packet)
++	if done := <-h.done; done == nil {
++		t.Fatal("Unknown опубликован")
++	}
++	if err != nil || !parent.datagramParent.unknown || h.f.c.operations != before {
++		t.Fatal("Unknown вернул pending")
++	}
++	if err = h.f.c.datagramParentTick(); err != nil || h.f.c.operations != before {
++		t.Fatal("Unknown cleanup вернул pending")
++	}
++}
 +
 +func TestProfileDatagramNetworkCleanupKeepsServiceUntilResourceAndBindings(t *testing.T) {
 +	h, op := datagramNetworkNumericWithCarrier(t, 2, false)

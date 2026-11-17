@@ -19,6 +19,9 @@ class FullProfilePatchTests(unittest.TestCase):
             "profileDNSResultPending - o.setupSettled",
             "TestProfileNetworkSetupPendingSettlement",
             "TestProfileNetworkPhysicalReservedKeepsPendingUntilAck",
+            "profileNetworkWaiterPending - w.setupSettled",
+            "TestProfileDatagramNetworkNestedPendingComposition",
+            "Known ACK58 завершает request57",
         ):
             self.assertIn(anchor, patch)
 

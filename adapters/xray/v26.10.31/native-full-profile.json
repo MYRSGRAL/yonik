@@ -3,7 +3,7 @@
   "version": "26.10.31",
   "source_commit": "a4a3dff5b20c2faae567b742c172c7b95e75c083",
   "base_archive_sha256": "e5184047fd1380472f69114fb8173a0adfd8c50970560eceb9c87fcba0bb35e9",
-  "patch_sha256": "3003bf774c389b2c804747239f078c2b4efdecd2763a9452476a857df3591b1b",
+  "patch_sha256": "3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339",
   "status": "partial-udp-v2-producer-source",
   "runtime_hooks_connected": false,
   "native_protocol": null,
@@ -65,7 +65,7 @@
     "profile_udp_namespace_linux_test.go": "e47cae6f7d389d1e3e6c1d3deca900807b56397b0ffd1431d691f3a93ec12172",
     "profile_udp_producer_linux.go": "2994ae72187931ffb55b745d3802f57512093ac5bc48d0f0ae148cf2b3580947",
     "profile_udp_producer_linux_test.go": "432df8547d89731b6d4b4f32374723ba800dc423954c07bf08bf516175b9efff",
-    "profile_dns_frontier_linux.go": "6303c57f0ef873f7cf30e597ed2de5d8a5cd6d33784946831be8aad380b9acd9",
+    "profile_dns_frontier_linux.go": "dcfc85d1ebd198a5edfb3f0632efb42484dcad450b0ba65da25d5efa640f9cae",
     "profile_dns_frontier_linux_test.go": "1b55fc2a4f6f39e18b13e08ccead02ed96b342cb42eefe84695c71e14478b865",
     "profile_dns_tasks_linux.go": "59591ac415e14010b993e3c8c25214dad2b3db00f1664f7f66da3f6a8c112d69",
     "profile_dns_tasks_other.go": "4d1e59f887a2877f3ef80d60be04adfeb9a0ed91ef451371adb7705fb39e709c",
@@ -90,11 +90,11 @@
     "profile-dns-v2-codec5.json": "a9f2e5f5517b72c97e4b7243a4dac9e590e885b50913a44249a393f0270d6116",
     "profile_dns_datagram_codec.go": "ef87184be6896d0d71f36e7e4befd41f740bc590bd3877b5f050f2093d704e0c",
     "profile_dns_datagram_codec_test.go": "6954b6e4ad758d81416f227757d558936e751d2af5d8c92279399b898cbde07b",
-    "profile_bootstrap_datagram_linux.go": "b3466a0a6fa8b075fcfb99f73ae5d04e4f4460895587afb4edc011f3a309b7ab",
+    "profile_bootstrap_datagram_linux.go": "273626e6f674c33854bab90881f9e845abc6b1dde348b54006b6d9aea13ffaa4",
     "profile_bootstrap_datagram_socket_linux.go": "b7b2ab3450e64623000b1400669ba47b5488255aeecf0d2ceb45c95ad131351c",
     "profile_bootstrap_datagram_linux_test.go": "4f6434a0655b131dbc3c7486dd2adfadc36ccb02384ec2349c186b383564b8cb",
     "profile_bootstrap_datagram_network_linux.go": "95f7440e97af4c416345f3f8cd162b62edb94811793c570b537c2568893417b4",
-    "profile_bootstrap_datagram_network_linux_test.go": "29a4c25f92ea11a898e83efdd73537916bfbaba2df3a8d01fc7f8730799a2481"
+    "profile_bootstrap_datagram_network_linux_test.go": "419d9da82ff0bef2c5afd1ffd400482de2de45921fe57519b795ba7502af43e1"
   },
   "callsite_files_sha256": {
     "transport/internet/splithttp/yonik_r9_test.go": "de0efd0442bbb2a6bc9cdca69fa70294b0496c20d5907089cb885d057d968b1e",
