@@ -601,12 +601,27 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 			if n.transport.setupSettled != 2 {
 				t.Fatal("Direct setup settlement not exact once")
 			}
+			if !n.setupSettled {
+				t.Fatal("producer exchange settlement missing")
+			}
+			expectedWaiter := 6
+			if foreign && n.parent == udp {
+				expectedWaiter = 4
+			}
+			if n.waiter != nil && n.waiter.setupSettled != expectedWaiter {
+				t.Fatal("waiter setup settlement not exact once")
+			}
 			expectedPublish := 1
 			if badQuestion && n.parent == udp {
 				expectedPublish = 0
 			}
 			if n.result.setupSettled != expectedPublish {
 				t.Fatal("Publish settlement not exact once")
+			}
+		}
+		for _, parent := range f.c.datagramParents[:f.c.datagramParentUsed] {
+			if !parent.setupSettled {
+				t.Fatal("Known parent ACK58 did not settle setup")
 			}
 		}
 		// Повторные normal ticks не возвращают исторические credits второй раз.

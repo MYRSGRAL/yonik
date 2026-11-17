@@ -247,6 +247,15 @@ impl Channel for Stdio {
         if b.len() < 128 {
             return Err(ServiceError::InvalidRequest);
         }
+        if b[10..12] == 55u16.to_be_bytes() {
+            eprintln!(
+                "interop Acquire Source budget: {}",
+                super::super::super::super::bootstrap_binding::tests::interop_status(
+                    &self.diagnostic,
+                    u64_at(&b[128..], 16)
+                )
+            );
+        }
         if b[10..12] == 40u16.to_be_bytes() && b.get(265) == Some(&1) {
             let body = &b[128..];
             eprintln!(

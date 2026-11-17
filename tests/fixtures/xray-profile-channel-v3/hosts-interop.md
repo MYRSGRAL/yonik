@@ -1,5 +1,28 @@
 # PURE_STATEFUL_INTEROP: HOSTS
 
+## R96 actual pair: nested parent проходит, Source Acquire12 RED
+
+Base669345e3, exact patch3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339.
+Actual pending после Published2 теперь43, independent waiter создан и parent57
+получает настоящий ACK58 (parent_used2, waiter_parent_bound=true). R95 Physical36
+slot до37 и Direct2/Publish1 settlement сохранены; Known producer/parent/waiter
+settlement и terminal counter assertions добавлены в test-only bridge.
+
+Следующий отказ — actual Rust Deny56 на Acquire55 query12/service7 для UDP waiter,
+после Probe→Grant7. Перед этим Source budget used42014/limit58419 Local, planner
+PLAN_BYTES16384 оставляет21 byte без новой query/context metadata. Peer/owner
+валидны, source epoch/deadline не изменялись. Source parent_lease создаёт новую
+prepaid query (native_bootstrap_binding.rs), question вызывает retained planner;
+новая metadata и16KiB не помещаются одновременно. Это не прежний Go cap64:
+после отказа pending54, parent binding уже ACKed. Production Rust/Go не менялись.
+
+Матрица47 выполнена на exact SUT: прежние35 GREEN сохранены, четыре positives
+и восемь downstream negatives/held-ACK остаются RED/unreached до waiter Reserve/
+Numeric17. Evidence p5-france-compose/current содержит actual55/Deny56 и Source
+budget snapshots всех четырёх Acquire, source/compiler/ELF preexecution hashes.
+Нужна отдельная scoped Source memory/lifetime correction без повышения caps/
+fixture limits и без удаления revalidation/planning. FranceReady/runtime PASS нет.
+
 ## R95 actual pair: вложенный DatagramParent precredit RED
 
 Base9e995134, production patch3003bf774c389b2c804747239f078c2b4efdecd2763a9452476a857df3591b1b.
