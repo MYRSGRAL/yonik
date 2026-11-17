@@ -81,6 +81,7 @@ fn dns_rrset_queue_credit_precedes_materialization_and_rx_bound_is_fixed() {
 
 // Весь driver below — in-memory: ни OS endpoint, ни runtime wrappers.
 pub(super) struct BundleIo {
+    pub(super) datagram_producer: Option<Arc<dns_datagram::Producer>>,
     pub(super) bootstrap_transcript: Option<Arc<dyn BootstrapDnsTranscript>>,
     pub(super) bootstrap_producer: Option<Arc<VerifiedBootstrapDnsProducer>>,
     pub(super) dns_inbox: Option<Arc<std::sync::Mutex<VecDeque<dns_transport::Incoming>>>>,
@@ -131,6 +132,10 @@ pub(super) fn dns_packet(
     bytes[..n].to_vec()
 }
 impl BundleIo {
+    pub(super) fn datagram(&mut self, producer: Arc<dns_datagram::Producer>) {
+        self.descriptor = wire::dns_v2::Negotiated::datagram_descriptor(self.record).unwrap();
+        self.datagram_producer = Some(producer);
+    }
     fn hold_reply(&self) -> Result<bool, ServiceError> {
         if self.fail_write_at == Some(self.output.borrow().len() + 1) {
             return Err(ServiceError::Unavailable);
@@ -149,6 +154,7 @@ impl BundleIo {
     }
     pub(super) fn new(record: LaunchRecord, requests: Vec<Vec<u8>>) -> Self {
         Self {
+            datagram_producer: None,
             bootstrap_transcript: None,
             bootstrap_producer: None,
             dns_inbox: None,
@@ -173,6 +179,12 @@ impl BundleIo {
     }
 }
 impl Channel for BundleIo {
+    fn bootstrap_datagram_producer(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dns_datagram::Producer>>, ServiceError> {
+        Ok(self.datagram_producer.clone())
+    }
     fn bootstrap_dns_transcript(
         &self,
         _: LaunchRecord,
@@ -262,7 +274,18 @@ impl Channel for BundleIo {
             if self.hold_reply()? {
                 return Ok(false);
             }
-            dns_bundle::decode(b, &dns_neg(self.record), wire::dns_v2::Direction::Issuer)?;
+            let neg = if self.datagram_producer.is_some() {
+                wire::dns_v2::Negotiated::accept_datagram(
+                    &self.descriptor,
+                    &wire::dns_v2::Negotiated::ack(&self.descriptor).unwrap(),
+                    self.record,
+                    [(0, 0); 2],
+                )
+                .map_err(unavailable)?
+            } else {
+                dns_neg(self.record)
+            };
+            dns_bundle::decode(b, &neg, wire::dns_v2::Direction::Issuer)?;
             self.output.borrow_mut().push(b.to_vec());
             if let Some(action) = &self.after_sent {
                 action(self.output.borrow().len());
@@ -1521,6 +1544,7 @@ pub(super) struct Proof {
     receipt: wire::Receipt,
 }
 pub(super) struct Fake {
+    pub(super) datagram_bindings: BTreeMap<u64, (LaunchRecord, Arc<UdpBinding>)>,
     pub(super) bootstrap_permit_live: Arc<AtomicBool>,
     pub(super) owner_forbidden: bool,
     pub(super) static_dns_peer: Option<std::net::SocketAddr>,
@@ -1551,6 +1575,7 @@ pub(super) struct Fake {
 impl Fake {
     pub(super) fn new(mode: Mode) -> Self {
         Self {
+            datagram_bindings: BTreeMap::new(),
             bootstrap_permit_live: Arc::new(AtomicBool::new(true)),
             owner_forbidden: false,
             static_dns_peer: None,
@@ -1581,6 +1606,17 @@ impl Fake {
     }
 }
 impl Authority for Fake {
+    fn datagram_lineage(&self, _: &(), source: u64) -> Result<dns_datagram::Lineage, ServiceError> {
+        let (launch, binding) = self
+            .datagram_bindings
+            .get(&source)
+            .ok_or(ServiceError::Unsupported)?;
+        Ok(dns_datagram::Lineage {
+            binding: binding.clone(),
+            launch: *launch,
+            namespace: (4, 5),
+        })
+    }
     fn check_bootstrap_permit(&mut self, route: BootstrapDnsRoute) -> Result<(), ServiceError> {
         self.fence()?;
         self.bootstrap_permit_checks += 1;

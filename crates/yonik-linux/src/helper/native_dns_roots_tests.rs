@@ -6,9 +6,12 @@ use super::super::super::{
 use super::*;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicUsize;
+#[path = "native_dns_datagram_tests.rs"]
+mod datagram;
 #[path = "native_hosts_interop_tests.rs"]
 mod interop;
 struct Facts {
+    carrier: u8,
     subject: u16,
     launch: LaunchRecord,
     reference: wire::SnapshotRef,
@@ -90,7 +93,7 @@ impl Source for Facts {
             || p.path != self.path
             || p.original.bytes != b"physical.invalid"
             || p.original.port != 8443
-            || p.original.protocol != 6
+            || p.original.protocol != self.carrier
         {
             return Err(ServiceError::Unavailable);
         }
@@ -194,6 +197,16 @@ fn fixture_digest(
     raw: bool,
     digest: [u8; 32],
 ) -> (Issuer<Fake>, Arc<Facts>) {
+    fixture_carrier(mode, address, order, raw, digest, 6)
+}
+fn fixture_carrier(
+    mode: Mode,
+    address: std::net::IpAddr,
+    order: u8,
+    raw: bool,
+    digest: [u8; 32],
+    carrier: u8,
+) -> (Issuer<Fake>, Arc<Facts>) {
     use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent, VerifiedSystemResolver};
     struct Snapshot;
     impl VerifiedSystemResolver for Snapshot {
@@ -207,6 +220,9 @@ fn fixture_digest(
     let mut graph = serde_json::json!({"outbounds":[{"tag":"a","protocol":"shadowsocks","settings":{"servers":[{"address":"remote.invalid","port":8388,"method":"aes-128-gcm","password":"fixture"}]},"proxySettings":{"tag":"b","transportLayer":true}},{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":"physical.invalid","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]});
     if raw {
         graph["outbounds"].as_array_mut().unwrap().remove(0);
+    }
+    if carrier == 17 {
+        graph = serde_json::json!({"outbounds":[{"tag":"b","protocol":"shadowsocks","settings":{"servers":[{"address":"physical.invalid","port":8443,"method":"aes-128-gcm","password":"fixture"}]}}]});
     }
     let intent =
         ProfileIntent::decode(&serde_json::json!({"version":1,"graph":graph}).to_string()).unwrap();
@@ -260,7 +276,7 @@ fn fixture_digest(
     let capsule =
         Arc::new(wire::OwnedCapsule::build(&intent, &plan, Some(reference), digest, 1, 1).unwrap());
     let cap = wire::Capsule::decode(capsule.bytes(), &digest).unwrap();
-    let (mut scope, mut mask) = cap.subject_scope(0, 6).unwrap();
+    let (mut scope, mut mask) = cap.subject_scope(0, carrier).unwrap();
     let mut path = vec![];
     let endpoint = loop {
         let branch = u8::from(mask & 1 == 0);
@@ -281,7 +297,8 @@ fn fixture_digest(
     issuer.authority.service_trusted = true;
     issuer.authority.owner_forbidden = true;
     let facts = Arc::new(Facts {
-        subject: if raw { 0 } else { 1 },
+        carrier,
+        subject: if raw || carrier == 17 { 0 } else { 1 },
         launch,
         reference,
         asset,
@@ -318,7 +335,7 @@ fn acquire(f: &Facts, hosts: bool, root: u64, query: u64) -> Vec<u8> {
     ] {
         b[at..at + 2].copy_from_slice(&v.to_be_bytes());
     }
-    for v in [2, f.endpoint, 1, if hosts { u16::MAX } else { 1 }] {
+    for v in [2, f.endpoint, f.subject, if hosts { u16::MAX } else { 1 }] {
         b.extend_from_slice(&v.to_be_bytes());
     }
     b.extend_from_slice(b"physical.invalid");
@@ -393,7 +410,7 @@ fn reserve(f: &Facts, hosts: bool, role: u8, query: u64) -> Vec<u8> {
     let (scope, branch) = *f.path.last().unwrap();
     for (at, v) in [
         (64, if hosts { u16::MAX } else { 1 }),
-        (66, 1),
+        (66, f.subject),
         (68, f.endpoint),
         (70, scope),
         (72, u16::from(!hosts)),
@@ -406,7 +423,13 @@ fn reserve(f: &Facts, hosts: bool, role: u8, query: u64) -> Vec<u8> {
     b[74..80].copy_from_slice(&[
         if hosts { 3 } else { 2 },
         if hosts { 2 } else { 1 },
-        if role == 2 { 17 } else { 6 },
+        if hosts {
+            f.carrier
+        } else if role == 2 {
+            17
+        } else {
+            6
+        },
         3,
         2,
         branch,
@@ -418,7 +441,7 @@ fn reserve(f: &Facts, hosts: bool, role: u8, query: u64) -> Vec<u8> {
     if !hosts {
         b.extend_from_slice(b"physical.invalid");
     }
-    for v in [2, f.endpoint, 1, if hosts { u16::MAX } else { 1 }] {
+    for v in [2, f.endpoint, f.subject, if hosts { u16::MAX } else { 1 }] {
         b.extend_from_slice(&v.to_be_bytes());
     }
     b
@@ -995,7 +1018,7 @@ fn hosts_publish(f: &Facts, observation: u64, query: u64) -> Vec<u8> {
     b[..2].copy_from_slice(&2u16.to_be_bytes());
     for (at, v) in [
         (4, u16::MAX),
-        (6, 1),
+        (6, f.subject),
         (8, f.endpoint),
         (140, f.path.last().unwrap().0),
     ] {
@@ -1008,7 +1031,7 @@ fn hosts_publish(f: &Facts, observation: u64, query: u64) -> Vec<u8> {
     b[76..108].copy_from_slice(&f.reference.asset);
     b[136] = 3;
     b[137] = 2;
-    b[142] = 6;
+    b[142] = f.carrier;
     let t = &mut b[144..];
     t[..8].copy_from_slice(b"DNHOST02");
     t[8..10].copy_from_slice(&2u16.to_be_bytes());
@@ -1027,7 +1050,7 @@ fn hosts_publish(f: &Facts, observation: u64, query: u64) -> Vec<u8> {
         (108, 1),
         (110, key.len() as u16),
         (112, original.len() as u16),
-        (114, 1),
+        (114, f.subject),
         (116, f.endpoint),
         (118, f.path.last().unwrap().0),
         (122, 8443),
@@ -1035,7 +1058,7 @@ fn hosts_publish(f: &Facts, observation: u64, query: u64) -> Vec<u8> {
         t[at..at + 2].copy_from_slice(&v.to_be_bytes());
     }
     t[120] = f.path.last().unwrap().1;
-    t[121] = 6;
+    t[121] = f.carrier;
     b.extend_from_slice(key);
     b.extend_from_slice(original);
     b.extend_from_slice(&0u16.to_be_bytes());
@@ -1462,14 +1485,14 @@ fn numeric_ip_body(f: &Facts, waiter: u64, ip: std::net::IpAddr) -> Vec<u8> {
     b[12..14].copy_from_slice(&8u16.to_be_bytes());
     b[14] = 2;
     b[15] = 3;
-    for v in [2, f.endpoint, 1, u16::MAX] {
+    for v in [2, f.endpoint, f.subject, u16::MAX] {
         b.extend_from_slice(&v.to_be_bytes());
     }
     let (family, bytes) = match ip {
         std::net::IpAddr::V4(ip) => (4, ip.octets().to_vec()),
         std::net::IpAddr::V6(ip) => (6, ip.octets().to_vec()),
     };
-    b.extend_from_slice(&[family, 6]);
+    b.extend_from_slice(&[family, f.carrier]);
     b.extend_from_slice(&8443u16.to_be_bytes());
     b.extend_from_slice(&[bytes.len() as u8, 0, 0]);
     b.extend_from_slice(&bytes);

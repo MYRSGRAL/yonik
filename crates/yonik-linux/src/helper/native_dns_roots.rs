@@ -157,7 +157,7 @@ impl<A: Authority> Issuer<A> {
         for (i, h) in b.hops.iter().enumerate() {
             path[i] = (h.scope, h.branch);
         }
-        let source = self.root_source()?;
+        let source = self.root_source(b.query, c.original.protocol)?;
         let q = self.source_result(
             binding.bundle,
             source.question(
@@ -262,7 +262,13 @@ impl<A: Authority> Issuer<A> {
             .map(|c| c.original)
             .ok_or(ServiceError::Unavailable)
     }
-    fn root_source(&self) -> Result<&dyn Source, ServiceError> {
+    fn root_source(&self, query: u64, carrier: u8) -> Result<&dyn Source, ServiceError> {
+        if carrier == 17 {
+            return self.datagram_source(query);
+        }
+        if carrier != 6 {
+            return Err(ServiceError::Unsupported);
+        }
         self.bootstrap_source
             .as_deref()
             .ok_or(ServiceError::Unsupported)
@@ -287,6 +293,22 @@ impl<A: Authority> Issuer<A> {
         r: Record<'_>,
     ) -> bool {
         match r {
+            Record::DatagramParentBind(v) => return self.datagram_bind_ready(v),
+            Record::BundleAcquire(v) => {
+                if let Ok(Some(selector)) = v.selector() {
+                    if self
+                        .capsule()
+                        .and_then(|cap| {
+                            cap.endpoint(selector.endpoint)
+                                .map(|d| d.protocol)
+                                .map_err(unavailable)
+                        })
+                        .is_ok_and(|p| p == 17)
+                    {
+                        return self.datagram_query(u64_at(v.bytes(), 16)).is_ok();
+                    }
+                }
+            }
             Record::Publish(v) if v.bytes()[137] == 2 => {
                 return self
                     .dns
@@ -368,7 +390,7 @@ impl<A: Authority> Issuer<A> {
         for (i, h) in b.hops.iter().enumerate() {
             path[i] = (h.scope, h.branch);
         }
-        let source = self.root_source()?;
+        let source = self.root_source(b.query, c.original.protocol)?;
         let checked = source.snapshot(self.record, c.reference).and_then(|until| {
             source
                 .parent(
@@ -525,7 +547,13 @@ impl<A: Authority> Issuer<A> {
                 None
             };
         let context = renewing.unwrap_or(0);
-        let source = self.source_result(context, self.root_source())?;
+        let datagram_until = if original.protocol == 17 {
+            Some(self.datagram_context(u64_at(b, 16), &path[..count], renewing)?)
+        } else {
+            None
+        };
+        let source =
+            self.source_result(context, self.root_source(u64_at(b, 16), original.protocol))?;
         let mut expires = self
             .source_result(context, source.snapshot(self.record, reference))?
             .min(
@@ -546,6 +574,9 @@ impl<A: Authority> Issuer<A> {
             )
             .min(session)
             .min(now + Duration::from_nanos(u64_at(b, 40)));
+        if let Some(until) = datagram_until {
+            expires = expires.min(until);
+        }
         let mut peer = None;
         let mut question = None;
         match kind {
@@ -647,6 +678,9 @@ impl<A: Authority> Issuer<A> {
             h.bundle = id;
             h.expires = expires;
         }
+        if original.protocol == 17 {
+            self.datagram_context_committed(u64_at(b, 16), id)?;
+        }
         let previous = self.dns.live.remove(&id);
         self.dns.live.insert(
             id,
@@ -730,6 +764,11 @@ impl<A: Authority> Issuer<A> {
     ) -> Result<super::super::dns_transport::Binding, ServiceError> {
         let b = self.dns.live.get(&id).ok_or(ServiceError::Unavailable)?;
         let c = b.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
+        // Scope5 parent/member contract не повышает CODEC4 wire/release scopes.
+        // NETWORK для datagram требует отдельного reviewed producer counterpart.
+        if c.original.protocol == 17 {
+            return Err(ServiceError::Unsupported);
+        }
         let permit = c.permit.as_ref().ok_or(ServiceError::Unsupported)?;
         let terminal = b.hops.last().ok_or(ServiceError::Unavailable)?;
         Ok(super::super::dns_transport::Binding {
@@ -932,7 +971,7 @@ impl<A: Authority> Issuer<A> {
             .hops
             .clone()
             .into_boxed_slice();
-        let source = self.root_source()?;
+        let source = self.root_source(query, original.protocol)?;
         expires =
             expires.min(self.source_result(context, source.snapshot(self.record, reference))?);
         let choice = self.source_result(
@@ -1041,7 +1080,7 @@ impl<A: Authority> Issuer<A> {
         for (i, h) in o._parent.iter().enumerate() {
             path[i] = (h.scope, h.branch);
         }
-        let source = self.root_source()?;
+        let source = self.root_source(b.query, o._original.protocol)?;
         let choice = self.source_result(
             o.context,
             source.hosts(
@@ -1468,6 +1507,7 @@ enum PermissionOrigin {
     Network(Box<super::super::dns_rrset::NetworkNumericProof>),
 }
 pub(super) struct BootstrapPhysicalPermission {
+    datagram: Option<super::super::dns_datagram::BootstrapDatagramPermission>,
     waiter: u64,
     member: u16,
     origin: PermissionOrigin,
@@ -1556,16 +1596,30 @@ impl<A: Authority> Issuer<A> {
         let waiter = v.waiter().map_err(unavailable)?.get();
         let member = u16_at(v.bytes(), 2);
         let target = Target::copy(v.numeric_destination())?;
+        let datagram = if target.protocol == 17 {
+            Some(self.datagram_permission(self.network_numeric_query(proof)?)?)
+        } else {
+            None
+        };
         let expires = until.min(session).min(started + Duration::from_secs(1));
+        let expires = if let Some(p) = &datagram {
+            expires.min(self.datagram_permission_live(p)?)
+        } else {
+            expires
+        };
         if expires.saturating_duration_since(self.authority.now()) < Duration::from_millis(1) {
             return Err(ServiceError::Unavailable);
         }
         self.bundle_history(1)?;
+        if let Some(p) = &datagram {
+            self.spend_datagram(p)?;
+        }
         let id = Self::id(&mut self.next_grant)?;
         self.consume_network_numeric(proof, request, id)?;
         self.dns.permissions.insert(
             id,
             Box::new(BootstrapPhysicalPermission {
+                datagram,
                 waiter,
                 member,
                 origin: PermissionOrigin::Network(Box::new(proof)),
@@ -1643,7 +1697,7 @@ impl<A: Authority> Issuer<A> {
         for (i, h) in o._parent.iter().enumerate() {
             path[i] = (h.scope, h.branch);
         }
-        let source = self.root_source()?;
+        let source = self.root_source(b.query, o._original.protocol)?;
         let mut selected = self.source_result(
             o.context,
             source.member(
@@ -1723,7 +1777,7 @@ impl<A: Authority> Issuer<A> {
             || member >= o.choice.count
             || target.port != o._original.port
             || target.protocol != o._original.protocol
-            || target.protocol != 6
+            || !matches!(target.protocol, 6 | 17)
             || !super::super::dns_rrset::numeric_ip_allowed(target_ip(target)?)
         {
             return Err(ServiceError::InvalidRequest);
@@ -1751,10 +1805,23 @@ impl<A: Authority> Issuer<A> {
             .expires
             .min(session)
             .min(started + Duration::from_secs(1));
+        let datagram = if target.protocol == 17 {
+            Some(self.datagram_permission(context.query)?)
+        } else {
+            None
+        };
+        let expires = if let Some(p) = &datagram {
+            expires.min(self.datagram_permission_live(p)?)
+        } else {
+            expires
+        };
         if expires.saturating_duration_since(self.authority.now()) < Duration::from_millis(1) {
             return Err(ServiceError::Unavailable);
         }
         self.bundle_history(1)?;
+        if let Some(p) = &datagram {
+            self.spend_datagram(p)?;
+        }
         let id = Self::id(&mut self.next_grant)?;
         self.dns
             .hosts_waiters
@@ -1764,6 +1831,7 @@ impl<A: Authority> Issuer<A> {
         self.dns.permissions.insert(
             id,
             Box::new(BootstrapPhysicalPermission {
+                datagram,
                 waiter,
                 member,
                 origin: PermissionOrigin::Hosts(source_index),
@@ -1824,11 +1892,16 @@ impl<A: Authority> Issuer<A> {
         {
             return Err(ServiceError::Unavailable);
         }
+        let datagram_until = match (&p.datagram, p.target.protocol) {
+            (None, 6) => p.expires,
+            (Some(proof), 17) => self.datagram_permission_live(proof)?.min(p.expires),
+            _ => return Err(ServiceError::Unavailable),
+        };
         let index = match &p.origin {
             PermissionOrigin::Network(proof) => {
                 let until = self
                     .network_permission_live(**proof, p.request, id, p.waiter, p.member, p.target)?
-                    .min(p.expires);
+                    .min(datagram_until);
                 if self.authority.now() >= until {
                     return Err(ServiceError::Unavailable);
                 }
@@ -1854,7 +1927,7 @@ impl<A: Authority> Issuer<A> {
                 .context;
             return self.source_result(context, Err(ServiceError::Unavailable));
         }
-        let until = p.expires.min(selected.expires);
+        let until = datagram_until.min(selected.expires);
         if self.authority.now() >= until {
             return Err(ServiceError::Unavailable);
         }

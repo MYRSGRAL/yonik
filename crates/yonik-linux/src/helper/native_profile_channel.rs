@@ -17,6 +17,8 @@ const RX_BYTES: usize = 256 * 1024;
 mod bootstrap_binding;
 #[path = "native_dns_bundle.rs"]
 mod dns_bundle;
+#[path = "native_dns_datagram.rs"]
+mod dns_datagram;
 #[path = "native_dns_rrset.rs"]
 mod dns_rrset;
 #[path = "native_dns_transport.rs"]
@@ -255,6 +257,13 @@ impl Subject {
     }
 }
 trait Authority: Send {
+    fn datagram_lineage(
+        &self,
+        _: &Self::Ingress,
+        _: u64,
+    ) -> Result<dns_datagram::Lineage, ServiceError> {
+        Err(ServiceError::Unsupported)
+    }
     fn check_bootstrap_permit(&mut self, _: BootstrapDnsRoute) -> Result<(), ServiceError> {
         Err(ServiceError::Unsupported)
     }
@@ -1778,6 +1787,7 @@ impl Drop for HistoryCredit {
     }
 }
 struct Grant {
+    sent: AtomicBool,
     numeric: Option<dns_rrset::NumericBinding>,
     source: u64,
     subject: u16,
@@ -1889,6 +1899,7 @@ impl<'a> RoutePlan<'a> {
     }
 }
 struct Issuer<A: Authority> {
+    datagrams: dns_datagram::Datagrams,
     bootstrap_transcript: Option<Arc<dyn BootstrapDnsTranscript>>,
     bootstrap_dns: Option<Arc<VerifiedBootstrapDnsProducer>>,
     bootstrap_source: Option<Arc<dyn dns_bundle::roots::Source>>,
@@ -1933,6 +1944,7 @@ impl<A: Authority> Issuer<A> {
         let budget = ChannelBudget::new(&capsule, record.mode.required(), &record.binding.digest)?;
         let dns = dns_bundle::Bundles::new(&budget.dynamic)?;
         Ok(Self {
+            datagrams: dns_datagram::Datagrams::new(),
             bootstrap_transcript: None,
             bootstrap_dns: None,
             authority,
@@ -2184,6 +2196,7 @@ impl<A: Authority> Issuer<A> {
                 .and_then(|d| d.next.map(|(s, m)| (s, m, d.endpoint_index)));
             self.fence()?;
             let entry = Grant {
+                sent: AtomicBool::new(false),
                 numeric: None,
                 source: a.source_flow,
                 subject: a.subject,
@@ -2395,6 +2408,7 @@ impl<A: Authority> Issuer<A> {
         if self.close_hosts_permission(id)? {
             return Ok(());
         }
+        self.cancel_datagram_matching(Some(id), None)?;
         self.cancel_dns_root(id, self.services.contains_key(&id))?;
         if let Some(service) = self.services.remove(&id) {
             if let Err(error) = self.release_tickets(&service.tickets) {
@@ -2460,6 +2474,7 @@ impl<A: Authority> Issuer<A> {
         Ok(())
     }
     fn cancel_request(&mut self, request: u64) -> Result<(), ServiceError> {
+        self.cancel_datagram_matching(None, Some(request))?;
         self.rrsets.cancel_request(request);
         if self.unknown {
             return Err(ServiceError::Unavailable);
@@ -2509,6 +2524,18 @@ struct SystemAuthority {
     routes: Box<dyn RouteAuthority>,
 }
 impl Authority for SystemAuthority {
+    fn datagram_lineage(
+        &self,
+        proof: &Self::Ingress,
+        source: u64,
+    ) -> Result<dns_datagram::Lineage, ServiceError> {
+        self.fence()?;
+        proof
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?
+            .proof
+            .datagram_lineage(source)
+    }
     fn check_bootstrap_permit(&mut self, route: BootstrapDnsRoute) -> Result<(), ServiceError> {
         self.fence()?;
         self.routes.check_bootstrap_permit(&self.scope, route)?;
@@ -2700,6 +2727,18 @@ struct LocalAuthority {
     prepared: Arc<crate::host::local_profile_channel::Prepared>,
 }
 impl Authority for LocalAuthority {
+    fn datagram_lineage(
+        &self,
+        proof: &Self::Ingress,
+        source: u64,
+    ) -> Result<dns_datagram::Lineage, ServiceError> {
+        self.fence()?;
+        proof
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?
+            .proof
+            .datagram_lineage(source)
+    }
     fn check_bootstrap_permit(&mut self, route: BootstrapDnsRoute) -> Result<(), ServiceError> {
         self.fence()?;
         let cap = wire::Capsule::decode(self.prepared.capsule.bytes(), &self.peer.config_hash)
@@ -3297,6 +3336,12 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn bootstrap_datagram_producer(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dns_datagram::Producer>>, ServiceError> {
+        Ok(None)
+    }
     fn bootstrap_dns_transcript(
         &self,
         _: LaunchRecord,
@@ -3480,6 +3525,21 @@ fn send_message<A: Authority>(
         )
         .map_err(unavailable)?;
         if socket.write(&bytes[..n])? {
+            if let wire::Message::Grant {
+                status: wire::Status::Allow,
+                grant,
+                flow,
+                ..
+            } = message
+            {
+                if let Some(g) = issuer
+                    .grants
+                    .get(grant)
+                    .filter(|g| g.source == *flow && g.request == reply_to)
+                {
+                    g.sent.store(true, Ordering::Release);
+                }
+            }
             return Ok(());
         }
         socket.writable_until(until);
@@ -3529,6 +3589,7 @@ struct UdpIngressRecord {
     expires: Instant,
 }
 struct UdpBinding {
+    bootstrap_spent: AtomicBool,
     record: UdpIngressRecord,
     principal: Option<Subject>,
     source: std::sync::atomic::AtomicU64,
@@ -4196,6 +4257,7 @@ impl SystemChannel {
                     expires: cycle.deadline,
                 };
                 let binding = Arc::new(UdpBinding {
+                    bootstrap_spent: AtomicBool::new(false),
                     record,
                     principal: control.principal,
                     source: std::sync::atomic::AtomicU64::new(0),
@@ -5223,6 +5285,7 @@ fn run_issuer<A: Authority>(
                 issuer.dns_release = socket.dns_producer(issuer.record)?;
                 issuer.dns_wire = socket.dns_wire_producer(issuer.record)?;
                 issuer.bootstrap_source = socket.bootstrap_source(issuer.record)?;
+                issuer.datagrams.producer = socket.bootstrap_datagram_producer(issuer.record)?;
                 issuer.bootstrap_dns = socket.bootstrap_dns_producer(issuer.record)?;
                 issuer.bootstrap_transcript = socket.bootstrap_dns_transcript(issuer.record)?;
                 issuer.dns_logical = socket.dns_logical_producer(issuer.record)?;
@@ -6441,6 +6504,22 @@ impl SocketProof {
         if let Some(binding) = &self.udp {
             binding.live.store(false, Ordering::Release);
         }
+    }
+    fn datagram_lineage(&self, source: u64) -> Result<dns_datagram::Lineage, ServiceError> {
+        self.validate()?;
+        let binding = self.udp.as_ref().ok_or(ServiceError::Unsupported)?;
+        if self.provenance != 3 || binding.source.load(Ordering::Acquire) != source {
+            return Err(ServiceError::Unsupported);
+        }
+        self.validate_association(self.tuple, binding.record.original.wire())?;
+        let namespace =
+            rustix::fs::fstat(self.namespace.as_ref().ok_or(ServiceError::Unsupported)?)
+                .map_err(unavailable)?;
+        Ok(dns_datagram::Lineage {
+            binding: Arc::clone(binding),
+            launch: self.peer.bound_launch.ok_or(ServiceError::Unsupported)?,
+            namespace: (namespace.st_dev, namespace.st_ino),
+        })
     }
     pub(crate) fn validate_association(
         &self,

@@ -1006,6 +1006,20 @@ fn network_numeric_proof_retains_ids_instead_of_duplicate_binding() {
     assert!(std::mem::size_of::<NetworkNumericProof>() < std::mem::size_of::<Binding>());
 }
 impl<A: Authority> Issuer<A> {
+    pub(super) fn network_numeric_query(
+        &self,
+        proof: NetworkNumericProof,
+    ) -> Result<u64, ServiceError> {
+        let w = self
+            .rrsets
+            .waiters
+            .get(&proof.waiter)
+            .ok_or(ServiceError::Unavailable)?;
+        if w.producer != proof.producer || w.reservation != proof.reservation {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(w.binding.query)
+    }
     fn network_numeric_candidate(
         &self,
         waiter: u64,
@@ -1041,9 +1055,12 @@ impl<A: Authority> Issuer<A> {
         let original = self.network_numeric_original(w.binding, selector)?;
         if target.protocol != original.protocol
             || target.port != original.port
-            || target.protocol != 6
+            || !matches!(target.protocol, 6 | 17)
         {
             return Err(ServiceError::Unsupported);
+        }
+        if target.protocol == 17 {
+            self.datagram_query(w.binding.query)?;
         }
         // Все immutable поля/member/address проверены ДО Source и history debit.
         self.numeric_member(waiter, member, target)?;
@@ -1328,6 +1345,7 @@ impl<A: Authority> Issuer<A> {
         self.grants.insert(
             id,
             Box::new(Grant {
+                sent: AtomicBool::new(false),
                 numeric: Some(NumericBinding {
                     waiter: checked.waiter,
                     member: checked.member,
@@ -1575,7 +1593,12 @@ pub(super) fn dispatch_numeric<A: Authority>(
         )
         .map_err(unavailable)?;
         match socket.write(&bytes[..n]) {
-            Ok(true) => return Ok(()),
+            Ok(true) => {
+                if let Some(g) = issuer.grants.get(&object) {
+                    g.sent.store(true, Ordering::Release);
+                }
+                return Ok(());
+            }
             Ok(false) => {}
             Err(error) => {
                 issuer.unknown = true;

@@ -735,7 +735,19 @@ pub(super) fn negotiate<A: Authority>(
         }
         socket.pause_until(until);
     };
-    let expected = Negotiated::descriptor(issuer.record).map_err(unavailable)?;
+    let datagram = issuer
+        .datagrams
+        .producer
+        .as_ref()
+        .map(|p| p.check(issuer.record))
+        .transpose()?
+        .is_some();
+    let expected = if datagram {
+        Negotiated::datagram_descriptor(issuer.record)
+    } else {
+        Negotiated::descriptor(issuer.record)
+    }
+    .map_err(unavailable)?;
     if descriptor.as_slice() != expected {
         return Err(ServiceError::Unavailable);
     }
@@ -750,8 +762,12 @@ pub(super) fn negotiate<A: Authority>(
         }
         socket.writable_until(until);
     }
-    let neg =
-        Negotiated::accept(&descriptor, &ack, issuer.record, [(0, 0); 2]).map_err(unavailable)?;
+    let neg = if datagram {
+        Negotiated::accept_datagram(&descriptor, &ack, issuer.record, [(0, 0); 2])
+    } else {
+        Negotiated::accept(&descriptor, &ack, issuer.record, [(0, 0); 2])
+    }
+    .map_err(unavailable)?;
     socket.dns_committed(neg)?;
     Ok(neg)
 }
@@ -809,6 +825,22 @@ pub(super) fn dispatch<A: Authority>(
     let mut body = [0; 64];
     body[..2].copy_from_slice(&2u16.to_be_bytes());
     let op = match frame.record {
+        Record::DatagramParentBind(view) => {
+            if !issuer.unknown {
+                drain(issuer)?;
+            }
+            match issuer.bind_datagram_parent(reply, view, session) {
+                Ok(id) => {
+                    body[2] = 1;
+                    body[8..16].copy_from_slice(&id.to_be_bytes());
+                    body[16..48].copy_from_slice(&view.bytes()[16..48]);
+                    body[32..40].copy_from_slice(&view.bytes()[8..16]);
+                    body[52..55].copy_from_slice(&view.bytes()[48..51]);
+                }
+                Err(_) => body[2] = if issuer.unknown { 3 } else { 2 },
+            }
+            Operation::DatagramParentBound
+        }
         Record::BundleAcquire(view) => {
             if !matches!(
                 view.root().map_err(unavailable)?,
@@ -841,7 +873,7 @@ pub(super) fn dispatch<A: Authority>(
             }
             Operation::BundleGranted
         }
-        Record::Cancel(view) if matches!(view.bytes()[2], 1..=8) => {
+        Record::Cancel(view) if matches!(view.bytes()[2], 1..=9) => {
             let (target, id) = cancel_fields(view);
             body[2] = if cancel(issuer, reply, target, id).is_ok() {
                 1
@@ -887,6 +919,26 @@ pub(super) fn dispatch<A: Authority>(
                 body[2] = 2;
             }
         }
+        if op == Operation::DatagramParentBound && body[2] == 1 {
+            let id = u64_at(&body, 8);
+            if let Ok(until) = issuer.datagram_parent_live(id, false) {
+                let remaining = until
+                    .saturating_duration_since(issuer.authority.now())
+                    .as_millis()
+                    .min(1000) as u32;
+                if remaining > 0 {
+                    body[48..52].copy_from_slice(&remaining.to_be_bytes());
+                } else {
+                    issuer.cancel_datagram_parent(id)?;
+                    body[2..].fill(0);
+                    body[2] = 2;
+                }
+            } else {
+                issuer.cancel_datagram_parent(id)?;
+                body[2..].fill(0);
+                body[2] = 2;
+            }
+        }
         let len = if op == Operation::Canceled { 32 } else { 64 };
         let record = Record::decode(op, &body[..len]).map_err(unavailable)?;
         let mut out = [0; 192];
@@ -909,6 +961,9 @@ pub(super) fn dispatch<A: Authority>(
             }
         };
         if sent {
+            if op == Operation::DatagramParentBound && body[2] == 1 {
+                issuer.ack_datagram_parent(u64_at(&body, 8))?;
+            }
             if op == Operation::BundleGranted && body[2] == 1 {
                 if let Some(c) = issuer
                     .dns
@@ -934,6 +989,7 @@ pub(super) fn cancel<A: Authority>(
     id: u64,
 ) -> Result<(), ServiceError> {
     match target {
+        9 => issuer.cancel_datagram_parent(id),
         8 => issuer.cancel_dns_bundle(id),
         1 if id < sequence => issuer.cancel_request(id),
         2..=4 => super::dns_transport::cancel(issuer, target, id),

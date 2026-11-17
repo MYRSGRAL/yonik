@@ -1880,3 +1880,64 @@ Method/password связываются final config digest, а не transport fi
 Actual Local prepare fake boundary и общий Local/System dispatcher проверяют
 отказ с нулём capture/image effects даже с injected three-scope reviewed image.
 Это SOURCE/PURE prerequisite, не France runtime/installed readiness.
+
+## CODEC5 UDP HOSTS issuer: отдельная lineage и member permission
+
+Canonical protocol prerequisite: `bootstrap-datagram-codec5.md`, commit350b720;
+corpus `dns-v2-codec5.json`, SHA256
+`a9f2e5f5517b72c97e4b7243a4dac9e590e885b50913a44249a393f0270d6116`.
+Numeric42 use2 уже кодирует protocol17, но CODEC4 context55 не связывает его с
+конкретным USER packet. Поэтому CODEC5 отдельно добавляет57/58 и cancel target9,
+без изменения42/55/19. Legacy4 не принимает57/58/target9 и не downgrade-ится.
+
+`native_dns_datagram.rs::Producer` — закрытый независимый scope5
+`udp-bootstrap-consumed-parent-member-send-v1`; `REVIEWED_DATAGRAM_PATCH=None`.
+`Channel::bootstrap_datagram_producer` по умолчанию None. Negotiation5 возможна
+только при проверенном exact launch/schema/contract producer, иначе fail before
+ACK. Старые Source4/Wire4/Release4/UDP ingress pins scope5 не mint-ят. Protected
+registry/build grammar и реальные Go producer/capability5 этой правкой не созданы.
+Положительные producer facts доступны только cfg(test), не через UI/env/JSON bool.
+
+Actual serialized `dns_bundle::dispatch` обрабатывает57→58; parent binding требует
+действительно отправленного USER class1 GRANT, immutable SourceFlow и scope/path,
+revision/epoch/subject и отдельного retained R9/R23/R25 Consumed UDP binding.
+`Authority::datagram_lineage` у Local/System использует held SocketProof validation,
+provenance3/actual UDP association, source ID, principal и retained namespace FD.
+TCP control proof, class3 grant или child cookie не заменяют этот proof. USER grant
+ACK watermark публикуется только после успешного channel send (включая USER Numeric
+caller); Source/service путь не выполняет нового USER owner lookup. System сохраняет
+original Known expiry≤20ms, Local attribution не получает.
+
+Для single SS raw UDP canonical scope имеет input/carrier17, terminal action1,
+subject kind2, no next и streamFFFF: TCP stream к packet carrier не применяется.
+Это не разрешение неизвестных SS settings; whole-profile DATA predicate/readiness
+и legitimate image/producer proof остаются независимыми и закрытыми для FranceSS.
+
+ACKed parent query связывает ровно один initial context55 и exact single checked
+physical path. Source5 revalidation выполняется перед observation/Publish/member
+и после backend/send; query/parent IDs не переиспользуются, history256 общая.
+`BootstrapDatagramPermission` удерживается отдельно от TCP carrier evidence в
+retained permission: parent/query/source/epoch плюс immutable member/selector/
+snapshot/full physical frontier в permission origin. HOSTS42 выбирает exact member,
+после capacity/immutable checks atomically тратит один Consumed packet и waiter,
+устанавливает mandatory durable UDP member route и только затем публикует19.
+Неверный member/port/carrier, replay, stale parent/source и cancellation не дают
+повторной попытки. DNS transport authority этим не выдаётся.
+
+Parent/source/request cancellation закрывает dependent context и permission route
+до KnownClosed; соседний SourceFlow остаётся самостоятельным. Uncertain durable
+release сохраняет sticky Unknown, binding/lineage/credits, без повторного cleanup.
+Map allocations предварительно оплачены; общие FD64/pending64/8MiB/history256 и
+route cap не повышены. Tombstones удерживают memory debit до конца invocation.
+
+SOURCE/PURE coverage использует actual run_issuer/setup/57/58/55/35/40/53/42/19 и
+retirement, injected Source/owner/route facts. USER ingress admission и kernel
+Consumed matcher здесь явно preseed leaf facts; никакого actual UDP socket/FD,
+SCM/kernel/Go5/runtime acceptance эти тесты не доказывают.
+
+Remaining: Go consuming57/58→private UDP parent/member/send/retire conjunction,
+reviewed independent protected scope5 record/factory и exact image/launch mint;
+NETWORK UDP требует отдельно reviewed transcript/consuming-close scope5, поэтому
+`bootstrap_binding` отклоняет carrier17 ДО transport binding/Connect. Старые TCP
+wire/release contracts не переиспользуются. FranceSS readiness/public flags остаются
+Unsupported/false; SS UDP не вырезан из graph/config и не заменён TCP permission.

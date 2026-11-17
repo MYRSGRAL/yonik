@@ -74,6 +74,13 @@ pub(crate) mod dns_v2 {
         }
     }
     impl Operation {
+        pub(crate) fn legacy(value: u16) -> Result<Self> {
+            let op = Self::try_from(value)?;
+            if matches!(op, Self::DatagramParentBind | Self::DatagramParentBound) {
+                return Err(Error::Schema);
+            }
+            Ok(op)
+        }
         pub(crate) fn is_reply(self) -> bool {
             matches!(
                 self,
@@ -672,7 +679,16 @@ pub(crate) mod dns_v2 {
         DatagramParentBound(View<'a, 58>),
     }
     impl<'a> Record<'a> {
+        pub(crate) fn decode_datagram(op: Operation, b: &'a [u8]) -> Result<Self> {
+            if op == Operation::Cancel && b.get(2) == Some(&9) {
+                return Ok(Self::Cancel(View::decode(b)?));
+            }
+            Self::decode(op, b)
+        }
         pub(crate) fn decode(op: Operation, b: &'a [u8]) -> Result<Self> {
+            if op == Operation::Cancel && b.get(2) == Some(&9) {
+                return Err(Error::Reference);
+            }
             Ok(match op {
                 Operation::Reserve => Self::Reserve(View::decode(b)?),
                 Operation::Reserved => Self::Reserved(View::decode(b)?),
@@ -993,7 +1009,11 @@ pub(crate) mod dns_v2 {
             if !(128..=65536).contains(&bytes.len()) {
                 return Err(Error::Bounds);
             }
-            let op = Operation::try_from(n16(bytes, 10))?;
+            let op = if neg.datagram {
+                Operation::try_from(n16(bytes, 10))
+            } else {
+                Operation::legacy(n16(bytes, 10))
+            }?;
             if op == Operation::PhysicalBind {
                 return Err(Error::Schema);
             }
@@ -1019,7 +1039,11 @@ pub(crate) mod dns_v2 {
             {
                 return Err(Error::Binding);
             }
-            let record = Record::decode(op, &bytes[128..])?;
+            let record = if neg.datagram {
+                Record::decode_datagram(op, &bytes[128..])
+            } else {
+                Record::decode(op, &bytes[128..])
+            }?;
             neg.record_allowed(record)?;
             if record
                 .source_epoch()
@@ -3801,6 +3825,10 @@ impl<'a> Capsule<'a> {
         let row = self.tables[3].row(index)?;
         Ok((row[0], row[1]))
     }
+    /// Только closed DATA enum Table1; не producer/flow authority.
+    pub(crate) fn subject_kind(&self, index: u16) -> Result<u8> {
+        Ok(subject(self.tables[0].row(index)?)?.kind)
+    }
     pub(crate) fn probe_scope(&self, index: u16, subject: u16) -> Result<ProbeScope<'_>> {
         self.validate_request(&Message::Probe {
             purpose: 1,
@@ -5713,6 +5741,10 @@ mod tests {
                 };
                 let reply = op.is_reply().then_some(9);
                 let frame = DnsFrame::decode(&frame_bytes, &neg, direction, 0, 0, reply).unwrap();
+                assert_eq!(Record::decode_datagram(op, &body).unwrap().bytes(), body);
+                if op == Operation::Cancel {
+                    assert!(Record::decode(op, &body).is_err());
+                }
                 assert_eq!(frame.record.bytes(), body);
                 let mut encoded = vec![0; frame_bytes.len()];
                 assert_eq!(frame.encode(&neg, &mut encoded).unwrap(), frame_bytes.len());
@@ -5721,13 +5753,13 @@ mod tests {
                 assert!(frame.encode(&legacy, &mut encoded).is_err());
                 assert!(DnsFrame::decode(&frame_bytes, &neg, direction, 1, 0, reply).is_err());
                 for length in 0..body.len() {
-                    assert!(Record::decode(op, &body[..length]).is_err());
+                    assert!(Record::decode_datagram(op, &body[..length]).is_err());
                 }
             }
         }
         for vector in corpus["rejectedBodies"].as_array().unwrap() {
             assert!(
-                Record::decode(
+                Record::decode_datagram(
                     Operation::try_from(vector["kind"].as_u64().unwrap() as u16).unwrap(),
                     &dns_v2_hex(vector["bodyHex"].as_str().unwrap())
                 )
@@ -6378,7 +6410,7 @@ mod tests {
             }
         }
         for n in [0, 1, 34, 49, 50, 51, 57, 65535] {
-            assert!(Operation::try_from(n).is_err());
+            assert!(Operation::legacy(n).is_err());
         }
         let mut waiter = [0; 64];
         waiter[1] = 2;
