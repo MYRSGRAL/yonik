@@ -20,6 +20,32 @@ import build_native_adapter as builder  # noqa: E402
 
 
 class BuilderTests(unittest.TestCase):
+    def test_bootstrap_candidate_is_independent_compile_only_metadata(self) -> None:
+        original = {"elf_sha256": "11" * 32, "patch_sha256": "44" * 32}
+        candidate = builder.bootstrap_candidate(original)
+        self.assertFalse(candidate["install_authority"])
+        self.assertTrue(candidate["requires_independent_scope_review"])
+        self.assertEqual(candidate["validation"], "COMPILE_ONLY_CANDIDATE")
+        record = candidate["candidate_record"]
+        self.assertEqual(record["elf_sha256"], original["elf_sha256"])
+        self.assertEqual(record["patch_sha256"], original["patch_sha256"])
+        for slot, contract in (
+            ("bootstrap_source", "captured-netgo-bootstrap-parent-member-v1"),
+            ("bootstrap_dns_wire", "bootstrap-direct-dns-bound-request-response-v1"),
+            ("bootstrap_dns_release", "bootstrap-direct-dns-consuming-close-join-v1"),
+        ):
+            self.assertNotIn(slot, original)
+            self.assertEqual(record[slot]["contract"], contract)
+            self.assertEqual(record[slot]["version"], 1)
+            self.assertEqual(
+                record[slot]["contract_sha256"],
+                hashlib.sha256(contract.encode() + b"\0").hexdigest(),
+            )
+            self.assertEqual(
+                record[slot]["schema_sha256"],
+                hashlib.sha256(b"YONIK-DNS-V2-CODEC-4\0").hexdigest(),
+            )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="yonik-builder-test-")
         self.addCleanup(self.temporary.cleanup)
@@ -331,6 +357,20 @@ class BuilderTests(unittest.TestCase):
             hashlib.sha256(b"YONIK-DNS-V2-CODEC-3\0").hexdigest(),
         )
         self.assertNotIn("dns_wire", record)
+        bootstrap = json.loads(
+            (self.output / "native-profile-bootstrap-candidate.json").read_text()
+        )
+        self.assertFalse(bootstrap["install_authority"])
+        self.assertTrue(bootstrap["requires_independent_scope_review"])
+        for slot in ("bootstrap_source", "bootstrap_dns_wire", "bootstrap_dns_release"):
+            self.assertNotIn(slot, record)
+            self.assertEqual(
+                bootstrap["candidate_record"][slot]["schema_sha256"],
+                hashlib.sha256(b"YONIK-DNS-V2-CODEC-4\0").hexdigest(),
+            )
+        self.assertEqual(
+            bootstrap["candidate_record"]["elf_sha256"], record["elf_sha256"]
+        )
         self.assertEqual(
             record["builder_sha256"], original_hash(Path(builder.__file__))
         )

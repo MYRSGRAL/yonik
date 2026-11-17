@@ -832,6 +832,35 @@ impl<A: Authority> Issuer<A> {
             .map(|p| p.producer_sequence)
             .ok_or(ServiceError::Unavailable)
     }
+    pub(super) fn dns_lifetime_anchor(
+        &self,
+        id: u64,
+        revision: u64,
+        exchange: u64,
+        binding: Binding,
+    ) -> Result<Instant, ServiceError> {
+        let p = self
+            .transport
+            .proofs
+            .get(&id)
+            .ok_or(ServiceError::Unavailable)?;
+        if p.binding != binding
+            || p.revision != revision
+            || p.exchange != exchange
+            || !p.acked
+            || p.pending_append.is_some()
+            || p.retired == Some(false)
+            || p.retired == Some(true) && !p.release_acked
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        self.transport
+            .reservations
+            .values()
+            .find(|r| r.role == 1 && r.exchange == exchange && r.binding == binding)
+            .map(|r| r.started)
+            .ok_or(ServiceError::Unavailable)
+    }
     pub(super) fn dns_frozen_revision(
         &self,
         id: u64,

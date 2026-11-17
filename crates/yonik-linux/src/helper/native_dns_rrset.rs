@@ -208,7 +208,7 @@ pub(super) fn numeric_ip_allowed(ip: IpAddr) -> bool {
         && !matches!(ip,IpAddr::V6(ip) if ip.is_unicast_link_local())
 }
 // Все scratch buffers заранее учтены caller; parser не аллоцирует.
-const SCRATCH: usize =
+pub(super) const SCRATCH: usize =
     std::mem::size_of::<Answer>() + (CHAIN + 4) * std::mem::size_of::<Name>() + 4096;
 fn parse(
     request: &[u8],
@@ -351,6 +351,16 @@ fn parse(
     Ok(result)
 }
 
+pub(super) fn verify_bootstrap_capture(
+    request: &[u8],
+    response: &[u8],
+    lookup: &[u8],
+    qtype: u16,
+    options: u16,
+    payload: u16,
+) -> Result<(), ServiceError> {
+    parse(request, response, lookup, qtype, options, payload).map(|_| ())
+}
 struct Producer {
     bootstrap: Option<Box<BootstrapPublication>>,
     binding: Binding,
@@ -542,6 +552,12 @@ impl<A: Authority> Issuer<A> {
         let q = usize::from(n16(b, 108));
         let r = usize::from(n16(b, 110));
         let receipt = super::BootstrapDnsReceipt {
+            lifetime_anchor: self.dns_lifetime_anchor(
+                n64(b, 120),
+                n64(b, 128),
+                n64(b, 28),
+                binding,
+            )?,
             binding,
             proof: n64(b, 120),
             revision: n64(b, 128),

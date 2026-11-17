@@ -11,7 +11,7 @@ pub(in crate::helper::native_profile_channel) struct Parent<'a> {
 }
 impl Parent<'_> {
     // Ограничивает callback DATA; actual parent/custody проверяет только Source.
-    fn checked(self) -> Result<Self, ServiceError> {
+    pub(in crate::helper::native_profile_channel) fn checked(self) -> Result<Self, ServiceError> {
         self.launch.encode().map_err(unavailable)?;
         let kind_matches = match self.root {
             wire::dns_v2::Root::BootstrapService(_) => self.selector.resolver.is_some(),
@@ -55,8 +55,8 @@ pub(in crate::helper::native_profile_channel) struct Member {
     pub address: std::net::IpAddr,
     pub expires: Instant,
 }
-/// Trusted CODEC4 bootstrap/choice + retained source custody. Production factory
-/// пока None: DirectUserDns record не разрешает реализацию этого scope.
+/// Trusted CODEC4 choice/parent contract + retained source custody.
+/// Production binding требует отдельного protected Source record/review pin.
 pub(in crate::helper::native_profile_channel) trait Source:
     Send + Sync
 {
@@ -2059,4 +2059,4 @@ pub(in crate::helper::native_profile_channel) fn dispatch_hosts_numeric<A: Autho
 }
 #[cfg(test)]
 #[path = "native_dns_roots_tests.rs"]
-mod tests;
+pub(in crate::helper::native_profile_channel) mod tests;

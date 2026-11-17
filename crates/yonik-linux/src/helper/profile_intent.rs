@@ -1402,11 +1402,42 @@ pub struct PinnedResolverSnapshot {
     _memory: super::memory::ByteLease,
 }
 impl PinnedResolverSnapshot {
+    #[cfg(test)]
+    pub(crate) fn fixture_lookup_data<'a>(
+        asset: &'a [u8],
+        peers: &'a [SocketAddr],
+        reference: crate::profile_channel::SnapshotRef,
+        original: &'a str,
+        epoch: u64,
+        family: LookupFamily,
+        budget: &super::memory::ByteBudget,
+    ) -> Result<ResolverLookupPlan<'a>, EgressError> {
+        resolver_snapshot_lookup::plan(
+            resolver_snapshot_lookup::Captured {
+                asset,
+                peers,
+                reference,
+                epoch,
+            },
+            original,
+            family,
+            budget,
+        )
+    }
     fn lookup_data<'a>(
         &'a self,
         original: &'a str,
         epoch: u64,
         family: LookupFamily,
+    ) -> Result<ResolverLookupPlan<'a>, EgressError> {
+        self.retained_lookup_data(original, epoch, family, super::memory::config_budget())
+    }
+    pub(crate) fn retained_lookup_data<'a>(
+        &'a self,
+        original: &'a str,
+        epoch: u64,
+        family: LookupFamily,
+        budget: &super::memory::ByteBudget,
     ) -> Result<ResolverLookupPlan<'a>, EgressError> {
         if self.invalid.load(std::sync::atomic::Ordering::Acquire) {
             return Err(EgressError::Stale);
@@ -1420,7 +1451,7 @@ impl PinnedResolverSnapshot {
             },
             original,
             family,
-            super::memory::config_budget(),
+            budget,
         )
     }
     pub(crate) fn server_endpoints(&self) -> &[SocketAddr] {
