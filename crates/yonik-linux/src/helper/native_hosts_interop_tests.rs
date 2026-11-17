@@ -116,18 +116,19 @@ fn pure_stateful_hosts_stdio_bridge() {
         return;
     }
     let digest: [u8; 32] = Sha256::digest(b"{}").into();
-    let (mut issuer, f) = fixture_digest(
-        Mode::Local,
-        "203.0.113.80".parse().unwrap(),
-        1,
-        true,
-        digest,
-    );
+    let case = std::env::var("YONIK_INTEROP_CASE").unwrap_or_default();
+    let mode = if case.starts_with("system-") {
+        Mode::System
+    } else {
+        Mode::Local
+    };
+    let (mut issuer, f) = fixture_digest(mode, "203.0.113.80".parse().unwrap(), 1, true, digest);
     // Исходный USER grant id=1 preseeded на Go стороне; его issuer allocator
     // обязан иметь тот же watermark, иначе permission alias-ится с parent.
     issuer.next_grant = 1;
     emit(
-        serde_json::json!({"init":{"launch":hex(&f.launch.encode().unwrap()),"snapshot":hex(&f.asset),"config":"7b7d","path":f.path,"subject":f.subject}}),
+        serde_json::json!({"init":{"launch":hex(&f.launch.encode().unwrap()),"snapshot":hex(&f.asset),"config":"7b7d","path":f.path,"subject":f.subject,
+            "user":{"grant":1,"flow":1,"revision":1,"owner_kind":if mode.required(){2}else{0},"owner_id":if mode.required(){77}else{0},"known_ns":if mode.required(){20_000_000}else{0}}}}),
     );
     let source = super::super::super::super::bootstrap_binding::tests::interop_source(
         issuer.capsule.clone(),

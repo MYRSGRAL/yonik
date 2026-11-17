@@ -52,6 +52,30 @@ actual Go consumer — завершить caller без factory и выполн�
 До Numeric ACK положительный прогон также вызывает actual physical gate и
 проверяет отсутствие factory effects.
 
+## System HOSTS без System runtime
+
+`--case system-positive` использует System capsule/`YNKEXT01` с теми же
+snapshot/config/path на обеих сторонах. В init явно передаются USER grant/flow
+watermark=1, policy revision=1, owner kind=2/id=77 и исходный Known=20ms.
+Go проверяет совпадение всего preseed, использует fake proof-channel liveness и
+authenticated setup credentials UID0; actual peer/kernel/OS producers пропущены.
+Rust flow0 Source/backend по-прежнему не вызывает USER owner lookup.
+
+`--case system-parent-expired` сначала получает реальные ACK вплоть до Numeric
+permission. Пока fake clock неподвижен, проверяет live parent, Source capability
+и permission. Caller приостановлен до physical factory; fake clock сдвигается
+ровно к исходному Known expiry (20ms), без wallclock sleep/renewal. Actual
+`ProfileDialBootstrap` обязан отказать до factory; parent deadline не продлевается.
+Derived leases также ограничены исходным Known, поэтому тест не разделяет
+отдельные причины отказа conjunction. Permission/DATA pointers не являются
+authority после expiry. Одна ранее разрешённая route уже установлена и затем
+retired через Close/cancel ACK; ожидаются routes=1, factory=0, owner lookups=0.
+Это consumer-clock expiry test, не проверка kernel freshness и не System runtime.
+
+Queued cancellation/late ACK не добавлены в этот bounded System cut. Cleanup
+Unknown не преобразуется в KnownClosed: тест принимает только фактически
+полученные ответы issuer и проверяет terminal custody, как в Local прогоне.
+
 R77: stdin и stdout nonblocking, selector обслуживает чтение и очередь частичных
 записей с тем же absolute deadline. Pending write budget≤8MiB; stop frame проходит
 через ту же очередь. Нечитающий peer не блокирует timeout/finally. Отдельные pure

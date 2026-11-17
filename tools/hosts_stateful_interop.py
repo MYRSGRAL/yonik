@@ -113,6 +113,12 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                             raise ValueError("oversized packet")
                         trace.append({"side": side, "packet": packet.hex()})
                     elif "init" in value:
+                        if case.startswith("system-"):
+                            launch = bytes.fromhex(value["init"]["launch"])
+                            if len(launch) != 192 or launch[:8] != b"YNKEXT01":
+                                raise AssertionError(
+                                    "System case requires exact System launch fixture"
+                                )
                         trace.append({"side": side, "init": value["init"]})
                     else:
                         done[side] = value
@@ -127,7 +133,8 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
         }
         if any(codes.values()) or not all(s in done for s in children):
             raise AssertionError(f"counterpart failed: {codes}; trace={trace[-12:]}")
-        expected = int(case == "positive")
+        expected = int(case in ("positive", "system-positive"))
+        expected_routes = int(case != "foreign-member")
         go_result, rust_result = done["go"], done["rust"]
         if (
             not go_result.get("go_done")
@@ -135,8 +142,15 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
             or go_result.get("attempts") != expected
             or go_result.get("kinds", [])[:7] != [55, 35, 40, 55, 35, 53, 42]
             or not rust_result.get("rust_done")
-            or rust_result.get("routes") != expected
+            or rust_result.get("routes") != expected_routes
             or rust_result.get("owners") != 0
+            or case.startswith("system-")
+            and go_result.get("mode") != 2
+            or case == "system-parent-expired"
+            and not (
+                go_result.get("parent_expired")
+                and go_result.get("permission_before_expiry")
+            )
         ):
             raise AssertionError(f"incomplete actor roundtrip: {done}")
         return {
@@ -170,7 +184,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=15)
     parser.add_argument(
-        "--case", choices=("positive", "foreign-member"), default="positive"
+        "--case",
+        choices=(
+            "positive",
+            "foreign-member",
+            "system-positive",
+            "system-parent-expired",
+        ),
+        default="positive",
     )
     args = parser.parse_args()
     if not 0 < args.timeout <= 60:
