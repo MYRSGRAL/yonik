@@ -5,6 +5,8 @@ use std::{
     cell::{Cell, RefCell},
     io::{BufRead, Read, Write},
 };
+#[path = "native_datagram_interop_tests.rs"]
+mod datagram;
 
 fn emit(value: serde_json::Value) {
     let mut out = std::io::stdout().lock();
@@ -54,7 +56,8 @@ struct Stdio {
     closed: Arc<AtomicUsize>,
     permit: Arc<AtomicBool>,
     no_permit: bool,
-    source: Arc<dyn Source>,
+    source: Option<Arc<dyn Source>>,
+    datagram: Option<Arc<super::super::super::super::dns_datagram::Producer>>,
     // recvmsg заменён framed stdin; после read drain обязан видеть пустую очередь.
     before_reply: Cell<bool>,
     slots: Arc<SidebandCredits>,
@@ -83,6 +86,12 @@ impl super::super::super::super::BootstrapDnsTranscript for TraceTranscript {
     }
 }
 impl Channel for Stdio {
+    fn bootstrap_datagram_producer(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<super::super::super::super::dns_datagram::Producer>>, ServiceError> {
+        Ok(self.datagram.clone())
+    }
     fn bootstrap_dns_transcript(
         &self,
         _: LaunchRecord,
@@ -106,7 +115,7 @@ impl Channel for Stdio {
         Ok(self.inbox.borrow_mut().pop_front())
     }
     fn bootstrap_source(&self, _: LaunchRecord) -> Result<Option<Arc<dyn Source>>, ServiceError> {
-        Ok(Some(self.source.clone()))
+        Ok(self.source.clone())
     }
     fn dns_slots(&self) -> Result<Arc<SidebandCredits>, ServiceError> {
         Ok(self.slots.clone())
@@ -224,6 +233,10 @@ fn pure_stateful_hosts_stdio_bridge() {
     }
     let digest: [u8; 32] = Sha256::digest(b"{}").into();
     let case = std::env::var("YONIK_INTEROP_CASE").unwrap_or_default();
+    if case.contains("udp-hosts-") {
+        datagram::run(&case);
+        return;
+    }
     let network = case.starts_with("network-");
     let mode = if case.starts_with("system-") {
         Mode::System
@@ -265,7 +278,8 @@ fn pure_stateful_hosts_stdio_bridge() {
     let closed = Arc::new(AtomicUsize::new(0));
     let io = Stdio {
         diagnostic: binding.clone(),
-        source: binding.source().unwrap(),
+        source: binding.source(),
+        datagram: None,
         record: f.launch,
         budget: issuer.budget.clone(),
         inbox: Default::default(),

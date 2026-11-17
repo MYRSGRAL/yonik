@@ -98,6 +98,76 @@ def check_network_cleanup(trace: list[dict[str, object]]) -> int:
     return closed
 
 
+def check_datagram_cleanup(trace: list[dict[str, object]]) -> int:
+    """Каждый real ACK58 требует cancel9 ACK после ACK собственных contexts."""
+    pending: dict[int, tuple[int, bytes]] = {}
+    parents: dict[int, int] = {}
+    contexts: dict[int, int] = {}
+    required: set[tuple[int, int]] = set()
+    acknowledged: set[tuple[int, int]] = set()
+
+    def number(b: bytes, at: int) -> int:
+        if len(b) < at + 8:
+            raise AssertionError("truncated UDP cleanup field")
+        return int.from_bytes(b[at : at + 8], "big")
+
+    for event in trace:
+        if "packet" not in event:
+            continue
+        raw = bytes.fromhex(str(event["packet"]))
+        if raw[:8] != b"YNKCAP01":
+            continue
+        if len(raw) < 128 or int.from_bytes(raw[12:16], "big") != len(raw):
+            raise AssertionError("invalid UDP frame")
+        kind = int.from_bytes(raw[10:12], "big")
+        body = raw[128:]
+        if event["side"] == "go":
+            pending[number(raw, 16)] = (kind, body)
+            if (
+                kind == 32
+                and number(body, 4) == 1
+                and any((9, parent) not in acknowledged for parent in parents)
+            ):
+                raise AssertionError("USER Close32 before owned parent ACK9")
+            if kind == 47 and len(body) >= 16 and body[2] == 9:
+                parent = number(body, 8)
+                if parent not in parents or any(
+                    query == parents[parent] and (8, context) not in acknowledged
+                    for context, query in contexts.items()
+                ):
+                    raise AssertionError("cancel9 before own context ACK")
+            continue
+        request = pending.get(number(raw, 24))
+        if request is None:
+            continue
+        sent_kind, sent = request
+        if kind == 19 and body[:1] == b"\x01" and sent_kind == 42:
+            required.add((0, number(body, 4)))
+        if kind == 34 and body[:2] == b"\x03\x01" and sent_kind == 32:
+            acknowledged.add((0, number(body, 4)))
+        if len(body) < 3 or body[2] != 1:
+            continue
+        if kind == 58 and sent_kind == 57:
+            parents[number(body, 8)] = number(sent, 8)
+            required.add((9, number(body, 8)))
+        elif kind == 56 and sent_kind == 55:
+            contexts[number(body, 8)] = number(sent, 16)
+            required.add((8, number(body, 8)))
+        elif kind == 36 and sent_kind == 35:
+            required.add((7, number(body, 8)))
+        elif kind == 41 and sent_kind == 40:
+            required.add((5, number(body, 8)))
+        elif kind == 54 and sent_kind == 53:
+            required.add((6, number(body, 8)))
+        elif kind == 48 and sent_kind == 47:
+            if number(body, 8) != number(sent, 8):
+                raise AssertionError("UDP cancel ACK ID mismatch")
+            acknowledged.add((sent[2], number(body, 8)))
+    if len(parents) != 2 or required - acknowledged:
+        raise AssertionError(f"missing UDP cleanup ACK: {required - acknowledged}")
+    return len(required)
+
+
 def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
     env = os.environ | {"YONIK_PURE_INTEROP": "1", "YONIK_INTEROP_CASE": case}
     commands = {
@@ -107,7 +177,13 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
             "--quiet",
             "--nocapture",
         ],
-        "go": [str(go), "-test.run=^TestPureStatefulHostsStdioBridge$", "-test.v"],
+        "go": [
+            str(go),
+            "-test.run=^TestPureStatefulDatagramHostsSSStdioBridge$"
+            if "udp-hosts-" in case
+            else "-test.run=^TestPureStatefulHostsStdioBridge$",
+            "-test.v",
+        ],
     }
     # Rust test name содержит module path; filter уникален и проверен summary.
     children: dict[str, subprocess.Popen[bytes]] = {}
@@ -224,6 +300,46 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
         if any(codes.values()) or not all(s in done for s in children):
             raise AssertionError(f"counterpart failed: {codes}; trace={trace[-12:]}")
         network = case.startswith("network-")
+        datagram = "udp-hosts-" in case
+        if datagram:
+            negative = case.endswith(("foreign-member", "parent-cancel"))
+            expected = int(not negative)
+            go_result, rust_result = done["go"], done["rust"]
+            if (
+                not go_result.get("cleanup")
+                or not go_result.get("ss_consumer")
+                or go_result.get("retained_operations")
+                != go_result.get("preseed_operations")
+                or go_result.get("attempts") != expected
+                or go_result.get("sends") != expected
+                or go_result.get("socket_closes") != expected
+                or go_result.get("tasks_joined") != 2 * expected
+                or go_result.get("kinds", [])[:9]
+                != [57, 55, 35, 40, 57, 55, 35, 53, 42]
+                or not rust_result.get("rust_done")
+                or rust_result.get("routes")
+                != (1 if case.endswith("foreign-member") else 2)
+                or rust_result.get("owners") != rust_result.get("preseed_owners")
+                or len(rust_result.get("retained_routes", []))
+                != int(not case.endswith("parent-cancel"))
+                or rust_result.get("contexts") != 0
+                or rust_result.get("services")
+                or rust_result.get("unknown")
+                or case.startswith("system-")
+                and go_result.get("mode") != 2
+                or case.endswith("replay")
+                and not go_result.get("replay_rejected")
+            ):
+                raise AssertionError(f"incomplete UDP actor roundtrip: {done}")
+            return {
+                "classification": "PURE_STATEFUL_INTEROP",
+                "case": case,
+                "commands": commands,
+                "codes": codes,
+                "results": done,
+                "datagram_cleanup_barriers": check_datagram_cleanup(trace),
+                "trace": trace,
+            }
         expected = int(case in ("positive", "system-positive", "network-positive"))
         expected_routes = (
             (5 if case == "network-positive" else 2)
@@ -321,6 +437,11 @@ def main() -> None:
             "network-positive",
             "network-wrong-question",
             "network-no-permit",
+            "udp-hosts-positive",
+            "system-udp-hosts-positive",
+            "udp-hosts-foreign-member",
+            "udp-hosts-parent-cancel",
+            "udp-hosts-replay",
         ),
         default="positive",
     )

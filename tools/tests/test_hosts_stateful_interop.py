@@ -95,6 +95,74 @@ class CleanupBarrierTests(unittest.TestCase):
             interop.check_network_cleanup(trace)
 
 
+def datagram_cleanup_trace() -> list[dict[str, object]]:
+    """Только unit corpus анализатора; эти кадры никогда не подаются SUT."""
+    trace: list[dict[str, object]] = []
+
+    def frame(
+        side: str,
+        kind: int,
+        seq: int,
+        reply: int,
+        fields: dict[int, int],
+        target: int = 0,
+    ) -> None:
+        body = bytearray(72)
+        body[2] = target if side == "go" else 1
+        for offset, value in fields.items():
+            body[offset : offset + 8] = value.to_bytes(8, "big")
+        header = bytearray(128)
+        header[:8] = b"YNKCAP01"
+        header[10:12] = kind.to_bytes(2, "big")
+        header[12:16] = (128 + len(body)).to_bytes(4, "big")
+        header[16:24] = seq.to_bytes(8, "big")
+        header[24:32] = reply.to_bytes(8, "big")
+        trace.append({"side": side, "packet": (header + body).hex()})
+
+    for i in range(2):
+        seq = 1 + i * 4
+        frame("go", 57, seq, 0, {8: 9 + i})
+        frame("rust", 58, seq, seq, {8: 1 + i})
+        frame("go", 55, seq + 1, 0, {16: 9 + i})
+        frame("rust", 56, seq + 1, seq + 1, {8: 11 + i})
+        frame("go", 47, seq + 2, 0, {8: 11 + i}, 8)
+        frame("rust", 48, seq + 2, seq + 2, {8: 11 + i})
+        frame("go", 47, seq + 3, 0, {8: 1 + i}, 9)
+        frame("rust", 48, seq + 3, seq + 3, {8: 1 + i})
+    return trace
+
+
+class DatagramBarrierTests(unittest.TestCase):
+    def test_each_parent_and_own_context_have_actual_terminal_ack(self) -> None:
+        self.assertEqual(interop.check_datagram_cleanup(datagram_cleanup_trace()), 4)
+
+    def test_missing_parent_ack_cannot_hide_behind_terminal_counts(self) -> None:
+        trace = datagram_cleanup_trace()
+        del trace[-1]
+        with self.assertRaisesRegex(AssertionError, "missing UDP cleanup ACK"):
+            interop.check_datagram_cleanup(trace)
+
+    def test_late_context_ack_does_not_authorize_earlier_parent_release(self) -> None:
+        trace = datagram_cleanup_trace()
+        trace[5], trace[6] = trace[6], trace[5]
+        with self.assertRaisesRegex(AssertionError, "cancel9 before own context ACK"):
+            interop.check_datagram_cleanup(trace)
+
+    def test_original_user_close_waits_for_both_parent_acks(self) -> None:
+        trace = datagram_cleanup_trace()
+        close = bytearray.fromhex(str(trace[-2]["packet"]))[:140]
+        close[10:12] = (32).to_bytes(2, "big")
+        close[12:16] = len(close).to_bytes(4, "big")
+        close[128:] = bytes(12)
+        close[128] = 3
+        close[132:140] = (1).to_bytes(8, "big")
+        trace.insert(-1, {"side": "go", "packet": close.hex()})
+        with self.assertRaisesRegex(
+            AssertionError, "USER Close32 before owned parent ACK9"
+        ):
+            interop.check_datagram_cleanup(trace)
+
+
 class RelayTests(unittest.TestCase):
     def test_nonreading_peer_cannot_bypass_absolute_deadline(self) -> None:
         original = subprocess.Popen
