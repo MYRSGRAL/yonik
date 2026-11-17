@@ -1674,6 +1674,65 @@ fn available_port(requested: u16) -> Result<NonZeroU16> {
     Err(DesktopError("listen_port_busy"))
 }
 
+fn available_distinct_local_port(
+    excluded: &[NonZeroU16],
+    mut candidate: impl FnMut() -> Result<NonZeroU16>,
+) -> Result<NonZeroU16> {
+    for _ in 0..16 {
+        let port = candidate()?;
+        if !excluded.contains(&port) {
+            return Ok(port);
+        }
+    }
+    Err(DesktopError("listen_port_busy"))
+}
+
+fn native_local_runtime_plan(
+    intent: &yonik_engine::native_profile::ProfileIntent,
+    port: NonZeroU16,
+    mut candidate: impl FnMut() -> Result<NonZeroU16>,
+) -> Result<yonik_engine::native_profile::OwnedRuntimePlan> {
+    use yonik_engine::native_profile::{OwnedIngress, OwnedRuntimePlan, ProviderIngressProtocol};
+
+    let graph = intent
+        .validate()
+        .map_err(|_| DesktopError("engine_config"))?;
+    let ingresses = graph.ingresses();
+    let has_http = ingresses
+        .iter()
+        .any(|ingress| ingress.protocol() == ProviderIngressProtocol::Http);
+    if has_http
+        && (ingresses.len() != 2
+            || !ingresses
+                .iter()
+                .any(|ingress| ingress.protocol() == ProviderIngressProtocol::Socks))
+    {
+        return Err(DesktopError("engine_config"));
+    }
+    let probe = if has_http {
+        available_distinct_local_port(&[port], &mut candidate)?
+    } else {
+        candidate()?
+    };
+    let mut plan = OwnedRuntimePlan::new(port, probe).map_err(|_| DesktopError("engine_config"))?;
+    if has_http {
+        let http = available_distinct_local_port(&[port, probe], candidate)?;
+        plan = plan
+            .with_local_http(http)
+            .map_err(|_| DesktopError("engine_config"))?;
+    }
+    for ingress in ingresses {
+        let owned = match ingress.protocol() {
+            ProviderIngressProtocol::Socks => OwnedIngress::Local,
+            ProviderIngressProtocol::Http => OwnedIngress::LocalHttp,
+        };
+        plan = plan
+            .map_ingress(ingress.tag(), owned)
+            .map_err(|_| DesktopError("engine_config"))?;
+    }
+    Ok(plan)
+}
+
 #[derive(Debug)]
 struct ContextFailure {
     error: DesktopError,
@@ -5701,11 +5760,7 @@ async fn run(
                                     } else {
                                         match actor.prepare_port().and_then(|()| {
                                             let port = NonZeroU16::new(actor.state.port).ok_or(DesktopError("invalid_input"))?;
-                                            let probe = available_port(0)?;
-                                            let graph = intent.validate().map_err(|_| DesktopError("engine_config"))?;
-                                            let mut plan = yonik_engine::native_profile::OwnedRuntimePlan::new(port, probe).map_err(|_| DesktopError("engine_config"))?;
-                                            for ingress in graph.ingresses() { plan = plan.map_ingress(ingress.tag(), yonik_engine::native_profile::OwnedIngress::Local).map_err(|_| DesktopError("engine_config"))?; }
-                                            Ok(plan)
+                                            native_local_runtime_plan(&intent, port, || available_port(0))
                                         }).and_then(|plan| actor.probe_target().map(|target| (plan, target))) {
                                             Err(error) => Err(error.into()),
                                             Ok((plan, target)) => {
@@ -8169,3 +8224,59 @@ mod probe_context_tests {
 #[cfg(all(test, feature = "test-support"))]
 #[path = "disk_host_acceptance.rs"]
 mod disk_host_acceptance;
+
+#[cfg(test)]
+mod local_native_port_tests {
+    use super::*;
+    use yonik_engine::native_profile::{OwnedIngress, ProfileIntent};
+
+    #[test]
+    fn http_port_selection_skips_socks_and_probe() {
+        let excluded = [10808, 10809].map(|port| NonZeroU16::new(port).unwrap());
+        let mut candidates = [10808, 10809, 10810].into_iter();
+        let picked = available_distinct_local_port(&excluded, || {
+            Ok(NonZeroU16::new(candidates.next().unwrap()).unwrap())
+        });
+        assert_eq!(picked.unwrap().get(), 10810);
+        assert_eq!(
+            available_distinct_local_port(&excluded, || Ok(excluded[0]))
+                .unwrap_err()
+                .0,
+            "listen_port_busy"
+        );
+    }
+
+    #[test]
+    fn native_local_mapping_keeps_socks_and_http_separate() {
+        for dual in [false, true] {
+            let mut graph = serde_json::json!({
+                "inbounds":[{"tag":"socks","protocol":"socks","settings":{"udp":true}}],
+                "outbounds":[{"tag":"direct","protocol":"freedom"}]
+            });
+            if dual {
+                graph["inbounds"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"tag":"http","protocol":"http"}));
+            }
+            let intent =
+                ProfileIntent::decode(&serde_json::json!({"version":1,"graph":graph}).to_string())
+                    .unwrap();
+            let mut candidates = [10809, 10810].into_iter();
+            let plan = native_local_runtime_plan(&intent, 10808.try_into().unwrap(), || {
+                Ok(candidates.next().unwrap().try_into().unwrap())
+            })
+            .unwrap();
+            assert_eq!(plan.probe_port().get(), 10809);
+            assert_eq!(
+                plan.local_http_port().map(NonZeroU16::get),
+                dual.then_some(10810)
+            );
+            let mut expected = vec![("socks", OwnedIngress::Local)];
+            if dual {
+                expected.insert(0, ("http", OwnedIngress::LocalHttp));
+            }
+            assert_eq!(plan.ingress_mappings().collect::<Vec<_>>(), expected);
+        }
+    }
+}

@@ -72,6 +72,7 @@ pub struct CompiledConfig {
     engine: Engine,
     port: NonZeroU16,
     probe_port: NonZeroU16,
+    local_http_port: Option<NonZeroU16>,
     probe_access: ProbeAccess,
 }
 impl CompiledConfig {
@@ -92,6 +93,9 @@ impl CompiledConfig {
     }
     pub fn probe_port(&self) -> NonZeroU16 {
         self.probe_port
+    }
+    pub fn local_http_port(&self) -> Option<NonZeroU16> {
+        self.local_http_port
     }
     pub fn probe_auth(&self) -> Option<&ProbeCredentials> {
         self.probe_access.auth()
@@ -138,6 +142,7 @@ pub fn compile(
         engine,
         port,
         probe_port: port,
+        local_http_port: None,
         probe_access: ProbeAccess::default(),
     })
 }

@@ -1,6 +1,6 @@
 use yonik_application::{ConfigDigest, Event, Outcome, State};
 
-use super::{HostError, LOCAL_ENV, LocalSession};
+use super::{HostError, LOCAL_ENV, LocalSession, all_local_listeners};
 
 fn advance(session: &mut LocalSession, event: Option<Event>) {
     let token = session.session.begin().unwrap();
@@ -124,6 +124,7 @@ async fn native_readers_are_joined_after_local_start_failure() {
         digest: ConfigDigest::new([0; 32]),
         port: NonZeroU16::new(24444).unwrap(),
         probe_port: NonZeroU16::new(24444).unwrap(),
+        http_port: None,
         probe_access: ProbeAccess::default(),
     };
     let mut session = LocalSession::new()
@@ -133,4 +134,20 @@ async fn native_readers_are_joined_after_local_start_failure() {
     assert!(session.start(checked, &mut cancel).await.is_err());
     assert!(session.readers.is_none());
     assert!(session.child.is_none());
+}
+
+#[test]
+fn local_listener_readiness_requires_the_owned_http_port() {
+    let http = Some(10810);
+    for (present, expected) in [
+        (&[10808, 10809][..], false),
+        (&[10808, 10809, 10810][..], true),
+        (&[10808, 10810][..], false),
+    ] {
+        assert_eq!(
+            all_local_listeners(10808, 10809, http, |port| Ok(present.contains(&port))).unwrap(),
+            expected,
+        );
+    }
+    assert!(all_local_listeners(10808, 10808, None, |port| Ok(port == 10808)).unwrap());
 }

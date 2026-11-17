@@ -8,7 +8,8 @@ pub(super) fn emit(
     runtime: &OwnedRuntimePlan,
     system: bool,
 ) -> Result<(CompiledConfig, ValidatedGraph), Error> {
-    if system != runtime.tun.is_some() {
+    let http_port = runtime.local_http_port();
+    if system != runtime.tun.is_some() || system && http_port.is_some() {
         return Err(Error::Ownership);
     }
     if graph.egress.requires_system_snapshot() && runtime.system_resolver.is_none() {
@@ -20,7 +21,8 @@ pub(super) fn emit(
                 .host()
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback()))
-            && [runtime.port.get(), runtime.probe_port.get()].contains(&endpoint.port())
+            && ([runtime.port.get(), runtime.probe_port.get()].contains(&endpoint.port())
+                || http_port.is_some_and(|port| port.get() == endpoint.port()))
         {
             return Err(Error::Ownership);
         }
@@ -52,10 +54,18 @@ pub(super) fn emit(
         if *target == OwnedIngress::System && !system {
             return Err(Error::Ownership);
         }
+        match (http_port, target) {
+            (Some(_), OwnedIngress::Local)
+                if i["protocol"] == "socks" && i["settings"]["udp"] == true => {}
+            (Some(_), OwnedIngress::LocalHttp) if i["protocol"] == "http" => {}
+            (None, OwnedIngress::Local | OwnedIngress::System) => {}
+            _ => return Err(Error::Ownership),
+        }
         if let Some((previous, sniffing)) = occupied.insert(*target as u8, (tag, i.get("sniffing")))
         {
-            if signatures.get(previous).map(Vec::as_slice).unwrap_or(&[])
-                != signatures.get(tag).map(Vec::as_slice).unwrap_or(&[])
+            if http_port.is_some()
+                || signatures.get(previous).map(Vec::as_slice).unwrap_or(&[])
+                    != signatures.get(tag).map(Vec::as_slice).unwrap_or(&[])
                 || sniffing != i.get("sniffing")
             {
                 return Err(Error::Ownership);
@@ -66,10 +76,11 @@ pub(super) fn emit(
             match target {
                 OwnedIngress::Local => "yonik-owned-local",
                 OwnedIngress::System => "system-tun",
+                OwnedIngress::LocalHttp => "yonik-owned-http",
             },
         );
     }
-    if mappings.len() != runtime.ingress.len() {
+    if mappings.len() != runtime.ingress.len() || http_port.is_some() && mappings.len() != 2 {
         return Err(Error::Ownership);
     }
     // DNS tags являются внутренними ingress subjects и не заменяются listener.
@@ -167,6 +178,12 @@ pub(super) fn emit(
         {"tag":"yonik-owned-local","listen":"127.0.0.1","port":runtime.port.get(),"protocol":"socks","settings":{"auth":"noauth","udp":true,"ip":"127.0.0.1"}},
         {"tag":"yonik-owned-probe","listen":"127.0.0.1","port":runtime.probe_port.get(),"protocol":"socks","settings":{"auth":"password","accounts":[{"user":auth.username(),"pass":auth.password()}]}}
     ]);
+    if let Some(port) = http_port {
+        value["inbounds"]
+            .as_array_mut()
+            .ok_or(Error::Ownership)?
+            .push(json!({"tag":"yonik-owned-http","listen":"127.0.0.1","port":port.get(),"protocol":"http"}));
+    }
     // Без override probe проходит ровно тот же ordered routing/default, что
     // пользовательский Local ingress. Это сохраняет Auto вместо fixed proxy.
     if let Some(rules) = value
@@ -193,6 +210,7 @@ pub(super) fn emit(
         engine: Engine::Xray,
         port: runtime.port,
         probe_port: runtime.probe_port,
+        local_http_port: http_port,
         probe_access: ProbeAccess::native(auth),
     };
     if system {
