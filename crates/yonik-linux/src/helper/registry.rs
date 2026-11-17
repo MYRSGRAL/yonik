@@ -110,18 +110,18 @@ const DNS_WIRE_REVIEWED_PATCH: Option<&str> =
 const PRODUCER_PATCH: &str = "6e6abdbdcedae5b7c4548e9225ae4f8531a4489b8788141a2b6b4cf64a083c7e";
 // Direct USER CODEC4 отдельно не принят; bootstrap review его не заменяет.
 const DNS_CODEC4_REVIEWED_PATCH: Option<&str> = None;
-// R74/R75: exact CODEC4 single raw TCP producer и независимые helper scopes.
+// R81/R83: exact CODEC4 single raw TCP producer и независимые helper scopes.
 const BOOTSTRAP_BUILD_REVIEWED_PATCH: Option<&str> =
-    Some("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
+    Some("1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05");
 const BOOTSTRAP_SOURCE_REVIEWED_PATCH: Option<&str> =
-    Some("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
+    Some("1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05");
 const BOOTSTRAP_DNS_WIRE_REVIEWED_PATCH: Option<&str> =
-    Some("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
+    Some("1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05");
 const BOOTSTRAP_DNS_RELEASE_REVIEWED_PATCH: Option<&str> =
-    Some("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
-// R76: UDP совместимость принята отдельно от bootstrap scopes.
+    Some("1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05");
+// R81: UDP совместимость нового patch принята отдельно от bootstrap scopes.
 const UDP_ADDITIONAL_REVIEWED_PATCH: Option<&str> =
-    Some("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
+    Some("1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05");
 const BOOTSTRAP_REVIEWED_PATCHES: [Option<&str>; 3] = [
     BOOTSTRAP_SOURCE_REVIEWED_PATCH,
     BOOTSTRAP_DNS_WIRE_REVIEWED_PATCH,
@@ -1135,6 +1135,12 @@ mod tests {
                 );
             }
         }
+        // Прежний accepted artifact не получает authority нового reviewed build,
+        // даже сохранив все три корректных contract/schema slots.
+        value["patch_sha256"] =
+            serde_json::json!("3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec");
+        let stale: super::ProducerRecord = serde_json::from_value(value).unwrap();
+        assert!(stale.validate(crate::host::Sha256([17; 32])).is_err());
     }
 
     #[test]

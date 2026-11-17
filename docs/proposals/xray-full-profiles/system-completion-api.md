@@ -1734,3 +1734,15 @@ Local/System HOSTS positive и negatives, NETWORK wrong-question и no-permit
 проходят на том же Rust ELF и Go SUT exact patch `1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05`.
 Это PURE_STATEFUL_INTEROP с injected OS/backend facts, без runtime/install допуска.
 Protected pins пока сохраняют прежний digest; joint GREEN не заявляется.
+
+## R83: protected producer pin после joint PURE_STATEFUL_INTEROP
+
+Bootstrap build/Source/BoundTranscript/ConsumingCloseJoin и отдельный UDP
+additional pin согласованы с exact patch
+`1e65fca3adcbcf9cf74bc73a21d47dcae49523073aa91f262c16e3f4fb6d4d05`
+по R81/R83, только в прежнем single raw TCP subset. Builder PROFILE_PATCH
+использует этот же digest. Legacy PRODUCER_PATCH и Direct3 DNS pins остаются
+6e6, Direct USER CODEC4 и resolver policy не получают authority. Public gates
+остаются false. Compile-only candidate не устанавливается и содержит
+install_authority=false; новый ELF не исполняется даже для --version.
+Evidence сборки/проверок: `/home/myrs/projects/yonik/local/orchestration/evidence/p5-reviewed-1e65`.
