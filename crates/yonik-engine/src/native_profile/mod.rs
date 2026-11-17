@@ -10,7 +10,7 @@ pub use intent::{
 
 use crate::{CompiledConfig, SystemTun};
 pub use graph::{
-    EgressPlan, IngressRequirement, OwnedResourceRequirement, PhysicalEndpoint,
+    DnsIngressIdentity, EgressPlan, IngressRequirement, OwnedResourceRequirement, PhysicalEndpoint,
     PhysicalFirstHopBootstrap, ProbeRequirement, ProfileCompileError, ProviderIngressProtocol,
     ResolverRequirement, SystemResolverBinding, SystemResolverRequirement, TransportProtocol,
     ValidatedGraph, VerifiedNativeResources, VerifiedSystemResolver,
