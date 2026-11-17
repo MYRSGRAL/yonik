@@ -28,6 +28,7 @@ def main() -> None:
             [
                 ui("click", "settingsButton", when={"ready": True}),
                 ui("click", "settingsConnectionButton"),
+                ui("click", "proxyDnsDetailsButton"),
                 ui("text", "proxyFetchDns", value="127.0.0.1:5353"),
                 ui("click", "saveProxyFetchDns"),
                 ui(
@@ -45,7 +46,7 @@ def main() -> None:
                     "command": {"command": "set_engine", "engine": "sing-box"},
                 },
                 {
-                    "when": {"engine": "sing-box"},
+                    "when": {"engine": "xray", "error": "engine_unavailable"},
                     "command": {
                         "command": "set_probe_target",
                         "url": "https://example.com/check",
@@ -84,7 +85,7 @@ def main() -> None:
                     when={
                         "ready": True,
                         "proxy_fetch_dns": "127.0.0.1:5353",
-                        "engine": "sing-box",
+                        "engine": "xray",
                         "probe_custom": True,
                         "probe_expected_status": 200,
                     },
@@ -98,7 +99,7 @@ def main() -> None:
         settings = json.loads((root / "data" / "preferences.json").read_text())
         assert settings["proxy_fetch_dns"] == "127.0.0.1:5353"
         assert settings["language"] == "en"
-        assert settings["engine"] == "sing-box"
+        assert settings["engine"] == "xray"
         assert settings["probe_url"] == "https://example.com/check"
         (output / "result.json").write_text(
             json.dumps(

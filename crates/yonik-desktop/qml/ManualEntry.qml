@@ -82,6 +82,7 @@ Dialog {
         clip: true
         ColumnLayout {
             width: parent.width
+            spacing: 8
             Label { text: form.tr("Протокол", "Protocol") }
             ComboBox { id: protocolInput; objectName: "manualProtocol"; Layout.fillWidth: true; textRole: "label"; valueRole: "value"; model: [
                 {label:"VLESS",value:"vless"}, {label:"VMess",value:"vmess"}, {label:"Trojan",value:"trojan"},
@@ -135,7 +136,7 @@ Dialog {
             TextField { id: wsHost; objectName: "manual_wsHost"; visible: form.transports && transport.currentIndex === 1; Layout.fillWidth: true; maximumLength: 1024; Accessible.name: form.tr("Host WS", "WS Host") }
             Label { visible: form.transports && transport.currentIndex === 2; text: form.tr("Сервис gRPC", "gRPC service") }
             TextField { id: service; objectName: "manual_service"; visible: form.transports && transport.currentIndex === 2; Layout.fillWidth: true; maximumLength: 1024; Accessible.name: form.tr("Сервис gRPC", "gRPC service") }
-            Label { Layout.fillWidth: true; wrapMode: Text.WordWrap; text: form.tr("Проверьте поля. Сохранение — после проверки импорта.", "Check the fields. Saving requires import approval.") }
+            Label { Layout.fillWidth: true; wrapMode: Text.WordWrap; text: form.tr("Сервер появится после проверки импорта.", "The server will appear after import review.") }
             RowLayout {
                 Button { objectName: "manualCancel"; text: form.tr("Отмена", "Cancel"); onClicked: form.close() }
                 Button { objectName: "manualSubmit"; text: form.tr("Проверить", "Review"); enabled: form.valid(); onClicked: { form.submitted(serverName.text.trim(), form.payload()); form.close() } }

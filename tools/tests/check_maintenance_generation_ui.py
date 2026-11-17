@@ -38,6 +38,7 @@ FLOW = r"""
   }
   if(step===1) { click("settingsDiagnosticsButton"); step=2; return }
   if(step===2) {
+   click("diagnosticsLogsTab")
    require(find(window.contentItem,"copyDiagnosticsButton").text===(LOCALE==="en"?"Copy diagnostics":"Копировать диагностику"),"localized copy button")
    click("copyDiagnosticsButton"); previous=clipboard()
    require(find(window.contentItem,"diagnosticsExportResult").text===(LOCALE==="en"?"Copied":"Скопировано"),"positive native export")
@@ -63,6 +64,7 @@ FLOW = r"""
   }
   if(step===6) { click("settingsDiagnosticsButton"); step=7; return }
   if(step===7) {
+   click("diagnosticsLogsTab")
    console.log("GEN BEFORE COPY " + backend.snapshot_json)
    click("copyDiagnosticsButton")
    console.log("GEN COPY RESULT " + JSON.stringify(find(window.contentItem,"diagnosticsExportResult").text))

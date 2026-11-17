@@ -18,6 +18,12 @@
     {
       "ui": {
         "action": "click",
+        "object": "diagnosticsLogsTab"
+      }
+    },
+    {
+      "ui": {
+        "action": "click",
         "object": "copyDiagnosticsButton"
       }
     },
@@ -86,6 +92,12 @@
     {
       "ui": {
         "action": "click",
+        "object": "addSourceButton"
+      }
+    },
+    {
+      "ui": {
+        "action": "click",
         "object": "pasteSourceButton"
       }
     },
@@ -96,8 +108,9 @@
         }
       },
       "ui": {
-        "action": "click",
-        "object": "sourceAddCancelButton"
+        "action": "key",
+        "object": "sourceUrlInput",
+        "key": "Escape"
       }
     },
     {

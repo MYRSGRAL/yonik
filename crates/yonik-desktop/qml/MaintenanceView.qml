@@ -47,20 +47,30 @@ ColumnLayout {
             feedback = tr("Отмена: ожидается освобождение файлов.", "Cancelling: waiting for files to be released.")
         }
     }
+    spacing: 10
+    Label {
+        Layout.fillWidth: true
+        text: root.tr("Резервная копия", "Backup")
+        font.pixelSize: 21
+        font.weight: Font.DemiBold
+    }
     Label {
         Layout.fillWidth: true
         wrapMode: Text.Wrap
-        text: root.tr("Данные копии зашифрованы существующим ключом системного кошелька. Для восстановления нужен тот же ключ. Восстановление создаёт новый файл и не переключает текущую базу.", "Backup data is encrypted with the existing system wallet key. Restoring requires the same key. Restore creates a new file and does not switch the current database.")
+        text: root.tr("Для восстановления нужен тот же ключ системного хранилища. Восстановление создаёт отдельный файл.", "Restoring requires the same system key. Restore creates a separate file.")
     }
     Button {
         objectName: "maintenanceBackup"
-        text: root.tr("Создать резервную копию…", "Create backup…")
+        Layout.fillWidth: true
+        highlighted: true
+        text: root.tr("Создать зашифрованную копию…", "Create encrypted backup…")
         enabled: root.available && !root.busy
         onClicked: { root.operation = "backup"; destination.open() }
     }
     Button {
         objectName: "maintenanceRestore"
-        text: root.tr("Восстановить в новый файл…", "Restore to a new file…")
+        Layout.fillWidth: true
+        text: root.tr("Восстановить из копии…", "Restore from backup…")
         enabled: root.available && !root.busy
         onClicked: { root.operation = "restore"; source.open() }
     }
@@ -74,12 +84,14 @@ ColumnLayout {
         objectName: "maintenanceFeedback"
         Layout.fillWidth: true
         wrapMode: Text.Wrap
+        visible: !!root.feedback
         text: root.feedback
     }
     Label {
         Layout.fillWidth: true
         wrapMode: Text.Wrap
-        text: root.tr("При ошибке записи проверьте выбранный файл: копия могла быть опубликована до ошибки синхронизации. Существующий файл никогда не заменяется.", "After a write error, check the selected file: the copy may have been published before a synchronization error. Existing files are never replaced.")
+        visible: !!root.feedback && !root.busy
+        text: root.tr("При ошибке записи проверьте выбранный файл. Существующие файлы не заменяются.", "If writing fails, check the selected file. Existing files are never replaced.")
     }
     FileDialog {
         id: source

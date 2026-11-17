@@ -67,7 +67,8 @@ def main() -> None:
             [
                 ui("resize", width=700, height=900, when={"ready": True}),
                 ui("click", "serverPickerButton"),
-                ui("click", "addSourceButton"),
+                ui("click", "sourceOptionsButton"),
+                ui("click", "configImportAction"),
                 ui(
                     "text",
                     "localImportTextInput",
@@ -142,6 +143,7 @@ def main() -> None:
                         "source_local": True,
                     },
                 ),
+                ui("click", "closeSourceOptionsButton"),
                 ui("click", "profileSelect_1"),
                 *core_steps,
                 {

@@ -113,6 +113,7 @@ def main() -> None:
                         command({"command": "connect"}, {"probe_custom": True}),
                         ui("click", "settingsButton", when={"status": "Limited"}),
                         ui("click", "settingsDiagnosticsButton"),
+                        ui("click", "diagnosticsLogsTab"),
                     ]
                     controls[len(steps) - 2] = "fault"
                     steps += [

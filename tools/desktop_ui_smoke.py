@@ -46,10 +46,9 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     page = 0
     settings_origin = 0
     settings_section = ""
-    source_options = False
 
     def click(target: str, **kwargs: Any) -> None:
-        nonlocal page, settings_origin, settings_section, source_options
+        nonlocal page, settings_origin, settings_section
         steps.append(ui("click", target, **kwargs))
         if target == "settingsButton":
             settings_origin, page, settings_section = page, 2, ""
@@ -59,16 +58,12 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
                     settings_section = ""
                 else:
                     page = settings_origin
-            elif source_options:
-                source_options = False
             else:
                 page = 0
         elif target == "serverPickerButton":
             page = 1
         elif target.startswith("settings") and target.endswith("Button"):
             settings_section = target
-        elif target == "sourceOptionsButton":
-            source_options = not source_options
         elif target == "sourceAddConfirmButton":
             page = 1
 
@@ -108,18 +103,15 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     steps.append(
         ui("text", "sourceUrlInput", value="https://cancel.invalid/?ui-secret=hidden")
     )
-    click("sourceAdvancedButton")
-    click("sourceHwidChoice")
-    click("revealSourceUrl")
-    click("sourceAddCancelButton")
+    steps.append(ui("text", "sourceNameInput", value="Отменённый импорт"))
+    steps.append(ui("key", "sourceUrlInput", key="Escape"))
     check({"window": {"page": 1}, "addSourceDialog": {"visible": False}})
     navigate(1)
     click("addSourceButton")
     check(
         {
             "sourceUrlInput": {"text": ""},
-            "sourceHwidChoice": {"checked": False},
-            "revealSourceUrl": {"checked": False},
+            "sourceNameInput": {"text": ""},
         }
     )
     steps.append(ui("key", "sourceUrlInput", key="Escape"))
@@ -128,78 +120,80 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
         expect={"window": {"page": 1}, "addSourceDialog": {"visible": False}},
     )
     steps.append(ui("clipboard", value=url))
+    click("addSourceButton")
     click("pasteSourceButton")
-    click(
-        "sourceAddCancelButton",
-        expect={"sourceUrlInput": {"text": url}, "window": {"page": 1}},
-        capture="paste-preview.png",
+    steps.append(
+        ui(
+            "key",
+            "sourceUrlInput",
+            key="Escape",
+            expect={"sourceUrlInput": {"text": url}, "window": {"page": 1}},
+            capture="paste-preview.png",
+        )
     )
+    click("sourceOptionsButton")
+    click("localSubscriptionAction")
     click("pasteSourceButton", expect={"window": {"page": 1}})
-    click("sourceAdvancedButton")
     steps.append(ui("text", "sourceNameInput", value="Тест А"))
-    click("sourceLocalException")
-    click("sourceHwidChoice")
     click("sourceAddConfirmButton")
-    click(
-        "discardRefreshButton",
-        when={"pending": True, "busy": False},
-        expect={
-            "refreshReviewDialog": {"visible": True},
+    check(
+        {
+            "refreshReviewDialog": {"visible": False},
             "sourceUrlInput": {"text": ""},
-            "window": {"page": 1},
+            "subscriptionFeedback": {
+                "text": {"contains": "Профили сохранены: 2 · пропущено: 1"}
+            },
         },
-        capture="import-review.png",
+        when={"pending": False, "busy": False, "profiles_count": 2},
+        capture="import-result.png",
     )
-    click(
-        "refreshSourceButton",
-        when={"pending": False, "busy": False, "profiles_count": 0},
-    )
+    click("refreshSourceButton")
     click("approveRefreshButton", when={"pending": True, "busy": False})
     click(
         "sourceOptionsButton",
         when={"pending": False, "busy": False, "profiles_count": 2},
     )
     click(
-        "subscriptionHwidChoice", expect={"subscriptionHwidChoice": {"checked": True}}
-    )
-    click(
-        "approveRefreshButton",
-        when={"pending": True, "busy": False, "source_hwid_enabled": False},
-    )
-    click(
-        "subscriptionHwidChoice",
-        when={"pending": False, "busy": False},
-        expect={"subscriptionHwidChoice": {"checked": False}},
+        "subscriptionHwidChoice", expect={"subscriptionHwidChoice": {"checked": False}}
     )
     click(
         "approveRefreshButton",
         when={"pending": True, "busy": False, "source_hwid_enabled": True},
     )
     click(
-        "renameSourceButton",
+        "refreshSourceButton",
+        when={"pending": False, "busy": False},
+    )
+    click(
+        "approveRefreshButton",
+        when={"pending": True, "busy": False, "source_hwid_enabled": True},
+    )
+    click(
+        "sourceOptionsButton",
         when={"pending": False, "busy": False, "profiles_count": 2},
+    )
+    click(
+        "renameSourceButton",
+        expect={"subscriptionHwidChoice": {"checked": True}},
+        capture="subscription-options.png",
     )
     steps.append(ui("text", "renameSourceInput", value="Переименованная А"))
     click("renameSourceConfirmButton")
-    steps.append(
-        ui(
-            "key",
-            "sourceOptionsButton",
-            key="Escape",
-            when={
-                "source_name": "Переименованная А",
-                "source_hwid_enabled": True,
-                "profiles_count": 2,
-            },
-            expect={"profileSourceFilter": {"currentText": "Переименованная А"}},
-        )
+    click(
+        "closeSourceOptionsButton",
+        when={
+            "source_name": "Переименованная А",
+            "source_hwid_enabled": True,
+            "profiles_count": 2,
+        },
+        expect={
+            "subscriptionOptionsDialog": {"visible": True},
+            "profileSourceFilter": {"displayText": "Переименованная А"},
+        },
     )
-    source_options = False
-    click("sourceOptionsButton", expect={"window": {"sourceOptions": False}})
-    click("homeButton", expect={"window": {"sourceOptions": True}})
     click(
         "refreshSourceButton",
-        expect={"window": {"sourceOptions": False}},
+        expect={"subscriptionOptionsDialog": {"visible": False}},
         capture="servers.png",
     )
     # Пока сервер держит ответ, навигация остаётся доступной, Cancel сохраняет профили.
@@ -228,12 +222,19 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
         "emptyProfilesAction", when={"profiles_count": 0}, capture="filtered-empty.png"
     )
     click("profileSelect_1", when={"profiles_count": 2})
+    page = 0
+    navigate(1, when={"selected_profile": 1})
     click(
-        "serversConnectButton",
-        when={"selected_profile": 1, "can_connect": True},
-        expect={"window": {"page": 1, "selectionConfirmed": True}},
+        "homeButton",
+        expect={"profileSelect_1": {"highlighted": True}},
+        capture="selected-server.png",
     )
-    navigate(0, when={"error": "engine_missing", "can_stop": False})
+    click(
+        "mainConnectButton",
+        when={"selected_profile": 1, "can_connect": True},
+        expect={"window": {"page": 0, "selectionConfirmed": True}},
+    )
+    check({"window": {"page": 0}}, when={"error": "engine_missing", "can_stop": False})
     click(
         "settingsButton",
         expect={"mainErrorLabel": {"visible": True}},
@@ -245,20 +246,13 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     )
     click("homeButton")
     click("settingsDiagnosticsButton", expect={"window": {"settingsSection": ""}})
-    steps.append(ui("wheel", "diagnosticsScroll", delta=-1200))
-    steps.append(
-        ui(
-            "wheel",
-            "diagnosticsScroll",
-            delta=1200,
-            expect={"diagnosticsScroll": {"atEnd": True, "moving": False}},
-            capture="diagnostics-bottom.png",
-        )
-    )
+    click("diagnosticsLogsTab")
+    click("diagnosticsTcpTab", capture="diagnostics-logs.png")
     click(
         "tcpCheckButton",
         expect={"diagnosticsScroll": {"atStart": True, "moving": False}},
     )
+    click("diagnosticsHttpsTab")
     steps.append(
         ui(
             "text",
@@ -304,6 +298,7 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     )
     click("settingsButton")
     click("settingsDiagnosticsButton")
+    click("diagnosticsHttpsTab")
     click(
         "resetProbeTargetButton",
         when={"probe_custom": True, "probe_expected_status": 200},
@@ -342,16 +337,23 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     # Второй источник добавляется через карточку Home; импорт сбрасывает фильтр.
     navigate(0)
     navigate(1)
-    click("addSourceButton")
+    click("sourceOptionsButton")
+    click("localSubscriptionAction")
     steps.append(ui("text", "sourceUrlInput", value=url + "-second"))
-    click("sourceAdvancedButton")
     steps.append(ui("text", "sourceNameInput", value="Тест Б"))
-    click("sourceLocalException")
     click("sourceAddConfirmButton")
-    click(
-        "approveRefreshButton",
-        when={"pending": True, "busy": False},
-        expect={"window": {"page": 1}, "profileSearch": {"text": ""}},
+    check(
+        {
+            "window": {"page": 1},
+            "profileSearch": {"text": ""},
+            "subscriptionFeedback": {"text": {"contains": "Profiles saved: 2"}},
+        },
+        when={
+            "source_name": "Тест Б",
+            "profiles_count": 2,
+            "pending": False,
+            "busy": False,
+        },
     )
     steps.append(
         ui(
@@ -374,6 +376,7 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     click("deleteSourceCancelButton", expect={"deleteSourceDialog": {"visible": True}})
     click("deleteSourceButton", when={"sources_total": 2, "profiles_count": 2})
     click("deleteSourceConfirmButton")
+    click("sourceOptionsButton", when={"sources_total": 1})
     click(
         "deleteSourceButton",
         when={"sources_total": 1, "source_name": "Тест Б", "profiles_count": 2},
@@ -385,7 +388,14 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
         when={"sources_total": 0, "profiles_count": 0},
         capture="servers-empty.png",
     )
-    click("sourceAddCancelButton", expect={"addSourceDialog": {"visible": True}})
+    steps.append(
+        ui(
+            "key",
+            "sourceNameInput",
+            key="Escape",
+            expect={"addSourceDialog": {"visible": True}},
+        )
+    )
     steps.append(
         {
             "when": {},
@@ -547,6 +557,11 @@ def run(
             if len(captured_hwids) == 6:
                 self.send_error(503)
                 return
+            if self.path.endswith("-second"):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body.rsplit(b"\n", 1)[0])
+                return
             super().do_GET()
 
     UiFixture.body = body
@@ -605,12 +620,12 @@ def run(
             rejected.append(label)
         if (
             len(captured_hwids) != 7
-            or not captured_hwids[0]
-            or captured_hwids[2] is not None
-            or captured_hwids[0] != captured_hwids[1]
-            or captured_hwids[0] != captured_hwids[3]
-            or captured_hwids[0] != captured_hwids[4]
-            or captured_hwids[0] != captured_hwids[5]
+            or captured_hwids[0] is not None
+            or captured_hwids[1] is not None
+            or not captured_hwids[2]
+            or captured_hwids[2] != captured_hwids[3]
+            or captured_hwids[2] != captured_hwids[4]
+            or captured_hwids[2] != captured_hwids[5]
             or captured_hwids[6] is not None
         ):
             raise RuntimeError("HWID opt-in/toggle wire sequence не совпадает")

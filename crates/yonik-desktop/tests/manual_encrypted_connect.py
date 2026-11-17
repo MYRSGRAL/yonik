@@ -262,7 +262,7 @@ def main() -> None:
                                     ),
                                     ui(
                                         "click",
-                                        "serversConnectButton",
+                                        "mainConnectButton",
                                         when={
                                             "selected_profile": 1,
                                             "can_connect": True,
@@ -272,7 +272,7 @@ def main() -> None:
                                 connect += [
                                     ui(
                                         "key",
-                                        "serversConnectButton",
+                                        "mainConnectButton",
                                         key="Tab",
                                         when={"can_stop": True},
                                     )
@@ -281,7 +281,7 @@ def main() -> None:
                                 connect += [
                                     ui(
                                         "click",
-                                        "serversConnectButton",
+                                        "mainConnectButton",
                                         when={"can_stop": True},
                                     ),
                                     {

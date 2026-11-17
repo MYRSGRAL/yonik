@@ -197,8 +197,8 @@ def check_source(source: str, require_catalog: bool = True) -> tuple[int, int]:
 SCOPED_UI = (
     ('SettingsRow { objectName: "settingsScheduleButton"', "\n"),
     (
-        '                SmallLabel { objectName: "routingDiagnosticsScope"',
-        '                RowLayout {\n                    objectName: "routingDefaultRow"',
+        'SmallLabel { objectName: "routingDiagnosticsScope"',
+        '// Конец блока проверки маршрутов.',
     ),
     ("        id: schedulePanel", "        id: appearancePanel"),
 )
@@ -234,6 +234,9 @@ SCOPED_TECHNICAL = frozenset(
         "dns_witness_missing",
         "dns_missing",
         "evaluation_rejected",
+        "xray",
+        "startupTab",
+        "updatesTab",
         "subscriptionInterval",
         "set_subscription_schedule",
         "subscriptionBackground",

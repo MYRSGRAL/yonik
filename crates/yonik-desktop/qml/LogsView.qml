@@ -15,6 +15,7 @@ ColumnLayout {
     property string saveStatus: ""
     property int serial: 0
     property bool stale: true
+    spacing: 10
     function tr(ru, en) { return root.english ? en : ru }
     function productCode(code) {
         switch (code) {
@@ -78,7 +79,7 @@ ColumnLayout {
     Label {
         Layout.fillWidth: true
         wrapMode: Text.Wrap
-        text: root.page ? root.tr("Курсор / вытеснено / отклонено / пропущено: ", "Cursor / evicted / rejected / missed: ") + [root.page.cursor, root.page.evicted, root.page.rejected, root.page.missed].join(" / ") : ""
+        text: root.page ? root.tr("Курсор · удалено · отклонено · пропущено: ", "Cursor · evicted · rejected · missed: ") + [root.page.cursor, root.page.evicted, root.page.rejected, root.page.missed].join(" / ") : ""
     }
     Label {
         Layout.fillWidth: true
@@ -91,7 +92,8 @@ ColumnLayout {
     ListView {
         objectName: "logsRows"
         Layout.fillWidth: true
-        Layout.preferredHeight: 200
+        Layout.fillHeight: true
+        Layout.minimumHeight: 120
         clip: true
         model: root.visible && !root.stale && root.page ? root.page.events : []
         delegate: Label {
@@ -107,7 +109,7 @@ ColumnLayout {
         id: destination
         objectName: "logsDestination"
         Layout.fillWidth: true
-        placeholderText: root.tr("Абсолютный путь нового файла", "Absolute path of a new file")
+        placeholderText: root.tr("Путь к новому файлу", "Path to a new file")
         maximumLength: 4096
     }
     Button {

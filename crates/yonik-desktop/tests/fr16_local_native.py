@@ -150,6 +150,7 @@ def main() -> None:
                             },
                             ui("click", "settingsButton", when={"status": "Limited"}),
                             ui("click", "settingsDiagnosticsButton"),
+                            ui("click", "diagnosticsLogsTab"),
                             ui("click", "logsRefresh"),
                             ui(
                                 "key",

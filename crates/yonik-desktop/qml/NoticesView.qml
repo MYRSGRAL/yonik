@@ -29,7 +29,7 @@ ColumnLayout {
         Layout.fillWidth: true
         textFormat: Text.PlainText
         wrapMode: Text.Wrap
-        text: view.tr("Лицензии компонентов. Rust: состав зависимостей сборки. Go: состав исследованных ядер. Controller-пакет содержит Xray и sing-box с архивами исходников. В legacy-варианте с внешним поставщиком ядра устанавливаются отдельно. Состав и версии проверяйте по конкретному пакету и его manifest.", "Component licenses. Rust: build dependency closure. Go: inspected core dependencies. The controller package includes Xray and sing-box with source archives. In the legacy external-provider variant, cores are installed separately. Check the specific package and its manifest for contents and versions.")
+        text: view.tr("Лицензии приложения и компонентов. Состав зависит от варианта сборки. Версии и уведомления смотрите в списке ниже.", "Application and component licenses. Contents depend on the build variant. See the list below for versions and notices.")
     }
     TextField {
         id: search
@@ -41,7 +41,8 @@ ColumnLayout {
     ListView {
         objectName: "noticesList"
         Layout.fillWidth: true
-        Layout.preferredHeight: 160
+        Layout.fillHeight: true
+        Layout.minimumHeight: 100
         clip: true
         model: view.entries.filter(item => (item.name + " " + item.version).toLowerCase().indexOf(search.text.toLowerCase()) >= 0)
         delegate: ItemDelegate {
@@ -54,7 +55,8 @@ ColumnLayout {
     }
     ScrollView {
         Layout.fillWidth: true
-        Layout.preferredHeight: 240
+        Layout.fillHeight: true
+        Layout.minimumHeight: 120
         TextArea {
             objectName: "noticesText"
             readOnly: true

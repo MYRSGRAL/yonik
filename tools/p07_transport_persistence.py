@@ -183,6 +183,7 @@ def gui_campaign(
         "fresh-negative",
         [
             *open_rules({"ready": True, "routing": ordered, "routing_revision": 4}),
+            button("routingRulesTab"),
             button("routingEdit41"),
             button("routingEnabled", expect=fields),
             button("routingSaveRule", expect={"routingEnabled": {"checked": True}}),
@@ -201,6 +202,7 @@ def gui_campaign(
         "fresh-final",
         [
             *open_rules({"ready": True, "routing": active, "routing_revision": 5}),
+            button("routingRulesTab"),
             button("routingEdit41"),
             button("routingModeButton", expect=simple_fields),
             button("routingModeButton", expect=advanced_fields),

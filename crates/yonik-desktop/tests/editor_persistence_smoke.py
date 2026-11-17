@@ -68,6 +68,7 @@ def main() -> None:
             first_steps = [
                 ui("click", "settingsButton", when={"ready": True}),
                 ui("click", "settingsRoutingButton"),
+                ui("click", "routingEditorTab"),
                 ui(
                     "click",
                     "routingModeButton",
@@ -78,6 +79,7 @@ def main() -> None:
                 ui("text", "routingCidr", value="192.0.2.0/24\n2001:db8::/32"),
                 ui("click", "routingSaveRule"),
                 checkpoint(initial, 1, True),
+                ui("click", "routingRulesTab"),
                 ui("click", "routingDuplicate1"),
                 ui(
                     "click",
@@ -86,6 +88,7 @@ def main() -> None:
                 ),
                 ui("click", "routingSaveRule"),
                 checkpoint(pair, 2, True),
+                ui("click", "routingRulesTab"),
                 ui("click", "routingUp2"),
                 checkpoint(ordered, 3, True),
                 {
@@ -98,6 +101,7 @@ def main() -> None:
                     },
                 },
                 checkpoint(final, 4, True),
+                ui("click", "routingRulesTab"),
                 ui("click", "routingEdit2"),
                 ui(
                     "click",
@@ -158,6 +162,7 @@ def main() -> None:
                 ),
                 ui("click", "settingsRoutingButton"),
                 checkpoint(final, 5, False),
+                ui("click", "routingRulesTab"),
                 ui("click", "routingEdit1"),
                 ui(
                     "click",
@@ -219,6 +224,7 @@ def main() -> None:
                     },
                 ),
                 ui("click", "settingsRoutingButton"),
+                ui("click", "routingEditorTab"),
             ]
             for request_id, mutation in enumerate(mutations, 1):
                 legacy_steps.extend(
