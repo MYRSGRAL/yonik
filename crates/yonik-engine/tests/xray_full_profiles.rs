@@ -743,6 +743,10 @@ fn local_dual_ingress_preserves_provider_routes_and_separate_socks_probe() {
         .unwrap()
         .map_ingress("fixture-http", OwnedIngress::LocalHttp)
         .unwrap();
+    ProfileIntent::from_profile(&native)
+        .unwrap()
+        .validate_ingress_mapping(&runtime)
+        .unwrap();
     let compiled = compile_profile_local(&native, &runtime).unwrap();
     assert_eq!(compiled.local_http_port().unwrap().get(), 10810);
     let config = emitted(&compiled);
@@ -805,6 +809,12 @@ fn local_dual_ingress_rejects_conflicting_ports_and_unowned_aliases() {
             .unwrap()
             .map_ingress("fixture-http", http)
             .unwrap();
+        assert!(matches!(
+            ProfileIntent::from_profile(&native)
+                .unwrap()
+                .validate_ingress_mapping(&runtime),
+            Err(ProfileCompileError::Ownership)
+        ));
         assert!(matches!(
             compile_profile_local(&native, &runtime),
             Err(ProfileCompileError::Ownership)

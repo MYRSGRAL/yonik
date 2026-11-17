@@ -427,6 +427,8 @@ impl ProfileIntent {
     }
     /// Проверка alias ownership без повторной компиляции/генерации credentials.
     pub fn validate_ingress_mapping(&self, runtime: &OwnedRuntimePlan) -> Result<(), Error> {
+        use super::OwnedIngress::{Local, LocalHttp, System};
+
         let inputs = self
             .wire
             .graph
@@ -434,10 +436,11 @@ impl ProfileIntent {
             .as_ref()
             .map(|i| i.0.as_slice())
             .unwrap_or(&[]);
-        if inputs.len() != runtime.ingress_mappings().count() {
+        let dual_local = runtime.local_http_port().is_some();
+        if inputs.len() != runtime.ingress_mappings().count() || dual_local && runtime.is_system() {
             return Err(Error::Ownership);
         }
-        let mut occupied: [Option<&Inbound>; 2] = [None, None];
+        let mut occupied: [Option<&Inbound>; 3] = [None, None, None];
         if let Some(dns) = self.wire.graph.dns.as_ref() {
             let reserved = |tag: Option<&str>| {
                 tag.is_some_and(|tag| tag.starts_with("yonik-owned-") || tag == "system-tun")
@@ -459,11 +462,22 @@ impl ProfileIntent {
                 .find(|(name, _)| *name == tag)
                 .map(|(_, o)| o)
                 .ok_or(Error::Ownership)?;
-            if owned == super::OwnedIngress::System && !runtime.is_system() {
-                return Err(Error::Ownership);
-            }
-            let index = usize::from(owned == super::OwnedIngress::System);
+            let index = match owned {
+                Local
+                    if !dual_local
+                        || (input.protocol.as_deref() == Some("socks")
+                            && input.settings.as_ref().and_then(|s| s.udp) == Some(true)) =>
+                {
+                    0
+                }
+                System if runtime.is_system() => 1,
+                LocalHttp if dual_local && input.protocol.as_deref() == Some("http") => 2,
+                _ => return Err(Error::Ownership),
+            };
             if let Some(previous) = occupied[index] {
+                if dual_local {
+                    return Err(Error::Ownership);
+                }
                 // Сравнение borrowed typed fields, без native JSON reconstruction.
                 let a = previous.sniffing.as_ref();
                 let b = input.sniffing.as_ref();
@@ -501,6 +515,9 @@ impl ProfileIntent {
             if let Some(dns) = self.wire.graph.dns.as_ref() {
                 if collision(dns.tag.as_deref()) || dns.servers.as_ref().is_some_and(|servers|servers.0.iter().any(|server|matches!(server,DnsServer::Scoped(s) if collision(s.tag.as_deref())))) {return Err(Error::Ownership);}
             }
+        }
+        if dual_local && (occupied[0].is_none() || occupied[2].is_none()) {
+            return Err(Error::Ownership);
         }
         Ok(())
     }

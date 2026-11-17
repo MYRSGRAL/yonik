@@ -84,11 +84,6 @@ impl Prepared {
         // Exact selected image/scope proof до capture/staging/config-check.
         let consumer = issuer::require_consumer(&intent, Mode::Local, binary)
             .map_err(|_| HostError::Unsupported)?;
-        // Текущий builder capsule связывает Local aliases только с SOCKS.
-        // Двойной план требует отдельной TCP-only строки HTTP в таблице ingress.
-        if plan.local_http_port().is_some() {
-            return Err(HostError::Unsupported);
-        }
         if plan.is_system()
             || rustix::process::geteuid().as_raw() == 0
             || rustix::process::geteuid() != rustix::process::getuid()
