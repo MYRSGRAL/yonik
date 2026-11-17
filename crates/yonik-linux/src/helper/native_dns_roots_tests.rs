@@ -11,6 +11,7 @@ mod datagram;
 #[path = "native_hosts_interop_tests.rs"]
 mod interop;
 struct Facts {
+    compiled: Option<Vec<u8>>,
     original: Target,
     carrier: u8,
     subject: u16,
@@ -305,11 +306,14 @@ fn fixture_intent_flags(
     } else {
         None
     };
-    let digest = compiled.as_ref().map_or(digest, |c| {
+    let compiled = compiled.as_ref().map(|c| {
         let mut bytes = Vec::new();
         c.write_sensitive(&mut bytes).unwrap();
-        Sha256::digest(&bytes).into()
+        bytes
     });
+    let digest = compiled
+        .as_ref()
+        .map_or(digest, |bytes| Sha256::digest(bytes).into());
     let checked = intent.validate().unwrap();
     let hostname = checked.egress().physical()[0].host();
     let asset = wire::ResolverData {
@@ -367,6 +371,7 @@ fn fixture_intent_flags(
     issuer.authority.service_trusted = true;
     issuer.authority.owner_forbidden = true;
     let facts = Arc::new(Facts {
+        compiled,
         original,
         carrier,
         subject: if raw || carrier == 17 { 0 } else { 1 },

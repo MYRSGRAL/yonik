@@ -23,6 +23,7 @@ fn stream(f: &Facts, cap: &wire::Capsule<'_>) -> Facts {
     assert_eq!(mask, 1);
     let endpoint = cap.dial_scope(scope, 0).unwrap().endpoint_index;
     Facts {
+        compiled: f.compiled.clone(),
         original: Target::copy(cap.endpoint(endpoint).unwrap()).unwrap(),
         carrier: 6,
         subject: 0,

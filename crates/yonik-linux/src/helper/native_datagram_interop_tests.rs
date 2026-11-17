@@ -39,6 +39,7 @@ pub(super) fn run(case: &str) {
             "original_port":original.port,"original":hex(original.wire().bytes)}
     }}));
     let io = Stdio {
+        tcp5: None,
         diagnostic: binding.clone(),
         record: f.launch,
         budget: issuer.budget.clone(),

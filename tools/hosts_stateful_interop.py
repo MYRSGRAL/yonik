@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import selectors
@@ -11,6 +12,224 @@ import subprocess
 import time
 from collections import deque
 from pathlib import Path
+
+
+def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
+    """Read-only oracle общей session. Не создаёт frames/ACK/authority."""
+    initial = [e["init"] for e in trace if "init" in e]
+    if len(initial) != 1:
+        raise AssertionError("France requires one init/launch")
+    initial = initial[0]
+    launch, config = bytes.fromhex(initial["launch"]), bytes.fromhex(initial["config"])
+    if len(launch) != 192 or hashlib.sha256(config).digest() != launch[48:80]:
+        raise AssertionError("France final config/launch mismatch")
+    outbounds = [o for o in json.loads(config)["outbounds"] if o["tag"] == "proxy"]
+    if (
+        len(outbounds) != 1
+        or outbounds[0]["protocol"] != "shadowsocks"
+        or outbounds[0]["settings"]
+        != {
+            "servers": [
+                {
+                    "address": "fr.example.invalid",
+                    "port": 443,
+                    "method": "aes-128-gcm",
+                    "password": "synthetic-password",
+                }
+            ]
+        }
+    ):
+        raise AssertionError("full FranceSS settings changed")
+    paths = {
+        tuple(tuple(h) for h in initial[key]): carrier
+        for key, carrier in [("tcp_path", 6), ("udp_path", 17)]
+    }
+    if len(paths) != 2:
+        raise AssertionError("TCP/UDP checked paths aliased")
+    pending: dict[int, tuple[int, bytes]] = {}
+    contexts: dict[int, tuple[tuple[int, int], ...]] = {}
+    queries: dict[int, tuple[tuple[int, int], ...]] = {}
+    reservations: dict[int, int] = {}
+    producers: dict[int, int] = {}
+    waiters: dict[int, int] = {}
+    permissions: dict[int, int] = {}
+    parents: set[int] = set()
+    closed_parents: set[int] = set()
+    closed_permissions: set[int] = set()
+    neighbor_events = 0
+    descriptors, acks, admissions = 0, 0, 0
+    descriptor = b""
+
+    def n(b: bytes, at: int) -> int:
+        if at + 8 > len(b):
+            raise AssertionError("truncated France field")
+        return int.from_bytes(b[at : at + 8], "big")
+
+    for e in trace:
+        if "event" in e:
+            detail = e["event"]
+            if (
+                detail["name"] != "tcp_neighbor_after_udp_cleanup"
+                or detail["grant"] != 2
+                or detail["protocol"] != 6
+                or not parents
+                or parents - closed_parents
+                or not any(
+                    p == 6 and i not in closed_permissions
+                    for i, p in permissions.items()
+                )
+            ):
+                raise AssertionError(
+                    "neighbor before UDP ACKs or without live TCP permission"
+                )
+            neighbor_events += 1
+            continue
+        if "physical" in e:
+            raise AssertionError("HOSTS emitted DNS PhysicalBind")
+        if "packet" not in e:
+            continue
+        raw = bytes.fromhex(e["packet"])
+        if raw[:8] == b"DNSNEG02":
+            descriptors += 1
+            descriptor = raw
+            if (
+                e["side"] != "go"
+                or len(raw) != 272
+                or raw[16:208] != launch
+                or raw[208:240] != hashlib.sha256(b"YONIK-DNS-V2-CODEC-5\0").digest()
+            ):
+                raise AssertionError("France descriptor downgrade/mixed launch")
+            continue
+        if raw[:8] == b"DNSACK02":
+            acks += 1
+            if (
+                e["side"] != "rust"
+                or raw != b"DNSACK02" + hashlib.sha256(descriptor).digest()
+            ):
+                raise AssertionError("France ACK binding")
+            continue
+        if (
+            raw[:8] != b"YNKCAP01"
+            or len(raw) < 128
+            or int.from_bytes(raw[12:16], "big") != len(raw)
+        ):
+            raise AssertionError("France frame header")
+        if (
+            raw[32:48] != launch[80:96]
+            or raw[48:64] != launch[96:112]
+            or raw[64:96] != launch[48:80]
+            or raw[96:112] != launch[112:128]
+        ):
+            raise AssertionError("mixed France frame binding")
+        kind = int.from_bytes(raw[10:12], "big")
+        b = raw[128:]
+        if kind == 2:
+            admissions += 1
+            if e["side"] != "rust" or b[:32] != launch[152:184]:
+                raise AssertionError("France manifest binding")
+            # Независимое чтение DATA rows, не issuer decoder и не proof mint.
+            at = 128
+            rows = {}
+            for table in range(1, 12):
+                if at + 8 > len(b) or int.from_bytes(b[at : at + 2], "big") != table:
+                    raise AssertionError("France capsule tables")
+                count = int.from_bytes(b[at + 2 : at + 4], "big")
+                size = int.from_bytes(b[at + 4 : at + 8], "big")
+                at += 8
+                end = at + size
+                caps = (256, 512, 1024, 256, 64, 16, 4, 1, 512, 16, 1)
+                if count > caps[table - 1] or end > len(b):
+                    raise AssertionError("France capsule bounds")
+                rows[table] = []
+                for _ in range(count):
+                    if at + 4 > end:
+                        raise AssertionError("France row header")
+                    length = int.from_bytes(b[at : at + 2], "big")
+                    at += 4
+                    if at + length > end:
+                        raise AssertionError("France row bounds")
+                    rows[table].append(b[at : at + length])
+                    at += length
+                if at != end or end > len(b):
+                    raise AssertionError("France capsule bounds")
+            expected = bytes.fromhex(
+                "010000006eef7fffac9bb760fff69a2c41df43aaad73104657c75088f69e2168e967053a"
+            )
+            if at != len(b) or rows[4] != [expected] or len(rows[1]) != 1:
+                raise AssertionError("France stream fingerprint/settings")
+            for path, carrier in paths.items():
+                if (
+                    len(path) != 1
+                    or path[0][1] != 0
+                    or rows[9][path[0][0]][2] != carrier
+                    or rows[9][path[0][0]][4] != carrier
+                ):
+                    raise AssertionError("France carrier projection")
+            continue
+        if e["side"] == "go":
+            pending[n(raw, 16)] = (kind, b)
+            continue
+        req = pending.get(n(raw, 24))
+        if req is None:
+            continue
+        sent_kind, sent = req
+        if kind == 58 and b[2] == 1:
+            parents.add(n(b, 8))
+        elif kind == 48 and b[2] == 1 and sent[2] == 9:
+            closed_parents.add(n(sent, 8))
+        elif kind == 34 and b[:2] == b"\x03\x01":
+            closed_permissions.add(n(b, 4))
+        elif kind == 56 and b[2] == 1:
+            count = int.from_bytes(sent[50:52], "big")
+            if count != 1:
+                raise AssertionError("France raw frontier count")
+            path = ((int.from_bytes(sent[-4:-2], "big"), sent[-2]),)
+            if path not in paths or n(b, 24) != n(sent, 16) or n(b, 8) in contexts:
+                raise AssertionError("foreign context path/query")
+            contexts[n(b, 8)] = path
+            queries[n(sent, 16)] = path
+        elif kind == 36 and b[2] == 1:
+            reservations[n(b, 8)] = n(sent, 8)
+        elif kind == 41 and b[2] == 1:
+            query = n(sent, 12)
+            if sent[136:138] != b"\x03\x02" or paths[queries[query]] != sent[142]:
+                raise AssertionError("France Hosts DATA kind/carrier")
+            producers[n(b, 8)] = query
+        elif kind == 54 and b[2] == 1:
+            if (
+                n(b, 24) != n(sent, 8)
+                or n(b, 16) != n(sent, 16)
+                or n(b, 32) != n(sent, 32)
+                or reservations[n(sent, 8)] != n(sent, 32)
+                or producers[n(sent, 16)] == n(sent, 32)
+                or queries[producers[n(sent, 16)]] != queries[n(sent, 32)]
+            ):
+                raise AssertionError("waiter borrowed producer/query authority")
+            waiters[n(b, 8)] = n(sent, 32)
+        elif kind == 19 and b[0] == 1 and sent_kind == 42:
+            carrier = sent[25]
+            if (
+                n(sent, 4) not in waiters
+                or carrier != paths[queries[waiters[n(sent, 4)]]]
+                or sent[14:16] != b"\x02\x03"
+                or n(b, 4) in (1, 2)
+                or int.from_bytes(sent[26:28], "big") != 443
+                or sent[31:] != bytes([203, 0, 113, 80])
+            ):
+                raise AssertionError("wrong waiter/member/USER namespace")
+            permissions[n(b, 4)] = carrier
+    if admissions != 1 or descriptors != 1 or acks > 1 or contexts and acks != 1:
+        raise AssertionError("multiple France admission/setup")
+    return {
+        "admissions": admissions,
+        "descriptors": descriptors,
+        "acks": acks,
+        "contexts": len(contexts),
+        "producers": len(producers),
+        "waiters": len(waiters),
+        "permission_carriers": sorted(permissions.values()),
+        "neighbor_events": neighbor_events,
+    }
 
 
 def check_network_cleanup(
@@ -219,7 +438,9 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
         ],
         "go": [
             str(go),
-            "-test.run=^TestPureStatefulDatagramHostsSSStdioBridge$"
+            "-test.run=^TestPureStatefulFranceSSStdioBridge$"
+            if "france-" in case
+            else "-test.run=^TestPureStatefulDatagramHostsSSStdioBridge$"
             if "udp-hosts-" in case or "udp-network-" in case
             else "-test.run=^TestPureStatefulHostsStdioBridge$",
             "-test.v",
@@ -332,7 +553,10 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                     else:
                         done[side] = value
                         trace.append({"side": side, "result": value})
-                        if side == "go" and value.get("go_done"):
+                        if side == "rust" and value.get("setup_denied"):
+                            # Отказ SUT — test control, не fabricated wire ACK.
+                            queue_write("go", line + b"\n")
+                        if side == "go" and value.get("go_done") and "rust" not in done:
                             queue_write("rust", b'{"stop":true}\n')
                         continue
                     queue_write("go" if side == "rust" else "rust", line + b"\n")
@@ -342,6 +566,72 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
         }
         if any(codes.values()) or not all(s in done for s in children):
             raise AssertionError(f"counterpart failed: {codes}; trace={trace[-12:]}")
+        if "france-" in case:
+            go_result, rust_result = done["go"], done["rust"]
+            bindings = check_france_binding(trace)
+            if case.endswith("missing-udp-scope"):
+                if (
+                    not (
+                        go_result.get("setup_denied")
+                        and rust_result.get("setup_denied")
+                    )
+                    or go_result.get("operations") != 0
+                    or rust_result.get("routes") != 0
+                ):
+                    raise AssertionError(f"missing UDP scope became authority: {done}")
+                if any(
+                    "packet" in x and bytes.fromhex(x["packet"])[:8] == b"DNSACK02"
+                    for x in trace
+                ):
+                    raise AssertionError("ACK without scope5")
+                if bindings["acks"] != 0:
+                    raise AssertionError("missing UDP scope ACK")
+                return {
+                    "classification": "PURE_STATEFUL_INTEROP",
+                    "case": case,
+                    "commands": commands,
+                    "codes": codes,
+                    "results": done,
+                    "france_binding": bindings,
+                    "trace": trace,
+                }
+            udp_expected = int(not case.endswith("parent-cancel"))
+            tcp_expected = int(not case.endswith("missing-tcp-scope"))
+            if bindings["acks"] != 1 or bindings["permission_carriers"] != (
+                [6, 17] if tcp_expected else [17]
+            ):
+                raise AssertionError("missing separate France branch permissions")
+            if bindings["neighbor_events"] != tcp_expected:
+                raise AssertionError("missing live TCP after UDP cleanup")
+            if (
+                not go_result.get("france")
+                or not go_result.get("cleanup")
+                or go_result.get("tcp_opens") != tcp_expected
+                or go_result.get("tcp_closes") != tcp_expected
+                or go_result.get("tcp_neighbor_writes", 0) < tcp_expected
+                or go_result.get("udp_opens") != udp_expected
+                or go_result.get("udp_sends") != udp_expected
+                or go_result.get("udp_closes") != udp_expected
+                or go_result.get("udp_tasks_joined") != udp_expected * 2
+                or go_result.get("operations") != 0
+                or not rust_result.get("france")
+                or rust_result.get("retained_routes")
+                or rust_result.get("contexts") != 0
+                or rust_result.get("flows") != 0
+                or rust_result.get("services") != 0
+                or rust_result.get("unknown")
+            ):
+                raise AssertionError(f"incomplete same-session FranceSS: {done}")
+            return {
+                "classification": "PURE_STATEFUL_INTEROP",
+                "case": case,
+                "commands": commands,
+                "codes": codes,
+                "results": done,
+                "france_binding": bindings,
+                "datagram_cleanup_barriers": check_datagram_cleanup(trace),
+                "trace": trace,
+            }
         network = case.startswith("network-")
         datagram = "udp-hosts-" in case or "udp-network-" in case
         if datagram:
@@ -504,6 +794,16 @@ def main() -> None:
     parser.add_argument(
         "--case",
         choices=(
+            "france-hosts-positive",
+            "system-france-hosts-positive",
+            "france-hosts-parent-cancel",
+            "france-hosts-second-send",
+            "france-hosts-missing-tcp-scope",
+            "france-hosts-missing-udp-scope",
+            "system-france-hosts-parent-cancel",
+            "system-france-hosts-second-send",
+            "system-france-hosts-missing-tcp-scope",
+            "system-france-hosts-missing-udp-scope",
             "positive",
             "foreign-member",
             "system-positive",

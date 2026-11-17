@@ -7,6 +7,8 @@ use std::{
 };
 #[path = "native_datagram_interop_tests.rs"]
 mod datagram;
+#[path = "native_france_interop_tests.rs"]
+mod france;
 
 fn emit(value: serde_json::Value) {
     let mut out = std::io::stdout().lock();
@@ -47,6 +49,7 @@ fn input() -> Result<(bool, Vec<u8>), ServiceError> {
     Ok((physical, bytes))
 }
 struct Stdio {
+    tcp5: Option<Arc<super::super::super::super::bootstrap_binding::Tcp5Views>>,
     diagnostic: Arc<super::super::super::super::bootstrap_binding::BootstrapBinding>,
     record: LaunchRecord,
     budget: Arc<super::super::super::super::ChannelBudget>,
@@ -91,6 +94,13 @@ impl super::super::super::super::BootstrapDnsTranscript for TraceTranscript {
     }
 }
 impl Channel for Stdio {
+    fn bootstrap_tcp5(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<super::super::super::super::bootstrap_binding::Tcp5Views>>, ServiceError>
+    {
+        Ok(self.tcp5.clone())
+    }
     fn bootstrap_datagram_wire(
         &self,
         _: LaunchRecord,
@@ -273,6 +283,10 @@ fn pure_stateful_hosts_stdio_bridge() {
     }
     let digest: [u8; 32] = Sha256::digest(b"{}").into();
     let case = std::env::var("YONIK_INTEROP_CASE").unwrap_or_default();
+    if case.contains("france-") {
+        france::run(&case);
+        return;
+    }
     if case.contains("udp-hosts-") || case.contains("udp-network-") {
         datagram::run(&case);
         return;
@@ -317,6 +331,7 @@ fn pure_stateful_hosts_stdio_bridge() {
     );
     let closed = Arc::new(AtomicUsize::new(0));
     let io = Stdio {
+        tcp5: None,
         diagnostic: binding.clone(),
         source: binding.source(),
         datagram: None,

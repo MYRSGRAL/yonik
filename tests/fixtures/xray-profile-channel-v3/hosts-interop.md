@@ -1,5 +1,60 @@
 # PURE_STATEFUL_INTEROP: HOSTS
 
+## FranceSS: обе ветки в одной session/CODEC5
+
+Base `f5ef5c88e1388a702a54fb22ced0d0cae2e236d3`, production Go patch
+`6e1e0f0ee6c0e48f7b77a1e858e594277a8f515d8267c0bdff2f47e7d8a24791`.
+Ни production Go/Rust semantics, ни registry/build pins не меняются. Overlay
+только добавляет новые tagged/test members; исходные1307 members byte-exact.
+
+`native_france_interop_tests` импортирует полный FranceSS из seven fixture,
+использует ОДИН compiler result (включая probe credentials), его config digest,
+capsule/manifest, launch/snapshot/source epoch для обоих carriers. Независимые
+TCP5 и Datagram5 protected records — явно injected test facts. Три view каждого
+scope создаёт actual BootstrapBinding/shared planner, Channel только доставляет
+их actual serialized run_issuer. Image/Peer/Source custody/route kernel facts
+здесь leaf fakes; это не protected install/current-image measurement.
+
+Go bridge имеет одну admission, actual DNSNEG02/DNSACK02 schema5 exchange и один
+ProfileRuntime/flow actor. TCP и UDP вызывают actual SS Client.Process с AES128GCM
+account/server из exact bound config. Thin policy/link/client constructor без
+core.New/NewClient; TCP Dialer interface заменяет только transport/raw IO и вызывает
+actual ProfileCheckDial/ProfileCheckTransport/ProfileDialBootstrap. Registered
+internet TCP transport/DefaultSystemDialer и реальные sockets НЕ исполняются.
+UDP использует actual private factory/managed tasks/member/send path. SS ciphertext
+не выдаётся за DNS transcript. Полный stream fingerprint6eef…053a сохранён.
+
+Пропущены USER admission/HELLO и kernel proof transport: общий explicit preseed
+даёт USER UDP(flow/grant1) и TCP(flow/grant2), distinct immutable originals/tuples,
+System Known20ms или Local ownerNone. USER ID watermark2 ОТДЕЛЬНО от runtime wire
+watermark2 после ADMIT_ACK; первая bootstrap sequence3. Их reserved request2 —
+preseed marker, не relayed AUTHORIZE. Ни один bootstrap ACK не scripted: 55/56,
+35/36,40/41,53/54,42/19,57/58 и cleanup выдаёт противоположный SUT.
+
+TCP SS второй payload ждёт полного UDP cleanup. Intermediate event допускается
+только после actual ACK9 всех UDP bindings, пока TCP permission не закрыта;
+затем actual SS write проходит native parent+permission gate. Один fake TCP open
+и один UDP send; USER close34, permission close34 и cancel48 namespaces проверяются
+отдельно. В конце обе USER seed routes также retired real ACKs, нет live routes/
+contexts/receipts/grants/tasks/association custody. History/metadata release только
+при завершении test process, compaction/long-lived readiness не заявлены.
+
+Cases для Local и System: france-hosts-positive, parent-cancel, second-send,
+missing-tcp-scope, missing-udp-scope (System prefix system-). Crossbranch attempts
+выполняются в каждом admitted case и не достигают IO. Missing TCP Source5:
+actual55 Deny, TCP open0, UDP сосед допустим. Missing UDP Source5: actual factory
+не mint producer, setup5 без ACK/no fallback; отказ ДО USER preseed/effects,
+0 permissions/opens/routes. Test control сообщает этот реальный отказ другому
+bridge, не создавая ACK. Positive namespace oracle проверяет один launch/admission/
+descriptor, full settings/fingerprint, distinct paths, own waiter query→member→
+carrier и все observed cleanup barriers. Три независимых pins5 не открываются.
+
+NETWORK в ОДНОЙ FranceSS session пока не покрыт: существующий DNS IO leaf хранит
+единственный socket/duplicate и hardcoded physical.invalid. Нужны separate
+per-exchange owned leaves для двух запросов fr.example.invalid, затем обоих
+resolver transports6/17 в Local/System. Старые21 независимых pair остаются
+regressions, не заменой этой acceptance. FranceReady/runtime/install PASS нет.
+
 ## NETWORK UDP после namespace correction8bdac3c: joint GREEN
 
 Base `1ccad0fcad12b70b9a8bad5eb77948a49e76f512`, exact production patch

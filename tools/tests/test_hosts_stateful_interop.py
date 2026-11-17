@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 import sys
 import unittest
@@ -9,6 +11,60 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools import hosts_stateful_interop as interop
+
+
+class FranceBindingTests(unittest.TestCase):
+    def initial(self, method: str = "aes-128-gcm") -> dict[str, object]:
+        config = json.dumps(
+            {
+                "outbounds": [
+                    {
+                        "tag": "proxy",
+                        "protocol": "shadowsocks",
+                        "settings": {
+                            "servers": [
+                                {
+                                    "address": "fr.example.invalid",
+                                    "port": 443,
+                                    "method": method,
+                                    "password": "synthetic-password",
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ).encode()
+        launch = bytearray(192)
+        launch[48:80] = hashlib.sha256(config).digest()
+        return {
+            "init": {
+                "launch": launch.hex(),
+                "config": config.hex(),
+                "tcp_path": [[0, 0]],
+                "udp_path": [[1, 0]],
+            }
+        }
+
+    def test_two_sessions_cannot_substitute_one_full_profile(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "one init/launch"):
+            interop.check_france_binding([self.initial(), self.initial()])
+
+    def test_config_digest_and_full_ss_settings_are_independent(self) -> None:
+        value = self.initial()
+        value["init"]["config"] = "7b7d"
+        with self.assertRaisesRegex(AssertionError, "config/launch mismatch"):
+            interop.check_france_binding([value])
+        with self.assertRaisesRegex(AssertionError, "settings changed"):
+            interop.check_france_binding([self.initial("aes-256-gcm")])
+
+    def test_aliased_paths_and_data_only_init_are_not_pair_evidence(self) -> None:
+        value = self.initial()
+        value["init"]["udp_path"] = [[0, 0]]
+        with self.assertRaisesRegex(AssertionError, "paths aliased"):
+            interop.check_france_binding([value])
+        with self.assertRaisesRegex(AssertionError, "admission/setup"):
+            interop.check_france_binding([self.initial()])
 
 
 def cleanup_trace() -> list[dict[str, object]]:
@@ -184,6 +240,35 @@ class DatagramBarrierTests(unittest.TestCase):
 
 
 class RelayTests(unittest.TestCase):
+    def test_setup_refusal_does_not_write_stop_to_already_exited_issuer(self) -> None:
+        original = subprocess.Popen
+        children: list[subprocess.Popen[bytes]] = []
+
+        def spawn(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            program = (
+                "import json,sys,time; v=json.loads(sys.stdin.readline()); "
+                "assert v['setup_denied']; time.sleep(0.05); "
+                "print(json.dumps({'go_done':True,'setup_denied':True,'operations':0}),flush=True)"
+            )
+            if command[0].endswith("rust"):
+                program = "import json; print(json.dumps({'rust_done':True,'setup_denied':True,'routes':0}),flush=True)"
+            child = original([sys.executable, "-c", program], **kwargs)
+            children.append(child)
+            return child
+
+        with (
+            patch.object(interop.subprocess, "Popen", side_effect=spawn),
+            patch.object(interop, "check_france_binding", return_value={"acks": 0}),
+        ):
+            result = interop.run(
+                Path("/fake/rust"),
+                Path("/fake/go"),
+                2,
+                "france-hosts-missing-udp-scope",
+            )
+        self.assertEqual(result["codes"], {"rust": 0, "go": 0})
+        self.assertTrue(all(child.poll() is not None for child in children))
+
     def test_nonreading_peer_cannot_bypass_absolute_deadline(self) -> None:
         original = subprocess.Popen
         children: list[subprocess.Popen[bytes]] = []

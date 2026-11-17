@@ -1176,7 +1176,22 @@ pub(super) mod tests {
         budget: Arc<ChannelBudget>,
         start: Instant,
     ) -> Arc<BootstrapBinding> {
-        scoped5_binding(capsule, launch, asset, reference, budget, start, false)
+        scoped5_binding(
+            capsule,
+            launch,
+            asset,
+            reference,
+            budget,
+            start,
+            (
+                false,
+                &[
+                    BootstrapScope::Source,
+                    BootstrapScope::Wire,
+                    BootstrapScope::Release,
+                ],
+            ),
+        )
     }
     pub(in crate::helper::native_profile_channel) fn tcp5_binding(
         capsule: Arc<wire::OwnedCapsule>,
@@ -1186,29 +1201,58 @@ pub(super) mod tests {
         budget: Arc<ChannelBudget>,
         start: Instant,
     ) -> Arc<BootstrapBinding> {
-        scoped5_binding(capsule, launch, asset, reference, budget, start, true)
+        scoped5_binding(
+            capsule,
+            launch,
+            asset,
+            reference,
+            budget,
+            start,
+            (
+                true,
+                &[
+                    BootstrapScope::Source,
+                    BootstrapScope::Wire,
+                    BootstrapScope::Release,
+                ],
+            ),
+        )
     }
-    fn scoped5_binding(
+    pub(in crate::helper::native_profile_channel) fn scoped5_binding(
         capsule: Arc<wire::OwnedCapsule>,
         launch: LaunchRecord,
         asset: Vec<u8>,
         reference: wire::SnapshotRef,
         budget: Arc<ChannelBudget>,
         start: Instant,
-        tcp: bool,
+        choice: (bool, &[BootstrapScope]),
     ) -> Arc<BootstrapBinding> {
         use crate::helper::registry::DatagramScope as D;
         use crate::helper::registry::Tcp5Scope as T;
+        let (tcp, roles) = choice;
+        let ds = [
+            (D::Source, BootstrapScope::Source),
+            (D::Wire, BootstrapScope::Wire),
+            (D::Release, BootstrapScope::Release),
+        ]
+        .into_iter()
+        .filter_map(|(s, r)| roles.contains(&r).then_some(s))
+        .collect::<Vec<_>>();
+        let ts = [
+            (T::Source, BootstrapScope::Source),
+            (T::Wire, BootstrapScope::Wire),
+            (T::Release, BootstrapScope::Release),
+        ]
+        .into_iter()
+        .filter_map(|(s, r)| roles.contains(&r).then_some(s))
+        .collect::<Vec<_>>();
         let peer = Arc::new(FakePeer {
             record: launch,
             image: [17; 32],
             config: launch.binding.digest,
             producer: Some(crate::helper::registry::fake_tcp5_image(
-                crate::helper::registry::fake_datagram_image(
-                    [17; 32],
-                    &[D::Source, D::Wire, D::Release],
-                ),
-                &[T::Source, T::Wire, T::Release],
+                crate::helper::registry::fake_datagram_image([17; 32], &ds),
+                &ts,
             )),
             valid: AtomicBool::new(true),
             clock: AtomicU64::new(0),
