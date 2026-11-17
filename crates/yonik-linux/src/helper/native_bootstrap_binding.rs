@@ -126,13 +126,41 @@ impl PeerCustody for RetainedPeer {
 fn same_ref(a: wire::SnapshotRef, b: wire::SnapshotRef) -> bool {
     (a.source, a.asset, a.bytes, a.flags) == (b.source, b.asset, b.bytes, b.flags)
 }
+// Immutable exact original, без максимального hostname tail в каждой query.
+// Arc clone нужен только до окончания observed(); queries не удаляются/reuse
+// внутри invocation, и заимствованный BootstrapBinding удерживает их lease.
+struct QueryOriginal {
+    protocol: u8,
+    family: u8,
+    port: u16,
+    bytes: Box<[u8]>,
+}
+impl QueryOriginal {
+    fn copy(original: wire::Destination<'_>) -> Result<Self, ServiceError> {
+        Target::copy(original)?;
+        Ok(Self {
+            protocol: original.protocol,
+            family: original.family,
+            port: original.port,
+            bytes: original.bytes.into(),
+        })
+    }
+    fn wire(&self) -> wire::Destination<'_> {
+        wire::Destination {
+            protocol: self.protocol,
+            family: self.family,
+            port: self.port,
+            bytes: &self.bytes,
+        }
+    }
+}
 struct Query {
     capture: Option<Box<CaptureStamp>>,
     capture_memory: Option<crate::helper::memory::ByteLease>,
     id: u64,
     root: wire::dns_v2::Root,
     selector: wire::dns_v2::BootstrapSelector,
-    original: Target,
+    original: Arc<QueryOriginal>,
     path: Box<[(u16, u8)]>,
     expires: Instant,
     _memory: crate::helper::memory::ByteLease,
@@ -677,6 +705,10 @@ impl BootstrapBinding {
                 .reserve(
                     std::mem::size_of::<Query>()
                         + p.path.len() * 4
+                        + std::mem::size_of::<QueryOriginal>()
+                        // Arc strong/weak counters; inner выровнен по usize.
+                        + 2 * std::mem::size_of::<usize>()
+                        + p.original.bytes.len()
                         + 160
                         + 4 * std::mem::size_of::<QuerySlot>(),
                 )
@@ -696,7 +728,7 @@ impl BootstrapBinding {
                 id: p.query,
                 root: p.root,
                 selector: p.selector,
-                original: Target::copy(p.original)?,
+                original: Arc::new(QueryOriginal::copy(p.original)?),
                 path: p.path.into(),
                 expires: until,
                 _memory: credit,
@@ -980,7 +1012,7 @@ impl BootstrapDnsTranscript for BootstrapBinding {
                     q.root,
                     q.id,
                     q.selector,
-                    q.original,
+                    q.original.clone(),
                     path,
                     credit,
                     q.expires.min(r.binding.expires),
@@ -1062,6 +1094,29 @@ pub(super) mod tests {
     }
     use super::*;
     use std::sync::atomic::AtomicU64;
+    #[test]
+    fn bootstrap_query_original_keeps_exact_bytes_and_shared_lifetime() {
+        for protocol in [6, 17] {
+            let destination = wire::Destination {
+                protocol,
+                family: 3,
+                port: 443,
+                bytes: b"fr.example.invalid",
+            };
+            let original = Arc::new(QueryOriginal::copy(destination).unwrap());
+            let held = original.clone();
+            assert!(held.wire() == destination);
+            assert_eq!(held.bytes.len(), destination.bytes.len());
+            assert!(
+                std::mem::size_of::<QueryOriginal>()
+                    + held.bytes.len()
+                    + 2 * std::mem::size_of::<usize>()
+                    < std::mem::size_of::<Target>()
+            );
+            drop(original);
+            assert!(held.wire() == destination);
+        }
+    }
     pub(in crate::helper::native_profile_channel) fn interop_status(
         b: &BootstrapBinding,
         query: u64,

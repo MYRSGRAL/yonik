@@ -2110,3 +2110,28 @@ ProfileRoutes использует эти predicates только дополни
 member/Consumed authority и durable install; никакой route до Numeric не добавлен.
 Pure prepare regression полного France проверяет HOSTS/NETWORK, оба carriers,
 foreign host/port/family, отсутствие synthetic capture и source mutation.
+
+### Retained NETWORK RRset memory (после000c485)
+
+`native_dns_rrset::Producer` удерживает `RetainedAnswer` с exact Box slice members
+и `RetainedBinding` с exact destination bytes. Все scalar fields Binding сохранены;
+`expand()` восстанавливает прежний stack Binding без allocation/ID lookup. Полные
+typed comparisons/frozen revision/source/peer/epoch/expiry checks продолжают
+исполняться. Publication хранит exact request+response, request boundary и observed
+anchor; остальные receipt fields уже immutable в Producer/retained transport.
+Повторная проверка Source/transcript/parser использует прежний trusted factory.
+
+Fixed parser Answer живёт под SCRATCH; отдельная lease оплачивает exact member
+copy до allocation при ещё живом Answer. Затем fixed Answer/scratch уничтожаются,
+и только после Source checks lease расширяется до Producer/map/publication/three
+destination allocations. Ошибка возвращает lease и buffers, не создавая DATA.
+CNAME path/ownership целиком проверен в отдельной фазе до materialization members;
+SCRATCH теперь13600 вместо17968, все CNAME/cycle/member-cap/strict RR checks сохранены.
+BootstrapBinding Query original использует immutable Arc+exact bytes, с оплатой
+inner/counters/bytes до allocation. Query records не reuse/evict внутри invocation;
+`observed(&self)` удерживает owning Binding пока жив clone original.
+
+Actual same-session France теперь достигает второго NETWORK Published41 при
+прежнем budget (40709 used против прежних46414). Полная pair acceptance ещё
+блокируется независимым frozen-Go pending guard: actual pending61 + next waiter9
+>64, profile_dns_frontier_linux.go:1600. Никакие pins/scopes/readiness не открыты.

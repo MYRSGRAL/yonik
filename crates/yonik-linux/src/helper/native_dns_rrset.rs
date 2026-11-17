@@ -187,6 +187,34 @@ struct Answer {
     count: usize,
     ttl: u32,
 }
+struct RetainedAnswer {
+    members: Box<[IpAddr]>,
+    ttl: u32,
+}
+impl Answer {
+    fn retain(
+        self,
+        budget: &super::super::memory::ByteBudget,
+    ) -> Result<(RetainedAnswer, ByteLease), ServiceError> {
+        if !(1..=MEMBERS).contains(&self.count) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        // Scratch ещё удерживает fixed Answer; отдельная lease оплачивает
+        // точную копию до allocation. Box slice не имеет capacity/reallocation.
+        let memory = budget
+            .reserve(
+                std::mem::size_of::<RetainedAnswer>() + self.count * std::mem::size_of::<IpAddr>(),
+            )
+            .map_err(unavailable)?;
+        Ok((
+            RetainedAnswer {
+                members: self.members[..self.count].into(),
+                ttl: self.ttl,
+            },
+            memory,
+        ))
+    }
+}
 fn unicast(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -208,8 +236,15 @@ pub(super) fn numeric_ip_allowed(ip: IpAddr) -> bool {
         && !matches!(ip,IpAddr::V6(ip) if ip.is_unicast_link_local())
 }
 // Все scratch buffers заранее учтены caller; parser не аллоцирует.
+// CNAME path полностью проверяется и уничтожается до materialization Answer.
+// Четыре текущих Name и прежний fixed запас оплачены в обеих фазах.
 pub(super) const SCRATCH: usize =
-    std::mem::size_of::<Answer>() + (CHAIN + 4) * std::mem::size_of::<Name>() + 4096;
+    if std::mem::size_of::<Answer>() > CHAIN * std::mem::size_of::<Name>() {
+        std::mem::size_of::<Answer>()
+    } else {
+        CHAIN * std::mem::size_of::<Name>()
+    } + 4 * std::mem::size_of::<Name>()
+        + 4096;
 fn parse(
     request: &[u8],
     response: &[u8],
@@ -272,41 +307,56 @@ fn parse(
     if cursor != response.len() {
         return Err(ServiceError::InvalidRequest);
     }
-    let mut path = [Name::empty(); CHAIN];
-    let mut depth = 1;
-    path[0] = expected;
-    let mut current = expected;
-    let mut ttl = u32::MAX;
-    loop {
-        let mut next = None;
+    let ttl = {
+        let mut path = [Name::empty(); CHAIN];
+        let mut depth = 1;
+        path[0] = expected;
+        let mut current = expected;
+        let mut ttl = u32::MAX;
+        loop {
+            let mut next = None;
+            let mut cursor = answer_start;
+            let mut address = false;
+            for _ in 0..answers {
+                let record = rr(response, &mut cursor)?;
+                if record.owner != current {
+                    continue;
+                }
+                if matches!(record.kind, 1 | 28) {
+                    address = true;
+                }
+                if record.kind == 5 {
+                    let mut offset = record.start;
+                    let target = name(response, &mut offset)?;
+                    if next.is_some_and(|n| n != target) {
+                        return Err(ServiceError::InvalidRequest);
+                    }
+                    next = Some(target);
+                    ttl = ttl.min(record.ttl);
+                }
+            }
+            let Some(next) = next else { break };
+            if address || depth == CHAIN || path[..depth].contains(&next) {
+                return Err(ServiceError::InvalidRequest);
+            }
+            path[depth] = next;
+            depth += 1;
+            current = next;
+        }
+        // Отдельный проход по immutable packet сохраняет exact ownership/qtype
+        // checks, но не удерживает максимальный path вместе с массивом members.
         let mut cursor = answer_start;
-        let mut address = false;
         for _ in 0..answers {
             let record = rr(response, &mut cursor)?;
-            if record.owner != current {
-                continue;
+            if !path[..depth].contains(&record.owner) {
+                return Err(ServiceError::InvalidRequest);
             }
-            if matches!(record.kind, 1 | 28) {
-                address = true;
-            }
-            if record.kind == 5 {
-                let mut offset = record.start;
-                let target = name(response, &mut offset)?;
-                if next.is_some_and(|n| n != target) {
-                    return Err(ServiceError::InvalidRequest);
-                }
-                next = Some(target);
-                ttl = ttl.min(record.ttl);
+            if matches!(record.kind, 1 | 28) && (record.owner != current || record.kind != qtype) {
+                return Err(ServiceError::InvalidRequest);
             }
         }
-        let Some(next) = next else { break };
-        if address || depth == CHAIN || path[..depth].contains(&next) {
-            return Err(ServiceError::InvalidRequest);
-        }
-        path[depth] = next;
-        depth += 1;
-        current = next;
-    }
+        ttl
+    };
     let mut result = Answer {
         members: [IpAddr::V4(Ipv4Addr::UNSPECIFIED); MEMBERS],
         count: 0,
@@ -315,13 +365,7 @@ fn parse(
     let mut cursor = answer_start;
     for _ in 0..answers {
         let record = rr(response, &mut cursor)?;
-        if !path[..depth].contains(&record.owner) {
-            return Err(ServiceError::InvalidRequest);
-        }
         if matches!(record.kind, 1 | 28) {
-            if record.owner != current || record.kind != qtype {
-                return Err(ServiceError::InvalidRequest);
-            }
             let bytes = &response[record.start..record.end];
             let ip = if record.kind == 1 {
                 IpAddr::V4(Ipv4Addr::from(
@@ -361,21 +405,150 @@ pub(super) fn verify_bootstrap_capture(
 ) -> Result<(), ServiceError> {
     parse(request, response, lookup, qtype, options, payload).map(|_| ())
 }
+// Все поля Binding удерживаются независимо от mutable transport ledgers.
+// Targets используют exact bytes; expand создаёт прежний stack Binding,
+// не заимствует authority по ID и не аллоцирует.
+struct RetainedTarget {
+    protocol: u8,
+    family: u8,
+    port: u16,
+    bytes: Box<[u8]>,
+}
+impl RetainedTarget {
+    fn copy(t: Target) -> Self {
+        let t = t.wire();
+        Self {
+            protocol: t.protocol,
+            family: t.family,
+            port: t.port,
+            bytes: t.bytes.into(),
+        }
+    }
+    fn expand(&self) -> Result<Target, ServiceError> {
+        Target::copy(wire::Destination {
+            protocol: self.protocol,
+            family: self.family,
+            port: self.port,
+            bytes: &self.bytes,
+        })
+    }
+}
+struct RetainedBinding {
+    bootstrap: bool,
+    parent_carrier: u8,
+    proxied: bool,
+    physical_peer: RetainedTarget,
+    physical_scope: u16,
+    physical_subject: u16,
+    physical_endpoint: u16,
+    physical_branch: u8,
+    physical_hop: u16,
+    bundle: u64,
+    revision: u64,
+    root: u64,
+    query: u64,
+    epoch: u64,
+    source: u64,
+    source_revision: u64,
+    resolver: u16,
+    subject: u16,
+    scope: u16,
+    branch: u8,
+    qtype: u16,
+    options: u16,
+    payload: u16,
+    base: [u8; 32],
+    name: RetainedTarget,
+    peer: RetainedTarget,
+    ticket: Option<u64>,
+    expires: Instant,
+}
+impl RetainedBinding {
+    fn bytes(b: Binding) -> usize {
+        b.physical_peer.wire().bytes.len() + b.name.wire().bytes.len() + b.peer.wire().bytes.len()
+    }
+    fn copy(b: Binding) -> Self {
+        Self {
+            bootstrap: b.bootstrap,
+            parent_carrier: b.parent_carrier,
+            proxied: b.proxied,
+            physical_peer: RetainedTarget::copy(b.physical_peer),
+            physical_scope: b.physical_scope,
+            physical_subject: b.physical_subject,
+            physical_endpoint: b.physical_endpoint,
+            physical_branch: b.physical_branch,
+            physical_hop: b.physical_hop,
+            bundle: b.bundle,
+            revision: b.revision,
+            root: b.root,
+            query: b.query,
+            epoch: b.epoch,
+            source: b.source,
+            source_revision: b.source_revision,
+            resolver: b.resolver,
+            subject: b.subject,
+            scope: b.scope,
+            branch: b.branch,
+            qtype: b.qtype,
+            options: b.options,
+            payload: b.payload,
+            base: b.base,
+            name: RetainedTarget::copy(b.name),
+            peer: RetainedTarget::copy(b.peer),
+            ticket: b.ticket,
+            expires: b.expires,
+        }
+    }
+    fn expand(&self) -> Result<Binding, ServiceError> {
+        Ok(Binding {
+            bootstrap: self.bootstrap,
+            parent_carrier: self.parent_carrier,
+            proxied: self.proxied,
+            physical_peer: self.physical_peer.expand()?,
+            physical_scope: self.physical_scope,
+            physical_subject: self.physical_subject,
+            physical_endpoint: self.physical_endpoint,
+            physical_branch: self.physical_branch,
+            physical_hop: self.physical_hop,
+            bundle: self.bundle,
+            revision: self.revision,
+            root: self.root,
+            query: self.query,
+            epoch: self.epoch,
+            source: self.source,
+            source_revision: self.source_revision,
+            resolver: self.resolver,
+            subject: self.subject,
+            scope: self.scope,
+            branch: self.branch,
+            qtype: self.qtype,
+            options: self.options,
+            payload: self.payload,
+            base: self.base,
+            name: self.name.expand()?,
+            peer: self.peer.expand()?,
+            ticket: self.ticket,
+            expires: self.expires,
+        })
+    }
+}
+
 struct Producer {
     bootstrap: Option<Box<BootstrapPublication>>,
-    binding: Binding,
+    binding: RetainedBinding,
     proof: u64,
     revision: u64,
     exchange: u64,
     request: u64,
     expires: Instant,
-    answer: Answer,
+    answer: RetainedAnswer,
     acked: bool,
     revoked: bool,
     _memory: ByteLease,
 }
 struct BootstrapPublication {
     raw: Box<[u8]>,
+    request_len: u16,
     observed: Instant,
 }
 struct Waiter {
@@ -566,6 +739,12 @@ impl<A: Authority> Issuer<A> {
             request: &b[144 + q..144 + q + r],
             response: &b[144 + q + r..],
         };
+        self.bootstrap_receipt_observed(receipt)
+    }
+    fn bootstrap_receipt_observed(
+        &self,
+        receipt: super::BootstrapDnsReceipt<'_>,
+    ) -> Result<Instant, ServiceError> {
         // DATA sanity до trusted endpoint; числа и transcript hash не mint.
         if !receipt.binding.bootstrap
             || [
@@ -581,7 +760,7 @@ impl<A: Authority> Issuer<A> {
         {
             return Err(ServiceError::InvalidRequest);
         }
-        if binding.parent_carrier == 17 {
+        if receipt.binding.parent_carrier == 17 {
             return self.datagram_response_observed(receipt);
         }
         if self.negotiated.is_some_and(|n| n.datagram()) {
@@ -598,14 +777,32 @@ impl<A: Authority> Issuer<A> {
     }
     fn bootstrap_rrset_live(&self, p: &Producer) -> Result<Instant, ServiceError> {
         let capture = p.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
-        let (_, until) = self.bootstrap_dns_data(p.binding)?;
-        if self.bootstrap_response_observed(p.binding, &capture.raw)? != capture.observed {
+        let binding = p.binding.expand()?;
+        let (_, until) = self.bootstrap_dns_data(binding)?;
+        // Binding/proof IDs уже удерживает immutable Producer. Capture хранит
+        // только exact request/response, без второй копии Publish header/query.
+        let split = usize::from(capture.request_len);
+        let (request, response) = capture
+            .raw
+            .split_at_checked(split)
+            .ok_or(ServiceError::Unavailable)?;
+        if self.bootstrap_receipt_observed(super::BootstrapDnsReceipt {
+            lifetime_anchor: self.dns_lifetime_anchor(p.proof, p.revision, p.exchange, binding)?,
+            binding,
+            proof: p.proof,
+            revision: p.revision,
+            exchange: p.exchange,
+            producer_sequence: self.dns_producer_sequence(p.proof)?,
+            request,
+            response,
+        })? != capture.observed
+        {
             return Err(ServiceError::Unavailable);
         }
         let until = p
             .expires
             .min(until)
-            .min(self.bootstrap_dns_data(p.binding)?.1);
+            .min(self.bootstrap_dns_data(binding)?.1);
         if self.authority.now() >= until {
             return Err(ServiceError::Unavailable);
         }
@@ -707,20 +904,7 @@ impl<A: Authority> Issuer<A> {
             return Err(ServiceError::Unsupported);
         }
         let (_, started, _) = self.dns_publish_binding(n64(b, 120), n64(b, 128), n64(b, 28))?;
-        let memory = self
-            .budget
-            .dynamic
-            .reserve(
-                std::mem::size_of::<Producer>()
-                    + 80
-                    + if binding.bootstrap {
-                        std::mem::size_of::<BootstrapPublication>() + b.len()
-                    } else {
-                        0
-                    },
-            )
-            .map_err(unavailable)?;
-        let answer = {
+        let (answer, mut memory) = {
             let _scratch = self.budget.dynamic.reserve(SCRATCH).map_err(unavailable)?;
             parse(
                 &b[144 + q..144 + q + r],
@@ -730,6 +914,7 @@ impl<A: Authority> Issuer<A> {
                 binding.options,
                 binding.payload,
             )?
+            .retain(&self.budget.dynamic)?
         };
         let observed = if binding.bootstrap {
             self.bootstrap_response_observed(binding, b)?
@@ -749,6 +934,22 @@ impl<A: Authority> Issuer<A> {
         if self.authority.now() >= expires {
             return Err(ServiceError::Unavailable);
         }
+        // Только actual retained members. Producer/publication ещё не созданы;
+        // временный fixed Answer и scratch завершились до Source revalidation.
+        memory
+            .resize(
+                std::mem::size_of::<Producer>()
+                    + 80
+                    + answer.members.len() * std::mem::size_of::<IpAddr>()
+                    + RetainedBinding::bytes(binding)
+                    + 6 * std::mem::size_of::<usize>()
+                    + if binding.bootstrap {
+                        std::mem::size_of::<BootstrapPublication>() + b.len() - 144 - q
+                    } else {
+                        0
+                    },
+            )
+            .map_err(unavailable)?;
         self.dns_publish_binding(n64(b, 120), n64(b, 128), n64(b, 28))?;
         self.bundle_history(1)?;
         let id = Self::id(&mut self.rrsets.next_producer)?;
@@ -758,11 +959,12 @@ impl<A: Authority> Issuer<A> {
             Box::new(Producer {
                 bootstrap: binding.bootstrap.then(|| {
                     Box::new(BootstrapPublication {
-                        raw: b.into(),
+                        raw: b[144 + q..].into(),
+                        request_len: r as u16,
                         observed,
                     })
                 }),
-                binding,
+                binding: RetainedBinding::copy(binding),
                 proof: n64(b, 120),
                 revision: n64(b, 128),
                 exchange: n64(b, 28),
@@ -826,7 +1028,9 @@ impl<A: Authority> Issuer<A> {
         if !p.acked
             || p.revoked
             || p.expires <= self.authority.now()
-            || self.rrset_data_matches(binding, p.binding).is_err()
+            || self
+                .rrset_data_matches(binding, p.binding.expand()?)
+                .is_err()
             || binding.bootstrap && binding.root == p.binding.root
             || binding.bundle == p.binding.bundle
             || n64(b, 24) != binding.root
@@ -903,7 +1107,7 @@ impl<A: Authority> Issuer<A> {
             };
             if !p.acked {
                 let (proof, revision, exchange, binding) =
-                    (p.proof, p.revision, p.exchange, p.binding);
+                    (p.proof, p.revision, p.exchange, p.binding.expand()?);
                 if self.dns_publish_binding(proof, revision, exchange)?.0 != binding {
                     return Err(ServiceError::Unavailable);
                 }
@@ -928,7 +1132,7 @@ impl<A: Authority> Issuer<A> {
                     .as_nanos()
                     .min(u128::from(u32::MAX) * 1_000_000_000) as u64,
             );
-            out[40..42].copy_from_slice(&(p.answer.count as u16).to_be_bytes());
+            out[40..42].copy_from_slice(&(p.answer.members.len() as u16).to_be_bytes());
             Ok(expires)
         } else {
             let w = self
@@ -946,13 +1150,14 @@ impl<A: Authority> Issuer<A> {
             }
             let binding = w.binding;
             let source_until = if binding.bootstrap {
-                self.rrset_data_matches(binding, p.binding)?;
+                self.rrset_data_matches(binding, p.binding.expand()?)?;
                 self.bootstrap_rrset_live(p)?
             } else {
                 p.expires
             };
             let expiry = w.expires.min(p.expires).min(source_until);
-            let (producer, reservation, count) = (w.producer, w.reservation, p.answer.count);
+            let (producer, reservation, count) =
+                (w.producer, w.reservation, p.answer.members.len());
             let (current_binding, reservation_expires) = self.dns_waiter_binding(reservation)?;
             if current_binding != binding {
                 return Err(ServiceError::Unavailable);
@@ -1055,7 +1260,7 @@ impl<A: Authority> Issuer<A> {
             || !w.binding.bootstrap
             || !p.binding.bootstrap
             || p.bootstrap.is_none()
-            || !same_data(w.binding, p.binding)
+            || !same_data(w.binding, p.binding.expand()?)
             || w.binding.root == p.binding.root
             || w.binding.source != 0
             || w.binding.source_revision != 0
@@ -1078,8 +1283,8 @@ impl<A: Authority> Issuer<A> {
         if binding != w.binding {
             return Err(ServiceError::Unavailable);
         }
-        self.rrset_data_matches(binding, p.binding)?;
-        self.dns_frozen_revision(p.proof, p.revision, p.exchange, p.binding)?;
+        self.rrset_data_matches(binding, p.binding.expand()?)?;
+        self.dns_frozen_revision(p.proof, p.revision, p.exchange, p.binding.expand()?)?;
         let until = w
             .expires
             .min(p.expires)
@@ -1188,7 +1393,12 @@ impl<A: Authority> Issuer<A> {
             .producers
             .get(&w.producer)
             .ok_or(ServiceError::Unavailable)?;
-        if !w.acked || w.revoked || !p.acked || p.revoked || !same_data(w.binding, p.binding) {
+        if !w.acked
+            || w.revoked
+            || !p.acked
+            || p.revoked
+            || !same_data(w.binding, p.binding.expand()?)
+        {
             return Err(ServiceError::Unavailable);
         }
         let (binding, reservation_expires) = self.dns_waiter_binding(w.reservation)?;
@@ -1217,7 +1427,6 @@ impl<A: Authority> Issuer<A> {
             .answer
             .members
             .get(usize::from(index))
-            .filter(|_| usize::from(index) < p.answer.count)
             .ok_or(ServiceError::InvalidRequest)?;
         let d = target.wire();
         let equal = match member {
@@ -1739,6 +1948,175 @@ pub(super) fn dispatch<A: Authority>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dns_rrset_retained_binding_roundtrips_every_field_without_id_lookup() {
+        let physical = Target::copy(wire::Destination {
+            protocol: 6,
+            family: 4,
+            port: 443,
+            bytes: &[192, 0, 2, 1],
+        })
+        .unwrap();
+        let peer = Target::copy(wire::Destination {
+            protocol: 17,
+            family: 6,
+            port: 53,
+            bytes: &Ipv6Addr::LOCALHOST.octets(),
+        })
+        .unwrap();
+        let name = Target::copy(wire::Destination {
+            protocol: 17,
+            family: 3,
+            port: 443,
+            bytes: b"fr.example.invalid",
+        })
+        .unwrap();
+        let binding = Binding {
+            bootstrap: true,
+            parent_carrier: 17,
+            proxied: true,
+            physical_peer: physical,
+            physical_scope: 5,
+            physical_subject: 6,
+            physical_endpoint: 7,
+            physical_branch: 1,
+            physical_hop: 9,
+            bundle: 10,
+            revision: 11,
+            root: 12,
+            query: 13,
+            epoch: 14,
+            source: 15,
+            source_revision: 16,
+            resolver: 17,
+            subject: 18,
+            scope: 19,
+            branch: 1,
+            qtype: 28,
+            options: 9,
+            payload: 1232,
+            base: [24; 32],
+            name,
+            peer,
+            ticket: Some(27),
+            expires: Instant::now(),
+        };
+        let bytes = RetainedBinding::bytes(binding);
+        assert_eq!(bytes, 4 + 16 + 18);
+        let budget = super::super::super::memory::ByteBudget::new(
+            std::mem::size_of::<RetainedBinding>() + bytes + 6 * std::mem::size_of::<usize>(),
+        );
+        let lease = budget
+            .reserve(
+                std::mem::size_of::<RetainedBinding>() + bytes + 6 * std::mem::size_of::<usize>(),
+            )
+            .unwrap();
+        let stored = RetainedBinding::copy(binding);
+        assert!(stored.expand().unwrap() == binding);
+        assert!(budget.used() < std::mem::size_of::<Binding>());
+        drop(stored);
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn dns_rrset_retained_producer_does_not_embed_maximum_answer() {
+        assert!(std::mem::size_of::<Producer>() < std::mem::size_of::<Answer>());
+        eprintln!(
+            "RRset layout: producer={} fixed_answer={} retained_answer={} scratch={} member={}",
+            std::mem::size_of::<Producer>(),
+            std::mem::size_of::<Answer>(),
+            std::mem::size_of::<RetainedAnswer>(),
+            SCRATCH,
+            std::mem::size_of::<IpAddr>()
+        );
+    }
+    #[test]
+    fn dns_rrset_compact_answer_prepaid_peak_and_release() {
+        for count in [1, 256] {
+            let needed =
+                std::mem::size_of::<RetainedAnswer>() + count * std::mem::size_of::<IpAddr>();
+            let budget = super::super::super::memory::ByteBudget::new(SCRATCH + needed);
+            let (answer, memory) = {
+                let _scratch = budget.reserve(SCRATCH).unwrap();
+                let parsed = Answer {
+                    members: [IpAddr::V4(Ipv4Addr::LOCALHOST); MEMBERS],
+                    count,
+                    ttl: 17,
+                };
+                parsed.retain(&budget).unwrap()
+            };
+            assert_eq!(answer.members.len(), count);
+            assert_eq!(answer.ttl, 17);
+            assert_eq!(budget.used(), needed);
+            assert_eq!(memory.bytes(), needed);
+            drop(answer);
+            drop(memory);
+            assert_eq!(budget.used(), 0);
+            let budget = super::super::super::memory::ByteBudget::new(needed - 1);
+            assert!(
+                Answer {
+                    members: [IpAddr::V4(Ipv4Addr::LOCALHOST); MEMBERS],
+                    count,
+                    ttl: 17
+                }
+                .retain(&budget)
+                .is_err()
+            );
+            assert_eq!(budget.used(), 0);
+        }
+    }
+    #[test]
+    fn dns_rrset_parser_member_cap_256_duplicates_and_overflow() {
+        let (q, mut r) = pair();
+        r.truncate(q.len());
+        r[6..8].copy_from_slice(&257u16.to_be_bytes());
+        for i in 0u16..256 {
+            record(
+                &mut r,
+                &[0xc0, 12],
+                1,
+                30,
+                &[203, 0, (i >> 8) as u8, i as u8],
+            );
+        }
+        let mut exact = r.clone();
+        exact[6..8].copy_from_slice(&256u16.to_be_bytes());
+        let a = parse(&q, &exact, b"query.invalid", 1, 1, 0).unwrap();
+        assert_eq!(a.count, 256);
+        record(&mut r, &[0xc0, 12], 1, 7, &[203, 0, 0, 0]);
+        let a = parse(&q, &r, b"query.invalid", 1, 1, 0).unwrap();
+        assert_eq!((a.count, a.ttl), (256, 7));
+        let n = r.len();
+        r[n - 4..].copy_from_slice(&[203, 0, 1, 0]);
+        assert!(matches!(
+            parse(&q, &r, b"query.invalid", 1, 1, 0),
+            Err(ServiceError::Busy)
+        ));
+    }
+    #[test]
+    fn dns_rrset_parser_full_cname_frontier_and_overflow() {
+        let (q, base) = pair();
+        for links in [31, 32] {
+            let mut r = base[..q.len()].to_vec();
+            r[6..8].copy_from_slice(&((links + 1) as u16).to_be_bytes());
+            let mut owner = vec![0xc0, 12];
+            for i in 0..links {
+                let label = format!("n{i}");
+                let mut target = vec![label.len() as u8];
+                target.extend_from_slice(label.as_bytes());
+                target.extend_from_slice(b"\x07invalid\0");
+                record(&mut r, &owner, 5, 20, &target);
+                owner = target;
+            }
+            record(&mut r, &owner, 1, 30, &[203, 0, 113, 80]);
+            let result = parse(&q, &r, b"query.invalid", 1, 1, 0);
+            if links == 31 {
+                assert_eq!(result.unwrap().count, 1);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
     fn pair() -> (Vec<u8>, Vec<u8>) {
         let mut q = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
         q.extend_from_slice(b"\x05query\x07invalid\0\0\x01\0\x01");

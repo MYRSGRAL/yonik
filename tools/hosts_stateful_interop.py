@@ -61,6 +61,8 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
     descriptor = b""
     physical: dict[int, int] = {}
     logical: dict[int, tuple[int, int]] = {}
+    numeric_requests: list[int] = []
+    numeric_denials: list[int] = []
 
     def n(b: bytes, at: int) -> int:
         if at + 8 > len(b):
@@ -70,7 +72,7 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
     for e in trace:
         if "event" in e:
             detail = e["event"]
-            if detail["name"] in ("ack_hold", "ack_release"):
+            if detail["name"] in ("ack_hold", "ack_release", "network_credit_state"):
                 continue  # Отдельный cleanup oracle проверяет actual held ACK.
             if (
                 detail["name"] != "tcp_neighbor_after_udp_cleanup"
@@ -186,6 +188,8 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
             continue
         if e["side"] == "go":
             pending[n(raw, 16)] = (kind, b)
+            if kind == 42:
+                numeric_requests.append(b[25])
             continue
         req = pending.get(n(raw, 24))
         if req is None:
@@ -245,6 +249,8 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
             ):
                 raise AssertionError("waiter borrowed producer/query authority")
             waiters[n(b, 8)] = n(sent, 32)
+        elif kind == 19 and b[0] != 1 and sent_kind == 42:
+            numeric_denials.append(sent[25])
         elif kind == 19 and b[0] == 1 and sent_kind == 42:
             carrier = sent[25]
             if (
@@ -271,6 +277,8 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
         "physical_exchanges": len(physical),
         "resolver_carriers": sorted(physical.values()),
         "logical_proofs": len(logical),
+        "numeric_requests": numeric_requests,
+        "numeric_denials": numeric_denials,
     }
 
 
@@ -297,7 +305,10 @@ def check_network_cleanup(
     for event in trace:
         if "event" in event:
             detail = event["event"]
-            if detail["name"] == "tcp_neighbor_after_udp_cleanup":
+            if detail["name"] in (
+                "tcp_neighbor_after_udp_cleanup",
+                "network_credit_state",
+            ):
                 continue
             key = (int(detail["target"]), int(detail["id"]))
             if detail["name"] == "ack_hold":
@@ -649,6 +660,13 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                 raise AssertionError("missing separate France branch permissions")
             if bindings["neighbor_events"] != tcp_expected:
                 raise AssertionError("missing live TCP after UDP cleanup")
+            if case.endswith("foreign-member") and (
+                bindings["numeric_requests"] != [6, 17]
+                or bindings["numeric_denials"] != [17]
+            ):
+                raise AssertionError(
+                    "foreign member did not reach actual UDP Numeric denial"
+                )
             if network:
                 protocol = 6 if "-tcp-" in case else 17
                 if (

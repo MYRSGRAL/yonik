@@ -300,6 +300,13 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 			if e := f.c.accept(p); e != nil {
 				t.Fatalf("accept %d/%d: %v", p.kind, p.reply, e)
 			}
+			if network && p.kind == 41 && len(p.body) > 2 && p.body[2] == 1 {
+				// Только read-only диагностика после actual ACK; credits/owners
+				// не освобождаются и следующая операция не синтезируется.
+				f.c.mu.Lock()
+				pipe.emit(map[string]any{"event": map[string]any{"name": "network_credit_state", "producer": u64(p.body, 8), "pending": f.c.profilePendingUsed(), "operations": f.c.operations, "waiter_pending": profileNetworkWaiterPending, "pending_cap": min(64, int(f.c.manifest.caps[3])), "buffered": f.c.buffered, "metadata": f.c.manifest.memoryCredit, "memory_cap": f.c.manifest.caps[4], "waiter_memory": profileHostsObservationCredit, "history": f.c.dnsHistoryUsed, "tasks": f.c.dnsTasksUsed}})
+				f.c.mu.Unlock()
+			}
 		}
 	}
 	tick := func() {

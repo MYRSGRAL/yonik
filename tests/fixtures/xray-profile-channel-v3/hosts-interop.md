@@ -51,6 +51,32 @@ carrier и все observed cleanup barriers. Три независимых pins5
 
 ## FranceSS NETWORK same-session: production memory RED
 
+### Следующий memory cut (после000c485)
+
+Исторический Deny41 ниже устранён production Rust representation/lifetime fix.
+Producer хранит exact-length members и destinations, не максимальные массивы;
+capture удерживает только request/response. Lease оплачивает копию до allocation,
+пик fixed Answer→compact учитывает оба buffers. Query original хранится как
+immutable exact bytes с Arc lifetime и оплаченной Arc metadata. Parser разделяет
+CNAME ownership phase и заполнение Answer; Source/transcript reparse не удалён.
+Перед вторым Publish used теперь40709 вместо46414 при том же limit58419 Local.
+
+Actual pair теперь получает **два Allow41**, но positive joint всё ещё RED по
+новому Go blocker: после второго Publish read-only event показывает operations59,
+profilePendingUsed61/cap64. Следующий profileAcquireNetworkWaiter требует9,
+61+9=70>64 (profile_dns_frontier_linux.go:1600). Memory995536+5900364+32768
+помещается в8388608, history68 также не исчерпан. Frozen Go не изменялся; event
+из overlay только читает state после настоящего ACK. Artificial release/early
+close/credits override не выполняются. Для завершения второго waiter/Numeric
+требуется отдельная Go pending representation/lifetime correction с сохранением
+precredits cleanup/cancel; версия wire/caps не меняется.
+
+Foreign-member oracle теперь требует actual UDP Numeric42 и Deny19, поэтому
+ранний unrelated Unsupported не засчитывается как проверка чужого member.
+После Go correction повторить все47 selectors. ROOT memory RED и новый Go RED
+хранятся отдельно; evidence нового cut — p5-france-memory/current. Это не полный
+same-session NETWORK GREEN и не FranceReady/runtime acceptance.
+
 Base a2f93b3e130a4fea17e4d578e6d07d61d61384af. Production Go по-прежнему exact6e1,
 1307 members неизменны; production Rust также неизменён. Семантика теста такая
 же, как HOSTS выше, но snapshot DNS-first: обе ветки используют actual NETWORK
