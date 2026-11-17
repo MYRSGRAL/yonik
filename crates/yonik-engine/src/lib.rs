@@ -279,7 +279,14 @@ fn xray_outbound(server: &ParsedServer, options: &Options) -> Result<Value, Comp
         }
         _ => {}
     }
-    Ok(json!({"tag":"proxy","protocol":protocol,"settings":settings,"streamSettings":stream}))
+    let mut outbound =
+        json!({"tag":"proxy","protocol":protocol,"settings":settings,"streamSettings":stream});
+    if options.xudp_mux {
+        // Положительная ёмкость включает XUDP. Один UDP-поток на worker
+        // не разделяет соединение с другими потоками. UDP/443 остаётся на default Xray.
+        outbound["mux"] = json!({"enabled":true,"concurrency":-1,"xudpConcurrency":1});
+    }
+    Ok(outbound)
 }
 
 fn sing_outbound(server: &ParsedServer, options: &Options) -> Result<Value, CompileError> {

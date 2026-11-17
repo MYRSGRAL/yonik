@@ -21,6 +21,7 @@ pub(crate) struct Options {
     pub authority: String,
     pub spider_path: String,
     pub cipher: String,
+    pub xudp_mux: bool,
 }
 
 type Parameters = BTreeMap<String, String>;
@@ -174,14 +175,18 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
         return Err(CompileError::UnsupportedOption);
     }
     if let Some(packet_encoding) = parameters.remove("packetEncoding") {
-        // VLESS outbound в Xray 26.10.31 сам включает XUDP для UDP с Vision.
-        // Оставляем нативную политику Vision для UDP/443 и не включаем отдельный mux.
         if packet_encoding != "xudp"
+            || protocol != Protocol::Vless
             || engine != Engine::Xray
             || security != Security::Reality
-            || options.flow != "xtls-rprx-vision"
         {
             return Err(CompileError::UnsupportedOption);
+        }
+        match transport {
+            // VLESS outbound сам кодирует UDP как XUDP при Vision.
+            Transport::Tcp if options.flow == "xtls-rprx-vision" => {}
+            Transport::Grpc | Transport::Xhttp => options.xudp_mux = true,
+            _ => return Err(CompileError::UnsupportedOption),
         }
     }
     if security != Security::None {
@@ -219,6 +224,11 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
                 }
             }
         } else {
+            // REALITY UClient берёт ALPN из uTLS fingerprint. Пустой список
+            // не задаёт переопределение, а непустой остаётся неподдерживаемым.
+            if engine == Engine::Xray && parameters.get("alpn").is_some_and(String::is_empty) {
+                parameters.remove("alpn");
+            }
             options.public_key = take(&mut parameters, "pbk");
             if URL_SAFE_NO_PAD
                 .decode(&options.public_key)
