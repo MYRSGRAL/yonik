@@ -12,6 +12,30 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_network_numeric_has_independent_waiter_and_two_private_authorities(
+        self,
+    ) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "profileAcquireNetworkWaiter(n)",
+            "c.probe(w.ctx, 2, f.endpoint, f.subject, n.resolver)",
+            "w.state.permission = &profileBootstrapPhysicalPermission{network: w",
+            "c.networkWaiterRequest(w, 53, 54, body)",
+            "c.networkWaiterRequest(w, 42, 19, body)",
+            "w.service == n.service || w.service.id == n.service.id",
+            "s.query == original.query",
+            "r.replied || r.cancelAck",
+            "c.bootstrapCleanupState(b, &w.unknown)",
+            "n.waiter != nil && !n.waiter.released",
+            "TestProfileNetworkNumericRetiresBeforeProducerAndContexts",
+            "TestProfileNetworkNumericLateFactoryAndUnknownCloseKeepCustody",
+            "TestProfileNetworkNumericFreshWaiterRepliesAreExact",
+        ):
+            self.assertIn(anchor, patch)
+        metadata = json.loads((ADAPTER / "native-full-profile.json").read_text())
+        self.assertFalse(metadata["builder_apply_enabled"])
+        self.assertFalse(metadata["physical_resolver_proof_connected"])
+
     def test_network_bootstrap_constructor_has_own_root_context_and_reservation(
         self,
     ) -> None:
@@ -92,7 +116,7 @@ class FullProfilePatchTests(unittest.TestCase):
             "c.bootstrapRequest(h, 42, 19, body)",
             "type profileBootstrapPhysicalPermission struct",
             "profileBootstrapGate(callback, permission)",
-            "h.bootstrap.opening = true",
+            "state.opening = true",
             "b.tasks.Wait()",
             "c.bootstrapCleanup(h)",
             "ProfileBootstrapRawContext(next, raw)",
