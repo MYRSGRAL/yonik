@@ -43057,9 +43057,9 @@ new file mode 100644
 +func (t *profileDNSDirect) bindingIDs() (uint64, uint64, uint16, uint16) {
 +	if t.network != nil {
 +		n := t.network
-+		return n.context.source.query, n.context.identity.id, n.resolver, n.frontier.scope
++		return n.context.source.query, n.context.identity.id, n.resolver, uint16(n.frontier.count - 1)
 +	}
-+	return t.bundle.queryID, t.bundle.id, t.bundle.resolver, t.bundle.path[0].scope
++	return t.bundle.queryID, t.bundle.id, t.bundle.resolver, uint16(t.bundle.count - 1)
 +}
 +func (c *profileFlowControl) dnsDirectNew(ctx context.Context, b *profileDNSBundle, io profileDNSDirectIO) (*profileDNSDirect, error) {
 +	c.mu.Lock()
@@ -43348,7 +43348,7 @@ new file mode 100644
 +		return nil, errProfile
 +	}
 +	r := t.runtime().admission.launch
-+	query, context, resolver, scope := t.bindingIDs()
++	query, context, resolver, pathRow := t.bindingIDs()
 +	body := make([]byte, 192)
 +	copy(body, "DNSPHY02")
 +	be.PutUint16(body[8:], 2)
@@ -43364,7 +43364,7 @@ new file mode 100644
 +	be.PutUint64(body[144:], context)
 +	be.PutUint64(body[152:], t.physicalReservation)
 +	be.PutUint16(body[160:], resolver)
-+	be.PutUint16(body[162:], scope)
++	be.PutUint16(body[162:], pathRow)
 +	body[164], body[165], body[166] = t.destination.network, 1, r.mode
 +	if body[164] == 17 {
 +		body[165] = 2

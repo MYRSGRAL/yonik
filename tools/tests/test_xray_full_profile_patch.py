@@ -217,7 +217,7 @@ class FullProfilePatchTests(unittest.TestCase):
             "c.profileFDUsed()+2 > 64",
             "t.network != nil",
             "t.runtime().admission.launch",
-            "query, context, resolver, scope := t.bindingIDs()",
+            "query, context, resolver, pathRow := t.bindingIDs()",
             "if !n.transport.released",
             "n.constructing = false",
         ):
