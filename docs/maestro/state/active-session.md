@@ -779,6 +779,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   Publish/Waiter/Numeric service/Hosts и transport/close продолжаются отдельно.
   Wire/schema/public gates не менялись; runtime/bootstrap PASS не заявлен.
 
+- R62 SOURCE scoped CLEAN: Go Hosts consumer63179d9 интегрирован. Actual
+  chain caller получает own waiter53/54 и Numeric42 use2, отдельная class3
+  permission действует только совместно с live USER parent/fullfrontier.
+  One-shot raw TCP bridge сохраняет credits до close/I/O joins/retirement;
+  generic USER authority не расширена. TLS/mux/chain/UDP Unsupported.
+  Stateful Rust/Go pair не исполнялся; capture/producer/public gates false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
