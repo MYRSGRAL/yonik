@@ -472,6 +472,12 @@ fn codec4_roots_driver_actual_service_probe_then_network_roles_keep_dual_carrier
         .unwrap();
         let mut io = BundleIo::new(f.launch, vec![packet[..n].to_vec()]);
         io.source = Some(f.clone());
+        io.bootstrap_producer = Some(Arc::new(
+            super::super::super::VerifiedBootstrapDnsProducer {
+                launch: f.launch,
+                schema: Sha256::digest(wire::dns_v2::SCHEMA).into(),
+            },
+        ));
         io.stop_after = 5;
         append(
             &io,
@@ -1886,4 +1892,391 @@ fn codec4_hosts_numeric_driver_backend_failure_keeps_prepaid_one_shot_state() {
     assert!(issuer.dns.hosts_waiters[&1].numeric_once.is_some());
     assert_eq!(issuer.authority.route_count, 0);
     assert!(issuer.cancel_grant(1).is_err());
+}
+
+fn bootstrap_raw(f: &Facts) -> [u8; 192] {
+    let mut b = [0; 192];
+    b[..8].copy_from_slice(b"DNSPHY02");
+    b[8..10].copy_from_slice(&2u16.to_be_bytes());
+    b[10..12].copy_from_slice(&192u16.to_be_bytes());
+    b[16..48].copy_from_slice(&f.launch.binding.digest);
+    b[48..64].copy_from_slice(&f.launch.binding.session);
+    b[64..80].copy_from_slice(&f.launch.binding.invocation);
+    b[80..88].copy_from_slice(&f.launch.binding.generation.to_be_bytes());
+    b[88..96].copy_from_slice(&f.launch.binding.epoch.to_be_bytes());
+    b[96..128].copy_from_slice(&f.launch.nonce);
+    for (at, value) in [(128, 1u64), (136, 9), (144, 1), (152, 2)] {
+        b[at..at + 8].copy_from_slice(&value.to_be_bytes());
+    }
+    b[160..162].copy_from_slice(&1u16.to_be_bytes());
+    b[162..164].copy_from_slice(&((f.path.len() - 1) as u16).to_be_bytes());
+    b[164] = 17;
+    b[165] = 2;
+    b[166] = f.launch.mode as u8;
+    b[168..175].copy_from_slice(&[4, 17, 0, 53, 4, 0, 0]);
+    b[175..179].copy_from_slice(&[192, 0, 2, 53]);
+    b
+}
+fn bootstrap_logical() -> Vec<u8> {
+    let mut b = vec![0; 72];
+    b[..2].copy_from_slice(&2u16.to_be_bytes());
+    b[2] = 1;
+    b[4..6].copy_from_slice(&1u16.to_be_bytes());
+    for (at, value) in [
+        (8, 1u64),
+        (16, 9),
+        (24, 1),
+        (32, 1),
+        (48, 1),
+        (56, 1_000_000_000),
+        (64, 1),
+    ] {
+        b[at..at + 8].copy_from_slice(&value.to_be_bytes());
+    }
+    b
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BootstrapTransportFault {
+    None,
+    LateFd,
+    NoProducer,
+    Schema3,
+    WrongLaunch,
+    NoPermit,
+    LostPermit,
+    NoCredits,
+    SourceInvalid,
+    WrongPeer,
+    WrongNamespace,
+    Retire,
+    ExpiredCleanup,
+    UnknownClose,
+}
+fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
+    let (mut issuer, f) = fixture(Mode::System);
+    service(&mut issuer, &f);
+    let inbox = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let mut io = BundleIo::new(
+        f.launch,
+        vec![dns_packet(
+            f.launch,
+            3,
+            Operation::BundleAcquire,
+            &acquire(&f, false, 1, 9),
+        )],
+    );
+    io.source = Some(f.clone());
+    io.dns_inbox = Some(inbox.clone());
+    io.stop_after = 5;
+    let mut launch = f.launch;
+    if fault == BootstrapTransportFault::WrongLaunch {
+        launch.nonce[0] ^= 1;
+    }
+    io.bootstrap_producer = if fault == BootstrapTransportFault::NoProducer {
+        None
+    } else {
+        Some(Arc::new(
+            super::super::super::VerifiedBootstrapDnsProducer {
+                launch,
+                schema: if fault == BootstrapTransportFault::Schema3 {
+                    [3; 32]
+                } else {
+                    Sha256::digest(wire::dns_v2::SCHEMA).into()
+                },
+            },
+        ))
+    };
+    append(
+        &io,
+        vec![dns_packet(
+            f.launch,
+            4,
+            Operation::Reserve,
+            &reserve(&f, false, 1, 9),
+        )],
+    );
+    append(
+        &io,
+        vec![dns_packet(
+            f.launch,
+            5,
+            Operation::Reserve,
+            &reserve(&f, false, 2, 9),
+        )],
+    );
+    append(&io, vec![]);
+    append(
+        &io,
+        vec![dns_packet(
+            f.launch,
+            6,
+            Operation::LogicalBind,
+            &bootstrap_logical(),
+        )],
+    );
+    let raw = bootstrap_raw(&f);
+    let neg = issuer_tests::dns_neg(f.launch);
+    let slots = io.dns_slots().unwrap();
+    let _fd_limit = if fault == BootstrapTransportFault::NoCredits {
+        Some(slots.fds.reserve(64).unwrap())
+    } else {
+        None
+    };
+    if fault == BootstrapTransportFault::LostPermit {
+        issuer.authority.bootstrap_revoke_on = Some(2);
+    }
+    let budget = issuer.budget.dynamic.clone();
+    let facts = Arc::new(std::sync::Mutex::new(
+        super::super::super::dns_transport::fake_facts(
+            "192.0.2.10:32001".parse().unwrap(),
+            if fault == BootstrapTransportFault::WrongPeer {
+                "192.0.2.54:53"
+            } else {
+                "192.0.2.53:53"
+            }
+            .parse()
+            .unwrap(),
+            17,
+            if fault == BootstrapTransportFault::WrongNamespace {
+                (4, 6)
+            } else {
+                (4, 5)
+            },
+        ),
+    ));
+    let valid = Arc::new(AtomicBool::new(true));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let close_count = closed.clone();
+    let validity = valid.clone();
+    let permit = issuer.authority.bootstrap_permit_live.clone();
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let calls = factory_calls.clone();
+    let source = f.clone();
+    let clock = issuer.authority.elapsed.clone();
+    let factory = move || {
+        calls.fetch_add(1, Ordering::AcqRel);
+        let incoming = super::super::super::dns_transport::Incoming::fake(
+            raw,
+            &neg,
+            &slots,
+            &budget,
+            None,
+            facts.clone(),
+            valid.clone(),
+            closed.clone(),
+            || {},
+        )
+        .unwrap();
+        inbox.lock().unwrap().push_back(incoming);
+    };
+    if fault == BootstrapTransportFault::LateFd {
+        io.after_sent = Some(Box::new(move |n| {
+            if n == 3 {
+                factory();
+            }
+        }));
+    } else {
+        io.on_request = Some(Box::new(move |seq| {
+            if seq == 7 && fault == BootstrapTransportFault::ExpiredCleanup {
+                clock.fetch_add(1_100_000_000, Ordering::AcqRel);
+            }
+            if seq == 5 {
+                if fault == BootstrapTransportFault::NoPermit {
+                    permit.store(false, Ordering::Release);
+                } else if fault == BootstrapTransportFault::SourceInvalid {
+                    source.invalid_source.store(true, Ordering::Release);
+                } else if !matches!(
+                    fault,
+                    BootstrapTransportFault::NoCredits | BootstrapTransportFault::LostPermit
+                ) {
+                    factory();
+                }
+            }
+            if seq == 8 && fault == BootstrapTransportFault::UnknownClose {
+                validity.store(false, Ordering::Release);
+            }
+        }));
+    }
+    if matches!(
+        fault,
+        BootstrapTransportFault::Retire
+            | BootstrapTransportFault::ExpiredCleanup
+            | BootstrapTransportFault::UnknownClose
+    ) {
+        io.stop_after = 11;
+        let retire = |kind, id, rev| {
+            let mut b = vec![0; 24];
+            b[..2].copy_from_slice(&2u16.to_be_bytes());
+            b[2] = kind;
+            b[8..16].copy_from_slice(&u64::to_be_bytes(id));
+            b[16..24].copy_from_slice(&u64::to_be_bytes(rev));
+            b
+        };
+        append(
+            &io,
+            vec![dns_packet(f.launch, 7, Operation::Retire, &retire(4, 1, 1))],
+        );
+        append(
+            &io,
+            vec![dns_packet(f.launch, 8, Operation::Retire, &retire(3, 1, 0))],
+        );
+        append(
+            &io,
+            vec![dns_packet(f.launch, 9, Operation::Retire, &retire(3, 1, 0))],
+        );
+        for (sequence, target, id) in [(10, 7, 2), (11, 7, 1), (12, 8, 1)] {
+            append(
+                &io,
+                vec![dns_packet(
+                    f.launch,
+                    sequence,
+                    Operation::Cancel,
+                    &cancel_body(target, id),
+                )],
+            );
+        }
+    }
+    if matches!(
+        fault,
+        BootstrapTransportFault::NoProducer
+            | BootstrapTransportFault::Schema3
+            | BootstrapTransportFault::WrongLaunch
+    ) {
+        io.stop_after = 2;
+        io.after_reply.borrow_mut().truncate(1);
+    } else if matches!(
+        fault,
+        BootstrapTransportFault::NoPermit
+            | BootstrapTransportFault::LostPermit
+            | BootstrapTransportFault::NoCredits
+            | BootstrapTransportFault::SourceInvalid
+    ) {
+        io.stop_after = 3;
+        io.after_reply.borrow_mut().truncate(2);
+    }
+    drive(&mut issuer, &io);
+    let out = io.output.borrow();
+    if matches!(
+        fault,
+        BootstrapTransportFault::NoProducer
+            | BootstrapTransportFault::Schema3
+            | BootstrapTransportFault::WrongLaunch
+    ) {
+        assert_eq!(out[1][130], 2);
+        assert_eq!(issuer.authority.dns_checks, 0);
+        return;
+    }
+    if matches!(
+        fault,
+        BootstrapTransportFault::NoPermit
+            | BootstrapTransportFault::LostPermit
+            | BootstrapTransportFault::NoCredits
+            | BootstrapTransportFault::SourceInvalid
+    ) {
+        assert_eq!(out[2][130], 2);
+        assert_eq!(factory_calls.load(Ordering::Acquire), 0);
+        assert_eq!(issuer.authority.dns_checks, 0);
+        return;
+    }
+    if matches!(
+        fault,
+        BootstrapTransportFault::WrongPeer | BootstrapTransportFault::WrongNamespace
+    ) {
+        assert!(out.len() < 5 || out[3][130] != 1);
+        assert_eq!(issuer.authority.owner_count, 0);
+        return;
+    }
+    if matches!(
+        fault,
+        BootstrapTransportFault::Retire
+            | BootstrapTransportFault::ExpiredCleanup
+            | BootstrapTransportFault::UnknownClose
+    ) {
+        assert_eq!(
+            out.len(),
+            if fault != BootstrapTransportFault::UnknownClose {
+                11
+            } else {
+                7
+            }
+        );
+        assert_eq!(out[5][130], 1);
+        assert_eq!(
+            out[6][130],
+            if fault != BootstrapTransportFault::UnknownClose {
+                1
+            } else {
+                3
+            }
+        );
+        if fault != BootstrapTransportFault::UnknownClose {
+            assert_eq!(out[7][130], out[6][130]);
+            for b in &out[8..] {
+                assert_eq!(b[130], 1);
+            }
+            assert_eq!(issuer.authority.release_attempts, 1);
+            assert_eq!(issuer.authority.live.len(), 1);
+            assert!(issuer.authority.live.contains(&1));
+            assert_eq!(io.dns_slots().unwrap().fds.used(), 0);
+        } else {
+            assert_eq!(issuer.authority.release_attempts, 0);
+            assert_eq!(issuer.authority.live.len(), 2);
+            assert!(io.dns_slots().unwrap().fds.used() > 0);
+        }
+        assert_eq!(close_count.load(Ordering::Acquire), 1);
+        assert_eq!(
+            issuer.unknown,
+            fault == BootstrapTransportFault::UnknownClose
+        );
+    } else {
+        assert_eq!(out.len(), 5);
+    }
+    for b in out.iter().take(5) {
+        assert_eq!(b[130], 1);
+    }
+    assert_eq!(u64_at(&out[3], 24), 5);
+    assert_eq!(u64_at(&out[4], 168), 1);
+    assert_eq!(issuer.authority.owner_count, 0);
+}
+#[test]
+fn codec4_bootstrap_transport_driver_raw_fd_then_distinct_logical_proof() {
+    for f in [
+        BootstrapTransportFault::None,
+        BootstrapTransportFault::LateFd,
+    ] {
+        bootstrap_transport_driver(f);
+    }
+}
+#[test]
+fn codec4_bootstrap_transport_driver_producer_scope_and_permit_before_factory() {
+    for f in [
+        BootstrapTransportFault::NoProducer,
+        BootstrapTransportFault::Schema3,
+        BootstrapTransportFault::WrongLaunch,
+        BootstrapTransportFault::NoPermit,
+        BootstrapTransportFault::LostPermit,
+        BootstrapTransportFault::NoCredits,
+        BootstrapTransportFault::SourceInvalid,
+    ] {
+        bootstrap_transport_driver(f);
+    }
+}
+#[test]
+fn codec4_bootstrap_transport_driver_kernel_peer_namespace_fail_closed() {
+    for f in [
+        BootstrapTransportFault::WrongPeer,
+        BootstrapTransportFault::WrongNamespace,
+    ] {
+        bootstrap_transport_driver(f);
+    }
+}
+#[test]
+fn codec4_bootstrap_transport_driver_consuming_close_once_and_unknown_sticky() {
+    for f in [
+        BootstrapTransportFault::Retire,
+        BootstrapTransportFault::ExpiredCleanup,
+        BootstrapTransportFault::UnknownClose,
+    ] {
+        bootstrap_transport_driver(f);
+    }
 }

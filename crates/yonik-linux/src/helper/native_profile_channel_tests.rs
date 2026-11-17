@@ -81,6 +81,8 @@ fn dns_rrset_queue_credit_precedes_materialization_and_rx_bound_is_fixed() {
 
 // Весь driver below — in-memory: ни OS endpoint, ни runtime wrappers.
 pub(super) struct BundleIo {
+    pub(super) bootstrap_producer: Option<Arc<VerifiedBootstrapDnsProducer>>,
+    pub(super) dns_inbox: Option<Arc<std::sync::Mutex<VecDeque<dns_transport::Incoming>>>>,
     pub(super) after_sent: Option<Box<dyn Fn(usize)>>,
     pub(super) deferred: Option<Arc<std::sync::Mutex<Vec<Vec<u8>>>>>,
     pub(super) fail_write_at: Option<usize>,
@@ -146,6 +148,8 @@ impl BundleIo {
     }
     pub(super) fn new(record: LaunchRecord, requests: Vec<Vec<u8>>) -> Self {
         Self {
+            bootstrap_producer: None,
+            dns_inbox: None,
             after_sent: None,
             deferred: None,
             fail_write_at: None,
@@ -167,6 +171,17 @@ impl BundleIo {
     }
 }
 impl Channel for BundleIo {
+    fn bootstrap_dns_producer(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<VerifiedBootstrapDnsProducer>>, ServiceError> {
+        Ok(self.bootstrap_producer.clone())
+    }
+    fn take_dns(&self) -> Result<Option<dns_transport::Incoming>, ServiceError> {
+        self.dns_inbox.as_ref().map_or(Ok(None), |queue| {
+            Ok(queue.lock().map_err(unavailable)?.pop_front())
+        })
+    }
     fn dns_slots(&self) -> Result<Arc<SidebandCredits>, ServiceError> {
         Ok(self.slots.clone())
     }
@@ -1498,11 +1513,14 @@ pub(super) struct Proof {
     receipt: wire::Receipt,
 }
 pub(super) struct Fake {
+    pub(super) bootstrap_permit_live: Arc<AtomicBool>,
     pub(super) owner_forbidden: bool,
     pub(super) static_dns_peer: Option<std::net::SocketAddr>,
     pub(super) numeric_delay: Duration,
     pub(super) dns_delay_on: Option<usize>,
-    dns_checks: usize,
+    pub(super) dns_checks: usize,
+    pub(super) bootstrap_permit_checks: usize,
+    pub(super) bootstrap_revoke_on: Option<usize>,
     udp_inbox: Option<Arc<std::sync::Mutex<Rendezvous<u8>>>>,
     pub(super) service_trusted: bool,
     mode: Mode,
@@ -1525,12 +1543,15 @@ pub(super) struct Fake {
 impl Fake {
     pub(super) fn new(mode: Mode) -> Self {
         Self {
+            bootstrap_permit_live: Arc::new(AtomicBool::new(true)),
             owner_forbidden: false,
             static_dns_peer: None,
             numeric_delay: Duration::ZERO,
             udp_inbox: None,
             dns_delay_on: None,
             dns_checks: 0,
+            bootstrap_permit_checks: 0,
+            bootstrap_revoke_on: None,
             service_trusted: false,
             mode,
             now: Instant::now(),
@@ -1552,6 +1573,52 @@ impl Fake {
     }
 }
 impl Authority for Fake {
+    fn check_bootstrap_permit(&mut self, route: BootstrapDnsRoute) -> Result<(), ServiceError> {
+        self.fence()?;
+        self.bootstrap_permit_checks += 1;
+        if !self.bootstrap_permit_live.load(Ordering::Acquire)
+            || !self.service_trusted
+            || !self.service_routes.contains(&route.peer)
+            || self.live.is_empty()
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        if self.bootstrap_revoke_on == Some(self.bootstrap_permit_checks) {
+            self.bootstrap_permit_live.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+    fn bootstrap_dns_socket(
+        &mut self,
+        route: BootstrapDnsRoute,
+        facts: &dns_transport::Facts,
+    ) -> Result<(), ServiceError> {
+        let peer = route.peer;
+        self.check_bootstrap_permit(route)?;
+        self.dns_checks += 1;
+        if self.dns_delay_on == Some(self.dns_checks) {
+            self.elapsed.fetch_add(25_000_000, Ordering::AcqRel);
+        }
+        let remote = match peer.family {
+            4 => std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                <[u8; 4]>::try_from(peer.wire().bytes).unwrap(),
+            )),
+            6 => std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(peer.wire().bytes).unwrap(),
+            )),
+            _ => return Err(ServiceError::Unavailable),
+        };
+        if facts.remote() != std::net::SocketAddr::new(remote, peer.port)
+            || facts.protocol() != peer.protocol
+            || facts.local().ip() != "192.0.2.10".parse::<std::net::IpAddr>().unwrap()
+            || facts.uid() != 997
+            || facts.mark() != if self.mode == Mode::System { 42 } else { 0 }
+            || facts.namespace() != (4, 5)
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(())
+    }
     fn dns_socket(
         &mut self,
         ticket: Option<u64>,

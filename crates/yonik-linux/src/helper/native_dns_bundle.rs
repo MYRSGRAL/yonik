@@ -66,6 +66,11 @@ struct Bundle {
     _routes: super::super::memory::ByteLease,
 }
 impl Bundles {
+    pub(super) fn bootstrap_context(&self, id: u64) -> bool {
+        self.live
+            .get(&id)
+            .is_some_and(|b| matches!(b.root_kind, wire::dns_v2::Root::BootstrapService(_)))
+    }
     pub(super) fn hosts_counts(&self) -> (usize, usize) {
         (self.hosts_producers.len(), self.hosts_waiters.len())
     }
@@ -381,7 +386,12 @@ impl<A: Authority> Issuer<A> {
                 wire::dns_v2::Root::BootstrapService(_) => !self.services.contains_key(&b.root),
                 wire::dns_v2::Root::HostsPath => false,
             };
-            if (now >= b.expires || root_missing) && !self.transport.holds_root_cleanup(b.root, now)
+            if (now >= b.expires || root_missing)
+                && !self.transport.holds_root_cleanup(
+                    b.root,
+                    matches!(b.root_kind, wire::dns_v2::Root::BootstrapService(_)),
+                    now,
+                )
             {
                 *ids.get_mut(n).ok_or(ServiceError::Busy)? = *id;
                 n += 1;
