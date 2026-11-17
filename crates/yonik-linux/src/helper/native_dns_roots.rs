@@ -1536,7 +1536,7 @@ impl<A: Authority> Issuer<A> {
             .reserve(std::mem::size_of::<BootstrapPhysicalPermission>() + 80)
             .map_err(unavailable)?;
         let routes = self.budget.routes.reserve(1).map_err(unavailable)?;
-        self.bundle_history(1)?;
+        self.bundle_history_available(1)?;
         let (selected, source_index) = self.host_member(waiter, member)?;
         if selected.address != target_ip(target)? {
             return Err(ServiceError::InvalidRequest);
@@ -1548,6 +1548,7 @@ impl<A: Authority> Issuer<A> {
         if expires.saturating_duration_since(self.authority.now()) < Duration::from_millis(1) {
             return Err(ServiceError::Unavailable);
         }
+        self.bundle_history(1)?;
         let id = Self::id(&mut self.next_grant)?;
         self.dns
             .hosts_waiters

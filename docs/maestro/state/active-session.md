@@ -801,6 +801,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   После Reserve36 transport ещё Unsupported; wire/pins authority/public gates
   не расширены. Actual network/socket/runtime выполнение не проводилось.
 
+- Hosts Numeric issuer ebf86c9 интегрирован с root-коррекцией R65P2: read-only
+  history capacity preflight предшествует Source member validation, необратимый
+  debit выполняется после exact member/address/expiry checks и до backend.
+  Серия wrong-address отказов не расходует DNS history, соседний waiter остаётся
+  usable. Общая invocation history повторно проверяется при debit; caps не
+  увеличены. Остальной R65 scoped review новых P1/P2 не выявил. Separate physical
+  permission/flow0/one-shot/Close32/34 сохранены; production Source/gates false,
+  совместный Go/Rust/runtime ещё не исполнялся.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение

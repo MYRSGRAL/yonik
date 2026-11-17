@@ -1410,6 +1410,46 @@ fn numeric_ip_body(f: &Facts, waiter: u64, ip: std::net::IpAddr) -> Vec<u8> {
     b
 }
 #[test]
+fn codec4_hosts_numeric_wrong_address_preserves_history_and_neighbor() {
+    let (mut issuer, f) = fixture(Mode::System);
+    let mut setup = hosts_script(&f);
+    setup.extend([
+        (Operation::BundleAcquire, acquire(&f, true, 0, 11)),
+        (Operation::Reserve, reserve(&f, true, 3, 11)),
+        (Operation::WaiterBind, hosts_bind(3, 1, 11)),
+    ]);
+    let output = scripted(&mut issuer, &f, &setup);
+    assert!(output.iter().all(|b| b[130] == 1));
+    let history = issuer.dns.history;
+    let wrong = numeric_body(&f, 1, [203, 0, 113, 81]);
+    let Record::NumericAuthorize(wrong) =
+        Record::decode(Operation::NumericAuthorize, &wrong).unwrap()
+    else {
+        panic!("numeric")
+    };
+    for request in 100..360 {
+        assert!(matches!(
+            issuer.authorize_hosts_numeric(request, wrong, f.expiry),
+            Err(ServiceError::InvalidRequest)
+        ));
+        assert_eq!(
+            issuer.dns.history, history,
+            "wrong address не расходует history"
+        );
+    }
+    assert!(issuer.dns.hosts_waiters[&1].numeric_once.is_none());
+    let good = numeric_body(&f, 2, [203, 0, 113, 80]);
+    let Record::NumericAuthorize(good) =
+        Record::decode(Operation::NumericAuthorize, &good).unwrap()
+    else {
+        panic!("numeric")
+    };
+    assert!(issuer.authorize_hosts_numeric(400, good, f.expiry).is_ok());
+    assert_eq!(issuer.authority.route_count, 1);
+    assert_eq!(issuer.dns.history, history + 1);
+}
+
+#[test]
 fn codec4_hosts_numeric_driver_grant_is_separate_flow0_permission_after_durable_route() {
     for mode in [Mode::Local, Mode::System] {
         let (mut issuer, f) = fixture(mode);

@@ -392,7 +392,7 @@ impl<A: Authority> Issuer<A> {
         }
         Ok(())
     }
-    pub(super) fn bundle_history(&mut self, count: usize) -> Result<(), ServiceError> {
+    pub(super) fn bundle_history_available(&self, count: usize) -> Result<(), ServiceError> {
         let limit = (self.capsule()?.limits()[7] as usize).min(256);
         if self
             .dns
@@ -403,7 +403,21 @@ impl<A: Authority> Issuer<A> {
             return Err(ServiceError::Busy);
         }
         if let Some(history) = &self.history {
-            // Отдельные kind/id namespaces, без eviction/reuse.
+            let h = history.lock().map_err(unavailable)?;
+            if h.len
+                .checked_add(h.reserved)
+                .and_then(|n| n.checked_add(count))
+                .is_none_or(|n| n > h.limit)
+            {
+                return Err(ServiceError::Busy);
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn bundle_history(&mut self, count: usize) -> Result<(), ServiceError> {
+        self.bundle_history_available(count)?;
+        if let Some(history) = &self.history {
+            // Другой канал мог занять capacity после read-only preflight.
             let mut h = history.lock().map_err(unavailable)?;
             if h.len
                 .checked_add(h.reserved)
@@ -412,6 +426,7 @@ impl<A: Authority> Issuer<A> {
             {
                 return Err(ServiceError::Busy);
             }
+            // Отдельные kind/id namespaces, без eviction/reuse.
             for i in 0..count {
                 h.reserve(3, (self.dns.history + i + 1) as u64)?;
             }
