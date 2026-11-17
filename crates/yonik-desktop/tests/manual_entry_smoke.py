@@ -33,7 +33,7 @@ def main() -> None:
         for case_number, (index, transport) in enumerate(cases):
             steps.extend(
                 [
-                    ui("click", "addSourceButton", when={"pending": False}),
+                    ui("click", "importMenuButton", when={"pending": False}),
                     ui("click", "manualEntryButton"),
                 ]
             )
@@ -173,8 +173,8 @@ def main() -> None:
                         ),
                     },
                     expect={
-                        "importAcceptedCount": {"text": "Принято: 1"},
-                        "importRejectedCount": {"text": "Отклонено: 0"},
+                        "importAcceptedCount": {"text": "Готово к сохранению: 1"},
+                        "importRejectedCount": {"visible": False},
                     },
                 )
             )

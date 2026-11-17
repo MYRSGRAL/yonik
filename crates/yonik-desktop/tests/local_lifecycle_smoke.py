@@ -67,7 +67,8 @@ def main() -> None:
             [
                 ui("resize", width=700, height=900, when={"ready": True}),
                 ui("click", "serverPickerButton"),
-                ui("click", "addSourceButton"),
+                ui("click", "importMenuButton"),
+                ui("click", "configImportAction"),
                 ui(
                     "text",
                     "localImportTextInput",

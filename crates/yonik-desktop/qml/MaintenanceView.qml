@@ -54,13 +54,13 @@ ColumnLayout {
     }
     Button {
         objectName: "maintenanceBackup"
-        text: root.tr("Создать резервную копию…", "Create backup…")
+        text: root.tr("Создать зашифрованную копию…", "Create encrypted backup…")
         enabled: root.available && !root.busy
         onClicked: { root.operation = "backup"; destination.open() }
     }
     Button {
         objectName: "maintenanceRestore"
-        text: root.tr("Восстановить в новый файл…", "Restore to a new file…")
+        text: root.tr("Восстановить из копии…", "Restore from backup…")
         enabled: root.available && !root.busy
         onClicked: { root.operation = "restore"; source.open() }
     }
@@ -79,7 +79,7 @@ ColumnLayout {
     Label {
         Layout.fillWidth: true
         wrapMode: Text.Wrap
-        text: root.tr("При ошибке записи проверьте выбранный файл: копия могла быть опубликована до ошибки синхронизации. Существующий файл никогда не заменяется.", "After a write error, check the selected file: the copy may have been published before a synchronization error. Existing files are never replaced.")
+        text: root.tr("При ошибке записи проверьте выбранный файл. Существующие файлы не заменяются.", "If writing fails, check the selected file. Existing files are never replaced.")
     }
     FileDialog {
         id: source

@@ -24,18 +24,20 @@ ColumnLayout {
     }
     function nextRequest() { request += 1; pendingRequest = request; feedback = ""; return request }
     signal command(var payload)
+    spacing: 10
     function tr(ru, en) { return language === "ru" ? ru : en }
-    Label { text: "ru-direct"; font.bold: true }
     Label {
         Layout.fillWidth: true
         wrapMode: Text.Wrap
-        text: panel.snapshot.current ? panel.tr("Текущая версия: ", "Current version: ") + panel.snapshot.current.version + " · " + new Date(panel.snapshot.current.checked_at_unix * 1000).toLocaleString(Qt.locale(panel.language)) : panel.tr("Нет проверенного snapshot", "No verified snapshot")
+        text: panel.snapshot.current ? panel.tr("Текущая версия: ", "Current version: ") + panel.snapshot.current.version + " · " + new Date(panel.snapshot.current.checked_at_unix * 1000).toLocaleString(Qt.locale(panel.language)) : panel.tr("Нет проверенной версии списков", "No verified snapshot")
     }
     Label {
         visible: !!panel.snapshot.previous
         text: panel.tr("Предыдущая версия: ", "Previous version: ") + (panel.snapshot.previous ? panel.snapshot.previous.version : "")
     }
     Label {
+        Layout.fillWidth: true
+        wrapMode: Text.Wrap
         visible: panel.snapshot.current_error || panel.snapshot.previous_error
         text: panel.tr("Текущая или резервная версия недоступна. Проверьте статус операции.", "Current or previous snapshot unavailable. Check operation status.")
     }
@@ -64,7 +66,7 @@ ColumnLayout {
         CheckBox { objectName: "presetLocal"; id: local; text: panel.tr("Явно разрешить локальный HTTP/LAN источник", "Explicitly allow local HTTP/LAN source") }
         Button {
             objectName: "presetUpdateButton"
-        text: panel.tr("Обновить snapshot", "Update snapshot")
+            text: panel.tr("Обновить списки", "Update lists")
             enabled: !panel.snapshot.busy && panel.pendingRequest === 0
             onClicked: {
                 const revision = version.text
@@ -83,7 +85,7 @@ ColumnLayout {
     }
     Button {
         objectName: "presetValidateButton"
-        text: panel.tr("Проверить ядро и Host", "Validate engine and Host")
+        text: panel.tr("Проверить конфигурацию ядра", "Validate engine and Host")
         enabled: !panel.snapshot.busy && panel.pendingRequest === 0
         onClicked: panel.command({command: "preset_validate", expected_revision: panel.routingRevision, request_id: panel.nextRequest()})
     }
@@ -94,10 +96,12 @@ ColumnLayout {
         text: panel.snapshot.compiler_error || ({invalid_ip: panel.tr("Введите корректный IP-адрес или домен", "Enter a valid IP address or domain"), storage: panel.tr("Хранилище недоступно", "Storage unavailable"), busy: panel.tr("Хранилище занято", "Storage busy"), integrity: panel.tr("Нарушена целостность snapshot", "Snapshot integrity failure")})[panel.snapshot.operation_error] || ""
     }
     Label {
+        Layout.fillWidth: true
+        wrapMode: Text.Wrap
         visible: panel.snapshot.host_validated === true
         text: panel.tr("Config-check Host пройден; native TUN не проверен", "Host config-check passed; native TUN not tested")
     }
-    Label { objectName: "presetFeedback"; text: panel.feedbackText(panel.feedback); visible: !!text }
+    Label { objectName: "presetFeedback"; Layout.fillWidth: true; wrapMode: Text.Wrap; text: panel.feedbackText(panel.feedback); visible: !!text }
     RowLayout {
         Button { objectName: "presetStatusButton"; text: panel.tr("Проверить версии", "Check versions"); onClicked: panel.command({command: "preset_status"}) }
         Button { objectName: "presetRollbackButton"; text: panel.tr("Откатить", "Roll back"); enabled: !!panel.snapshot.previous && !panel.snapshot.busy; onClicked: panel.command({command: "preset_rollback", request_id: panel.nextRequest()}) }
@@ -106,12 +110,12 @@ ColumnLayout {
         id: target
         objectName: "presetTarget"
         Layout.fillWidth: true
-        placeholderText: panel.tr("IP или домен для проверки решения", "IP or domain for decision check")
+        placeholderText: panel.tr("IP-адрес или домен", "IP address or domain")
         maximumLength: 253
     }
     Button {
         objectName: "presetPrepareButton"
-        text: panel.tr("Проверить модель Policy", "Check Policy model")
+        text: panel.tr("Проверить маршрут", "Check route")
         enabled: !!panel.snapshot.current && !panel.snapshot.busy
         onClicked: panel.command({command: "preset_prepare", target: target.text, request_id: panel.nextRequest()})
     }
@@ -125,6 +129,6 @@ ColumnLayout {
     Label {
         Layout.fillWidth: true
         wrapMode: Text.Wrap
-        text: panel.tr("Активация сохраняется в черновике. Production system_tun=false: сеть не меняется. Обновление snapshot требует отдельной активации новой версии.", "Activation is saved in the draft. Production system_tun=false: network is unchanged. Updated snapshots require separate activation of the new version.")
+        text: panel.tr("Списки сохраняются в черновике. После обновления активируйте новую версию.", "The lists are saved in the draft. Activate the new version after updating.")
     }
 }

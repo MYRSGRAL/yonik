@@ -108,18 +108,15 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     steps.append(
         ui("text", "sourceUrlInput", value="https://cancel.invalid/?ui-secret=hidden")
     )
-    click("sourceAdvancedButton")
-    click("sourceHwidChoice")
-    click("revealSourceUrl")
-    click("sourceAddCancelButton")
+    steps.append(ui("text", "sourceNameInput", value="Отменённый импорт"))
+    steps.append(ui("key", "sourceUrlInput", key="Escape"))
     check({"window": {"page": 1}, "addSourceDialog": {"visible": False}})
     navigate(1)
     click("addSourceButton")
     check(
         {
             "sourceUrlInput": {"text": ""},
-            "sourceHwidChoice": {"checked": False},
-            "revealSourceUrl": {"checked": False},
+            "sourceNameInput": {"text": ""},
         }
     )
     steps.append(ui("key", "sourceUrlInput", key="Escape"))
@@ -128,48 +125,50 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
         expect={"window": {"page": 1}, "addSourceDialog": {"visible": False}},
     )
     steps.append(ui("clipboard", value=url))
+    click("addSourceButton")
     click("pasteSourceButton")
-    click(
-        "sourceAddCancelButton",
-        expect={"sourceUrlInput": {"text": url}, "window": {"page": 1}},
-        capture="paste-preview.png",
+    steps.append(
+        ui(
+            "key",
+            "sourceUrlInput",
+            key="Escape",
+            expect={"sourceUrlInput": {"text": url}, "window": {"page": 1}},
+            capture="paste-preview.png",
+        )
     )
+    click("importMenuButton")
+    click("localSubscriptionAction")
     click("pasteSourceButton", expect={"window": {"page": 1}})
-    click("sourceAdvancedButton")
     steps.append(ui("text", "sourceNameInput", value="Тест А"))
-    click("sourceLocalException")
-    click("sourceHwidChoice")
     click("sourceAddConfirmButton")
-    click(
-        "discardRefreshButton",
-        when={"pending": True, "busy": False},
-        expect={
-            "refreshReviewDialog": {"visible": True},
+    check(
+        {
+            "refreshReviewDialog": {"visible": False},
             "sourceUrlInput": {"text": ""},
-            "window": {"page": 1},
+            "subscriptionFeedback": {
+                "text": {"contains": "Профили сохранены: 2 · пропущено: 1"}
+            },
         },
-        capture="import-review.png",
+        when={"pending": False, "busy": False, "profiles_count": 2},
+        capture="import-result.png",
     )
-    click(
-        "refreshSourceButton",
-        when={"pending": False, "busy": False, "profiles_count": 0},
-    )
+    click("refreshSourceButton")
     click("approveRefreshButton", when={"pending": True, "busy": False})
     click(
         "sourceOptionsButton",
         when={"pending": False, "busy": False, "profiles_count": 2},
     )
     click(
-        "subscriptionHwidChoice", expect={"subscriptionHwidChoice": {"checked": True}}
+        "subscriptionHwidChoice", expect={"subscriptionHwidChoice": {"checked": False}}
     )
     click(
         "approveRefreshButton",
-        when={"pending": True, "busy": False, "source_hwid_enabled": False},
+        when={"pending": True, "busy": False, "source_hwid_enabled": True},
     )
     click(
-        "subscriptionHwidChoice",
+        "refreshSourceButton",
         when={"pending": False, "busy": False},
-        expect={"subscriptionHwidChoice": {"checked": False}},
+        expect={"subscriptionHwidChoice": {"checked": True}},
     )
     click(
         "approveRefreshButton",
@@ -228,12 +227,13 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
         "emptyProfilesAction", when={"profiles_count": 0}, capture="filtered-empty.png"
     )
     click("profileSelect_1", when={"profiles_count": 2})
+    page = 0
     click(
-        "serversConnectButton",
+        "mainConnectButton",
         when={"selected_profile": 1, "can_connect": True},
-        expect={"window": {"page": 1, "selectionConfirmed": True}},
+        expect={"window": {"page": 0, "selectionConfirmed": True}},
     )
-    navigate(0, when={"error": "engine_missing", "can_stop": False})
+    check({"window": {"page": 0}}, when={"error": "engine_missing", "can_stop": False})
     click(
         "settingsButton",
         expect={"mainErrorLabel": {"visible": True}},
@@ -342,16 +342,23 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
     # Второй источник добавляется через карточку Home; импорт сбрасывает фильтр.
     navigate(0)
     navigate(1)
-    click("addSourceButton")
+    click("importMenuButton")
+    click("localSubscriptionAction")
     steps.append(ui("text", "sourceUrlInput", value=url + "-second"))
-    click("sourceAdvancedButton")
     steps.append(ui("text", "sourceNameInput", value="Тест Б"))
-    click("sourceLocalException")
     click("sourceAddConfirmButton")
-    click(
-        "approveRefreshButton",
-        when={"pending": True, "busy": False},
-        expect={"window": {"page": 1}, "profileSearch": {"text": ""}},
+    check(
+        {
+            "window": {"page": 1},
+            "profileSearch": {"text": ""},
+            "subscriptionFeedback": {"text": {"contains": "Profiles saved: 2"}},
+        },
+        when={
+            "source_name": "Тест Б",
+            "profiles_count": 2,
+            "pending": False,
+            "busy": False,
+        },
     )
     steps.append(
         ui(
@@ -385,7 +392,14 @@ def script(url: str, width: int, height: int) -> list[dict[str, object]]:
         when={"sources_total": 0, "profiles_count": 0},
         capture="servers-empty.png",
     )
-    click("sourceAddCancelButton", expect={"addSourceDialog": {"visible": True}})
+    steps.append(
+        ui(
+            "key",
+            "sourceNameInput",
+            key="Escape",
+            expect={"addSourceDialog": {"visible": True}},
+        )
+    )
     steps.append(
         {
             "when": {},
@@ -547,6 +561,11 @@ def run(
             if len(captured_hwids) == 6:
                 self.send_error(503)
                 return
+            if self.path.endswith("-second"):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body.rsplit(b"\n", 1)[0])
+                return
             super().do_GET()
 
     UiFixture.body = body
@@ -605,12 +624,12 @@ def run(
             rejected.append(label)
         if (
             len(captured_hwids) != 7
-            or not captured_hwids[0]
-            or captured_hwids[2] is not None
-            or captured_hwids[0] != captured_hwids[1]
-            or captured_hwids[0] != captured_hwids[3]
-            or captured_hwids[0] != captured_hwids[4]
-            or captured_hwids[0] != captured_hwids[5]
+            or captured_hwids[0] is not None
+            or captured_hwids[1] is not None
+            or not captured_hwids[2]
+            or captured_hwids[2] != captured_hwids[3]
+            or captured_hwids[2] != captured_hwids[4]
+            or captured_hwids[2] != captured_hwids[5]
             or captured_hwids[6] is not None
         ):
             raise RuntimeError("HWID opt-in/toggle wire sequence не совпадает")
