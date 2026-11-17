@@ -826,6 +826,14 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   Production bootstrap producer/Source None; NETWORK Publish/Waiter/Numeric и
   Go/Rust kernel/runtime acceptance остаются открытыми, public gates false.
 
+- R68 SOURCE scoped CLEAN: NETWORK Publish/Waiter12de66d интегрирован.
+  Separate BootstrapDnsReceipt/Transcript связывает transport/request/response/
+  Source/fullpath; immutable observation time и initial deadlines не продлеваются.
+  Независимый waiter требует fresh context/reservation и live producer context;
+  flow0 не вызывает USER owner lookup. Numeric use2 остаётся следующим переходом.
+  Production Source/transcript None, Go stateful pair/runtime не запускались,
+  public gates false. Go exchange/Publish7ffdc1c ожидает R69 review.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
