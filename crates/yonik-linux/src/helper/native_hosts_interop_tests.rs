@@ -65,6 +65,7 @@ struct Stdio {
     datagram_release: Option<Arc<super::super::super::super::dns_datagram::NetworkRelease>>,
     dns_protocol: u8,
     physical_count: Cell<u16>,
+    phases: [Cell<usize>; 128],
     descriptor: RefCell<Option<Vec<u8>>>,
     negotiated: RefCell<Option<wire::dns_v2::Negotiated>>,
     // recvmsg заменён framed stdin; после read drain обязан видеть пустую очередь.
@@ -76,6 +77,24 @@ struct TraceTranscript(
     Arc<dyn super::super::super::super::BootstrapDnsTranscript>,
     Arc<super::super::super::super::bootstrap_binding::BootstrapBinding>,
 );
+impl Stdio {
+    fn note_phase(&self, kind: u16, reply: bool) {
+        if kind < 64 {
+            let cell = &self.phases[usize::from(kind) + usize::from(reply) * 64];
+            cell.set(cell.get().max(self.budget.dynamic.used()));
+        }
+    }
+    fn phase_report(&self) -> serde_json::Value {
+        let rows = self
+            .phases
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.get() != 0)
+            .map(|(i, v)| serde_json::json!({"kind":i%64,"reply":i>=64,"held":v.get()}))
+            .collect::<Vec<_>>();
+        serde_json::json!({"phases":rows,"planner_peak":crate::helper::profile_intent::resolver_plan_audit_peak(),"parser_scratch":super::super::super::super::dns_rrset::SCRATCH,"parser_peak":super::super::super::super::dns_rrset::parser_audit_peak()})
+    }
+}
 impl super::super::super::super::BootstrapDnsTranscript for TraceTranscript {
     fn observed(
         &self,
@@ -247,6 +266,7 @@ impl Channel for Stdio {
         if b.len() < 128 {
             return Err(ServiceError::InvalidRequest);
         }
+        self.note_phase(u16::from_be_bytes([b[10], b[11]]), false);
         if b[10..12] == 55u16.to_be_bytes() {
             eprintln!(
                 "interop Acquire Source budget: {}",
@@ -289,6 +309,7 @@ impl Channel for Stdio {
         Ok(Some(b.len()))
     }
     fn write(&self, b: &[u8]) -> Result<bool, ServiceError> {
+        self.note_phase(u16::from_be_bytes([b[10], b[11]]), true);
         self.before_reply.set(false);
         emit(serde_json::json!({"packet":hex(b)}));
         Ok(true)
@@ -363,6 +384,7 @@ fn pure_stateful_hosts_stdio_bridge() {
         datagram_release: None,
         dns_protocol: 17,
         physical_count: Cell::new(0),
+        phases: std::array::from_fn(|_| Cell::new(0)),
         descriptor: RefCell::new(None),
         negotiated: RefCell::new(None),
         record: f.launch,

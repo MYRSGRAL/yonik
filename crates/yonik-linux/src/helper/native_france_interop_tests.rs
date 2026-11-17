@@ -180,6 +180,7 @@ pub(super) fn run(case: &str) {
         datagram_release: d.datagram_release(issuer.record).unwrap(),
         dns_protocol: if resolver_tcp { 6 } else { 17 },
         physical_count: Cell::new(0),
+        phases: std::array::from_fn(|_| Cell::new(0)),
         descriptor: RefCell::new(None),
         negotiated: RefCell::new(None),
         inbox: Default::default(),
@@ -227,6 +228,6 @@ pub(super) fn run(case: &str) {
     assert_eq!(issuer.dns.count(), 0);
     assert!(issuer.flows.is_empty() && issuer.services.is_empty());
     emit(
-        serde_json::json!({"rust_done":true,"france":true,"owners":owners,"routes":issuer.authority.route_count,"retained_routes":issuer.authority.live,"contexts":issuer.dns.count(),"flows":issuer.flows.len(),"services":issuer.services.len(),"unknown":issuer.unknown,"release_attempts":issuer.authority.release_attempts}),
+        serde_json::json!({"rust_done":true,"france":true,"owners":owners,"routes":issuer.authority.route_count,"retained_routes":issuer.authority.live,"contexts":issuer.dns.count(),"flows":issuer.flows.len(),"services":issuer.services.len(),"unknown":issuer.unknown,"release_attempts":issuer.authority.release_attempts,"memory_audit":io.phase_report()}),
     );
 }

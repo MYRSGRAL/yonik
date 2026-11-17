@@ -1038,11 +1038,7 @@ impl BootstrapDnsTranscript for BootstrapBinding {
             (id, expires)
         };
         {
-            let _parser = self
-                .budget
-                .dynamic
-                .reserve(super::dns_rrset::SCRATCH)
-                .map_err(unavailable)?;
+            let _parser = super::dns_rrset::parser_credit(&self.budget.dynamic)?;
             super::dns_rrset::verify_bootstrap_capture(
                 r.request,
                 r.response,

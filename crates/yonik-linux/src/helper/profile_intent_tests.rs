@@ -1162,6 +1162,118 @@ fn lookup_fixture(nss: &[u8], resolv: &[u8], hosts: Option<&[u8]>) -> PinnedReso
     }
 }
 #[test]
+fn captured_lookup_small_network_fits_actual_capacity_budget() {
+    let snapshot = lookup_fixture(b"hosts: dns\n", b"nameserver 192.0.2.53\n", None);
+    let budget = super::super::memory::ByteBudget::new(4096);
+    let plan = snapshot
+        .retained_lookup_data("fr.example.invalid", 7, LookupFamily::Ipv4, &budget)
+        .unwrap();
+    assert_eq!(plan.original(), "fr.example.invalid");
+    assert!(budget.used() < 2048);
+    drop(plan);
+    assert_eq!(budget.used(), 0);
+}
+#[test]
+fn captured_lookup_last_alias_borrows_rows_and_keeps_source_index() {
+    use std::fmt::Write;
+    let mut hosts = String::new();
+    for i in 0..4096 {
+        writeln!(hosts, "192.0.2.1 host{i}").unwrap();
+    }
+    let snapshot = lookup_fixture(b"hosts: files\n", b"", Some(hosts.as_bytes()));
+    let budget = super::super::memory::ByteBudget::new(4096);
+    let plan = snapshot
+        .retained_lookup_data("Host4095", 7, LookupFamily::Any, &budget)
+        .unwrap();
+    let LookupStep::Hosts(row) = &plan.steps()[0] else {
+        panic!("hosts")
+    };
+    assert_eq!(row.row(), 4095);
+    assert_eq!(row.alias(), "host4095");
+    assert_eq!(row.members()[0].index, 0);
+    assert!(budget.used() < 2048);
+    drop(plan);
+    assert_eq!(budget.used(), 0);
+}
+#[test]
+fn captured_lookup_max_hosts_members_search_and_exact_budget_exhaustion() {
+    let mut hosts = String::new();
+    for i in 0u16..16 {
+        hosts.push_str(&format!("203.0.{}.{} Node\n", i >> 8, i as u8));
+    }
+    let snapshot = lookup_fixture(b"hosts: dns files\n", b"search a.invalid b.invalid c.invalid d.invalid e.invalid f.invalid\nnameserver 192.0.2.53\n", Some(hosts.as_bytes()));
+    let run = |cap| {
+        let budget = super::super::memory::ByteBudget::new(cap);
+        let result = snapshot.retained_lookup_data("Node", 7, LookupFamily::Any, &budget);
+        let success = if let Ok(plan) = result {
+            let LookupStep::Network(n) = &plan.steps()[0] else {
+                panic!("network first")
+            };
+            assert_eq!(n.questions().count(), 7);
+            let LookupStep::Hosts(h) = &plan.steps()[1] else {
+                panic!("hosts second")
+            };
+            assert_eq!(h.members().len(), 16);
+            assert!(
+                h.members()
+                    .iter()
+                    .enumerate()
+                    .all(|(i, m)| usize::from(m.index) == i)
+            );
+            true
+        } else {
+            false
+        };
+        assert_eq!(budget.used(), 0);
+        success
+    };
+    assert!(run(12000));
+    let (mut low, mut high) = (0, 12000);
+    while low + 1 < high {
+        let mid = (low + high) / 2;
+        if run(mid) {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    assert!(!run(high - 1));
+    assert!(run(high));
+}
+#[test]
+fn captured_lookup_maximum_question_bytes_are_prepaid_without_reallocation() {
+    let suffixes = (0..6)
+        .map(|i| {
+            format!(
+                "{}.{}.{}.{}{}.",
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63),
+                "d".repeat(58),
+                i
+            )
+        })
+        .collect::<Vec<_>>();
+    let resolv = format!("search {}\nnameserver 192.0.2.53\n", suffixes.join(" "));
+    let snapshot = lookup_fixture(
+        b"hosts: dns files\n",
+        resolv.as_bytes(),
+        Some(b"192.0.2.1 N\n"),
+    );
+    let budget = super::super::memory::ByteBudget::new(12000);
+    let plan = snapshot
+        .retained_lookup_data("N", 7, LookupFamily::Any, &budget)
+        .unwrap();
+    let LookupStep::Network(n) = &plan.steps()[0] else {
+        panic!("network")
+    };
+    assert_eq!(n.unique_question_count(), 7);
+    assert_eq!(n.questions().filter(|q| q.fqdn().len() == 254).count(), 6);
+    assert!(budget.used() < 6000);
+    drop(plan);
+    assert_eq!(budget.used(), 0);
+}
+#[test]
 fn captured_lookup_files_dns_and_dns_files_keep_original_and_source_members() {
     for (nss, network_first) in [
         (b"hosts: files dns\n".as_slice(), false),

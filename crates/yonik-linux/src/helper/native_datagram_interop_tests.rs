@@ -57,6 +57,7 @@ pub(super) fn run(case: &str) {
         },
         dns_protocol: if tcp { 6 } else { 17 },
         physical_count: Cell::new(0),
+        phases: std::array::from_fn(|_| Cell::new(0)),
         descriptor: RefCell::new(None),
         negotiated: RefCell::new(None),
         inbox: Default::default(),

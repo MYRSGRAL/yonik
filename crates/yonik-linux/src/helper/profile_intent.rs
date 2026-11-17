@@ -1,6 +1,10 @@
 //! DATA-проекция закрытого compiler graph. Не IPC codec и не разрешение запуска.
 #[path = "resolver_snapshot_lookup.rs"]
 mod resolver_snapshot_lookup;
+#[cfg(test)]
+pub(crate) fn resolver_plan_audit_peak() -> [usize; 2] {
+    resolver_snapshot_lookup::audit_peak()
+}
 use crate::{
     Cancellation,
     managed_network::firewall::{BoundTransport, TransportProtocol},

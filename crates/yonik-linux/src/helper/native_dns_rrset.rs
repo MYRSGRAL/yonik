@@ -236,15 +236,35 @@ pub(super) fn numeric_ip_allowed(ip: IpAddr) -> bool {
         && !matches!(ip,IpAddr::V6(ip) if ip.is_unicast_link_local())
 }
 // Все scratch buffers заранее учтены caller; parser не аллоцирует.
-// CNAME path полностью проверяется и уничтожается до materialization Answer.
-// Четыре текущих Name и прежний fixed запас оплачены в обеих фазах.
-pub(super) const SCRATCH: usize =
-    if std::mem::size_of::<Answer>() > CHAIN * std::mem::size_of::<Name>() {
-        std::mem::size_of::<Answer>()
-    } else {
-        CHAIN * std::mem::size_of::<Name>()
-    } + 4 * std::mem::size_of::<Name>()
-        + 4096;
+// Path хранит checked offsets в immutable response, не32 padded Names.
+// Оплачены оба массива одновременно, текущие Names и прежний fixed запас.
+pub(super) const SCRATCH: usize = std::mem::size_of::<Answer>()
+    + CHAIN * std::mem::size_of::<usize>()
+    + 4 * std::mem::size_of::<Name>()
+    + 4096;
+#[cfg(test)]
+static PARSER_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(super) fn parser_audit_peak() -> usize {
+    PARSER_PEAK.load(Ordering::Relaxed)
+}
+pub(super) fn parser_credit(
+    budget: &super::super::memory::ByteBudget,
+) -> Result<ByteLease, ServiceError> {
+    let lease = budget.reserve(SCRATCH).map_err(unavailable)?;
+    #[cfg(test)]
+    PARSER_PEAK.fetch_max(budget.used(), Ordering::Relaxed);
+    Ok(lease)
+}
+fn path_has(packet: &[u8], offsets: &[usize], wanted: Name) -> Result<bool, ServiceError> {
+    for start in offsets {
+        let mut at = *start;
+        if name(packet, &mut at)? == wanted {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 fn parse(
     request: &[u8],
     response: &[u8],
@@ -308,9 +328,9 @@ fn parse(
         return Err(ServiceError::InvalidRequest);
     }
     let ttl = {
-        let mut path = [Name::empty(); CHAIN];
+        let mut path = [0; CHAIN];
         let mut depth = 1;
-        path[0] = expected;
+        path[0] = 12;
         let mut current = expected;
         let mut ttl = u32::MAX;
         loop {
@@ -328,18 +348,18 @@ fn parse(
                 if record.kind == 5 {
                     let mut offset = record.start;
                     let target = name(response, &mut offset)?;
-                    if next.is_some_and(|n| n != target) {
+                    if next.is_some_and(|(n, _)| n != target) {
                         return Err(ServiceError::InvalidRequest);
                     }
-                    next = Some(target);
+                    next = Some((target, record.start));
                     ttl = ttl.min(record.ttl);
                 }
             }
-            let Some(next) = next else { break };
-            if address || depth == CHAIN || path[..depth].contains(&next) {
+            let Some((next, offset)) = next else { break };
+            if address || depth == CHAIN || path_has(response, &path[..depth], next)? {
                 return Err(ServiceError::InvalidRequest);
             }
-            path[depth] = next;
+            path[depth] = offset;
             depth += 1;
             current = next;
         }
@@ -348,7 +368,7 @@ fn parse(
         let mut cursor = answer_start;
         for _ in 0..answers {
             let record = rr(response, &mut cursor)?;
-            if !path[..depth].contains(&record.owner) {
+            if !path_has(response, &path[..depth], record.owner)? {
                 return Err(ServiceError::InvalidRequest);
             }
             if matches!(record.kind, 1 | 28) && (record.owner != current || record.kind != qtype) {
@@ -553,7 +573,7 @@ struct BootstrapPublication {
 }
 struct Waiter {
     numeric_once: Option<(u64, u64)>,
-    binding: Binding,
+    binding: RetainedBinding,
     producer: u64,
     reservation: u64,
     request: u64,
@@ -905,7 +925,7 @@ impl<A: Authority> Issuer<A> {
         }
         let (_, started, _) = self.dns_publish_binding(n64(b, 120), n64(b, 128), n64(b, 28))?;
         let (answer, mut memory) = {
-            let _scratch = self.budget.dynamic.reserve(SCRATCH).map_err(unavailable)?;
+            let _scratch = parser_credit(&self.budget.dynamic)?;
             parse(
                 &b[144 + q..144 + q + r],
                 &b[144 + q + r..],
@@ -1060,7 +1080,12 @@ impl<A: Authority> Issuer<A> {
         let memory = self
             .budget
             .dynamic
-            .reserve(std::mem::size_of::<Waiter>() + 80)
+            .reserve(
+                std::mem::size_of::<Waiter>()
+                    + 80
+                    + RetainedBinding::bytes(binding)
+                    + 6 * std::mem::size_of::<usize>(),
+            )
             .map_err(unavailable)?;
         self.bundle_history(1)?;
         let expires = expires.min(self.fresh_waiter(binding)?);
@@ -1069,7 +1094,7 @@ impl<A: Authority> Issuer<A> {
             id,
             Box::new(Waiter {
                 numeric_once: None,
-                binding,
+                binding: RetainedBinding::copy(binding),
                 producer,
                 reservation,
                 request,
@@ -1148,7 +1173,7 @@ impl<A: Authority> Issuer<A> {
             if w.revoked || p.revoked || self.authority.now() >= w.expires.min(p.expires) {
                 return Err(ServiceError::Unavailable);
             }
-            let binding = w.binding;
+            let binding = w.binding.expand()?;
             let source_until = if binding.bootstrap {
                 self.rrset_data_matches(binding, p.binding.expand()?)?;
                 self.bootstrap_rrset_live(p)?
@@ -1260,14 +1285,14 @@ impl<A: Authority> Issuer<A> {
             || !w.binding.bootstrap
             || !p.binding.bootstrap
             || p.bootstrap.is_none()
-            || !same_data(w.binding, p.binding.expand()?)
+            || !same_data(w.binding.expand()?, p.binding.expand()?)
             || w.binding.root == p.binding.root
             || w.binding.source != 0
             || w.binding.source_revision != 0
         {
             return Err(ServiceError::InvalidRequest);
         }
-        let original = self.network_numeric_original(w.binding, selector)?;
+        let original = self.network_numeric_original(w.binding.expand()?, selector)?;
         if target.protocol != original.protocol
             || target.port != original.port
             || !matches!(target.protocol, 6 | 17)
@@ -1280,7 +1305,7 @@ impl<A: Authority> Issuer<A> {
         // Все immutable поля/member/address проверены ДО Source и history debit.
         self.numeric_member(waiter, member, target)?;
         let (binding, reservation_until) = self.dns_waiter_binding(w.reservation)?;
-        if binding != w.binding {
+        if binding != w.binding.expand()? {
             return Err(ServiceError::Unavailable);
         }
         self.rrset_data_matches(binding, p.binding.expand()?)?;
@@ -1397,7 +1422,7 @@ impl<A: Authority> Issuer<A> {
             || w.revoked
             || !p.acked
             || p.revoked
-            || !same_data(w.binding, p.binding.expand()?)
+            || !same_data(w.binding.expand()?, p.binding.expand()?)
         {
             return Err(ServiceError::Unavailable);
         }
@@ -1407,7 +1432,7 @@ impl<A: Authority> Issuer<A> {
             .min(p.expires)
             .min(reservation_expires)
             .min(binding.expires);
-        if binding != w.binding || self.authority.now() >= expires {
+        if binding != w.binding.expand()? || self.authority.now() >= expires {
             return Err(ServiceError::Unavailable);
         }
         Ok((binding, expires))

@@ -3,8 +3,121 @@ use super::super::memory::{ByteBudget, ByteLease};
 use super::EgressError;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-const PLAN_BYTES: usize = 16 * 1024;
 const CANDIDATES: usize = 7;
+#[cfg(test)]
+static PLAN_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(super) fn audit_peak() -> [usize; 2] {
+    [
+        PLAN_PEAK.load(std::sync::atomic::Ordering::Relaxed),
+        SCAN_BYTES,
+    ]
+}
+#[derive(Clone, Copy)]
+struct NameBuffer {
+    bytes: [u8; 254],
+    len: usize,
+}
+impl NameBuffer {
+    fn empty() -> Self {
+        Self {
+            bytes: [0; 254],
+            len: 0,
+        }
+    }
+    fn join(parts: &[&str]) -> Result<Self, EgressError> {
+        let mut value = Self::empty();
+        for part in parts {
+            let end = value
+                .len
+                .checked_add(part.len())
+                .filter(|n| *n <= 254)
+                .ok_or(EgressError::Budget)?;
+            value.bytes[value.len..end].copy_from_slice(part.as_bytes());
+            value.len = end;
+        }
+        Ok(value)
+    }
+    fn text(&self) -> Result<&str, EgressError> {
+        std::str::from_utf8(&self.bytes[..self.len]).map_err(|_| EgressError::Resolver)
+    }
+}
+struct CandidateNames {
+    names: [NameBuffer; CANDIDATES],
+    unique: usize,
+    order: [u8; CANDIDATES],
+    count: usize,
+}
+impl CandidateNames {
+    fn new() -> Self {
+        Self {
+            names: [NameBuffer::empty(); CANDIDATES],
+            unique: 0,
+            order: [0; CANDIDATES],
+            count: 0,
+        }
+    }
+    fn add(&mut self, parts: &[&str]) -> Result<(), EgressError> {
+        let value = NameBuffer::join(parts)?;
+        let fqdn = value.text()?;
+        if avoid_dns(fqdn) {
+            return Ok(());
+        }
+        if !dns_name(fqdn) {
+            return Err(EgressError::Resolver);
+        }
+        if self.count == CANDIDATES {
+            return Err(EgressError::Budget);
+        }
+        let mut index = None;
+        for (i, q) in self.names[..self.unique].iter().enumerate() {
+            if q.text()? == fqdn {
+                index = Some(i);
+                break;
+            }
+        }
+        let index = if let Some(i) = index {
+            i
+        } else {
+            let i = self.unique;
+            self.names[i] = value;
+            self.unique += 1;
+            i
+        };
+        self.order[self.count] = index as u8;
+        self.count += 1;
+        Ok(())
+    }
+    fn bytes(&self) -> usize {
+        self.names[..self.unique]
+            .iter()
+            .map(|q| q.len + if q.len == 1 { 1 } else { q.len - 1 })
+            .sum()
+    }
+    fn materialize(&self) -> Result<Vec<Question>, EgressError> {
+        let mut out = Vec::with_capacity(self.unique);
+        for q in &self.names[..self.unique] {
+            let fqdn = q.text()?;
+            out.push(Question {
+                fqdn: fqdn.to_owned(),
+                canonical: if fqdn == "." {
+                    ".".to_owned()
+                } else {
+                    fqdn[..fqdn.len() - 1].to_ascii_lowercase()
+                },
+            });
+        }
+        Ok(out)
+    }
+}
+// Все preflight buffers фиксированы; в materialization они ещё живы и оплачены
+// отдельно от exact retained capacities. Нет format/clone временных Strings.
+const SCAN_BYTES: usize = std::mem::size_of::<CandidateNames>()
+    + 2 * std::mem::size_of::<NameBuffer>()
+    + 6 * std::mem::size_of::<&str>()
+    + std::mem::size_of::<Reader<'static>>()
+    + std::mem::size_of::<HostScan<'static>>()
+    + 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LookupFamily {
     Any,
@@ -101,33 +214,6 @@ impl<'a> NetworkStep<'a> {
     }
     pub fn unique_question_count(&self) -> usize {
         self.questions.len()
-    }
-    fn add(&mut self, fqdn: String) -> Result<(), EgressError> {
-        if avoid_dns(&fqdn) {
-            return Ok(());
-        }
-        if !dns_name(&fqdn) {
-            return Err(EgressError::Resolver);
-        }
-        if self.count == CANDIDATES {
-            return Err(EgressError::Budget);
-        }
-        // Оба списка ограничены7, scan не зависит от размера hosts/source.
-        let index = if let Some(index) = self.questions.iter().position(|q| q.fqdn == fqdn) {
-            index
-        } else {
-            let canonical = if fqdn == "." {
-                ".".to_owned()
-            } else {
-                fqdn[..fqdn.len() - 1].to_ascii_lowercase()
-            };
-            let index = self.questions.len();
-            self.questions.push(Question { fqdn, canonical });
-            index
-        };
-        self.order[self.count] = index as u8;
-        self.count += 1;
-        Ok(())
     }
 }
 /// Следующий step допустим только если предыдущий DNS step не дал адресов.
@@ -232,27 +318,30 @@ fn dns_name(name: &str) -> bool {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         })
 }
-fn hosts<'a>(r: &mut Reader<'a>, key: &str) -> Result<Option<HostsStep<'a>>, EgressError> {
+struct HostScan<'a> {
+    row: u16,
+    alias: &'a str,
+    count: usize,
+    at: usize,
+}
+fn hosts<'a>(r: &mut Reader<'a>, key: &str) -> Result<Option<HostScan<'a>>, EgressError> {
     let count = r.short()?;
     for row in 0..count {
         let alias = r.string()?;
         let count = r.short()?;
-        let mut members = if alias == key {
-            Vec::with_capacity(usize::from(count))
-        } else {
-            Vec::new()
-        };
-        for index in 0..count {
-            let address = r.ip()?;
-            if alias == key {
-                members.push(HostMember { index, address });
-            }
+        if count > 16 {
+            return Err(EgressError::Budget);
+        }
+        let at = r.at;
+        for _ in 0..count {
+            r.ip()?;
         }
         if alias == key {
-            return Ok(Some(HostsStep {
+            return Ok(Some(HostScan {
                 row,
                 alias,
-                members,
+                count: usize::from(count),
+                at,
             }));
         }
     }
@@ -275,11 +364,13 @@ pub(super) fn plan<'a>(
     }
     crate::profile_channel::resolver_name(original, original.ends_with('.'), false)
         .map_err(|_| EgressError::Resolver)?;
-    let memory = budget
-        .reserve(PLAN_BYTES)
-        .map_err(|_| EgressError::Budget)?;
+    // Fixed verifier scratch оплачен owning channel/snapshot и завершён
+    // до новых scan buffers. Это не источник custody/authority.
     crate::profile_channel::verify_resolver_asset(capture.asset, capture.reference)
         .map_err(|_| EgressError::Stale)?;
+    let _scratch = budget
+        .reserve(SCAN_BYTES)
+        .map_err(|_| EgressError::Budget)?;
     let mut r = Reader {
         bytes: capture.asset,
         at: 152,
@@ -321,59 +412,106 @@ pub(super) fn plan<'a>(
             return Err(EgressError::Stale);
         }
     }
-    let mut key = original.to_ascii_lowercase();
-    if key.contains('.') && !key.ends_with('.') {
-        key.push('.');
-    }
+    let mut key_buffer = NameBuffer::join(&[
+        original,
+        if original.contains('.') && !original.ends_with('.') {
+            "."
+        } else {
+            ""
+        },
+    ])?;
+    key_buffer.bytes[..key_buffer.len].make_ascii_lowercase();
+    let key = key_buffer.text()?;
     let host = if order == 2 {
         None
     } else {
-        hosts(&mut r, &key)?
+        hosts(&mut r, key)?
     };
-    let mut steps = Vec::with_capacity(2);
-    if matches!(order, 1 | 3) && host.is_some() {
-        steps.push(LookupStep::Hosts(host.ok_or(EgressError::Resolver)?));
-    } else if order != 1 {
+    let host_first = matches!(order, 1 | 3) && host.is_some();
+    let network_needed = !host_first && order != 1;
+    let mut names = CandidateNames::new();
+    if network_needed {
         if !dns_name(original) {
             return Err(EgressError::Resolver);
         }
-        let mut network = NetworkStep {
-            peers: capture.peers,
-            family,
-            options: NetworkOptions {
-                attempts,
-                timeout_ms: timeout,
-                rotate: flags & 1 != 0,
-                single_request: flags & 2 != 0,
-                use_tcp: flags & 4 != 0,
-                query_options: 1
-                    | if flags & 16 != 0 { 8 } else { 0 }
-                    | if flags & 8 != 0 { 16 } else { 0 },
-                udp_payload: if flags & 16 != 0 { 1232 } else { 0 },
-            },
-            questions: Vec::with_capacity(CANDIDATES),
-            order: [0; CANDIDATES],
-            count: 0,
-        };
         if original.ends_with('.') {
-            network.add(original.to_owned())?;
+            names.add(&[original])?;
         } else {
-            let absolute = format!("{original}.");
             let first = original.bytes().filter(|b| *b == b'.').count() >= usize::from(ndots);
             if first {
-                network.add(absolute.clone())?;
+                names.add(&[original, "."])?;
             }
             for suffix in &searches[..count] {
-                // nameList пропускает слишком длинную expansion, не обрезает её.
-                if absolute.len() + suffix.len() <= 254 {
-                    network.add(format!("{absolute}{suffix}"))?;
+                if original.len() + 1 + suffix.len() <= 254 {
+                    names.add(&[original, ".", suffix])?;
                 }
             }
             if !first {
-                network.add(absolute)?;
+                names.add(&[original, "."])?;
             }
         }
-        if network.count != 0 {
+    }
+    let include_host = host_first || order == 4 && host.is_some();
+    let step_count = usize::from(include_host) + usize::from(names.count != 0);
+    let member_count = if include_host {
+        host.as_ref().map_or(0, |h| h.count)
+    } else {
+        0
+    };
+    let bytes = std::mem::size_of::<ResolverLookupPlan<'_>>()
+        + key.len()
+        + step_count * std::mem::size_of::<LookupStep<'_>>()
+        + member_count * std::mem::size_of::<HostMember>()
+        + names.unique * std::mem::size_of::<Question>()
+        + names.bytes();
+    let memory = budget.reserve(bytes).map_err(|_| EgressError::Budget)?;
+    #[cfg(test)]
+    PLAN_PEAK.fetch_max(budget.used(), std::sync::atomic::Ordering::Relaxed);
+    let key = key.to_owned();
+    let mut steps = Vec::with_capacity(step_count);
+    let host = if include_host {
+        let h = host.ok_or(EgressError::Resolver)?;
+        let mut r = Reader {
+            bytes: capture.asset,
+            at: h.at,
+        };
+        let mut members = Vec::with_capacity(h.count);
+        for index in 0..h.count {
+            members.push(HostMember {
+                index: index as u16,
+                address: r.ip()?,
+            });
+        }
+        Some(HostsStep {
+            row: h.row,
+            alias: h.alias,
+            members,
+        })
+    } else {
+        None
+    };
+    if host_first {
+        steps.push(LookupStep::Hosts(host.ok_or(EgressError::Resolver)?));
+    } else {
+        if names.count != 0 {
+            let network = NetworkStep {
+                peers: capture.peers,
+                family,
+                options: NetworkOptions {
+                    attempts,
+                    timeout_ms: timeout,
+                    rotate: flags & 1 != 0,
+                    single_request: flags & 2 != 0,
+                    use_tcp: flags & 4 != 0,
+                    query_options: 1
+                        | if flags & 16 != 0 { 8 } else { 0 }
+                        | if flags & 8 != 0 { 16 } else { 0 },
+                    udp_payload: if flags & 16 != 0 { 1232 } else { 0 },
+                },
+                questions: names.materialize()?,
+                order: names.order,
+                count: names.count,
+            };
             steps.push(LookupStep::Network(network));
         }
         if order == 4 {
