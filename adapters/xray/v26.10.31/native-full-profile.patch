@@ -39260,7 +39260,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_linux_test.go b/common/yonikb
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux_test.go
-@@ -0,0 +1,3244 @@
+@@ -0,0 +1,3291 @@
 +//go:build linux
 +
 +package nativehooks
@@ -40703,6 +40703,53 @@ new file mode 100644
 +	}
 +	return nil
 +}
++func TestProfileNetworkSetupPendingSettlement(t *testing.T) {
++	for _, tcp := range []bool{false, true} {
++		h, logical := networkExchangeStart(t, 1, tcp, nil)
++		op := networkExchangePublish(t, h, logical)
++		if h.n.transport.setupSettled != 2 {
++			t.Fatal("PhysicalAck37 и LogicalAck39 должны погасить ровно два setup slots")
++		}
++		before := h.f.c.operations
++		if err := h.f.c.dispatch(op); err != nil {
++			t.Fatal(err)
++		}
++		if err := h.f.c.accept(networkPublished(op)); err != nil {
++			t.Fatal(err)
++		}
++		if h.f.c.operations != before-1 {
++			t.Fatalf("Publish setup pending retained: before=%d after=%d", before, h.f.c.operations)
++		}
++		if h.conn.closes != 0 {
++			t.Fatal("settlement closed live transport")
++		}
++		before = h.f.c.operations
++		if err := h.f.c.accept(networkPublished(op)); err == nil || h.f.c.operations != before {
++			t.Fatal("replay повторно вернул pending")
++		}
++	}
++}
++
++func TestProfileNetworkPhysicalReservedKeepsPendingUntilAck(t *testing.T) {
++	h := networkTransportStart(t, 1, true, nil, nil)
++	before := h.f.c.operations
++	if err := h.f.c.accept(networkTransportReply(h.physical)); err != nil {
++		t.Fatal(err)
++	}
++	proof := h.next(t, 52)
++	<-h.proof
++	if h.f.c.operations != before || h.n.transport.setupSettled != 0 {
++		t.Fatal("Reserved36 вернул общий physical slot до ACK37")
++	}
++	if err := h.f.c.accept(networkTransportReply(proof)); err != nil {
++		t.Fatal(err)
++	}
++	_ = h.next(t, 38)
++	if h.f.c.operations != before-1 || h.n.transport.setupSettled != 1 {
++		t.Fatal("ACK37 не погасил общий slot ровно один раз")
++	}
++}
++
 +func TestProfileNetworkExchangeActualPublishBoundDataAndRetirement(t *testing.T) {
 +	for _, mode := range []byte{1, 2} {
 +		for _, tcp := range []bool{false, true} {
@@ -42509,7 +42556,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux.go
-@@ -0,0 +1,1603 @@
+@@ -0,0 +1,1610 @@
 +//go:build linux
 +
 +package nativehooks
@@ -42970,6 +43017,7 @@ new file mode 100644
 +	cleanup             bool
 +}
 +type profileDNSDirect struct {
++	setupSettled                                                        int
 +	network                                                             *profileNetworkBootstrap
 +	wireMu                                                              sync.Mutex
 +	wireRequest                                                         [514]byte
@@ -43329,6 +43377,12 @@ new file mode 100644
 +				t.cancel()
 +				c.dnsNotify(op, errProfile)
 +				return true, errProfile
++			}
++			// Physical Reserved36 сохраняет общий slot до PhysicalAck37.
++			// Cleanup slots и retained history здесь не освобождаются.
++			if !t.unknown && !t.closed && c.dnsDirectLive(t) && (f.kind == 36 && !r.physical || f.kind == 37 || f.kind == 39) {
++				t.setupSettled++
++				c.operations--
 +			}
 +			if f.kind != 46 && f.kind != 48 && !c.dnsDirectLive(t) {
 +				c.dnsNotify(op, errProfile)
@@ -44079,7 +44133,7 @@ new file mode 100644
 +			continue
 +		}
 +		t.released = true
-+		c.operations -= profileDNSDirectPending
++		c.operations -= profileDNSDirectPending - t.setupSettled
 +		c.dnsFDUsed -= 2
 +		// Retained IDs/request bytes остаются в оплаченной history до session end.
 +		c.buffered -= profileDNSDirectCredit / 2
@@ -44167,7 +44221,7 @@ diff --git a/common/yonikbroker/profile_rx_budget_linux_test.go b/common/yonikbr
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_rx_budget_linux_test.go
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,306 @@
 +//go:build linux
 +
 +package nativehooks
@@ -44305,6 +44359,10 @@ new file mode 100644
 +	if err = h.f.c.accept(packet); err != nil {
 +		release(false)
 +		t.Fatal(err)
++	}
++	// Setup ACK возвращает свой slot, RX lease не владеет этим кредитом.
++	if packet.kind == 36 && packet.body[60] == 1 || packet.kind == 37 || packet.kind == 39 {
++		beforePending--
 +	}
 +	release(true)
 +	release(true)
@@ -44536,7 +44594,7 @@ diff --git a/common/yonikbroker/profile_dns_rrset_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_rrset_linux.go
-@@ -0,0 +1,1226 @@
+@@ -0,0 +1,1232 @@
 +//go:build linux
 +
 +package nativehooks
@@ -44582,6 +44640,7 @@ new file mode 100644
 +const profileDNSResultCredit = 64 * 1024
 +
 +type profileDNSResultOwner struct {
++	setupSettled              int
 +	network                   *profileNetworkBootstrap
 +	networkConn               *profileDNSDirectConn
 +	networkPublishHash        [32]byte
@@ -45260,6 +45319,11 @@ new file mode 100644
 +				sort.Slice(q.ips[:q.count], func(i, j int) bool { return q.ips[i].Compare(q.ips[j]) < 0 })
 +				q.ready = true
 +			}
++			// received запрещает повторное погашение setup; cleanup остаётся prepaid.
++			if !o.unknown && !o.closed {
++				o.setupSettled++
++				c.operations--
++			}
 +			c.dnsNotify(op, nil)
 +			return true, nil
 +		}
@@ -45476,7 +45540,7 @@ new file mode 100644
 +				continue
 +			}
 +			o.released = true
-+			c.operations -= profileDNSResultPending
++			c.operations -= profileDNSResultPending - o.setupSettled
 +			c.buffered -= profileDNSResultCredit - 8192
 +			if o.query != nil {
 +				o.query.refs--

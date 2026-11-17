@@ -12,6 +12,16 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_setup_pending_settlement_preserves_cleanup_remainder(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "profileDNSDirectPending - t.setupSettled",
+            "profileDNSResultPending - o.setupSettled",
+            "TestProfileNetworkSetupPendingSettlement",
+            "TestProfileNetworkPhysicalReservedKeepsPendingUntilAck",
+        ):
+            self.assertIn(anchor, patch)
+
     def test_datagram_network_uses_independent_bindings_and_existing_transport(
         self,
     ) -> None:

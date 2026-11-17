@@ -1908,3 +1908,14 @@ Original USER parent остаётся удержан обоими binding owners
 Wire/schema/canonical corpus, frozen ingress proof/ABI, registry/builder и public
 gates не меняются. OS wrappers/main только компилируются; pure positives используют
 authenticated fake counterpart и не доказывают runtime/pair/FranceSS readiness.
+
+Pending setup теперь погашается отдельно от retained memory/history: после
+валидированного live ACK Direct owner возвращает Exchange Reserved36 (только
+неphysical), PhysicalAck37 и LogicalAck39; Result owner — Publish/Bind setup ACK.
+Physical Reserved36 сохраняет общий slot до ACK37. Received/replay guards стоят
+до settlement; Unknown, закрытый owner и невалидный ACK кредит не возвращают.
+Owner хранит число погашенных setup slots; окончательный cleanup вычитает только
+остаток исходного debit, сохраняя prepaid cancel/retire и все прежние barriers.
+NETWORK Direct возвращает два setup slots, Publish — один: для двух producers
+это шесть slots, необходимые для исходного pending61 + waiter9 при cap64.
+Это расчёт ledger; совместный FranceSS Go↔Rust pair остаётся отдельной проверкой.
