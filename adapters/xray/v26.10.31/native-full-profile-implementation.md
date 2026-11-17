@@ -1655,3 +1655,51 @@ pending credits во время передачи Probe/context/reservation в co
 после завершения handoff обычный cleanup снимает обе ссылки и grant slot.
 Детерминированный pure interleaving проверяет custody до handoff и освобождение
 после него; actual concurrent OS/runtime выполнение этим тестом не аттестовано.
+
+### NETWORK: отдельный waiter и private numeric physical handoff (CODEC4)
+
+Actual `ProfilePrepareChain` → `profilePrepareNetworkBootstrap` после strict
+exchange/Published DATA вызывает `profileAcquireNetworkWaiter` только для уже
+поддержанного one-shot raw TCP physical leaf. TLS/mux/chain/UDP original target
+остаются Unsupported. Новый waiter получает собственные purpose2 service root,
+query/context55/56, role3 Reserve35/36, WaiterBind53/54 и Numeric42 use2/class3.
+Publisher root/context/query, ProducerRRsetId и resolver-only transport permit
+не используются как waiter или original-target authority. NETWORK DATA по-прежнему
+не выдаёт публичный IP/TTL и не принимается USER cache/answer APIs.
+
+`profileBootstrapPhysicalPermission` имеет явный закрытый origin Hosts либо
+NETWORK waiter. NETWORK origin удерживает DATA pointer/member, fresh root/query,
+snapshot/source epoch, original parent/full actual frontier, resolver/selector,
+port/carrier и original hostname. Numeric GRANT19 строго class3/flow0/required0/
+owner0; отдельный live original USER grant/receipt обязателен. Общий private
+`ProfileDialBootstrap` проверяет обе authority перед factory, при позднем
+возврате и на каждом I/O. Native caller сохраняет hostname/SNI; numeric member
+передаётся только physical runner. Ни ordinary AUTHORIZE, ни USER live/resolve
+не расширяются. Повторный physical attempt Unsupported.
+
+Reserve/Waiter/Numeric replies привязаны к pending sequence и собственным typed
+namespaces, query/context/epoch/member count/revision. Абсолютный observed TTL,
+producer context/root, reservation/receipt/parent/session deadlines и System
+Known20ms только сужаются с RTT. Known request cancellation не принимает late
+Allow. Невалидный member/address и недостаток общей pending/memory/history quota
+отвергаются до нового retained history/root effect. Waiter precredit — 9 pending/
+history и 32KiB retained metadata; shared RX/FD credits не повторяются.
+
+Waiter constructor имеет свой constructing barrier; cleanup не освобождает refs
+между Probe/context return и private handoff. NETWORK producer context остаётся
+живым до завершения permission/waiter. Retirement: original physical close/join →
+permission Close32/34 → waiter Cancel6 → waiter reservation Cancel7 → waiter
+context Cancel8 → Producer Cancel5 → Proof45/46 → Resource45/46 → physical/exchange
+reservations → producer context. DNS consuming Conn/duplicate/tasks close/join
+может завершиться раньше Producer ACK, но обязательно предшествует Proof retire.
+Обе ветви используют прежние barriers; Unknown sticky удерживает custody и не
+превращается в Known от повторного ACK/Close. Локальная отмена не отменяет соседний
+USER flow; malformed/replay protocol error сохраняет общий fail-closed fence.
+Retained metadata/history не компактизируются и не обещают long-lived readiness.
+
+Wire/schema/corpus не меняются. Authenticated fake counterpart используется
+только в pure tests; actual Rust NETWORK Numeric/route/source validation и новый
+protected producer contract требуют отдельного counterpart/source review.
+`dns4CaptureReviewed`, public gates и allowlists остаются закрытыми; прежний
+schema3 Direct record не подтверждает этот CODEC4 путь. OS wrappers/main только
+скомпилированы, runtime/network acceptance не заявляется.
