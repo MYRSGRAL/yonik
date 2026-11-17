@@ -810,6 +810,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   permission/flow0/one-shot/Close32/34 сохранены; production Source/gates false,
   совместный Go/Rust/runtime ещё не исполнялся.
 
+- R66 SOURCE scoped CLEAN: NETWORK transport consumer78ed175 интегрирован.
+  Physical Reserve ACK предшествует factory, retained ingress namespace fence —
+  Connect/FD export; Physical/Logical ACK — выдаче Conn. Close/joins предшествуют
+  Proof→Resource→reservation/context retirement; constructing barrier сохранён.
+  До Physical Reserved36 обязательно наличие resolver-only route permit:
+  поздний отказ Physical/Logical не является защитой раннего Connect. Rust
+  counterpart ещё реализуется, capture/Source/public gates закрыты. NETWORK
+  payload/answers и runtime не объявлены готовыми.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
