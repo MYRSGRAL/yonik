@@ -834,6 +834,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   Production Source/transcript None, Go stateful pair/runtime не запускались,
   public gates false. Go exchange/Publish7ffdc1c ожидает R69 review.
 
+- R69 SOURCE scoped CLEAN: Go NETWORK exchange/Publish7ffdc1c интегрирован.
+  Logical ACK предшествует private one-shot exact request/connection exchange;
+  parser credit списывается до Unpack, Published остаётся immutable DATA.
+  Public Read/Write/IP/TTL закрыты; Producer Cancel ACK предшествует transport
+  retirement. NETWORK waiter/Numeric ещё реализуются; syscall/join/runtime
+  совместной пары не аттестованы, capture/producer/public flags false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
