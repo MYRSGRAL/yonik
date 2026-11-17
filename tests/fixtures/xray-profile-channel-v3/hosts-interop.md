@@ -1,5 +1,73 @@
 # PURE_STATEFUL_INTEROP: HOSTS
 
+## UDP HOSTS: отдельный CODEC5 pair после R89
+
+База Rust `0641f995cc279c9c0f76a9a469bea06ad34218d8`; Go SUT — exact
+`04fda581e1c69b432d0196bf2b25b62da66b6315`, profile patch SHA256
+`6a0bd7327e27e20b64dc89922110816e0a27ea8c754b9648a2d6e3d9559b6e52`.
+1305 native members восстановлены из retained official tree с обратным применением
+1e65 patch и чистым применением 04fda patch. Все1299 прежних members и6 новых
+сопоставляются по hashes до/после overlay и test execution. Ни один existing
+native member не заменяется overlay; production Rust/Go, reviewed pins и gates
+не меняются. NETWORK UDP2619814 — следующий отдельный pair, не результат этого cut.
+
+Новые `datagram-interop-{bridge,external}_test.go` включаются только в test binary.
+`datagram-interop-ss.go` — **добавленный**, а не заменяющий source member, build tag
+`yonikpureinterop`, пакет shadowsocks. Он конструирует Client с fake policy/link
+без core.New/NewClient и вызывает неизменённый actual `Client.Process`: AES-GCM
+UDP encoder, `ProfileBootstrapDatagramPayloadSize`, private dial, context binding,
+две consuming tasks и deferred Close. External test package устраняет import cycle
+с private broker fixture. Tag не используется production builder.
+
+Новые overlay destinations относительно exact source:
+`common/yonikbroker/datagram-interop-bridge_test.go`,
+`common/yonikbroker/datagram-interop-external_test.go`,
+`proxy/shadowsocks/datagram-interop-ss.go`; сохраняются оба прежних overlay files.
+Compile-only команда с прежними offline/cache env и абсолютным overlay:
+`go test -p=1 -mod=readonly -tags=yonikpureinterop -overlay=... -c -o ... ./common/yonikbroker`.
+Relay автоматически выбирает named external test
+`TestPureStatefulDatagramHostsSSStdioBridge`, Rust endpoint прежний.
+
+Cases: `udp-hosts-positive`, `system-udp-hosts-positive`,
+`udp-hosts-foreign-member`, `udp-hosts-parent-cancel`, `udp-hosts-replay`.
+Positive выполняет real57/58→55/56→35/36→40/41→independent57/58→55/56→35/36→53/54→42/19,
+один fake connected UDP owner, один actual SS encoded send и join двух tasks.
+Replay подаёт второй packet в тот же открытый actual SS caller: второй Write
+отвергается, factory/send остаются1; второй physical open также отвергается.
+Foreign member мутирует только outbound Numeric42 DATA и получает actual Deny19
+до factory. Parent-cancel закрывает **исходный USER grant**, а не только derived
+waiter binding; consuming gate не допускает factory, actual Close32 USER ждёт
+оба cancel9 ACK. Остальные случаи сохраняют исходный USER seed как live neighbor.
+
+Rust использует общий production factory core `BootstrapBinding::create_for`,
+вызываемый `prepare_datagram`, с injected PeerCustody/SourceOwner/explicit reviewed5
+record. Реальные Local/System OS custody wrappers не вызываются. Planner,
+Source checks, launch/config/capsule/snapshot binding и serialized `run_issuer`
+не подменены. Descriptor5/ACK выдают противоположные SUT; fallback4 отсутствует.
+Source/Wire/Release5 review pins остаются None.
+
+Явно пропущены USER admission/HELLO, protected install/image OS custody и UDP
+control/kernel proof exchange. Общий preseed задаёт grant=flow=revision=1,
+original USER endpoint203.0.113.9:443/UDP, initiator192.0.2.1:32001→ingress127.0.0.1:1082,
+matched Consumed lineage; Go fixture leaf приводится к этим фактам **до**57.
+System Known owner2/id77/20ms — fake facts, не OS attribution. В Rust два owner calls
+относятся только к USER seed; flow0 Source не вызывает owner backend. USER effective
+остаётся requested logical destination, отдельно от SS physical hostname frontier.
+Actual USER authorization этого seed не проверяется данным pair.
+
+Fake datagram owner заменяет только connected socket create/read/write/consuming
+close; socket/netlink/ioctl/SCM/core/main/services не исполняются. Authority ACK,
+permission и KnownClosed не создаются harness. Каждая выдача context/reservation/
+producer/waiter/parent требует соответствующий actual terminal ACK. Анализатор
+отклоняет cancel9 до собственного context8 ACK и USER Close32 до обоих ACK9.
+После cleanup bootstrap routes/contexts/operations retired; единственная USER
+seed route остаётся live, кроме parent-cancel, который закрывает её actual frame.
+Preseed counts выводятся отдельно, не обнуляются ради cleanup assertion.
+
+Evidence: `/home/myrs/projects/yonik/local/orchestration/evidence/p5-udp-hosts-pair`.
+Классификация только PURE_STATEFUL_INTEROP: не runtime/kernel/installed/FranceSS PASS.
+Прежние7 TCP cases прогоняются на том же test ELF с явным descriptor4 selection.
+
 Актуальный результат после root `febd859` и Numeric memory correction:
 все7 cases GREEN, включая NETWORK Publish→Waiter→Numeric→fake original open→
 Known cleanup. Убрана retained копия immutable Binding из Numeric proof;

@@ -11,12 +11,19 @@ fn fixture5(mode: Mode) -> (Issuer<Fake>, Arc<Facts>) {
     fixture5_order(mode, 1)
 }
 fn fixture5_order(mode: Mode, order: u8) -> (Issuer<Fake>, Arc<Facts>) {
+    fixture5_digest(mode, order, [3; 32])
+}
+pub(super) fn fixture5_digest(
+    mode: Mode,
+    order: u8,
+    digest: [u8; 32],
+) -> (Issuer<Fake>, Arc<Facts>) {
     let (mut issuer, f) = fixture_carrier(
         mode,
         "203.0.113.80".parse().unwrap(),
         order,
         true,
-        [3; 32],
+        digest,
         17,
     );
     issuer.authority.owner_forbidden = false;
