@@ -12,6 +12,30 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_network_bootstrap_constructor_has_own_root_context_and_reservation(
+        self,
+    ) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "return profilePrepareNetworkBootstrap(ctx, root)",
+            "c.probe(n.ctx, 2, f.endpoint, f.subject, n.resolver)",
+            "op.fixedDeadline = n.deadline",
+            "c.networkBootstrapDispatch(op)",
+            "c.networkBootstrapAccept(f)",
+            "c.networkBootstrapTick()",
+            "c.dnsCancel(7, n.reservation)",
+            "n.context.hostReferences--",
+            "n.service.pending--",
+        ):
+            self.assertIn(anchor, patch)
+        section = patch.split(
+            "+++ b/common/yonikbroker/profile_dns_frontier_linux.go\n", 1
+        )[1].split("diff --git ", 1)[0]
+        self.assertIn("profileNetworkBootstrapPending = 4", section)
+        self.assertNotIn("dns4CaptureReviewed = true", section)
+        self.assertNotIn("net.DefaultResolver", section)
+        self.assertIn("Physical52/Logical38 service runner ещё закрыт", section)
+
     def test_hosts_waiter_numeric_keeps_two_private_physical_authorities(self) -> None:
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         for anchor in (
