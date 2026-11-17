@@ -24,16 +24,47 @@ pub enum FullProfileMode {
     System,
 }
 
-/// Ранний отказ до binary/config/IPC effects; не выдаёт launch authority.
+/// DATA availability до binary/config/IPC effects; не выдаёт launch authority.
 /// Проверки image, источников и режима при подготовке остаются обязательными.
 pub fn full_profile_preflight(mode: FullProfileMode) -> Result<(), HostError> {
     match mode {
         FullProfileMode::Local | FullProfileMode::System => {
-            crate::helper::native_profile_channel::require_consumer()
+            crate::helper::native_profile_channel::consumer_planning_available()
                 .map(|_| ())
                 .map_err(|_| HostError::Unsupported)
         }
     }
+}
+/// DATA selected-subset check; installed image/source проверяются в prepare.
+pub fn full_profile_plan_preflight(
+    mode: FullProfileMode,
+    intent: &yonik_engine::native_profile::ProfileIntent,
+) -> Result<(), HostError> {
+    crate::helper::native_profile_channel::consumer_profile_plan(intent, profile_mode(mode))
+        .map_err(|_| HostError::Unsupported)
+}
+pub fn full_profile_request_preflight(
+    mode: FullProfileMode,
+    request: &crate::helper::profile_intent::FullProfileRequest,
+) -> Result<(), HostError> {
+    crate::helper::native_profile_channel::consumer_request_plan(request, profile_mode(mode))
+        .map_err(|_| HostError::Unsupported)
+}
+fn profile_mode(mode: FullProfileMode) -> crate::profile_channel::Mode {
+    match mode {
+        FullProfileMode::Local => crate::profile_channel::Mode::Local,
+        FullProfileMode::System => crate::profile_channel::Mode::System,
+    }
+}
+/// Selected sealed image/scope preflight до port allocation/IPC. Не FlowGrant.
+pub fn full_profile_image_preflight(
+    mode: FullProfileMode,
+    intent: &yonik_engine::native_profile::ProfileIntent,
+    image: &BinarySnapshot,
+) -> Result<(), HostError> {
+    crate::helper::native_profile_channel::require_consumer(intent, profile_mode(mode), image)
+        .map(|_| ())
+        .map_err(|_| HostError::Unsupported)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,15 +212,12 @@ impl Cancellation {
 #[cfg(test)]
 mod full_profile_preflight_tests {
     #[test]
-    fn closed_admission_refuses_both_modes_without_effects() {
+    fn planning_is_available_without_claiming_effect_authority() {
         for mode in [
             super::FullProfileMode::Local,
             super::FullProfileMode::System,
         ] {
-            assert_eq!(
-                super::full_profile_preflight(mode),
-                Err(super::HostError::Unsupported)
-            );
+            assert_eq!(super::full_profile_preflight(mode), Ok(()));
         }
     }
 }

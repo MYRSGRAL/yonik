@@ -1746,3 +1746,66 @@ additional pin согласованы с exact patch
 остаются false. Compile-only candidate не устанавливается и содержит
 install_authority=false; новый ELF не исполняется даже для --version.
 Evidence сборки/проверок: `/home/myrs/projects/yonik/local/orchestration/evidence/p5-reviewed-1e65`.
+
+## Narrow consumer prepare: planning отдельно от installed proof
+
+`full_profile_preflight` теперь DATA availability canonical CODEC4, без чтения
+registry, Source или выполнения image. Desktop backend/SystemSession используют
+`full_profile_plan_preflight` / `full_profile_request_preflight` с конкретным
+selected intent до LocalSession/SystemClient. Успех не является эффектной
+capability. UI can_connect использует ту же узкую DATA selection; семь прежних
+расширенных profiles этим изменением не открываются.
+`require_consumer(intent, mode, &BinarySnapshot)` отдельно валидирует graph,
+exact selected sealed image/hash и три независимых bootstrap scopes. Candidate,
+env/JSON, Source-only scope и Direct USER DNS4 не дают этот proof.
+
+Поддержан только один VLESS subject с одним TCP physical frontier, default raw
+P5STRM01 stream/mux (оба отсутствуют), без provider DNS/direct subjects,
+selectors/probes/chains/aliases/resources. Любая transport extension (включая
+TLS, mux, XHTTP, UDP carrier) явно Unsupported до sources/staging/spawn.
+Это prepare capability, не USER/service FlowGrant и не разрешение UDP ingress.
+Authority каждого open по-прежнему проверяется actual issuer отдельно.
+P3 declaration default system DNS app при отсутствии provider DNS сохраняется;
+в exact no-routing raw VLESS это не требование USER DNS query и не capability.
+Если actual flow всё же требует USER DNS, отдельный Direct USER4 proof остаётся
+обязательным/закрытым; bootstrap scopes не заменяют его.
+
+Engine `is_raw_tcp_consumer_subset()` читает только typed private поля
+exhaustively; не парсит JSON и не заменяет P3 validate. В частности, routing
+domainStrategy и VLESS flow исключены. Captured Local DATA после capture и до
+staging revalidate-ится дважды: если первый lookup step NETWORK, все его peers
+должны быть nonloopback unicast:53; отсутствующая loopback policy не становится
+bootstrap capability. Первый HOSTS step не требует DNS transport. Planning epoch
+не экспортируется как owning epoch/observation/receipt; runtime Source перепроверяет
+свою actual invocation самостоятельно. Никакого Source/grant из этого DATA check.
+
+Local CheckedConfig передаёт именно свой BinarySnapshot в Prepared::prepare до
+capture/staging/config-check. Prepared удерживает hash/provenance; CheckedConfig
+и LocalSession удерживают actual image; launch проверяет final config/capsule/
+actual child заново. System installed_consumer сначала проверяет DATA plan,
+читает protected registry и возвращает image+proof; Backend передаёт именно этот
+image в WorkerPayload, без повторной selection. Owner/stamp/self-fence checks
+и Source revalidation не ослаблены.
+Desktop native preflight загружает protected snapshot до port allocation/IPC,
+повторяет source/selection/generation checks после await и проверяет
+`full_profile_image_preflight`. Local SessionConfig передаёт именно этот snapshot
+дальше, без повторного registry lookup; отсутствие snapshot — явный отказ, не
+legacy fallback. System helper независимо проверяет свой protected snapshot;
+frontend image не является authority для helper.
+
+**Конкретное оставшееся ограничение System hostname**: session_host.rs
+prepare_full_profile всё ещё строит static numeric ProfileRoute и вызывает
+PhysicalRequirements::validate_numeric/capture_numeric. Поэтому System plan
+отвергает requires_bootstrap до attestation/network/listen, numeric raw TCP
+остаётся eligible. Для System HOSTS/NETWORK нужен отдельный integration bridge:
+retained CapturedPhysicalRoutes должен различать static numeric route и pending
+bootstrap frontier; Source/Waiter/Numeric permission должен добавить exact
+numeric route через durable RouteAuthority, затем retire эту запись вместе с
+SessionArtifact (prepare/apply/start/active stale fences). Нельзя пропустить
+validate_numeric или превратить hostname в исключение. API profile_intent.rs
+capture_numeric прямо запрещает такой bridge сейчас; файл вне текущего scope.
+
+Pure tests проверяют настоящий Local prepare до injected capture boundary (без
+/etc/exec) и общий System planning dispatcher с injected record scopes. Успех
+полной System/Local OS preparation/runtime этими тестами не заявляется. Existing
+Source/digest/cancel/owner tests остаются отдельными regression filters.

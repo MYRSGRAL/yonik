@@ -90,7 +90,7 @@ impl CheckedConfig {
             return Err(HostError::ConfigRejected);
         }
         let (profile, config) =
-            super::local_profile_channel::Prepared::prepare(intent, runtime, cancel)?;
+            super::local_profile_channel::Prepared::prepare(&binary, intent, runtime, cancel)?;
         let mut output = ConfigBuffer(Vec::new());
         config
             .write_sensitive(&mut output)

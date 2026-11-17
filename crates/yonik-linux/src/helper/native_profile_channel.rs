@@ -5594,13 +5594,319 @@ pub(super) fn reject_unproved_stub(peer: wire::Destination<'_>) -> Result<(), Se
     Ok(())
 }
 
-/// Gate не имеет caller constructor или UI bool. Go a004e92 ещё не содержит
-/// physical pools/DNS/service enforcement; launch ACK этого не доказывает.
-pub(crate) struct ConsumerReady {
-    _private: (),
+/// Planning проверяет только наличие typed codec, не installed authority.
+pub(crate) fn consumer_planning_available() -> Result<(), ServiceError> {
+    if super::registry::DnsSchema::current().map_err(unavailable)?
+        != super::registry::DnsSchema::Codec4
+    {
+        return Err(ServiceError::Unsupported);
+    }
+    Ok(())
 }
-pub(crate) fn require_consumer() -> Result<ConsumerReady, ServiceError> {
-    Err(ServiceError::Unsupported)
+pub(crate) fn consumer_profile_plan(
+    intent: &yonik_engine::native_profile::ProfileIntent,
+    mode: Mode,
+) -> Result<(), ServiceError> {
+    ConsumerPlan::derive(intent, mode).map(|_| ())
+}
+pub(crate) fn consumer_request_plan(
+    request: &super::profile_intent::FullProfileRequest,
+    mode: Mode,
+) -> Result<(), ServiceError> {
+    consumer_profile_plan(request.intent(), mode)
+}
+/// Закрытая DATA selection: один raw VLESS TCP frontier, без provider DNS,
+/// observatory, routing chains и transport extensions. Не grant.
+struct ConsumerPlan;
+impl ConsumerPlan {
+    fn derive(
+        intent: &yonik_engine::native_profile::ProfileIntent,
+        mode: Mode,
+    ) -> Result<Self, ServiceError> {
+        consumer_planning_available()?;
+        if !intent.is_raw_tcp_consumer_subset() {
+            return Err(ServiceError::Unsupported);
+        }
+        let graph = intent.validate().map_err(unavailable)?;
+        let egress = graph.egress();
+        if graph.subjects().len() != 1
+            || graph.probe().is_some()
+            || !graph.selector_sets().is_empty()
+            || !graph.ingresses().is_empty()
+            || !graph.resources().is_empty()
+            || !egress.chains().is_empty()
+            || !egress.direct_subjects().is_empty()
+            || !egress.resolvers().is_empty()
+            // P3 декларирует default system DNS app даже без provider DNS.
+            // Exact no-routing/no-DNS predicate не требует USER-DNS query;
+            // декларация не является authority и Direct USER4 не включается.
+            || egress.system_resolvers().iter().any(|r| r.subject().is_some())
+            || egress.physical().len() != 1
+            || egress.physical()[0].protocol()
+                != yonik_engine::native_profile::TransportProtocol::Tcp
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        // System static route capture ещё требует numeric leaves. Не выдаём
+        // prepare-ready для hostname до independent route/provenance bridge.
+        if mode.required() && egress.physical()[0].requires_bootstrap() {
+            return Err(ServiceError::Unsupported);
+        }
+        if let Ok(ip) = egress.physical()[0].host().parse::<std::net::IpAddr>() {
+            if !dns_rrset::numeric_ip_allowed(ip) {
+                return Err(ServiceError::Unsupported);
+            }
+        }
+        Ok(Self)
+    }
+    fn image(&self, proof: &super::ImageContract, hash: [u8; 32]) -> Result<(), ServiceError> {
+        for scope in [
+            super::registry::BootstrapScope::Source,
+            super::registry::BootstrapScope::Wire,
+            super::registry::BootstrapScope::Release,
+        ] {
+            proof
+                .bootstrap_channel(hash, scope)
+                .map_err(unavailable)?
+                .ok_or(ServiceError::Unsupported)?
+                .check(hash, scope)
+                .map_err(unavailable)?;
+        }
+        Ok(())
+    }
+}
+/// Installed sealed image retained до конца prepare; launch проверяет actual
+/// executable/config/capsule отдельно. Эта capability не FlowGrant.
+pub(crate) struct ConsumerReady {
+    _proof: super::ImageContract,
+    _image: [u8; 32],
+}
+pub(crate) fn require_consumer(
+    intent: &yonik_engine::native_profile::ProfileIntent,
+    mode: Mode,
+    image: &crate::host::BinarySnapshot,
+) -> Result<ConsumerReady, ServiceError> {
+    prepare_consumer(intent, mode, |plan| {
+        if mode == Mode::Local
+            && (rustix::process::geteuid().as_raw() == 0
+                || rustix::process::geteuid() != rustix::process::getuid())
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        if image.engine != yonik_engine::Engine::Xray {
+            return Err(ServiceError::Unsupported);
+        }
+        let proof = image.producer().ok_or(ServiceError::Unsupported)?;
+        plan.image(&proof, image.trusted_hash())?;
+        Ok(ConsumerReady {
+            _proof: proof,
+            _image: image.trusted_hash(),
+        })
+    })
+}
+
+pub(crate) fn installed_consumer(
+    intent: &yonik_engine::native_profile::ProfileIntent,
+    mode: Mode,
+) -> Result<(crate::host::BinarySnapshot, ConsumerReady), ServiceError> {
+    prepare_consumer(intent, mode, |_| {
+        let image = super::registry::TrustedRegistry::system()
+            .map_err(unavailable)?
+            .full_profile_snapshot()
+            .map_err(unavailable)?;
+        let ready = require_consumer(intent, mode, &image)?;
+        Ok((image, ready))
+    })
+}
+
+fn prepare_consumer<T>(
+    intent: &yonik_engine::native_profile::ProfileIntent,
+    mode: Mode,
+    load: impl FnOnce(ConsumerPlan) -> Result<T, ServiceError>,
+) -> Result<T, ServiceError> {
+    let plan = ConsumerPlan::derive(intent, mode)?;
+    load(plan)
+}
+
+fn consumer_resolver_peers(peers: &[std::net::SocketAddr]) -> Result<(), ServiceError> {
+    if peers.is_empty()
+        || peers
+            .iter()
+            .any(|p| p.port() != 53 || !dns_rrset::numeric_ip_allowed(p.ip()))
+    {
+        return Err(ServiceError::Unsupported);
+    }
+    Ok(())
+}
+/// Captured DATA availability перед staging. Не выдаёт observation/route/grant.
+pub(crate) fn validate_consumer_sources(
+    intent: &yonik_engine::native_profile::ProfileIntent,
+    sources: &super::profile_intent::FullProfileSources,
+    cancel: &crate::Cancellation,
+) -> Result<(), ServiceError> {
+    use super::profile_intent::{LookupFamily, LookupStep};
+    sources.revalidate(intent, cancel).map_err(unavailable)?;
+    let graph = intent.validate().map_err(unavailable)?;
+    for endpoint in graph
+        .egress()
+        .physical()
+        .iter()
+        .filter(|p| p.requires_bootstrap())
+    {
+        let snapshot = sources.snapshot().ok_or(ServiceError::Unsupported)?;
+        // Epoch1 — только локальный DATA plan; его identity никуда не передаётся.
+        // Реальный owning invocation заново создаёт binding перед observation.
+        let plan = snapshot
+            .retained_lookup_data(
+                endpoint.host(),
+                1,
+                LookupFamily::Any,
+                super::memory::config_budget(),
+            )
+            .map_err(unavailable)?;
+        match plan.steps().first() {
+            Some(LookupStep::Hosts(_)) => {}
+            Some(LookupStep::Network(n)) => consumer_resolver_peers(n.peers())?,
+            None => return Err(ServiceError::Unsupported),
+        }
+    }
+    sources.revalidate(intent, cancel).map_err(unavailable)
+}
+
+#[cfg(test)]
+pub(crate) fn fake_consumer_image(hash: [u8; 32]) -> super::ImageContract {
+    use super::registry::{BootstrapScope, fake_bootstrap_image};
+    fake_bootstrap_image(
+        hash,
+        &[
+            BootstrapScope::Source,
+            BootstrapScope::Wire,
+            BootstrapScope::Release,
+        ],
+    )
+}
+
+#[cfg(test)]
+mod subset_readiness_tests {
+    use super::super::registry::{BootstrapScope, fake_bootstrap_image, fake_dns4_image};
+    use super::*;
+    use yonik_engine::native_profile::ProfileIntent;
+    #[test]
+    fn subset_captured_network_requires_nonloopback_peer_policy() {
+        assert!(consumer_resolver_peers(&["192.0.2.53:53".parse().unwrap()]).is_ok());
+        for peers in [
+            vec![],
+            vec!["127.0.0.53:53".parse().unwrap()],
+            vec!["0.0.0.0:53".parse().unwrap()],
+            vec!["192.0.2.53:54".parse().unwrap()],
+            vec![
+                "192.0.2.53:53".parse().unwrap(),
+                "127.0.0.53:53".parse().unwrap(),
+            ],
+        ] {
+            assert!(consumer_resolver_peers(&peers).is_err());
+        }
+    }
+
+    fn intent(host: &str, change: impl FnOnce(&mut serde_json::Value)) -> ProfileIntent {
+        let mut value = serde_json::json!({"version":1,"graph":{"outbounds":[{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":host,"port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]}});
+        change(&mut value);
+        ProfileIntent::decode(&value.to_string()).unwrap()
+    }
+    #[test]
+    fn subset_prepare_dispatch_local_hosts_network_and_system_numeric() {
+        for (host, mode) in [
+            ("physical.invalid", Mode::Local),
+            ("192.0.2.80", Mode::Local),
+            ("192.0.2.80", Mode::System),
+        ] {
+            let intent = intent(host, |_| {});
+            let scopes = [
+                BootstrapScope::Source,
+                BootstrapScope::Wire,
+                BootstrapScope::Release,
+            ];
+            let image = fake_bootstrap_image([17; 32], &scopes);
+            assert_eq!(
+                prepare_consumer(&intent, mode, |plan| {
+                    plan.image(&image, [17; 32])?;
+                    Ok(7)
+                })
+                .unwrap(),
+                7
+            );
+            for missing in scopes {
+                let proof = fake_bootstrap_image(
+                    [17; 32],
+                    &scopes
+                        .into_iter()
+                        .filter(|s| *s != missing)
+                        .collect::<Vec<_>>(),
+                );
+                assert!(
+                    prepare_consumer(&intent, mode, |plan| plan.image(&proof, [17; 32])).is_err()
+                );
+            }
+            let plan = ConsumerPlan::derive(&intent, mode).unwrap();
+            assert!(plan.image(&image, [18; 32]).is_err());
+            assert!(plan.image(&fake_dns4_image([17; 32]), [17; 32]).is_err());
+        }
+    }
+    #[test]
+    fn subset_prepare_unsupported_graph_never_loads_image_or_sources() {
+        let variants = [
+            intent(
+                "physical.invalid",
+                |v| v["graph"]["outbounds"][0]["streamSettings"] = serde_json::json!({"network":"tcp","security":"tls","tlsSettings":{"serverName":"fixture.invalid"}}),
+            ),
+            intent("physical.invalid", |v| {
+                v["graph"]["outbounds"][0]["mux"] =
+                    serde_json::json!({"enabled":true,"concurrency":8})
+            }),
+            intent("physical.invalid", |v| {
+                v["graph"]["dns"] = serde_json::json!({"servers":["192.0.2.53"]})
+            }),
+            intent("physical.invalid", |v| {
+                let mut next = v["graph"]["outbounds"][0].clone();
+                next["tag"] = serde_json::json!("c");
+                v["graph"]["outbounds"].as_array_mut().unwrap().push(next);
+                v["graph"]["outbounds"][0]["proxySettings"] =
+                    serde_json::json!({"tag":"c","transportLayer":true});
+            }),
+        ];
+        let imported = yonik_import::import_profiles(
+            include_bytes!("../../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
+        )
+        .unwrap();
+        assert_eq!(imported.entries.len(), 7);
+        let imported = imported.entries.into_iter().filter_map(|entry| {
+            let yonik_import::ProfileEntry::Xray(profile) = entry else {
+                panic!("native fixture");
+            };
+            // Уже Unsupported на typed IPC boundary также не достигает loader.
+            ProfileIntent::from_profile(&profile).ok()
+        });
+        for intent in variants.into_iter().chain(imported) {
+            let mut effects = 0;
+            assert!(
+                prepare_consumer(&intent, Mode::Local, |_| {
+                    effects += 1;
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert_eq!(effects, 0);
+        }
+        let mut effects = 0;
+        assert!(
+            prepare_consumer(&intent("physical.invalid", |_| {}), Mode::System, |_| {
+                effects += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(effects, 0);
+    }
 }
 
 fn unavailable<T>(_: T) -> ServiceError {

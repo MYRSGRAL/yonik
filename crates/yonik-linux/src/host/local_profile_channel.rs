@@ -48,6 +48,7 @@ pub(crate) fn create_udp_relay() -> Result<(OwnedFd, OwnedFd), HostError> {
     Ok((fd, before.into()))
 }
 pub(crate) struct Prepared {
+    _consumer: issuer::ConsumerReady,
     intent: ProfileIntent,
     sources: FullProfileSources,
     pub capsule: Arc<OwnedCapsule>,
@@ -63,19 +64,36 @@ impl Prepared {
         self.sources.snapshot()
     }
     pub(crate) fn prepare(
+        binary: &BinarySnapshot,
         intent: ProfileIntent,
         plan: OwnedRuntimePlan,
         cancel: &Cancellation,
     ) -> Result<(Arc<Self>, yonik_engine::CompiledConfig), HostError> {
-        // Installed consumer/grants proof остаётся обязательным и закрытым.
-        issuer::require_consumer().map_err(|_| HostError::Unsupported)?;
+        Self::prepare_with_sources(binary, intent, plan, cancel, |intent, cancel| {
+            FullProfileSources::capture(intent, cancel).map_err(rejected)
+        })
+    }
+    fn prepare_with_sources(
+        binary: &BinarySnapshot,
+        intent: ProfileIntent,
+        plan: OwnedRuntimePlan,
+        cancel: &Cancellation,
+        capture: impl FnOnce(&ProfileIntent, &Cancellation) -> Result<FullProfileSources, HostError>,
+    ) -> Result<(Arc<Self>, yonik_engine::CompiledConfig), HostError> {
+        cancel.check().map_err(|_| HostError::Cancelled)?;
+        // Exact selected image/scope proof до capture/staging/config-check.
+        let consumer = issuer::require_consumer(&intent, Mode::Local, binary)
+            .map_err(|_| HostError::Unsupported)?;
         if plan.is_system()
             || rustix::process::geteuid().as_raw() == 0
             || rustix::process::geteuid() != rustix::process::getuid()
         {
             return Err(HostError::ConfigRejected);
         }
-        let sources = FullProfileSources::capture(&intent, cancel).map_err(rejected)?;
+        cancel.check().map_err(|_| HostError::Cancelled)?;
+        let sources = capture(&intent, cancel)?;
+        issuer::validate_consumer_sources(&intent, &sources, cancel)
+            .map_err(|_| HostError::Unsupported)?;
         let plan = sources.bind(&intent, plan, cancel).map_err(rejected)?;
         intent.validate_ingress_mapping(&plan).map_err(rejected)?;
         let config = intent
@@ -132,6 +150,7 @@ impl Prepared {
             .map_err(rejected)?,
         );
         let mut prepared = Self {
+            _consumer: consumer,
             intent,
             sources,
             capsule,
@@ -498,6 +517,7 @@ mod tests {
     }
     #[test]
     fn missing_consumer_denies_before_sources_staging_or_spawn() {
+        let binary = fixture_image();
         let intent = ProfileIntent::decode(
             r#"{"version":1,"graph":{"outbounds":[{"tag":"direct","protocol":"freedom"}]}}"#,
         )
@@ -506,8 +526,60 @@ mod tests {
             OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap()).unwrap();
         let (_keep, cancel) = Cancellation::new();
         assert!(matches!(
-            Prepared::prepare(intent, plan, &cancel),
+            Prepared::prepare(&binary, intent, plan, &cancel),
             Err(HostError::Unsupported)
         ));
+    }
+    fn fixture_image() -> BinarySnapshot {
+        let mut nonce = [0; 16];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let path = std::env::temp_dir().join(format!("yonik-readiness-{}", hex(&nonce)));
+        let bytes = b"\x7fELFfixture-never-executed";
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let image = BinarySnapshot::load(
+            &path,
+            super::super::Sha256(Sha256::digest(bytes).into()),
+            yonik_engine::Engine::Xray,
+        )
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+        image
+    }
+    #[test]
+    fn local_subset_actual_prepare_checks_selected_image_before_capture() {
+        for (capability, matching, cancelled, expected) in [
+            (false, true, false, 0),
+            (true, false, false, 0),
+            (true, true, false, 1),
+            (true, true, true, 0),
+        ] {
+            let mut binary = fixture_image();
+            if capability {
+                let hash = if matching {
+                    binary.trusted_hash()
+                } else {
+                    [19; 32]
+                };
+                binary = binary.with_producer(Some(issuer::fake_consumer_image(hash)));
+            }
+            let intent = ProfileIntent::decode(r#"{"version":1,"graph":{"outbounds":[{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":"physical.invalid","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]}}"#).unwrap();
+            let plan =
+                OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap()).unwrap();
+            let (keep, cancel) = Cancellation::new();
+            if cancelled {
+                keep.send(true).unwrap();
+            }
+            let mut captures = 0;
+            let result = Prepared::prepare_with_sources(&binary, intent, plan, &cancel, |_, _| {
+                captures += 1;
+                Err(HostError::State)
+            });
+            assert!(result.is_err());
+            assert_eq!(captures, expected);
+            if expected == 1 {
+                assert!(matches!(result, Err(HostError::State)));
+            }
+        }
     }
 }

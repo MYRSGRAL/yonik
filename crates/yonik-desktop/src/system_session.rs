@@ -163,7 +163,7 @@ impl SystemSession {
         self.prepared = None;
         self.fence(revision)?;
         cancel.check().map_err(|_| ClientError::Cancelled)?;
-        yonik_linux::full_profile_preflight(yonik_linux::FullProfileMode::System)
+        yonik_linux::full_profile_request_preflight(yonik_linux::FullProfileMode::System, request)
             .map_err(|_| ClientError::Unsupported)?;
         let prepared = self
             .client

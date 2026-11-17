@@ -1073,8 +1073,14 @@ impl Backend {
             OwnedIngress, OwnedRuntimePlan, TransportProtocol as NativeProtocol,
         };
         request.preflight(cancel)?;
-        // Отсутствующий Go grants consumer закрывает вход до listen/check/worker.
-        let _consumer = crate::helper::native_profile_channel::require_consumer()?;
+        // Exact graph/image/scope guard до listen/check/worker. Тот же sealed
+        // snapshot передаётся WorkerPayload; повторная image selection запрещена.
+        let (consumer_image, _consumer) =
+            crate::helper::native_profile_channel::installed_consumer(
+                request.intent(),
+                crate::profile_channel::Mode::System,
+            )?;
+        cancel.check().map_err(|_| ServiceError::Cancelled)?;
         let installed = crate::helper::native_bootstrap::load_static_preflight(
             std::time::Instant::now() + Duration::from_secs(3),
         )
@@ -1152,14 +1158,8 @@ impl Backend {
         if self.registry.is_none() {
             self.registry = Some(TrustedRegistry::system().map_err(unavailable)?);
         }
-        let binary = self
-            .registry
-            .as_ref()
-            .ok_or(ServiceError::Unavailable)?
-            .snapshot(yonik_engine::Engine::Xray)
-            .map_err(unavailable)?;
         let payload = Arc::new(
-            WorkerPayload::new_full_profile(binary, Arc::clone(&prepared), cancel)
+            WorkerPayload::new_full_profile(consumer_image, Arc::clone(&prepared), cancel)
                 .map_err(unavailable)?,
         );
         let mut routes = Vec::with_capacity(physical.endpoints().len());

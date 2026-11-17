@@ -294,6 +294,100 @@ impl fmt::Debug for ProfileIntent {
     }
 }
 impl ProfileIntent {
+    /// Только typed DATA shape текущего subset, не validator или grant.
+    /// Caller отдельно обязан вызвать существующий validate до effects.
+    /// Exhaustive patterns заставляют явно обработать новые typed settings.
+    pub fn is_raw_tcp_consumer_subset(&self) -> bool {
+        let Graph {
+            log,
+            inbounds,
+            outbounds,
+            routing,
+            dns,
+            observatory,
+        } = &self.wire.graph;
+        if log.is_some()
+            || inbounds.is_some()
+            || routing.is_some()
+            || dns.is_some()
+            || observatory.is_some()
+        {
+            return false;
+        }
+        let Some(List(outbounds)) = outbounds.as_ref() else {
+            return false;
+        };
+        let [
+            Outbound {
+                tag,
+                protocol,
+                settings,
+                stream_settings,
+                mux,
+                proxy_settings,
+            },
+        ] = outbounds.as_slice()
+        else {
+            return false;
+        };
+        if tag.is_none()
+            || !matches!(protocol, Some(Protocol::Vless))
+            || stream_settings.is_some()
+            || mux.is_some()
+            || proxy_settings.is_some()
+        {
+            return false;
+        }
+        let Some(Settings {
+            vnext,
+            servers,
+            address,
+            port,
+            version,
+            domain_strategy,
+        }) = settings.as_ref()
+        else {
+            return false;
+        };
+        if servers.is_some()
+            || address.is_some()
+            || port.is_some()
+            || version.is_some()
+            || domain_strategy.is_some()
+        {
+            return false;
+        }
+        let Some(List(next)) = vnext.as_ref() else {
+            return false;
+        };
+        let [
+            Next {
+                address,
+                port,
+                users,
+            },
+        ] = next.as_slice()
+        else {
+            return false;
+        };
+        if address.is_none() || port.is_none() {
+            return false;
+        }
+        let Some(List(users)) = users.as_ref() else {
+            return false;
+        };
+        let [
+            User {
+                id,
+                encryption,
+                flow,
+            },
+        ] = users.as_slice()
+        else {
+            return false;
+        };
+        id.is_some() && encryption.as_deref() == Some("none") && flow.is_none()
+    }
     /// Проверка alias ownership без повторной компиляции/генерации credentials.
     pub fn validate_ingress_mapping(&self, runtime: &OwnedRuntimePlan) -> Result<(), Error> {
         let inputs = self
@@ -806,6 +900,39 @@ impl<'de> Visitor<'de> for Scan {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_tcp_consumer_subset_is_read_only_and_rejects_typed_extensions() {
+        let base = serde_json::json!({"version":1,"graph":{"outbounds":[{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":"physical.invalid","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]}});
+        let intent = super::ProfileIntent::decode(&base.to_string()).unwrap();
+        assert!(intent.is_raw_tcp_consumer_subset());
+        for case in 0..6 {
+            let mut value = base.clone();
+            match case {
+                0 => {
+                    value["graph"]["routing"] = serde_json::json!({"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","domain":["full:example.invalid"],"outboundTag":"b"}]})
+                }
+                1 => {
+                    value["graph"]["outbounds"][0]["settings"]["vnext"][0]["users"][0]["flow"] =
+                        serde_json::json!("xtls-rprx-vision")
+                }
+                2 => {
+                    value["graph"]["outbounds"][0]["streamSettings"] =
+                        serde_json::json!({"network":"tcp"})
+                }
+                3 => value["graph"]["outbounds"][0]["mux"] = serde_json::json!({"enabled":false}),
+                4 => value["graph"]["log"] = serde_json::json!({"loglevel":"warning"}),
+                _ => value["graph"]["dns"] = serde_json::json!({"servers":["192.0.2.53"]}),
+            }
+            let intent = super::ProfileIntent::decode(&value.to_string()).unwrap();
+            assert!(intent.validate().is_ok(), "valid P3 variant {case}");
+            let mut before = Vec::new();
+            intent.write_sensitive(&mut before).unwrap();
+            assert!(!intent.is_raw_tcp_consumer_subset());
+            let mut after = Vec::new();
+            intent.write_sensitive(&mut after).unwrap();
+            assert_eq!(before, after);
+        }
+    }
     use super::*;
     #[test]
     fn native_mux_decision_matches_disabled_xudp_and_port443_paths() {

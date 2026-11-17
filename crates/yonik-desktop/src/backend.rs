@@ -1191,8 +1191,45 @@ struct SourceChangeAck {
     error: Option<&'static str>,
 }
 
+// Только DATA affordance: installed image/owner/source authority остаётся prepare.
+fn native_subset_plannable(entry: &yonik_import::ProfileEntry, mode: ConnectionMode) -> bool {
+    let yonik_import::ProfileEntry::Xray(profile) = entry else {
+        return false;
+    };
+    let Ok(intent) = yonik_engine::native_profile::ProfileIntent::from_profile(profile) else {
+        return false;
+    };
+    let mode = match mode {
+        ConnectionMode::Local => yonik_linux::FullProfileMode::Local,
+        ConnectionMode::System => yonik_linux::FullProfileMode::System,
+    };
+    yonik_linux::full_profile_plan_preflight(mode, &intent).is_ok()
+}
+
 #[cfg(test)]
 mod full_profile_review_tests {
+    #[test]
+    fn native_subset_data_affordance_is_not_generic_codec_availability() {
+        let raw = br#"[{"remarks":"fixture","outbounds":[{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":"physical.invalid","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]}]"#;
+        let report = yonik_import::import_profiles(raw.to_vec()).unwrap();
+        assert!(super::native_subset_plannable(
+            &report.entries[0],
+            super::ConnectionMode::Local
+        ));
+        assert!(!super::native_subset_plannable(
+            &report.entries[0],
+            super::ConnectionMode::System
+        ));
+        let report = yonik_import::import_profiles(
+            include_bytes!("../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
+        )
+        .unwrap();
+        for entry in report.entries {
+            for mode in [super::ConnectionMode::Local, super::ConnectionMode::System] {
+                assert!(!super::native_subset_plannable(&entry, mode));
+            }
+        }
+    }
     #[test]
     fn native_catalog_row_preserves_name_and_has_no_fake_endpoint_or_selection() {
         let row = super::catalog_profile_dto(yonik_linux::CatalogProfile::Xray(
@@ -2215,7 +2252,12 @@ impl Actor {
         }
         self.state.can_connect = self.state.ready
             && self.state.engine.ensure_available().is_ok()
-            && self.selected.is_some()
+            && (self.selected.is_some()
+                || self.selected_native.as_ref().is_some_and(|profile| {
+                    self.selected_native_token.is_some()
+                        && Some(profile.source_id) == self.state.source_id
+                        && native_subset_plannable(&profile.entry, self.state.connection_mode)
+                }))
             && !self.state.can_stop
             && !self.state.system_busy
             && !self.state.busy
@@ -2228,7 +2270,7 @@ impl Actor {
         control: &Control,
         generation: u64,
         busy: bool,
-    ) -> SourceResult<yonik_engine::native_profile::ProfileIntent> {
+    ) -> SourceResult<(yonik_engine::native_profile::ProfileIntent, BinarySnapshot)> {
         if !matches!(command, Command::Connect) {
             return Err(DesktopError("invalid_input").into());
         }
@@ -2248,12 +2290,23 @@ impl Actor {
             ConnectionMode::Local => yonik_linux::FullProfileMode::Local,
             ConnectionMode::System => yonik_linux::FullProfileMode::System,
         };
-        yonik_linux::full_profile_preflight(mode)
+        yonik_linux::full_profile_plan_preflight(mode, &intent)
+            .map_err(|_| DesktopError("profile_unavailable"))?;
+        let binary = tokio::task::spawn_blocking(|| {
+            yonik_linux::helper::TrustedRegistry::system()
+                .and_then(|registry| registry.full_profile_snapshot())
+        })
+        .await
+        .map_err(|_| DesktopError("profile_unavailable"))?
+        .map_err(|_| DesktopError("profile_unavailable"))?;
+        // Новая await boundary: source/revision/selection и generation заново.
+        let intent = self.native_connect_intent(control, generation).await?;
+        yonik_linux::full_profile_image_preflight(mode, &intent, &binary)
             .map_err(|_| DesktopError("profile_unavailable"))?;
         if generation != control.generation.load(Ordering::SeqCst) {
             return Err(DesktopError("cancelled").into());
         }
-        Ok(intent)
+        Ok((intent, binary))
     }
     async fn native_connect_intent(
         &self,
@@ -4230,14 +4283,16 @@ struct TcpRunning {
 
 enum SessionConfig {
     Server(yonik_engine::CompiledConfig),
-    FullProfile(
-        yonik_engine::native_profile::ProfileIntent,
-        yonik_engine::native_profile::OwnedRuntimePlan,
-    ),
+    FullProfile(Box<NativeSessionConfig>),
+}
+struct NativeSessionConfig {
+    intent: yonik_engine::native_profile::ProfileIntent,
+    plan: yonik_engine::native_profile::OwnedRuntimePlan,
+    image: Option<BinarySnapshot>,
 }
 #[cfg_attr(feature = "test-support", allow(clippy::too_many_arguments))]
 async fn session(
-    config: SessionConfig,
+    mut config: SessionConfig,
     engine_dir: PathBuf,
     engine: Engine,
     target: ProbeTarget,
@@ -4254,8 +4309,7 @@ async fn session(
     if cancel.check().is_err() {
         return Ok(());
     }
-    if matches!(config, SessionConfig::FullProfile(..))
-        && yonik_linux::full_profile_preflight(yonik_linux::FullProfileMode::Local).is_err()
+    if matches!(&config, SessionConfig::FullProfile(native) if yonik_linux::full_profile_plan_preflight(yonik_linux::FullProfileMode::Local, &native.intent).is_err() || native.image.as_ref().is_none_or(|image| yonik_linux::full_profile_image_preflight(yonik_linux::FullProfileMode::Local, &native.intent, image).is_err()))
     {
         let _ = updates
             .send(SessionUpdate {
@@ -4269,6 +4323,10 @@ async fn session(
             .await;
         return Ok(());
     }
+    let native_image = match &mut config {
+        SessionConfig::FullProfile(native) => native.image.take(),
+        SessionConfig::Server(_) => None,
+    };
     let Ok(session) = LocalSession::new() else {
         let _ = updates
             .send(SessionUpdate {
@@ -4302,12 +4360,7 @@ async fn session(
         cancel.check().map_err(|_| "cancelled")?;
         let path = engine_dir.join(relative);
         let native = matches!(config, SessionConfig::FullProfile(..));
-        let binary = tokio::task::spawn_blocking(move || {
-            if native {
-                return yonik_linux::helper::TrustedRegistry::system()
-                    .and_then(|registry| registry.full_profile_snapshot())
-                    .map_err(|_| HostError::BinaryHash);
-            }
+        let binary = if native { native_image.ok_or("profile_unavailable")? } else {tokio::task::spawn_blocking(move || {
             BinarySnapshot::load(
                 &path,
                 digest.parse().map_err(|_| HostError::BinaryHash)?,
@@ -4316,11 +4369,11 @@ async fn session(
         })
         .await
         .map_err(|_| "engine_missing")?
-        .map_err(|_| "engine_missing")?;
+        .map_err(|_| "engine_missing")?};
         cancel.check().map_err(|_| "cancelled")?;
         let checked = match config {
             SessionConfig::Server(config) => CheckedConfig::validate(binary, config, &mut cancel).await,
-            SessionConfig::FullProfile(intent, plan) => CheckedConfig::validate_full_profile(binary, intent, plan, &mut cancel).await,
+            SessionConfig::FullProfile(native) => CheckedConfig::validate_full_profile(binary, native.intent, native.plan, &mut cancel).await,
         }
             .map_err(|e| {
                 if e == HostError::Cancelled {
@@ -5627,7 +5680,7 @@ async fn run(
                         } else {
                             match actor.native_connect_preflight(&Command::Connect, &control, envelope.generation, false).await {
                                 Err(error) => Err(error),
-                                Ok(intent) => {
+                                Ok((intent, binary)) => {
                                     let mode = match actor.state.connection_mode { ConnectionMode::System => yonik_linux::FullProfileMode::System, ConnectionMode::Local => yonik_linux::FullProfileMode::Local };
                                     if yonik_linux::full_profile_preflight(mode).is_err() { Err(DesktopError("profile_unavailable").into()) }
                                     else if envelope.generation != control.generation.load(Ordering::SeqCst) { Err(DesktopError("cancelled").into()) }
@@ -5659,7 +5712,7 @@ async fn run(
                                                 let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, plan.local_port().get()));
                                                 let (cancel, receiver) = Cancellation::new();
                                                 session_generation = session_generation.saturating_add(1); actor.state.error_generation = session_generation;
-                                                let task = tokio::spawn(session(SessionConfig::FullProfile(intent, plan), config.engine_dir.clone(), Engine::Xray, target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
+                                                let task = tokio::spawn(session(SessionConfig::FullProfile(Box::new(NativeSessionConfig {intent, plan, image: Some(binary)})), config.engine_dir.clone(), Engine::Xray, target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
                                                 running = Some(Running { lease: (session_generation, endpoint), cancel, task });
                                                 actor.state.can_stop = true; actor.state.active_name = actor.state.selected_name.clone(); actor.state.active_engine = Some(EngineChoice::Xray);
                                                 actor.state.probe_result = None; actor.state.status = "Preparing"; Ok(())
@@ -6413,7 +6466,11 @@ mod routing_regressions {
         let (output, mut events) = mpsc::channel(1);
         assert!(
             session(
-                SessionConfig::FullProfile(intent, plan),
+                SessionConfig::FullProfile(Box::new(NativeSessionConfig {
+                    intent,
+                    plan,
+                    image: None
+                })),
                 path.join("nonexistent-engine"),
                 Engine::Xray,
                 actor.probe_target().expect("probe target DATA"),
@@ -7321,9 +7378,7 @@ impl Flight {
         let mutating = !matches!(operation, Operation::State);
         let (cancel, cancellation) = Cancellation::new();
         let task = tokio::spawn(async move {
-            if matches!(operation, Operation::FullProfile(..))
-                && yonik_linux::full_profile_preflight(yonik_linux::FullProfileMode::System)
-                    .is_err()
+            if matches!(&operation, Operation::FullProfile(request) if yonik_linux::full_profile_request_preflight(yonik_linux::FullProfileMode::System, request).is_err())
             {
                 return (session, Err(ClientError::Unsupported));
             }
