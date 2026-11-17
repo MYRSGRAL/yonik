@@ -849,6 +849,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   независимый live original-parent conjunction. Production Source/transcript/
   CODEC4 mint None; runtime/public gates false, stateful pair не запускался.
 
+- R72 SOURCE scoped CLEAN: Go NETWORK consumer602eb1f интегрирован. Own
+  service/context/query/reservation/waiter и origin-specific numeric permission
+  связываются с live original USER parent/fullfrontier до/после factory и на I/O.
+  One-shot raw TCP leaf, сужение deadline/TTL, cleanup barriers и custody сохранены.
+  Это source candidate для будущего pinned BootstrapSource scope только этого
+  consuming path; общий capture API/multi-hop не получают authority автоматически.
+  Exact final patch проходит отдельную проверку трёх CODEC4 producer contracts;
+  protected pins/capture/public gates пока false, runtime не запускался.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
