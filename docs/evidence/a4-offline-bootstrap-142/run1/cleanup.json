@@ -1,9 +1,0 @@
-{
-  "task": "/var/tmp/codex-myrs/transient/a4-offline-extract-f19965f3",
-  "task_exists": false,
-  "references": [],
-  "input_bytes_and_identity_unchanged": {
-    "overlay": true,
-    "base": true
-  }
-}

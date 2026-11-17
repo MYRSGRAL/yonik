@@ -1,6 +1,0 @@
-{
-  "pid": 1667912,
-  "exit": 1,
-  "output": "Error: \"Неверная own-prefix среда\"\n",
-  "secret_service_not_reached": "guard executes before runtime/backend"
-}

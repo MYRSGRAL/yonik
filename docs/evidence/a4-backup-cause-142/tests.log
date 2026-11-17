@@ -1,8 +1,0 @@
-test_context_manager_alone_blocks_exclusive_but_closing_releases (test_a4_sqlite_diagnostic_lifetime.DiagnosticLifetime.test_context_manager_alone_blocks_exclusive_but_closing_releases) ... ok
-test_real_link_preserves_bytes_and_inode (test_a4_userdata_prefix.RuntimeHardlinkTests.test_real_link_preserves_bytes_and_inode) ... ok
-test_traversal_and_foreign_source_rejected (test_a4_userdata_prefix.RuntimeHardlinkTests.test_traversal_and_foreign_source_rejected) ... ok
-
-----------------------------------------------------------------------
-Ran 3 tests in 0.019s
-
-OK

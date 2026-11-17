@@ -7,7 +7,9 @@ OR/WITH не выполнялись. Product, builder и исторически�
 ## Источники и воспроизведение
 
 Frozen PR181 `8844d221d6b55aa0aade08f214dec3d42269e7d1`:
-`docs/evidence/a4-mtree4/result.json`, `registry-inventory.json`, `provenance.log`.
+[result.json](https://github.com/MYRSGRAL/yonik/blob/8844d221d6b55aa0aade08f214dec3d42269e7d1/docs/evidence/a4-mtree4/result.json),
+[registry-inventory.json](https://github.com/MYRSGRAL/yonik/blob/8844d221d6b55aa0aade08f214dec3d42269e7d1/docs/evidence/a4-mtree4/registry-inventory.json),
+[provenance.log](https://github.com/MYRSGRAL/yonik/blob/8844d221d6b55aa0aade08f214dec3d42269e7d1/docs/evidence/a4-mtree4/provenance.log).
 COLLECTED source `14229843f9a11bf98ec4f5992df00f3247102ea2`, tree
 `7daa4ebb7cc25d3ceafab76809afc78753dc5ec3`.
 PR179 `2599fe70`: `docs/validation/2026-11-13-package-provenance-preflight.md`

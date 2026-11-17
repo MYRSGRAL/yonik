@@ -47,7 +47,7 @@ ELF объединённого source **не собран**, runtime harness н�
    SHA256 `794eb4889b39e1f0ed7d5ae998b2a1ed2137db8cf8c3476cf2962c7437ecb003`;
    `.qcow2.sig` SHA256 `3dbdf7ffdc95654c47f5262df531dfa563733c72047915eff1245985f030b018`;
    signer fingerprint `1B9A16984A4E8CB448712D2AE0B78BF4326C6F8F`.
-   Источник pins: `docs/design/a4-package-hook-proposal-142/readonly-inputs.json`.
+   Источник pins: [исторический readonly-inputs.json](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/design/a4-package-hook-proposal-142/readonly-inputs.json).
    До нового boot перепроверить signature/base hash; base readonly, один собственный
    overlay, отдельные vars/seed; не продолжать прежнюю работающую VM без grant.
 5. Manifest гостя: image/kernel/systemd/dbus версии и hashes, fixture UID,
@@ -63,7 +63,7 @@ start_authorized ради acceptance. Если существующий admitted
 
 ## Разделение двух сред и command shape
 
-Существующий `tools/a4_private_system_bus.py` — пустой own-UID system-type bus
+[Историческая fixture `a4_private_system_bus.py`](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/tools/a4_private_system_bus.py) — пустой own-UID system-type bus
 без manager/helper/activation. Он годится для отдельной transport-negative lane,
 но не может доказать systemd invocation/cgroup-empty. Не выдавать его за guest
 system bus. Для полного worker lane нужен настоящий PID1 и system bus **внутри

@@ -1,7 +1,7 @@
 # Компиляторы конфигураций одного сервера
 
 9 ноября 2026 года, Linux x86_64, tofu-engine. Продолжение FR-03/04/06/08/10,
-не закрытие полных сетевых gates. [План](../superpowers/plans/2026-11-09-engine-compiler.md).
+не закрытие полных сетевых gates. [План](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-09-engine-compiler.md).
 
 ## Контракт
 
