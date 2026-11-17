@@ -786,6 +786,13 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   generic USER authority не расширена. TLS/mux/chain/UDP Unsupported.
   Stateful Rust/Go pair не исполнялся; capture/producer/public gates false.
 
+- R63 SOURCE scoped CLEAN: Rust Hosts Publish/Waiter42a0e74 интегрирован.
+  DNHOST02 связан с ACKed observation/source/full context и повторной Source
+  revalidation; отдельные context/query/reservation дают independent waiter.
+  Published остаётся DATA-only, deadlines/ACK/cancel/Unknown/credits сохранены.
+  Numeric use2 и production Source binding остаются следующими переходами;
+  stateful Go/Rust pair и runtime не запускались, public gates false.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
