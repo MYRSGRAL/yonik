@@ -1408,6 +1408,55 @@ producer binding; Direct3/wire/release records не наследуются. Posi
 прочитан для shapes; stateful Rust↔Go execution/runtime acceptance не проводились.
 Network Bootstrap transport/close, production pins и public gates остаются закрыты.
 
+### Hosts Numeric use2: отдельная BootstrapPhysicalPermission SOURCE/PURE
+
+`run_issuer → dns_rrset::dispatch_numeric → roots::dispatch_hosts_numeric` теперь
+обрабатывает canonical Probe8/parentClass3/use2. Только live ACKed Hosts waiter с
+точным retained selector/full physical path/source epoch и original port/TCP
+carrier допускает попытку. Ordinal из42 переводится в retained ordered snapshot
+member index; private `Source::member(Parent, SnapshotRef, row, index)` возвращает
+actual held-source address и expiry. Default implementation Unsupported, production
+`bootstrap_source` остаётся None: metadata/hash/child IP не создают такой proof.
+Source snapshot, row/member choice и original parent повторно проверяются до
+effect, после backend и при publication; исходные leases не продлеваются.
+
+`BootstrapPhysicalPermission` хранится отдельно от USER grants и service roots,
+не участвует в AUTHORIZE18/Probe refresh. Exported grant IDs используют общий
+неповторяемый allocator, но context/observation/producer/waiter — иные typed
+namespaces. Один effectful attempt на waiter, без renew/replay/fallback. До
+backend оплачиваются memory/history/route credits; placeholder и one-shot marker
+сохраняют custody при uncertain effect. Private service authority вызывает existing
+`RouteAuthority::service(Direct)` только после source/member проверки: System
+использует manifest/session/network fence, mandatory numeric/LAN policy и durable
+desired-rules install с существующим aggregate cap128; USER owner lookup не нужен.
+Local не получает System attribution. Общие bounds не повышались.
+
+GRANT19 остаётся byte-exact class3/flow0/required0/fresh0/ownerNone с текущей
+policy revision и min(source/context/observation/waiter/session/member) lease.
+Это permission для exact numeric member/original hostname+port/carrier/frontier,
+а не общий class3 grant. Consuming open/read/write отдельно требует original live
+parent conjunction; source63179d9 содержит этот private raw TCP consumer, но здесь
+его execution/OS behaviour не подтверждается. UDP и network-bootstrap receipts
+этот issuer path не принимает. Full checked path сохраняется даже если consuming
+raw-leaf implementation пока поддерживает более узкий набор transport settings.
+
+Close32 target3 → CloseAck34 использует отдельный permission retirement; он не
+отзывает одноимённый raw context ID. Cancel1/5/6/7/8 и expiry через common actor
+отзывают соответствующие derivatives, затем release durable ticket один раз.
+KnownClosed освобождает route credit; terminal permission/one-shot tombstone не
+переиспользуется. Backend/write uncertainty или провал post-send fence сохраняет
+ticket/context/pending custody как Unknown и globally revokes issuer; повторный
+cleanup не выдаёт KnownClosed и не повторяет uncertain release. Actor wakeup
+учитывает более короткий permission deadline.
+
+Pure actual-driver controls покрывают полный Host context→observation→Publish→
+waiter→42→durable fake route→19 и Close32/34, оба режима, IPv6, wrong member/port/
+carrier/selector/namespace/epoch/parent, precredits, delayed backend/send, queued
+cancel до/после effect, replay, sibling ticket isolation и Unknown cleanup.
+Никаких sockets/proc/OS wrappers не запускалось. Wire/schema/corpus/allowlists,
+registry/builder и public gates не менялись; legitimate reviewed Source/record
+binding и runtime/Go pair acceptance остаются отдельными необходимыми gates.
+
 `dns_transport_binding` выводит из всего live checked bundle два разных target:
 logical resolver peer и actual numeric physical frontier. Последний следует
 carrier→nextInput через manifest path; Physical Reserve/SCM сверяет terminal
