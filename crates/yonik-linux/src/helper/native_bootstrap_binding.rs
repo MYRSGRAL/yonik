@@ -6,7 +6,9 @@ use super::{
     wire,
 };
 use crate::helper::profile_intent::{LookupFamily, LookupStep, ResolverLookupPlan};
-use crate::helper::registry::{BootstrapCapability, BootstrapScope, ImageContract};
+use crate::helper::registry::{
+    BootstrapCapability, BootstrapScope, ImageContract, Tcp5Capability, Tcp5Scope,
+};
 use sha2::{Digest, Sha256};
 use std::{
     sync::{
@@ -135,8 +137,14 @@ struct Query {
     expires: Instant,
     _memory: crate::helper::memory::ByteLease,
 }
-// Только pointer slots оплачены при factory; большие capture records — перед Box.
+// Pointer slots оплачены до grow; большие capture records — перед Box.
 struct QuerySlot(Box<Query>);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flavor {
+    Legacy4,
+    Tcp5,
+    Datagram5,
+}
 impl std::ops::Deref for QuerySlot {
     type Target = Query;
     fn deref(&self) -> &Query {
@@ -176,6 +184,7 @@ pub(super) struct BootstrapBinding {
     launch: LaunchRecord,
     capabilities: [Option<BootstrapCapability>; 3],
     datagram_caps: Option<Box<[Option<crate::helper::registry::DatagramCapability>; 3]>>,
+    tcp5_caps: Option<Box<[Option<Tcp5Capability>; 3]>>,
     created: Instant,
     until: Instant,
     invalid: AtomicBool,
@@ -183,6 +192,31 @@ pub(super) struct BootstrapBinding {
     queries: std::sync::Mutex<Vec<QuerySlot>>,
     budget: Arc<ChannelBudget>,
     _memory: crate::helper::memory::ByteLease,
+}
+/// Закрытая TCP6 authority именно CODEC5; Source4 и Datagram5 не конвертируются.
+pub(super) struct Tcp5Views(Arc<BootstrapBinding>);
+impl Tcp5Views {
+    pub(super) fn source(&self, launch: LaunchRecord) -> Result<&dyn Source, ServiceError> {
+        self.0.tcp5_check(BootstrapScope::Source, launch)?;
+        Ok(self.0.as_ref())
+    }
+    pub(super) fn release(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
+        self.0.tcp5_check(BootstrapScope::Release, launch)
+    }
+    pub(super) fn observed(
+        &self,
+        launch: LaunchRecord,
+        receipt: BootstrapDnsReceipt<'_>,
+    ) -> Result<Instant, ServiceError> {
+        self.0.tcp5_check(BootstrapScope::Wire, launch)?;
+        if !receipt.binding.bootstrap
+            || receipt.binding.proxied
+            || receipt.binding.parent_carrier != 6
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        self.0.observed(launch, receipt)
+    }
 }
 impl BootstrapBinding {
     pub(super) fn prepare(
@@ -207,7 +241,7 @@ impl BootstrapBinding {
         launch: LaunchRecord,
         budget: Arc<ChannelBudget>,
     ) -> Result<Option<Arc<Self>>, ServiceError> {
-        Self::create_for(peer, owner, capsule, launch, budget, false)
+        Self::create_for(peer, owner, capsule, launch, budget, Flavor::Legacy4)
     }
     pub(super) fn prepare_datagram(
         peer: Arc<Peer>,
@@ -222,7 +256,23 @@ impl BootstrapBinding {
             capsule,
             launch,
             budget,
-            true,
+            Flavor::Datagram5,
+        )
+    }
+    pub(super) fn prepare_tcp5(
+        peer: Arc<Peer>,
+        owner: Sources,
+        capsule: Arc<wire::OwnedCapsule>,
+        launch: LaunchRecord,
+        budget: Arc<ChannelBudget>,
+    ) -> Result<Option<Arc<Self>>, ServiceError> {
+        Self::create_for(
+            Arc::new(RetainedPeer(peer)),
+            Arc::new(owner),
+            capsule,
+            launch,
+            budget,
+            Flavor::Tcp5,
         )
     }
     fn create_for(
@@ -231,7 +281,7 @@ impl BootstrapBinding {
         capsule: Arc<wire::OwnedCapsule>,
         launch: LaunchRecord,
         budget: Arc<ChannelBudget>,
-        datagram: bool,
+        flavor: Flavor,
     ) -> Result<Option<Arc<Self>>, ServiceError> {
         let _fds = peer.validation_credit()?;
         peer.validate()?;
@@ -250,10 +300,12 @@ impl BootstrapBinding {
         let Some(record) = peer.producer() else {
             return Ok(None);
         };
-        if datagram && !Self::requires_datagram(&capsule, launch)? {
+        let datagram = flavor == Flavor::Datagram5;
+        let tcp5 = flavor == Flavor::Tcp5;
+        if (datagram || tcp5) && !Self::requires_datagram(&capsule, launch)? {
             return Ok(None);
         }
-        let capabilities = if datagram {
+        let capabilities = if datagram || tcp5 {
             [None, None, None]
         } else {
             [
@@ -284,10 +336,28 @@ impl BootstrapBinding {
         } else {
             None
         };
+        let tcp5_caps = if tcp5 {
+            Some([
+                record
+                    .tcp5_channel(peer.image(), Tcp5Scope::Source)
+                    .map_err(unavailable)?,
+                record
+                    .tcp5_channel(peer.image(), Tcp5Scope::Wire)
+                    .map_err(unavailable)?,
+                record
+                    .tcp5_channel(peer.image(), Tcp5Scope::Release)
+                    .map_err(unavailable)?,
+            ])
+        } else {
+            None
+        };
         if capabilities.iter().all(Option::is_none)
             && datagram_caps
                 .as_ref()
                 .is_none_or(|c| c.iter().all(Option::is_none))
+            && tcp5_caps
+                .as_ref()
+                .is_none_or(|c: &[Option<Tcp5Capability>; 3]| c.iter().all(Option::is_none))
         {
             return Ok(None);
         }
@@ -319,9 +389,15 @@ impl BootstrapBinding {
                 .dynamic
                 .reserve(
                     std::mem::size_of::<Self>()
-                        + limit * std::mem::size_of::<QuerySlot>()
                         + 128
                         + views
+                        + if tcp5 {
+                            std::mem::size_of::<[Option<Tcp5Capability>; 3]>()
+                                + std::mem::size_of::<Tcp5Views>()
+                                + 32
+                        } else {
+                            0
+                        }
                         + if datagram {
                             std::mem::size_of::<
                                 [Option<crate::helper::registry::DatagramCapability>; 3],
@@ -342,11 +418,12 @@ impl BootstrapBinding {
             launch,
             capabilities,
             datagram_caps: datagram_caps.map(Box::new),
+            tcp5_caps: tcp5_caps.map(Box::new),
             created,
             until,
             invalid: AtomicBool::new(false),
             limit,
-            queries: std::sync::Mutex::new(Vec::with_capacity(limit)),
+            queries: std::sync::Mutex::new(Vec::new()),
             budget,
             _memory: memory,
         })))
@@ -398,7 +475,18 @@ impl BootstrapBinding {
         {
             return Err(ServiceError::Unavailable);
         }
-        if let Some(caps) = &self.datagram_caps {
+        if let Some(caps) = &self.tcp5_caps {
+            let s = match scope {
+                BootstrapScope::Source => Tcp5Scope::Source,
+                BootstrapScope::Wire => Tcp5Scope::Wire,
+                BootstrapScope::Release => Tcp5Scope::Release,
+            };
+            caps[s.index()]
+                .as_ref()
+                .ok_or(ServiceError::Unsupported)?
+                .check(self.peer.image(), s)
+                .map_err(unavailable)?;
+        } else if let Some(caps) = &self.datagram_caps {
             use crate::helper::registry::DatagramScope as D;
             let d = match scope {
                 BootstrapScope::Source => D::Source,
@@ -442,6 +530,22 @@ impl BootstrapBinding {
         self.capabilities[0]
             .as_ref()
             .map(|_| Arc::clone(self) as Arc<dyn Source>)
+    }
+    fn tcp5_check(&self, scope: BootstrapScope, launch: LaunchRecord) -> Result<(), ServiceError> {
+        if self.tcp5_caps.is_none() {
+            return Err(ServiceError::Unsupported);
+        }
+        self.check(scope, launch)
+    }
+    pub(super) fn tcp5_views(
+        self: &Arc<Self>,
+        launch: LaunchRecord,
+    ) -> Result<Option<Arc<Tcp5Views>>, ServiceError> {
+        if self.tcp5_caps.is_none() {
+            return Ok(None);
+        }
+        self.tcp5_check(BootstrapScope::Source, launch)?;
+        Ok(Some(Arc::new(Tcp5Views(Arc::clone(self)))))
     }
     pub(super) fn datagram_source(
         self: &Arc<Self>,
@@ -570,8 +674,21 @@ impl BootstrapBinding {
             let credit = self
                 .budget
                 .dynamic
-                .reserve(std::mem::size_of::<Query>() + p.path.len() * 4 + 160)
+                .reserve(
+                    std::mem::size_of::<Query>()
+                        + p.path.len() * 4
+                        + 160
+                        + 4 * std::mem::size_of::<QuerySlot>(),
+                )
                 .map_err(unavailable)?;
+            // Не создаём по 256 пустых slots для каждой independent factory.
+            // Четыре pointer slots/query покрывают old+new при удвоении Vec;
+            // initial minimum4 покрыт factory credit128. Growth amortized O(1),
+            // history/limit проверены до effect, Query удерживает credit.
+            if queries.len() == queries.capacity() {
+                let growth = queries.len().max(4);
+                queries.try_reserve_exact(growth).map_err(unavailable)?;
+            }
             let until = self.until.min(self.peer.now() + Duration::from_secs(1));
             queries.push(QuerySlot(Box::new(Query {
                 capture: None,
@@ -1059,14 +1176,39 @@ pub(super) mod tests {
         budget: Arc<ChannelBudget>,
         start: Instant,
     ) -> Arc<BootstrapBinding> {
+        scoped5_binding(capsule, launch, asset, reference, budget, start, false)
+    }
+    pub(in crate::helper::native_profile_channel) fn tcp5_binding(
+        capsule: Arc<wire::OwnedCapsule>,
+        launch: LaunchRecord,
+        asset: Vec<u8>,
+        reference: wire::SnapshotRef,
+        budget: Arc<ChannelBudget>,
+        start: Instant,
+    ) -> Arc<BootstrapBinding> {
+        scoped5_binding(capsule, launch, asset, reference, budget, start, true)
+    }
+    fn scoped5_binding(
+        capsule: Arc<wire::OwnedCapsule>,
+        launch: LaunchRecord,
+        asset: Vec<u8>,
+        reference: wire::SnapshotRef,
+        budget: Arc<ChannelBudget>,
+        start: Instant,
+        tcp: bool,
+    ) -> Arc<BootstrapBinding> {
         use crate::helper::registry::DatagramScope as D;
+        use crate::helper::registry::Tcp5Scope as T;
         let peer = Arc::new(FakePeer {
             record: launch,
             image: [17; 32],
             config: launch.binding.digest,
-            producer: Some(crate::helper::registry::fake_datagram_image(
-                [17; 32],
-                &[D::Source, D::Wire, D::Release],
+            producer: Some(crate::helper::registry::fake_tcp5_image(
+                crate::helper::registry::fake_datagram_image(
+                    [17; 32],
+                    &[D::Source, D::Wire, D::Release],
+                ),
+                &[T::Source, T::Wire, T::Release],
             )),
             valid: AtomicBool::new(true),
             clock: AtomicU64::new(0),
@@ -1082,9 +1224,16 @@ pub(super) mod tests {
             valid: AtomicBool::new(true),
             fail_plan: AtomicBool::new(false),
         });
-        BootstrapBinding::create_for(peer, owner, capsule, launch, budget, true)
-            .unwrap()
-            .unwrap()
+        BootstrapBinding::create_for(
+            peer,
+            owner,
+            capsule,
+            launch,
+            budget,
+            if tcp { Flavor::Tcp5 } else { Flavor::Datagram5 },
+        )
+        .unwrap()
+        .unwrap()
     }
     impl SourceOwner for FakeOwner {
         fn mode(&self) -> Mode {

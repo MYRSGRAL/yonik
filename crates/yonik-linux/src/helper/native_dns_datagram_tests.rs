@@ -4,6 +4,8 @@ use super::super::super::super::{
     SourceFlow, Target, UdpBinding, UdpIngressRecord, dns_datagram, send_message,
 };
 use super::*;
+#[path = "native_france_session_tests.rs"]
+mod france;
 #[path = "native_dns_datagram_network_tests.rs"]
 mod network;
 
@@ -35,6 +37,11 @@ pub(super) fn fixture5_snapshot(
         17,
         flags,
     );
+    seed_parent(&mut issuer, &f);
+    (issuer, f)
+}
+pub(super) fn seed_parent(issuer: &mut Issuer<Fake>, f: &Arc<Facts>) {
+    let mode = f.launch.mode;
     issuer.authority.owner_forbidden = false;
     let mut tuple = match issuer_tests::open(mode, 32001) {
         wire::Message::OpenIngress { tuple, .. } => tuple,
@@ -97,7 +104,7 @@ pub(super) fn fixture5_snapshot(
     let mut ack = BundleIo::new(f.launch, vec![]);
     ack.source = Some(f.clone());
     send_message(
-        &issuer,
+        issuer,
         &ack,
         &AtomicBool::new(false),
         1,
@@ -147,7 +154,6 @@ pub(super) fn fixture5_snapshot(
         .datagram_bindings
         .insert(1, (f.launch, binding));
     issuer.authority.owner_forbidden = true;
-    (issuer, f)
 }
 fn parent(f: &Facts, query: u64) -> Vec<u8> {
     let mut b = vec![0; 64];

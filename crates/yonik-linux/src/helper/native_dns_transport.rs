@@ -705,6 +705,13 @@ impl<A: Authority> Issuer<A> {
         if binding.parent_carrier == 17 {
             return self.datagram_network_release();
         }
+        if self.negotiated.is_some_and(|n| n.datagram()) {
+            return self
+                .bootstrap_tcp5
+                .as_ref()
+                .ok_or(ServiceError::Unsupported)?
+                .release(self.record);
+        }
         self.bootstrap_dns
             .as_ref()
             .ok_or(ServiceError::Unsupported)?

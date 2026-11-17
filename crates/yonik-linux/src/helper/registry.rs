@@ -20,7 +20,9 @@ const MAX_MANIFEST: u64 = 4096;
 mod datagram;
 #[cfg(test)]
 pub(crate) use datagram::fake_image as fake_datagram_image;
-pub(crate) use datagram::{DatagramCapability, DatagramScope};
+#[cfg(test)]
+pub(crate) use datagram::fake_tcp_image as fake_tcp5_image;
+pub(crate) use datagram::{DatagramCapability, DatagramScope, Tcp5Capability, Tcp5Scope};
 const FILE_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC)
     .union(OFlags::NOFOLLOW)
@@ -76,6 +78,12 @@ struct Entry {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProducerRecord {
+    #[serde(default)]
+    bootstrap_tcp5_source: Option<DnsReleaseRecord>,
+    #[serde(default)]
+    bootstrap_tcp5_dns_wire: Option<DnsReleaseRecord>,
+    #[serde(default)]
+    bootstrap_tcp5_dns_release: Option<DnsReleaseRecord>,
     #[serde(default)]
     bootstrap_datagram: Option<DnsReleaseRecord>,
     #[serde(default)]
@@ -373,6 +381,7 @@ impl DnsCapability {
 #[derive(Clone)]
 pub(crate) struct ImageContract {
     datagram: [Option<datagram::Provenance>; 3],
+    tcp5: [Option<datagram::Provenance>; 3],
     bootstrap: [Option<BootstrapProvenance>; 3],
     image: [u8; 32],
     udp_reviewed: bool,
@@ -529,6 +538,7 @@ impl ProducerRecord {
         }
         Ok(ImageContract {
             datagram: datagram::decode_slots(self)?,
+            tcp5: datagram::decode_tcp_slots(self)?,
             bootstrap: [
                 (&self.bootstrap_source, BootstrapScope::Source),
                 (&self.bootstrap_dns_wire, BootstrapScope::Wire),
@@ -604,6 +614,7 @@ pub(crate) fn fake_bootstrap_image(image: [u8; 32], scopes: &[BootstrapScope]) -
     });
     ImageContract {
         datagram: [None, None, None],
+        tcp5: [None, None, None],
         image,
         bootstrap,
         udp_reviewed: false,
@@ -625,12 +636,19 @@ pub(crate) fn fake_dns4_image(image: [u8; 32]) -> ImageContract {
     };
     ImageContract {
         datagram: [None, None, None],
+        tcp5: [None, None, None],
         bootstrap: [None, None, None],
         image,
         udp_reviewed: false,
         dns_release: Some(record(DnsContract::Release)),
         dns_wire: Some(record(DnsContract::Wire)),
     }
+}
+#[cfg(test)]
+pub(crate) fn fake_udp_review(mut image: ImageContract) -> ImageContract {
+    // Отдельный injected consuming-v2 review, не следствие Source5.
+    image.udp_reviewed = true;
+    image
 }
 #[cfg(test)]
 pub(crate) fn fake_dns_image(image: [u8; 32]) -> ImageContract {

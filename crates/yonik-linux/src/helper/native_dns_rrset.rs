@@ -584,6 +584,13 @@ impl<A: Authority> Issuer<A> {
         if binding.parent_carrier == 17 {
             return self.datagram_response_observed(receipt);
         }
+        if self.negotiated.is_some_and(|n| n.datagram()) {
+            return self
+                .bootstrap_tcp5
+                .as_ref()
+                .ok_or(ServiceError::Unsupported)?
+                .observed(self.record, receipt);
+        }
         self.bootstrap_transcript
             .as_ref()
             .ok_or(ServiceError::Unsupported)?

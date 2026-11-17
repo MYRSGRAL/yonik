@@ -1903,6 +1903,7 @@ struct Issuer<A: Authority> {
     bootstrap_transcript: Option<Arc<dyn BootstrapDnsTranscript>>,
     bootstrap_dns: Option<Arc<VerifiedBootstrapDnsProducer>>,
     bootstrap_source: Option<Arc<dyn dns_bundle::roots::Source>>,
+    bootstrap_tcp5: Option<Arc<bootstrap_binding::Tcp5Views>>,
     rrsets: dns_rrset::State,
     dns_wire: Option<VerifiedDnsWireProducer>,
     dns_logical: Option<VerifiedDnsLogicalProducer>,
@@ -1951,6 +1952,7 @@ impl<A: Authority> Issuer<A> {
             rrsets: dns_rrset::State::new(),
             dns_wire: None,
             bootstrap_source: None,
+            bootstrap_tcp5: None,
             dns_logical: None,
             dns_release: None,
             transport: dns_transport::Transport::new(&budget.dynamic)?,
@@ -3336,6 +3338,12 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn bootstrap_tcp5(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<bootstrap_binding::Tcp5Views>>, ServiceError> {
+        Ok(None)
+    }
     fn bootstrap_datagram_wire(
         &self,
         _: LaunchRecord,
@@ -3961,6 +3969,7 @@ struct DeliveryCredit {
 }
 struct SystemChannel {
     bootstrap_datagram: Option<Arc<bootstrap_binding::BootstrapBinding>>,
+    bootstrap_tcp5: Option<Arc<bootstrap_binding::BootstrapBinding>>,
     bootstrap: Option<Arc<bootstrap_binding::BootstrapBinding>>,
     capsule: Arc<wire::OwnedCapsule>,
     budget: Arc<ChannelBudget>,
@@ -4037,7 +4046,19 @@ impl SystemChannel {
         budget: Arc<ChannelBudget>,
         sources: bootstrap_binding::Sources,
     ) -> Result<Self, ServiceError> {
-        let bootstrap = bootstrap_binding::BootstrapBinding::prepare(
+        let dual = bootstrap_binding::BootstrapBinding::requires_datagram(&capsule, launch)?;
+        let bootstrap = if dual {
+            None
+        } else {
+            bootstrap_binding::BootstrapBinding::prepare(
+                Arc::clone(&peer),
+                sources.clone(),
+                Arc::clone(&capsule),
+                launch,
+                Arc::clone(&budget),
+            )?
+        };
+        let bootstrap_tcp5 = bootstrap_binding::BootstrapBinding::prepare_tcp5(
             Arc::clone(&peer),
             sources.clone(),
             Arc::clone(&capsule),
@@ -4051,13 +4072,19 @@ impl SystemChannel {
             launch,
             Arc::clone(&budget),
         )?;
-        if bootstrap_binding::BootstrapBinding::requires_datagram(&capsule, launch)?
-            && bootstrap_datagram
+        if dual
+            && (bootstrap_tcp5
                 .as_ref()
-                .map(|b| b.datagram_source(launch))
+                .map(|b| b.tcp5_views(launch))
                 .transpose()?
                 .flatten()
                 .is_none()
+                || bootstrap_datagram
+                    .as_ref()
+                    .map(|b| b.datagram_source(launch))
+                    .transpose()?
+                    .flatten()
+                    .is_none())
         {
             return Err(ServiceError::Unsupported);
         }
@@ -4111,6 +4138,7 @@ impl SystemChannel {
         Ok(Self {
             bootstrap,
             bootstrap_datagram,
+            bootstrap_tcp5,
             runtime,
             capsule,
             budget,
@@ -4439,6 +4467,14 @@ impl SystemChannel {
     }
 }
 impl Channel for SystemChannel {
+    fn bootstrap_tcp5(
+        &self,
+        record: LaunchRecord,
+    ) -> Result<Option<Arc<bootstrap_binding::Tcp5Views>>, ServiceError> {
+        self.bootstrap_tcp5
+            .as_ref()
+            .map_or(Ok(None), |b| b.tcp5_views(record))
+    }
     fn bootstrap_datagram_producer(
         &self,
         record: LaunchRecord,
@@ -5340,6 +5376,7 @@ fn run_issuer<A: Authority>(
                 issuer.dns_release = socket.dns_producer(issuer.record)?;
                 issuer.dns_wire = socket.dns_wire_producer(issuer.record)?;
                 issuer.bootstrap_source = socket.bootstrap_source(issuer.record)?;
+                issuer.bootstrap_tcp5 = socket.bootstrap_tcp5(issuer.record)?;
                 issuer.datagrams.producer = socket.bootstrap_datagram_producer(issuer.record)?;
                 issuer.datagrams.wire = socket.bootstrap_datagram_wire(issuer.record)?;
                 issuer.datagrams.release = socket.bootstrap_datagram_release(issuer.record)?;
@@ -5735,9 +5772,12 @@ pub(crate) fn consumer_request_plan(
 ) -> Result<(), ServiceError> {
     consumer_profile_plan(request.intent(), mode)
 }
-/// Закрытая DATA selection: один raw VLESS TCP frontier, без provider DNS,
-/// observatory, routing chains и transport extensions. Не grant.
-struct ConsumerPlan;
+/// Закрытая DATA selection: raw VLESS TCP4 или полный raw SS TCP+UDP5,
+/// без provider DNS/observatory/chain/transport extensions. Не grant.
+enum ConsumerPlan {
+    Tcp4,
+    ShadowsocksDual5,
+}
 impl ConsumerPlan {
     fn derive(
         intent: &yonik_engine::native_profile::ProfileIntent,
@@ -5749,12 +5789,8 @@ impl ConsumerPlan {
             .ok_or(ServiceError::Unsupported)?;
         let graph = intent.validate().map_err(unavailable)?;
         let egress = graph.egress();
-        // SS default stream TCP не отменяет native UDP из того же intent.
-        // Bootstrap Source/physical permission текущего reviewed scope TCP-only;
-        // нельзя публиковать full-profile readiness для половины FranceSS.
-        if shape.requires_physical_udp() {
-            return Err(ServiceError::Unsupported);
-        }
+        // Один SS intent требует обе независимые ветки в одной negotiation5.
+        let dual = shape.requires_physical_udp();
         if graph.subjects().len() != 1
             || graph.probe().is_some()
             || !graph.selector_sets().is_empty()
@@ -5767,20 +5803,57 @@ impl ConsumerPlan {
             // Exact no-routing/no-DNS predicate не требует USER-DNS query;
             // декларация не является authority и Direct USER4 не включается.
             || egress.system_resolvers().iter().any(|r| r.subject().is_some())
-            || egress.physical().len() != 1
-            || egress.physical()[0].protocol()
-                != yonik_engine::native_profile::TransportProtocol::Tcp
+            || egress.physical().len() != if dual { 2 } else { 1 }
+            || !egress.physical().iter().any(|p| p.protocol() == yonik_engine::native_profile::TransportProtocol::Tcp)
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        if dual
+            && (!egress
+                .physical()
+                .iter()
+                .any(|p| p.protocol() == yonik_engine::native_profile::TransportProtocol::Udp)
+                || egress.physical().iter().any(|p| {
+                    p.host() != egress.physical()[0].host()
+                        || p.port() != egress.physical()[0].port()
+                }))
         {
             return Err(ServiceError::Unsupported);
         }
         if let Ok(ip) = egress.physical()[0].host().parse::<std::net::IpAddr>() {
-            if !dns_rrset::numeric_ip_allowed(ip) {
+            if dual || !dns_rrset::numeric_ip_allowed(ip) {
                 return Err(ServiceError::Unsupported);
             }
         }
-        Ok(Self)
+        Ok(if dual {
+            Self::ShadowsocksDual5
+        } else {
+            Self::Tcp4
+        })
     }
     fn image(&self, proof: &super::ImageContract, hash: [u8; 32]) -> Result<(), ServiceError> {
+        if matches!(self, Self::ShadowsocksDual5) {
+            use super::registry::{DatagramScope as D, Tcp5Scope as T};
+            for s in [T::Source, T::Wire, T::Release] {
+                proof
+                    .tcp5_channel(hash, s)
+                    .map_err(unavailable)?
+                    .ok_or(ServiceError::Unsupported)?
+                    .check(hash, s)
+                    .map_err(unavailable)?;
+            }
+            for s in [D::Source, D::Wire, D::Release] {
+                proof
+                    .datagram_channel(hash, s)
+                    .map_err(unavailable)?
+                    .ok_or(ServiceError::Unsupported)?
+                    .check(hash, s)
+                    .map_err(unavailable)?;
+            }
+            // UDP bootstrap не заменяет independent consuming/relay v2 authority.
+            proof.check(hash).map_err(unavailable)?;
+            return Ok(());
+        }
         for scope in [
             super::registry::BootstrapScope::Source,
             super::registry::BootstrapScope::Wire,
@@ -5913,6 +5986,80 @@ mod subset_readiness_tests {
     use super::*;
     use yonik_engine::native_profile::ProfileIntent;
     #[test]
+    fn france_full_fixture_same_session_reaches_independent_image_authority() {
+        let report = yonik_import::import_profiles(
+            include_bytes!("../../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
+        )
+        .unwrap();
+        let profile = report
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                yonik_import::ProfileEntry::Xray(p) if p.name() == "FranceSS" => Some(p),
+                _ => None,
+            })
+            .unwrap();
+        let intent = ProfileIntent::from_profile(profile).unwrap();
+        for mode in [Mode::Local, Mode::System] {
+            let mut image_checks = 0;
+            let proof = crate::helper::registry::fake_datagram_image(
+                [17; 32],
+                &[
+                    crate::helper::registry::DatagramScope::Source,
+                    crate::helper::registry::DatagramScope::Wire,
+                    crate::helper::registry::DatagramScope::Release,
+                ],
+            );
+            let result = prepare_consumer(&intent, mode, |plan| {
+                image_checks += 1;
+                plan.image(&proof, [17; 32])
+            });
+            assert_eq!(
+                image_checks, 1,
+                "полный SS TCP+UDP intent должен дойти до отдельной image authority без удаления UDP"
+            );
+            assert!(
+                result.is_err(),
+                "только UDP5 не выдаёт обе ветки одной session"
+            );
+            use crate::helper::registry::{
+                DatagramScope as D, Tcp5Scope as T, fake_datagram_image, fake_tcp5_image,
+                fake_udp_review,
+            };
+            let both = fake_tcp5_image(proof, &[T::Source, T::Wire, T::Release]);
+            assert!(
+                prepare_consumer(&intent, mode, |p| p.image(&both, [17; 32])).is_err(),
+                "bootstrap scopes не UDP consuming contract"
+            );
+            let both = fake_udp_review(both);
+            assert!(prepare_consumer(&intent, mode, |p| p.image(&both, [17; 32])).is_ok());
+            assert!(prepare_consumer(&intent, mode, |p| p.image(&both, [18; 32])).is_err());
+            for missing in [T::Source, T::Wire, T::Release] {
+                let partial = fake_udp_review(fake_tcp5_image(
+                    fake_datagram_image([17; 32], &[D::Source, D::Wire, D::Release]),
+                    &[T::Source, T::Wire, T::Release]
+                        .into_iter()
+                        .filter(|s| *s != missing)
+                        .collect::<Vec<_>>(),
+                ));
+                assert!(prepare_consumer(&intent, mode, |p| p.image(&partial, [17; 32])).is_err());
+            }
+            for missing in [D::Source, D::Wire, D::Release] {
+                let partial = fake_udp_review(fake_tcp5_image(
+                    fake_datagram_image(
+                        [17; 32],
+                        &[D::Source, D::Wire, D::Release]
+                            .into_iter()
+                            .filter(|s| *s != missing)
+                            .collect::<Vec<_>>(),
+                    ),
+                    &[T::Source, T::Wire, T::Release],
+                ));
+                assert!(prepare_consumer(&intent, mode, |p| p.image(&partial, [17; 32])).is_err());
+            }
+        }
+    }
+    #[test]
     fn france_ss_readiness_preserves_stream_hash_and_denies_unproved_udp_before_effects() {
         let report = yonik_import::import_profiles(
             include_bytes!("../../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
@@ -5953,8 +6100,8 @@ mod subset_readiness_tests {
                 .is_err()
             );
             assert_eq!(
-                effects, 0,
-                "нет image/capture/stage/route effects для неполной UDP capability"
+                effects, 1,
+                "image authority отказала до capture/stage/route effects"
             );
         }
         let graph = intent.validate().unwrap();
@@ -6060,6 +6207,9 @@ mod subset_readiness_tests {
             let yonik_import::ProfileEntry::Xray(profile) = entry else {
                 panic!("native fixture");
             };
+            if profile.name() == "FranceSS" {
+                return None;
+            }
             // Уже Unsupported на typed IPC boundary также не достигает loader.
             ProfileIntent::from_profile(&profile).ok()
         });

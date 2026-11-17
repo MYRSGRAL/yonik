@@ -92,6 +92,33 @@ def datagram_candidate(record: dict[str, object]) -> dict[str, object]:
     }
 
 
+def tcp5_candidate(record: dict[str, object]) -> dict[str, object]:
+    """Отдельный TCP6 review под5; UDP5/Source4 не переносят eligibility."""
+    candidate = dict(record)
+    for slot, contract in (
+        ("bootstrap_tcp5_source", "tcp-codec5-bootstrap-parent-member-v1"),
+        ("bootstrap_tcp5_dns_wire", "tcp-codec5-bootstrap-bound-dns-transcript-v1"),
+        (
+            "bootstrap_tcp5_dns_release",
+            "tcp-codec5-bootstrap-dns-consuming-close-join-v1",
+        ),
+    ):
+        candidate[slot] = {
+            "contract": contract,
+            "version": 1,
+            "contract_sha256": hashlib.sha256(contract.encode() + b"\0").hexdigest(),
+            "schema_sha256": hashlib.sha256(b"YONIK-DNS-V2-CODEC-5\0").hexdigest(),
+        }
+    return {
+        "validation": "COMPILE_ONLY_CANDIDATE",
+        "install_authority": False,
+        "source_eligibility": False,
+        "requires_independent_scope_review": True,
+        "subset": "single_raw_ss_tcp_in_shared_codec5_session",
+        "candidate_record": candidate,
+    }
+
+
 def bootstrap_candidate(record: dict[str, object]) -> dict[str, object]:
     """Три независимых review-запроса; это не protected install record."""
     candidate = dict(record)
@@ -643,6 +670,8 @@ def build_locked(
             stream.write(json.dumps(bootstrap_candidate(record), indent=2) + "\n")
         with (output / "native-profile-datagram-candidate.json").open("x") as stream:
             stream.write(json.dumps(datagram_candidate(record), indent=2) + "\n")
+        with (output / "native-profile-tcp5-candidate.json").open("x") as stream:
+            stream.write(json.dumps(tcp5_candidate(record), indent=2) + "\n")
     destination = output / engine
     with binary.open("rb") as incoming, destination.open("xb") as outgoing:
         shutil.copyfileobj(incoming, outgoing)

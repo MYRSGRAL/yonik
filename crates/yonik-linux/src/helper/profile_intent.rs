@@ -1997,22 +1997,23 @@ impl SystemPhysicalPlan {
                 numeric_routes.push(endpoint.clone());
                 continue;
             }
-            if snapshot.is_none()
-                || endpoint.protocol() != yonik_engine::native_profile::TransportProtocol::Tcp
-            {
+            if snapshot.is_none() {
                 return Err(EgressError::BootstrapRequired);
             }
+            let network = match endpoint.protocol() {
+                yonik_engine::native_profile::TransportProtocol::Tcp => {
+                    yonik_engine::native_profile::WireNetwork::Tcp
+                }
+                yonik_engine::native_profile::TransportProtocol::Udp => {
+                    yonik_engine::native_profile::WireNetwork::Udp
+                }
+            };
             let subject = graph
                 .subjects()
                 .first()
                 .ok_or(EgressError::InvalidBinding)?;
             let frontier = intent
-                .physical_bootstrap_frontier(
-                    subject,
-                    yonik_engine::native_profile::WireNetwork::Tcp,
-                    endpoint.port(),
-                    &[false],
-                )
+                .physical_bootstrap_frontier(subject, network, endpoint.port(), &[false])
                 .map_err(|_| EgressError::InvalidBinding)?
                 .ok_or(EgressError::InvalidBinding)?;
             if frontier.endpoint() != endpoint {
@@ -2071,17 +2072,31 @@ impl SystemPhysicalPlan {
         destination: crate::profile_channel::Destination<'_>,
     ) -> bool {
         destination.family == 3
-            && destination.protocol == 6
             && self.deferred.iter().any(|f| {
-                f.endpoint().host().as_bytes() == destination.bytes
+                matches!(
+                    (f.endpoint().protocol(), destination.protocol),
+                    (yonik_engine::native_profile::TransportProtocol::Tcp, 6)
+                        | (yonik_engine::native_profile::TransportProtocol::Udp, 17)
+                ) && f.endpoint().host().as_bytes() == destination.bytes
                     && f.endpoint().port() == destination.port
             })
     }
     /// Только shape; member authority приходит исключительно из checked Numeric
     /// issuer + live manifest/scope и durable backend, не из этого predicate.
     pub(crate) fn member_shape(&self, port: u16, protocol: crate::TransportProtocol) -> bool {
-        protocol == crate::TransportProtocol::Tcp
-            && self.deferred.iter().any(|f| f.endpoint().port() == port)
+        self.deferred.iter().any(|f| {
+            f.endpoint().port() == port
+                && matches!(
+                    (f.endpoint().protocol(), protocol),
+                    (
+                        yonik_engine::native_profile::TransportProtocol::Tcp,
+                        crate::TransportProtocol::Tcp
+                    ) | (
+                        yonik_engine::native_profile::TransportProtocol::Udp,
+                        crate::TransportProtocol::Udp
+                    )
+                )
+        })
     }
     fn same_snapshot(&self, snapshot: Option<crate::profile_channel::SnapshotRef>) -> bool {
         match (self.snapshot, snapshot) {

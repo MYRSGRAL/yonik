@@ -20,6 +20,34 @@ import build_native_adapter as builder  # noqa: E402
 
 
 class BuilderTests(unittest.TestCase):
+    def test_tcp5_candidate_keeps_tcp_udp_source_reviews_separate(self) -> None:
+        original = {"elf_sha256": "11" * 32, "patch_sha256": "44" * 32}
+        candidate = builder.tcp5_candidate(original)
+        self.assertFalse(candidate["install_authority"])
+        self.assertFalse(candidate["source_eligibility"])
+        record = candidate["candidate_record"]
+        self.assertEqual(record["elf_sha256"], original["elf_sha256"])
+        self.assertEqual(record["patch_sha256"], original["patch_sha256"])
+        self.assertNotIn("bootstrap_source", record)
+        self.assertNotIn("bootstrap_datagram", record)
+        self.assertEqual(set(original), {"elf_sha256", "patch_sha256"})
+        for slot, contract in (
+            ("bootstrap_tcp5_source", "tcp-codec5-bootstrap-parent-member-v1"),
+            ("bootstrap_tcp5_dns_wire", "tcp-codec5-bootstrap-bound-dns-transcript-v1"),
+            (
+                "bootstrap_tcp5_dns_release",
+                "tcp-codec5-bootstrap-dns-consuming-close-join-v1",
+            ),
+        ):
+            self.assertEqual(
+                record[slot]["schema_sha256"],
+                hashlib.sha256(b"YONIK-DNS-V2-CODEC-5\0").hexdigest(),
+            )
+            self.assertEqual(
+                record[slot]["contract_sha256"],
+                hashlib.sha256(contract.encode() + b"\0").hexdigest(),
+            )
+
     def test_datagram_candidate_is_scope5_request_not_source_or_install_authority(
         self,
     ) -> None:

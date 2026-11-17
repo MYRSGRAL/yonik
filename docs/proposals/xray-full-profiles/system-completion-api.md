@@ -2036,3 +2036,77 @@ Builder пишет отдельный `native-profile-datagram-candidate.json` �
 review request с `install_authority=false` и `source_eligibility=false`; текущий
 PROFILE_PATCH не меняется и не получает новые scopes. Нужны новый reviewed Go pin,
 trusted installation и отдельная acceptance. FranceSS readiness не включена.
+
+### FranceSS: TCP6 и UDP17 в одной CODEC5 session (review request)
+
+Полный imported FranceSS не превращается в TCP-only config: ConsumerPlan сохраняет
+обе physical rows и требует одну negotiation5. DATA planning теперь достигает image
+check; effectful prepare требует независимо три TCP5 slots, три UDP5 slots и
+reviewed UDP consuming-v2 capability. Source4/Direct3 не удовлетворяют этому check.
+Другие шесть fixture shapes остаются Unsupported; это не новый global ready flag.
+
+Новые optional protected record slots (version1, schema SHA256(name+NUL) CODEC5
+`c05c312d47ed27ef93db80158cb7bc78f10c6b319d5d4407929885cb192ead03`):
+
+| Slot | Independent contract | SHA256(contract+NUL) |
+|---|---|---|
+| bootstrap_tcp5_source | tcp-codec5-bootstrap-parent-member-v1 | e1383c18f69a9d0a9a426dd4ecb5d80d7045d9b5a7ba9f9492412da38f04086f |
+| bootstrap_tcp5_dns_wire | tcp-codec5-bootstrap-bound-dns-transcript-v1 | 3257e0e61f3ad00634d1d57bc5df246d23da5356db264365b7a1cf96842cc589 |
+| bootstrap_tcp5_dns_release | tcp-codec5-bootstrap-dns-consuming-close-join-v1 | 2b6f522eff0af28246ba2c8fc563a239d569b95ebbe1204eb6af3860636f88c7 |
+
+Все TCP5 review pins `registry_datagram::TCP_REVIEWS` — None. Нужен отдельный
+root source verdict для TCP6 consuming path Go exact patch
+`6e1e0f0ee6c0e48f7b77a1e858e594277a8f515d8267c0bdff2f47e7d8a24791`
+именно при выбранной CODEC5. Прежний R92 UDP5 verdict не расширен. Build/UDP5/
+legacy UDP4 pins в этом unit не меняются. Candidate не installed authority.
+
+Wire не меняется: Go `profileNeedsDatagramCodec` выбирает5 на всём SS graph;
+TCP `profileNetworkRawEligible`/Hosts raw frontier остаются carrier6, existing
+55/35/40/53/42 принимают6 под5. Различение protected producer contracts — helper
+authority, не новое поле ACK/descriptor или child assertion. Минимальный вопрос
+root: покрывает ли отдельный SOURCE review этого TCP6 path три новых contracts?
+До принятия ответ None даёт отказ до capture/staging/config-check.
+
+Actual Local/System SystemChannel::new выбирает по graph: legacy4 binding только
+для TCP4; dual SS создаёт separate prepare_tcp5 и prepare_datagram с одинаковыми
+retained Peer/image/config/capsule/launch и Sources, но разными typed capabilities.
+После ADMIT_ACK Channel::bootstrap_tcp5 экспортирует закрытый Tcp5Views в issuer.
+root_source, resolver transport release и RRset transcript выбирают именно этот
+view при negotiated5+carrier6; Source4 fallback запрещён. Carrier17 по-прежнему
+требует57/58 + immutable Consumed lineage и отдельные Datagram5 views. Source,
+Wire и Release проверяются независимо и повторно; conservative Reservation.started
+anchor, parser/revalidation/sticky invalidation и route/cancel fences сохранены.
+Tcp5Views не конвертируется в legacy Source4/Release4 или Datagram5 token.
+
+Builder дополнительно пишет native-profile-tcp5-candidate.json: только три новых
+scope requests, install_authority=false/source_eligibility=false, exact artifact
+inputs сохранены. Никакой автоматической установки/нового принятого patch pin.
+
+SOURCE/PURE regression `native_france_session_tests` строит capsule и digest из
+реального imported FranceSS/compiled config (Local и System), одну launch/schema5,
+actual shared Binding/planner и serialized run_issuer: TCP Hosts context→DATA→own
+waiter→Numeric6 и UDP57/58→own contexts→DATA→own waiter→Numeric17. Independent
+injected reviewed records нужны обеим branches; deliberately supplied legacy Source
+не даёт TCP5 context. Проверены foreign member без расходования соседней authority,
+Numeric replay и late Cancel9 после UDP Grant с live TCP neighbor. USER/Consumed/
+Peer/image/custody/route backend — явно fake leaves; Go SUT в этом новом France
+driver не участвует. Это не installed/runtime/full-France interop acceptance.
+
+Tight capsule buffer budget не увеличен. Query ledger теперь Vec::new + bounded
+geometric grow после precredit (четыре pointer slots/query покрывают realloc peak,
+initial minimum4 оплачен fixed factory credit128),
+вместо двух независимо allocated пустых массивов по256 slots. Capture storage
+по-прежнему lazy/prepaid; ID/query не reuse. В reserve_hosts path имеет отдельный
+scoped credit во время Source, а seen[1024] materializes/prepaid после Source;
+проверка indices и revalidation сохранены. На полном France тесте эти lifetimes
+позволяют обе ветки без повышения лимита58419 bytes.
+
+SystemPhysicalPlan сохраняет отдельные checked Tcp/Udp physical frontiers того же
+intent и snapshot. `deferred_parent_shape`/`member_shape` сравнивают exact carrier
+каждого retained frontier; прежний TCP-only guard не отсекает полный SS. Это DATA:
+capture_routes не получает hostname/выдуманный IP ни для одной ветки. Snapshot
+before/after и intent/source binding сохраняются; static numeric capture не менялся.
+ProfileRoutes использует эти predicates только дополнительно к typed issuer
+member/Consumed authority и durable install; никакой route до Numeric не добавлен.
+Pure prepare regression полного France проверяет HOSTS/NETWORK, оба carriers,
+foreign host/port/family, отсутствие synthetic capture и source mutation.

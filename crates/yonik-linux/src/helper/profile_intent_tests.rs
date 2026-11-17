@@ -1,4 +1,91 @@
 use super::*;
+#[tokio::test]
+async fn system_france_prepare_both_deferred_carriers_without_synthetic_routes() {
+    let report = yonik_import::import_profiles(
+        include_bytes!("../../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
+    )
+    .unwrap();
+    let profile = report
+        .entries
+        .iter()
+        .find_map(|e| match e {
+            yonik_import::ProfileEntry::Xray(p) if p.name() == "FranceSS" => Some(p),
+            _ => None,
+        })
+        .unwrap();
+    let intent = yonik_engine::native_profile::ProfileIntent::from_profile(profile).unwrap();
+    for order in [
+        b"hosts: files dns\n".as_slice(),
+        b"hosts: dns files\n".as_slice(),
+    ] {
+        let snapshot = lookup_fixture(
+            order,
+            b"nameserver 192.0.2.53\n",
+            Some(b"203.0.113.80 fr.example.invalid\n"),
+        );
+        let mut plan =
+            SystemPhysicalPlan::capture_checked(&intent, || Ok(Some(snapshot.reference())))
+                .unwrap();
+        plan.bind_resolver(&snapshot).unwrap();
+        assert_eq!(plan.deferred_count(), 2);
+        assert!(plan.numeric().is_empty());
+        for protocol in [6, 17] {
+            let parent = crate::profile_channel::Destination {
+                family: 3,
+                protocol,
+                port: 443,
+                bytes: b"fr.example.invalid",
+            };
+            assert!(plan.deferred_parent_shape(parent));
+            assert!(
+                !plan.deferred_parent_shape(crate::profile_channel::Destination {
+                    port: 444,
+                    ..parent
+                })
+            );
+            assert!(
+                !plan.deferred_parent_shape(crate::profile_channel::Destination {
+                    bytes: b"foreign.invalid",
+                    ..parent
+                })
+            );
+            assert!(
+                !plan.deferred_parent_shape(crate::profile_channel::Destination {
+                    family: 4,
+                    bytes: &[203, 0, 113, 80],
+                    ..parent
+                })
+            );
+        }
+        assert!(plan.member_shape(443, crate::TransportProtocol::Tcp));
+        assert!(plan.member_shape(443, crate::TransportProtocol::Udp));
+        assert!(!plan.member_shape(53, crate::TransportProtocol::Udp));
+        let (_keep, cancel) = Cancellation::new();
+        let captured = plan
+            .capture_routes::<()>(997, 42, &cancel, async |_, _| {
+                panic!("deferred SS не имеет numeric route до issuer Numeric")
+            })
+            .await
+            .unwrap();
+        assert_eq!(captured.transports().unwrap().count(), 0);
+        assert_eq!(
+            plan.resolver_peers().len(),
+            if order.starts_with(b"hosts: files") {
+                0
+            } else {
+                2
+            },
+            "resolver DATA отдельно от ещё не разрешённых physical SS routes"
+        );
+        assert!(SystemPhysicalPlan::build(&intent, None).is_err());
+        let mut changed = snapshot.reference();
+        changed.source[0] ^= 1;
+        assert!(
+            plan.check_binding(FullProfileSources::digest(&intent).unwrap(), Some(changed))
+                .is_err()
+        );
+    }
+}
 fn raw_system_intent(host: &str) -> yonik_engine::native_profile::ProfileIntent {
     yonik_engine::native_profile::ProfileIntent::decode(&serde_json::json!({"version":1,"graph":{"outbounds":[{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":host,"port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]}}).to_string()).unwrap()
 }

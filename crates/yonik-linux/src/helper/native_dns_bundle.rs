@@ -742,6 +742,9 @@ pub(super) fn negotiate<A: Authority>(
         .map(|p| p.check(issuer.record))
         .transpose()?
         .is_some();
+    if issuer.bootstrap_tcp5.is_some() && !datagram {
+        return Err(ServiceError::Unsupported);
+    }
     let expected = if datagram {
         Negotiated::datagram_descriptor(issuer.record)
     } else {

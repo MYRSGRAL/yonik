@@ -269,6 +269,13 @@ impl<A: Authority> Issuer<A> {
         if carrier != 6 {
             return Err(ServiceError::Unsupported);
         }
+        if self.negotiated.is_some_and(|n| n.datagram()) {
+            return self
+                .bootstrap_tcp5
+                .as_ref()
+                .ok_or(ServiceError::Unsupported)?
+                .source(self.record);
+        }
         self.bootstrap_source
             .as_deref()
             .ok_or(ServiceError::Unsupported)
@@ -953,12 +960,6 @@ impl<A: Authority> Issuer<A> {
                     + b.hops.len() * std::mem::size_of::<DnsHopPermit>(),
             )
             .map_err(unavailable)?;
-        let scratch = self.budget.dynamic.reserve(8192).map_err(unavailable)?;
-        let mut path = [(0, 0); 256];
-        for (i, h) in b.hops.iter().enumerate() {
-            path[i] = (h.scope, h.branch);
-        }
-        let count = b.hops.len();
         self.bundle_history(1)?;
         let pending = socket.take_dns_credit(request)?;
         let parent = self
@@ -972,21 +973,34 @@ impl<A: Authority> Issuer<A> {
         let source = self.root_source(query, original.protocol)?;
         expires =
             expires.min(self.source_result(context, source.snapshot(self.record, reference))?);
-        let choice = self.source_result(
-            context,
-            source.hosts(
-                Parent {
-                    root,
-                    launch: self.record,
-                    query,
-                    selector,
-                    original: original.wire(),
-                    path: &path[..count],
-                }
-                .checked()?,
-                reference,
-            ),
-        )?;
+        let choice = {
+            // Path существует только во время Source. Seen materializes позже;
+            // его credit не должен перекрывать независимый parser/planner.
+            let _path = self
+                .budget
+                .dynamic
+                .reserve(std::mem::size_of::<[(u16, u8); 256]>())
+                .map_err(unavailable)?;
+            let mut path = [(0, 0); 256];
+            for (i, h) in parent.iter().enumerate() {
+                path[i] = (h.scope, h.branch);
+            }
+            self.source_result(
+                context,
+                source.hosts(
+                    Parent {
+                        root,
+                        launch: self.record,
+                        query,
+                        selector,
+                        original: original.wire(),
+                        path: &path[..parent.len()],
+                    }
+                    .checked()?,
+                    reference,
+                ),
+            )?
+        };
         if choice.count == 0
             || choice.count > 256
             || choice.key_len == 0
@@ -1003,6 +1017,11 @@ impl<A: Authority> Issuer<A> {
             context,
             wire::resolver_name(key, key.contains('.'), true).map_err(unavailable),
         )?;
+        let scratch = self
+            .budget
+            .dynamic
+            .reserve(std::mem::size_of::<[u64; 1024]>())
+            .map_err(unavailable)?;
         let mut seen = [0u64; 1024];
         for index in &choice.members[..usize::from(choice.count)] {
             let word = usize::from(*index) / 64;

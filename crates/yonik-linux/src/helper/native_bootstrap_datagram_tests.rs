@@ -40,8 +40,43 @@ fn create5(f: &Fixture) -> Result<Option<Arc<BootstrapBinding>>, ServiceError> {
         f.owner.capsule.clone(),
         f.peer.record,
         f.budget.clone(),
-        true,
+        super::super::Flavor::Datagram5,
     )
+}
+#[test]
+fn tcp5_factory_independent_source_wire_release_and_carrier() {
+    use crate::helper::registry::{Tcp5Scope as T, fake_tcp5_image};
+    for mode in [Mode::Local,Mode::System] {
+        let mut f = fixture5(mode,&[D::Source,D::Wire,D::Release]);
+        let make = |f: &Fixture| BootstrapBinding::create_for(f.peer.clone(),f.owner.clone(),f.owner.capsule.clone(),f.peer.record,f.budget.clone(),super::super::Flavor::Tcp5);
+        assert!(make(&f).unwrap().is_none(),"UDP5 review не mint TCP5");
+        let legacy = crate::helper::registry::fake_bootstrap_image([17;32],&[BootstrapScope::Source,BootstrapScope::Wire,BootstrapScope::Release]);
+        Arc::get_mut(&mut f.peer).unwrap().producer = Some(legacy);
+        assert!(make(&f).unwrap().is_none(),"Source4 review не mint TCP5");
+        Arc::get_mut(&mut f.peer).unwrap().producer = Some(fake_tcp5_image(fake_datagram_image([17;32],&[]),&[T::Source,T::Release]));
+        let cap = crate::profile_channel::Capsule::decode(f.owner.capsule.bytes(),&f.peer.config).unwrap();
+        let (scope,mask) = cap.subject_scope(0,6).unwrap();
+        assert_eq!(mask,1);
+        f.path = vec![(scope,0)];
+        f.endpoint = cap.dial_scope(scope,0).unwrap().endpoint_index;
+        let b = make(&f).unwrap().unwrap();
+        let view = b.tcp5_views(f.peer.record).unwrap().unwrap();
+        assert!(b.source().is_none() && b.transcript().is_none() && b.release().is_none());
+        assert!(b.datagram_source(f.peer.record).unwrap().is_none());
+        assert!(view.release(f.peer.record).is_ok());
+        assert!(b.check(BootstrapScope::Wire,f.peer.record).is_err());
+        assert!(view.source(f.peer.record).unwrap().parent(super::parent(&f,false,9)).is_ok());
+        let mut wrong = super::parent(&f,false,10);
+        wrong.original.protocol = 17;
+        assert!(view.source(f.peer.record).unwrap().parent(wrong).is_err());
+        let mut wrong = f.peer.record;
+        wrong.binding.epoch += 1;
+        assert!(view.release(wrong).is_err());
+        f.owner.valid.store(false,Ordering::Release);
+        assert!(view.release(f.peer.record).is_err());
+        f.owner.valid.store(true,Ordering::Release);
+        assert!(view.release(f.peer.record).is_err(),"source change sticky");
+    }
 }
 #[test]
 fn scope5_factory_local_system_independent_records_and_sticky_source() {

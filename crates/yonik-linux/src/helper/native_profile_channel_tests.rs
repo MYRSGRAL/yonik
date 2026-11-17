@@ -82,6 +82,7 @@ fn dns_rrset_queue_credit_precedes_materialization_and_rx_bound_is_fixed() {
 // Весь driver below — in-memory: ни OS endpoint, ни runtime wrappers.
 type PacketObserver = Box<dyn Fn(&[u8])>;
 pub(super) struct BundleIo {
+    pub(super) tcp5: Option<Arc<bootstrap_binding::Tcp5Views>>,
     pub(super) datagram_wire: Option<Arc<dns_datagram::NetworkWire>>,
     pub(super) datagram_release: Option<Arc<dns_datagram::NetworkRelease>>,
     pub(super) after_packet: Option<PacketObserver>,
@@ -158,6 +159,7 @@ impl BundleIo {
     }
     pub(super) fn new(record: LaunchRecord, requests: Vec<Vec<u8>>) -> Self {
         Self {
+            tcp5: None,
             datagram_wire: None,
             datagram_release: None,
             after_packet: None,
@@ -186,6 +188,12 @@ impl BundleIo {
     }
 }
 impl Channel for BundleIo {
+    fn bootstrap_tcp5(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<bootstrap_binding::Tcp5Views>>, ServiceError> {
+        Ok(self.tcp5.clone())
+    }
     fn bootstrap_datagram_wire(
         &self,
         _: LaunchRecord,
