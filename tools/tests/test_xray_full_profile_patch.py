@@ -12,6 +12,37 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_datagram_network_uses_independent_bindings_and_existing_transport(
+        self,
+    ) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "profileBindDatagramParent(n.ctx, root, f, n.deadline)",
+            "profileBindDatagramParent(w.ctx, n.parent, f, w.deadline)",
+            "w.state.datagram = &profileBootstrapDatagramPermission{network: w",
+            "source.datagram = w.datagramParent",
+            "return fd, profileDNSDatagramNamespace(n.transport, fd)",
+            "t.started = n.op.sent",
+            "TestProfileDatagramNetworkActualNumericAndConsumingSend",
+            "TestProfileDatagramNetworkTransportProofAndLogicalBarriers",
+        ):
+            self.assertTrue(anchor in patch, anchor)
+
+    def test_datagram_network_cleanup_retains_refs_through_binding_retirement(
+        self,
+    ) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        for anchor in (
+            "c.datagramParentClose(w.datagramParent)",
+            "c.datagramParentClose(n.datagramParent)",
+            "TestProfileDatagramNetworkCleanupKeepsServiceUntilResourceAndBindings",
+            "TestProfileDatagramNetworkFencesAndUnknown",
+            "TestProfileDatagramNetworkStrictTranscriptBeforePublish",
+            "TestProfileDatagramNetworkIndependentWaiterAndBudgetDenial",
+            "TestProfileDatagramNetworkReplayCannotRevive",
+        ):
+            self.assertTrue(anchor in patch, anchor)
+
     def test_codec5_uses_exact_canonical_corpus_without_upgrading_codec4(self) -> None:
         patch = (ADAPTER / "native-full-profile.patch").read_text()
         section = patch.split(

@@ -30496,7 +30496,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux.go
-@@ -0,0 +1,2557 @@
+@@ -0,0 +1,2630 @@
 +//go:build linux
 +
 +package nativehooks
@@ -30745,9 +30745,6 @@ new file mode 100644
 +	// DATA или USER grant в resolver transport authority.
 +	if p.snapshot.order == 2 || p.snapshot.order == 4 || p.snapshot.order == 3 && len(p.snapshot.files(frontier.target.address, true, true)) == 0 {
 +		c.mu.Unlock()
-+		if udp {
-+			return ErrProfileUnsupported
-+		}
 +		return profilePrepareNetworkBootstrap(ctx, root)
 +	}
 +	raw, _ := ctx.Value(profileBootstrapRawKey{}).(bool)
@@ -32004,6 +32001,7 @@ new file mode 100644
 +const profileNetworkWaiterPending = 9
 +
 +type profileNetworkWaiter struct {
++	datagramParent                          *profileDatagramParent
 +	serviceOperation                        *profileOperation
 +	producer                                *profileNetworkBootstrap
 +	ctx                                     context.Context
@@ -32019,6 +32017,9 @@ new file mode 100644
 +	raw, _ := n.ctx.Value(profileBootstrapRawKey{}).(bool)
 +	c := n.runtime.flow
 +	g := n.parent
++	if n.runtime.dnsCodec5 && c.datagramFrontierReady(g, n.frontier) {
++		return raw && c.datagramParentLive(n.datagramParent)
++	}
 +	return raw && n.frontier.count == 1 && n.frontier.branch == 0 && n.frontier.carrier == 6 && g.parent == nil && g.receipt.original.network == 6 && c.manifest.rows[8][g.scope][2] == 6 && g.stream != 65535 && c.manifest.rows[3][g.stream][0] == 1
 +}
 +func profileNetworkMember(n *profileNetworkBootstrap) (profileDestinationValue, uint16, bool) {
@@ -32106,7 +32107,11 @@ new file mode 100644
 +	if w.data.expires.Before(w.deadline) {
 +		w.deadline = w.data.expires
 +	}
-+	w.state.permission = &profileBootstrapPhysicalPermission{network: w, target: target, member: member}
++	if n.datagramParent != nil {
++		w.state.datagram = &profileBootstrapDatagramPermission{network: w, target: target, member: member, producerParent: n.datagramParent}
++	} else {
++		w.state.permission = &profileBootstrapPhysicalPermission{network: w, target: target, member: member}
++	}
 +	n.waiter = w
 +	c.mu.Unlock()
 +	defer func() {
@@ -32118,6 +32123,22 @@ new file mode 100644
 +		c.mu.Unlock()
 +	}()
 +	f := n.frontier
++	if n.datagramParent != nil {
++		binding, e := profileBindDatagramParent(w.ctx, n.parent, f, w.deadline)
++		if e != nil {
++			return e
++		}
++		c.mu.Lock()
++		w.datagramParent = binding
++		w.state.datagram.waiterParent = binding
++		if binding.deadline.Before(w.deadline) {
++			w.deadline = binding.deadline
++		}
++		if binding.cleanupDeadline.Before(w.cleanupDeadline) {
++			w.cleanupDeadline = binding.cleanupDeadline
++		}
++		c.mu.Unlock()
++	}
 +	g, op, err := c.networkProbe(w.ctx, f.endpoint, f.subject, n.resolver)
 +	if err != nil {
 +		return err
@@ -32140,6 +32161,10 @@ new file mode 100644
 +	source.service = g
 +	source.query = c.nextDNSQuery + 1
 +	source.deadline = w.deadline
++	if w.datagramParent != nil {
++		source.datagram = w.datagramParent
++		source.query = w.datagramParent.query
++	}
 +	c.mu.Unlock()
 +	metadata, release, err := ProfileDNSAcquirePhysicalContext(context.WithValue(w.ctx, profileDNSCapture4Key{}, &source))
 +	if err != nil {
@@ -32306,12 +32331,16 @@ new file mode 100644
 +						return bad()
 +					}
 +				case 19:
-+					p := b.permission
-+					p.id = u64(d, 4)
-+					if d[1] != 3 || d[2] != 0 || d[3] != 0 || f.object != p.id || !profileDNSV2ID(p.id) || p.id <= c.highestGrant || u64(d, 12) != 0 || u32(d, 20) < 1 || u32(d, 20) > 1000 || u64(d, 24) != c.manifest.policy || !zero(d[32:]) {
++					id := u64(d, 4)
++					if b.datagram != nil {
++						b.datagram.id = id
++					} else {
++						b.permission.id = id
++					}
++					if d[1] != 3 || d[2] != 0 || d[3] != 0 || f.object != id || !profileDNSV2ID(id) || id <= c.highestGrant || u64(d, 12) != 0 || u32(d, 20) < 1 || u32(d, 20) > 1000 || u64(d, 24) != c.manifest.policy || !zero(d[32:]) {
 +						return bad()
 +					}
-+					c.highestGrant = p.id
++					c.highestGrant = id
 +					remaining = uint64(u32(d, 20)) * uint64(time.Millisecond)
 +				}
 +				if remaining == 0 || remaining > uint64(op.deadline.Sub(op.sent)) {
@@ -32325,7 +32354,11 @@ new file mode 100644
 +					b.receiptDeadline = until
 +				}
 +				if f.kind == 19 {
-+					b.permission.deadline = until
++					if b.datagram != nil {
++						b.datagram.deadline = until
++					} else {
++						b.permission.deadline = until
++					}
 +				}
 +				if cleanup := until.Add(time.Second); cleanup.Before(w.cleanupDeadline) {
 +					w.cleanupDeadline = cleanup
@@ -32356,7 +32389,7 @@ new file mode 100644
 +			}
 +		}
 +		if f.kind == 34 && b.grantClose != 0 && f.reply == b.grantClose {
-+			if w.unknown || b.grantAck != 0 || !profileCloseACK(f, 3, b.permission.id) || !c.clock().Before(w.cleanupDeadline) {
++			if w.unknown || b.grantAck != 0 || !profileCloseACK(f, 3, b.permissionID()) || !c.clock().Before(w.cleanupDeadline) {
 +				w.unknown = true
 +				return true, errProfile
 +			}
@@ -32429,7 +32462,7 @@ new file mode 100644
 +		}
 +		return nil
 +	}
-+	if !c.networkWaiterLive(w) || b.permission.id != 0 && !c.bootstrapPermissionLive(b.permission) {
++	if !c.networkWaiterLive(w) || b.permission != nil && b.permission.id != 0 && !c.bootstrapPermissionLive(b.permission) || b.datagram != nil && b.datagram.id != 0 && !c.datagramPermissionLive(b.datagram) {
 +		c.networkWaiterClose(w)
 +	}
 +	if !w.closed {
@@ -32452,6 +32485,12 @@ new file mode 100644
 +	if w.serviceOperation != nil && !w.serviceOperation.completed {
 +		return nil
 +	}
++	if w.datagramParent != nil {
++		c.datagramParentClose(w.datagramParent)
++		if !w.datagramParent.released {
++			return nil
++		}
++	}
 +	if w.service != nil {
 +		c.closeGrant(w.service)
 +		w.service.pending--
@@ -32465,6 +32504,7 @@ new file mode 100644
 +// Constructor custody, не socket permit. Даже successful Reserved36 этого cut
 +// не публикует Conn, request bytes, RRset или BootstrapPhysicalPermission.
 +type profileNetworkBootstrap struct {
++	datagramParent                                                           *profileDatagramParent
 +	serviceOperation                                                         *profileOperation
 +	sourceCapability                                                         *profileDNSSourceCapability
 +	waiter                                                                   *profileNetworkWaiter
@@ -32500,6 +32540,9 @@ new file mode 100644
 +	if n == nil || n.closed || n.unknown || n.released || n.ctx.Err() != nil || !c.clock().Before(n.deadline) || !c.hostsSnapshotLive(n.runtime, n.snapshot) || n.context != nil && !c.dnsSourceCapabilityLive(n.context, n.sourceCapability) {
 +		return false
 +	}
++	if n.datagramParent != nil && !c.datagramParentLive(n.datagramParent) {
++		return false
++	}
 +	f, _, err := c.hostsParentFrontier(n.parent)
 +	if err != nil || f != n.frontier || n.snapshot.order == 1 || n.snapshot.order == 3 && len(n.snapshot.files(f.target.address, true, true)) != 0 {
 +		return false
@@ -32520,7 +32563,9 @@ new file mode 100644
 +	c := p.flow
 +	c.mu.Lock()
 +	f, deadline, err := c.hostsParentFrontier(root)
-+	if err != nil || !c.dnsSourceFrontierReady(root, f) || !c.hostsSnapshotLive(p, p.snapshot) || ctx.Err() != nil || profileReceiptFrom(ctx) != root.receipt || c.nextDNSQuery >= ^uint64(0)-1 {
++	udp := p.dnsCodec5 && c.datagramFrontierReady(root, f)
++	raw, _ := ctx.Value(profileBootstrapRawKey{}).(bool)
++	if err != nil || !c.dnsSourceFrontierReady(root, f) && !(udp && raw) || !c.hostsSnapshotLive(p, p.snapshot) || ctx.Err() != nil || profileReceiptFrom(ctx) != root.receipt || c.nextDNSQuery >= ^uint64(0)-1 {
 +		c.mu.Unlock()
 +		return ErrProfileUnsupported
 +	}
@@ -32582,6 +32627,21 @@ new file mode 100644
 +		n.deadline = until
 +	}
 +	c.mu.Unlock()
++	if udp {
++		binding, e := profileBindDatagramParent(n.ctx, root, f, n.deadline)
++		if e != nil {
++			return e
++		}
++		c.mu.Lock()
++		n.datagramParent = binding
++		if binding.deadline.Before(n.deadline) {
++			n.deadline = binding.deadline
++		}
++		if binding.cleanupDeadline.Before(n.cleanupDeadline) {
++			n.cleanupDeadline = binding.cleanupDeadline
++		}
++		c.mu.Unlock()
++	}
 +	g, op, err := c.networkProbe(n.ctx, f.endpoint, f.subject, n.resolver)
 +	if err != nil {
 +		return err
@@ -32609,6 +32669,10 @@ new file mode 100644
 +		options |= 16
 +	}
 +	source := &profileDNSCapture4{runtime: p, parent: root, service: g, frontier: f, snapshot: s, query: c.nextDNSQuery + 1, epoch: p.admission.launch.epoch, resolver: n.resolver, qtype: 1, options: options, payload: payload, deadline: n.deadline}
++	if n.datagramParent != nil {
++		source.datagram = n.datagramParent
++		source.query = n.datagramParent.query
++	}
 +	c.mu.Unlock()
 +	metadata, release, err := ProfileDNSAcquirePhysicalContext(context.WithValue(n.ctx, profileDNSCapture4Key{}, source))
 +	if err != nil {
@@ -32671,6 +32735,9 @@ new file mode 100644
 +		if err == nil {
 +			c.mu.Lock()
 +			valid := c.bootstrapPermissionLive(n.waiter.state.permission)
++			if d := n.waiter.state.datagram; d != nil {
++				valid = c.datagramPermissionLive(d)
++			}
 +			if valid {
 +				n.parent.prepared = true
 +			}
@@ -32913,6 +32980,12 @@ new file mode 100644
 +				continue
 +			}
 +			if !n.context.released {
++				continue
++			}
++		}
++		if n.datagramParent != nil {
++			c.datagramParentClose(n.datagramParent)
++			if !n.datagramParent.released {
 +				continue
 +			}
 +		}
@@ -42436,7 +42509,7 @@ diff --git a/common/yonikbroker/profile_dns_direct_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_direct_linux.go
-@@ -0,0 +1,1553 @@
+@@ -0,0 +1,1603 @@
 +//go:build linux
 +
 +package nativehooks
@@ -42749,10 +42822,24 @@ new file mode 100644
 +		if !c.dnsDirectLive(t) {
 +			return errProfile
 +		}
++		if t.network != nil && t.network.datagramParent != nil {
++			return profileDNSDatagramNamespace(t, fd)
++		}
 +		return nil
 +	}
 +	s.waitIO = func(c context.Context, w bool, d time.Time) error { return profileDNSWaitOwned(fd, c, w, d) }
 +	s.readIO = func(b []byte) (size int, result error) {
++		if t.network != nil && t.network.datagramParent != nil {
++			c := t.runtime().flow
++			c.mu.Lock()
++			defer c.mu.Unlock()
++			if !c.dnsDirectLive(t) {
++				return 0, errProfile
++			}
++			if result = profileDNSDatagramNamespace(t, fd); result != nil {
++				return
++			}
++		}
 +		result = fd.withFD(func(number int) error {
 +			flags := unix.MSG_DONTWAIT
 +			if want.network == 17 {
@@ -42764,6 +42851,17 @@ new file mode 100644
 +		return
 +	}
 +	s.writeIO = func(b []byte) (size int, result error) {
++		if t.network != nil && t.network.datagramParent != nil {
++			c := t.runtime().flow
++			c.mu.Lock()
++			defer c.mu.Unlock()
++			if !c.dnsDirectLive(t) {
++				return 0, errProfile
++			}
++			if result = profileDNSDatagramNamespace(t, fd); result != nil {
++				return
++			}
++		}
 +		result = fd.withFD(func(number int) error {
 +			size, result = unix.SendmsgN(number, b, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
 +			return result
@@ -42779,7 +42877,11 @@ new file mode 100644
 +		c := t.runtime().flow
 +		c.mu.Lock()
 +		control := t.network.parent.receipt.association
-+		if !c.dnsDirectLive(t) || control == nil || control.proof == nil {
++		if !c.dnsDirectLive(t) {
++			err = ErrProfileUnsupported
++		} else if t.network.datagramParent != nil {
++			err = profileDNSDatagramNamespace(t, fd)
++		} else if control == nil || control.proof == nil {
 +			err = ErrProfileUnsupported
 +		} else {
 +			err = profileKernelSocketNamespace(control.proof, fd)
@@ -42805,7 +42907,18 @@ new file mode 100644
 +	if !ProfileDNSDirectFactory(ctx) {
 +		return s, errProfile
 +	}
-+	err = unix.Connect(n, peer)
++	if t.network != nil && t.network.datagramParent != nil {
++		c := t.runtime().flow
++		c.mu.Lock()
++		if !c.dnsDirectLive(t) {
++			err = errProfile
++		} else if err = profileDNSDatagramNamespace(t, fd); err == nil {
++			err = unix.Connect(n, peer)
++		}
++		c.mu.Unlock()
++	} else {
++		err = unix.Connect(n, peer)
++	}
 +	if err == unix.EINPROGRESS || err == unix.EALREADY || err == unix.EINTR {
 +		for {
 +			if err = s.waitIO(ctx, true, time.Time{}); err != nil {
@@ -43329,12 +43442,16 @@ new file mode 100644
 +	p := n.runtime
 +	io := p.dnsDirectIO
 +	if io == nil {
-+		if p.proofs == nil || !p.proofs.live() || n.parent.receipt == nil || n.parent.receipt.association == nil {
++		if p.proofs == nil || !p.proofs.live() || n.parent.receipt == nil || n.parent.receipt.association == nil && n.datagramParent == nil {
 +			return nil, ErrProfileUnsupported
 +		}
 +		source := n.parent.receipt.association
 +		p.flow.mu.Lock()
-+		proved := source.proof != nil
++		proved := source != nil && source.proof != nil
++		if n.datagramParent != nil {
++			_, e := profileDatagramIngressFD(n.datagramParent)
++			proved = e == nil && p.flow.datagramParentLive(n.datagramParent)
++		}
 +		p.flow.mu.Unlock()
 +		if !proved {
 +			return nil, ErrProfileUnsupported
@@ -43346,7 +43463,10 @@ new file mode 100644
 +			}
 +			p.flow.mu.Lock()
 +			defer p.flow.mu.Unlock()
-+			if source.proof == nil {
++			if n.datagramParent != nil {
++				return fd, profileDNSDatagramNamespace(n.transport, fd)
++			}
++			if source == nil || source.proof == nil {
 +				return fd, ErrProfileUnsupported
 +			}
 +			return fd, profileKernelSocketNamespace(source.proof, fd)
@@ -43364,6 +43484,9 @@ new file mode 100644
 +	c.buffered += profileDNSDirectCredit
 +	child, cancel := context.WithDeadline(n.ctx, n.deadline)
 +	t := &profileDNSDirect{network: n, ctx: child, cancel: cancel, destination: n.peer, deadline: n.deadline, cleanupDeadline: n.cleanupDeadline, io: *io, epoch: n.context.source.epoch, exchangeReservation: n.reservation, exchange: n.exchange, started: c.clock(), publishDone: make(chan struct{})}
++	if n.datagramParent != nil {
++		t.started = n.op.sent
++	}
 +	n.transport = t
 +	c.dnsDirect[c.dnsDirectUsed] = t
 +	c.dnsDirectUsed++
@@ -47713,7 +47836,7 @@ diff --git a/common/yonikbroker/profile_bootstrap_datagram_socket_linux.go b/com
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_bootstrap_datagram_socket_linux.go
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,484 @@
 +//go:build linux
 +
 +package nativehooks
@@ -47735,6 +47858,7 @@ new file mode 100644
 +
 +// Не TCP permission и не FlowGrant. Один Consumed source → одна effectful send.
 +type profileBootstrapDatagramPermission struct {
++	network                      *profileNetworkWaiter
 +	owner                        *profileHostsObservation
 +	producerParent, waiterParent *profileDatagramParent
 +	id                           uint64
@@ -47745,6 +47869,45 @@ new file mode 100644
 +	conn                         *profileBootstrapDatagramConn
 +	creating, credited           bool
 +}
++
++func (d *profileBootstrapDatagramPermission) runtime() *ProfileRuntime {
++	return d.producerParent.runtime
++}
++func (d *profileBootstrapDatagramPermission) parent() *profileGrant { return d.producerParent.parent }
++func (d *profileBootstrapDatagramPermission) context() context.Context {
++	if d.network != nil {
++		return d.network.ctx
++	}
++	return d.owner.ctx
++}
++func (d *profileBootstrapDatagramPermission) cancel() {
++	if d.network != nil {
++		d.network.cancel()
++	} else {
++		d.owner.cancel()
++	}
++}
++func (d *profileBootstrapDatagramPermission) unknown() {
++	if d.network != nil {
++		d.network.unknown = true
++	} else {
++		d.owner.unknown = true
++	}
++}
++func (c *profileFlowControl) datagramForGrant(g *profileGrant) *profileBootstrapDatagramPermission {
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		if h.root == g && h.datagram != nil {
++			return h.datagram
++		}
++	}
++	for _, n := range c.networkBootstraps[:c.networkBootstrapUsed] {
++		if n.parent == g && n.waiter != nil && n.waiter.state.datagram != nil {
++			return n.waiter.state.datagram
++		}
++	}
++	return nil
++}
++
 +type profileBootstrapDatagramConn struct {
 +	permission                                           *profileBootstrapDatagramPermission
 +	socket                                               *profileDNSOwnedSocket
@@ -47775,6 +47938,15 @@ new file mode 100644
 +	return 0
 +}
 +func (c *profileFlowControl) datagramPermissionLive(d *profileBootstrapDatagramPermission) bool {
++	if d != nil && d.network != nil {
++		w := d.network
++		n := w.producer
++		if d.owner != nil || w.state.datagram != d || !profileDNSV2ID(d.id) || !c.clock().Before(d.deadline) || !c.networkWaiterLive(w) || !c.datagramParentLive(d.producerParent) || !c.datagramParentLive(d.waiterParent) || d.producerParent != n.datagramParent || d.waiterParent != w.datagramParent || d.producerParent == d.waiterParent {
++			return false
++		}
++		target, member, ok := profileNetworkMember(n)
++		return ok && target == d.target && member == d.member && target.network == 17 && d.producerParent.query == n.context.source.query && d.waiterParent.query == w.state.context.source.query
++	}
 +	if d == nil || d.owner == nil || d.owner.datagram != d || d.owner.bootstrap == nil || d.owner.bootstrap.datagram != d || !profileDNSV2ID(d.id) || !c.clock().Before(d.deadline) || !c.bootstrapBaseLive(d.owner) || !c.datagramParentLive(d.producerParent) || !c.datagramParentLive(d.waiterParent) || d.producerParent == d.waiterParent {
 +		return false
 +	}
@@ -47783,10 +47955,10 @@ new file mode 100644
 +}
 +func (s *profileBootstrapDatagramConn) gate() error {
 +	d := s.permission
-+	c := d.owner.runtime.flow
++	c := d.runtime().flow
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
-+	if s.ctx.Err() != nil || !c.datagramPermissionLive(d) || d.owner.root.receipt.udp != d.producerParent.flow {
++	if s.ctx.Err() != nil || !c.datagramPermissionLive(d) || d.parent().receipt.udp != d.producerParent.flow {
 +		return errProfile
 +	}
 +	return nil
@@ -47863,7 +48035,7 @@ new file mode 100644
 +	// Даже uncertain/partial effect расходует единственную попытку, retry нет.
 +	n, e := s.socket.Write(b)
 +	if n != len(b) || e != nil {
-+		s.permission.owner.cancel()
++		s.permission.cancel()
 +		return n, errors.Join(errProfile, e)
 +	}
 +	if err := s.gate(); err != nil {
@@ -47887,7 +48059,7 @@ new file mode 100644
 +		// Downstream callback может ждать USER link, а не raw socket. Отзываем
 +		// только этот packet до join, иначе Close ожидал бы собственный cancel.
 +		s.permission.producerParent.flow.cancel()
-+		s.permission.owner.cancel()
++		s.permission.cancel()
 +		s.result = s.socket.Close()
 +		s.tasks.Wait()
 +		s.managed.Wait()
@@ -47903,7 +48075,7 @@ new file mode 100644
 +	if !ok || len(tasks) != 2 {
 +		return ErrProfileUnsupported
 +	}
-+	if ctx == nil || profileReceiptFrom(ctx) != s.permission.owner.root.receipt || tasks[0] == nil || tasks[1] == nil {
++	if ctx == nil || profileReceiptFrom(ctx) != s.permission.parent().receipt || tasks[0] == nil || tasks[1] == nil {
 +		return errProfile
 +	}
 +	s.mu.Lock()
@@ -47918,7 +48090,7 @@ new file mode 100644
 +	for _, task := range tasks {
 +		go func(f func() error) { defer s.managed.Done(); done <- f() }(task)
 +	}
-+	stop := func() { s.permission.producerParent.flow.cancel(); s.permission.owner.cancel(); s.requestClose() }
++	stop := func() { s.permission.producerParent.flow.cancel(); s.permission.cancel(); s.requestClose() }
 +	wait := ctx.Done()
 +	var result error
 +	for i := 0; i < 2; {
@@ -47942,7 +48114,7 @@ new file mode 100644
 +	if !ok {
 +		return nil
 +	}
-+	if ctx == nil || profileReceiptFrom(ctx) != s.permission.owner.root.receipt {
++	if ctx == nil || profileReceiptFrom(ctx) != s.permission.parent().receipt {
 +		return errProfile
 +	}
 +	context.AfterFunc(ctx, s.requestClose)
@@ -47966,14 +48138,12 @@ new file mode 100644
 +	c := p.flow
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
-+	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
-+		if h.root == g && h.datagram != nil {
-+			v, err := profileValue(target)
-+			if err != nil || v != g.effective || !c.datagramPermissionLive(h.datagram) {
-+				return 0, true, errProfile
-+			}
-+			return len(h.datagram.producerParent.flow.payload), true, nil
++	if d := c.datagramForGrant(g); d != nil {
++		v, err := profileValue(target)
++		if err != nil || v != g.effective || !c.datagramPermissionLive(d) {
++			return 0, true, errProfile
 +		}
++		return len(d.producerParent.flow.payload), true, nil
 +	}
 +	return 0, false, nil
 +}
@@ -47999,13 +48169,7 @@ new file mode 100644
 +	}
 +	c := p.flow
 +	c.mu.Lock()
-+	var d *profileBootstrapDatagramPermission
-+	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
-+		if h.root == g && h.datagram != nil {
-+			d = h.datagram
-+			break
-+		}
-+	}
++	d := c.datagramForGrant(g)
 +	if d == nil {
 +		c.mu.Unlock()
 +		if original.Address != nil && original.Address.Family().IsIP() {
@@ -48014,7 +48178,7 @@ new file mode 100644
 +		return nil, true, ErrProfileUnsupported
 +	}
 +	v, e := profileValue(original)
-+	if e != nil || v != d.owner.frontier.target || profileReceiptFrom(ctx) != g.receipt || !c.datagramPermissionLive(d) || d.attempted || c.profileFDUsed()+1 > 64 || c.profilePendingUsed()+profileDatagramSocketPending > min(64, int(c.manifest.caps[3])) || c.buffered+c.manifest.memoryCredit+profileDatagramSocketCredit > uint64(c.manifest.caps[4]) {
++	if e != nil || v != d.producerParent.frontier.target || profileReceiptFrom(ctx) != g.receipt || !c.datagramPermissionLive(d) || d.attempted || c.profileFDUsed()+1 > 64 || c.profilePendingUsed()+profileDatagramSocketPending > min(64, int(c.manifest.caps[3])) || c.buffered+c.manifest.memoryCredit+profileDatagramSocketCredit > uint64(c.manifest.caps[4]) {
 +		c.mu.Unlock()
 +		return nil, true, ErrProfileUnsupported
 +	}
@@ -48034,20 +48198,20 @@ new file mode 100644
 +	d.creating = false
 +	live := c.datagramPermissionLive(d)
 +	if socket != nil {
-+		d.conn = &profileBootstrapDatagramConn{permission: d, socket: socket, ctx: d.owner.ctx, done: make(chan struct{}), sendDone: make(chan struct{})}
++		d.conn = &profileBootstrapDatagramConn{permission: d, socket: socket, ctx: d.context(), done: make(chan struct{}), sendDone: make(chan struct{})}
 +	}
 +	owned := d.conn
 +	if socket == nil {
 +		if err == nil {
 +			err = errProfile
 +		}
-+		d.owner.unknown = true
++		d.unknown()
 +	}
 +	c.mu.Unlock()
 +	if owned == nil {
 +		return nil, true, err
 +	}
-+	context.AfterFunc(d.owner.ctx, func() { _ = owned.Close() })
++	context.AfterFunc(d.context(), func() { _ = owned.Close() })
 +	if err != nil || !live {
 +		ce := owned.Close()
 +		return nil, true, errors.Join(errProfile, err, ce)
@@ -48056,8 +48220,7 @@ new file mode 100644
 +}
 +
 +func profileCreateBootstrapDatagramSocket(d *profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
-+	h := d.owner
-+	p := h.runtime
++	p := d.runtime()
 +	c := p.flow
 +	c.mu.Lock()
 +	live := c.datagramPermissionLive(d)
@@ -48094,7 +48257,7 @@ new file mode 100644
 +		return nil, err
 +	}
 +	fd := profileDNSOwnFD(n)
-+	life, cancel := context.WithDeadline(h.ctx, d.deadline)
++	life, cancel := context.WithDeadline(d.context(), d.deadline)
 +	s := &profileDNSOwnedSocket{ctx: life, cancel: cancel, fd: fd, destination: d.target, remote: profileDNSOwnedAddress{"udp", net.JoinHostPort(d.target.address, strconv.Itoa(int(d.target.port)))}, closeFD: fd.Close}
 +	s.gateIO = func() error {
 +		c.mu.Lock()
@@ -59226,4 +59389,666 @@ new file mode 100644
 +      "patches": []
 +    }
 +  ]
++}
+diff --git a/common/yonikbroker/profile_bootstrap_datagram_network_linux.go b/common/yonikbroker/profile_bootstrap_datagram_network_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_bootstrap_datagram_network_linux.go
+@@ -0,0 +1,32 @@
++//go:build linux
++
++package nativehooks
++
++// Вызывается под flow.mu. Namespace — от actual retained UDP ingress duplicate,
++// не от TCP control/cookie/child metadata. Resolver protocol независим от parent.
++func profileDNSDatagramNamespace(t *profileDNSDirect, fd profileProofFD) error {
++	n := t.network
++	if n == nil || n.datagramParent == nil || !t.runtime().flow.datagramParentLive(n.datagramParent) {
++		return errProfile
++	}
++	source, err := profileDatagramIngressFD(n.datagramParent)
++	if err != nil {
++		return err
++	}
++	return profileKernelSocketNamespace(source, fd)
++}
++
++func profileDatagramIngressFD(b *profileDatagramParent) (profileProofFD, error) {
++	u := b.flow
++	r, ok := u.producer.association.receiver.(*profileOSUDPReceiver)
++	if !ok {
++		return nil, ErrProfileUnsupported
++	}
++	r.mu.Lock()
++	source, closed := r.fd, r.closed
++	r.mu.Unlock()
++	if closed || source == nil {
++		return nil, ErrProfileUnsupported
++	}
++	return source, nil
++}
+diff --git a/common/yonikbroker/profile_bootstrap_datagram_network_linux_test.go b/common/yonikbroker/profile_bootstrap_datagram_network_linux_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/yonikbroker/profile_bootstrap_datagram_network_linux_test.go
+@@ -0,0 +1,620 @@
++//go:build linux
++
++package nativehooks
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"golang.org/x/net/dns/dnsmessage"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestProfileDatagramNetworkCleanupKeepsServiceUntilResourceAndBindings(t *testing.T) {
++	h, op := datagramNetworkNumericWithCarrier(t, 2, false)
++	if h.f.c.dispatch(op) != nil || h.f.c.accept(networkNumericGrant(op)) != nil || <-h.done != nil {
++		t.Fatal("Numeric")
++	}
++	d := h.n.waiter.state.datagram
++	h.f.p.datagramIO = func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++		life, cancel := context.WithCancel(d.context())
++		return &profileDNSOwnedSocket{ctx: life, cancel: cancel, destination: d.target, closeFD: func() error { return nil }}, nil
++	}
++	conn, _, err := ProfileDialBootstrapDatagram(h.n.ctx, profileNumericDestination(h.n.frontier.target))
++	if err != nil || conn.Close() != nil {
++		t.Fatal(err)
++	}
++	index := len(h.f.writes)
++	var held *profileOperation
++	delayed := false
++	for step := 0; step < 100 && !h.n.released; step++ {
++		if h.f.c.tick() != nil {
++			t.Fatal("cleanup tick")
++		}
++		packets := append([]profilePacket(nil), h.f.writes[index:]...)
++		index = len(h.f.writes)
++		for _, p := range packets {
++			switch p.kind {
++			case 32:
++				id := u64(p.body, 4)
++				if id == h.n.service.id && (!h.n.transport.released || !h.n.context.released || !h.n.datagramParent.released) {
++					t.Fatal("producer service before custody barriers")
++				}
++				if id == h.n.waiter.service.id && !h.n.waiter.datagramParent.released {
++					t.Fatal("waiter service before binding9")
++				}
++				b := append([]byte(nil), p.body...)
++				b[1] = 1
++				if h.f.c.accept(profilePacket{kind: 34, reply: p.sequence, body: b}) != nil {
++					t.Fatal("Close ACK")
++				}
++			case 47:
++				b := make([]byte, 32)
++				be.PutUint16(b, 2)
++				b[2] = 1
++				be.PutUint64(b[8:], u64(p.body, 8))
++				be.PutUint64(b[16:], h.f.c.lastSent)
++				if h.f.c.accept(profilePacket{kind: 48, reply: p.sequence, body: b}) != nil {
++					t.Fatal("cancel ACK", p.body[2])
++				}
++			case 45:
++				var retire *profileOperation
++				for _, r := range h.n.transport.requests[:h.n.transport.used] {
++					if r.sequence == p.sequence {
++						retire = r
++					}
++				}
++				if retire == nil {
++					t.Fatal("retire owner")
++				}
++				if p.body[2] == 3 && !delayed {
++					held = retire
++					delayed = true
++					continue
++				}
++				if h.f.c.accept(dnsFactoryRetired(retire, 1)) != nil {
++					t.Fatal("retired")
++				}
++			default:
++				t.Fatal("unexpected cleanup", p.kind)
++			}
++		}
++		if held != nil {
++			for i := 0; i < 3; i++ {
++				if h.f.c.tick() != nil {
++					t.Fatal("delayed tick")
++				}
++			}
++			if h.n.service.cancelSent || h.n.released || h.n.service.networkCleanupRefs != 1 || h.f.c.dnsCleanupResult() == nil {
++				t.Fatal("Resource wait lost custody")
++			}
++			if h.f.c.accept(dnsFactoryRetired(held, 1)) != nil {
++				t.Fatal("late Resource ACK")
++			}
++			held = nil
++		}
++		// Actual Close callback имеет собственный consuming join.
++		if h.n.closed && h.n.result.released && h.n.result.networkConn.Close() != nil {
++			t.Fatal("DNS close")
++		}
++	}
++	if !h.n.released || !h.n.waiter.released || h.f.c.operations != 0 || h.f.c.dnsFDUsed != profileRXFD || h.f.c.physicalFDs != 0 || h.f.c.dnsCleanupResult() != nil {
++		t.Fatal("incomplete known cleanup", h.f.c.operations)
++	}
++	if !delayed || h.f.p.ctx.Err() != nil {
++		t.Fatal("missing delay/neighbor cancelled")
++	}
++}
++
++func TestProfileDatagramNetworkFencesAndUnknown(t *testing.T) {
++	for _, fault := range []string{"member", "port", "carrier", "parent", "binding", "epoch", "snapshot", "cancel", "expired", "close-error", "late-grant"} {
++		t.Run(fault, func(t *testing.T) {
++			h, op := datagramNetworkNumericWithCarrier(t, 2, false)
++			if h.f.c.dispatch(op) != nil {
++				t.Fatal("dispatch")
++			}
++			if fault == "late-grant" {
++				h.n.waiter.cancel()
++			}
++			if h.f.c.accept(networkNumericGrant(op)) != nil {
++				t.Fatal("reply")
++			}
++			e := <-h.done
++			if fault == "late-grant" {
++				if e == nil || h.f.p.ctx.Err() != nil {
++					t.Fatal("late grant published")
++				}
++				return
++			}
++			if e != nil {
++				t.Fatal(e)
++			}
++			d := h.n.waiter.state.datagram
++			switch fault {
++			case "member":
++				d.member++
++			case "port":
++				d.target.port++
++			case "carrier":
++				d.target.network = 6
++			case "parent":
++				h.n.parent.closed = true
++			case "binding":
++				d.waiterParent = d.producerParent
++			case "epoch":
++				d.waiterParent.epoch++
++			case "snapshot":
++				h.f.p.snapshot = nil
++			case "cancel":
++				h.n.waiter.cancel()
++			case "expired":
++				h.f.now = d.deadline
++			}
++			calls := 0
++			h.f.p.datagramIO = func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++				calls++
++				life, cancel := context.WithCancel(d.context())
++				return &profileDNSOwnedSocket{ctx: life, cancel: cancel, destination: d.target, closeFD: func() error { return errors.New("uncertain close") }}, nil
++			}
++			conn, _, err := ProfileDialBootstrapDatagram(h.n.ctx, profileNumericDestination(h.n.frontier.target))
++			if fault != "close-error" {
++				if err == nil || calls != 0 {
++					t.Fatal("invalid source reached factory")
++				}
++				return
++			}
++			if err != nil || conn.Close() == nil || conn.Close() == nil {
++				t.Fatal("sticky close")
++			}
++			if h.f.c.tick() != nil || !h.n.waiter.unknown || h.n.waiter.released || h.n.released || !d.credited {
++				t.Fatal("Unknown lost custody")
++			}
++		})
++	}
++}
++
++func datagramNetworkFixture(t *testing.T, tcp bool, modes ...byte) (*flowFixture, context.Context) {
++	t.Helper()
++	f, ctx := datagramHostsFixture(t, modes...)
++	b, _ := syntheticProfileSnapshot()
++	b[152] = 2
++	copy(b[172:176], []byte{192, 0, 2, 53})
++	if tcp {
++		be.PutUint16(b[160:], 16|4)
++	}
++	networkBootstrapSnapshot(t, f, b, tcp)
++	f.p.dnsID = func() uint16 { return 0x1234 }
++	return f, ctx
++}
++
++func TestProfileDatagramNetworkActualNumericAndConsumingSend(t *testing.T) {
++	for _, mode := range []byte{1, 2} {
++		for _, tcp := range []bool{false, true} {
++			t.Run(fmtBool(tcp)+fmtBool(mode == 2), func(t *testing.T) {
++				h, op := datagramNetworkNumericWithCarrier(t, mode, tcp)
++				if h.f.c.dispatch(op) != nil || h.f.c.accept(networkNumericGrant(op)) != nil || <-h.done != nil {
++					t.Fatal("Numeric")
++				}
++				w := h.n.waiter
++				d := w.state.datagram
++				if d == nil || w.state.permission != nil || d.producerParent == d.waiterParent || d.parent() != h.n.parent || !h.f.c.datagramPermissionLive(d) {
++					t.Fatal("UDP authority alias")
++				}
++				if h.n.transport.started != h.n.op.sent || h.n.transport.destination != h.n.peer || h.n.peer.network == 6 && !tcp {
++					t.Fatal("resolver/anchor")
++				}
++				writes, closes := 0, 0
++				h.f.p.datagramIO = func(got *profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++					if got != d || !h.f.c.datagramPermissionLive(d) {
++						return nil, errProfile
++					}
++					life, cancel := context.WithCancel(d.context())
++					return &profileDNSOwnedSocket{ctx: life, cancel: cancel, destination: d.target, gateIO: func() error {
++						h.f.c.mu.Lock()
++						defer h.f.c.mu.Unlock()
++						if !h.f.c.datagramPermissionLive(d) {
++							return errProfile
++						}
++						return nil
++					}, writeIO: func(b []byte) (int, error) { writes++; return len(b), nil }, closeFD: func() error { closes++; return nil }}, nil
++				}
++				conn, handled, err := ProfileDialBootstrapDatagram(h.n.ctx, profileNumericDestination(h.n.frontier.target))
++				if !handled || err != nil {
++					t.Fatal("SS physical owner", err)
++				}
++				if _, err = conn.Write([]byte("one SS ciphertext")); err != nil {
++					t.Fatal(err)
++				}
++				if _, err = conn.Write([]byte("replay")); err == nil || writes != 1 {
++					t.Fatal("packet reuse")
++				}
++				if conn.Close() != nil || conn.Close() != nil || closes != 1 {
++					t.Fatal("consuming close")
++				}
++				if h.f.p.ctx.Err() != nil {
++					t.Fatal("neighbor/session cancelled")
++				}
++			})
++		}
++	}
++}
++
++func datagramNetworkTransportStart(t *testing.T, mode byte, tcp bool, inspect error, block <-chan struct{}, raw ...bool) *networkTransportHarness {
++	t.Helper()
++	f, ctx := datagramNetworkFixture(t, tcp, mode)
++	done := make(chan error, 1)
++	go func() { done <- ProfilePrepareChain(ctx, nil) }()
++	h := &networkTransportHarness{f: f, done: done, factory: make(chan struct{}), proof: make(chan []byte, 1), conn: &dnsDirectFakeConn{}, fd: &proofFakeFD{}}
++	parent := h.next(t, 57)
++	if f.c.accept(datagramBound(parent, 10)) != nil {
++		t.Fatal("producer binding")
++	}
++	root := h.next(t, 20)
++	if f.c.accept(serviceReply(f, root)) != nil {
++		t.Fatal("service")
++	}
++	ctxop := h.next(t, 55)
++	if u64(ctxop.body, 16) != parent.datagramParent.query || ctxop.dnsContext4.source.datagram != parent.datagramParent {
++		t.Fatal("parent query")
++	}
++	if f.c.accept(dnsBundleReply(ctxop, 1100, 1)) != nil {
++		t.Fatal("context")
++	}
++	exchange := h.next(t, 35)
++	h.n = exchange.networkBootstrap
++	if exchange.body[76] != 17 || h.n.peer.network == 17 && tcp || h.n.peer.network == 6 && !tcp {
++		t.Fatal("carrier conflation")
++	}
++	f.p.dnsDirectIO = &profileDNSDirectIO{create: func(ctx context.Context, want profileDestinationValue) (*profileDNSOwnedSocket, error) {
++		if !ProfileDNSDirectFactory(ctx) || want != h.n.peer || !h.n.replied {
++			return nil, errProfile
++		}
++		close(h.factory)
++		if block != nil {
++			<-block
++		}
++		owner := ctx.Value(profileDNSFactoryKey{}).(*profileDNSDirect)
++		life, cancel := context.WithCancel(owner.ctx)
++		h.socket = &profileDNSOwnedSocket{ctx: life, cancel: cancel, destination: want, fd: &proofFakeFD{}, readIO: h.conn.Read, writeIO: h.conn.Write, closeFD: h.conn.Close, waitIO: func(context.Context, bool, time.Time) error { return errProfile }}
++		return h.socket, nil
++	}, duplicate: func(s *profileDNSOwnedSocket, want profileDestinationValue) (profileProofFD, error) {
++		if s != h.socket || want != h.n.peer {
++			return nil, errProfile
++		}
++		return h.fd, inspect
++	}, send: func(raw []byte, fd profileProofFD) error {
++		if fd != h.fd || !profileDNSV5Envelope(f.p.admission.launch, raw, false, 1, 1, 0) {
++			return errProfile
++		}
++		h.proof <- append([]byte(nil), raw...)
++		return nil
++	}}
++	if f.c.accept(networkBootstrapReserved(exchange)) != nil {
++		t.Fatal("resolver permit")
++	}
++	h.physical = h.next(t, 35)
++	select {
++	case <-h.factory:
++		t.Fatal("factory before physical permit")
++	default:
++	}
++	return h
++}
++
++func TestProfileDatagramNetworkActualCallerRequiresParentBind(t *testing.T) {
++	f, ctx := datagramNetworkFixture(t, false)
++	done := make(chan error, 1)
++	go func() { done <- ProfilePrepareChain(ctx, nil) }()
++	select {
++	case op := <-f.p.flowQueue:
++		if op.kind != 57 || f.c.dispatch(op) != nil {
++			t.Fatal("NETWORK before private57", op.kind)
++		}
++		select {
++		case <-f.p.flowQueue:
++			t.Fatal("effects before58")
++		default:
++		}
++		b := make([]byte, 64)
++		be.PutUint16(b, 2)
++		b[2] = 2
++		if f.c.accept(profilePacket{kind: 58, reply: op.sequence, body: b}) != nil || <-done == nil {
++			t.Fatal("denial")
++		}
++	case err := <-done:
++		t.Fatal("NETWORK stopped before57", err)
++	case <-time.After(time.Second):
++		t.Fatal("missing actual caller")
++	}
++}
++
++func TestProfileDatagramNetworkTransportProofAndLogicalBarriers(t *testing.T) {
++	for _, fault := range []string{"peer", "namespace", "closed-parent", "mixed-schema", "wrong-physical-ACK", "wrong-logical-ACK", "cancel-factory"} {
++		t.Run(fault, func(t *testing.T) {
++			var inspect error
++			if fault == "peer" || fault == "namespace" {
++				inspect = errors.New(fault)
++			}
++			var block chan struct{}
++			if fault == "cancel-factory" {
++				block = make(chan struct{})
++			}
++			h := datagramNetworkTransportStart(t, 2, false, inspect, block)
++			reply := networkTransportReply(h.physical)
++			switch fault {
++			case "closed-parent":
++				h.n.parent.closed = true
++			case "mixed-schema":
++				h.f.p.dnsCodec5 = false
++			case "wrong-physical-ACK":
++				reply.body[24] ^= 1
++			}
++			_ = h.f.c.accept(reply)
++			if fault == "cancel-factory" {
++				<-h.factory
++				h.n.cancel()
++				if h.f.c.tick() != nil || h.n.released || !h.n.constructing || h.n.service.cancelSent {
++					t.Fatal("factory handoff custody")
++				}
++				close(block)
++			}
++			if fault == "wrong-logical-ACK" {
++				proof := h.next(t, 52)
++				<-h.proof
++				if h.f.c.accept(networkTransportReply(proof)) != nil {
++					t.Fatal("proof ACK")
++				}
++				logical := h.next(t, 38)
++				reply = networkTransportReply(logical)
++				be.PutUint64(reply.body[40:], 2)
++				_ = h.f.c.accept(reply)
++			}
++			if err := <-h.done; err == nil || h.conn.writes != 0 || h.n.waiter != nil || h.f.p.ctx.Err() != nil {
++				t.Fatal("unproved transport reached query/neighbor")
++			}
++			if fault == "peer" || fault == "namespace" {
++				select {
++				case <-h.proof:
++					t.Fatal("uninspected resource exported")
++				default:
++				}
++			}
++		})
++	}
++}
++
++func TestProfileDatagramNetworkStrictTranscriptBeforePublish(t *testing.T) {
++	for _, fault := range []string{"question", "id", "TC", "class", "TTL"} {
++		t.Run(fault, func(t *testing.T) {
++			h, logical := datagramNetworkExchangeStart(t, 2, false, func(m *dnsmessage.Message) {
++				switch fault {
++				case "question":
++					m.Questions[0].Name = dnsmessage.MustNewName("foreign.invalid.")
++				case "id":
++					m.ID++
++				case "TC":
++					m.Truncated = true
++				case "class":
++					m.Answers[0].Header.Class = dnsmessage.ClassCHAOS
++				case "TTL":
++					m.Answers[0].Header.TTL = 0
++				}
++			}, true)
++			if h.f.c.accept(networkTransportReply(logical)) != nil {
++				t.Fatal("logical ACK")
++			}
++			select {
++			case op := <-h.f.p.flowQueue:
++				t.Fatal("invalid transcript reached Publish", op.kind)
++			case err := <-h.done:
++				if err == nil || h.n.waiter != nil || h.n.result.data.id != 0 {
++					t.Fatal("invalid answer authority")
++				}
++			case <-time.After(time.Second):
++				t.Fatal("missing denial")
++			}
++		})
++	}
++}
++
++func TestProfileDatagramNetworkIndependentWaiterAndBudgetDenial(t *testing.T) {
++	for _, fault := range []string{"reserve-query", "reserve-context", "reserve-epoch", "reserve-transport", "reserve-lease", "bind-producer", "bind-reservation", "bind-query", "bind-epoch", "bind-lease"} {
++		t.Run(fault, func(t *testing.T) {
++			h, _ := datagramNetworkNumericWithCarrier(t, 2, false, fault)
++			if h.n.waiter.state.datagram.id != 0 || !h.n.waiter.unknown || h.f.p.ctx.Err() != nil {
++				t.Fatal("foreign waiter promoted")
++			}
++		})
++	}
++	for _, fault := range []string{"FD", "pending", "memory"} {
++		t.Run(fault, func(t *testing.T) {
++			h, op := datagramNetworkNumericWithCarrier(t, 2, false)
++			if h.f.c.dispatch(op) != nil || h.f.c.accept(networkNumericGrant(op)) != nil || <-h.done != nil {
++				t.Fatal("numeric")
++			}
++			c := h.f.c
++			switch fault {
++			case "FD":
++				c.physicalFDs += 64 - c.profileFDUsed()
++			case "pending":
++				c.operations += 64 - c.profilePendingUsed()
++			case "memory":
++				c.buffered = uint64(c.manifest.caps[4]) - c.manifest.memoryCredit
++			}
++			calls := 0
++			h.f.p.datagramIO = func(*profileBootstrapDatagramPermission) (*profileDNSOwnedSocket, error) {
++				calls++
++				return nil, errProfile
++			}
++			if _, _, err := ProfileDialBootstrapDatagram(h.n.ctx, profileNumericDestination(h.n.frontier.target)); err == nil || calls != 0 || h.n.waiter.state.datagram.attempted || h.f.p.ctx.Err() != nil {
++				t.Fatal("uncredited factory/local denial revoked neighbor")
++			}
++		})
++	}
++}
++
++func TestProfileDatagramNetworkReplayCannotRevive(t *testing.T) {
++	h, op := datagramNetworkNumericWithCarrier(t, 2, false)
++	if h.f.c.dispatch(op) != nil {
++		t.Fatal("dispatch")
++	}
++	reply := networkNumericGrant(op)
++	if h.f.c.accept(reply) != nil || <-h.done != nil {
++		t.Fatal("grant")
++	}
++	if h.f.c.accept(reply) == nil || !h.n.waiter.unknown || h.f.c.datagramPermissionLive(h.n.waiter.state.datagram) {
++		t.Fatal("replayed grant remained usable")
++	}
++	if h.f.p.ctx.Err() != nil {
++		t.Fatal("neighbor revoked")
++	}
++}
++
++func datagramNetworkExchangeStart(t *testing.T, mode byte, tcp bool, change func(*dnsmessage.Message), raw ...bool) (*networkTransportHarness, *profileOperation) {
++	t.Helper()
++	h := datagramNetworkTransportStart(t, mode, tcp, nil, nil, raw...)
++	h.f.p.dnsID = func() uint16 { return 0x1234 }
++	if h.f.c.accept(networkTransportReply(h.physical)) != nil {
++		t.Fatal("Physical Reserve")
++	}
++	proof := h.next(t, 52)
++	<-h.proof
++	if h.f.c.accept(networkTransportReply(proof)) != nil {
++		t.Fatal("Physical ACK")
++	}
++	logical := h.next(t, 38)
++	var response *bytes.Reader
++	h.socket.writeIO = func(b []byte) (int, error) {
++		h.conn.mu.Lock()
++		h.conn.writes++
++		h.conn.mu.Unlock()
++		raw := b
++		if tcp {
++			if len(b) < 2 || int(u16(b, 0)) != len(b)-2 {
++				return 0, errProfile
++			}
++			raw = b[2:]
++		}
++		var m dnsmessage.Message
++		if m.Unpack(raw) != nil || len(m.Questions) != 1 {
++			return 0, errProfile
++		}
++		m.Response = true
++		m.Answers = []dnsmessage.Resource{{Header: dnsmessage.ResourceHeader{Name: m.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 30}, Body: &dnsmessage.AResource{A: [4]byte{203, 0, 113, 7}}}}
++		m.Additionals = nil
++		if change != nil {
++			change(&m)
++		}
++		reply, err := m.Pack()
++		if err != nil {
++			return 0, err
++		}
++		if tcp {
++			prefix := make([]byte, 2)
++			be.PutUint16(prefix, uint16(len(reply)))
++			reply = append(prefix, reply...)
++		}
++		response = bytes.NewReader(reply)
++		return len(b), nil
++	}
++	h.socket.readIO = func(b []byte) (int, error) {
++		if response == nil {
++			return 0, errProfile
++		}
++		return response.Read(b)
++	}
++	return h, logical
++}
++
++func datagramNetworkNumericWithCarrier(t *testing.T, mode byte, tcp bool, fault ...string) (*networkTransportHarness, *profileOperation) {
++	t.Helper()
++	h, logical := datagramNetworkExchangeStart(t, mode, tcp, nil, true)
++	op := networkExchangePublish(t, h, logical)
++	if h.f.c.dispatch(op) != nil || h.f.c.accept(networkPublished(op)) != nil {
++		t.Fatal("Published")
++	}
++	parent := h.next(t, 57)
++	if h.f.c.accept(datagramBound(parent, 20)) != nil {
++		t.Fatal("waiter parent")
++	}
++	root := h.next(t, 20)
++	if root.grant == h.n.service || root.grant.receipt != nil || root.grant.class != 3 || root.grant.purpose != 2 {
++		t.Fatal("fresh waiter service")
++	}
++	if h.f.c.accept(serviceReply(h.f, root)) != nil {
++		t.Fatal("waiter root ACK")
++	}
++	context := h.next(t, 55)
++	if u64(context.body, 8) != root.grant.id || u64(context.body, 16) == h.n.context.source.query || u16(context.body, 48) != 8 {
++		t.Fatal("fresh context/query")
++	}
++	if h.f.c.accept(dnsBundleReply(context, 1400, 1)) != nil {
++		t.Fatal("waiter context ACK")
++	}
++	reserve := h.next(t, 35)
++	if reserve.body[2] != 3 || u64(reserve.body, 16) != 1400 || u64(reserve.body, 24) != root.grant.id || u64(reserve.body, 32) != 0 || u64(reserve.body, 40) != 0 || reserve.body[74] != 2 || reserve.body[75] != 1 {
++		t.Fatal("NETWORK waiter reservation")
++	}
++	b := make([]byte, 64)
++	be.PutUint16(b, 2)
++	b[2] = 1
++	for _, v := range []struct {
++		at int
++		v  uint64
++	}{{8, 1401}, {16, u64(reserve.body, 8)}, {24, 1400}, {40, h.n.context.source.epoch}, {48, u64(reserve.body, 56)}} {
++		be.PutUint64(b[v.at:], v.v)
++	}
++	be.PutUint16(b[58:], 1)
++	b[60] = 3
++	if len(fault) != 0 && strings.HasPrefix(fault[0], "reserve-") {
++		at := map[string]int{"reserve-query": 16, "reserve-context": 24, "reserve-epoch": 40, "reserve-transport": 32, "reserve-lease": 48}[fault[0]]
++		be.PutUint64(b[at:], u64(b, at)+1)
++		if h.f.c.accept(profilePacket{kind: 36, reply: reserve.sequence, body: b}) == nil || <-h.done == nil || !h.n.waiter.unknown {
++			t.Fatal("foreign reservation accepted")
++		}
++		return h, nil
++	}
++	if h.f.c.accept(profilePacket{kind: 36, reply: reserve.sequence, body: b}) != nil {
++		t.Fatal("waiter Reserved")
++	}
++	bind := h.next(t, 53)
++	if u64(bind.body, 8) != 1401 || u64(bind.body, 16) != 1300 || u64(bind.body, 24) != root.grant.id || u64(bind.body, 32) != u64(reserve.body, 8) || u64(bind.body, 40) != 0 || u64(bind.body, 48) != 0 {
++		t.Fatal("producer ID aliased/bound wrong root")
++	}
++	b = make([]byte, 64)
++	be.PutUint16(b, 2)
++	b[2] = 1
++	for _, v := range []struct {
++		at int
++		v  uint64
++	}{{8, 1402}, {16, 1300}, {24, 1401}, {32, u64(bind.body, 32)}, {40, h.n.context.source.epoch}, {48, u64(bind.body, 56)}} {
++		be.PutUint64(b[v.at:], v.v)
++	}
++	be.PutUint16(b[56:], 1)
++	b[58], b[59] = 1, 2
++	if len(fault) != 0 && strings.HasPrefix(fault[0], "bind-") {
++		at := map[string]int{"bind-producer": 16, "bind-reservation": 24, "bind-query": 32, "bind-epoch": 40, "bind-lease": 48}[fault[0]]
++		be.PutUint64(b[at:], u64(b, at)+1)
++		if h.f.c.accept(profilePacket{kind: 54, reply: bind.sequence, body: b}) == nil || <-h.done == nil || !h.n.waiter.unknown {
++			t.Fatal("foreign waiter accepted")
++		}
++		return h, nil
++	}
++	if h.f.c.accept(profilePacket{kind: 54, reply: bind.sequence, body: b}) != nil {
++		t.Fatal("WaiterBound")
++	}
++	select {
++	case numeric := <-h.f.p.flowQueue:
++		if numeric.kind != 42 {
++			t.Fatal("missing Numeric42")
++		}
++		return h, numeric
++	case err := <-h.done:
++		t.Fatal("early caller", err)
++	case <-time.After(time.Second):
++		t.Fatal("missing Numeric42")
++	}
++	return nil, nil
 +}
