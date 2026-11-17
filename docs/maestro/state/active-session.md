@@ -858,6 +858,15 @@ Hysteria SOURCE blocker: совместимость native socket wrapper и QUI
   Exact final patch проходит отдельную проверку трёх CODEC4 producer contracts;
   protected pins/capture/public gates пока false, runtime не запускался.
 
+- R74 narrow SOURCE scoped CLEAN: capability wiring eacbcc3 интегрирован.
+  Bool удалён; setup даёт private DATA-ready planning, exact authenticated ACK56
+  создаёт retained per-context Source token. Effect callers требуют именно его;
+  cancel/renew/expiry/source/context substitution инвалидируют старый token.
+  Digest3c156ca03b36d22d94a5f8cadfd42705a80833f45f65c17cb210fe6a2705b3ec
+  SOURCE-eligible для трёх независимых CODEC4 contracts прежнего single raw TCP
+  subset. Source ACK не выдаёт transcript/release authority. Protected helper
+  binding ещё реализуется; pins/public gates не открыты, runtime не запускался.
+
 Сохранить шифрование, границы размеров, проверку возможностей, lifecycle,
 native broker и авторизацию. Произвольный JSON не становится System authority.
 Go разрешён только в описанных observatory и P4 transport scopes. Изменение
