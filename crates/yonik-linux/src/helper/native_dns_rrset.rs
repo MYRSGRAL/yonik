@@ -201,6 +201,12 @@ fn unicast(ip: IpAddr) -> bool {
         }
     }
 }
+pub(super) fn numeric_ip_allowed(ip: IpAddr) -> bool {
+    unicast(ip)
+        && !ip.is_loopback()
+        && !matches!(ip,IpAddr::V4(ip) if ip.is_link_local())
+        && !matches!(ip,IpAddr::V6(ip) if ip.is_unicast_link_local())
+}
 // Все scratch buffers заранее учтены caller; parser не аллоцирует.
 const SCRATCH: usize =
     std::mem::size_of::<Answer>() + (CHAIN + 4) * std::mem::size_of::<Name>() + 4096;
@@ -833,12 +839,7 @@ impl<A: Authority> Issuer<A> {
             IpAddr::V4(ip) => d.family == 4 && d.bytes == ip.octets(),
             IpAddr::V6(ip) => d.family == 6 && d.bytes == ip.octets(),
         };
-        if !equal
-            || !unicast(*member)
-            || member.is_loopback()
-            || matches!(member,IpAddr::V4(ip) if ip.is_link_local())
-            || matches!(member,IpAddr::V6(ip) if ip.is_unicast_link_local())
-        {
+        if !equal || !numeric_ip_allowed(*member) {
             return Err(ServiceError::InvalidRequest);
         }
         Ok(())
@@ -917,7 +918,9 @@ impl<A: Authority> Issuer<A> {
             return Err(ServiceError::Unavailable);
         }
         let checked = self.checked_numeric(v, session)?;
-        if self.grants.len() + self.services.len() >= self.capsule()?.limits()[0] as usize {
+        if self.grants.len() + self.services.len() + self.hosts_permission_count()
+            >= self.capsule()?.limits()[0] as usize
+        {
             return Err(ServiceError::Busy);
         }
         let memory = self
@@ -1080,6 +1083,7 @@ impl<A: Authority> Issuer<A> {
         if self.unknown {
             return Err(ServiceError::Unavailable);
         }
+        self.retire_hosts_permissions()?;
         let mut ids = [0; 4096];
         let mut count = 0;
         for (id, grant) in &self.grants {
@@ -1106,6 +1110,11 @@ pub(super) fn dispatch_numeric<A: Authority>(
     session: Instant,
     mut drain: impl FnMut(&mut Issuer<A>) -> Result<(), ServiceError>,
 ) -> Result<(), ServiceError> {
+    if view.bootstrap_selector().map_err(unavailable)?.is_some() {
+        return super::dns_bundle::roots::dispatch_hosts_numeric(
+            issuer, socket, stop, sequence, request, view, session, drain,
+        );
+    }
     let response_until = session.min(issuer.authority.now() + Duration::from_secs(1));
     let outcome = issuer.authorize_numeric(request, view, session);
     loop {

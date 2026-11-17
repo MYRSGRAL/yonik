@@ -81,6 +81,8 @@ fn dns_rrset_queue_credit_precedes_materialization_and_rx_bound_is_fixed() {
 
 // Весь driver below — in-memory: ни OS endpoint, ни runtime wrappers.
 pub(super) struct BundleIo {
+    pub(super) after_sent: Option<Box<dyn Fn(usize)>>,
+    pub(super) deferred: Option<Arc<std::sync::Mutex<Vec<Vec<u8>>>>>,
     pub(super) fail_write_at: Option<usize>,
     pub(super) delay_write_at: usize,
     pub(super) on_request: Option<Box<dyn Fn(u64)>>,
@@ -126,8 +128,26 @@ pub(super) fn dns_packet(
     bytes[..n].to_vec()
 }
 impl BundleIo {
+    fn hold_reply(&self) -> Result<bool, ServiceError> {
+        if self.fail_write_at == Some(self.output.borrow().len() + 1) {
+            return Err(ServiceError::Unavailable);
+        }
+        let elapsed =
+            if self.delay_write_at == 0 || self.delay_write_at == self.output.borrow().len() + 1 {
+                self.delayed_send.borrow_mut().take()
+            } else {
+                None
+            };
+        if let Some(elapsed) = elapsed {
+            elapsed.fetch_add(25_000_000, Ordering::AcqRel);
+            return Ok(true);
+        }
+        Ok(false)
+    }
     pub(super) fn new(record: LaunchRecord, requests: Vec<Vec<u8>>) -> Self {
         Self {
+            after_sent: None,
+            deferred: None,
             fail_write_at: None,
             delay_write_at: 0,
             on_request: None,
@@ -191,6 +211,11 @@ impl Channel for BundleIo {
         _: u32,
         out: &mut [u8; RUNTIME_PACKET],
     ) -> Result<Option<usize>, ServiceError> {
+        if let Some(deferred) = &self.deferred {
+            self.input
+                .borrow_mut()
+                .extend(deferred.lock().map_err(unavailable)?.drain(..));
+        }
         if let Some(b) = self.input.borrow_mut().pop_front() {
             if self.source.is_some() {
                 let credit = self.slots.pending.reserve(1).map_err(unavailable)?;
@@ -211,22 +236,14 @@ impl Channel for BundleIo {
     }
     fn write(&self, b: &[u8]) -> Result<bool, ServiceError> {
         if dns_bundle::is_dns(b) {
-            if self.fail_write_at == Some(self.output.borrow().len() + 1) {
-                return Err(ServiceError::Unavailable);
-            }
-            let elapsed = if self.delay_write_at == 0
-                || self.delay_write_at == self.output.borrow().len() + 1
-            {
-                self.delayed_send.borrow_mut().take()
-            } else {
-                None
-            };
-            if let Some(elapsed) = elapsed {
-                elapsed.fetch_add(25_000_000, Ordering::AcqRel);
+            if self.hold_reply()? {
                 return Ok(false);
             }
             dns_bundle::decode(b, &dns_neg(self.record), wire::dns_v2::Direction::Issuer)?;
             self.output.borrow_mut().push(b.to_vec());
+            if let Some(action) = &self.after_sent {
+                action(self.output.borrow().len());
+            }
             if let Some(next) = self.after_reply.borrow_mut().pop_front() {
                 self.input.borrow_mut().extend(next);
             }
@@ -238,15 +255,16 @@ impl Channel for BundleIo {
         if self.source.is_some()
             && matches!(
                 f.message,
-                wire::Message::Grant {
-                    class: 3,
-                    flow: 0,
-                    required: false,
-                    ..
-                }
+                wire::Message::Grant { .. } | wire::Message::CloseAck { .. }
             )
         {
+            if self.hold_reply()? {
+                return Ok(false);
+            }
             self.output.borrow_mut().push(b.to_vec());
+            if let Some(action) = &self.after_sent {
+                action(self.output.borrow().len());
+            }
             if let Some(next) = self.after_reply.borrow_mut().pop_front() {
                 self.input.borrow_mut().extend(next);
             }
@@ -1501,7 +1519,8 @@ pub(super) struct Fake {
     pub(super) unknown_release: bool,
     pub(super) release_attempts: usize,
     fail_after_route: bool,
-    fail_route_at: Option<u64>,
+    pub(super) fail_route_at: Option<u64>,
+    pub(super) service_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl Fake {
     pub(super) fn new(mode: Mode) -> Self {
@@ -1528,6 +1547,7 @@ impl Fake {
             release_attempts: 0,
             fail_after_route: false,
             fail_route_at: None,
+            service_hook: None,
         }
     }
 }
@@ -1580,6 +1600,9 @@ impl Authority for Fake {
         if !self.service_trusted {
             return Err(ServiceError::Unavailable);
         }
+        if self.fail_route_at == Some(self.route_count + 1) {
+            return Err(ServiceError::Busy);
+        }
         match route {
             RouteRequest::Static(d) | RouteRequest::Direct(d) | RouteRequest::Dns(d) => {
                 self.service_routes.push(Target::copy(d)?)
@@ -1589,6 +1612,9 @@ impl Authority for Fake {
         self.route_count += 1;
         self.live.insert(self.route_count);
         self.now += self.route_delay;
+        if let Some(hook) = &self.service_hook {
+            hook();
+        }
         Ok(Some(self.route_count))
     }
     type Proof = Proof;

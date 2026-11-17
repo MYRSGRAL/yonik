@@ -1925,7 +1925,8 @@ impl<A: Authority> Issuer<A> {
             .validate_request(&wire::Message::Authorize(*a))
             .map_err(unavailable)?;
         if refresh == 0
-            && (self.grants.len() + self.services.len() >= capsule.limits()[0] as usize
+            && (self.grants.len() + self.services.len() + self.hosts_permission_count()
+                >= capsule.limits()[0] as usize
                 || self.retired.len() >= capsule.limits()[7] as usize)
         {
             return Err(ServiceError::Busy);
@@ -2202,7 +2203,8 @@ impl<A: Authority> Issuer<A> {
         }
         let fingerprint = hash.finalize().into();
         let id = if refresh == 0 {
-            if self.grants.len() + self.services.len() >= capsule.limits()[0] as usize
+            if self.grants.len() + self.services.len() + self.hosts_permission_count()
+                >= capsule.limits()[0] as usize
                 || self.retired.len() >= capsule.limits()[7] as usize
             {
                 return Err(ServiceError::Busy);
@@ -2270,6 +2272,9 @@ impl<A: Authority> Issuer<A> {
     fn cancel_grant(&mut self, id: u64) -> Result<(), ServiceError> {
         if self.unknown {
             return Err(ServiceError::Unavailable);
+        }
+        if self.close_hosts_permission(id)? {
+            return Ok(());
         }
         self.cancel_dns_root(id, self.services.contains_key(&id))?;
         if let Some(service) = self.services.remove(&id) {
@@ -2340,6 +2345,7 @@ impl<A: Authority> Issuer<A> {
         if self.unknown {
             return Err(ServiceError::Unavailable);
         }
+        self.close_hosts_request(request)?;
         match self.transport.cancel_request(request) {
             Ok(Some(id)) => self.rrsets.cancel_reservation(id),
             Ok(None) => {}

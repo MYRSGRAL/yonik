@@ -25,6 +25,7 @@ pub(super) struct Bundles {
     observations: BTreeMap<u64, Box<roots::Observation>>,
     hosts_producers: BTreeMap<u64, Box<roots::HostsProducer>>,
     hosts_waiters: BTreeMap<u64, Box<roots::HostsWaiter>>,
+    permissions: BTreeMap<u64, Box<roots::BootstrapPhysicalPermission>>,
     next_observation: u64,
     _ledger_credit: super::super::memory::ByteLease,
     live: BTreeMap<u64, Box<Bundle>>,
@@ -72,6 +73,7 @@ impl Bundles {
         self.live
             .values()
             .map(|b| b.expires)
+            .chain(self.permissions.values().filter_map(|p| p.wakeup()))
             .filter(|until| *until > now)
             .min()
     }
@@ -83,6 +85,7 @@ impl Bundles {
             observations: BTreeMap::new(),
             hosts_producers: BTreeMap::new(),
             hosts_waiters: BTreeMap::new(),
+            permissions: BTreeMap::new(),
             next_observation: 0,
             _ledger_credit: budget
                 .reserve(std::mem::size_of::<Self>())
@@ -467,7 +470,10 @@ impl<A: Authority> Issuer<A> {
             )
         } else {
             if self.dns.live.len() >= 256
-                || self.dns.live.len() + self.grants.len() + self.services.len()
+                || self.dns.live.len()
+                    + self.grants.len()
+                    + self.services.len()
+                    + self.hosts_permission_count()
                     >= self.capsule()?.limits()[0] as usize
             {
                 return Err(ServiceError::Busy);
@@ -908,6 +914,7 @@ pub(super) fn cancel<A: Authority>(
         2..=4 => super::dns_transport::cancel(issuer, target, id),
         7 => {
             if issuer.cancel_host_reservation(id) {
+                issuer.cancel_numeric_dependents()?;
                 return Ok(());
             }
             super::dns_transport::cancel(issuer, target, id)?;

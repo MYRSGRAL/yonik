@@ -10,6 +10,8 @@ struct Facts {
     launch: LaunchRecord,
     reference: wire::SnapshotRef,
     asset: Vec<u8>,
+    addresses: Vec<std::net::IpAddr>,
+    member_calls: AtomicUsize,
     path: Vec<(u16, u8)>,
     endpoint: u16,
     expiry: Instant,
@@ -20,6 +22,31 @@ struct Facts {
     failed_operation: AtomicUsize,
 }
 impl Source for Facts {
+    fn member(
+        &self,
+        p: Parent<'_>,
+        r: wire::SnapshotRef,
+        row: u16,
+        index: u16,
+    ) -> Result<Member, ServiceError> {
+        self.member_calls.fetch_add(1, Ordering::AcqRel);
+        if self.failed_operation.load(Ordering::Acquire) == 4 {
+            return Err(ServiceError::Unavailable);
+        }
+        self.parent(p)?;
+        self.snapshot(self.launch, r)?;
+        if row != 0 {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let address = *self
+            .addresses
+            .get(usize::from(index))
+            .ok_or(ServiceError::InvalidRequest)?;
+        Ok(Member {
+            address,
+            expires: self.expiry,
+        })
+    }
     fn question(
         &self,
         p: Parent<'_>,
@@ -109,6 +136,9 @@ impl Source for Facts {
     }
 }
 fn fixture(mode: Mode) -> (Issuer<Fake>, Arc<Facts>) {
+    fixture_address(mode, "203.0.113.80".parse().unwrap())
+}
+fn fixture_address(mode: Mode, address: std::net::IpAddr) -> (Issuer<Fake>, Arc<Facts>) {
     use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent, VerifiedSystemResolver};
     struct Snapshot;
     impl VerifiedSystemResolver for Snapshot {
@@ -155,7 +185,7 @@ fn fixture(mode: Mode) -> (Issuer<Fake>, Arc<Facts>) {
         peers: vec!["192.0.2.53:53".parse().unwrap()],
         hosts: vec![wire::ResolverHost {
             alias: "physical.invalid.".into(),
-            addresses: vec!["203.0.113.80".parse().unwrap()],
+            addresses: vec![address],
         }],
         _memory: super::super::super::super::memory::config_budget()
             .reserve(4096)
@@ -196,6 +226,8 @@ fn fixture(mode: Mode) -> (Issuer<Fake>, Arc<Facts>) {
         launch,
         reference,
         asset,
+        addresses: vec![address],
+        member_calls: AtomicUsize::new(0),
         path,
         endpoint,
         expiry: issuer.authority.now() + Duration::from_secs(1),
@@ -1352,4 +1384,466 @@ fn codec4_hosts_driver_typed_cancel_namespaces_and_source_derivatives_are_isolat
         assert_eq!(issuer.hosts_waiter_live(2, true).is_ok(), neighbor_live);
         assert_eq!(issuer.authority.route_count, 0);
     }
+}
+
+fn numeric_body(f: &Facts, waiter: u64, ip: [u8; 4]) -> Vec<u8> {
+    numeric_ip_body(f, waiter, std::net::IpAddr::V4(ip.into()))
+}
+fn numeric_ip_body(f: &Facts, waiter: u64, ip: std::net::IpAddr) -> Vec<u8> {
+    let mut b = vec![0; 16];
+    b[..2].copy_from_slice(&2u16.to_be_bytes());
+    b[4..12].copy_from_slice(&waiter.to_be_bytes());
+    b[12..14].copy_from_slice(&8u16.to_be_bytes());
+    b[14] = 2;
+    b[15] = 3;
+    for v in [2, f.endpoint, 1, u16::MAX] {
+        b.extend_from_slice(&v.to_be_bytes());
+    }
+    let (family, bytes) = match ip {
+        std::net::IpAddr::V4(ip) => (4, ip.octets().to_vec()),
+        std::net::IpAddr::V6(ip) => (6, ip.octets().to_vec()),
+    };
+    b.extend_from_slice(&[family, 6]);
+    b.extend_from_slice(&8443u16.to_be_bytes());
+    b.extend_from_slice(&[bytes.len() as u8, 0, 0]);
+    b.extend_from_slice(&bytes);
+    b
+}
+#[test]
+fn codec4_hosts_numeric_driver_grant_is_separate_flow0_permission_after_durable_route() {
+    for mode in [Mode::Local, Mode::System] {
+        let (mut issuer, f) = fixture(mode);
+        let mut script = hosts_script(&f);
+        script.push((
+            Operation::NumericAuthorize,
+            numeric_body(&f, 1, [203, 0, 113, 80]),
+        ));
+        let output = scripted(&mut issuer, &f, &script);
+        assert_eq!(output.len(), 7);
+        let frame = wire::Frame::decode(&output[6], f.launch.binding, mode, true).unwrap();
+        assert_eq!(frame.header.reply_to, 9);
+        assert!(matches!(
+            frame.message,
+            wire::Message::Grant {
+                status: wire::Status::Allow,
+                class: 3,
+                flow: 0,
+                required: false,
+                fresh: 0,
+                receipt: wire::Receipt {
+                    kind: wire::ReceiptKind::None,
+                    id: 0
+                },
+                ..
+            }
+        ));
+        assert_eq!(issuer.authority.route_count, 1);
+        assert_eq!(issuer.authority.owner_count, 0);
+        assert!(issuer.grants.is_empty() && issuer.services.is_empty());
+        assert!(
+            issuer
+                .hosts_permission_live(frame.header.object_id, true)
+                .is_ok()
+        );
+    }
+}
+
+fn numeric_script(f: &Facts) -> Vec<(Operation, Vec<u8>)> {
+    let mut script = hosts_script(f);
+    script.push((
+        Operation::NumericAuthorize,
+        numeric_body(f, 1, [203, 0, 113, 80]),
+    ));
+    script
+}
+fn grant_status(output: &[u8], f: &Facts) -> wire::Status {
+    match wire::Frame::decode(output, f.launch.binding, f.launch.mode, true)
+        .unwrap()
+        .message
+    {
+        wire::Message::Grant { status, .. } => status,
+        _ => panic!("ожидается GRANT19"),
+    }
+}
+fn packets(f: &Facts, script: &[(Operation, Vec<u8>)]) -> Vec<Vec<u8>> {
+    script
+        .iter()
+        .enumerate()
+        .map(|(i, (kind, b))| dns_packet(f.launch, 3 + i as u64, *kind, b))
+        .collect()
+}
+fn io_script(f: &Arc<Facts>, packets: &[Vec<u8>]) -> BundleIo {
+    let mut io = BundleIo::new(f.launch, vec![packets[0].clone()]);
+    io.source = Some(f.clone());
+    io.stop_after = packets.len();
+    for p in &packets[1..] {
+        append(&io, vec![p.clone()]);
+    }
+    io
+}
+#[test]
+fn codec4_hosts_numeric_driver_wrong_member_parent_port_carrier_and_namespace_before_effect() {
+    for fault in 0..7 {
+        let (mut issuer, f) = fixture(Mode::System);
+        let mut script = numeric_script(&f);
+        let b = &mut script[6].1;
+        match fault {
+            0 => {
+                let end = b.len();
+                b[end - 1] = 81;
+            }
+            1 => b[3] = 1,
+            2 => b[27] ^= 1,
+            3 => b[25] = 17,
+            4 => b[19] ^= 1,
+            5 => b[21] = 0,
+            6 => b[11] = 2,
+            _ => unreachable!(),
+        }
+        let output = scripted(&mut issuer, &f, &script);
+        assert_eq!(output.len(), 7);
+        assert_eq!(
+            grant_status(&output[6], &f),
+            wire::Status::Deny,
+            "fault {fault}"
+        );
+        assert_eq!(issuer.authority.route_count, 0);
+        assert!(issuer.dns.permissions.is_empty());
+        assert!(issuer.bootstrap_live(2, true).is_ok());
+        if fault != 0 {
+            assert_eq!(f.member_calls.load(Ordering::Acquire), 0);
+        }
+    }
+}
+#[test]
+fn codec4_hosts_numeric_driver_changed_parent_source_epoch_or_expiry_never_route() {
+    for fault in 0..4 {
+        let (mut issuer, f) = fixture(Mode::System);
+        let mut p = packets(&f, &numeric_script(&f));
+        if fault == 3 {
+            p[6][111] ^= 1;
+        }
+        let mut io = io_script(&f, &p);
+        let source = f.clone();
+        let elapsed = issuer.authority.elapsed.clone();
+        io.on_request = Some(Box::new(move |seq| {
+            if seq == 9 {
+                match fault {
+                    0 => source.failed_operation.store(1, Ordering::Release),
+                    1 => source.failed_operation.store(4, Ordering::Release),
+                    2 => {
+                        elapsed.fetch_add(2_000_000_000, Ordering::AcqRel);
+                    }
+                    _ => {}
+                }
+            }
+        }));
+        drive(&mut issuer, &io);
+        if fault == 3 {
+            assert_eq!(io.output.borrow().len(), 6);
+        } else {
+            assert_eq!(io.output.borrow().len(), 7);
+            assert_eq!(grant_status(&io.output.borrow()[6], &f), wire::Status::Deny);
+        }
+        assert_eq!(issuer.authority.route_count, 0);
+        assert!(issuer.dns.permissions.is_empty());
+    }
+}
+#[test]
+fn codec4_hosts_numeric_driver_backend_latency_and_source_change_cleanup_once() {
+    for fault in 0..3 {
+        let (mut issuer, mut f) = fixture(Mode::System);
+        if fault == 0 {
+            Arc::get_mut(&mut f).unwrap().expiry =
+                issuer.authority.now() + Duration::from_millis(20);
+            issuer.authority.route_delay = Duration::from_millis(25);
+        } else {
+            let source = f.clone();
+            issuer.authority.service_hook = Some(Arc::new(move || {
+                source.failed_operation.store(4, Ordering::Release)
+            }));
+            issuer.authority.unknown_release = fault == 2;
+        }
+        let output = scripted(&mut issuer, &f, &numeric_script(&f));
+        assert_eq!(output.len(), 7);
+        assert_eq!(
+            grant_status(&output[6], &f),
+            if fault == 2 {
+                wire::Status::Unknown
+            } else {
+                wire::Status::Deny
+            }
+        );
+        assert_eq!(issuer.authority.route_count, 1);
+        assert_eq!(issuer.authority.release_attempts, 1);
+        assert_eq!(issuer.authority.live.len(), usize::from(fault == 2));
+        assert_eq!(issuer.unknown, fault == 2);
+        assert_eq!(
+            issuer.dns.permissions[&1].state,
+            if fault == 2 {
+                PermissionState::Unknown
+            } else {
+                PermissionState::Closed
+            }
+        );
+        let attempts = issuer.authority.release_attempts;
+        let _closed = issuer.cancel_grant(1);
+        assert_eq!(issuer.authority.release_attempts, attempts);
+    }
+}
+#[test]
+fn codec4_hosts_numeric_driver_replay_and_numeric_request_cancel_are_one_shot() {
+    for cancel in [false, true] {
+        let (mut issuer, f) = fixture(Mode::System);
+        let mut p = packets(&f, &numeric_script(&f));
+        if cancel {
+            p.push(dns_packet(
+                f.launch,
+                10,
+                Operation::Cancel,
+                &cancel_body(1, 9),
+            ));
+        } else {
+            p.push(dns_packet(
+                f.launch,
+                10,
+                Operation::NumericAuthorize,
+                &numeric_body(&f, 1, [203, 0, 113, 80]),
+            ));
+        }
+        let io = io_script(&f, &p);
+        if cancel {
+            // Numeric9 и Cancel10 одновременно готовы: drain до install.
+            io.after_reply.borrow_mut().pop_back();
+            let mut batches = io.after_reply.borrow_mut();
+            batches.back_mut().unwrap().push(p[7].clone());
+        }
+        drive(&mut issuer, &io);
+        let output = io.output.borrow();
+        assert_eq!(output.len(), 8);
+        if cancel {
+            assert_eq!(grant_status(&output[6], &f), wire::Status::Deny);
+            assert_eq!(issuer.authority.route_count, 0);
+        } else {
+            assert_eq!(grant_status(&output[7], &f), wire::Status::Deny);
+            assert_eq!(issuer.authority.route_count, 1);
+        }
+    }
+}
+#[test]
+fn codec4_hosts_numeric_driver_cancel_after_backend_retires_before_reply() {
+    let (mut issuer, f) = fixture(Mode::System);
+    let p = packets(&f, &numeric_script(&f));
+    let mut io = io_script(&f, &p);
+    io.stop_after = 8;
+    // Пакет появляется только после effectful backend call.
+    let deferred = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let arrival = deferred.clone();
+    let cancel = dns_packet(f.launch, 10, Operation::Cancel, &cancel_body(1, 9));
+    issuer.authority.service_hook = Some(Arc::new(move || {
+        arrival.lock().unwrap().push(cancel.clone())
+    }));
+    io.deferred = Some(deferred);
+    drive(&mut issuer, &io);
+    let output = io.output.borrow();
+    assert_eq!(output.len(), 8);
+    assert_eq!(grant_status(&output[6], &f), wire::Status::Deny);
+    assert_eq!(issuer.authority.route_count, 1);
+    assert_eq!(issuer.authority.release_attempts, 1);
+    assert!(issuer.authority.live.is_empty());
+    assert!(!issuer.dns.permissions[&1].acked);
+}
+
+fn legacy_close(f: &Facts, seq: u64, id: u64) -> Vec<u8> {
+    let mut out = [0; 160];
+    let n = wire::Frame::encode(
+        wire::Header {
+            kind: wire::Kind::Cancel,
+            sequence: seq,
+            reply_to: 0,
+            binding: f.launch.binding,
+            object_id: 0,
+        },
+        &wire::Message::Cancel {
+            target: 3,
+            id,
+            reason: 0,
+        },
+        &mut out,
+    )
+    .unwrap();
+    out[..n].to_vec()
+}
+#[test]
+fn codec4_hosts_numeric_driver_close32_retires_only_permission_and_retry_is_immutable() {
+    for mode in [Mode::Local, Mode::System] {
+        let (mut issuer, f) = fixture(mode);
+        let mut p = packets(&f, &numeric_script(&f));
+        p.push(legacy_close(&f, 10, 1));
+        p.push(legacy_close(&f, 11, 1));
+        let io = io_script(&f, &p);
+        drive(&mut issuer, &io);
+        let output = io.output.borrow();
+        assert_eq!(output.len(), 9);
+        assert_eq!(grant_status(&output[6], &f), wire::Status::Allow);
+        for b in &output[7..] {
+            assert!(matches!(
+                wire::Frame::decode(b, f.launch.binding, mode, true)
+                    .unwrap()
+                    .message,
+                wire::Message::CloseAck {
+                    target: 3,
+                    id: 1,
+                    status: wire::CloseStatus::KnownClosed
+                }
+            ));
+        }
+        assert_eq!(issuer.dns.permissions[&1].state, PermissionState::Closed);
+        assert!(issuer.dns.permissions[&1].routes.is_none());
+        assert_eq!(issuer.authority.release_attempts, 1);
+        assert!(issuer.authority.live.is_empty());
+        assert!(issuer.bootstrap_live(1, true).is_ok() && issuer.bootstrap_live(2, true).is_ok());
+        assert!(issuer.grants.is_empty() && issuer.services.is_empty());
+        assert!(
+            issuer
+                .service(
+                    50,
+                    1,
+                    &wire::Message::Probe {
+                        purpose: 2,
+                        index: f.endpoint,
+                        subject: 1,
+                        resolver: 1
+                    }
+                )
+                .is_err()
+        );
+    }
+}
+#[test]
+fn codec4_hosts_numeric_driver_waiter_cancel_preserves_neighbor_ticket() {
+    let (mut issuer, f) = fixture(Mode::System);
+    let mut script = numeric_script(&f);
+    script.extend([
+        (Operation::BundleAcquire, acquire(&f, true, 0, 11)),
+        (Operation::Reserve, reserve(&f, true, 3, 11)),
+        (Operation::WaiterBind, hosts_bind(3, 1, 11)),
+        (
+            Operation::NumericAuthorize,
+            numeric_body(&f, 2, [203, 0, 113, 80]),
+        ),
+        (Operation::Cancel, cancel_body(6, 1)),
+    ]);
+    let output = scripted(&mut issuer, &f, &script);
+    assert_eq!(output.len(), 12);
+    assert_eq!(issuer.authority.route_count, 2);
+    assert_eq!(issuer.authority.release_attempts, 1);
+    assert_eq!(issuer.dns.permissions[&1].state, PermissionState::Closed);
+    assert!(issuer.hosts_permission_live(2, true).is_ok());
+    assert!(issuer.authority.live.contains(&2));
+}
+#[test]
+fn codec4_hosts_numeric_driver_pending_send_failure_retains_unknown_ticket_and_credits() {
+    let (mut issuer, f) = fixture(Mode::System);
+    let p = packets(&f, &numeric_script(&f));
+    let mut io = io_script(&f, &p);
+    io.fail_write_at = Some(7);
+    drive(&mut issuer, &io);
+    assert_eq!(io.output.borrow().len(), 6);
+    assert!(issuer.unknown);
+    assert_eq!(issuer.dns.permissions[&1].state, PermissionState::Unknown);
+    assert!(!issuer.dns.permissions[&1].acked);
+    assert!(
+        issuer.dns.permissions[&1].ticket.is_some() && issuer.dns.permissions[&1].routes.is_some()
+    );
+    assert_eq!(io.dns_slots().unwrap().pending.used(), 1);
+    assert_eq!(issuer.authority.release_attempts, 0);
+}
+#[test]
+fn codec4_hosts_numeric_driver_blocked_send_cannot_extend_original_source_deadline() {
+    let (mut issuer, mut f) = fixture(Mode::System);
+    Arc::get_mut(&mut f).unwrap().expiry = issuer.authority.now() + Duration::from_millis(20);
+    let p = packets(&f, &numeric_script(&f));
+    let mut io = io_script(&f, &p);
+    io.delay_write_at = 7;
+    *io.delayed_send.borrow_mut() = Some(issuer.authority.elapsed.clone());
+    drive(&mut issuer, &io);
+    assert_eq!(io.output.borrow().len(), 7);
+    assert_eq!(grant_status(&io.output.borrow()[6], &f), wire::Status::Deny);
+    assert_eq!(issuer.dns.permissions[&1].state, PermissionState::Closed);
+    assert!(!issuer.dns.permissions[&1].acked);
+    assert_eq!(issuer.authority.release_attempts, 1);
+    assert!(issuer.authority.live.is_empty());
+}
+#[test]
+fn codec4_hosts_numeric_driver_history_credit_precedes_member_capture_and_backend() {
+    let (mut issuer, f) = fixture(Mode::System);
+    issuer.dns.history = 256 - (2 * f.path.len() + 6);
+    let output = scripted(&mut issuer, &f, &numeric_script(&f));
+    assert_eq!(output.len(), 7);
+    assert_eq!(grant_status(&output[6], &f), wire::Status::Deny);
+    assert_eq!(f.member_calls.load(Ordering::Acquire), 0);
+    assert_eq!(issuer.authority.route_count, 0);
+    assert!(issuer.dns.permissions.is_empty());
+}
+#[test]
+fn codec4_hosts_numeric_driver_ipv6_and_literal_data_never_skip_numeric_policy() {
+    for address in ["2001:db8::80", "0.0.0.0", "127.0.0.1"] {
+        let ip = address.parse().unwrap();
+        let (mut issuer, f) = fixture_address(Mode::System, ip);
+        let mut script = hosts_script(&f);
+        let eligible = address == "2001:db8::80";
+        let target = if eligible {
+            ip
+        } else {
+            "203.0.113.80".parse().unwrap()
+        };
+        script.push((Operation::NumericAuthorize, numeric_ip_body(&f, 1, target)));
+        let output = scripted(&mut issuer, &f, &script);
+        assert_eq!(output.len(), 7);
+        assert_eq!(output[2][130], 1);
+        assert_eq!(
+            grant_status(&output[6], &f),
+            if eligible {
+                wire::Status::Allow
+            } else {
+                wire::Status::Deny
+            }
+        );
+        assert_eq!(issuer.authority.route_count, u64::from(eligible));
+    }
+}
+
+#[test]
+fn codec4_hosts_numeric_driver_after_send_uncertainty_retains_custody_not_known_closed() {
+    let (mut issuer, f) = fixture(Mode::System);
+    let p = packets(&f, &numeric_script(&f));
+    let mut io = io_script(&f, &p);
+    let source = f.clone();
+    io.after_sent = Some(Box::new(move |n| {
+        if n == 7 {
+            source.failed_operation.store(4, Ordering::Release);
+        }
+    }));
+    drive(&mut issuer, &io);
+    assert!(issuer.unknown);
+    assert_eq!(io.output.borrow().len(), 7);
+    assert_eq!(issuer.dns.permissions[&1].state, PermissionState::Unknown);
+    assert!(!issuer.dns.permissions[&1].acked);
+    assert!(issuer.dns.permissions[&1].ticket.is_some());
+    assert_eq!(issuer.authority.release_attempts, 0);
+    assert_eq!(io.dns_slots().unwrap().pending.used(), 1);
+}
+#[test]
+fn codec4_hosts_numeric_driver_backend_failure_keeps_prepaid_one_shot_state() {
+    let (mut issuer, f) = fixture(Mode::System);
+    issuer.authority.fail_route_at = Some(1);
+    let output = scripted(&mut issuer, &f, &numeric_script(&f));
+    assert_eq!(output.len(), 7);
+    assert_eq!(grant_status(&output[6], &f), wire::Status::Unknown);
+    assert_eq!(issuer.dns.permissions[&1].state, PermissionState::Unknown);
+    assert!(issuer.dns.permissions[&1].routes.is_some());
+    assert!(issuer.dns.hosts_waiters[&1].numeric_once.is_some());
+    assert_eq!(issuer.authority.route_count, 0);
+    assert!(issuer.cancel_grant(1).is_err());
 }

@@ -51,11 +51,25 @@ pub(in crate::helper::native_profile_channel) struct Question {
     pub len: u16,
     pub expires: Instant,
 }
+pub(in crate::helper::native_profile_channel) struct Member {
+    pub address: std::net::IpAddr,
+    pub expires: Instant,
+}
 /// Trusted CODEC4 bootstrap/choice + retained source custody. Production factory
 /// пока None: DirectUserDns record не разрешает реализацию этого scope.
 pub(in crate::helper::native_profile_channel) trait Source:
     Send + Sync
 {
+    // Только held asset/source custody, не caller IP/hash или decoded DATA.
+    fn member(
+        &self,
+        _: Parent<'_>,
+        _: wire::SnapshotRef,
+        _: u16,
+        _: u16,
+    ) -> Result<Member, ServiceError> {
+        Err(ServiceError::Unsupported)
+    }
     fn parent(&self, parent: Parent<'_>) -> Result<Instant, ServiceError>;
     fn snapshot(
         &self,
@@ -116,6 +130,7 @@ pub(super) struct HostsProducer {
     _memory: super::super::super::memory::ByteLease,
 }
 pub(super) struct HostsWaiter {
+    numeric_once: Option<(u64, u64)>,
     observation: u64,
     producer: u64,
     request: u64,
@@ -524,7 +539,10 @@ impl<A: Authority> Issuer<A> {
                         .ok_or(ServiceError::Busy)?,
                 )
             } else {
-                if self.dns.live.len() + self.grants.len() + self.services.len()
+                if self.dns.live.len()
+                    + self.grants.len()
+                    + self.services.len()
+                    + self.hosts_permission_count()
                     >= cap.limits()[0] as usize
                 {
                     return Err(ServiceError::Busy);
@@ -1223,6 +1241,7 @@ impl<A: Authority> Issuer<A> {
         self.dns.hosts_waiters.insert(
             id,
             Box::new(HostsWaiter {
+                numeric_once: None,
                 observation,
                 producer,
                 request,
@@ -1344,6 +1363,477 @@ impl<A: Authority> Issuer<A> {
             }
             _ => Err(ServiceError::InvalidRequest),
         }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionState {
+    Preparing,
+    Active,
+    Closed,
+    Unknown,
+}
+pub(super) struct BootstrapPhysicalPermission {
+    waiter: u64,
+    member: u16,
+    source_index: u16,
+    target: Target,
+    request: u64,
+    expires: Instant,
+    state: PermissionState,
+    acked: bool,
+    ticket: Option<u64>,
+    routes: Option<super::super::super::memory::ByteLease>,
+    _memory: super::super::super::memory::ByteLease,
+}
+impl BootstrapPhysicalPermission {
+    pub(super) fn wakeup(&self) -> Option<Instant> {
+        (self.state == PermissionState::Active).then_some(self.expires)
+    }
+}
+fn target_ip(target: Target) -> Result<std::net::IpAddr, ServiceError> {
+    match target.wire() {
+        wire::Destination {
+            family: 4, bytes, ..
+        } => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+            <[u8; 4]>::try_from(bytes).map_err(unavailable)?,
+        ))),
+        wire::Destination {
+            family: 6, bytes, ..
+        } => Ok(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+            <[u8; 16]>::try_from(bytes).map_err(unavailable)?,
+        ))),
+        _ => Err(ServiceError::InvalidRequest),
+    }
+}
+impl<A: Authority> Issuer<A> {
+    pub(in crate::helper::native_profile_channel) fn hosts_permission_count(&self) -> usize {
+        self.dns
+            .permissions
+            .values()
+            .filter(|p| p.state != PermissionState::Closed)
+            .count()
+    }
+    fn host_member(&self, waiter: u64, member: u16) -> Result<(Member, u16), ServiceError> {
+        let _scratch = self.budget.dynamic.reserve(2048).map_err(unavailable)?;
+        let until = self.hosts_waiter_live(waiter, true)?;
+        let w = self
+            .dns
+            .hosts_waiters
+            .get(&waiter)
+            .ok_or(ServiceError::Unavailable)?;
+        let o = self
+            .dns
+            .observations
+            .get(&w.observation)
+            .ok_or(ServiceError::Unavailable)?;
+        if member >= o.choice.count {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let index = o.choice.members[usize::from(member)];
+        let b = self
+            .dns
+            .live
+            .get(&o.context)
+            .ok_or(ServiceError::Unavailable)?;
+        let c = b.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
+        let mut path = [(0, 0); 256];
+        for (i, h) in o._parent.iter().enumerate() {
+            path[i] = (h.scope, h.branch);
+        }
+        let source = self.root_source()?;
+        let mut selected = self.source_result(
+            o.context,
+            source.member(
+                Parent {
+                    root: b.root_kind,
+                    launch: self.record,
+                    query: b.query,
+                    selector: c.selector,
+                    original: o._original.wire(),
+                    path: &path[..o._parent.len()],
+                }
+                .checked()?,
+                o._reference,
+                o.choice.row,
+                index,
+            ),
+        )?;
+        selected.expires = selected
+            .expires
+            .min(until)
+            .min(self.source_result(o.context, source.snapshot(self.record, o._reference))?)
+            .min(self.bootstrap_live(o.context, true)?);
+        if self.authority.now() >= selected.expires {
+            return self.source_result(o.context, Err(ServiceError::Unavailable));
+        }
+        Ok((selected, index))
+    }
+    fn authorize_hosts_numeric(
+        &mut self,
+        request: u64,
+        v: View<'_, 42>,
+        session: Instant,
+    ) -> Result<u64, ServiceError> {
+        self.fence()?;
+        let started = self.authority.now();
+        if self.retired.iter().any(|(n, _)| *n == request) {
+            return Err(ServiceError::Unavailable);
+        }
+        let b = v.bytes();
+        let waiter = v.waiter().map_err(unavailable)?.get();
+        let member = u16_at(b, 2);
+        let selector = v
+            .bootstrap_selector()
+            .map_err(unavailable)?
+            .ok_or(ServiceError::InvalidRequest)?;
+        let w = self
+            .dns
+            .hosts_waiters
+            .get(&waiter)
+            .ok_or(ServiceError::Unavailable)?;
+        let o = self
+            .dns
+            .observations
+            .get(&w.observation)
+            .ok_or(ServiceError::Unavailable)?;
+        let context = self
+            .dns
+            .live
+            .get(&o.context)
+            .ok_or(ServiceError::Unavailable)?;
+        let c = context
+            .bootstrap
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?;
+        let target = Target::copy(v.numeric_destination())?;
+        if b[14] != 2
+            || b[15] != 3
+            || selector.resolver.is_some()
+            || selector != c.selector
+            || context.root_kind != wire::dns_v2::Root::HostsPath
+            || !w.acked
+            || w.revoked
+            || w.numeric_once.is_some()
+            || member >= o.choice.count
+            || target.port != o._original.port
+            || target.protocol != o._original.protocol
+            || target.protocol != 6
+            || !super::super::dns_rrset::numeric_ip_allowed(target_ip(target)?)
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if self.hosts_permission_count()
+            + self.grants.len()
+            + self.services.len()
+            + self.dns.live.len()
+            >= self.capsule()?.limits()[0] as usize
+        {
+            return Err(ServiceError::Busy);
+        }
+        let memory = self
+            .budget
+            .dynamic
+            .reserve(std::mem::size_of::<BootstrapPhysicalPermission>() + 80)
+            .map_err(unavailable)?;
+        let routes = self.budget.routes.reserve(1).map_err(unavailable)?;
+        self.bundle_history(1)?;
+        let (selected, source_index) = self.host_member(waiter, member)?;
+        if selected.address != target_ip(target)? {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let expires = selected
+            .expires
+            .min(session)
+            .min(started + Duration::from_secs(1));
+        if expires.saturating_duration_since(self.authority.now()) < Duration::from_millis(1) {
+            return Err(ServiceError::Unavailable);
+        }
+        let id = Self::id(&mut self.next_grant)?;
+        self.dns
+            .hosts_waiters
+            .get_mut(&waiter)
+            .ok_or(ServiceError::Unavailable)?
+            .numeric_once = Some((request, id));
+        self.dns.permissions.insert(
+            id,
+            Box::new(BootstrapPhysicalPermission {
+                waiter,
+                member,
+                source_index,
+                target,
+                request,
+                expires,
+                state: PermissionState::Preparing,
+                acked: false,
+                ticket: None,
+                routes: Some(routes),
+                _memory: memory,
+            }),
+        );
+        match self
+            .authority
+            .service(self.record.manifest, RouteRequest::Direct(target.wire()))
+        {
+            Ok(ticket) => {
+                let p = self
+                    .dns
+                    .permissions
+                    .get_mut(&id)
+                    .ok_or(ServiceError::Unavailable)?;
+                p.ticket = ticket;
+                p.state = PermissionState::Active;
+            }
+            Err(error) => {
+                self.dns
+                    .permissions
+                    .get_mut(&id)
+                    .ok_or(ServiceError::Unavailable)?
+                    .state = PermissionState::Unknown;
+                self.unknown = true;
+                self.authority.revoke();
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.hosts_permission_live(id, false) {
+            self.close_hosts_permission(id)?;
+            return Err(error);
+        }
+        Ok(id)
+    }
+    pub(in crate::helper::native_profile_channel) fn hosts_permission_live(
+        &self,
+        id: u64,
+        acked: bool,
+    ) -> Result<Instant, ServiceError> {
+        self.fence()?;
+        let p = self
+            .dns
+            .permissions
+            .get(&id)
+            .ok_or(ServiceError::Unavailable)?;
+        let w = self
+            .dns
+            .hosts_waiters
+            .get(&p.waiter)
+            .ok_or(ServiceError::Unavailable)?;
+        if p.state != PermissionState::Active
+            || acked && !p.acked
+            || w.numeric_once != Some((p.request, id))
+            || self.authority.now() >= p.expires
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        let (selected, index) = self.host_member(p.waiter, p.member)?;
+        if index != p.source_index || selected.address != target_ip(p.target)? {
+            let context = self
+                .dns
+                .observations
+                .get(&w.observation)
+                .ok_or(ServiceError::Unavailable)?
+                .context;
+            return self.source_result(context, Err(ServiceError::Unavailable));
+        }
+        let until = p.expires.min(selected.expires);
+        if self.authority.now() >= until {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(until)
+    }
+    pub(in crate::helper::native_profile_channel) fn close_hosts_permission(
+        &mut self,
+        id: u64,
+    ) -> Result<bool, ServiceError> {
+        let Some(p) = self.dns.permissions.get_mut(&id) else {
+            return Ok(false);
+        };
+        match p.state {
+            PermissionState::Closed => return Ok(true),
+            PermissionState::Unknown | PermissionState::Preparing => {
+                return Err(ServiceError::Unavailable);
+            }
+            PermissionState::Active => {}
+        }
+        p.state = PermissionState::Unknown;
+        if let Some(ticket) = p.ticket {
+            if self.authority.release(ticket).is_err() {
+                self.unknown = true;
+                self.authority.revoke();
+                return Err(ServiceError::Unavailable);
+            }
+        }
+        p.ticket = None;
+        p.state = PermissionState::Closed;
+        p.routes.take();
+        Ok(true)
+    }
+    pub(in crate::helper::native_profile_channel) fn close_hosts_request(
+        &mut self,
+        request: u64,
+    ) -> Result<(), ServiceError> {
+        let id = self
+            .dns
+            .permissions
+            .iter()
+            .find(|(_, p)| p.request == request)
+            .map(|(id, _)| *id);
+        if let Some(id) = id {
+            self.close_hosts_permission(id)?;
+        }
+        Ok(())
+    }
+    pub(in crate::helper::native_profile_channel) fn retire_hosts_permissions(
+        &mut self,
+    ) -> Result<(), ServiceError> {
+        let mut ids = [0; 256];
+        let mut count = 0;
+        for (id, p) in &self.dns.permissions {
+            if p.state == PermissionState::Active && self.hosts_permission_live(*id, false).is_err()
+            {
+                *ids.get_mut(count).ok_or(ServiceError::Busy)? = *id;
+                count += 1;
+            }
+        }
+        for id in &ids[..count] {
+            self.close_hosts_permission(*id)?;
+        }
+        Ok(())
+    }
+}
+#[allow(clippy::too_many_arguments)] // Exact Numeric pending, one reader, original deadline.
+pub(in crate::helper::native_profile_channel) fn dispatch_hosts_numeric<A: Authority>(
+    issuer: &mut Issuer<A>,
+    socket: &impl Channel,
+    stop: &AtomicBool,
+    sequence: u64,
+    request: u64,
+    view: View<'_, 42>,
+    session: Instant,
+    mut drain: impl FnMut(&mut Issuer<A>) -> Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    let response_until = session.min(issuer.authority.now() + Duration::from_secs(1));
+    if !issuer.unknown {
+        drain(issuer)?;
+    }
+    let outcome = issuer.authorize_hosts_numeric(request, view, session);
+    loop {
+        if !issuer.unknown {
+            drain(issuer)?;
+        }
+        let live = outcome.as_ref().ok().and_then(|id| {
+            if stop.load(Ordering::Acquire) || issuer.retired.iter().any(|(n, _)| *n == request) {
+                return None;
+            }
+            issuer
+                .hosts_permission_live(*id, false)
+                .ok()
+                .and_then(|until| {
+                    let remaining = until.saturating_duration_since(issuer.authority.now());
+                    (remaining >= Duration::from_millis(1)).then_some((*id, until, remaining))
+                })
+        });
+        if live.is_none() {
+            if let Ok(id) = &outcome {
+                if !issuer.unknown {
+                    issuer.close_hosts_permission(*id)?;
+                }
+            }
+        }
+        if stop.load(Ordering::Acquire) || issuer.authority.now() >= response_until {
+            return Err(ServiceError::Unavailable);
+        }
+        let (object, message) = if let Some((id, _, remaining)) = live {
+            (
+                id,
+                wire::Message::Grant {
+                    status: wire::Status::Allow,
+                    class: 3,
+                    required: false,
+                    grant: id,
+                    flow: 0,
+                    lease: remaining.as_millis().min(1000) as u32,
+                    revision: issuer.capsule()?.policy_revision,
+                    fresh: 0,
+                    receipt: wire::Receipt {
+                        kind: wire::ReceiptKind::None,
+                        id: 0,
+                    },
+                },
+            )
+        } else {
+            (
+                0,
+                wire::Message::Grant {
+                    status: if issuer.unknown {
+                        wire::Status::Unknown
+                    } else {
+                        wire::Status::Deny
+                    },
+                    class: 3,
+                    required: false,
+                    grant: 0,
+                    flow: 0,
+                    lease: 0,
+                    revision: 0,
+                    fresh: 0,
+                    receipt: wire::Receipt {
+                        kind: wire::ReceiptKind::None,
+                        id: 0,
+                    },
+                },
+            )
+        };
+        let mut bytes = [0; 184];
+        let n = wire::Frame::encode(
+            wire::Header {
+                kind: wire::Kind::Grant,
+                sequence,
+                reply_to: request,
+                binding: issuer.record.binding,
+                object_id: object,
+            },
+            &message,
+            &mut bytes,
+        )
+        .map_err(unavailable)?;
+        match socket.write(&bytes[..n]) {
+            Ok(true) => {
+                if let Some((id, _, _)) = live {
+                    if issuer.hosts_permission_live(id, false).is_err() {
+                        issuer
+                            .dns
+                            .permissions
+                            .get_mut(&id)
+                            .ok_or(ServiceError::Unavailable)?
+                            .state = PermissionState::Unknown;
+                        issuer.unknown = true;
+                        issuer.authority.revoke();
+                        return Err(ServiceError::Unavailable);
+                    }
+                    issuer
+                        .dns
+                        .permissions
+                        .get_mut(&id)
+                        .ok_or(ServiceError::Unavailable)?
+                        .acked = true;
+                }
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                if let Ok(id) = &outcome {
+                    if let Some(p) = issuer.dns.permissions.get_mut(id) {
+                        if p.state == PermissionState::Active {
+                            p.state = PermissionState::Unknown;
+                        }
+                    }
+                }
+                issuer.unknown = true;
+                issuer.authority.revoke();
+                return Err(error);
+            }
+        }
+        socket
+            .writable_until(live.map_or(response_until, |(_, until, _)| until.min(response_until)));
     }
 }
 #[cfg(test)]
