@@ -90,6 +90,8 @@ pub(super) struct Context {
     pub(super) permit: Option<DirectSystemTransportPermit>,
 }
 pub(super) struct Observation {
+    publish: Option<u64>,
+    waiter: Option<u64>,
     reservation: u64,
     context: u64,
     revision: u64,
@@ -103,6 +105,23 @@ pub(super) struct Observation {
     _reference: wire::SnapshotRef,
     _original: Target,
     pending: Option<super::super::super::memory::ByteLease>,
+    _memory: super::super::super::memory::ByteLease,
+}
+pub(super) struct HostsProducer {
+    observation: u64,
+    request: u64,
+    expires: Instant,
+    acked: bool,
+    revoked: bool,
+    _memory: super::super::super::memory::ByteLease,
+}
+pub(super) struct HostsWaiter {
+    observation: u64,
+    producer: u64,
+    request: u64,
+    expires: Instant,
+    acked: bool,
+    revoked: bool,
     _memory: super::super::super::memory::ByteLease,
 }
 impl<A: Authority> Issuer<A> {
@@ -161,6 +180,31 @@ impl<A: Authority> Issuer<A> {
         &self,
         r: Record<'_>,
     ) -> bool {
+        match r {
+            Record::Publish(v) if v.bytes()[137] == 2 => {
+                return self
+                    .dns
+                    .observations
+                    .get(&u64_at(v.bytes(), 144 + 88))
+                    .is_some_and(|o| {
+                        o.acked && !o.revoked && o.publish.is_none() && o.waiter.is_none()
+                    });
+            }
+            Record::WaiterBind(v) if self.is_hosts_reservation(u64_at(v.bytes(), 8)) => {
+                return self.dns.observations.values().any(|o| {
+                    o.reservation == u64_at(v.bytes(), 8)
+                        && o.acked
+                        && !o.revoked
+                        && o.publish.is_none()
+                        && o.waiter.is_none()
+                }) && self
+                    .dns
+                    .hosts_producers
+                    .get(&u64_at(v.bytes(), 16))
+                    .is_some_and(|p| p.acked && !p.revoked);
+            }
+            _ => {}
+        }
         let Record::Reserve(v) = r else {
             return true;
         };
@@ -625,6 +669,22 @@ impl<A: Authority> Issuer<A> {
         }
     }
     pub(in crate::helper::native_profile_channel) fn cancel_host_request(&mut self, request: u64) {
+        for p in self
+            .dns
+            .hosts_producers
+            .values_mut()
+            .filter(|p| p.request == request)
+        {
+            p.revoked = true;
+        }
+        for w in self
+            .dns
+            .hosts_waiters
+            .values_mut()
+            .filter(|w| w.request == request)
+        {
+            w.revoked = true;
+        }
         for o in self
             .dns
             .observations
@@ -818,6 +878,8 @@ impl<A: Authority> Issuer<A> {
         self.dns.observations.insert(
             id,
             Box::new(Observation {
+                publish: None,
+                waiter: None,
                 reservation,
                 context,
                 revision,
@@ -842,6 +904,446 @@ impl<A: Authority> Issuer<A> {
             query,
             self.record.binding.epoch,
         ))
+    }
+}
+// Hosts DATA хранит provenance observation, а не фиктивный DNS transport Binding.
+impl<A: Authority> Issuer<A> {
+    pub(in crate::helper::native_profile_channel) fn is_hosts_reservation(&self, id: u64) -> bool {
+        self.dns.observations.values().any(|o| o.reservation == id)
+    }
+    fn revalidate_host_data(&self, id: u64) -> Result<Instant, ServiceError> {
+        let _scratch = self.budget.dynamic.reserve(2048).map_err(unavailable)?;
+        let until = self.host_observation_live(id)?;
+        let o = self
+            .dns
+            .observations
+            .get(&id)
+            .ok_or(ServiceError::Unavailable)?;
+        if !o.acked {
+            return Err(ServiceError::Unavailable);
+        }
+        let b = self
+            .dns
+            .live
+            .get(&o.context)
+            .ok_or(ServiceError::Unavailable)?;
+        let c = b.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
+        let mut path = [(0, 0); 256];
+        for (i, h) in o._parent.iter().enumerate() {
+            path[i] = (h.scope, h.branch);
+        }
+        let source = self.root_source()?;
+        let choice = self.source_result(
+            o.context,
+            source.hosts(
+                Parent {
+                    root: b.root_kind,
+                    launch: self.record,
+                    query: b.query,
+                    selector: c.selector,
+                    original: o._original.wire(),
+                    path: &path[..o._parent.len()],
+                }
+                .checked()?,
+                o._reference,
+            ),
+        )?;
+        if choice.count != o.choice.count
+            || choice.key_len != o.choice.key_len
+            || choice.row != o.choice.row
+            || choice.key[..usize::from(choice.key_len)]
+                != o.choice.key[..usize::from(o.choice.key_len)]
+            || choice.members[..usize::from(choice.count)]
+                != o.choice.members[..usize::from(o.choice.count)]
+        {
+            return self.source_result(o.context, Err(ServiceError::Unavailable));
+        }
+        let until = until
+            .min(choice.expires)
+            .min(self.source_result(o.context, source.snapshot(self.record, o._reference))?)
+            .min(self.bootstrap_live(o.context, true)?);
+        if self.authority.now() >= until {
+            return self.source_result(o.context, Err(ServiceError::Unavailable));
+        }
+        Ok(until)
+    }
+    pub(in crate::helper::native_profile_channel) fn publish_hosts(
+        &mut self,
+        v: View<'_, 40>,
+        request: u64,
+        session: Instant,
+    ) -> Result<u64, ServiceError> {
+        self.fence()?;
+        let start = self.authority.now();
+        let b = v.bytes();
+        let t = &b[144..];
+        let host = v
+            .hosts()
+            .map_err(unavailable)?
+            .ok_or(ServiceError::InvalidRequest)?;
+        let observation = host.observation().map_err(unavailable)?.get();
+        let o = self
+            .dns
+            .observations
+            .get(&observation)
+            .ok_or(ServiceError::Unavailable)?;
+        let context = self
+            .dns
+            .live
+            .get(&o.context)
+            .ok_or(ServiceError::Unavailable)?;
+        let c = context
+            .bootstrap
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?;
+        let terminal = o._parent.last().ok_or(ServiceError::Unavailable)?;
+        let original = o._original.wire();
+        let key = host.lookup_key().map_err(unavailable)?;
+        let original_at = 128 + usize::from(u16_at(t, 110));
+        if context.root_kind != wire::dns_v2::Root::HostsPath
+            || !o.acked
+            || o.revoked
+            || o.publish.is_some()
+            || o.waiter.is_some()
+            || u64_at(b, 12) != context.query
+            || u64_at(b, 36) != self.record.binding.epoch
+            || t[16..48] != o._reference.source
+            || t[48..80] != o._reference.asset
+            || u16_at(t, 104) != 0
+            || u16_at(t, 106) != o.choice.row
+            || u16_at(t, 108) != o.choice.count
+            || key.as_bytes() != &o.choice.key[..usize::from(o.choice.key_len)]
+            || &t[original_at..original_at + usize::from(u16_at(t, 112))] != original.bytes
+            || u16_at(t, 114) != c.selector.subject
+            || u16_at(t, 116) != c.selector.endpoint
+            || u16_at(t, 118) != terminal.scope
+            || t[120] != terminal.branch
+            || t[121] != original.protocol
+            || u16_at(t, 122) != original.port
+            || !host
+                .member_indices()
+                .eq(o.choice.members[..usize::from(o.choice.count)]
+                    .iter()
+                    .copied())
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if self.dns.hosts_producers.len() + self.rrsets.counts().0 >= 64 {
+            return Err(ServiceError::Busy);
+        }
+        let expires = o
+            .expires
+            .min(session)
+            .min(start + Duration::from_nanos(u64_at(t, 96)));
+        let memory = self
+            .budget
+            .dynamic
+            .reserve(std::mem::size_of::<HostsProducer>() + 80)
+            .map_err(unavailable)?;
+        self.bundle_history(1)?;
+        let expires = expires.min(self.revalidate_host_data(observation)?);
+        if self.authority.now() >= expires || self.retired.iter().any(|(n, _)| *n == request) {
+            return Err(ServiceError::Unavailable);
+        }
+        let id = self.rrsets.host_id::<A>(Operation::Published)?;
+        self.dns
+            .observations
+            .get_mut(&observation)
+            .ok_or(ServiceError::Unavailable)?
+            .publish = Some(id);
+        self.dns.hosts_producers.insert(
+            id,
+            Box::new(HostsProducer {
+                observation,
+                request,
+                expires,
+                acked: false,
+                revoked: false,
+                _memory: memory,
+            }),
+        );
+        Ok(id)
+    }
+    fn same_hosts_data(&self, a: u64, b: u64) -> Result<bool, ServiceError> {
+        let a = self
+            .dns
+            .observations
+            .get(&a)
+            .ok_or(ServiceError::Unavailable)?;
+        let b = self
+            .dns
+            .observations
+            .get(&b)
+            .ok_or(ServiceError::Unavailable)?;
+        Ok(a._reference.source == b._reference.source
+            && a._reference.asset == b._reference.asset
+            && a._reference.bytes == b._reference.bytes
+            && a._reference.flags == b._reference.flags
+            && a._original == b._original
+            && a.choice.row == b.choice.row
+            && a.choice.key_len == b.choice.key_len
+            && a.choice.key[..usize::from(a.choice.key_len)]
+                == b.choice.key[..usize::from(b.choice.key_len)]
+            && a.choice.count == b.choice.count
+            && a.choice.members[..usize::from(a.choice.count)]
+                == b.choice.members[..usize::from(b.choice.count)]
+            && a._parent.len() == b._parent.len()
+            && a._parent.iter().zip(b._parent.iter()).all(|(a, b)| {
+                (
+                    a.index, a.scope, a.branch, a.subject, a.chain, a.stream, a.carrier, a.endpoint,
+                ) == (
+                    b.index, b.scope, b.branch, b.subject, b.chain, b.stream, b.carrier, b.endpoint,
+                )
+            }))
+    }
+    fn hosts_producer_live(&self, id: u64, acked: bool) -> Result<Instant, ServiceError> {
+        let p = self
+            .dns
+            .hosts_producers
+            .get(&id)
+            .ok_or(ServiceError::Unavailable)?;
+        if p.revoked || acked && !p.acked || self.authority.now() >= p.expires {
+            return Err(ServiceError::Unavailable);
+        }
+        let until = p.expires.min(self.revalidate_host_data(p.observation)?);
+        if self.authority.now() >= until {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(until)
+    }
+    pub(in crate::helper::native_profile_channel) fn hosts_waiter_live(
+        &self,
+        id: u64,
+        acked: bool,
+    ) -> Result<Instant, ServiceError> {
+        let w = self
+            .dns
+            .hosts_waiters
+            .get(&id)
+            .ok_or(ServiceError::Unavailable)?;
+        if w.revoked || acked && !w.acked || self.authority.now() >= w.expires {
+            return Err(ServiceError::Unavailable);
+        }
+        let until = w
+            .expires
+            .min(self.revalidate_host_data(w.observation)?)
+            .min(self.hosts_producer_live(w.producer, true)?);
+        if self.authority.now() >= until {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(until)
+    }
+    pub(in crate::helper::native_profile_channel) fn bind_hosts_waiter(
+        &mut self,
+        v: View<'_, 53>,
+        request: u64,
+        session: Instant,
+    ) -> Result<u64, ServiceError> {
+        self.fence()?;
+        let start = self.authority.now();
+        let b = v.bytes();
+        let reservation = u64_at(b, 8);
+        let producer = u64_at(b, 16);
+        let (observation, o) = self
+            .dns
+            .observations
+            .iter()
+            .find(|(_, o)| o.reservation == reservation)
+            .ok_or(ServiceError::Unavailable)?;
+        let observation = *observation;
+        let context = self
+            .dns
+            .live
+            .get(&o.context)
+            .ok_or(ServiceError::Unavailable)?;
+        let p = self
+            .dns
+            .hosts_producers
+            .get(&producer)
+            .ok_or(ServiceError::Unavailable)?;
+        let source = self
+            .dns
+            .observations
+            .get(&p.observation)
+            .ok_or(ServiceError::Unavailable)?;
+        let parent = self
+            .dns
+            .live
+            .get(&source.context)
+            .ok_or(ServiceError::Unavailable)?;
+        if !o.acked
+            || o.revoked
+            || o.publish.is_some()
+            || o.waiter.is_some()
+            || !p.acked
+            || p.revoked
+            || context.root_kind != wire::dns_v2::Root::HostsPath
+            || o.context == source.context
+            || context.query == parent.query
+            || u64_at(b, 24) != 0
+            || u64_at(b, 32) != context.query
+            || u64_at(b, 40) != 0
+            || u64_at(b, 48) != 0
+            || self.dns.hosts_waiters.values().any(|w| {
+                self.dns
+                    .observations
+                    .get(&w.observation)
+                    .is_some_and(|prior| prior.context == o.context)
+            })
+            || !self.same_hosts_data(observation, p.observation)?
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if self.dns.hosts_waiters.len() + self.rrsets.counts().1 >= 256 {
+            return Err(ServiceError::Busy);
+        }
+        let expires = o
+            .expires
+            .min(p.expires)
+            .min(session)
+            .min(start + Duration::from_nanos(u64_at(b, 56)));
+        let memory = self
+            .budget
+            .dynamic
+            .reserve(std::mem::size_of::<HostsWaiter>() + 80)
+            .map_err(unavailable)?;
+        self.bundle_history(1)?;
+        let expires = expires
+            .min(self.revalidate_host_data(observation)?)
+            .min(self.hosts_producer_live(producer, true)?);
+        if self.authority.now() >= expires || self.retired.iter().any(|(n, _)| *n == request) {
+            return Err(ServiceError::Unavailable);
+        }
+        let id = self.rrsets.host_id::<A>(Operation::WaiterBound)?;
+        self.dns
+            .observations
+            .get_mut(&observation)
+            .ok_or(ServiceError::Unavailable)?
+            .waiter = Some(id);
+        self.dns.hosts_waiters.insert(
+            id,
+            Box::new(HostsWaiter {
+                observation,
+                producer,
+                request,
+                expires,
+                acked: false,
+                revoked: false,
+                _memory: memory,
+            }),
+        );
+        Ok(id)
+    }
+    pub(in crate::helper::native_profile_channel) fn hosts_rrset_reply(
+        &self,
+        op: Operation,
+        id: u64,
+        out: &mut [u8; 64],
+    ) -> Result<Option<Instant>, ServiceError> {
+        let (until, observation) = match op {
+            Operation::Published => match self.dns.hosts_producers.get(&id) {
+                Some(p) => (self.hosts_producer_live(id, false)?, p.observation),
+                None => return Ok(None),
+            },
+            Operation::WaiterBound => match self.dns.hosts_waiters.get(&id) {
+                Some(w) => (self.hosts_waiter_live(id, false)?, w.observation),
+                None => return Ok(None),
+            },
+            _ => return Err(ServiceError::InvalidRequest),
+        };
+        let o = self
+            .dns
+            .observations
+            .get(&observation)
+            .ok_or(ServiceError::Unavailable)?;
+        let context = self
+            .dns
+            .live
+            .get(&o.context)
+            .ok_or(ServiceError::Unavailable)?;
+        let checked = self.authority.now();
+        if checked >= until {
+            return Err(ServiceError::Unavailable);
+        }
+        out[8..16].copy_from_slice(&id.to_be_bytes());
+        if op == Operation::Published {
+            out[24..32].copy_from_slice(&self.record.binding.epoch.to_be_bytes());
+            out[32..40].copy_from_slice(
+                &((until - checked).as_nanos().min(1_000_000_000) as u64).to_be_bytes(),
+            );
+            out[40..42].copy_from_slice(&o.choice.count.to_be_bytes());
+        } else {
+            let w = self
+                .dns
+                .hosts_waiters
+                .get(&id)
+                .ok_or(ServiceError::Unavailable)?;
+            for (at, value) in [
+                (16, w.producer),
+                (24, o.reservation),
+                (32, context.query),
+                (40, self.record.binding.epoch),
+                (48, (until - checked).as_nanos().min(1_000_000_000) as u64),
+            ] {
+                out[at..at + 8].copy_from_slice(&value.to_be_bytes());
+            }
+            out[56..58].copy_from_slice(&o.choice.count.to_be_bytes());
+            out[58] = 2;
+            out[59] = 3;
+        }
+        Ok(Some(until))
+    }
+    pub(in crate::helper::native_profile_channel) fn ack_hosts_data(
+        &mut self,
+        op: Operation,
+        id: u64,
+    ) -> Result<bool, ServiceError> {
+        match op {
+            Operation::Published if self.dns.hosts_producers.contains_key(&id) => {
+                self.hosts_producer_live(id, false)?;
+                self.dns
+                    .hosts_producers
+                    .get_mut(&id)
+                    .ok_or(ServiceError::Unavailable)?
+                    .acked = true;
+                Ok(true)
+            }
+            Operation::WaiterBound if self.dns.hosts_waiters.contains_key(&id) => {
+                self.hosts_waiter_live(id, false)?;
+                self.dns
+                    .hosts_waiters
+                    .get_mut(&id)
+                    .ok_or(ServiceError::Unavailable)?
+                    .acked = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+    pub(in crate::helper::native_profile_channel) fn cancel_hosts_data(
+        &mut self,
+        target: u8,
+        id: u64,
+    ) -> Result<bool, ServiceError> {
+        match target {
+            5 => {
+                if let Some(p) = self.dns.hosts_producers.get_mut(&id) {
+                    p.revoked = true;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            6 => {
+                if let Some(w) = self.dns.hosts_waiters.get_mut(&id) {
+                    w.revoked = true;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            _ => Err(ServiceError::InvalidRequest),
+        }
     }
 }
 #[cfg(test)]

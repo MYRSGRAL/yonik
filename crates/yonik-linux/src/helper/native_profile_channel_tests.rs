@@ -81,6 +81,9 @@ fn dns_rrset_queue_credit_precedes_materialization_and_rx_bound_is_fixed() {
 
 // Весь driver below — in-memory: ни OS endpoint, ни runtime wrappers.
 pub(super) struct BundleIo {
+    pub(super) fail_write_at: Option<usize>,
+    pub(super) delay_write_at: usize,
+    pub(super) on_request: Option<Box<dyn Fn(u64)>>,
     pub(super) after_reply: std::cell::RefCell<VecDeque<Vec<Vec<u8>>>>,
     slots: Arc<SidebandCredits>,
     credits: std::cell::RefCell<BTreeMap<u64, super::super::memory::ByteLease>>,
@@ -125,6 +128,9 @@ pub(super) fn dns_packet(
 impl BundleIo {
     pub(super) fn new(record: LaunchRecord, requests: Vec<Vec<u8>>) -> Self {
         Self {
+            fail_write_at: None,
+            delay_write_at: 0,
+            on_request: None,
             source: None,
             after_reply: Default::default(),
             slots: SidebandCredits::new(),
@@ -191,6 +197,9 @@ impl Channel for BundleIo {
                 let sequence = u64::from_be_bytes(b[16..24].try_into().unwrap());
                 self.credits.borrow_mut().insert(sequence, credit);
             }
+            if let Some(action) = &self.on_request {
+                action(u64::from_be_bytes(b[16..24].try_into().unwrap()));
+            }
             out[..b.len()].copy_from_slice(&b);
             return Ok(Some(b.len()));
         }
@@ -202,7 +211,17 @@ impl Channel for BundleIo {
     }
     fn write(&self, b: &[u8]) -> Result<bool, ServiceError> {
         if dns_bundle::is_dns(b) {
-            if let Some(elapsed) = self.delayed_send.borrow_mut().take() {
+            if self.fail_write_at == Some(self.output.borrow().len() + 1) {
+                return Err(ServiceError::Unavailable);
+            }
+            let elapsed = if self.delay_write_at == 0
+                || self.delay_write_at == self.output.borrow().len() + 1
+            {
+                self.delayed_send.borrow_mut().take()
+            } else {
+                None
+            };
+            if let Some(elapsed) = elapsed {
                 elapsed.fetch_add(25_000_000, Ordering::AcqRel);
                 return Ok(false);
             }

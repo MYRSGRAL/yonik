@@ -54,7 +54,7 @@ impl Source for Facts {
                 }
                 wire::dns_v2::Root::UserDns(_) => true,
             }
-            || ![9, 10].contains(&p.query)
+            || !(9..=12).contains(&p.query)
             || p.selector.endpoint != self.endpoint
             || p.selector.subject != 1
             || p.path != self.path
@@ -887,4 +887,469 @@ fn codec4_roots_driver_blocked_context_ack_never_refreshes_expired_source() {
     assert!(issuer.dns.observations.is_empty());
     assert_eq!(f.observed.load(Ordering::Acquire), 0);
     assert_eq!(issuer.authority.owner_count, 0);
+}
+
+// Независимый field packer: не вызывает Rust Hosts encoder для body.
+fn hosts_publish(f: &Facts, observation: u64, query: u64) -> Vec<u8> {
+    let key = b"physical.invalid.";
+    let original = b"physical.invalid";
+    let mut b = vec![0; 144 + 128];
+    b[..2].copy_from_slice(&2u16.to_be_bytes());
+    for (at, v) in [
+        (4, u16::MAX),
+        (6, 1),
+        (8, f.endpoint),
+        (140, f.path.last().unwrap().0),
+    ] {
+        b[at..at + 2].copy_from_slice(&v.to_be_bytes());
+    }
+    for (at, v) in [(12, query), (36, f.launch.binding.epoch)] {
+        b[at..at + 8].copy_from_slice(&v.to_be_bytes());
+    }
+    b[44..76].copy_from_slice(&f.reference.source);
+    b[76..108].copy_from_slice(&f.reference.asset);
+    b[136] = 3;
+    b[137] = 2;
+    b[142] = 6;
+    let t = &mut b[144..];
+    t[..8].copy_from_slice(b"DNHOST02");
+    t[8..10].copy_from_slice(&2u16.to_be_bytes());
+    let len = (128 + key.len() + original.len() + 2) as u16;
+    t[10..12].copy_from_slice(&len.to_be_bytes());
+    t[16..48].copy_from_slice(&f.reference.source);
+    t[48..80].copy_from_slice(&f.reference.asset);
+    for (at, v) in [
+        (80, f.launch.binding.epoch),
+        (88, observation),
+        (96, 1_000_000_000),
+    ] {
+        t[at..at + 8].copy_from_slice(&v.to_be_bytes());
+    }
+    for (at, v) in [
+        (108, 1),
+        (110, key.len() as u16),
+        (112, original.len() as u16),
+        (114, 1),
+        (116, f.endpoint),
+        (118, f.path.last().unwrap().0),
+        (122, 8443),
+    ] {
+        t[at..at + 2].copy_from_slice(&v.to_be_bytes());
+    }
+    t[120] = f.path.last().unwrap().1;
+    t[121] = 6;
+    b.extend_from_slice(key);
+    b.extend_from_slice(original);
+    b.extend_from_slice(&0u16.to_be_bytes());
+    b
+}
+fn hosts_bind(reservation: u64, producer: u64, query: u64) -> Vec<u8> {
+    let mut b = vec![0; 64];
+    b[..2].copy_from_slice(&2u16.to_be_bytes());
+    for (at, v) in [
+        (8, reservation),
+        (16, producer),
+        (32, query),
+        (56, 1_000_000_000),
+    ] {
+        b[at..at + 8].copy_from_slice(&v.to_be_bytes());
+    }
+    b
+}
+fn hosts_script(f: &Facts) -> Vec<(Operation, Vec<u8>)> {
+    vec![
+        (Operation::BundleAcquire, acquire(f, true, 0, 9)),
+        (Operation::Reserve, reserve(f, true, 3, 9)),
+        (Operation::Publish, hosts_publish(f, 1, 9)),
+        (Operation::BundleAcquire, acquire(f, true, 0, 10)),
+        (Operation::Reserve, reserve(f, true, 3, 10)),
+        (Operation::WaiterBind, hosts_bind(2, 1, 10)),
+    ]
+}
+fn scripted(
+    issuer: &mut Issuer<Fake>,
+    f: &Arc<Facts>,
+    script: &[(Operation, Vec<u8>)],
+) -> Vec<Vec<u8>> {
+    let packets: Vec<_> = script
+        .iter()
+        .enumerate()
+        .map(|(i, (kind, b))| dns_packet(f.launch, 3 + i as u64, *kind, b))
+        .collect();
+    let mut io = BundleIo::new(f.launch, vec![packets[0].clone()]);
+    io.source = Some(f.clone());
+    io.stop_after = script.len();
+    for p in &packets[1..] {
+        append(&io, vec![p.clone()]);
+    }
+    drive(issuer, &io);
+    io.output.into_inner()
+}
+fn cancel_body(target: u8, id: u64) -> Vec<u8> {
+    let mut b = vec![0; 24];
+    b[..2].copy_from_slice(&2u16.to_be_bytes());
+    b[2] = target;
+    b[8..16].copy_from_slice(&id.to_be_bytes());
+    b
+}
+#[test]
+fn codec4_hosts_driver_publish_then_independent_waiter_are_not_numeric_authority() {
+    for mode in [Mode::Local, Mode::System] {
+        let (mut issuer, f) = fixture(mode);
+        let output = scripted(&mut issuer, &f, &hosts_script(&f));
+        assert_eq!(output.len(), 6);
+        for b in &output {
+            assert_eq!(b[130], 1, "reply {}", u64_at(b, 24));
+        }
+        assert_eq!(output[2].len(), 176);
+        assert_eq!(u64_at(&output[2], 144), 0);
+        assert_eq!(u64_at(&output[5], 136), 1);
+        assert_eq!(u64_at(&output[5], 152), 2);
+        assert_eq!(&output[5][186..188], &[2, 3]);
+        assert_eq!(
+            (issuer.authority.owner_count, issuer.authority.route_count),
+            (0, 0)
+        );
+        assert!(issuer.hosts_waiter_live(1, true).is_ok());
+        assert!(issuer.grants.is_empty() && issuer.services.is_empty());
+    }
+}
+
+#[test]
+fn codec4_hosts_driver_two_waiters_cancel_one_preserves_neighbor_and_data() {
+    let (mut issuer, f) = fixture(Mode::System);
+    let mut script = hosts_script(&f);
+    script.extend([
+        (Operation::BundleAcquire, acquire(&f, true, 0, 11)),
+        (Operation::Reserve, reserve(&f, true, 3, 11)),
+        (Operation::WaiterBind, hosts_bind(3, 1, 11)),
+        (Operation::Cancel, cancel_body(6, 1)),
+    ]);
+    let output = scripted(&mut issuer, &f, &script);
+    assert_eq!(output.len(), 10);
+    for b in &output {
+        assert_eq!(b[130], 1);
+    }
+    assert!(issuer.hosts_waiter_live(1, true).is_err());
+    assert!(issuer.hosts_waiter_live(2, true).is_ok());
+    assert!(issuer.hosts_producer_live(1, true).is_ok());
+    assert_eq!(
+        (issuer.authority.owner_count, issuer.authority.route_count),
+        (0, 0)
+    );
+}
+#[test]
+fn codec4_hosts_driver_observation_publish_and_waiter_are_single_consumers() {
+    for fault in 0..3 {
+        let (mut issuer, f) = fixture(Mode::System);
+        let mut script = hosts_script(&f);
+        match fault {
+            0 => {
+                script.truncate(3);
+                script.push((Operation::Publish, hosts_publish(&f, 1, 9)));
+            }
+            1 => {
+                script.truncate(3);
+                script.push((Operation::WaiterBind, hosts_bind(1, 1, 9)));
+            }
+            2 => script.push((Operation::WaiterBind, hosts_bind(2, 1, 10))),
+            _ => unreachable!(),
+        }
+        let output = scripted(&mut issuer, &f, &script);
+        assert_eq!(output.len(), script.len());
+        assert_eq!(output.last().unwrap()[130], 2);
+        assert!(issuer.hosts_producer_live(1, true).is_ok());
+        assert_eq!(issuer.authority.route_count, 0);
+    }
+}
+#[test]
+fn codec4_hosts_driver_foreign_publish_fields_cannot_poison_source_context() {
+    for fault in 0..6 {
+        let (mut issuer, f) = fixture(Mode::System);
+        let mut p = hosts_publish(&f, 1, 9);
+        match fault {
+            0 => p[19] = 10,
+            1 => p[144 + 107] = 1,
+            2 => {
+                let end = p.len();
+                p[end - 1] = 1;
+            }
+            3 => {
+                p[144 + 128] = b'x';
+                p[144 + 128 + 17] = b'x';
+            }
+            4 => p[144 + 123] ^= 1,
+            5 => {
+                p[44] ^= 1;
+                p[144 + 16] ^= 1;
+            }
+            _ => unreachable!(),
+        }
+        let mut script = hosts_script(&f);
+        script.truncate(3);
+        script[2].1 = p;
+        let packets: Vec<_> = script
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, b))| dns_packet(f.launch, i as u64 + 3, *kind, b))
+            .collect();
+        let mut io = BundleIo::new(f.launch, vec![packets[0].clone()]);
+        io.source = Some(f.clone());
+        io.stop_after = 3;
+        for p in &packets[1..] {
+            append(&io, vec![p.clone()]);
+        }
+        let source = f.clone();
+        io.on_request = Some(Box::new(move |n| {
+            if n == 5 {
+                source.failed_operation.store(2, Ordering::Release);
+            }
+        }));
+        drive(&mut issuer, &io);
+        assert_eq!(io.output.borrow().len(), 3);
+        assert_eq!(io.output.borrow()[2][130], 2, "fault {fault}");
+        f.failed_operation.store(0, Ordering::Release);
+        assert!(issuer.bootstrap_live(1, true).is_ok(), "fault {fault}");
+        assert!(issuer.dns.hosts_producers.is_empty());
+    }
+}
+#[test]
+fn codec4_hosts_driver_source_change_at_publish_or_waiter_is_sticky() {
+    for fault in 0..2 {
+        let (mut issuer, f) = fixture(Mode::System);
+        let mut script = hosts_script(&f);
+        if fault == 0 {
+            script.truncate(3);
+        }
+        let packets: Vec<_> = script
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, b))| dns_packet(f.launch, i as u64 + 3, *kind, b))
+            .collect();
+        let mut io = BundleIo::new(f.launch, vec![packets[0].clone()]);
+        io.source = Some(f.clone());
+        io.stop_after = script.len();
+        for p in &packets[1..] {
+            append(&io, vec![p.clone()]);
+        }
+        let source = f.clone();
+        io.on_request = Some(Box::new(move |n| {
+            if n == if fault == 0 { 5 } else { 8 } {
+                source.failed_operation.store(2, Ordering::Release);
+            }
+        }));
+        drive(&mut issuer, &io);
+        assert_eq!(io.output.borrow().len(), script.len());
+        assert_eq!(io.output.borrow().last().unwrap()[130], 2);
+        f.failed_operation.store(0, Ordering::Release);
+        assert!(
+            issuer
+                .bootstrap_live(if fault == 0 { 1 } else { 2 }, true)
+                .is_err()
+        );
+        assert!(issuer.dns.hosts_waiters.is_empty());
+    }
+}
+#[test]
+fn codec4_hosts_driver_publish_received_before_observation_ack_is_denied() {
+    let (mut issuer, f) = fixture(Mode::System);
+    let script = hosts_script(&f);
+    let mut io = BundleIo::new(
+        f.launch,
+        vec![dns_packet(f.launch, 3, script[0].0, &script[0].1)],
+    );
+    io.source = Some(f.clone());
+    io.stop_after = 3;
+    append(
+        &io,
+        vec![
+            dns_packet(f.launch, 4, script[1].0, &script[1].1),
+            dns_packet(f.launch, 5, script[2].0, &script[2].1),
+        ],
+    );
+    drive(&mut issuer, &io);
+    let output = io.output.borrow();
+    assert_eq!(output.len(), 3);
+    assert_eq!(output[1][130], 1);
+    assert_eq!(output[2][130], 2);
+    assert!(issuer.dns.hosts_producers.is_empty());
+}
+
+#[test]
+fn codec4_hosts_driver_lost_reply_retains_metadata_and_pending_without_authority() {
+    for fault in [3, 6] {
+        let (mut issuer, f) = fixture(Mode::System);
+        let script = hosts_script(&f);
+        let packets: Vec<_> = script
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, b))| dns_packet(f.launch, i as u64 + 3, *kind, b))
+            .collect();
+        let mut io = BundleIo::new(f.launch, vec![packets[0].clone()]);
+        io.source = Some(f.clone());
+        io.stop_after = script.len();
+        io.fail_write_at = Some(fault);
+        for p in &packets[1..] {
+            append(&io, vec![p.clone()]);
+        }
+        drive(&mut issuer, &io);
+        assert!(issuer.unknown);
+        assert_eq!(io.output.borrow().len(), fault - 1);
+        assert_eq!(io.dns_slots().unwrap().pending.used(), 1);
+        assert_eq!(issuer.dns.hosts_producers.len(), 1);
+        if fault == 3 {
+            assert!(!issuer.dns.hosts_producers[&1].acked);
+        } else {
+            assert_eq!(issuer.dns.hosts_waiters.len(), 1);
+            assert!(!issuer.dns.hosts_waiters[&1].acked);
+        }
+        assert!(issuer.grants.is_empty() && issuer.services.is_empty());
+    }
+}
+#[test]
+fn codec4_hosts_driver_blocked_send_never_renews_observation_lease() {
+    for step in [3, 6] {
+        let (mut issuer, mut f) = fixture(Mode::System);
+        Arc::get_mut(&mut f).unwrap().expiry = issuer.authority.now() + Duration::from_millis(5);
+        let script = hosts_script(&f);
+        let packets: Vec<_> = script
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, b))| dns_packet(f.launch, i as u64 + 3, *kind, b))
+            .collect();
+        let mut io = BundleIo::new(f.launch, vec![packets[0].clone()]);
+        io.source = Some(f.clone());
+        io.stop_after = script.len();
+        io.delay_write_at = step;
+        *io.delayed_send.borrow_mut() = Some(issuer.authority.elapsed.clone());
+        for p in &packets[1..] {
+            append(&io, vec![p.clone()]);
+        }
+        drive(&mut issuer, &io);
+        assert_eq!(io.output.borrow().len(), step - 1);
+        assert!(issuer.hosts_producer_live(1, true).is_err());
+        assert!(issuer.hosts_waiter_live(1, true).is_err());
+        assert!(issuer.grants.is_empty());
+        assert_eq!(io.dns_slots().unwrap().pending.used(), 1);
+    }
+}
+#[test]
+fn codec4_hosts_driver_cancel_queued_publish_is_drained_before_data_ack() {
+    let (mut issuer, f) = fixture(Mode::System);
+    let script = hosts_script(&f);
+    let mut io = BundleIo::new(
+        f.launch,
+        vec![dns_packet(f.launch, 3, script[0].0, &script[0].1)],
+    );
+    io.source = Some(f.clone());
+    io.stop_after = 4;
+    append(
+        &io,
+        vec![dns_packet(f.launch, 4, script[1].0, &script[1].1)],
+    );
+    append(
+        &io,
+        vec![
+            dns_packet(f.launch, 5, script[2].0, &script[2].1),
+            dns_packet(f.launch, 6, Operation::Cancel, &cancel_body(1, 5)),
+        ],
+    );
+    drive(&mut issuer, &io);
+    let output = io.output.borrow();
+    assert_eq!(output.len(), 4);
+    assert_eq!(output[2][130], 2);
+    assert!(issuer.hosts_producer_live(1, true).is_err());
+    assert!(issuer.dns.hosts_producers.values().all(|p| !p.acked));
+    assert!(issuer.bootstrap_live(1, true).is_ok());
+}
+#[test]
+fn codec4_hosts_driver_waiter_requires_own_acked_reservation_and_exact_query() {
+    for fault in 0..3 {
+        let (mut issuer, f) = fixture(Mode::System);
+        let mut script = hosts_script(&f);
+        match fault {
+            0 => script[5].1[39] = 9,
+            1 => script[5].1[31] = 1,
+            2 => script[5].1[47] = 1,
+            _ => unreachable!(),
+        }
+        // class3 service flow0 допускает только source/revision оба0;
+        // malformed pair кодируется как оба1, а затем отвергается issuer.
+        if fault == 2 {
+            script[5].1[55] = 1;
+        }
+        let output = scripted(&mut issuer, &f, &script);
+        assert_eq!(output.len(), 6);
+        assert_eq!(output[5][130], 2);
+        assert!(issuer.dns.hosts_waiters.is_empty());
+        assert!(issuer.bootstrap_live(2, true).is_ok());
+    }
+}
+
+#[test]
+fn codec4_hosts_driver_history_credit_precedes_publish_and_waiter_source_capture() {
+    for waiter in [false, true] {
+        let (mut issuer, f) = fixture(Mode::System);
+        let mut script = hosts_script(&f);
+        if !waiter {
+            script.truncate(3);
+        }
+        let prior = if waiter {
+            2 * f.path.len() + 5
+        } else {
+            f.path.len() + 2
+        };
+        issuer.dns.history = 256 - prior;
+        let packets: Vec<_> = script
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, b))| dns_packet(f.launch, i as u64 + 3, *kind, b))
+            .collect();
+        let mut io = BundleIo::new(f.launch, vec![packets[0].clone()]);
+        io.source = Some(f.clone());
+        io.stop_after = script.len();
+        for p in &packets[1..] {
+            append(&io, vec![p.clone()]);
+        }
+        let source = f.clone();
+        io.on_request = Some(Box::new(move |seq| {
+            if seq == if waiter { 8 } else { 5 } {
+                source.failed_operation.store(2, Ordering::Release);
+            }
+        }));
+        drive(&mut issuer, &io);
+        assert_eq!(io.output.borrow().len(), script.len());
+        assert_eq!(io.output.borrow().last().unwrap()[130], 2);
+        f.failed_operation.store(0, Ordering::Release);
+        assert!(
+            issuer
+                .bootstrap_live(if waiter { 2 } else { 1 }, true)
+                .is_ok()
+        );
+        assert!(issuer.dns.hosts_waiters.is_empty());
+        if !waiter {
+            assert!(issuer.dns.hosts_producers.is_empty());
+        }
+        assert_eq!(issuer.authority.route_count, 0);
+    }
+}
+
+#[test]
+fn codec4_hosts_driver_typed_cancel_namespaces_and_source_derivatives_are_isolated() {
+    for (target, id, neighbor_live) in [(7, 2, true), (8, 2, true), (5, 1, false), (7, 1, false)] {
+        let (mut issuer, f) = fixture(Mode::System);
+        let mut script = hosts_script(&f);
+        script.extend([
+            (Operation::BundleAcquire, acquire(&f, true, 0, 11)),
+            (Operation::Reserve, reserve(&f, true, 3, 11)),
+            (Operation::WaiterBind, hosts_bind(3, 1, 11)),
+            (Operation::Cancel, cancel_body(target, id)),
+        ]);
+        let output = scripted(&mut issuer, &f, &script);
+        assert_eq!(output.len(), 10);
+        assert_eq!(output.last().unwrap()[130], 1);
+        assert!(issuer.hosts_waiter_live(1, true).is_err());
+        assert_eq!(issuer.hosts_waiter_live(2, true).is_ok(), neighbor_live);
+        assert_eq!(issuer.authority.route_count, 0);
+    }
 }

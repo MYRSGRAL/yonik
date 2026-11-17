@@ -425,6 +425,10 @@ pub(super) struct Transport {
 }
 impl Transport {
     pub(super) fn ready_at_arrival(&self, record: Record<'_>) -> bool {
+        if matches!(record,Record::Publish(v) if v.bytes()[137]==2) {
+            // Hosts ACK readiness проверяет typed observation registry, не proof0.
+            return true;
+        }
         let vector = match record {
             Record::LogicalBind(v) => Some(&v.bytes()[64..]),
             Record::Append(v) => Some(&v.bytes()[48..]),

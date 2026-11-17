@@ -375,6 +375,17 @@ pub(super) struct State {
     next_waiter: u64,
 }
 impl State {
+    pub(super) fn counts(&self) -> (usize, usize) {
+        (self.producers.len(), self.waiters.len())
+    }
+    pub(super) fn host_id<A: Authority>(&mut self, op: Operation) -> Result<u64, ServiceError> {
+        let counter = match op {
+            Operation::Published => &mut self.next_producer,
+            Operation::WaiterBound => &mut self.next_waiter,
+            _ => return Err(ServiceError::InvalidRequest),
+        };
+        Issuer::<A>::id(counter)
+    }
     #[cfg(test)]
     pub(super) fn waiter_flags(&self) -> Vec<bool> {
         self.waiters
@@ -488,6 +499,9 @@ impl<A: Authority> Issuer<A> {
     ) -> Result<u64, ServiceError> {
         self.fence()?;
         let b = v.bytes();
+        if b[137] == 2 {
+            return self.publish_hosts(v, request, session);
+        }
         if b[136] != 1
             || b[137] != 1
             || n16(b, 8) != u16::MAX
@@ -522,7 +536,7 @@ impl<A: Authority> Issuer<A> {
             || n64(b, 36) != binding.epoch
             || b[142] != binding.peer.protocol
             || &b[144..144 + q] != binding.name.wire().bytes
-            || self.rrsets.producers.len() >= 64
+            || self.rrsets.producers.len() + self.dns.hosts_counts().0 >= 64
         {
             return Err(ServiceError::InvalidRequest);
         }
@@ -611,6 +625,9 @@ impl<A: Authority> Issuer<A> {
         self.fence()?;
         let b = v.bytes();
         let reservation = n64(b, 8);
+        if self.is_hosts_reservation(reservation) {
+            return self.bind_hosts_waiter(v, request, session);
+        }
         let producer = n64(b, 16);
         let (binding, reservation_expires) = self.dns_waiter_binding(reservation)?;
         let p = self
@@ -632,7 +649,7 @@ impl<A: Authority> Issuer<A> {
                     || w.binding.bundle == binding.bundle
                     || w.binding.root == binding.root
             })
-            || self.rrsets.waiters.len() >= 256
+            || self.rrsets.waiters.len() + self.dns.hosts_counts().1 >= 256
         {
             return Err(ServiceError::InvalidRequest);
         }
@@ -672,6 +689,9 @@ impl<A: Authority> Issuer<A> {
         out: &mut [u8; 64],
     ) -> Result<Instant, ServiceError> {
         self.fence()?;
+        if let Some(until) = self.hosts_rrset_reply(operation, id, out)? {
+            return Ok(until);
+        }
         if operation == Operation::Published {
             let p = self
                 .rrsets
@@ -1232,6 +1252,9 @@ pub(super) fn dispatch<A: Authority>(
     }
     let mut deadline = session;
     loop {
+        if !issuer.unknown {
+            drain(issuer)?;
+        }
         if stop.load(Ordering::Acquire) || issuer.authority.now() >= deadline {
             return Err(ServiceError::Unavailable);
         }
@@ -1272,10 +1295,20 @@ pub(super) fn dispatch<A: Authority>(
                 &mut bytes,
             )
             .map_err(unavailable)?;
-        if socket.write(&bytes[..n])? {
+        let sent = match socket.write(&bytes[..n]) {
+            Ok(sent) => sent,
+            Err(error) => {
+                issuer.unknown = true;
+                issuer.authority.revoke();
+                return Err(error);
+            }
+        };
+        if sent {
             if body[2] == 1 {
                 let id = result?;
-                if operation == Operation::Published {
+                if issuer.ack_hosts_data(operation, id)? {
+                    return Ok(());
+                } else if operation == Operation::Published {
                     issuer
                         .rrsets
                         .producers

@@ -23,6 +23,8 @@ pub(super) struct Bundles {
     roots: [u64; 256],
     kinds: [u8; 256],
     observations: BTreeMap<u64, Box<roots::Observation>>,
+    hosts_producers: BTreeMap<u64, Box<roots::HostsProducer>>,
+    hosts_waiters: BTreeMap<u64, Box<roots::HostsWaiter>>,
     next_observation: u64,
     _ledger_credit: super::super::memory::ByteLease,
     live: BTreeMap<u64, Box<Bundle>>,
@@ -63,6 +65,9 @@ struct Bundle {
     _routes: super::super::memory::ByteLease,
 }
 impl Bundles {
+    pub(super) fn hosts_counts(&self) -> (usize, usize) {
+        (self.hosts_producers.len(), self.hosts_waiters.len())
+    }
     pub(super) fn wakeup(&self, now: Instant) -> Option<Instant> {
         self.live
             .values()
@@ -76,6 +81,8 @@ impl Bundles {
             roots: [0; 256],
             kinds: [0; 256],
             observations: BTreeMap::new(),
+            hosts_producers: BTreeMap::new(),
+            hosts_waiters: BTreeMap::new(),
             next_observation: 0,
             _ledger_credit: budget
                 .reserve(std::mem::size_of::<Self>())
@@ -909,7 +916,9 @@ pub(super) fn cancel<A: Authority>(
             Ok(())
         }
         5 | 6 => {
-            issuer.rrsets.cancel(target, id)?;
+            if !issuer.cancel_hosts_data(target, id)? {
+                issuer.rrsets.cancel(target, id)?;
+            }
             issuer.cancel_numeric_dependents()
         }
         _ => Err(ServiceError::InvalidRequest),
