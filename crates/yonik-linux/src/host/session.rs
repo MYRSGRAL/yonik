@@ -15,7 +15,7 @@ use tokio::{
 use yonik_application::{
     ConfigDigest, EnvironmentStamp, Event, Fault, Outcome, Session, State, Token,
 };
-use yonik_engine::{CompiledConfig, ProbeAccess};
+use yonik_engine::{CompiledConfig, PendingXrayRealityH2, ProbeAccess};
 
 use super::{BinarySnapshot, Cancellation, HostError, ProbeResult, ProbeTarget, probe, process};
 
@@ -114,7 +114,9 @@ impl CheckedConfig {
         config: CompiledConfig,
         cancel: &mut Cancellation,
     ) -> Result<Self, HostError> {
-        if binary.engine != config.engine() {
+        if binary.engine != config.engine()
+            || (config.requires_xray_reality_h2() && binary.xray_reality_h2().is_none())
+        {
             return Err(HostError::ConfigRejected);
         }
         let config = config.with_local_runtime_logging();
@@ -138,6 +140,15 @@ impl CheckedConfig {
             probe_port,
             probe_access,
         })
+    }
+
+    pub async fn validate_xray_reality_h2(
+        binary: BinarySnapshot,
+        config: PendingXrayRealityH2,
+        cancel: &mut Cancellation,
+    ) -> Result<Self, HostError> {
+        let proof = binary.xray_reality_h2().ok_or(HostError::ConfigRejected)?;
+        Self::validate(binary, config.authorize(proof), cancel).await
     }
 }
 

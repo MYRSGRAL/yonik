@@ -734,7 +734,10 @@ def build_xray_reality_h2(root: Path, output: Path, archive: Path) -> Path:
     if output.exists():
         raise BuildError("Выходной каталог REALITY h2 уже существует")
     patch = DEFAULT_PATCH.parents[2] / "xray" / XRAY_TAG / "client-reality-h2.patch"
-    if sha256(archive) != XRAY_REALITY_H2_BASE or sha256(patch) != XRAY_REALITY_H2_PATCH:
+    if (
+        sha256(archive) != XRAY_REALITY_H2_BASE
+        or sha256(patch) != XRAY_REALITY_H2_PATCH
+    ):
         raise BuildError("Неверный source или patch pin для REALITY h2")
     root.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
@@ -868,7 +871,9 @@ def main() -> int:
                 or options.native_codec
                 or options.patch != DEFAULT_PATCH
             ):
-                raise BuildError("REALITY h2 требует отдельную Xray compile-only сборку")
+                raise BuildError(
+                    "REALITY h2 требует отдельную Xray compile-only сборку"
+                )
             manifest = build_xray_reality_h2(
                 options.build_root, options.output_dir, options.client_reality_h2_source
             )
