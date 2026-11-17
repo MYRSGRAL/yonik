@@ -1,44 +1,65 @@
 //! CODEC5: USER datagram lineage отдельно от TCP/service/DNS authority.
 use super::*;
 
-pub(super) const REVIEWED_DATAGRAM_PATCH: Option<&str> = None;
-const REVIEWED_NETWORK_WIRE_PATCH: Option<&str> = None;
-const REVIEWED_NETWORK_RELEASE_PATCH: Option<&str> = None;
 const CONTRACT: &[u8] = b"udp-bootstrap-consumed-parent-member-send-v1\0";
 
 /// Три независимых scope5: Source/parent не создаёт wire или release authority.
 struct NetworkScope {
+    installed: Option<Arc<bootstrap_binding::BootstrapBinding>>,
+    #[cfg(test)]
+    injected: Option<Box<InjectedScope>>,
+}
+#[cfg(test)]
+struct InjectedScope {
     launch: LaunchRecord,
     schema: [u8; 32],
     contract: [u8; 32],
-    patch: String,
 }
 impl NetworkScope {
-    fn check(
-        &self,
-        launch: LaunchRecord,
-        contract: &[u8],
-        reviewed: Option<&str>,
-    ) -> Result<(), ServiceError> {
-        let accepted = reviewed == Some(self.patch.as_str());
-        #[cfg(test)]
-        let accepted = accepted || self.patch == "cfgtest-reviewed-network5";
-        if !accepted
-            || self.launch != launch
-            || self.schema != <[u8; 32]>::from(Sha256::digest(wire::dns_v2::DATAGRAM_SCHEMA))
-            || self.contract != <[u8; 32]>::from(Sha256::digest(contract))
-        {
-            return Err(ServiceError::Unsupported);
+    fn check(&self, launch: LaunchRecord, contract: &[u8]) -> Result<(), ServiceError> {
+        if let Some(binding) = &self.installed {
+            let scope = if contract == NETWORK_WIRE {
+                super::super::registry::BootstrapScope::Wire
+            } else if contract == NETWORK_RELEASE {
+                super::super::registry::BootstrapScope::Release
+            } else if contract == CONTRACT {
+                super::super::registry::BootstrapScope::Source
+            } else {
+                return Err(ServiceError::Unsupported);
+            };
+            return binding.datagram_check(scope, launch);
         }
-        Ok(())
+        #[cfg(test)]
+        if let Some(p) = &self.injected {
+            if p.launch == launch
+                && p.schema == <[u8; 32]>::from(Sha256::digest(wire::dns_v2::DATAGRAM_SCHEMA))
+                && p.contract == <[u8; 32]>::from(Sha256::digest(contract))
+            {
+                return Ok(());
+            }
+        }
+        Err(ServiceError::Unsupported)
     }
     #[cfg(test)]
     fn fake(launch: LaunchRecord, contract: &[u8]) -> Self {
         Self {
-            launch,
-            schema: Sha256::digest(wire::dns_v2::DATAGRAM_SCHEMA).into(),
-            contract: Sha256::digest(contract).into(),
-            patch: "cfgtest-reviewed-network5".into(),
+            installed: None,
+            injected: Some(Box::new(InjectedScope {
+                launch,
+                schema: Sha256::digest(wire::dns_v2::DATAGRAM_SCHEMA).into(),
+                contract: Sha256::digest(contract).into(),
+            })),
+        }
+    }
+    fn installed(
+        binding: Arc<bootstrap_binding::BootstrapBinding>,
+        _launch: LaunchRecord,
+        _contract: &[u8],
+    ) -> Self {
+        Self {
+            installed: Some(binding),
+            #[cfg(test)]
+            injected: None,
         }
     }
 }
@@ -52,9 +73,17 @@ pub(super) struct NetworkRelease {
     scope: NetworkScope,
 }
 impl NetworkWire {
+    pub(super) fn installed(
+        binding: Arc<bootstrap_binding::BootstrapBinding>,
+        launch: LaunchRecord,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            scope: NetworkScope::installed(binding.clone(), launch, NETWORK_WIRE),
+            transcript: binding,
+        })
+    }
     fn check(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
-        self.scope
-            .check(launch, NETWORK_WIRE, REVIEWED_NETWORK_WIRE_PATCH)
+        self.scope.check(launch, NETWORK_WIRE)
     }
     fn observed(
         &self,
@@ -87,9 +116,16 @@ impl NetworkWire {
     }
 }
 impl NetworkRelease {
+    pub(super) fn installed(
+        binding: Arc<bootstrap_binding::BootstrapBinding>,
+        launch: LaunchRecord,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            scope: NetworkScope::installed(binding, launch, NETWORK_RELEASE),
+        })
+    }
     fn check(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
-        self.scope
-            .check(launch, NETWORK_RELEASE, REVIEWED_NETWORK_RELEASE_PATCH)
+        self.scope.check(launch, NETWORK_RELEASE)
     }
     #[cfg(test)]
     pub(super) fn fake(launch: LaunchRecord) -> Arc<Self> {
@@ -99,28 +135,24 @@ impl NetworkRelease {
     }
 }
 
-/// Закрытый scope5. Production constructor отсутствует до protected record/pin;
+/// Закрытый scope5: installed constructor требует checked Binding5.
 /// Source4/descriptor/child metadata не могут создать этот тип.
 pub(super) struct Producer {
-    launch: LaunchRecord,
-    schema: [u8; 32],
-    contract: [u8; 32],
-    patch: String,
+    scope: NetworkScope,
     source: Arc<dyn dns_bundle::roots::Source>,
 }
 impl Producer {
+    pub(super) fn installed(
+        binding: Arc<bootstrap_binding::BootstrapBinding>,
+        launch: LaunchRecord,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            scope: NetworkScope::installed(binding.clone(), launch, CONTRACT),
+            source: binding,
+        })
+    }
     pub(super) fn check(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
-        let accepted = REVIEWED_DATAGRAM_PATCH == Some(self.patch.as_str());
-        #[cfg(test)]
-        let accepted = accepted || self.patch == "cfgtest-reviewed-scope5";
-        if !accepted
-            || self.launch != launch
-            || self.schema != <[u8; 32]>::from(Sha256::digest(wire::dns_v2::DATAGRAM_SCHEMA))
-            || self.contract != <[u8; 32]>::from(Sha256::digest(CONTRACT))
-        {
-            return Err(ServiceError::Unsupported);
-        }
-        Ok(())
+        self.scope.check(launch, CONTRACT)
     }
     pub(super) fn source(
         &self,
@@ -135,10 +167,7 @@ impl Producer {
         source: Arc<dyn dns_bundle::roots::Source>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            launch,
-            schema: Sha256::digest(wire::dns_v2::DATAGRAM_SCHEMA).into(),
-            contract: Sha256::digest(CONTRACT).into(),
-            patch: "cfgtest-reviewed-scope5".into(),
+            scope: NetworkScope::fake(launch, CONTRACT),
             source,
         })
     }
@@ -206,8 +235,7 @@ pub(super) struct Datagrams {
     pub(super) producer: Option<Arc<Producer>>,
     pub(super) wire: Option<Arc<NetworkWire>>,
     pub(super) release: Option<Arc<NetworkRelease>>,
-    parents: BTreeMap<u64, Box<ParentBinding>>,
-    queries: BTreeMap<u64, u64>,
+    parents: Parents,
     next: u64,
 }
 impl Datagrams {
@@ -216,10 +244,32 @@ impl Datagrams {
             producer: None,
             wire: None,
             release: None,
-            parents: BTreeMap::new(),
-            queries: BTreeMap::new(),
+            parents: Parents(Vec::new()),
             next: 0,
         }
+    }
+}
+// IDs — последовательные nonreuse slots. Один ledger вместо двух BTreeMap:
+// нет map nodes/дублирующего query index; query scan жёстко ограничен history256.
+struct Parents(Vec<ParentBinding>);
+impl Parents {
+    fn get(&self, id: &u64) -> Option<&ParentBinding> {
+        self.0.get(usize::try_from(id.checked_sub(1)?).ok()?)
+    }
+    fn get_mut(&mut self, id: &u64) -> Option<&mut ParentBinding> {
+        self.0.get_mut(usize::try_from(id.checked_sub(1)?).ok()?)
+    }
+    fn query(&self, q: u64) -> Option<u64> {
+        self.0
+            .iter()
+            .position(|p| p.query == q)
+            .map(|i| i as u64 + 1)
+    }
+    fn reserve(&mut self) -> Result<(), ServiceError> {
+        self.0.try_reserve_exact(1).map_err(unavailable)
+    }
+    fn iter(&self) -> impl Iterator<Item = (u64, &ParentBinding)> {
+        self.0.iter().enumerate().map(|(i, p)| (i as u64 + 1, p))
     }
 }
 impl<A: Authority> Issuer<A> {
@@ -333,7 +383,7 @@ impl<A: Authority> Issuer<A> {
         let branch = b[50];
         if epoch != self.record.binding.epoch
             || revision != self.capsule()?.policy_revision
-            || self.datagrams.queries.contains_key(&query)
+            || self.datagrams.parents.query(query).is_some()
             || self.datagrams.next >= 256
         {
             return Err(ServiceError::InvalidRequest);
@@ -341,8 +391,8 @@ impl<A: Authority> Issuer<A> {
         let memory = self
             .budget
             .dynamic
-            // Два новых BTreeMap nodes + Box: debit до обеих insert allocations.
-            .reserve(std::mem::size_of::<ParentBinding>() + 4096)
+            // Один contiguous slot, без map nodes/второго index/Box allocation.
+            .reserve(std::mem::size_of::<ParentBinding>() + 16)
             .map_err(unavailable)?;
         self.bundle_history_available(1)?;
         let g = self
@@ -402,26 +452,23 @@ impl<A: Authority> Issuer<A> {
             return Err(ServiceError::Unavailable);
         }
         self.bundle_history(1)?;
+        self.datagrams.parents.reserve()?;
         let id = Self::id(&mut self.datagrams.next)?;
-        self.datagrams.queries.insert(query, id);
-        self.datagrams.parents.insert(
-            id,
-            Box::new(ParentBinding {
-                grant,
-                source,
-                revision,
-                scope,
-                branch,
-                query,
-                request,
-                parent_request,
-                expires,
-                state: ParentState::Preparing,
-                context: None,
-                lineage: Some(lineage),
-                _memory: memory,
-            }),
-        );
+        self.datagrams.parents.0.push(ParentBinding {
+            grant,
+            source,
+            revision,
+            scope,
+            branch,
+            query,
+            request,
+            parent_request,
+            expires,
+            state: ParentState::Preparing,
+            context: None,
+            lineage: Some(lineage),
+            _memory: memory,
+        });
         Ok(id)
     }
     pub(super) fn ack_datagram_parent(&mut self, id: u64) -> Result<(), ServiceError> {
@@ -463,12 +510,12 @@ impl<A: Authority> Issuer<A> {
     ) -> Result<(), ServiceError> {
         let mut ids = [0; 256];
         let mut count = 0;
-        for (id, p) in &self.datagrams.parents {
+        for (id, p) in self.datagrams.parents.iter() {
             if grant == Some(p.grant)
                 || request == Some(p.request)
                 || request == Some(p.parent_request)
             {
-                *ids.get_mut(count).ok_or(ServiceError::Busy)? = *id;
+                *ids.get_mut(count).ok_or(ServiceError::Busy)? = id;
                 count += 1;
             }
         }
@@ -485,10 +532,10 @@ impl<A: Authority> Issuer<A> {
         })
     }
     pub(super) fn datagram_query(&self, query: u64) -> Result<u64, ServiceError> {
-        let id = *self
+        let id = self
             .datagrams
-            .queries
-            .get(&query)
+            .parents
+            .query(query)
             .ok_or(ServiceError::Unsupported)?;
         self.datagram_parent_live(id, true)?;
         if self
