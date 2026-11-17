@@ -77,7 +77,7 @@ impl Source for Facts {
             || match p.root {
                 wire::dns_v2::Root::HostsPath => p.selector.resolver.is_some(),
                 wire::dns_v2::Root::BootstrapService(id) => {
-                    id.get() != 1 || p.selector.resolver != Some(1)
+                    !(1..=3).contains(&id.get()) || p.selector.resolver != Some(1)
                 }
                 wire::dns_v2::Root::UserDns(_) => true,
             }
@@ -1951,10 +1951,134 @@ enum BootstrapTransportFault {
     Retire,
     ExpiredCleanup,
     UnknownClose,
+    Publish(NetworkFault),
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetworkFault {
+    Good,
+    NoTranscript,
+    WrongCapture,
+    WrongQuestion,
+    WrongSource,
+    WrongRevision,
+    WrongCarrier,
+    ZeroTtl,
+    FutureObservation,
+    SourceAtSend,
+    AfterSendSource,
+    TwoWaiters,
+    WrongWaiterRoot,
+    WaiterExpiry,
+    WaiterReplay,
+    CancelWaiter,
+}
+fn bootstrap_publish(f: &Facts) -> Vec<u8> {
+    let mut q = vec![0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    q.extend_from_slice(b"\x08physical\x07invalid\0\0\x01\0\x01");
+    let mut r = q.clone();
+    r[2] = 0x80;
+    r[7] = 1;
+    r.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 203, 0, 113, 80]);
+    let mut b = vec![0; 144];
+    b[1] = 2;
+    for (at, v) in [
+        (4, 1u16),
+        (6, 1),
+        (8, f.endpoint),
+        (10, 1),
+        (108, 16),
+        (110, q.len() as u16),
+        (140, f.path.last().unwrap().0),
+    ] {
+        b[at..at + 2].copy_from_slice(&v.to_be_bytes());
+    }
+    for (at, v) in [
+        (12, 9u64),
+        (20, 1),
+        (28, 1),
+        (36, f.launch.binding.epoch),
+        (120, 1),
+        (128, 1),
+    ] {
+        b[at..at + 8].copy_from_slice(&v.to_be_bytes());
+    }
+    b[44..76].copy_from_slice(&f.reference.source);
+    b[76..108].copy_from_slice(&f.reference.asset);
+    b[112..116].copy_from_slice(&(r.len() as u32).to_be_bytes());
+    b[136] = 2;
+    b[137] = 1;
+    b[142] = 6;
+    b.extend_from_slice(b"physical.invalid");
+    b.extend_from_slice(&q);
+    b.extend_from_slice(&r);
+    b
+}
+struct CapturedBootstrapResponse {
+    facts: Arc<Facts>,
+    raw: Vec<u8>,
+    observed: Instant,
+    invalidate: bool,
+    calls: AtomicUsize,
+}
+impl super::super::super::BootstrapDnsTranscript for CapturedBootstrapResponse {
+    fn observed(
+        &self,
+        launch: LaunchRecord,
+        r: super::super::super::BootstrapDnsReceipt<'_>,
+    ) -> Result<Instant, ServiceError> {
+        let f = &self.facts;
+        let b = &self.raw;
+        let q = usize::from(u16_at(b, 108));
+        let n = usize::from(u16_at(b, 110));
+        if launch != f.launch
+            || !r.binding.bootstrap
+            || r.binding.query != 9
+            || r.binding.root != 1
+            || r.binding.bundle != 1
+            || r.binding.epoch != launch.binding.epoch
+            || r.binding.source != 0
+            || r.binding.source_revision != 0
+            || r.binding.physical_endpoint != f.endpoint
+            || r.binding.physical_scope != f.path.last().unwrap().0
+            || r.binding.parent_carrier != 6
+            || r.binding.peer.protocol != 17
+            || r.binding.peer.wire().bytes != [192, 0, 2, 53]
+            || r.binding.peer.port != 53
+            || r.binding.qtype != 1
+            || r.binding.options != 0
+            || r.binding.payload != 0
+            || r.binding.resolver != 1
+            || r.proof != 1
+            || r.revision != 1
+            || r.exchange != 1
+            || r.producer_sequence != 1
+            || r.request != &b[144 + q..144 + q + n]
+            || r.response != &b[144 + q + n..]
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        if self.invalidate && self.calls.fetch_add(1, Ordering::AcqRel) == 1 {
+            self.facts.invalid_source.store(true, Ordering::Release);
+        }
+        Ok(self.observed)
+    }
 }
 fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
     let (mut issuer, f) = fixture(Mode::System);
     service(&mut issuer, &f);
+    if matches!(
+        fault,
+        BootstrapTransportFault::Publish(
+            NetworkFault::TwoWaiters
+                | NetworkFault::WrongWaiterRoot
+                | NetworkFault::WaiterExpiry
+                | NetworkFault::WaiterReplay
+                | NetworkFault::CancelWaiter
+        )
+    ) {
+        service(&mut issuer, &f);
+        service(&mut issuer, &f);
+    }
     let inbox = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     let mut io = BundleIo::new(
         f.launch,
@@ -1968,6 +2092,27 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
     io.source = Some(f.clone());
     io.dns_inbox = Some(inbox.clone());
     io.stop_after = 5;
+    if let BootstrapTransportFault::Publish(case) = fault {
+        let mut raw = bootstrap_publish(&f);
+        if case == NetworkFault::WrongCapture {
+            let end = raw.len();
+            raw[end - 1] ^= 1;
+        }
+        if case != NetworkFault::NoTranscript {
+            io.bootstrap_transcript = Some(Arc::new(CapturedBootstrapResponse {
+                facts: f.clone(),
+                raw,
+                observed: issuer.authority.now()
+                    + if case == NetworkFault::FutureObservation {
+                        Duration::from_millis(1)
+                    } else {
+                        Duration::ZERO
+                    },
+                invalidate: case == NetworkFault::SourceAtSend,
+                calls: AtomicUsize::new(0),
+            }));
+        }
+    }
     let mut launch = f.launch;
     if fault == BootstrapTransportFault::WrongLaunch {
         launch.nonce[0] ^= 1;
@@ -2014,6 +2159,126 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
             &bootstrap_logical(),
         )],
     );
+    if let BootstrapTransportFault::Publish(case) = fault {
+        io.stop_after = 6;
+        let mut b = bootstrap_publish(&f);
+        match case {
+            NetworkFault::WrongQuestion => b[144] = b'x',
+            NetworkFault::WrongSource => b[44] ^= 1,
+            NetworkFault::WrongRevision => b[135] = 2,
+            NetworkFault::WrongCarrier => b[142] = 17,
+            NetworkFault::ZeroTtl => {
+                let at = b.len() - 10;
+                b[at..at + 4].fill(0);
+            }
+            _ => {}
+        }
+        append(&io, vec![dns_packet(f.launch, 7, Operation::Publish, &b)]);
+        if matches!(
+            case,
+            NetworkFault::TwoWaiters
+                | NetworkFault::WrongWaiterRoot
+                | NetworkFault::WaiterExpiry
+                | NetworkFault::WaiterReplay
+                | NetworkFault::CancelWaiter
+        ) {
+            let waiter = |reservation: u64, root: u64, query: u64| {
+                let mut b = vec![0; 64];
+                b[1] = 2;
+                for (at, v) in [
+                    (8, reservation),
+                    (16, 1),
+                    (24, root),
+                    (32, query),
+                    (56, 1_000_000_000),
+                ] {
+                    b[at..at + 8].copy_from_slice(&v.to_be_bytes());
+                }
+                b
+            };
+            for (sequence, context, query, root, reservation) in
+                [(8, 2u64, 10u64, 2u64, 3u64), (11, 3, 11, 3, 4)]
+            {
+                let mut r = reserve(&f, false, 3, query);
+                r[16..24].copy_from_slice(&context.to_be_bytes());
+                r[24..32].copy_from_slice(&root.to_be_bytes());
+                if case == NetworkFault::WaiterExpiry {
+                    r[56..64].copy_from_slice(&1_000_000u64.to_be_bytes());
+                }
+                append(
+                    &io,
+                    vec![dns_packet(
+                        f.launch,
+                        sequence,
+                        Operation::BundleAcquire,
+                        &acquire(&f, false, root, query),
+                    )],
+                );
+                append(
+                    &io,
+                    vec![dns_packet(f.launch, sequence + 1, Operation::Reserve, &r)],
+                );
+                append(
+                    &io,
+                    vec![dns_packet(
+                        f.launch,
+                        sequence + 2,
+                        Operation::WaiterBind,
+                        &waiter(
+                            reservation,
+                            if case == NetworkFault::WrongWaiterRoot {
+                                1
+                            } else {
+                                root
+                            },
+                            query,
+                        ),
+                    )],
+                );
+                if matches!(
+                    case,
+                    NetworkFault::WrongWaiterRoot
+                        | NetworkFault::WaiterExpiry
+                        | NetworkFault::WaiterReplay
+                ) {
+                    break;
+                }
+            }
+            io.stop_after = if matches!(
+                case,
+                NetworkFault::WrongWaiterRoot | NetworkFault::WaiterExpiry
+            ) {
+                9
+            } else if case == NetworkFault::WaiterReplay {
+                10
+            } else {
+                12
+            };
+            if case == NetworkFault::WaiterReplay {
+                append(
+                    &io,
+                    vec![dns_packet(
+                        f.launch,
+                        11,
+                        Operation::WaiterBind,
+                        &waiter(3, 2, 10),
+                    )],
+                );
+            }
+            if case == NetworkFault::CancelWaiter {
+                io.stop_after = 13;
+                append(
+                    &io,
+                    vec![dns_packet(
+                        f.launch,
+                        14,
+                        Operation::Cancel,
+                        &cancel_body(6, 1),
+                    )],
+                );
+            }
+        }
+    }
     let raw = bootstrap_raw(&f);
     let neg = issuer_tests::dns_neg(f.launch);
     let slots = io.dns_slots().unwrap();
@@ -2069,7 +2334,19 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
         .unwrap();
         inbox.lock().unwrap().push_back(incoming);
     };
-    if fault == BootstrapTransportFault::LateFd {
+    if fault == BootstrapTransportFault::Publish(NetworkFault::AfterSendSource) {
+        let source = f.clone();
+        io.after_sent = Some(Box::new(move |n| {
+            if n == 6 {
+                source.invalid_source.store(true, Ordering::Release);
+            }
+        }));
+        io.on_request = Some(Box::new(move |seq| {
+            if seq == 5 {
+                factory();
+            }
+        }));
+    } else if fault == BootstrapTransportFault::LateFd {
         io.after_sent = Some(Box::new(move |n| {
             if n == 3 {
                 factory();
@@ -2077,6 +2354,9 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
         }));
     } else {
         io.on_request = Some(Box::new(move |seq| {
+            if seq == 10 && fault == BootstrapTransportFault::Publish(NetworkFault::WaiterExpiry) {
+                clock.fetch_add(2_000_000, Ordering::AcqRel);
+            }
             if seq == 7 && fault == BootstrapTransportFault::ExpiredCleanup {
                 clock.fetch_add(1_100_000_000, Ordering::AcqRel);
             }
@@ -2228,6 +2508,58 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
             issuer.unknown,
             fault == BootstrapTransportFault::UnknownClose
         );
+    } else if let BootstrapTransportFault::Publish(case) = fault {
+        let allowed = matches!(
+            case,
+            NetworkFault::Good
+                | NetworkFault::AfterSendSource
+                | NetworkFault::TwoWaiters
+                | NetworkFault::WrongWaiterRoot
+                | NetworkFault::WaiterExpiry
+                | NetworkFault::WaiterReplay
+                | NetworkFault::CancelWaiter
+        );
+        assert_eq!(
+            out[5][130],
+            if allowed { 1 } else { 2 },
+            "network case {}",
+            case as u8
+        );
+        if allowed {
+            assert_eq!(u64_at(&out[5], 136), 1);
+            assert_eq!(u64_at(&out[5], 144), 1);
+        }
+        if matches!(case, NetworkFault::TwoWaiters | NetworkFault::CancelWaiter) {
+            assert_eq!(out[8][130], 1);
+            assert_eq!(out[11][130], 1);
+            assert_eq!(out[8][187], 2);
+            assert_eq!(out[11][187], 2);
+            assert_eq!(
+                issuer.rrsets.waiter_flags(),
+                if case == NetworkFault::CancelWaiter {
+                    vec![false, true]
+                } else {
+                    vec![true, true]
+                }
+            );
+        }
+        if matches!(
+            case,
+            NetworkFault::WrongWaiterRoot | NetworkFault::WaiterExpiry | NetworkFault::WaiterReplay
+        ) {
+            assert_eq!(out.last().unwrap()[130], 2);
+        }
+        if !allowed {
+            let retained = usize::from(case == NetworkFault::SourceAtSend);
+            assert_eq!(issuer.rrsets.counts(), (retained, 0));
+            assert_eq!(issuer.dns.history, f.path.len() + 6 + retained);
+        }
+        if case == NetworkFault::AfterSendSource {
+            assert!(issuer.unknown);
+            assert_eq!(issuer.rrsets.producer_flags(), vec![false]);
+            assert_eq!(io.dns_slots().unwrap().pending.used(), 1);
+        }
+        assert!(issuer.grants.is_empty());
     } else {
         assert_eq!(out.len(), 5);
     }
@@ -2237,6 +2569,39 @@ fn bootstrap_transport_driver(fault: BootstrapTransportFault) {
     assert_eq!(u64_at(&out[3], 24), 5);
     assert_eq!(u64_at(&out[4], 168), 1);
     assert_eq!(issuer.authority.owner_count, 0);
+}
+#[test]
+fn codec4_bootstrap_rrset_driver_publish_data_not_user_authority() {
+    bootstrap_transport_driver(BootstrapTransportFault::Publish(NetworkFault::Good));
+}
+#[test]
+fn codec4_bootstrap_rrset_driver_closed_transcript_exact_source_question_and_ttl() {
+    for case in [
+        NetworkFault::NoTranscript,
+        NetworkFault::WrongCapture,
+        NetworkFault::WrongQuestion,
+        NetworkFault::WrongSource,
+        NetworkFault::WrongRevision,
+        NetworkFault::WrongCarrier,
+        NetworkFault::ZeroTtl,
+        NetworkFault::FutureObservation,
+        NetworkFault::SourceAtSend,
+        NetworkFault::AfterSendSource,
+    ] {
+        bootstrap_transport_driver(BootstrapTransportFault::Publish(case));
+    }
+}
+#[test]
+fn codec4_bootstrap_rrset_driver_fresh_waiters_and_cancel_are_independent() {
+    for case in [
+        NetworkFault::TwoWaiters,
+        NetworkFault::WrongWaiterRoot,
+        NetworkFault::WaiterExpiry,
+        NetworkFault::WaiterReplay,
+        NetworkFault::CancelWaiter,
+    ] {
+        bootstrap_transport_driver(BootstrapTransportFault::Publish(case));
+    }
 }
 #[test]
 fn codec4_bootstrap_transport_driver_raw_fd_then_distinct_logical_proof() {

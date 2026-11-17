@@ -751,9 +751,6 @@ impl<A: Authority> Issuer<A> {
             .proofs
             .get(&id)
             .ok_or(ServiceError::Unavailable)?;
-        if p.binding.bootstrap {
-            return Err(ServiceError::Unsupported);
-        }
         if p.revision != revision
             || p.exchange != exchange
             || !p.acked
@@ -767,7 +764,7 @@ impl<A: Authority> Issuer<A> {
         let count = p.kind.resources().len();
         resources[..count].copy_from_slice(p.kind.resources());
         match &p.kind {
-            ProofKind::BootstrapDirect(_) => return Err(ServiceError::Unsupported),
+            ProofKind::BootstrapDirect(_) => self.bootstrap_producer()?,
             ProofKind::Direct(_) => self
                 .dns_wire
                 .as_ref()
@@ -806,6 +803,34 @@ impl<A: Authority> Issuer<A> {
             .ok_or(ServiceError::Unavailable)?;
         let started = parent.started;
         Ok((binding, started, published))
+    }
+    pub(super) fn dns_publication_metadata(
+        &self,
+        id: u64,
+        revision: u64,
+        exchange: u64,
+    ) -> Result<(Binding, bool), ServiceError> {
+        let p = self
+            .transport
+            .proofs
+            .get(&id)
+            .ok_or(ServiceError::Unavailable)?;
+        if p.revision != revision
+            || p.exchange != exchange
+            || !p.acked
+            || p.retired.is_some()
+            || p.pending_append.is_some()
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok((p.binding, p.published))
+    }
+    pub(super) fn dns_producer_sequence(&self, id: u64) -> Result<u64, ServiceError> {
+        self.transport
+            .proofs
+            .get(&id)
+            .map(|p| p.producer_sequence)
+            .ok_or(ServiceError::Unavailable)
     }
     pub(super) fn dns_freeze_publish(&mut self, id: u64) -> Result<(), ServiceError> {
         let p = self

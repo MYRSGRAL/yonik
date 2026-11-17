@@ -81,6 +81,7 @@ fn dns_rrset_queue_credit_precedes_materialization_and_rx_bound_is_fixed() {
 
 // Весь driver below — in-memory: ни OS endpoint, ни runtime wrappers.
 pub(super) struct BundleIo {
+    pub(super) bootstrap_transcript: Option<Arc<dyn BootstrapDnsTranscript>>,
     pub(super) bootstrap_producer: Option<Arc<VerifiedBootstrapDnsProducer>>,
     pub(super) dns_inbox: Option<Arc<std::sync::Mutex<VecDeque<dns_transport::Incoming>>>>,
     pub(super) after_sent: Option<Box<dyn Fn(usize)>>,
@@ -148,6 +149,7 @@ impl BundleIo {
     }
     pub(super) fn new(record: LaunchRecord, requests: Vec<Vec<u8>>) -> Self {
         Self {
+            bootstrap_transcript: None,
             bootstrap_producer: None,
             dns_inbox: None,
             after_sent: None,
@@ -171,6 +173,12 @@ impl BundleIo {
     }
 }
 impl Channel for BundleIo {
+    fn bootstrap_dns_transcript(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dyn BootstrapDnsTranscript>>, ServiceError> {
+        Ok(self.bootstrap_transcript.clone())
+    }
     fn bootstrap_dns_producer(
         &self,
         _: LaunchRecord,

@@ -1207,6 +1207,24 @@ pub(super) struct VerifiedBootstrapDnsProducer {
     launch: LaunchRecord,
     schema: [u8; 32],
 }
+/// Отдельный trusted capture endpoint; consuming-close token его не создаёт.
+/// Production provider отсутствует до reviewed CODEC4 image/launch/source scope.
+struct BootstrapDnsReceipt<'a> {
+    binding: dns_transport::Binding,
+    proof: u64,
+    revision: u64,
+    exchange: u64,
+    producer_sequence: u64,
+    request: &'a [u8],
+    response: &'a [u8],
+}
+trait BootstrapDnsTranscript: Send + Sync {
+    fn observed(
+        &self,
+        launch: LaunchRecord,
+        receipt: BootstrapDnsReceipt<'_>,
+    ) -> Result<Instant, ServiceError>;
+}
 impl VerifiedBootstrapDnsProducer {
     fn bound(&self, launch: LaunchRecord) -> Result<(), ServiceError> {
         launch.encode().map_err(unavailable)?;
@@ -1855,6 +1873,7 @@ impl<'a> RoutePlan<'a> {
     }
 }
 struct Issuer<A: Authority> {
+    bootstrap_transcript: Option<Arc<dyn BootstrapDnsTranscript>>,
     bootstrap_dns: Option<Arc<VerifiedBootstrapDnsProducer>>,
     bootstrap_source: Option<Arc<dyn dns_bundle::roots::Source>>,
     rrsets: dns_rrset::State,
@@ -1898,6 +1917,7 @@ impl<A: Authority> Issuer<A> {
         let budget = ChannelBudget::new(&capsule, record.mode.required(), &record.binding.digest)?;
         let dns = dns_bundle::Bundles::new(&budget.dynamic)?;
         Ok(Self {
+            bootstrap_transcript: None,
             bootstrap_dns: None,
             authority,
             rrsets: dns_rrset::State::new(),
@@ -3254,6 +3274,12 @@ fn receive(
     Ok(Some(msg.bytes))
 }
 trait Channel {
+    fn bootstrap_dns_transcript(
+        &self,
+        _: LaunchRecord,
+    ) -> Result<Option<Arc<dyn BootstrapDnsTranscript>>, ServiceError> {
+        Ok(None)
+    }
     fn bootstrap_dns_producer(
         &self,
         _: LaunchRecord,
@@ -5126,6 +5152,7 @@ fn run_issuer<A: Authority>(
                 issuer.dns_wire = socket.dns_wire_producer(issuer.record)?;
                 issuer.bootstrap_source = socket.bootstrap_source(issuer.record)?;
                 issuer.bootstrap_dns = socket.bootstrap_dns_producer(issuer.record)?;
+                issuer.bootstrap_transcript = socket.bootstrap_dns_transcript(issuer.record)?;
                 issuer.dns_logical = socket.dns_logical_producer(issuer.record)?;
                 issuer.negotiated = Some(dns_bundle::negotiate(
                     issuer,

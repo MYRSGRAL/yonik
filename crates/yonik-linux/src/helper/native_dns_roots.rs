@@ -140,6 +140,97 @@ pub(super) struct HostsWaiter {
     _memory: super::super::super::memory::ByteLease,
 }
 impl<A: Authority> Issuer<A> {
+    pub(in crate::helper::native_profile_channel) fn bootstrap_dns_data(
+        &self,
+        binding: super::super::dns_transport::Binding,
+    ) -> Result<(wire::SnapshotRef, Instant), ServiceError> {
+        if !binding.bootstrap || self.dns_transport_binding(binding.bundle)? != binding {
+            return Err(ServiceError::Unavailable);
+        }
+        let b = self
+            .dns
+            .live
+            .get(&binding.bundle)
+            .ok_or(ServiceError::Unavailable)?;
+        let c = b.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
+        let mut path = [(0, 0); 256];
+        for (i, h) in b.hops.iter().enumerate() {
+            path[i] = (h.scope, h.branch);
+        }
+        let source = self.root_source()?;
+        let q = self.source_result(
+            binding.bundle,
+            source.question(
+                Parent {
+                    root: b.root_kind,
+                    launch: self.record,
+                    query: b.query,
+                    selector: c.selector,
+                    original: c.original.wire(),
+                    path: &path[..b.hops.len()],
+                }
+                .checked()?,
+                c.reference,
+                b.qtype,
+                b.options,
+                b.payload,
+            ),
+        )?;
+        if q.len == 0
+            || usize::from(q.len) > q.bytes.len()
+            || &q.bytes[..usize::from(q.len)] != binding.name.wire().bytes
+        {
+            return self.source_result(binding.bundle, Err(ServiceError::Unavailable));
+        }
+        let until = binding
+            .expires
+            .min(q.expires)
+            .min(self.bootstrap_live(binding.bundle, true)?);
+        if self.authority.now() >= until {
+            return self.source_result(binding.bundle, Err(ServiceError::Unavailable));
+        }
+        Ok((c.reference, until))
+    }
+    pub(in crate::helper::native_profile_channel) fn bootstrap_dns_same_data(
+        &self,
+        a: u64,
+        b: u64,
+    ) -> Result<(), ServiceError> {
+        self.bootstrap_live(a, true)?;
+        self.bootstrap_live(b, true)?;
+        let a = self.dns.live.get(&a).ok_or(ServiceError::Unavailable)?;
+        let b = self.dns.live.get(&b).ok_or(ServiceError::Unavailable)?;
+        let x = a.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
+        let y = b.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
+        if a.root_kind == wire::dns_v2::Root::HostsPath
+            || b.root_kind == wire::dns_v2::Root::HostsPath
+            || (
+                x.reference.source,
+                x.reference.asset,
+                x.reference.bytes,
+                x.reference.flags,
+            ) != (
+                y.reference.source,
+                y.reference.asset,
+                y.reference.bytes,
+                y.reference.flags,
+            )
+            || x.selector != y.selector
+            || x.original != y.original
+            || x.question != y.question
+            || a.hops.len() != b.hops.len()
+            || a.hops.iter().zip(&b.hops).any(|(x, y)| {
+                (
+                    x.index, x.scope, x.branch, x.subject, x.chain, x.stream, x.carrier, x.endpoint,
+                ) != (
+                    y.index, y.scope, y.branch, y.subject, y.chain, y.stream, y.carrier, y.endpoint,
+                )
+            })
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        Ok(())
+    }
     fn source_result<T>(
         &self,
         context: u64,

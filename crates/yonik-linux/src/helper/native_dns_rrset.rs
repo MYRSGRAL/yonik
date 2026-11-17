@@ -352,6 +352,7 @@ fn parse(
 }
 
 struct Producer {
+    bootstrap: Option<Box<BootstrapPublication>>,
     binding: Binding,
     proof: u64,
     revision: u64,
@@ -362,6 +363,10 @@ struct Producer {
     acked: bool,
     revoked: bool,
     _memory: ByteLease,
+}
+struct BootstrapPublication {
+    raw: Box<[u8]>,
+    observed: Instant,
 }
 struct Waiter {
     numeric_once: Option<(u64, u64)>,
@@ -400,6 +405,13 @@ impl State {
             .collect()
     }
     #[cfg(test)]
+    pub(super) fn producer_flags(&self) -> Vec<bool> {
+        self.producers
+            .values()
+            .map(|p| p.acked && !p.revoked)
+            .collect()
+    }
+    #[cfg(test)]
     pub(super) fn data_lifetime(&self) -> Option<(Instant, Instant)> {
         self.producers
             .values()
@@ -415,6 +427,11 @@ impl State {
         }
     }
     pub(super) fn cancel_bundle(&mut self, bundle: u64) {
+        for p in self.producers.values_mut() {
+            if p.binding.bootstrap && p.binding.bundle == bundle {
+                p.revoked = true;
+            }
+        }
         for w in self.waiters.values_mut() {
             if w.binding.bundle == bundle {
                 w.revoked = true;
@@ -466,6 +483,9 @@ impl State {
     }
 }
 fn same_data(a: Binding, b: Binding) -> bool {
+    if a.bootstrap != b.bootstrap || a.parent_carrier != b.parent_carrier {
+        return false;
+    }
     let (Ok(a_name), Ok(b_name)) = (
         Name::lookup(a.name.wire().bytes),
         Name::lookup(b.name.wire().bytes),
@@ -497,6 +517,83 @@ fn same_data(a: Binding, b: Binding) -> bool {
     ) && a_name == b_name
 }
 impl<A: Authority> Issuer<A> {
+    fn bootstrap_reply_fence(&mut self, op: Operation, id: u64) -> Result<(), ServiceError> {
+        let bootstrap = if op == Operation::Published {
+            self.rrsets
+                .producers
+                .get(&id)
+                .is_some_and(|p| p.binding.bootstrap)
+        } else {
+            self.rrsets
+                .waiters
+                .get(&id)
+                .is_some_and(|w| w.binding.bootstrap)
+        };
+        if bootstrap {
+            self.rrset_reply(op, id, &mut [0; 64])?;
+        }
+        Ok(())
+    }
+    fn bootstrap_response_observed(
+        &self,
+        binding: Binding,
+        b: &[u8],
+    ) -> Result<Instant, ServiceError> {
+        let q = usize::from(n16(b, 108));
+        let r = usize::from(n16(b, 110));
+        let receipt = super::BootstrapDnsReceipt {
+            binding,
+            proof: n64(b, 120),
+            revision: n64(b, 128),
+            exchange: n64(b, 28),
+            producer_sequence: self.dns_producer_sequence(n64(b, 120))?,
+            request: &b[144 + q..144 + q + r],
+            response: &b[144 + q + r..],
+        };
+        // DATA sanity до trusted endpoint; числа и transcript hash не mint.
+        if !receipt.binding.bootstrap
+            || [
+                receipt.proof,
+                receipt.revision,
+                receipt.exchange,
+                receipt.producer_sequence,
+            ]
+            .iter()
+            .any(|v| *v == 0 || *v == u64::MAX)
+            || !(12..=512).contains(&receipt.request.len())
+            || !(12..=32768).contains(&receipt.response.len())
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.bootstrap_transcript
+            .as_ref()
+            .ok_or(ServiceError::Unsupported)?
+            .observed(self.record, receipt)
+    }
+    fn bootstrap_rrset_live(&self, p: &Producer) -> Result<Instant, ServiceError> {
+        let capture = p.bootstrap.as_ref().ok_or(ServiceError::Unavailable)?;
+        let (_, until) = self.bootstrap_dns_data(p.binding)?;
+        if self.bootstrap_response_observed(p.binding, &capture.raw)? != capture.observed {
+            return Err(ServiceError::Unavailable);
+        }
+        let until = p
+            .expires
+            .min(until)
+            .min(self.bootstrap_dns_data(p.binding)?.1);
+        if self.authority.now() >= until {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(until)
+    }
+    fn rrset_data_matches(&self, a: Binding, b: Binding) -> Result<(), ServiceError> {
+        if !same_data(a, b) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if a.bootstrap {
+            self.bootstrap_dns_same_data(a.bundle, b.bundle)?;
+        }
+        Ok(())
+    }
     fn publish_dns(
         &mut self,
         v: View<'_, 40>,
@@ -508,17 +605,12 @@ impl<A: Authority> Issuer<A> {
         if b[137] == 2 {
             return self.publish_hosts(v, request, session);
         }
-        if b[136] != 1
-            || b[137] != 1
-            || n16(b, 8) != u16::MAX
-            || n16(b, 140) != u16::MAX
-            || b[44..108].iter().any(|b| *b != 0)
-        {
+        if !matches!(b[136], 1 | 2) || b[137] != 1 {
             return Err(ServiceError::Unsupported);
         }
-        self.bundle_history(1)?;
-        let (binding, started, published) =
-            self.dns_publish_binding(n64(b, 120), n64(b, 128), n64(b, 28))?;
+        self.bundle_history_available(1)?;
+        let (binding, published) =
+            self.dns_publication_metadata(n64(b, 120), n64(b, 128), n64(b, 28))?;
         if published {
             return Err(ServiceError::InvalidRequest);
         }
@@ -540,27 +632,68 @@ impl<A: Authority> Issuer<A> {
             || n64(b, 12) != binding.query
             || n64(b, 20) != binding.root
             || n64(b, 36) != binding.epoch
-            || b[142] != binding.peer.protocol
+            || b[136] != if binding.bootstrap { 2 } else { 1 }
+            || b[142]
+                != if binding.bootstrap {
+                    binding.parent_carrier
+                } else {
+                    binding.peer.protocol
+                }
+            || n16(b, 8)
+                != if binding.bootstrap {
+                    binding.physical_endpoint
+                } else {
+                    u16::MAX
+                }
+            || n16(b, 140)
+                != if binding.bootstrap {
+                    binding.physical_scope
+                } else {
+                    u16::MAX
+                }
             || &b[144..144 + q] != binding.name.wire().bytes
             || self.rrsets.producers.len() + self.dns.hosts_counts().0 >= 64
         {
             return Err(ServiceError::InvalidRequest);
         }
-        // Только provider row без captured snapshot; System resolver source — следующий cut.
-        if self
-            .capsule()?
-            .resolver_scope(binding.resolver)
-            .map_err(unavailable)?
-            .source
-            != [0; 32]
+        let reference = if binding.bootstrap {
+            Some(
+                self.capsule()?
+                    .bootstrap_snapshot()
+                    .map_err(unavailable)?
+                    .asset_reference(),
+            )
+        } else {
+            None
+        };
+        if let Some(reference) = reference {
+            if b[44..76] != reference.source || b[76..108] != reference.asset {
+                return Err(ServiceError::InvalidRequest);
+            }
+        } else if b[44..108].iter().any(|v| *v != 0)
+            || self
+                .capsule()?
+                .resolver_scope(binding.resolver)
+                .map_err(unavailable)?
+                .source
+                != [0; 32]
         {
             return Err(ServiceError::Unsupported);
         }
+        let (_, started, _) = self.dns_publish_binding(n64(b, 120), n64(b, 128), n64(b, 28))?;
         let _scratch = self.budget.dynamic.reserve(SCRATCH).map_err(unavailable)?;
         let memory = self
             .budget
             .dynamic
-            .reserve(std::mem::size_of::<Producer>() + 80)
+            .reserve(
+                std::mem::size_of::<Producer>()
+                    + 80
+                    + if binding.bootstrap {
+                        std::mem::size_of::<BootstrapPublication>() + b.len()
+                    } else {
+                        0
+                    },
+            )
             .map_err(unavailable)?;
         let answer = parse(
             &b[144 + q..144 + q + r],
@@ -570,19 +703,37 @@ impl<A: Authority> Issuer<A> {
             binding.options,
             binding.payload,
         )?;
-        let expires = started
+        let observed = if binding.bootstrap {
+            self.bootstrap_response_observed(binding, b)?
+        } else {
+            started
+        };
+        if observed < started || observed > self.authority.now() {
+            return Err(ServiceError::Unavailable);
+        }
+        let mut expires = observed
             .checked_add(Duration::from_secs(u64::from(answer.ttl)))
             .ok_or(ServiceError::Unavailable)?
             .min(session);
+        if binding.bootstrap {
+            expires = expires.min(self.bootstrap_dns_data(binding)?.1);
+        }
         if self.authority.now() >= expires {
             return Err(ServiceError::Unavailable);
         }
         self.dns_publish_binding(n64(b, 120), n64(b, 128), n64(b, 28))?;
+        self.bundle_history(1)?;
         let id = Self::id(&mut self.rrsets.next_producer)?;
         self.dns_freeze_publish(n64(b, 120))?;
         self.rrsets.producers.insert(
             id,
             Box::new(Producer {
+                bootstrap: binding.bootstrap.then(|| {
+                    Box::new(BootstrapPublication {
+                        raw: b.into(),
+                        observed,
+                    })
+                }),
                 binding,
                 proof: n64(b, 120),
                 revision: n64(b, 128),
@@ -598,6 +749,9 @@ impl<A: Authority> Issuer<A> {
         Ok(id)
     }
     fn fresh_waiter(&mut self, binding: Binding) -> Result<Instant, ServiceError> {
+        if binding.bootstrap {
+            return self.bootstrap_dns_data(binding).map(|(_, until)| until);
+        }
         if self.dns_transport_binding(binding.bundle)? != binding {
             return Err(ServiceError::Unavailable);
         }
@@ -644,7 +798,8 @@ impl<A: Authority> Issuer<A> {
         if !p.acked
             || p.revoked
             || p.expires <= self.authority.now()
-            || !same_data(binding, p.binding)
+            || self.rrset_data_matches(binding, p.binding).is_err()
+            || binding.bootstrap && binding.root == p.binding.root
             || binding.bundle == p.binding.bundle
             || n64(b, 24) != binding.root
             || n64(b, 32) != binding.query
@@ -653,14 +808,20 @@ impl<A: Authority> Issuer<A> {
             || self.rrsets.waiters.values().any(|w| {
                 w.reservation == reservation
                     || w.binding.bundle == binding.bundle
-                    || w.binding.root == binding.root
+                    || w.binding.root == binding.root && w.binding.bootstrap == binding.bootstrap
             })
             || self.rrsets.waiters.len() + self.dns.hosts_counts().1 >= 256
         {
             return Err(ServiceError::InvalidRequest);
         }
+        let source_until = if binding.bootstrap {
+            self.bootstrap_rrset_live(p)?
+        } else {
+            p.expires
+        };
         let expires = p
             .expires
+            .min(source_until)
             .min(reservation_expires)
             .min(session)
             .min(self.authority.now() + Duration::from_nanos(n64(b, 56)));
@@ -707,6 +868,11 @@ impl<A: Authority> Issuer<A> {
             if p.revoked || p.expires <= self.authority.now() {
                 return Err(ServiceError::Unavailable);
             }
+            let source_until = if p.binding.bootstrap {
+                self.bootstrap_rrset_live(p)?
+            } else {
+                p.expires
+            };
             if !p.acked {
                 let (proof, revision, exchange, binding) =
                     (p.proof, p.revision, p.exchange, p.binding);
@@ -720,7 +886,8 @@ impl<A: Authority> Issuer<A> {
                 .get(&id)
                 .ok_or(ServiceError::Unavailable)?;
             let now = self.authority.now();
-            if now >= p.expires {
+            let expires = p.expires.min(source_until);
+            if now >= expires {
                 return Err(ServiceError::Unavailable);
             }
             put(out, 8, id);
@@ -729,12 +896,12 @@ impl<A: Authority> Issuer<A> {
             put(
                 out,
                 32,
-                (p.expires - now)
+                (expires - now)
                     .as_nanos()
                     .min(u128::from(u32::MAX) * 1_000_000_000) as u64,
             );
             out[40..42].copy_from_slice(&(p.answer.count as u16).to_be_bytes());
-            Ok(p.expires)
+            Ok(expires)
         } else {
             let w = self
                 .rrsets
@@ -750,7 +917,13 @@ impl<A: Authority> Issuer<A> {
                 return Err(ServiceError::Unavailable);
             }
             let binding = w.binding;
-            let expiry = w.expires.min(p.expires);
+            let source_until = if binding.bootstrap {
+                self.rrset_data_matches(binding, p.binding)?;
+                self.bootstrap_rrset_live(p)?
+            } else {
+                p.expires
+            };
+            let expiry = w.expires.min(p.expires).min(source_until);
             let (producer, reservation, count) = (w.producer, w.reservation, p.answer.count);
             let (current_binding, reservation_expires) = self.dns_waiter_binding(reservation)?;
             if current_binding != binding {
@@ -772,7 +945,7 @@ impl<A: Authority> Issuer<A> {
             put(out, 48, (until - now).as_nanos().min(1_000_000_000) as u64);
             out[56..58].copy_from_slice(&(count as u16).to_be_bytes());
             out[58] = 1;
-            out[59] = 1;
+            out[59] = if binding.bootstrap { 2 } else { 1 };
             Ok(until)
         }
     }
@@ -1317,7 +1490,13 @@ pub(super) fn dispatch<A: Authority>(
                 let id = result?;
                 if issuer.ack_hosts_data(operation, id)? {
                     return Ok(());
-                } else if operation == Operation::Published {
+                }
+                if let Err(e) = issuer.bootstrap_reply_fence(operation, id) {
+                    issuer.unknown = true;
+                    issuer.authority.revoke();
+                    return Err(e);
+                }
+                if operation == Operation::Published {
                     issuer
                         .rrsets
                         .producers

@@ -1546,6 +1546,42 @@ Cleanup window исходный, не более 1s; USER и service root с о�
 loopback Stub policy и legitimate bootstrap Source/producer mint остаются
 следующими этапами. Публичные gates закрыты; runtime acceptance не заявляется.
 
+### CODEC4 NETWORK bootstrap: Publish DATA и независимые waiters
+
+`native_dns_rrset::dispatch` обслуживает BootstrapDns Publish40/Published41
+через retained `BootstrapDirect` proof/revision/exchange и отдельный private
+`Channel::bootstrap_dns_transcript`. Последний по exact launch, binding,
+producer sequence, request и response подтверждает immutable response observation
+time. Его production factory возвращает None до reviewed CODEC4 capture scope;
+USER `dns_wire`, Direct3 и bootstrap consuming-close не конвертируются в него.
+Pure tests inject-ят только fake captured facts, без OS/image attestation.
+
+Issuer сравнивает cheap immutable prefix/source metadata до Source/kernel
+revalidation, повторяет strict DNS parser, сверяет role4 SnapshotRef и pinned
+Source.question/options с полным исходным physical path. Parent carrier и DNS
+transport carrier остаются разными полями. Source question не заменяет original
+hostname/port. DATA expiry — min(observed response + actual parsed minimum TTL,
+original context/source/root/session deadlines); повторный receipt обязан иметь
+тот же observation time. Raw capture хранится с предварительным debit общего
+8MiB ledger, максимум 64 producers; invalid Publish не расходует shared history.
+В этом bounded cut DATA дополнительно требует live исходный producer context;
+teardown этого context отзывает его derivatives, cache не переживает этот fence.
+
+Каждый NETWORK waiter имеет новый ACKed context/query/service root и role3
+reservation, затем Bind53/54. Issuer сравнивает full ordered parent path,
+original/selector, exact snapshot/epoch, resolver/question/options и retained
+producer DATA; owner lookup для flow0 не выполняется. Required0/owner0 не
+становятся USER authority. Bind ACK ограничен исходным reservation deadline;
+source revalidation выполняется вокруг transcript checks и после фактической
+отправки Allow. Uncertain post-send fence отзывает context и сохраняет custody.
+Cancel6 изолирует waiter; producer/context/source cancellation запрещает его
+derivatives. Shared namespaces/history/credits и USER/Hosts semantics сохранены.
+
+NETWORK Numeric42 use2 → BootstrapPhysicalPermission остаётся следующим
+отдельным unit: этот NETWORK waiter пока не принимается Hosts numeric path и
+не выдаёт generic class3/user grant. Production bootstrap Source/transcript
+mint и public gates закрыты. CODEC4 wire/schema/corpus/pins не изменены.
+
 ### StubBind: bounded listener observation, не service authority
 
 `helper/resolver_stub.rs` отделяет retained sampled observation от policy issuer.
