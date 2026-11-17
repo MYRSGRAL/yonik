@@ -9754,13 +9754,24 @@ new file mode 100644
 diff --git a/transport/internet/system_dialer.go b/transport/internet/system_dialer.go
 --- a/transport/internet/system_dialer.go
 +++ b/transport/internet/system_dialer.go
-@@ -257,6 +257,23 @@
+@@ -257,6 +257,34 @@
  
  // guardedSystemDial закрывает все вызовы effective dialer, включая Happy Eyeballs.
  func guardedSystemDial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
 +	if hooks.ProfileSession(ctx) {
 +		if _, ok := effectiveSystemDialer.(*DefaultSystemDialer); !ok {
 +			return nil, errors.New("full-profile alternative dialer denied")
++		}
++		if hooks.ProfileBootstrapPhysicalRequired(ctx) {
++			ControllersLock.Lock()
++			controlled := len(Controllers) != 0
++			ControllersLock.Unlock()
++			if src != nil && src != net.AnyIP || sockopt != nil || controlled {
++				return nil, hooks.ErrProfileUnsupported
++			}
++			return hooks.ProfileDialBootstrap(ctx, dest, func(physical context.Context, numeric net.Destination) (net.Conn, error) {
++				return effectiveSystemDialer.Dial(physical, src, numeric, nil)
++			})
 +		}
 +		if hooks.ProfileDNSDirectRequired(ctx) {
 +			ControllersLock.Lock()
@@ -9778,7 +9789,7 @@ diff --git a/transport/internet/system_dialer.go b/transport/internet/system_dia
  	if err := hooks.BeforeSocketDial(ctx); err != nil {
  		return nil, err
  	}
-@@ -268,13 +285,55 @@
+@@ -268,13 +296,55 @@
  	if err != nil {
  		return nil, err
  	}
@@ -10945,7 +10956,7 @@ diff --git a/common/yonikbroker/profile_transport_other.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_other.go
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,42 @@
 +//go:build !linux
 +
 +package nativehooks
@@ -10959,6 +10970,12 @@ new file mode 100644
 +
 +type ProfileCloser = io.Closer
 +type ProfilePool struct{}
++
++func ProfileBootstrapRawContext(ctx context.Context, _ bool) context.Context { return ctx }
++func ProfileBootstrapPhysicalRequired(context.Context) bool                  { return false }
++func ProfileDialBootstrap(context.Context, xnet.Destination, func(context.Context, xnet.Destination) (net.Conn, error)) (net.Conn, error) {
++	return nil, errProfile
++}
 +
 +func ProfileTransportPool(context.Context, byte) (*ProfilePool, error)    { return nil, nil }
 +func (*ProfilePool) Key() [32]byte                                        { return [32]byte{} }
@@ -11651,7 +11668,7 @@ diff --git a/common/yonikbroker/profile_transport_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_transport_linux.go
-@@ -0,0 +1,919 @@
+@@ -0,0 +1,1147 @@
 +//go:build linux
 +
 +package nativehooks
@@ -11670,6 +11687,214 @@ new file mode 100644
 +
 +type ProfileCloser = io.Closer
 +type profilePoolContextKey struct{}
++
++func profileBootstrapFor(ctx context.Context) *profileBootstrapPhysicalPermission {
++	if ctx == nil {
++		return nil
++	}
++	p := profileRuntime(ctx)
++	if p == nil {
++		return nil
++	}
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	if g == nil {
++		return nil
++	}
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		if h.root == g && h.bootstrap != nil {
++			return h.bootstrap.permission
++		}
++	}
++	return nil
++}
++func ProfileBootstrapPhysicalRequired(ctx context.Context) bool {
++	return profileBootstrapFor(ctx) != nil
++}
++func profileBootstrapGate(ctx context.Context, permission *profileBootstrapPhysicalPermission) error {
++	if ctx == nil || ctx.Err() != nil || permission == nil {
++		return errProfile
++	}
++	h := permission.owner
++	p := profileRuntime(ctx)
++	g, _ := ctx.Value(profileGrantKey{}).(*profileGrant)
++	raw, _ := ctx.Value(profileBootstrapRawKey{}).(bool)
++	if p != h.runtime || g != h.root || profileReceiptFrom(ctx) != h.root.receipt || !raw || !p.flowFresh() {
++		return errProfile
++	}
++	c := p.flow
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if !c.bootstrapPermissionLive(permission) {
++		return errProfile
++	}
++	return nil
++}
++
++// Исходный hostname остаётся у transport. Только этот closed runner получает
++// проверенный numeric target; parent USER grant не меняется и не клонируется.
++func ProfileDialBootstrap(ctx context.Context, original xnet.Destination, runner func(context.Context, xnet.Destination) (net.Conn, error)) (net.Conn, error) {
++	permission := profileBootstrapFor(ctx)
++	if runner == nil || permission == nil || profileBootstrapGate(ctx, permission) != nil {
++		return nil, ErrProfileUnsupported
++	}
++	h := permission.owner
++	c := h.runtime.flow
++	value, err := profileValue(original)
++	c.mu.Lock()
++	if err != nil || value != h.frontier.target || permission.attempted || !c.bootstrapPermissionLive(permission) {
++		c.mu.Unlock()
++		return nil, ErrProfileUnsupported
++	}
++	permission.attempted = true
++	h.bootstrap.opening = true
++	deadline := permission.deadline
++	c.mu.Unlock()
++	base := context.WithValue(ctx, profileBootstrapPermissionKey{}, permission)
++	physical, finish := context.WithDeadline(base, deadline)
++	defer finish()
++	numeric := profileNumericDestination(permission.target)
++	conn, err := ProfileDialPhysical(physical, numeric, func(callback context.Context) (net.Conn, error) {
++		if profileBootstrapGate(callback, permission) != nil {
++			return nil, errProfile
++		}
++		return runner(callback, numeric)
++	})
++	if err != nil {
++		c.mu.Lock()
++		h.bootstrap.opening = false
++		c.mu.Unlock()
++		return nil, err
++	}
++	owned := &profileBootstrapConn{conn: conn, permission: permission, ctx: base, done: make(chan struct{})}
++	context.AfterFunc(h.ctx, owned.requestClose)
++	c.mu.Lock()
++	h.bootstrap.conn = owned
++	h.bootstrap.opening = false
++	live := c.bootstrapPermissionLive(permission)
++	c.mu.Unlock()
++	if !live {
++		owned.requestClose()
++		return nil, errProfile
++	}
++	return owned, nil
++}
++
++type profileBootstrapConn struct {
++	conn       net.Conn
++	permission *profileBootstrapPhysicalPermission
++	ctx        context.Context
++	mu         sync.Mutex
++	tasks      sync.WaitGroup
++	once       sync.Once
++	requested  atomic.Bool
++	closing    bool
++	busy       [3]bool
++	done       chan struct{}
++	result     error
++}
++
++func (b *profileBootstrapConn) begin(direction int) (time.Time, error) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	if b.closing || b.busy[direction] || profileBootstrapGate(b.ctx, b.permission) != nil {
++		return time.Time{}, errProfile
++	}
++	b.tasks.Add(1)
++	b.busy[direction] = true
++	return b.permission.deadline, nil
++}
++func (b *profileBootstrapConn) end(direction int) {
++	b.mu.Lock()
++	b.busy[direction] = false
++	b.mu.Unlock()
++	b.tasks.Done()
++}
++func (b *profileBootstrapConn) Read(data []byte) (int, error) {
++	d, err := b.begin(0)
++	if err != nil {
++		return 0, err
++	}
++	defer b.end(0)
++	if err = b.conn.SetReadDeadline(d); err != nil {
++		return 0, err
++	}
++	n, err := b.conn.Read(data)
++	if profileBootstrapGate(b.ctx, b.permission) != nil {
++		clear(data[:n])
++		b.requestClose()
++		return 0, errProfile
++	}
++	return n, err
++}
++func (b *profileBootstrapConn) Write(data []byte) (int, error) {
++	d, err := b.begin(1)
++	if err != nil {
++		return 0, err
++	}
++	defer b.end(1)
++	if err = b.conn.SetWriteDeadline(d); err != nil {
++		return 0, err
++	}
++	n, err := b.conn.Write(data)
++	if profileBootstrapGate(b.ctx, b.permission) != nil {
++		return n, errProfile
++	}
++	return n, err
++}
++func (b *profileBootstrapConn) requestClose() {
++	if b.requested.CompareAndSwap(false, true) {
++		go func() { _ = b.Close() }()
++	}
++}
++func (b *profileBootstrapConn) Close() error {
++	b.once.Do(func() {
++		b.requested.Store(true)
++		b.mu.Lock()
++		b.closing = true
++		b.mu.Unlock()
++		b.result = b.conn.Close()
++		b.tasks.Wait()
++		close(b.done)
++	})
++	<-b.done
++	return b.result
++}
++func (b *profileBootstrapConn) LocalAddr() net.Addr  { return b.conn.LocalAddr() }
++func (b *profileBootstrapConn) RemoteAddr() net.Addr { return b.conn.RemoteAddr() }
++func (b *profileBootstrapConn) SetDeadline(t time.Time) error {
++	if _, err := b.begin(2); err != nil {
++		return err
++	}
++	defer b.end(2)
++	if t.IsZero() || b.permission.deadline.Before(t) {
++		t = b.permission.deadline
++	}
++	return b.conn.SetDeadline(t)
++}
++func (b *profileBootstrapConn) SetReadDeadline(t time.Time) error {
++	if _, err := b.begin(2); err != nil {
++		return err
++	}
++	defer b.end(2)
++	if t.IsZero() || b.permission.deadline.Before(t) {
++		t = b.permission.deadline
++	}
++	return b.conn.SetReadDeadline(t)
++}
++func (b *profileBootstrapConn) SetWriteDeadline(t time.Time) error {
++	if _, err := b.begin(2); err != nil {
++		return err
++	}
++	defer b.end(2)
++	if t.IsZero() || b.permission.deadline.Before(t) {
++		t = b.permission.deadline
++	}
++	return b.conn.SetWriteDeadline(t)
++}
++
 +type profilePathKey struct{}
 +type profilePhysicalContextKey struct{}
 +
@@ -12273,6 +12498,14 @@ new file mode 100644
 +	return nil
 +}
 +func ProfilePhysicalGate(ctx context.Context) error {
++	if ctx == nil {
++		return errProfile
++	}
++	if permission, _ := ctx.Value(profileBootstrapPermissionKey{}).(*profileBootstrapPhysicalPermission); permission != nil {
++		if profileBootstrapGate(ctx, permission) != nil {
++			return errProfile
++		}
++	}
 +	if profileDNSExchangeFrom(ctx) != nil {
 +		t, _ := ctx.Value(profileDNSFactoryKey{}).(*profileDNSDirect)
 +		if t == nil || profileRuntime(ctx) != t.bundle.exchange.query.runtime || profileDNSExchangeFrom(ctx) != t.bundle.exchange || profileQueryFrom(ctx) != t.bundle.exchange.query || profileReceiptFrom(ctx) != t.bundle.exchange.query.receipt || ctx.Err() != nil {
@@ -12298,6 +12531,9 @@ new file mode 100644
 +	return e
 +}
 +func ProfileDialPhysical(ctx context.Context, dest xnet.Destination, runner func(context.Context) (net.Conn, error)) (net.Conn, error) {
++	if ctx == nil {
++		return nil, errProfile
++	}
 +	if profileDNSExchangeFrom(ctx) != nil {
 +		return nil, ErrProfileUnsupported
 +	}
@@ -12309,7 +12545,16 @@ new file mode 100644
 +	if dest.Address.Family().IsDomain() {
 +		return nil, ErrProfileUnsupported
 +	}
-+	if ProfileCheckDial(ctx, dest, true) != nil {
++	if permission, _ := ctx.Value(profileBootstrapPermissionKey{}).(*profileBootstrapPhysicalPermission); permission != nil {
++		value, err := profileValue(dest)
++		control := permission.owner.runtime.flow
++		control.mu.Lock()
++		opening := permission.attempted && permission.owner.bootstrap.opening
++		control.mu.Unlock()
++		if err != nil || value != permission.target || !opening || profileBootstrapGate(ctx, permission) != nil {
++			return nil, errProfile
++		}
++	} else if ProfileCheckDial(ctx, dest, true) != nil {
 +		return nil, errProfile
 +	}
 +	pool, e := ProfileTransportPool(ctx, 0)
@@ -13468,7 +13713,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	}
  
  	if config.SenderSettings != nil {
-@@ -175,11 +222,100 @@
+@@ -175,11 +222,102 @@
  }
  
  // Dispatch implements proxy.Outbound.Dispatch.
@@ -13545,6 +13790,8 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
 +		}
 +		next, release, e := nativehooks.ProfileAuthorizeHandler(ctx, h.tag, ob.Target, mux)
 +		if e == nil {
++			raw := !mux && internet.ProfileNumericRawSettings(h.streamSettings) && (h.senderSettings == nil || h.senderSettings.Via == nil)
++			next = nativehooks.ProfileBootstrapRawContext(next, raw)
 +			e = nativehooks.ProfilePrepareChain(next, h.profileBranch)
 +		}
 +		if e != nil {
@@ -13569,7 +13816,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  		strategy := h.senderSettings.TargetStrategy
  		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
  			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
-@@ -204,38 +340,41 @@
+@@ -204,38 +342,41 @@
  		link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  		link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
  	}
@@ -13633,7 +13880,7 @@ diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
  	err := h.proxy.Process(ctx, link, h)
  	var errC error
  	if err != nil {
-@@ -266,6 +405,9 @@
+@@ -266,6 +407,9 @@
  
  // Dial implements internet.Dialer.
  func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
@@ -15720,7 +15967,7 @@ diff --git a/common/yonikbroker/profile_flow_linux.go b/common/yonikbroker/profi
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_flow_linux.go
-@@ -0,0 +1,1181 @@
+@@ -0,0 +1,1197 @@
 +//go:build linux
 +
 +package nativehooks
@@ -15835,6 +16082,7 @@ new file mode 100644
 +	refresh                             *profileOperation
 +}
 +type profileOperation struct {
++	bootstrap                               *profileBootstrapRPC
 +	hostsObservation                        *profileHostsObservation
 +	dnsContext4                             *profileDNSContext4
 +	dns4CancelSequence                      uint64
@@ -16142,6 +16390,11 @@ new file mode 100644
 +	}
 +}
 +func (c *profileFlowControl) finish(op *profileOperation, e error) {
++	if op.bootstrap != nil {
++		c.hostsObservationClose(op.bootstrap.owner)
++		c.dnsNotify(op, e)
++		return
++	}
 +	if op.hostsObservation != nil {
 +		c.hostsObservationClose(op.hostsObservation)
 +		c.dnsNotify(op, e)
@@ -16198,6 +16451,10 @@ new file mode 100644
 +func (c *profileFlowControl) abort(op *profileOperation) {
 +	c.mu.Lock()
 +	defer c.mu.Unlock()
++	if op.bootstrap != nil {
++		c.hostsObservationClose(op.bootstrap.owner)
++		return
++	}
 +	if op.hostsObservation != nil {
 +		c.hostsObservationClose(op.hostsObservation)
 +		return
@@ -16329,6 +16586,9 @@ new file mode 100644
 +	return c.dispatchLocked(op)
 +}
 +func (c *profileFlowControl) dispatchLocked(op *profileOperation) error {
++	if op.bootstrap != nil {
++		return c.bootstrapDispatch(op)
++	}
 +	if op.hostsObservation != nil {
 +		return c.hostsObservationDispatch(op)
 +	}
@@ -16421,6 +16681,9 @@ new file mode 100644
 +	defer c.mu.Unlock()
 +	if !c.live() {
 +		return errProfile
++	}
++	if handled, err := c.bootstrapAccept(f); handled {
++		return err
 +	}
 +	if handled, err := c.numericAccept(f); handled {
 +		return err
@@ -20236,10 +20499,13 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  // RegisterTransportDialer registers a Dialer with given name.
  func RegisterTransportDialer(protocol string, dialer dialFunc) error {
  	if _, found := transportDialerCache[protocol]; found {
-@@ -46,6 +72,15 @@
+@@ -46,6 +72,18 @@
  
  // Dial dials a internet connection towards the given destination.
  func Dial(ctx context.Context, dest net.Destination, streamSettings *MemoryStreamConfig) (stat.Connection, error) {
++	if nativehooks.ProfileBootstrapPhysicalRequired(ctx) && !profileDNSRawSettings(streamSettings) {
++		return nil, nativehooks.ErrProfileUnsupported
++	}
 +	if e := nativehooks.ProfileCheckDial(ctx, dest, false); e != nil {
 +		return nil, e
 +	}
@@ -20252,7 +20518,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	if dest.Network == net.Network_TCP {
  		if streamSettings == nil {
  			s, err := ToMemoryStreamConfig(nil)
-@@ -56,11 +91,36 @@
+@@ -56,11 +94,36 @@
  		}
  
  		protocol := streamSettings.ProtocolName
@@ -20290,7 +20556,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	}
  
  	if dest.Network == net.Network_UDP {
-@@ -68,7 +128,14 @@
+@@ -68,7 +131,14 @@
  		if udpDialer == nil {
  			return nil, errors.New("UDP dialer not registered")
  		}
@@ -20306,7 +20572,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	}
  
  	return nil, errors.New("unknown network ", dest.Network)
-@@ -108,7 +175,12 @@
+@@ -108,7 +178,12 @@
  	return ips, err
  }
  
@@ -20320,7 +20586,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	errors.LogInfo(ctx, "redirecting request "+dst.String()+" to "+obt)
  	outbounds := session.OutboundsFromContext(ctx)
  	ctx = session.ContextWithOutbounds(ctx, append(outbounds, &session.Outbound{
-@@ -120,7 +192,11 @@
+@@ -120,7 +195,11 @@
  	ur, uw := pipe.New(pipe.OptionsFromContext(ctx)...)
  	dr, dw := pipe.New(pipe.OptionsFromContext(ctx)...)
  
@@ -20333,7 +20599,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	var readerOpt cnc.ConnectionOption
  	if dst.Network == net.Network_TCP {
  		readerOpt = cnc.ConnectionOutputMulti(dr)
-@@ -132,7 +208,7 @@
+@@ -132,7 +211,7 @@
  		readerOpt,
  		cnc.ConnectionOnClose(common.ChainedClosable{uw, dw}),
  	)
@@ -20342,7 +20608,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  }
  
  func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (*net.Destination, error) {
-@@ -224,6 +300,9 @@
+@@ -224,6 +303,9 @@
  
  // DialSystem calls system dialer to create a network connection.
  func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
@@ -20352,7 +20618,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  	var src net.Address
  	outbounds := session.OutboundsFromContext(ctx)
  	var outboundName string
-@@ -242,6 +321,9 @@
+@@ -242,6 +324,9 @@
  	if sockopt == nil {
  		return guardedSystemDial(ctx, src, dest, sockopt)
  	}
@@ -20362,7 +20628,7 @@ diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
  
  	if newDest, err := checkAddressPortStrategy(ctx, dest, sockopt); err == nil && newDest != nil {
  		errors.LogInfo(ctx, "replace destination with "+newDest.String())
-@@ -275,7 +357,7 @@
+@@ -275,7 +360,7 @@
  		if h == nil {
  			return nil, errors.New("there is no outbound handler for dialerProxy")
  		}
@@ -30053,7 +30319,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux.go
-@@ -0,0 +1,838 @@
+@@ -0,0 +1,1424 @@
 +//go:build linux
 +
 +package nativehooks
@@ -30063,12 +30329,23 @@ new file mode 100644
 +	"context"
 +	"crypto/sha256"
 +	xnet "github.com/xtls/xray-core/common/net"
++	"net/netip"
 +	"strings"
 +	"time"
 +)
 +
 +const profileHostsObservationCredit = 32 * 1024
 +const profileHostsObservationPending = 6
++
++type profileBootstrapRawKey struct{}
++
++// Только отрицательный shape gate. Bool не выдаёт ни receipt, ни permission.
++func ProfileBootstrapRawContext(ctx context.Context, raw bool) context.Context {
++	if profileRuntime(ctx) == nil {
++		return ctx
++	}
++	return context.WithValue(ctx, profileBootstrapRawKey{}, raw)
++}
 +
 +// ProducerRRset DATA не является WaiterReceipt, grant или transport permission.
 +type profileHostsProducerData struct {
@@ -30085,6 +30362,9 @@ new file mode 100644
 +	key     string
 +}
 +type profileHostsObservation struct {
++	bootstrap                                               *profileBootstrapState
++	raw                                                     bool
++	pendingCredit                                           int
 +	data                                                    *profileHostsProducerData
 +	publish                                                 *profileOperation
 +	publishHash                                             [32]byte
@@ -30244,8 +30524,8 @@ new file mode 100644
 +	return frontier, deadline, nil
 +}
 +
-+// Actual chain caller не получает IP или permission: этот cut заканчивается
-+// Hosts Producer DATA. Waiter/Numeric/physical conjunction пока закрыты.
++// Actual chain caller удерживает DATA и отдельный waiter. Только raw TCP leaf
++// может получить private permission; USER parent и original hostname неизменны.
 +func profilePrepareHostsObservation(ctx context.Context, root *profileGrant) error {
 +	p := profileRuntime(ctx)
 +	if p == nil || !p.dns4CaptureReviewed {
@@ -30265,15 +30545,29 @@ new file mode 100644
 +		c.mu.Unlock()
 +		return ErrProfileUnsupported
 +	}
-+	if c.hostsObservationUsed >= len(c.hostsObservations) || c.profilePendingUsed()+profileHostsObservationPending > min(64, int(c.manifest.caps[3])) || c.buffered+c.manifest.memoryCredit+profileHostsObservationCredit > uint64(c.manifest.caps[4]) || !c.dnsReserveHistory(profileHostsObservationPending) {
++	raw, _ := ctx.Value(profileBootstrapRawKey{}).(bool)
++	raw = raw && frontier.count == 1 && frontier.branch == 0 && frontier.carrier == 6 && root.receipt.original.network == 6 && c.manifest.rows[8][root.scope][2] == 6 && root.stream != 65535 && c.manifest.rows[3][root.stream][0] == 1
++	for _, other := range c.hostsObservations[:c.hostsObservationUsed] {
++		if raw && other.root == root && other.bootstrap != nil {
++			c.mu.Unlock()
++			return ErrProfileUnsupported
++		}
++	}
++	pendingCredit := profileHostsObservationPending
++	credit := uint64(profileHostsObservationCredit)
++	if raw {
++		pendingCredit += 10
++		credit += 64 * 1024
++	}
++	if c.hostsObservationUsed >= len(c.hostsObservations) || c.profilePendingUsed()+pendingCredit > min(64, int(c.manifest.caps[3])) || c.buffered+c.manifest.memoryCredit+credit > uint64(c.manifest.caps[4]) || !c.dnsReserveHistory(pendingCredit) {
 +		c.mu.Unlock()
 +		return errProfileFlowBusy
 +	}
-+	c.operations += profileHostsObservationPending
-+	c.buffered += profileHostsObservationCredit
++	c.operations += pendingCredit
++	c.buffered += credit
 +	base := context.WithValue(ctx, profileGrantKey{}, root)
 +	child, cancel := context.WithCancel(base)
-+	h := &profileHostsObservation{runtime: p, ctx: child, cancel: cancel, root: root, frontier: frontier, snapshot: p.snapshot, deadline: deadline, cleanupDeadline: deadline.Add(time.Second)}
++	h := &profileHostsObservation{raw: raw, pendingCredit: pendingCredit, runtime: p, ctx: child, cancel: cancel, root: root, frontier: frontier, snapshot: p.snapshot, deadline: deadline, cleanupDeadline: deadline.Add(time.Second)}
 +	if c.sessionDeadline.Before(h.cleanupDeadline) {
 +		h.cleanupDeadline = c.sessionDeadline
 +	}
@@ -30282,7 +30576,14 @@ new file mode 100644
 +	h.selection, err = profileHostsSelect(p.snapshot, frontier.target.address)
 +	query := c.nextDNSQuery + 1
 +	c.mu.Unlock()
-+	defer func() { c.mu.Lock(); c.hostsObservationClose(h); c.mu.Unlock() }()
++	retained := false
++	defer func() {
++		if !retained {
++			c.mu.Lock()
++			c.hostsObservationClose(h)
++			c.mu.Unlock()
++		}
++	}()
 +	if err != nil {
 +		return err
 +	}
@@ -30292,7 +30593,11 @@ new file mode 100644
 +	if err != nil {
 +		return err
 +	}
-+	defer release()
++	defer func() {
++		if !retained {
++			release()
++		}
++	}()
 +	x, _ := metadata.Value(profileDNSContext4Key{}).(*profileDNSContext4)
 +	c.mu.Lock()
 +	if !c.dnsContext4Live(x) || x.identity.kind != profileDNSHostsRoot || !c.hostsObservationSourceLive(h) {
@@ -30330,9 +30635,23 @@ new file mode 100644
 +	if err = profilePublishHostsObservation(h); err != nil {
 +		return err
 +	}
-+	// DATA ID не WaiterReceipt/BootstrapPhysicalPermission. Numeric/use2 и
-+	// conjunction отсутствуют в current physical seam; raw open остаётся закрыт.
-+	return ErrProfileUnsupported
++	if !h.raw {
++		return ErrProfileUnsupported
++	}
++	if err = profileAcquireBootstrapPermission(h); err != nil {
++		return err
++	}
++	c.mu.Lock()
++	valid := c.bootstrapPermissionLive(h.bootstrap.permission)
++	if valid {
++		root.prepared = true
++	}
++	c.mu.Unlock()
++	if !valid {
++		return errProfile
++	}
++	retained = true
++	return nil
 +}
 +
 +func profilePublishHostsObservation(h *profileHostsObservation) error {
@@ -30660,6 +30979,16 @@ new file mode 100644
 +		if h.released || h.unknown {
 +			continue
 +		}
++		if b := h.bootstrap; b != nil {
++			for _, r := range b.requests[:b.used] {
++				if r.op.submitted && !r.replied && !c.clock().Before(r.op.deadline) {
++					c.hostsObservationClose(h)
++				}
++			}
++			if b.permission.id != 0 && !c.bootstrapPermissionLive(b.permission) {
++				c.hostsObservationClose(h)
++			}
++		}
 +		if !c.hostsObservationSourceLive(h) || h.context != nil && !c.dnsContext4Live(h.context) || h.pending != nil && h.pending.submitted && !h.replied && !c.clock().Before(h.pending.deadline) {
 +			c.hostsObservationClose(h)
 +		}
@@ -30672,6 +31001,15 @@ new file mode 100644
 +		if !c.clock().Before(h.cleanupDeadline) {
 +			h.unknown = true
 +			continue
++		}
++		if h.bootstrap != nil {
++			ready, err := c.bootstrapCleanup(h)
++			if err != nil {
++				return err
++			}
++			if !ready {
++				continue
++			}
 +		}
 +		if op := h.publish; op != nil && op.submitted && !h.publishReceived {
 +			c.dnsNotify(op, errProfile)
@@ -30733,7 +31071,7 @@ new file mode 100644
 +			continue
 +		}
 +		h.released = true
-+		c.operations -= profileHostsObservationPending
++		c.operations -= h.pendingCredit
 +		// Retained selection/IDs оплачены до effects, eviction/compaction нет.
 +		if h.context != nil {
 +			h.context.hostReferences--
@@ -30746,6 +31084,21 @@ new file mode 100644
 +	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
 +		if h.released {
 +			continue
++		}
++		if b := h.bootstrap; b != nil {
++			for _, r := range b.requests[:b.used] {
++				if r.op.submitted && !r.replied && r.op.sequence < floor {
++					floor = r.op.sequence
++				}
++				if r.cancelSequence != 0 && !r.cancelAck && r.cancelSequence < floor {
++					floor = r.cancelSequence
++				}
++			}
++			for _, x := range [][2]uint64{{b.grantClose, b.grantAck}, {b.waiterClose, b.waiterAck}, {b.reserveClose, b.reserveAck}} {
++				if x[0] != 0 && x[1] == 0 && x[0] < floor {
++					floor = x[0]
++				}
++			}
 +		}
 +		if op := h.publish; op != nil && op.submitted && !h.publishReceived && op.sequence < floor {
 +			floor = op.sequence
@@ -30770,8 +31123,14 @@ new file mode 100644
 +}
 +
 +func (c *profileFlowControl) hostsReservationUsed(id uint64) bool {
++	return c.hostsReservationUsedExcept(id, nil)
++}
++func (c *profileFlowControl) hostsReservationUsedExcept(id uint64, except *profileBootstrapState) bool {
 +	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
 +		if h.reservation != 0 && h.reservation == id {
++			return true
++		}
++		if h.bootstrap != nil && h.bootstrap != except && h.bootstrap.reservation != 0 && h.bootstrap.reservation == id {
 +			return true
 +		}
 +	}
@@ -30798,6 +31157,499 @@ new file mode 100644
 +type profileDNSHop struct {
 +	scope  uint16
 +	branch byte
++}
++
++type profileBootstrapPermissionKey struct{}
++type profileBootstrapPhysicalPermission struct {
++	owner     *profileHostsObservation
++	id        uint64
++	deadline  time.Time
++	target    profileDestinationValue
++	member    uint16
++	attempted bool
++}
++type profileBootstrapRPC struct {
++	owner              *profileHostsObservation
++	op                 *profileOperation
++	expected           uint16
++	hash               [32]byte
++	replied, cancelAck bool
++	cancelSequence     uint64
++}
++type profileBootstrapState struct {
++	opening                                                                bool
++	context                                                                *profileDNSContext4
++	requests                                                               [3]*profileBootstrapRPC
++	used                                                                   int
++	reservation, observation, receipt                                      uint64
++	reservationDeadline, receiptDeadline                                   time.Time
++	permission                                                             *profileBootstrapPhysicalPermission
++	grantClose, grantAck, waiterClose, waiterAck, reserveClose, reserveAck uint64
++	contextReleased                                                        bool
++	conn                                                                   *profileBootstrapConn
++}
++
++func (c *profileFlowControl) bootstrapBaseLive(h *profileHostsObservation) bool {
++	if h == nil || !h.raw || !c.hostsProducerDataLive(h.data) || h.frontier.count != 1 || h.frontier.branch != 0 || h.frontier.carrier != 6 || h.root.parent != nil {
++		return false
++	}
++	b := h.bootstrap
++	if b == nil || b.context == nil || !c.dnsContext4Live(b.context) || b.context.identity.kind != profileDNSHostsRoot || b.context.source.query == h.context.source.query || b.context.source.frontier != h.frontier || b.context.source.snapshot != h.snapshot {
++		return false
++	}
++	if b.reservation != 0 && !c.clock().Before(b.reservationDeadline) {
++		return false
++	}
++	return b.receipt == 0 || c.clock().Before(b.receiptDeadline)
++}
++func (c *profileFlowControl) bootstrapPermissionLive(p *profileBootstrapPhysicalPermission) bool {
++	if p == nil || !profileDNSV2ID(p.id) || !c.bootstrapBaseLive(p.owner) || p.owner.bootstrap.permission != p || !c.clock().Before(p.deadline) {
++		return false
++	}
++	target, member, ok := profileBootstrapMember(p.owner)
++	return ok && target == p.target && member == p.member
++}
++func (c *profileFlowControl) bootstrapRequest(h *profileHostsObservation, kind, expected uint16, body []byte) (*profileOperation, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	b := h.bootstrap
++	if !c.bootstrapBaseLive(h) || b.used >= len(b.requests) || !profileDNSV2Body(kind, body) {
++		return nil, errProfile
++	}
++	r := &profileBootstrapRPC{owner: h, expected: expected, hash: sha256.Sum256(body)}
++	op := &profileOperation{bootstrap: r, ctx: h.ctx, kind: kind, body: body, done: make(chan struct{})}
++	r.op = op
++	b.requests[b.used] = r
++	b.used++
++	return op, nil
++}
++func profileAcquireBootstrapPermission(h *profileHostsObservation) error {
++	c := h.runtime.flow
++	c.mu.Lock()
++	if h.bootstrap != nil || !h.raw || !c.hostsProducerDataLive(h.data) || c.nextDNSQuery >= ^uint64(0)-1 {
++		c.mu.Unlock()
++		return ErrProfileUnsupported
++	}
++	b := &profileBootstrapState{permission: &profileBootstrapPhysicalPermission{owner: h}}
++	h.bootstrap = b
++	s := h.context.source
++	s.query = c.nextDNSQuery + 1
++	s.deadline = h.deadline
++	c.mu.Unlock()
++	metadata, release, err := ProfileDNSAcquirePhysicalContext(context.WithValue(h.ctx, profileDNSCapture4Key{}, &s))
++	if err != nil {
++		return err
++	}
++	c.mu.Lock()
++	x, _ := metadata.Value(profileDNSContext4Key{}).(*profileDNSContext4)
++	if !c.dnsContext4Live(x) || x.source.query == h.context.source.query || !c.hostsProducerDataLive(h.data) {
++		c.mu.Unlock()
++		release()
++		return errProfile
++	}
++	b.context = x
++	x.hostReferences++
++	if until := x.deadline.Add(time.Second); until.Before(h.cleanupDeadline) {
++		h.cleanupDeadline = until
++	}
++	body := append([]byte(nil), h.pending.body...)
++	be.PutUint64(body[8:], x.source.query)
++	be.PutUint64(body[56:], uint64(time.Second))
++	c.mu.Unlock()
++	op, err := c.bootstrapRequest(h, 35, 36, body)
++	if err != nil {
++		return err
++	}
++	if err = h.runtime.flowRPC(op); err != nil {
++		return err
++	}
++	c.mu.Lock()
++	body = make([]byte, 64)
++	be.PutUint16(body, 2)
++	be.PutUint64(body[8:], b.reservation)
++	be.PutUint64(body[16:], h.data.id)
++	be.PutUint64(body[32:], x.source.query)
++	be.PutUint64(body[56:], uint64(time.Second))
++	c.mu.Unlock()
++	op, err = c.bootstrapRequest(h, 53, 54, body)
++	if err != nil {
++		return err
++	}
++	if err = h.runtime.flowRPC(op); err != nil {
++		return err
++	}
++	c.mu.Lock()
++	target, member, ok := profileBootstrapMember(h)
++	if !ok {
++		c.mu.Unlock()
++		return ErrProfileUnsupported
++	}
++	b.permission.target = target
++	b.permission.member = member
++	body = make([]byte, 24)
++	be.PutUint16(body, 2)
++	be.PutUint16(body[2:], member)
++	be.PutUint64(body[4:], b.receipt)
++	be.PutUint16(body[12:], 8)
++	body[14], body[15] = 2, 3
++	be.PutUint16(body[16:], 2)
++	be.PutUint16(body[18:], h.frontier.endpoint)
++	be.PutUint16(body[20:], h.frontier.subject)
++	be.PutUint16(body[22:], 65535)
++	ip, _ := netip.ParseAddr(target.address)
++	dst := make([]byte, 7)
++	dst[0], dst[1], dst[4] = target.family, target.network, byte(ip.BitLen()/8)
++	be.PutUint16(dst[2:], target.port)
++	body = append(body, dst...)
++	body = append(body, ip.AsSlice()...)
++	c.mu.Unlock()
++	op, err = c.bootstrapRequest(h, 42, 19, body)
++	if err != nil {
++		return err
++	}
++	return h.runtime.flowRPC(op)
++}
++func profileBootstrapMember(h *profileHostsObservation) (profileDestinationValue, uint16, bool) {
++	for _, view := range h.snapshot.hosts[:h.snapshot.hostCount] {
++		cur := profileCursor{b: view}
++		if string(cur.str(253)) != h.selection.key {
++			continue
++		}
++		count := int(cur.n16())
++		for i := 0; i < count; i++ {
++			f := cur.take(1)
++			if f == nil {
++				return profileDestinationValue{}, 0, false
++			}
++			size := 4
++			if f[0] == 6 {
++				size = 16
++			}
++			raw := cur.take(size)
++			ip, ok := netip.AddrFromSlice(raw)
++			if !ok || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.Is4In6() || ip == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
++				continue
++			}
++			for member, index := range h.selection.members[:h.selection.count] {
++				if int(index) == i {
++					v := h.frontier.target
++					v.family = f[0]
++					v.address = ip.String()
++					return v, uint16(member), true
++				}
++			}
++		}
++		break
++	}
++	return profileDestinationValue{}, 0, false
++}
++func (c *profileFlowControl) bootstrapDispatch(op *profileOperation) error {
++	r := op.bootstrap
++	h := r.owner
++	b := h.bootstrap
++	if op.submitted || op.completed {
++		return nil
++	}
++	if !c.bootstrapBaseLive(h) || r.hash != sha256.Sum256(op.body) || !profileDNSV2Body(op.kind, op.body) {
++		c.hostsObservationClose(h)
++		c.dnsNotify(op, errProfile)
++		return nil
++	}
++	op.sent = c.clock()
++	op.deadline = h.deadline
++	for _, d := range []time.Time{h.data.expires, h.context.deadline, b.context.deadline} {
++		if d.Before(op.deadline) {
++			op.deadline = d
++		}
++	}
++	if b.reservation != 0 && b.reservationDeadline.Before(op.deadline) {
++		op.deadline = b.reservationDeadline
++	}
++	if b.receipt != 0 && b.receiptDeadline.Before(op.deadline) {
++		op.deadline = b.receiptDeadline
++	}
++	if d, ok := op.ctx.Deadline(); ok && d.Before(op.deadline) {
++		op.deadline = d
++	}
++	if !op.sent.Before(op.deadline) {
++		c.hostsObservationClose(h)
++		c.dnsNotify(op, errProfile)
++		return nil
++	}
++	if op.kind == 35 || op.kind == 53 {
++		be.PutUint64(op.body[56:], uint64(op.deadline.Sub(op.sent)))
++	}
++	op.submitted = true
++	seq, err := c.write(op.kind, 0, op.body)
++	op.sequence = seq
++	if seq > c.lastSent {
++		c.lastSent = seq
++	}
++	if err != nil || !profileDNSV2ID(seq) {
++		h.unknown = true
++		c.hostsObservationClose(h)
++		c.dnsNotify(op, errProfile)
++		return errProfile
++	}
++	return nil
++}
++func (c *profileFlowControl) bootstrapAccept(f profilePacket) (bool, error) {
++	for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++		b := h.bootstrap
++		if b == nil {
++			continue
++		}
++		for _, r := range b.requests[:b.used] {
++			op := r.op
++			if op.submitted && f.reply == op.sequence && f.kind == r.expected {
++				bad := func() (bool, error) {
++					h.unknown = true
++					c.hostsObservationClose(h)
++					c.dnsNotify(op, errProfile)
++					return true, errProfile
++				}
++				if r.replied || r.cancelAck {
++					return bad()
++				}
++				r.replied = true
++				if f.kind != 19 && (f.object != 0 || !profileDNSV2Body(f.kind, f.body)) || f.kind == 19 && len(f.body) != 56 {
++					return bad()
++				}
++				data := f.body
++				status := data[2]
++				if f.kind == 19 {
++					status = data[0]
++				}
++				if status != 1 {
++					if f.kind == 19 && (f.object != 0 || data[1] != 3 || !zero(data[2:])) || status != 2 && status != 3 {
++						return bad()
++					}
++					if status == 3 {
++						h.unknown = true
++					}
++					c.hostsObservationClose(h)
++					c.dnsNotify(op, errProfile)
++					return true, nil
++				}
++				remaining := uint64(0)
++				switch f.kind {
++				case 36:
++					b.reservation, b.observation = u64(data, 8), u64(data, 32)
++					remaining = u64(data, 48)
++					if u64(data, 16) != b.context.source.query || u64(data, 24) != 0 || u64(data, 40) != b.context.source.epoch || u16(data, 56) != 0 || u16(data, 58) != 1 || data[60] != 3 || c.hostsReservationUsedExcept(b.reservation, b) {
++						return bad()
++					}
++					for _, other := range c.hostsObservations[:c.hostsObservationUsed] {
++						if other.observation == b.observation || other.bootstrap != nil && other.bootstrap != b && other.bootstrap.observation == b.observation {
++							return bad()
++						}
++					}
++					for _, other := range c.dnsResults[:c.dnsResultUsed] {
++						if other.waiter != nil && other.waiter.reservation == b.reservation {
++							return bad()
++						}
++					}
++					for _, other := range c.dnsDirect[:c.dnsDirectUsed] {
++						if other.exchangeReservation == b.reservation || other.physicalReservation == b.reservation {
++							return bad()
++						}
++					}
++				case 54:
++					b.receipt = u64(data, 8)
++					remaining = u64(data, 48)
++					if u64(data, 16) != h.data.id || u64(data, 24) != b.reservation || u64(data, 32) != b.context.source.query || u64(data, 40) != b.context.source.epoch || int(u16(data, 56)) != h.selection.count || data[58] != 2 || data[59] != 3 {
++						return bad()
++					}
++					for _, other := range c.dnsResults[:c.dnsResultUsed] {
++						if other.waiter != nil && other.waiter.id == b.receipt {
++							return bad()
++						}
++					}
++					for _, other := range c.hostsObservations[:c.hostsObservationUsed] {
++						if other.bootstrap != nil && other.bootstrap != b && other.bootstrap.receipt == b.receipt {
++							return bad()
++						}
++					}
++				case 19:
++					p := b.permission
++					p.id = u64(data, 4)
++					if data[1] != 3 || data[2] != 0 || data[3] != 0 || !profileDNSV2ID(p.id) || f.object != p.id || u64(data, 12) != 0 || u32(data, 20) < 1 || u32(data, 20) > 1000 || u64(data, 24) != c.manifest.policy || !zero(data[32:]) || p.id <= c.highestGrant {
++						return bad()
++					}
++					c.highestGrant = p.id
++					remaining = uint64(u32(data, 20)) * uint64(time.Millisecond)
++				}
++				if remaining == 0 || remaining > uint64(op.deadline.Sub(op.sent)) {
++					return bad()
++				}
++				until := op.sent.Add(time.Duration(remaining))
++				if f.kind == 36 {
++					b.reservationDeadline = until
++				}
++				if f.kind == 54 {
++					b.receiptDeadline = until
++				}
++				if f.kind == 19 {
++					b.permission.deadline = until
++				}
++				if !c.bootstrapBaseLive(h) || !c.clock().Before(op.deadline) || !c.clock().Before(until) {
++					c.hostsObservationClose(h)
++					c.dnsNotify(op, errProfile)
++					return true, nil
++				}
++				c.dnsNotify(op, nil)
++				return true, nil
++			}
++			if f.kind == 48 && r.cancelSequence != 0 && f.reply == r.cancelSequence {
++				if r.cancelAck || f.object != 0 || !profileDNSV2Body(48, f.body) || !c.clock().Before(h.cleanupDeadline) {
++					h.unknown = true
++					return true, errProfile
++				}
++				if f.body[2] != 1 {
++					h.unknown = true
++					return true, nil
++				}
++				if u64(f.body, 8) != op.sequence {
++					h.unknown = true
++					return true, errProfile
++				}
++				r.cancelAck = true
++				return true, nil
++			}
++		}
++		if f.kind == 34 && b.grantClose != 0 && f.reply == b.grantClose {
++			if b.grantAck != 0 || !profileCloseACK(f, 3, b.permission.id) || !c.clock().Before(h.cleanupDeadline) {
++				h.unknown = true
++				return true, errProfile
++			}
++			if f.body[1] != 1 {
++				h.unknown = true
++				return true, nil
++			}
++			b.grantAck = 1
++			return true, nil
++		}
++		if f.kind == 48 && f.reply != 0 && (f.reply == b.waiterClose || f.reply == b.reserveClose) {
++			if f.object != 0 || !profileDNSV2Body(48, f.body) || !c.clock().Before(h.cleanupDeadline) {
++				h.unknown = true
++				return true, errProfile
++			}
++			if f.body[2] != 1 {
++				h.unknown = true
++				return true, nil
++			}
++			id := b.receipt
++			ack := &b.waiterAck
++			if f.reply == b.reserveClose {
++				id = b.reservation
++				ack = &b.reserveAck
++			}
++			if *ack != 0 || u64(f.body, 8) != id {
++				h.unknown = true
++				return true, errProfile
++			}
++			*ack = 1
++			return true, nil
++		}
++	}
++	return false, nil
++}
++func (c *profileFlowControl) bootstrapCleanup(h *profileHostsObservation) (bool, error) {
++	b := h.bootstrap
++	if b.opening {
++		return false, nil
++	}
++	if b.conn != nil {
++		b.conn.requestClose()
++		select {
++		case <-b.conn.done:
++			if b.conn.result != nil {
++				h.unknown = true
++				return false, nil
++			}
++		default:
++			return false, nil
++		}
++	}
++	for _, r := range b.requests[:b.used] {
++		op := r.op
++		if !op.submitted {
++			c.dnsNotify(op, errProfile)
++			continue
++		}
++		if !r.replied {
++			c.dnsNotify(op, errProfile)
++			if r.cancelSequence == 0 {
++				seq, err := c.dnsCancel(1, op.sequence)
++				r.cancelSequence = seq
++				if err != nil {
++					h.unknown = true
++					return false, err
++				}
++			}
++			if !r.cancelAck || c.clock().Before(op.deadline) {
++				return false, nil
++			}
++			r.replied = true
++		}
++		if r.cancelSequence != 0 && !r.cancelAck {
++			return false, nil
++		}
++	}
++	if b.permission.id != 0 && b.grantAck == 0 {
++		if b.grantClose == 0 {
++			body := make([]byte, 12)
++			body[0] = 3
++			be.PutUint64(body[4:], b.permission.id)
++			seq, err := c.write(32, 0, body)
++			b.grantClose = seq
++			if seq > c.lastSent {
++				c.lastSent = seq
++			}
++			if err != nil || !profileDNSV2ID(seq) {
++				h.unknown = true
++				return false, errProfile
++			}
++		}
++		return false, nil
++	}
++	if b.receipt != 0 && b.waiterAck == 0 {
++		if b.waiterClose == 0 {
++			seq, err := c.dnsCancel(6, b.receipt)
++			b.waiterClose = seq
++			if err != nil {
++				h.unknown = true
++				return false, err
++			}
++		}
++		return false, nil
++	}
++	if b.reservation != 0 && b.reserveAck == 0 {
++		if b.reserveClose == 0 {
++			seq, err := c.dnsCancel(7, b.reservation)
++			b.reserveClose = seq
++			if err != nil {
++				h.unknown = true
++				return false, err
++			}
++		}
++		return false, nil
++	}
++	if b.context != nil {
++		if !b.contextReleased {
++			b.context.hostReferences--
++			c.dnsContext4Close(b.context)
++			b.contextReleased = true
++		}
++		if b.context.unknown {
++			h.unknown = true
++			return false, nil
++		}
++		if !b.context.released {
++			return false, nil
++		}
++	}
++	return true, nil
 +}
 +
 +// Intent — DATA, не permission. Только actual physical leaf, не remote proxy target.
@@ -30896,7 +31748,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux_test.go b/common/yoni
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux_test.go
-@@ -0,0 +1,769 @@
+@@ -0,0 +1,1247 @@
 +//go:build linux
 +
 +package nativehooks
@@ -30905,9 +31757,11 @@ new file mode 100644
 +	"bytes"
 +	"context"
 +	"crypto/sha256"
++	"errors"
 +	xnet "github.com/xtls/xray-core/common/net"
 +	"net"
 +	"strconv"
++	"sync"
 +	"testing"
 +	"time"
 +)
@@ -31051,6 +31905,482 @@ new file mode 100644
 +	be.PutUint64(b[32:], u64(op.body[144:], 96))
 +	be.PutUint16(b[40:], u16(op.body[144:], 108))
 +	return profilePacket{kind: 41, reply: op.sequence, body: b}
++}
++
++func TestProfileHostsRawCallerNeedsOwnWaiterBeforePhysicalPermission(t *testing.T) {
++	f, ctx := hostsCallerFixture(t)
++	ctx = ProfileBootstrapRawContext(ctx, true)
++	op, done := hostsCallerPublish(t, f, ctx)
++	if f.c.dispatch(op) != nil || f.c.accept(hostsPublishReply(op, 903)) != nil {
++		t.Fatal("Published")
++	}
++	select {
++	case err := <-done:
++		t.Fatal("raw caller returned before own waiter context", err)
++	case waiter := <-f.p.flowQueue:
++		if waiter.kind != 55 || u64(waiter.body, 16) == u64(op.body, 12) || u64(waiter.body, 8) != 0 {
++			t.Fatal("waiter context/query alias")
++		}
++		if f.c.dispatch(waiter) != nil {
++			t.Fatal("waiter dispatch")
++		}
++		reply := make([]byte, 64)
++		be.PutUint16(reply, 2)
++		reply[2] = 2
++		if f.c.accept(profilePacket{kind: 56, reply: waiter.sequence, body: reply}) != nil {
++			t.Fatal("closed fake issuer")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("missing actual waiter caller")
++	}
++	if err := <-done; err == nil {
++		t.Fatal("denial became permission")
++	}
++}
++
++func hostsRawNumeric(t *testing.T, f *flowFixture, ctx context.Context) (*profileOperation, <-chan error, context.Context) {
++	t.Helper()
++	ctx = ProfileBootstrapRawContext(ctx, true)
++	publish, done := hostsCallerPublish(t, f, ctx)
++	if f.c.dispatch(publish) != nil || f.c.accept(hostsPublishReply(publish, 903)) != nil {
++		t.Fatal("Published")
++	}
++	next := func(kind uint16) *profileOperation {
++		t.Helper()
++		select {
++		case op := <-f.p.flowQueue:
++			if op.kind != kind {
++				t.Fatal("phase", op.kind, kind)
++			}
++			return op
++		case err := <-done:
++			t.Fatal("early caller", err)
++		case <-time.After(time.Second):
++			t.Fatal("phase blocked", kind)
++		}
++		return nil
++	}
++	op := next(55)
++	if u64(op.body, 16) == u64(publish.body, 12) || f.c.dispatch(op) != nil || f.c.accept(dnsBundleReply(op, 904, 1)) != nil {
++		t.Fatal("own waiter context")
++	}
++	op = next(35)
++	if f.c.dispatch(op) != nil {
++		t.Fatal("waiter reserve")
++	}
++	reply := hostsReserveReply(op)
++	be.PutUint64(reply.body[8:], 905)
++	be.PutUint64(reply.body[32:], 906)
++	if f.c.accept(reply) != nil {
++		t.Fatal("own observation")
++	}
++	op = next(53)
++	if u64(op.body, 8) != 905 || u64(op.body, 16) != 903 || u64(op.body, 24) != 0 || u64(op.body, 40) != 0 || u64(op.body, 48) != 0 || f.c.dispatch(op) != nil {
++		t.Fatal("WaiterBind source/class")
++	}
++	body := make([]byte, 64)
++	be.PutUint16(body, 2)
++	body[2] = 1
++	be.PutUint64(body[8:], 907)
++	be.PutUint64(body[16:], 903)
++	be.PutUint64(body[24:], 905)
++	be.PutUint64(body[32:], u64(op.body, 32))
++	be.PutUint64(body[40:], f.p.admission.launch.epoch)
++	be.PutUint64(body[48:], u64(op.body, 56))
++	be.PutUint16(body[56:], 2)
++	body[58], body[59] = 2, 3
++	if f.c.accept(profilePacket{kind: 54, reply: op.sequence, body: body}) != nil {
++		t.Fatal("WaiterBound")
++	}
++	op = next(42)
++	if u64(op.body, 4) != 907 || u16(op.body, 2) != 1 || op.body[14] != 2 || op.body[15] != 3 || u16(op.body, 12) != 8 || u16(op.body, 16) != 2 || u16(op.body, 22) != 65535 {
++		t.Fatal("Numeric typed namespace")
++	}
++	return op, done, ctx
++}
++func hostsBootstrapGrant(op *profileOperation) profilePacket {
++	b := make([]byte, 56)
++	b[0], b[1] = 1, 3
++	be.PutUint64(b[4:], 1000)
++	lease := uint32(op.deadline.Sub(op.sent) / time.Millisecond)
++	be.PutUint32(b[20:], lease)
++	be.PutUint64(b[24:], op.bootstrap.owner.runtime.flow.manifest.policy)
++	return profilePacket{kind: 19, reply: op.sequence, object: 1000, body: b}
++}
++
++type hostsBlockedConn struct {
++	flowFakeConn
++	entered, resume, closed chan struct{}
++	once                    sync.Once
++	failure                 error
++	blockWrite              bool
++}
++
++func (b *hostsBlockedConn) Read(p []byte) (int, error) {
++	close(b.entered)
++	<-b.resume
++	p[0] = 42
++	return 1, nil
++}
++func (b *hostsBlockedConn) Close() error {
++	b.once.Do(func() { close(b.closed) })
++	return b.failure
++}
++func (b *hostsBlockedConn) Write(p []byte) (int, error) {
++	if b.blockWrite {
++		close(b.entered)
++		<-b.resume
++	}
++	return len(p), nil
++}
++func hostsReadyPermission(t *testing.T) (*flowFixture, context.Context, *profileHostsObservation) {
++	t.Helper()
++	f, ctx := hostsCallerFixture(t)
++	op, done, ctx := hostsRawNumeric(t, f, ctx)
++	if f.c.dispatch(op) != nil || f.c.accept(hostsBootstrapGrant(op)) != nil {
++		t.Fatal("Numeric")
++	}
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++	return f, ctx, op.bootstrap.owner
++}
++func TestProfileHostsBootstrapActualCloseWaitsIOBeforeRetirement(t *testing.T) {
++	f, ctx, h := hostsReadyPermission(t)
++	b := &hostsBlockedConn{entered: make(chan struct{}), resume: make(chan struct{}), closed: make(chan struct{})}
++	conn, err := ProfileDialBootstrap(ctx, profileNumericDestination(h.frontier.target), func(context.Context, xnet.Destination) (net.Conn, error) { return b, nil })
++	if err != nil {
++		t.Fatal(err)
++	}
++	read := make(chan error, 1)
++	go func() {
++		p := make([]byte, 1)
++		n, e := conn.Read(p)
++		if n != 0 || p[0] != 0 {
++			read <- errors.New("cancelled payload published")
++			return
++		}
++		read <- e
++	}()
++	<-b.entered
++	if _, err = conn.Read(make([]byte, 1)); err == nil {
++		t.Fatal("second read exceeded owned task credit")
++	}
++	f.c.hostsObservationClose(h)
++	if f.c.dnsTick() != nil {
++		t.Fatal("close tick")
++	}
++	<-b.closed
++	if f.c.dnsTick() != nil || h.bootstrap.grantClose != 0 || h.released {
++		t.Fatal("retirement before I/O join")
++	}
++	select {
++	case <-h.bootstrap.conn.done:
++		t.Fatal("Close skipped read join")
++	default:
++	}
++	close(b.resume)
++	if err = <-read; err == nil {
++		t.Fatal("cancelled read allowed")
++	}
++	<-h.bootstrap.conn.done
++	if f.c.dnsTick() != nil || h.bootstrap.grantClose == 0 || h.bootstrap.waiterClose != 0 {
++		t.Fatal("grant barrier")
++	}
++	ack := make([]byte, 12)
++	ack[0], ack[1] = 3, 1
++	be.PutUint64(ack[4:], 1000)
++	if f.c.accept(profilePacket{kind: 34, reply: h.bootstrap.grantClose, body: ack}) != nil {
++		t.Fatal("grant ACK")
++	}
++	ackDNS := func(seq, id uint64) {
++		t.Helper()
++		body := make([]byte, 32)
++		be.PutUint16(body, 2)
++		body[2] = 1
++		be.PutUint64(body[8:], id)
++		be.PutUint64(body[16:], f.c.lastSent)
++		if seq == 0 || f.c.accept(profilePacket{kind: 48, reply: seq, body: body}) != nil {
++			t.Fatal("DNS retirement ACK", id)
++		}
++	}
++	if f.c.dnsTick() != nil {
++		t.Fatal("waiter close")
++	}
++	ackDNS(h.bootstrap.waiterClose, 907)
++	if f.c.dnsTick() != nil {
++		t.Fatal("reserve close")
++	}
++	ackDNS(h.bootstrap.reserveClose, 905)
++	if f.c.dnsTick() != nil {
++		t.Fatal("context close")
++	}
++	ackDNS(h.bootstrap.context.closeSequence, 904)
++	if f.c.dnsTick() != nil || f.c.dnsTick() != nil {
++		t.Fatal("producer close")
++	}
++	ackDNS(h.producerCloseSequence, 903)
++	if f.c.dnsTick() != nil {
++		t.Fatal("publisher reserve close")
++	}
++	ackDNS(h.closeSequence, 901)
++	if f.c.dnsTick() != nil {
++		t.Fatal("publisher context close")
++	}
++	ackDNS(h.context.closeSequence, 900)
++	if f.c.dnsTick() != nil || !h.released || !h.context.released || !h.bootstrap.context.released || f.c.operations != 0 {
++		t.Fatal("custody not retired")
++	}
++	if err = conn.Close(); err != nil {
++		t.Fatal("repeated Close", err)
++	}
++}
++func TestProfileHostsBootstrapFailedPhysicalCloseRetainsUnknown(t *testing.T) {
++	f, ctx, h := hostsReadyPermission(t)
++	failure := errors.New("unconfirmed close")
++	b := &hostsBlockedConn{closed: make(chan struct{}), failure: failure}
++	conn, err := ProfileDialBootstrap(ctx, profileNumericDestination(h.frontier.target), func(context.Context, xnet.Destination) (net.Conn, error) { return b, nil })
++	if err != nil {
++		t.Fatal(err)
++	}
++	if conn.Close() != failure || conn.Close() != failure {
++		t.Fatal("Close result changed")
++	}
++	f.c.hostsObservationClose(h)
++	if f.c.dnsTick() != nil || !h.unknown || h.released || h.bootstrap.grantClose != 0 || h.bootstrap.waiterClose != 0 {
++		t.Fatal("failed cleanup released authority")
++	}
++	if f.c.physicalFDs == 0 {
++		t.Fatal("Unknown lost FD custody")
++	}
++}
++
++func TestProfileHostsBootstrapWriteJoinAndNoRetryAfterCancel(t *testing.T) {
++	f, ctx, h := hostsReadyPermission(t)
++	b := &hostsBlockedConn{entered: make(chan struct{}), resume: make(chan struct{}), closed: make(chan struct{}), blockWrite: true}
++	conn, err := ProfileDialBootstrap(ctx, profileNumericDestination(h.frontier.target), func(context.Context, xnet.Destination) (net.Conn, error) { return b, nil })
++	if err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	go func() {
++		n, e := conn.Write([]byte{42})
++		if n != 1 {
++			done <- errors.New("write result lost")
++			return
++		}
++		done <- e
++	}()
++	<-b.entered
++	f.c.hostsObservationClose(h)
++	if f.c.dnsTick() != nil {
++		t.Fatal("close")
++	}
++	<-b.closed
++	if f.c.dnsTick() != nil || h.bootstrap.grantClose != 0 {
++		t.Fatal("retire skipped write join")
++	}
++	close(b.resume)
++	if err = <-done; err == nil {
++		t.Fatal("cancelled write allowed")
++	}
++	<-h.bootstrap.conn.done
++	if n, e := conn.Write([]byte{42}); n != 0 || e == nil {
++		t.Fatal("retry after uncertain send")
++	}
++	if f.c.dnsTick() != nil || h.bootstrap.grantClose == 0 {
++		t.Fatal("write join not retired")
++	}
++}
++func TestProfileHostsBootstrapCancelledFactoryCannotPublishLateConnection(t *testing.T) {
++	f, ctx, h := hostsReadyPermission(t)
++	ctx, cancel := context.WithCancel(ctx)
++	entered, resume := make(chan struct{}), make(chan struct{})
++	b := &hostsBlockedConn{closed: make(chan struct{})}
++	result := make(chan error, 1)
++	go func() {
++		conn, e := ProfileDialBootstrap(ctx, profileNumericDestination(h.frontier.target), func(context.Context, xnet.Destination) (net.Conn, error) { close(entered); <-resume; return b, nil })
++		if conn != nil {
++			result <- errors.New("late connection published")
++			return
++		}
++		result <- e
++	}()
++	<-entered
++	cancel()
++	f.c.hostsObservationClose(h)
++	if f.c.dnsTick() != nil || h.bootstrap.grantClose != 0 {
++		t.Fatal("factory custody lost")
++	}
++	close(resume)
++	if err := <-result; err == nil {
++		t.Fatal("cancelled factory allowed")
++	}
++	<-b.closed
++	if f.p.ctx.Err() != nil {
++		t.Fatal("local cancellation revoked neighbor session")
++	}
++	if f.c.dnsTick() != nil || h.bootstrap.grantClose == 0 {
++		t.Fatal("late factory cleanup did not settle")
++	}
++}
++func TestProfileHostsBootstrapActualNumericAndBothPhysicalAuthorities(t *testing.T) {
++	for _, mode := range []byte{1, 2} {
++		t.Run(strconv.Itoa(int(mode)), func(t *testing.T) {
++			f, ctx := hostsCallerFixture(t, mode)
++			op, done, ctx := hostsRawNumeric(t, f, ctx)
++			calls := 0
++			target := profileNumericDestination(op.bootstrap.owner.frontier.target)
++			if _, err := ProfileDialBootstrap(ctx, target, func(context.Context, xnet.Destination) (net.Conn, error) { calls++; return &flowFakeConn{}, nil }); err == nil || calls != 0 {
++				t.Fatal("open before Numeric GRANT")
++			}
++			if f.c.dispatch(op) != nil || f.c.accept(hostsBootstrapGrant(op)) != nil {
++				t.Fatal("Numeric GRANT")
++			}
++			if err := <-done; err != nil {
++				t.Fatal(err)
++			}
++			h := op.bootstrap.owner
++			p := h.bootstrap.permission
++			if p.id != 1000 || p.target.address != "203.0.113.7" || p.target.port != 8443 || p.target.network != 6 || p.member != 1 || h.root.class == 3 {
++				t.Fatal("permission promoted/incorrect target")
++			}
++			conn, err := ProfileDialBootstrap(ctx, target, func(callback context.Context, numeric xnet.Destination) (net.Conn, error) {
++				calls++
++				if numeric.Address.String() != "203.0.113.7" || numeric.Port != 8443 || target.Address.String() != "Physical.INVALID" || ProfilePhysicalGate(callback) != nil {
++					t.Fatal("physical conjunction/hostname")
++				}
++				return &flowFakeConn{}, nil
++			})
++			if err != nil || calls != 1 || conn == nil {
++				t.Fatal("guarded physical open", err)
++			}
++			if _, err = ProfileDialBootstrap(ctx, target, func(context.Context, xnet.Destination) (net.Conn, error) { calls++; return &flowFakeConn{}, nil }); err == nil || calls != 1 {
++				t.Fatal("permission reused")
++			}
++			if err = conn.Close(); err != nil {
++				t.Fatal(err)
++			}
++		})
++	}
++}
++
++func TestProfileHostsBootstrapGrantAndOriginalParentCannotBeSubstituted(t *testing.T) {
++	for _, fault := range []string{"class", "required", "flow", "owner", "revision", "object", "expired", "cancel", "namespace", "member", "target", "port", "carrier", "parent", "receipt", "source", "raw"} {
++		t.Run(fault, func(t *testing.T) {
++			f, ctx := hostsCallerFixture(t, 2)
++			op, done, ctx := hostsRawNumeric(t, f, ctx)
++			if f.c.dispatch(op) != nil {
++				t.Fatal("dispatch")
++			}
++			reply := hostsBootstrapGrant(op)
++			h := op.bootstrap.owner
++			switch fault {
++			case "class":
++				reply.body[1] = 1
++			case "required":
++				reply.body[2] = 1
++			case "flow":
++				be.PutUint64(reply.body[12:], h.root.receipt.id)
++			case "owner":
++				be.PutUint64(reply.body[32:], 1)
++			case "revision":
++				be.PutUint64(reply.body[24:], 99)
++			case "object":
++				reply.object++
++			case "expired":
++				f.now = op.deadline
++			case "cancel":
++				h.cancel()
++				if f.c.dnsTick() != nil {
++					t.Fatal("cancel")
++				}
++			case "namespace":
++				be.PutUint64(reply.body[4:], h.root.id)
++				reply.object = h.root.id
++			}
++			_ = f.c.accept(reply)
++			err := <-done
++			if fault == "class" || fault == "required" || fault == "flow" || fault == "owner" || fault == "revision" || fault == "object" || fault == "expired" || fault == "cancel" || fault == "namespace" {
++				if err == nil {
++					t.Fatal("invalid service permission accepted")
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			p := h.bootstrap.permission
++			target := profileNumericDestination(h.frontier.target)
++			switch fault {
++			case "member":
++				p.member = 0
++			case "target":
++				p.target.address = "203.0.113.8"
++			case "port":
++				target.Port++
++			case "carrier":
++				target.Network = xnet.Network_UDP
++			case "parent":
++				f.grantID = 1000
++				g := f.granted(t, f.admittedReceipt(t, "neighbor.invalid"))
++				ctx = context.WithValue(ctx, profileGrantKey{}, g)
++			case "receipt":
++				ctx = context.WithValue(ctx, profileReceiptKey{}, f.admittedReceipt(t, "neighbor.invalid"))
++			case "source":
++				f.c.manifest.rows[10][0][32] ^= 1
++			case "raw":
++				ctx = ProfileBootstrapRawContext(ctx, false)
++			}
++			calls := 0
++			if _, err = ProfileDialBootstrap(ctx, target, func(context.Context, xnet.Destination) (net.Conn, error) { calls++; return &flowFakeConn{}, nil }); err == nil || calls != 0 {
++				t.Fatal("one token replaced both authorities")
++			}
++		})
++	}
++}
++func TestProfileHostsBootstrapNumericRequestIsExactAndSingleAttempt(t *testing.T) {
++	for _, offset := range []int{2, 4, 14, 15, 18, 20, 22, 24, 31} {
++		t.Run(strconv.Itoa(offset), func(t *testing.T) {
++			f, ctx := hostsCallerFixture(t)
++			op, done, _ := hostsRawNumeric(t, f, ctx)
++			op.body[offset] ^= 1
++			before := len(f.writes)
++			if f.c.dispatch(op) != nil {
++				t.Fatal("local rejection")
++			}
++			if err := <-done; err == nil || len(f.writes) != before || op.submitted {
++				t.Fatal("changed Numeric42 had effects")
++			}
++		})
++	}
++}
++
++func TestProfileHostsBootstrapCancelACKCannotAdmitLateNumeric(t *testing.T) {
++	f, ctx := hostsCallerFixture(t)
++	op, done, _ := hostsRawNumeric(t, f, ctx)
++	if f.c.dispatch(op) != nil {
++		t.Fatal("dispatch")
++	}
++	h := op.bootstrap.owner
++	f.c.hostsObservationClose(h)
++	if f.c.dnsTick() != nil || op.bootstrap.cancelSequence == 0 {
++		t.Fatal("pending cancel")
++	}
++	ack := make([]byte, 32)
++	be.PutUint16(ack, 2)
++	ack[2] = 1
++	be.PutUint64(ack[8:], op.sequence)
++	be.PutUint64(ack[16:], f.c.lastSent)
++	if f.c.accept(profilePacket{kind: 48, reply: op.bootstrap.cancelSequence, body: ack}) != nil {
++		t.Fatal("KnownClosed ACK")
++	}
++	if err := <-done; err == nil {
++		t.Fatal("cancelled caller allowed")
++	}
++	if f.c.accept(hostsBootstrapGrant(op)) == nil || !h.unknown || h.released || h.bootstrap.permission.id != 0 {
++		t.Fatal("late grant resurrected closed request")
++	}
 +}
 +func hostsFinishPublish(t *testing.T, f *flowFixture, id uint64, deny bool) *profileOperation {
 +	t.Helper()
@@ -39287,7 +40617,7 @@ diff --git a/common/yonikbroker/profile_dns_rrset_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_rrset_linux.go
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,942 @@
 +//go:build linux
 +
 +package nativehooks
@@ -39713,6 +41043,13 @@ new file mode 100644
 +				}
 +				if f.kind == 41 && other.data != nil && other.data.id == o.data.id || f.kind == 36 && other.waiter != nil && other.waiter.reservation == o.waiter.reservation || f.kind == 54 && other.waiter != nil && other.waiter.id == o.waiter.id {
 +					valid = false
++				}
++			}
++			if f.kind == 54 {
++				for _, h := range c.hostsObservations[:c.hostsObservationUsed] {
++					if h.bootstrap != nil && h.bootstrap.receipt == o.waiter.id {
++						valid = false
++					}
 +				}
 +			}
 +			if !valid {
