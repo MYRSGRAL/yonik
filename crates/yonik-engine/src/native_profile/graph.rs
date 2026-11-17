@@ -74,13 +74,35 @@ impl PhysicalFirstHopBootstrap {
         &self.endpoint
     }
 }
+/// Источник DNS внутри конфигурации Xray. Совпадение имени с outbound
+/// не связывает эти пространства и не выбирает маршрут.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DnsIngressIdentity {
+    Untagged,
+    Tagged(String),
+}
+impl DnsIngressIdentity {
+    pub(super) fn from_tag(tag: Option<&str>) -> Self {
+        tag.map_or(Self::Untagged, |tag| Self::Tagged(tag.to_owned()))
+    }
+    pub fn tag(&self) -> Option<&str> {
+        match self {
+            Self::Untagged => None,
+            Self::Tagged(tag) => Some(tag),
+        }
+    }
+}
 /// Native localhost использует OS resolver вне provider dispatcher.
 pub struct SystemResolverRequirement {
-    pub(super) subject: Option<String>,
+    pub(super) dns_ingress: DnsIngressIdentity,
 }
 impl SystemResolverRequirement {
+    pub fn dns_ingress(&self) -> &DnsIngressIdentity {
+        &self.dns_ingress
+    }
+    /// Совместимый accessor для тега DNS ingress.
     pub fn subject(&self) -> Option<&str> {
-        self.subject.as_deref()
+        self.dns_ingress.tag()
     }
 }
 /// Trusted host удерживает exact resolver/NSS snapshot и проверенные UDP/TCP routes.
@@ -103,14 +125,18 @@ impl SystemResolverBinding {
 /// Требование resolver, а не разрешение прямого обхода provider DNS routing.
 pub struct ResolverRequirement {
     pub(super) endpoint: PhysicalEndpoint,
-    pub(super) subject: Option<String>,
+    pub(super) dns_ingress: DnsIngressIdentity,
 }
 impl ResolverRequirement {
     pub fn endpoint(&self) -> &PhysicalEndpoint {
         &self.endpoint
     }
+    pub fn dns_ingress(&self) -> &DnsIngressIdentity {
+        &self.dns_ingress
+    }
+    /// Совместимый accessor для тега DNS ingress.
     pub fn subject(&self) -> Option<&str> {
-        self.subject.as_deref()
+        self.dns_ingress.tag()
     }
 }
 impl EgressPlan {
