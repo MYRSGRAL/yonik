@@ -18506,9 +18506,9 @@ new file mode 100644
 +// ProfileRuntime не содержит FlowGrant. Constructor доступен только через
 +// потребление sealed record и authenticated channel. Владение FD однократное.
 +type ProfileRuntime struct {
-+	// Отдельный reviewed CODEC4 capture contract пока отсутствует. Setup DATA
-+	// и прежний Direct3 record не включают service/Hosts producer.
-+	dns4CaptureReviewed         bool
++	// Negotiated DATA-ready не разрешает capture effects. Source capability
++	// принадлежит конкретному ACK56 context, а не runtime/session.
++	dns4Metadata                *profileDNSMetadata4
 +	dnsV2                       bool
 +	dnsDirectIO                 *profileDNSDirectIO
 +	udpActor                    *profileUDPActor
@@ -30384,7 +30384,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux.go b/common/yonikbrok
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux.go
-@@ -0,0 +1,2426 @@
+@@ -0,0 +1,2440 @@
 +//go:build linux
 +
 +package nativehooks
@@ -30428,6 +30428,7 @@ new file mode 100644
 +	key     string
 +}
 +type profileHostsObservation struct {
++	sourceCapability                                        *profileDNSSourceCapability
 +	bootstrap                                               *profileBootstrapState
 +	raw                                                     bool
 +	pendingCredit                                           int
@@ -30527,7 +30528,7 @@ new file mode 100644
 +	return selected, ErrProfileUnsupported
 +}
 +func (c *profileFlowControl) hostsSnapshotLive(p *ProfileRuntime, s *profileSnapshot) bool {
-+	if p == nil || !p.dns4CaptureReviewed || !p.dnsV2 || c.manifest.mapping != 4 || s == nil || s != p.snapshot || len(c.manifest.rows[10]) != 1 || len(s.encoded) < 170 {
++	if !p.dns4MetadataReady() || c.manifest.mapping != 4 || s == nil || s != p.snapshot || len(c.manifest.rows[10]) != 1 || len(s.encoded) < 170 {
 +		return false
 +	}
 +	r := c.manifest.rows[10][0]
@@ -30536,6 +30537,13 @@ new file mode 100644
 +	}
 +	hash := sha256.Sum256(s.encoded)
 +	return bytes.Equal(hash[:], r[32:64])
++}
++
++// DATA-only shape check перед Probe/55; actual authority остаётся в USER parent
++// и последующем Source ACK56. Raw hint сам не разрешает никакого эффекта.
++func (c *profileFlowControl) dnsSourceFrontierReady(parent *profileGrant, f profileDNSFrontier) bool {
++	actual, _, err := c.hostsParentFrontier(parent)
++	return err == nil && actual == f && f.count == 1 && f.branch == 0 && f.carrier == 6 && parent.receipt.original.network == 6 && c.manifest.rows[8][parent.scope][2] == 6 && int(parent.stream) < len(c.manifest.rows[3]) && c.manifest.rows[3][parent.stream][0] == 1
 +}
 +func (c *profileFlowControl) hostsParentFrontier(root *profileGrant) (profileDNSFrontier, time.Time, error) {
 +	var empty profileDNSFrontier
@@ -30594,7 +30602,7 @@ new file mode 100644
 +// может получить private permission; USER parent и original hostname неизменны.
 +func profilePrepareHostsObservation(ctx context.Context, root *profileGrant) error {
 +	p := profileRuntime(ctx)
-+	if p == nil || !p.dns4CaptureReviewed {
++	if !p.dns4MetadataReady() {
 +		return ErrProfileUnsupported
 +	}
 +	c := p.flow
@@ -30607,7 +30615,7 @@ new file mode 100644
 +		root = root.parent
 +	}
 +	frontier, deadline, err := c.hostsParentFrontier(root)
-+	if err != nil || !c.hostsSnapshotLive(p, p.snapshot) || ctx.Err() != nil || profileReceiptFrom(ctx) != root.receipt || c.nextDNSQuery >= ^uint64(0)-1 {
++	if err != nil || !c.dnsSourceFrontierReady(root, frontier) || !c.hostsSnapshotLive(p, p.snapshot) || ctx.Err() != nil || profileReceiptFrom(ctx) != root.receipt || c.nextDNSQuery >= ^uint64(0)-1 {
 +		c.mu.Unlock()
 +		return ErrProfileUnsupported
 +	}
@@ -30677,6 +30685,7 @@ new file mode 100644
 +		return errProfile
 +	}
 +	h.context = x
++	h.sourceCapability = x.capability
 +	x.hostReferences++
 +	if until := x.deadline.Add(time.Second); until.Before(h.cleanupDeadline) {
 +		h.cleanupDeadline = until
@@ -30903,7 +30912,7 @@ new file mode 100644
 +	return false, nil
 +}
 +func (c *profileFlowControl) hostsObservationSourceLive(h *profileHostsObservation) bool {
-+	if h == nil || h.closed || h.unknown || h.ctx.Err() != nil || !c.clock().Before(h.deadline) || !c.hostsSnapshotLive(h.runtime, h.snapshot) {
++	if h == nil || h.closed || h.unknown || h.ctx.Err() != nil || !c.clock().Before(h.deadline) || !c.hostsSnapshotLive(h.runtime, h.snapshot) || h.context != nil && !c.dnsSourceCapabilityLive(h.context, h.sourceCapability) {
 +		return false
 +	}
 +	f, _, err := c.hostsParentFrontier(h.root)
@@ -31273,6 +31282,7 @@ new file mode 100644
 +	cancelSequence     uint64
 +}
 +type profileBootstrapState struct {
++	sourceCapability                                                       *profileDNSSourceCapability
 +	opening                                                                bool
 +	context                                                                *profileDNSContext4
 +	requests                                                               [3]*profileBootstrapRPC
@@ -31290,7 +31300,7 @@ new file mode 100644
 +		return false
 +	}
 +	b := h.bootstrap
-+	if b == nil || b.context == nil || !c.dnsContext4Live(b.context) || b.context.identity.kind != profileDNSHostsRoot || b.context.source.query == h.context.source.query || b.context.source.frontier != h.frontier || b.context.source.snapshot != h.snapshot {
++	if b == nil || b.context == nil || !c.dnsSourceCapabilityLive(b.context, b.sourceCapability) || b.context.identity.kind != profileDNSHostsRoot || b.context.source.query == h.context.source.query || b.context.source.frontier != h.frontier || b.context.source.snapshot != h.snapshot {
 +		return false
 +	}
 +	if b.reservation != 0 && !c.clock().Before(b.reservationDeadline) {
@@ -31352,6 +31362,7 @@ new file mode 100644
 +		return errProfile
 +	}
 +	b.context = x
++	b.sourceCapability = x.capability
 +	x.hostReferences++
 +	if until := x.deadline.Add(time.Second); until.Before(h.cleanupDeadline) {
 +		h.cleanupDeadline = until
@@ -31837,7 +31848,7 @@ new file mode 100644
 +	if !profileNetworkRawEligible(n) || w.data != n.result.data || !c.dnsDataLive(w.data) || !c.dnsContext4Live(n.context) {
 +		return false
 +	}
-+	if b.context == nil || !c.dnsContext4Live(b.context) || b.context.identity.kind != profileDNSBootstrapRoot || b.context.source.service != w.service || w.service == n.service || w.service.id == n.service.id {
++	if b.context == nil || !c.dnsSourceCapabilityLive(b.context, b.sourceCapability) || b.context.identity.kind != profileDNSBootstrapRoot || b.context.source.service != w.service || w.service == n.service || w.service.id == n.service.id {
 +		return false
 +	}
 +	s := &b.context.source
@@ -31923,6 +31934,7 @@ new file mode 100644
 +		return errProfile
 +	}
 +	w.state.context = x
++	w.state.sourceCapability = x.capability
 +	x.hostReferences++
 +	if x.deadline.Before(w.deadline) {
 +		w.deadline = x.deadline
@@ -32230,6 +32242,7 @@ new file mode 100644
 +// Constructor custody, не socket permit. Даже successful Reserved36 этого cut
 +// не публикует Conn, request bytes, RRset или BootstrapPhysicalPermission.
 +type profileNetworkBootstrap struct {
++	sourceCapability                                                         *profileDNSSourceCapability
 +	waiter                                                                   *profileNetworkWaiter
 +	result                                                                   *profileDNSResultOwner
 +	transport                                                                *profileDNSDirect
@@ -32260,7 +32273,7 @@ new file mode 100644
 +	}
 +}
 +func (c *profileFlowControl) networkBootstrapLive(n *profileNetworkBootstrap) bool {
-+	if n == nil || n.closed || n.unknown || n.released || n.ctx.Err() != nil || !c.clock().Before(n.deadline) || !c.hostsSnapshotLive(n.runtime, n.snapshot) {
++	if n == nil || n.closed || n.unknown || n.released || n.ctx.Err() != nil || !c.clock().Before(n.deadline) || !c.hostsSnapshotLive(n.runtime, n.snapshot) || n.context != nil && !c.dnsSourceCapabilityLive(n.context, n.sourceCapability) {
 +		return false
 +	}
 +	f, _, err := c.hostsParentFrontier(n.parent)
@@ -32277,13 +32290,13 @@ new file mode 100644
 +}
 +func profilePrepareNetworkBootstrap(ctx context.Context, root *profileGrant) error {
 +	p := profileRuntime(ctx)
-+	if p == nil || !p.dns4CaptureReviewed {
++	if !p.dns4MetadataReady() {
 +		return ErrProfileUnsupported
 +	}
 +	c := p.flow
 +	c.mu.Lock()
 +	f, deadline, err := c.hostsParentFrontier(root)
-+	if err != nil || !c.hostsSnapshotLive(p, p.snapshot) || ctx.Err() != nil || profileReceiptFrom(ctx) != root.receipt || c.nextDNSQuery >= ^uint64(0)-1 {
++	if err != nil || !c.dnsSourceFrontierReady(root, f) || !c.hostsSnapshotLive(p, p.snapshot) || ctx.Err() != nil || profileReceiptFrom(ctx) != root.receipt || c.nextDNSQuery >= ^uint64(0)-1 {
 +		c.mu.Unlock()
 +		return ErrProfileUnsupported
 +	}
@@ -32385,6 +32398,7 @@ new file mode 100644
 +		return errProfile
 +	}
 +	n.context = x
++	n.sourceCapability = x.capability
 +	x.hostReferences++
 +	for _, until := range []time.Time{x.deadline, g.deadline} {
 +		if until.Before(n.deadline) {
@@ -32815,7 +32829,7 @@ diff --git a/common/yonikbroker/profile_dns_frontier_linux_test.go b/common/yoni
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_frontier_linux_test.go
-@@ -0,0 +1,1701 @@
+@@ -0,0 +1,1833 @@
 +//go:build linux
 +
 +package nativehooks
@@ -32863,6 +32877,173 @@ new file mode 100644
 +	f.c.manifest.rows[10] = [][]byte{row}
 +	ctx = context.WithValue(ctx, profileDNSCapture4Key{}, (*profileDNSCapture4)(nil))
 +	return f, ctx
++}
++
++func TestProfileSourceCapabilityActualCallerCanRequestWithoutReviewBool(t *testing.T) {
++	for _, network := range []bool{false, true} {
++		t.Run(strconv.FormatBool(network), func(t *testing.T) {
++			f, ctx := hostsCallerFixture(t)
++			if network {
++				f, ctx = networkBootstrapFixture(t, 1, false)
++			}
++			done := make(chan error, 1)
++			go func() { done <- ProfilePrepareChain(ctx, nil) }()
++			if network {
++				select {
++				case root := <-f.p.flowQueue:
++					if root.kind != 20 || f.c.dispatch(root) != nil || f.c.accept(serviceReply(f, root)) != nil {
++						t.Fatal("own service root")
++					}
++				case err := <-done:
++					t.Fatal("metadata planning blocked by review bool", err)
++				case <-time.After(time.Second):
++					t.Fatal("missing service root")
++				}
++			}
++			select {
++			case op := <-f.p.flowQueue:
++				if op.kind != 55 || f.c.dispatch(op) != nil {
++					t.Fatal("missing private Source request")
++				}
++				if f.c.dnsContext4Live(op.dnsContext4) || len(f.p.flowQueue) != 0 {
++					t.Fatal("effects before ACK56")
++				}
++				deny := make([]byte, 64)
++				be.PutUint16(deny, 2)
++				deny[2] = 2
++				if f.c.accept(profilePacket{kind: 56, reply: op.sequence, body: deny}) != nil || <-done == nil {
++					t.Fatal("Source Deny accepted")
++				}
++			case err := <-done:
++				t.Fatal("metadata planning blocked by review bool", err)
++			case <-time.After(time.Second):
++				t.Fatal("missing private Source request")
++			}
++		})
++	}
++}
++
++func TestProfileSourceCapabilityActualCallerMetadataIsNotAuthority(t *testing.T) {
++	for _, fault := range []string{"setup-bool-only", "foreign-setup", "launch-epoch", "snapshot-role", "snapshot-hash", "parent", "tls-stream"} {
++		t.Run(fault, func(t *testing.T) {
++			f, ctx := hostsCallerFixture(t)
++			switch fault {
++			case "setup-bool-only":
++				f.p.dnsV2 = true
++				f.p.dns4Metadata = nil
++			case "foreign-setup":
++				neighbor, _ := hostsCallerFixture(t)
++				f.p.dns4Metadata = neighbor.p.dns4Metadata
++			case "launch-epoch":
++				f.p.admission.launch.epoch++
++			case "snapshot-role":
++				be.PutUint32(f.c.manifest.rows[10][0][72:], 2)
++			case "snapshot-hash":
++				f.c.manifest.rows[10][0][32] ^= 1
++			case "parent":
++				f.c.closeGrant(ctx.Value(profileGrantKey{}).(*profileGrant))
++			case "tls-stream":
++				f.c.manifest.rows[3][0][0] = 2
++			}
++			before := len(f.writes)
++			if ProfilePrepareChain(ctx, nil) == nil || len(f.p.flowQueue) != 0 || len(f.writes) != before {
++				t.Fatal("invalid planning source caused effects")
++			}
++		})
++	}
++}
++
++func TestProfileSourceCapabilityActualReserveCannotBorrowRenewal(t *testing.T) {
++	f, ctx := hostsCallerFixture(t)
++	op, done := hostsCallerReserve(t, f, ctx)
++	h := f.c.hostsObservations[0]
++	x, cap := h.context, h.sourceCapability
++	if !f.c.dnsSourceCapabilityLive(x, cap) {
++		t.Fatal("Source not ACKed")
++	}
++	_, renew, err := f.c.dnsContext4Acquire(ctx, &x.source, x)
++	if err != nil || f.c.dnsSourceCapabilityLive(x, cap) || f.c.dispatch(renew) != nil || f.c.accept(dnsBundleReply(renew, 900, 2)) != nil || !f.c.dnsContext4Live(x) {
++		t.Fatal("exact context renewal", err)
++	}
++	before := len(f.writes)
++	if f.c.dispatch(op) != nil || <-done == nil || len(f.writes) != before || f.c.hostsObservationSourceLive(h) || h.observation != 0 {
++		t.Fatal("queued Reserve borrowed new Source token")
++	}
++}
++
++func TestProfileSourceCapabilityActualACKControlsReserve(t *testing.T) {
++	for _, network := range []bool{false, true} {
++		for _, fault := range []string{"allow", "wrong-root", "wrong-epoch", "wrong-path", "snapshot", "parent", "cancel", "late"} {
++			t.Run(strconv.FormatBool(network)+"/"+fault, func(t *testing.T) {
++				f, ctx := hostsCallerFixture(t)
++				if network {
++					f, ctx = networkBootstrapFixture(t, 1, false)
++				}
++				done := make(chan error, 1)
++				go func() { done <- ProfilePrepareChain(ctx, nil) }()
++				next := func() *profileOperation {
++					t.Helper()
++					select {
++					case op := <-f.p.flowQueue:
++						return op
++					case err := <-done:
++						t.Fatal("early constructor", err)
++					case <-time.After(time.Second):
++						t.Fatal("blocked constructor")
++					}
++					return nil
++				}
++				if network {
++					root := next()
++					if root.kind != 20 || f.c.dispatch(root) != nil || f.c.accept(serviceReply(f, root)) != nil {
++						t.Fatal("service root")
++					}
++				}
++				op := next()
++				if op.kind != 55 || f.c.dispatch(op) != nil || op.dnsContext4.capability != nil || len(f.p.flowQueue) != 0 {
++					t.Fatal("effects before Source ACK")
++				}
++				reply := dnsBundleReply(op, 940, 1)
++				switch fault {
++				case "wrong-root":
++					be.PutUint64(reply.body[16:], u64(reply.body, 16)+1)
++				case "wrong-epoch":
++					be.PutUint64(reply.body[32:], u64(reply.body, 32)+1)
++				case "wrong-path":
++					be.PutUint16(reply.body[48:], 2)
++				case "snapshot":
++					f.c.manifest.rows[10][0][32] ^= 1
++				case "parent":
++					f.c.closeGrant(ctx.Value(profileGrantKey{}).(*profileGrant))
++				case "cancel":
++					f.c.dnsContext4Close(op.dnsContext4)
++				case "late":
++					f.now = op.deadline
++				}
++				before := len(f.writes)
++				err := f.c.accept(reply)
++				if fault != "allow" {
++					if <-done == nil || op.dnsContext4.capability != nil || len(f.p.flowQueue) != 0 || len(f.writes) != before {
++						t.Fatal("invalid Source ACK permitted Reserve/physical effects")
++					}
++					return
++				}
++				if err != nil || !f.c.dnsContext4Live(op.dnsContext4) {
++					t.Fatal("valid Source ACK", err)
++				}
++				reserve := next()
++				if reserve.kind != 35 || f.c.dispatch(reserve) != nil {
++					t.Fatal("ACKed Source did not enable its own Reserve")
++				}
++				deny := make([]byte, 64)
++				be.PutUint16(deny, 2)
++				deny[2] = 2
++				if f.c.accept(profilePacket{kind: 36, reply: reserve.sequence, body: deny}) != nil || <-done == nil {
++					t.Fatal("resource Deny bypassed")
++				}
++			})
++		}
++	}
 +}
 +
 +func networkBootstrapFixture(t *testing.T, mode byte, tcp bool) (*flowFixture, context.Context) {
@@ -34177,7 +34358,7 @@ new file mode 100644
 +			f, ctx := hostsCallerFixture(t)
 +			switch fault {
 +			case "gate":
-+				f.p.dns4CaptureReviewed = false
++				f.p.dns4Metadata = nil
 +			case "role":
 +				be.PutUint32(f.c.manifest.rows[10][0][72:], 2)
 +			case "mapping":
@@ -34326,50 +34507,15 @@ new file mode 100644
 +	}
 +	root.next = child
 +	child.parent = root
-+	done := make(chan error, 1)
-+	go func() { done <- profilePrepareHostsObservation(ctx, root) }()
-+	select {
-+	case op := <-f.p.flowQueue:
-+		if op.kind != 55 || u16(op.body, 50) != 2 {
-+			t.Fatal("full path absent")
-+		}
-+		start := 72 + int(u16(op.body, 48))
-+		if string(op.body[start:start+int(u16(op.body, 58))]) != "Physical.INVALID" {
-+			t.Fatal("remote hostname promoted to physical leaf")
-+		}
-+		tail := op.body[start+int(u16(op.body, 58)):]
-+		if u16(tail, 0) != 0 || u16(tail, 4) != 1 {
-+			t.Fatal("path changed")
-+		}
-+		if f.c.dispatch(op) != nil || f.c.accept(dnsBundleReply(op, 950, 1)) != nil {
-+			t.Fatal("context ACK")
-+		}
-+	case err := <-done:
-+		t.Fatal(err)
-+	case <-time.After(time.Second):
-+		t.Fatal("context blocked")
++	f.c.mu.Lock()
++	frontier, _, err := f.c.hostsParentFrontier(root)
++	f.c.mu.Unlock()
++	if err != nil || frontier.count != 2 || frontier.target.address != "Physical.INVALID" || frontier.path[0].scope != 0 || frontier.path[1].scope != 1 {
++		t.Fatal("DATA chooser lost full path/remote distinction", err)
 +	}
-+	select {
-+	case op := <-f.p.flowQueue:
-+		if op.kind != 35 || u16(op.body, 66) != 1 || u16(op.body, 68) != 1 || u16(op.body, 70) != 1 {
-+			t.Fatal("terminal binding")
-+		}
-+		if f.c.dispatch(op) != nil {
-+			t.Fatal("reserve")
-+		}
-+		b := make([]byte, 64)
-+		be.PutUint16(b, 2)
-+		b[2] = 2
-+		if f.c.accept(profilePacket{kind: 36, reply: op.sequence, body: b}) != nil {
-+			t.Fatal("denial")
-+		}
-+	case err := <-done:
-+		t.Fatal(err)
-+	case <-time.After(time.Second):
-+		t.Fatal("reserve blocked")
-+	}
-+	if err := <-done; err == nil {
-+		t.Fatal("denial opened flow")
++	before := len(f.writes)
++	if profilePrepareHostsObservation(ctx, root) == nil || len(f.p.flowQueue) != 0 || len(f.writes) != before || f.c.hostsObservationUsed != 0 {
++		t.Fatal("single raw SOURCE contract admitted multi-hop effects")
 +	}
 +}
 +func TestProfileHostsSystemObservationCannotExtendOriginalKnown(t *testing.T) {
@@ -34521,7 +34667,7 @@ diff --git a/common/yonikbroker/profile_dns_setup_linux.go b/common/yonikbroker/
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_setup_linux.go
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,86 @@
 +//go:build linux
 +
 +package nativehooks
@@ -34540,6 +34686,16 @@ new file mode 100644
 +	reject  func(profileProofPacket) error
 +	alive   func() bool
 +	now     func() time.Time
++}
++
++// Только negotiated DATA. Ни Source, ни transcript/release permission.
++type profileDNSMetadata4 struct {
++	runtime *ProfileRuntime
++	launch  profileLaunch
++}
++
++func (p *ProfileRuntime) dns4MetadataReady() bool {
++	return p != nil && p.dnsV2 && p.dns4Metadata != nil && p.dns4Metadata.runtime == p && p.dns4Metadata.launch == p.admission.launch && p.ctx != nil && p.ctx.Err() == nil
 +}
 +
 +// Единственный setup owner до monitor. Descriptor/ACK — не runtime frame.
@@ -34569,12 +34725,6 @@ new file mode 100644
 +
 +// Вызывается только синхронным launch owner после ADMIT_ACK, до monitor.
 +func (p *ProfileRuntime) negotiateDNSV2(record []byte, deadline time.Time) error {
-+	if p.admission.state != profileAdmitted || p.admission.capsule.mapping != 4 {
-+		return errProfile
-+	}
-+	if p.admission.deadline.Before(deadline) {
-+		deadline = p.admission.deadline
-+	}
 +	ops := profileDNSSetupOps{now: time.Now, receive: p.receiveBootstrap, reject: p.rejectRights, alive: func() bool { return p.peerAlive() == nil }}
 +	ops.send = func(b []byte) error {
 +		if p.ctx.Err() != nil || p.peerAlive() != nil {
@@ -34586,17 +34736,29 @@ new file mode 100644
 +		}
 +		return nil
 +	}
-+	if e := profileDNSSetup(p.ctx, p.admission.launch, record, deadline, uint32(os.Geteuid()), ops); e != nil {
++	return p.setupDNSV2(record, deadline, uint32(os.Geteuid()), ops)
++}
++
++// Единственный pre-monitor setup owner; pure tests инъецируют только channel IO.
++func (p *ProfileRuntime) setupDNSV2(record []byte, deadline time.Time, uid uint32, ops profileDNSSetupOps) error {
++	if p.admission.state != profileAdmitted || p.admission.capsule.mapping != 4 || p.dnsV2 || p.dns4Metadata != nil {
++		return errProfile
++	}
++	if p.admission.deadline.Before(deadline) {
++		deadline = p.admission.deadline
++	}
++	if e := profileDNSSetup(p.ctx, p.admission.launch, record, deadline, uid, ops); e != nil {
 +		return e
 +	}
 +	p.dnsV2 = true
++	p.dns4Metadata = &profileDNSMetadata4{runtime: p, launch: p.admission.launch}
 +	return nil
 +}
 diff --git a/common/yonikbroker/profile_dns_setup_linux_test.go b/common/yonikbroker/profile_dns_setup_linux_test.go
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_setup_linux_test.go
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,171 @@
 +//go:build linux
 +
 +package nativehooks
@@ -34608,6 +34770,55 @@ new file mode 100644
 +	"testing"
 +	"time"
 +)
++
++// Pure authenticated channel counterpart; production setup/decoder исполняются
++// реально, OS boundary не вызывается. Не создаёт Source/effect capability.
++func dnsMetadata4Fixture(t *testing.T, f *flowFixture) {
++	t.Helper()
++	r := f.p.admission.launch
++	r.hostPID, r.hostStart = 1001, 42
++	if r.mode == 2 {
++		r.workerPID, r.workerStart = 1002, 43
++	}
++	f.p.admission.launch = r
++	f.p.admission.capsule.mapping = 4
++	if f.p.proofs != nil {
++		f.p.proofs.launch = r
++	}
++	record := make([]byte, 192)
++	copy(record, "YNKLOC01")
++	if r.mode == 2 {
++		copy(record, "YNKEXT01")
++		be.PutUint16(record[12:], 1)
++	}
++	be.PutUint16(record[8:], 1)
++	be.PutUint16(record[10:], 192)
++	copy(record[16:], r.nonce[:])
++	copy(record[48:], r.digest[:])
++	copy(record[80:], r.session[:])
++	copy(record[96:], r.invocation[:])
++	be.PutUint64(record[112:], r.generation)
++	be.PutUint64(record[120:], r.epoch)
++	be.PutUint32(record[128:], r.hostPID)
++	be.PutUint32(record[132:], r.workerPID)
++	be.PutUint64(record[136:], r.hostStart)
++	be.PutUint64(record[144:], r.workerStart)
++	copy(record[152:], r.manifest[:])
++	var descriptor []byte
++	ops := profileDNSSetupOps{now: func() time.Time { return f.now }, alive: func() bool { return true }, reject: func(profileProofPacket) error { return nil }}
++	ops.send = func(b []byte) error { descriptor = append([]byte(nil), b...); return nil }
++	ops.receive = func(time.Time) (profileProofPacket, error) {
++		h := sha256.Sum256(descriptor)
++		uid := uint32(1000)
++		if r.mode == 2 {
++			uid = 0
++		}
++		return profileProofPacket{body: append([]byte("DNSACK02"), h[:]...), credentials: 1, pid: int32(r.hostPID), uid: uid}, nil
++	}
++	if err := f.p.setupDNSV2(record, f.now.Add(time.Second), 1000, ops); err != nil || !f.p.dns4MetadataReady() {
++		t.Fatal("negotiated metadata", err)
++	}
++}
 +
 +func TestProfileDNSSetupActualBootFence(t *testing.T) {
 +	_, r := syntheticProfileCapsule()
@@ -34676,12 +34887,17 @@ new file mode 100644
 +				return p, nil
 +			}
 +			ops.reject = func(profileProofPacket) error { rejected++; return nil }
-+			e := profileDNSSetup(ctx, r, record, deadline, 1000, ops)
++			p := &ProfileRuntime{ctx: ctx, admission: profileAdmission{launch: r, state: profileAdmitted, deadline: deadline}}
++			p.admission.capsule.mapping = 4
++			e := p.setupDNSV2(record, deadline, 1000, ops)
 +			if e == nil {
 +				started = true
 +			}
 +			if started != (mode == "matching") {
 +				t.Fatal("setup allowed/denied", mode, e)
++			}
++			if p.dns4MetadataReady() != started || p.dnsV2 != started || started && p.setupDNSV2(record, deadline, 1000, ops) == nil {
++				t.Fatal("setup DATA mint/replay")
 +			}
 +			if stage == 2 && rejected != 1 {
 +				t.Fatal("packet custody not settled")
@@ -36044,7 +36260,7 @@ diff --git a/common/yonikbroker/profile_dns_bundle_linux.go b/common/yonikbroker
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_bundle_linux.go
-@@ -0,0 +1,1478 @@
+@@ -0,0 +1,1507 @@
 +//go:build linux
 +
 +package nativehooks
@@ -36094,7 +36310,7 @@ new file mode 100644
 +type profileDNSContext4Key struct{}
 +
 +// Private DATA от actual capture/choice seam; не network/USER permission.
-+// Public setup не создаёт этот объект и не включает capture-reviewed gate.
++// Public setup не создаёт этот объект и не выдаёт Source capability.
 +type profileDNSCapture4 struct {
 +	runtime                           *ProfileRuntime
 +	parent, service                   *profileGrant
@@ -36106,8 +36322,10 @@ new file mode 100644
 +	deadline                          time.Time
 +}
 +type profileDNSContext4 struct {
++	capability                *profileDNSSourceCapability
 +	hostReferences            int
 +	source                    profileDNSCapture4
++	captured                  profileDNSCapture4
 +	identity                  *profileDNSContextIdentity
 +	ctx                       context.Context
 +	cancel                    context.CancelFunc
@@ -36122,8 +36340,18 @@ new file mode 100644
 +	closeAck                  bool
 +}
 +
++// Закрытый Source scope от exact authenticated ACK56. Это не право transcript,
++// consuming release, network resource или USER traffic; их ACK gates отдельны.
++type profileDNSSourceCapability struct {
++	context  *profileDNSContext4
++	source   profileDNSCapture4
++	identity profileDNSContextIdentity
++	revision uint64
++	deadline time.Time
++}
++
 +// Внешний producer endpoint: источник может установить только private capture
-+// seam. До отдельного protected CODEC4 review он закрыт даже после setup4 ACK.
++// seam. Setup разрешает только request55; effects требуют exact Source ACK56.
 +func ProfileDNSAcquirePhysicalContext(ctx context.Context) (context.Context, func(), error) {
 +	noop := func() {}
 +	if ctx == nil {
@@ -36131,7 +36359,7 @@ new file mode 100644
 +	}
 +	p := profileRuntime(ctx)
 +	s, _ := ctx.Value(profileDNSCapture4Key{}).(*profileDNSCapture4)
-+	if p == nil || !p.dns4CaptureReviewed || s == nil || s.runtime != p {
++	if !p.dns4MetadataReady() || s == nil || s.runtime != p {
 +		return ctx, noop, ErrProfileUnsupported
 +	}
 +	x, op, err := p.flow.dnsContext4Acquire(ctx, s, nil)
@@ -36153,7 +36381,7 @@ new file mode 100644
 +}
 +
 +func (c *profileFlowControl) dnsCapture4Live(s *profileDNSCapture4) bool {
-+	if s == nil || s.runtime == nil || s.runtime.flow != c || !s.runtime.dns4CaptureReviewed || !s.runtime.dnsV2 || c.manifest.mapping != 4 || !c.live() || !c.clock().Before(s.deadline) || s.epoch != s.runtime.admission.launch.epoch || !profileDNSV2ID(s.query) || s.snapshot == nil || s.snapshot != s.runtime.snapshot || len(c.manifest.rows[10]) != 1 || u32(c.manifest.rows[10][0], 72)&4 == 0 || !c.grantLive(s.parent) || s.parent.class > 2 || s.parent.class != 2 && s.parent.receipt == nil {
++	if s == nil || s.runtime == nil || s.runtime.flow != c || !s.runtime.dns4MetadataReady() || c.manifest.mapping != 4 || !c.live() || !c.clock().Before(s.deadline) || s.epoch != s.runtime.admission.launch.epoch || !profileDNSV2ID(s.query) || !c.hostsSnapshotLive(s.runtime, s.snapshot) || !c.grantLive(s.parent) || s.parent.class > 1 || s.parent.receipt == nil {
 +		return false
 +	}
 +	if c.mode == 2 && s.parent.class != 2 && (s.parent.ownerKind < 1 || s.parent.ownerKind > 2 || !profileDNSV2ID(s.parent.ownerID) || !c.clock().Before(s.parent.ownerDeadline)) {
@@ -36164,6 +36392,10 @@ new file mode 100644
 +	}
 +	f := s.frontier
 +	if f.count < 1 || f.count > 256 || f.target.family != 3 || f.target.network != f.carrier || !f.target.valid() || f.path[0].scope != s.parent.scope || f.path[0].branch != s.parent.branch {
++		return false
++	}
++	// SOURCE-reviewed subset: один actual raw TCP leaf и original USER parent.
++	if !c.dnsSourceFrontierReady(s.parent, f) {
 +		return false
 +	}
 +	// Повторный graph walk использует сохранённые actual branch decisions.
@@ -36190,10 +36422,14 @@ new file mode 100644
 +	return ok && g != nil && g.class == 3 && g.purpose == 2 && g.receipt == nil && g.ownerKind == 0 && g.ownerID == 0 && g.revision == c.manifest.policy && g.subject == f.subject && g.serviceIndex == f.endpoint && g.resolver == s.resolver && g.query == f.target.address && g.effective == peer && c.grantLive(g) && (s.qtype == 1 || s.qtype == 28)
 +}
 +func (c *profileFlowControl) dnsContext4Live(x *profileDNSContext4) bool {
-+	return x != nil && !x.closed && !x.unknown && !x.released && x.ctx.Err() == nil && x.identity.id != 0 && c.clock().Before(x.deadline) && c.dnsCapture4Live(&x.source)
++	return x != nil && c.dnsSourceCapabilityLive(x, x.capability)
++}
++func (c *profileFlowControl) dnsSourceCapabilityLive(x *profileDNSContext4, cap *profileDNSSourceCapability) bool {
++	return x != nil && cap != nil && cap == x.capability && cap.context == x && x.source == x.captured && cap.source == x.source && cap.identity == *x.identity && cap.revision == x.revision && cap.deadline == x.deadline && !x.closed && !x.unknown && !x.released && x.ctx.Err() == nil && x.identity.id != 0 && c.clock().Before(x.deadline) && c.dnsCapture4Live(&x.source)
 +}
 +func (c *profileFlowControl) dnsContext4Close(x *profileDNSContext4) {
 +	if !x.closed {
++		x.capability = nil
 +		x.closed = true
 +		x.cancel()
 +	}
@@ -36250,7 +36486,7 @@ new file mode 100644
 +		if s.hosts {
 +			kind = profileDNSHostsRoot
 +		}
-+		x = &profileDNSContext4{source: *s, ctx: child, cancel: cancel, identity: c.dnsReserveContextIdentity(kind), cleanupDeadline: s.deadline.Add(time.Second)}
++		x = &profileDNSContext4{source: *s, captured: *s, ctx: child, cancel: cancel, identity: c.dnsReserveContextIdentity(kind), cleanupDeadline: s.deadline.Add(time.Second)}
 +		until := s.deadline
 +		for _, d := range []time.Time{s.parent.deadline, c.sessionDeadline} {
 +			if d.Before(until) {
@@ -36304,6 +36540,8 @@ new file mode 100644
 +		body[at+2] = h.branch
 +	}
 +	op := &profileOperation{dnsContext4: x, ctx: ctx, kind: 55, body: body, done: make(chan struct{})}
++	// Refresh не позволяет потреблять старую capability во время нового ACK.
++	x.capability = nil
 +	x.pending = op
 +	x.requests[x.used] = op
 +	x.requestHashes[x.used] = sha256.Sum256(body)
@@ -36322,7 +36560,7 @@ new file mode 100644
 +			break
 +		}
 +	}
-+	if !immutable || x.closed || op.ctx.Err() != nil || !c.dnsCapture4Live(&x.source) || !profileDNSV2Body(55, op.body) {
++	if !immutable || x.source != x.captured || x.closed || op.ctx.Err() != nil || !c.dnsCapture4Live(&x.source) || !profileDNSV2Body(55, op.body) {
 +		c.dnsContext4Close(x)
 +		c.dnsNotify(op, errProfile)
 +		c.operations -= 2
@@ -36357,6 +36595,12 @@ new file mode 100644
 +		return nil
 +	}
 +	be.PutUint64(op.body[40:], uint64(lease.Sub(op.sent)))
++	for i, request := range x.requests[:x.used] {
++		if request == op {
++			x.requestHashes[i] = sha256.Sum256(op.body)
++			break
++		}
++	}
 +	op.submitted = true
 +	seq, err := c.write(55, 0, op.body)
 +	op.sequence = seq
@@ -36373,9 +36617,9 @@ new file mode 100644
 +}
 +func (c *profileFlowControl) dnsContext4Accept(f profilePacket) (bool, error) {
 +	for _, x := range c.dnsContexts4[:c.dnsContext4Used] {
-+		for _, op := range x.requests[:x.used] {
++		for i, op := range x.requests[:x.used] {
 +			if op.submitted && op.sequence == f.reply && f.kind == 56 {
-+				if op.dns4Replied || op.dns4CancelAck || f.object != 0 {
++				if op.dns4Replied || op.dns4CancelAck || f.object != 0 || x.requestHashes[i] != sha256.Sum256(op.body) {
 +					x.unknown = true
 +					c.dnsContext4Close(x)
 +					c.dnsNotify(op, errProfile)
@@ -36406,12 +36650,13 @@ new file mode 100644
 +					return true, errProfile
 +				}
 +				deadline := op.sent.Add(time.Duration(u64(f.body, 40)))
-+				if x.closed || x.ctx.Err() != nil || op.ctx.Err() != nil || !c.dnsCapture4Live(&x.source) || !c.clock().Before(deadline) || !c.clock().Before(op.deadline) {
++				if x.source != x.captured || x.closed || x.ctx.Err() != nil || op.ctx.Err() != nil || !c.dnsCapture4Live(&x.source) || !c.clock().Before(deadline) || !c.clock().Before(op.deadline) {
 +					c.dnsContext4Close(x)
 +					c.dnsNotify(op, errProfile)
 +				} else {
 +					x.deadline = deadline
 +					x.revision = u64(f.body, 56)
++					x.capability = &profileDNSSourceCapability{context: x, source: x.source, identity: *x.identity, revision: x.revision, deadline: x.deadline}
 +					c.dnsNotify(op, nil)
 +				}
 +				c.dnsContext4Settle(op)
@@ -37527,7 +37772,7 @@ diff --git a/common/yonikbroker/profile_dns_bundle_linux_test.go b/common/yonikb
 new file mode 100644
 --- /dev/null
 +++ b/common/yonikbroker/profile_dns_bundle_linux_test.go
-@@ -0,0 +1,1053 @@
+@@ -0,0 +1,1137 @@
 +//go:build linux
 +
 +package nativehooks
@@ -37551,14 +37796,19 @@ new file mode 100644
 +		mode = modes[0]
 +	}
 +	f := newFlowFixture(t, mode)
-+	f.p.dnsV2 = true
-+	f.p.dns4CaptureReviewed = true
 +	f.c.manifest.mapping = 4
++	dnsMetadata4Fixture(t, f)
 +	r := f.admittedReceipt(t, "parent.invalid")
 +	g := f.granted(t, r)
 +	ctx := context.WithValue(context.WithValue(context.WithValue(f.p.ctx, profileContextKey{}, f.p), profileReceiptKey{}, r), profileGrantKey{}, g)
-+	f.p.snapshot = &profileSnapshot{}
++	b, _ := syntheticProfileSnapshot()
++	a := snapshotAsset(b)
++	f.p.snapshot, _ = decodeProfileSnapshot(b, a)
 +	row := make([]byte, 76)
++	copy(row, a.source[:])
++	copy(row[32:], a.digest[:])
++	be.PutUint32(row[64:], uint32(len(b)))
++	be.PutUint16(row[68:], 1)
 +	be.PutUint32(row[72:], 4)
 +	f.c.manifest.rows[10] = [][]byte{row}
 +	domain := profileDestinationValue{family: 3, network: 6, address: "Physical.INVALID", port: 8443}
@@ -37665,7 +37915,7 @@ new file mode 100644
 +			f, ctx, s := dnsContext4Fixture(t, true)
 +			switch fault {
 +			case "sourcegate":
-+				f.p.dns4CaptureReviewed = false
++				f.p.dns4Metadata = nil
 +			case "role":
 +				be.PutUint32(f.c.manifest.rows[10][0][72:], 2)
 +			case "mapping":
@@ -37784,6 +38034,85 @@ new file mode 100644
 +	f.now = y.deadline
 +	if _, _, err = f.c.dnsContext4Acquire(ctx, &neighbor, y); err == nil {
 +		t.Fatal("expired context resurrected")
++	}
++}
++
++func TestProfileSourceCapabilityOnlyExactACKAndContextCanConsume(t *testing.T) {
++	for _, fault := range []string{"before-ack", "wrong-root", "wrong-epoch", "wrong-count", "late", "cancel", "snapshot", "parent", "pending-source", "sent-request", "source", "foreign", "renew"} {
++		t.Run(fault, func(t *testing.T) {
++			f, ctx, s := dnsContext4Fixture(t, true)
++			x, op, err := f.c.dnsContext4Acquire(ctx, s, nil)
++			if err != nil || f.c.dispatch(op) != nil {
++				t.Fatal("Source request", err)
++			}
++			if x.capability != nil || f.c.dnsContext4Live(x) {
++				t.Fatal("DATA/setup/request minted effects")
++			}
++			if fault == "before-ack" {
++				// ID/revision/deadline, даже похожие на ACK, не являются capability.
++				x.identity.id, x.revision, x.deadline = 701, 1, s.deadline
++				if f.c.dnsContext4Live(x) {
++					t.Fatal("manual DATA minted Source")
++				}
++				return
++			}
++			reply := dnsBundleReply(op, 701, 1)
++			switch fault {
++			case "wrong-root":
++				be.PutUint64(reply.body[16:], 1)
++			case "wrong-epoch":
++				be.PutUint64(reply.body[32:], s.epoch+1)
++			case "wrong-count":
++				be.PutUint16(reply.body[48:], 2)
++			case "late":
++				f.now = op.deadline
++			case "cancel":
++				f.c.dnsContext4Close(x)
++			case "snapshot":
++				f.p.snapshot = &profileSnapshot{}
++			case "parent":
++				f.c.closeGrant(s.parent)
++			case "pending-source":
++				x.source.frontier.scope++
++			case "sent-request":
++				op.body[len(op.body)-2] ^= 1
++			}
++			accepted := f.c.accept(reply)
++			if fault != "source" && fault != "foreign" && fault != "renew" {
++				if x.capability != nil || f.c.dnsContext4Live(x) {
++					t.Fatal("invalid ACK/source minted capability")
++				}
++				return
++			}
++			cap := x.capability
++			if accepted != nil || !f.c.dnsSourceCapabilityLive(x, cap) {
++				t.Fatal("valid ACK", accepted)
++			}
++			if fault == "source" {
++				x.source.frontier.scope++
++				if f.c.dnsSourceCapabilityLive(x, cap) {
++					t.Fatal("capability changed source binding")
++				}
++				return
++			}
++			if fault == "renew" {
++				_, renew, err := f.c.dnsContext4Acquire(ctx, s, x)
++				if err != nil || f.c.dnsSourceCapabilityLive(x, cap) || f.c.dispatch(renew) != nil || f.c.accept(dnsBundleReply(renew, 701, 2)) != nil || !f.c.dnsContext4Live(x) || f.c.dnsSourceCapabilityLive(x, cap) || x.capability == cap {
++					t.Fatal("renewal reused old capability", err)
++				}
++				return
++			}
++			neighbor := *s
++			neighbor.query++
++			y, pending, err := f.c.dnsContext4Acquire(ctx, &neighbor, nil)
++			if err != nil || f.c.dispatch(pending) != nil || f.c.accept(dnsBundleReply(pending, 702, 1)) != nil || !f.c.dnsContext4Live(y) || f.c.dnsSourceCapabilityLive(y, cap) {
++				t.Fatal("foreign capability", err)
++			}
++			f.c.dnsContext4Close(x)
++			if f.c.dnsSourceCapabilityLive(x, cap) || !f.c.dnsContext4Live(y) {
++				t.Fatal("cancel authority/neighbor isolation")
++			}
++		})
 +	}
 +}
 +

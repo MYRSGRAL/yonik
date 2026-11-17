@@ -12,6 +12,26 @@ ADAPTER = Path(__file__).resolve().parents[2] / "adapters/xray/v26.10.31"
 
 
 class FullProfilePatchTests(unittest.TestCase):
+    def test_source_capability_is_context_ack_bound_not_setup_authority(self) -> None:
+        patch = (ADAPTER / "native-full-profile.patch").read_text()
+        self.assertNotIn("dns4CaptureReviewed", patch)
+        for anchor in (
+            "type profileDNSMetadata4 struct",
+            "p.setupDNSV2(record, deadline, uint32(os.Geteuid()), ops)",
+            "p.dns4Metadata = &profileDNSMetadata4{runtime: p",
+            "type profileDNSSourceCapability struct",
+            "x.capability = &profileDNSSourceCapability{context: x",
+            "x.source != x.captured",
+            "x.requestHashes[i] != sha256.Sum256(op.body)",
+            "cap == x.capability && cap.context == x",
+            "c.dnsSourceCapabilityLive(h.context, h.sourceCapability)",
+            "c.dnsSourceCapabilityLive(n.context, n.sourceCapability)",
+            "c.dnsSourceCapabilityLive(b.context, b.sourceCapability)",
+            "TestProfileSourceCapabilityActualACKControlsReserve",
+            "TestProfileSourceCapabilityActualReserveCannotBorrowRenewal",
+        ):
+            self.assertIn(anchor, patch)
+
     def test_network_numeric_has_independent_waiter_and_two_private_authorities(
         self,
     ) -> None:

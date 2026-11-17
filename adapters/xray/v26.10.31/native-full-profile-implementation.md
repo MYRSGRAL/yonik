@@ -1703,3 +1703,56 @@ protected producer contract требуют отдельного counterpart/sour
 `dns4CaptureReviewed`, public gates и allowlists остаются закрытыми; прежний
 schema3 Direct record не подтверждает этот CODEC4 путь. OS wrappers/main только
 скомпилированы, runtime/network acceptance не заявляется.
+
+### R73: negotiated DATA и per-context Source capability вместо bool
+
+Этот раздел заменяет прежние описания runtime `dns4CaptureReviewed`: поле удалено,
+а не включено присваиванием true. Production trace:
+sealed launch/authenticated ADMIT/asset verification → exact ADMIT_ACK →
+`negotiateDNSV2` → `setupDNSV2` → Descriptor272/exact authenticated ACK40 →
+private `profileDNSMetadata4` → actual `ProfilePrepareChain`/Hosts или NETWORK
+constructor → private context55 → validated context56 →
+`profileDNSSourceCapability` → собственный Reserve35. Setup owner по-прежнему
+единственный до monitor; absolute initial admission deadline не продлевается.
+Unexpected rights/hash/sender/error/late/cancel не создают DATA-ready marker.
+
+Metadata marker удерживает exact runtime/launch binding и только разрешает
+подготовить запрос. До Probe/55 под c.mu проверяются live private USER parent,
+original receipt/System Known20ms, actual full frontier и retained role4 snapshot
+с digest/source/size. SOURCE subset ограничен одним raw-stream TCP physical leaf:
+multihop/TLS-stream/UDP не получают effects; remote chained hostname не становится
+physical target. Public `ProfileBootstrapRawContext` остаётся только отрицательным
+shape hint. Descriptor/schema/hash/env/tag или class3 root не Source authority.
+
+Source token создаётся только успешной ветвью private decoder ACK56. Decoder
+проверяет exact pending request/hash и root variant, ContextId namespace,
+root/query/epoch/pathCount/revision/lease, captured source, current parent,
+snapshot и min original/RTT deadlines. Legacy UserDns Bundle56 не проходит этот
+context consumer. ACK56 не имеет нового scope поля: BootstrapService/HostsPath
+вариант и обязательный helper `bootstrap_source`/protected Source check до Allow
+задают существующий authoritative contract. При missing/unreviewed Source helper
+возвращает Deny; Go не обходит этот отказ и не вводит новый wire/version.
+
+Token непрозрачен и связан с exact context/source/identity/revision/deadline.
+Hosts observation, NETWORK producer и каждый waiter сохраняют именно полученный
+token. Cancel/expiry/source change инвалидируют его; начало renewal снимает
+старый token, новый ACK создаёт другой. Старый consumer не заимствует новый token
+того же context, sibling или иной runtime. Подмена ID/revision/deadline без ACK
+не создаёт authority. Observation36, consuming socket factory/Connect, private
+exchange/Publish и numeric permission остаются за context capability и своими
+отдельными resource/transcript/release/user-parent gates. Обычный USER authorize,
+System mandatory attribution и original-hostname/SNI conjunction не меняются.
+
+Source ACK56 **не** выдаёт BootstrapBoundTranscript или
+BootstrapConsumingCloseJoin scope. Helper независимо проверяет reviewed
+`bootstrap-direct-dns-bound-request-response-v1` и
+`bootstrap-direct-dns-consuming-close-join-v1` перед соответствующими эффектами;
+Source contract — `captured-netgo-bootstrap-parent-member-v1`. Mere setup4 не
+означает наличие всех трёх scopes. Требуется bounded review нового patch digest
+и отдельное root решение по каждому protected pin; registry/builder/allowlists,
+public Connect/install/require_consumer flags этим unit не меняются.
+
+Pure tests используют authenticated fake channel/issuer через actual setup,
+context decoder и actual callers. Они не измеряют current executable, kernel
+proof, durable policy install или runtime acceptance. Wire/schema/corpus,
+frozen ABI, R9/R14/UDP/RX и R64 custody barriers не меняются.
