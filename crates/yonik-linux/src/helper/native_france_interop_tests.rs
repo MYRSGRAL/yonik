@@ -101,14 +101,16 @@ pub(super) fn run(case: &str) {
         Mode::Local
     };
     let intent = intent();
+    let network = case.contains("france-network-");
+    let resolver_tcp = network && case.contains("-tcp-");
     let (mut issuer, f) = fixture_intent_flags(
         mode,
         "203.0.113.80".parse().unwrap(),
-        1,
+        if network { 2 } else { 1 },
         true,
         [3; 32],
         17,
-        16,
+        if resolver_tcp { 20 } else { 16 },
         Some(intent),
     );
     // Тот же compiler result/probe credentials, не повторная компиляция intent.
@@ -176,7 +178,8 @@ pub(super) fn run(case: &str) {
         datagram: d.datagram_source(issuer.record).unwrap(),
         datagram_wire: d.datagram_wire(issuer.record).unwrap(),
         datagram_release: d.datagram_release(issuer.record).unwrap(),
-        dns_protocol: 17,
+        dns_protocol: if resolver_tcp { 6 } else { 17 },
+        physical_count: Cell::new(0),
         descriptor: RefCell::new(None),
         negotiated: RefCell::new(None),
         inbox: Default::default(),

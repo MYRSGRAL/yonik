@@ -49,11 +49,61 @@ bridge, не создавая ACK. Positive namespace oracle проверяет 
 descriptor, full settings/fingerprint, distinct paths, own waiter query→member→
 carrier и все observed cleanup barriers. Три независимых pins5 не открываются.
 
-NETWORK в ОДНОЙ FranceSS session пока не покрыт: существующий DNS IO leaf хранит
-единственный socket/duplicate и hardcoded physical.invalid. Нужны separate
-per-exchange owned leaves для двух запросов fr.example.invalid, затем обоих
-resolver transports6/17 в Local/System. Старые21 независимых pair остаются
-regressions, не заменой этой acceptance. FranceReady/runtime/install PASS нет.
+## FranceSS NETWORK same-session: production memory RED
+
+Base a2f93b3e130a4fea17e4d578e6d07d61d61384af. Production Go по-прежнему exact6e1,
+1307 members неизменны; production Rust также неизменён. Семантика теста такая
+же, как HOSTS выше, но snapshot DNS-first: обе ветки используют actual NETWORK
+service/context→Physical/Logical→captured exchange→Publish→own waiter→Numeric.
+Resolver TCP6 и UDP17 независимы от original carriers6/17.
+
+Leaf IO теперь имеет два фиксированных exchange-owned slots. Capacity проверяется
+до create; каждый slot удерживает собственные socket/duplicate/response и sent
+fence. Duplicate lookup выполняется по exact socket identity; send по exact
+duplicate identity, повторный send запрещён. Runtime credits до factory остаются
+production. Строка fr.example.invalid. проверяется только внутри fake DNS peer;
+никаких issuer ACK в leaf/relay нет. Rust fake kernel producer выдаёт собственный
+bounded monotonic cookie/local endpoint каждому socket, не выводя их из child
+PhysicalBind. Исходный cookie101 для обоих sockets корректно отвергался guard
+native_dns_transport.rs; этот harness RED и исправление сохранены отдельно.
+
+Четыре positives (Local/System × resolverTCP/UDP) сейчас **RED**, не acceptance:
+TCP branch получает actual Published/Waiter/Numeric, открывает fake TCP; UDP
+branch получает own57/58/service/context/Physical/Logical, но второй Publish40
+получает Deny41. До Publish dynamic used46414, limit58419(Local)/58399(System).
+SCRATCH17968 уже даёт64382, то есть не помещается даже без нового Producer credit.
+Production publish_dns одновременно резервирует Producer+BootstrapPublication+
+capture (native_dns_rrset.rs:710–722) и parser scratch (:724). Парсер валидных
+request/response сам по себе PASS; grants/Source checks не удалялись. Первый TCP
+owner намеренно остаётся live для независимой соседней ветки. Бюджеты/caps/fixture
+limits НЕ увеличены. Точный минимальный production вопрос — убрать лишнее
+удержание/дублирование либо изменить законный lifetime оплаченных данных, сохранив
+оба live permissions и все Source/transcript/parser/revalidation fences. Это
+вне test-only ownership; production исправление здесь не выполняется.
+
+Четыре wrong-question cases проходят: испорчен только ответ второго fake DNS
+peer. Production Go strict parser не отправляет второй Publish; нет UDP DATA/
+waiter/member permission/open/send. TCP сосед выполняет второй actual SS write
+после real UDP context/binding cleanup, затем обе branches/USER seeds закрываются
+с нулевой active custody. Oracle независимо проверяет два Physical/Logical,
+own proof/revision/query и настоящие Proof/Resource/reservation/context/parent/
+service ACK barriers. Исходные31 cases проходят на тех же финальных test ELF.
+
+Новые selectors: [system-]france-network-{tcp,udp}-{positive,wrong-question};
+test-only ветки foreign-member/parent-cancel/second-send/late-ack также реализованы,
+но их финальная проверка блокируется более ранним вторым Publish. Held Resource
+ACK берётся только от Rust, удерживается через normal ticks, проверяет custody
+и отдаётся тому же production accept; до устранения RED покрытие НЕ заявлено.
+Crossbranch permission attempts сохранены; положительная same-session NETWORK
+acceptance и полный FranceReady отсутствуют.
+
+Evidence `/home/myrs/projects/yonik/local/orchestration/evidence/p5-france-network`
+содержит current source/compiler/test ELFs до execution,39 traces/results,
+red-cookie и red-second-publish. Повтор (после production correction):
+`python tools/hosts_stateful_interop.py --rust <current/rust.test> --go
+<current/go.test> --case france-network-udp-positive --output <result.json>`.
+Обычный HOSTS case использует те же ELF. Classification PURE_STATEFUL_INTEROP;
+USER/HELLO/Consumed/kernel/route/IO facts остаются injected, install/runtime PASS нет.
 
 ## NETWORK UDP после namespace correction8bdac3c: joint GREEN
 

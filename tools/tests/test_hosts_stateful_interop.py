@@ -113,6 +113,24 @@ def cleanup_trace() -> list[dict[str, object]]:
 
 
 class CleanupBarrierTests(unittest.TestCase):
+    def test_neighbor_event_does_not_replace_network_cleanup_barriers(self) -> None:
+        trace = cleanup_trace()
+        trace.insert(
+            0,
+            {
+                "side": "go",
+                "event": {
+                    "name": "tcp_neighbor_after_udp_cleanup",
+                    "grant": 2,
+                    "protocol": 6,
+                },
+            },
+        )
+        self.assertEqual(interop.check_network_cleanup(trace), 1)
+        del trace[9]  # Actual Proof ACK отсутствует, соседний event его не заменяет.
+        with self.assertRaisesRegex(AssertionError, "Resource retire before Proof ACK"):
+            interop.check_network_cleanup(trace)
+
     def test_resource_retire_requires_prior_actual_proof_ack(self) -> None:
         trace = cleanup_trace()
         del trace[8]

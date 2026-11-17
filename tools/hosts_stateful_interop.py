@@ -59,6 +59,8 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
     neighbor_events = 0
     descriptors, acks, admissions = 0, 0, 0
     descriptor = b""
+    physical: dict[int, int] = {}
+    logical: dict[int, tuple[int, int]] = {}
 
     def n(b: bytes, at: int) -> int:
         if at + 8 > len(b):
@@ -68,6 +70,8 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
     for e in trace:
         if "event" in e:
             detail = e["event"]
+            if detail["name"] in ("ack_hold", "ack_release"):
+                continue  # Отдельный cleanup oracle проверяет actual held ACK.
             if (
                 detail["name"] != "tcp_neighbor_after_udp_cleanup"
                 or detail["grant"] != 2
@@ -85,7 +89,21 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
             neighbor_events += 1
             continue
         if "physical" in e:
-            raise AssertionError("HOSTS emitted DNS PhysicalBind")
+            raw = bytes.fromhex(e["physical"])
+            if (
+                len(raw) != 192
+                or raw[:8] != b"DNSPHY02"
+                or raw[16:48] != launch[48:80]
+                or raw[48:80] != launch[80:112]
+                or raw[80:96] != launch[112:128]
+                or raw[162:164] != bytes(2)
+                or raw[168:175] != bytes([4, raw[164], 0, 53, 4, 0, 0])
+                or raw[175:179] != bytes([192, 0, 2, 53])
+                or n(raw, 136) in physical
+            ):
+                raise AssertionError("foreign/duplicate France physical exchange")
+            physical[n(raw, 136)] = raw[164]
+            continue
         if "packet" not in e:
             continue
         raw = bytes.fromhex(e["packet"])
@@ -190,10 +208,31 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
             queries[n(sent, 16)] = path
         elif kind == 36 and b[2] == 1:
             reservations[n(b, 8)] = n(sent, 8)
+        elif kind == 39 and b[2] == 1:
+            if n(b, 24) not in physical or n(b, 16) in logical:
+                raise AssertionError("logical proof without owned physical exchange")
+            logical[n(b, 16)] = (n(b, 24), n(b, 40))
         elif kind == 41 and b[2] == 1:
             query = n(sent, 12)
-            if sent[136:138] != b"\x03\x02" or paths[queries[query]] != sent[142]:
-                raise AssertionError("France Hosts DATA kind/carrier")
+            if paths[queries[query]] != sent[142]:
+                raise AssertionError("France DATA carrier")
+            if sent[136:138] == b"\x02\x01":
+                if logical.get(n(sent, 120)) != (query, n(sent, 128)):
+                    raise AssertionError("France NETWORK proof/revision/query")
+                q = int.from_bytes(sent[108:110], "big")
+                request = int.from_bytes(sent[110:112], "big")
+                response = int.from_bytes(sent[112:116], "big")
+                if (
+                    sent[144 : 144 + q] != b"fr.example.invalid"
+                    or request == 0
+                    or response == 0
+                    or len(sent) != 144 + q + request + response
+                ):
+                    raise AssertionError(
+                        "France NETWORK exact capture lengths/question"
+                    )
+            elif sent[136:138] != b"\x03\x02" or physical:
+                raise AssertionError("France DATA kind")
             producers[n(b, 8)] = query
         elif kind == 54 and b[2] == 1:
             if (
@@ -229,6 +268,9 @@ def check_france_binding(trace: list[dict[str, object]]) -> dict[str, object]:
         "waiters": len(waiters),
         "permission_carriers": sorted(permissions.values()),
         "neighbor_events": neighbor_events,
+        "physical_exchanges": len(physical),
+        "resolver_carriers": sorted(physical.values()),
+        "logical_proofs": len(logical),
     }
 
 
@@ -255,6 +297,8 @@ def check_network_cleanup(
     for event in trace:
         if "event" in event:
             detail = event["event"]
+            if detail["name"] == "tcp_neighbor_after_udp_cleanup":
+                continue
             key = (int(detail["target"]), int(detail["id"]))
             if detail["name"] == "ack_hold":
                 if key not in acknowledged or key in held:
@@ -595,14 +639,26 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                     "france_binding": bindings,
                     "trace": trace,
                 }
-            udp_expected = int(not case.endswith("parent-cancel"))
+            network = "france-network-" in case
+            denied = case.endswith(("foreign-member", "wrong-question"))
+            udp_expected = int(not case.endswith("parent-cancel") and not denied)
             tcp_expected = int(not case.endswith("missing-tcp-scope"))
             if bindings["acks"] != 1 or bindings["permission_carriers"] != (
-                [6, 17] if tcp_expected else [17]
+                [6] if denied else [6, 17] if tcp_expected else [17]
             ):
                 raise AssertionError("missing separate France branch permissions")
             if bindings["neighbor_events"] != tcp_expected:
                 raise AssertionError("missing live TCP after UDP cleanup")
+            if network:
+                protocol = 6 if "-tcp-" in case else 17
+                if (
+                    bindings["physical_exchanges"] != 2
+                    or bindings["logical_proofs"] != 2
+                    or bindings["resolver_carriers"] != [protocol, protocol]
+                    or bindings["producers"]
+                    != (1 if case.endswith("wrong-question") else 2)
+                ):
+                    raise AssertionError("missing independent NETWORK capture/proofs")
             if (
                 not go_result.get("france")
                 or not go_result.get("cleanup")
@@ -629,7 +685,14 @@ def run(rust: Path, go: Path, timeout: float, case: str) -> dict[str, object]:
                 "codes": codes,
                 "results": done,
                 "france_binding": bindings,
-                "datagram_cleanup_barriers": check_datagram_cleanup(trace),
+                "datagram_cleanup_barriers": check_datagram_cleanup(
+                    trace, minimum_parents=1 if case.endswith("wrong-question") else 2
+                ),
+                "network_cleanup_barriers": check_network_cleanup(
+                    trace, frozenset({1, 2})
+                )
+                if network
+                else 0,
                 "trace": trace,
             }
         network = case.startswith("network-")
@@ -794,6 +857,22 @@ def main() -> None:
     parser.add_argument(
         "--case",
         choices=(
+            "france-network-tcp-positive",
+            "france-network-udp-positive",
+            "system-france-network-tcp-positive",
+            "system-france-network-udp-positive",
+            "france-network-tcp-parent-cancel",
+            "france-network-udp-parent-cancel",
+            "france-network-tcp-foreign-member",
+            "france-network-udp-foreign-member",
+            "france-network-tcp-wrong-question",
+            "france-network-udp-wrong-question",
+            "system-france-network-tcp-wrong-question",
+            "system-france-network-udp-wrong-question",
+            "france-network-tcp-second-send",
+            "france-network-udp-second-send",
+            "france-network-tcp-late-ack",
+            "france-network-udp-late-ack",
             "france-hosts-positive",
             "system-france-hosts-positive",
             "france-hosts-parent-cancel",

@@ -64,6 +64,7 @@ struct Stdio {
     datagram_wire: Option<Arc<super::super::super::super::dns_datagram::NetworkWire>>,
     datagram_release: Option<Arc<super::super::super::super::dns_datagram::NetworkRelease>>,
     dns_protocol: u8,
+    physical_count: Cell<u16>,
     descriptor: RefCell<Option<Vec<u8>>>,
     negotiated: RefCell<Option<wire::dns_v2::Negotiated>>,
     // recvmsg заменён framed stdin; после read drain обязан видеть пустую очередь.
@@ -205,12 +206,19 @@ impl Channel for Stdio {
         let (physical, b) = input()?;
         if physical {
             let raw: [u8; 192] = b.try_into().map_err(|_| ServiceError::InvalidRequest)?;
+            // Fake kernel facts принадлежат разным sockets, не полям child record.
+            let index = self.physical_count.get();
+            if index >= 2 {
+                return Err(ServiceError::Busy);
+            }
+            self.physical_count.set(index + 1);
             let facts = super::super::super::super::dns_transport::fake_facts(
-                "192.0.2.10:32001".parse().unwrap(),
+                std::net::SocketAddr::from(([192, 0, 2, 10], 32001 + index)),
                 "192.0.2.53:53".parse().unwrap(),
                 self.dns_protocol,
                 (4, 5),
             )
+            .with_cookie(101 + u64::from(index))
             .with_test_mark(if self.record.mode.required() { 42 } else { 0 });
             let incoming = super::super::super::super::dns_transport::Incoming::fake(
                 raw,
@@ -241,6 +249,13 @@ impl Channel for Stdio {
         }
         if b[10..12] == 40u16.to_be_bytes() && b.get(265) == Some(&1) {
             let body = &b[128..];
+            eprintln!(
+                "interop Publish budget: {}",
+                super::super::super::super::bootstrap_binding::tests::interop_status(
+                    &self.diagnostic,
+                    u64_at(body, 12)
+                )
+            );
             let q = usize::from(u16::from_be_bytes(body[108..110].try_into().unwrap()));
             let r = usize::from(u16::from_be_bytes(body[110..112].try_into().unwrap()));
             eprintln!(
@@ -338,6 +353,7 @@ fn pure_stateful_hosts_stdio_bridge() {
         datagram_wire: None,
         datagram_release: None,
         dns_protocol: 17,
+        physical_count: Cell::new(0),
         descriptor: RefCell::new(None),
         negotiated: RefCell::new(None),
         record: f.launch,

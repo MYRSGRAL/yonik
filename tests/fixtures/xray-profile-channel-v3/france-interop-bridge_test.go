@@ -112,6 +112,14 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 		t.Fatal("two exact checked paths/watermark")
 	}
 	caseName := os.Getenv("YONIK_INTEROP_CASE")
+	network := strings.Contains(caseName, "france-network-")
+	resolverProtocol := byte(17)
+	if network && strings.Contains(caseName, "-tcp-") {
+		resolverProtocol = 6
+	}
+	foreign := strings.HasSuffix(caseName, "foreign-member")
+	badQuestion := strings.HasSuffix(caseName, "wrong-question")
+	lateACK := strings.HasSuffix(caseName, "late-ack")
 	missingTCP := strings.HasSuffix(caseName, "missing-tcp-scope")
 	if strings.HasSuffix(caseName, "missing-udp-scope") {
 		// Под5 нет legitimate DatagramSource: actual setup должен отвергнуть
@@ -236,10 +244,28 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 	}
 	var replies []profilePacket
 	var kinds []uint16
+	udpPhase := false
+	receiveReply := func(seq uint64) error {
+		response := pipe.packet()
+		pipe.rx++
+		p, e := r.decodePacket(response, pipe.rx)
+		if e != nil {
+			return e
+		}
+		if (profileDNSV2Operation(p.kind) || p.kind == 58) && !profileDNSV5Envelope(r, response, true, 0, 0, seq) {
+			return errProfile
+		}
+		replies = append(replies, p)
+		return nil
+	}
 	f.c.write = func(kind uint16, object uint64, body []byte) (uint64, error) {
 		f.sequence++
 		seq := f.sequence
 		kinds = append(kinds, kind)
+		if foreign && udpPhase && kind == 42 {
+			body = append([]byte(nil), body...)
+			body[len(body)-1] ^= 1
+		}
 		var raw []byte
 		if profileDNSV2Operation(kind) || kind == 57 {
 			raw = make([]byte, 65536)
@@ -253,22 +279,24 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 			be.PutUint64(raw[112:], object)
 		}
 		pipe.emit(map[string]any{"packet": hex.EncodeToString(raw)})
-		response := pipe.packet()
-		pipe.rx++
-		p, e := r.decodePacket(response, pipe.rx)
-		if e != nil {
-			return 0, e
-		}
-		if (profileDNSV2Operation(p.kind) || p.kind == 58) && !profileDNSV5Envelope(r, response, true, 0, 0, seq) {
-			return 0, errProfile
-		}
-		replies = append(replies, p)
-		return seq, nil
+		return seq, receiveReply(seq)
 	}
+	var dnsLeaf *interopDNSLeaf
+	if network {
+		dnsLeaf = interopNetworkOwnedIO(t, f, pipe, resolverProtocol, "fr.example.invalid.", 2, func(index int) bool { return badQuestion && index == 1 }, receiveReply, func() { kinds = append(kinds, 52) })
+	}
+	var held *profilePacket
+	delayed := false
 	accept := func() {
 		for len(replies) > 0 {
 			p := replies[0]
 			replies = replies[1:]
+			if lateACK && udpPhase && !delayed && p.kind == 46 && len(p.body) > 3 && p.body[3] == 3 {
+				copy := p
+				held, delayed = &copy, true
+				pipe.emit(map[string]any{"event": map[string]any{"name": "ack_hold", "target": 3, "id": u64(p.body, 8), "reply": p.reply}})
+				continue
+			}
 			if e := f.c.accept(p); e != nil {
 				t.Fatalf("accept %d/%d: %v", p.kind, p.reply, e)
 			}
@@ -358,10 +386,15 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 		}
 	}
 	until(tcpDone, !missingTCP)
+	udpPhase = true
 	cancelParent := strings.HasSuffix(caseName, "parent-cancel")
 	second := strings.HasSuffix(caseName, "second-send")
 	go func() {
 		if e := ProfilePrepareChain(udpctx, nil); e != nil {
+			if foreign || badQuestion {
+				udpDone <- nil
+				return
+			}
 			udpDone <- e
 			return
 		}
@@ -379,7 +412,7 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 	}()
 	until(udpDone, false)
 	udpJoins := 0
-	if !cancelParent {
+	if !cancelParent && !foreign && !badQuestion {
 		d := f.c.datagramForGrant(udp)
 		if d == nil || d.conn == nil || !d.conn.managedStarted || !d.conn.closing || d.conn.readActive || d.conn.writeActive {
 			t.Fatal("actual SS UDP managed tasks not joined")
@@ -387,7 +420,27 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 		udpJoins = 2
 	}
 	// Закрываем только UDP derivatives; исходный TCP и его SS tasks живы.
+	closeNetworkIO := func(parent *profileGrant) {
+		if !network {
+			return
+		}
+		for _, n := range f.c.networkBootstraps[:f.c.networkBootstrapUsed] {
+			if (parent == nil || n.parent == parent) && n.result != nil && n.result.networkConn != nil {
+				if e := n.result.networkConn.Close(); e != nil {
+					t.Fatal(e)
+				}
+			}
+		}
+	}
+	closeNetworkIO(udp)
 	f.c.mu.Lock()
+	if network {
+		for _, n := range f.c.networkBootstraps[:f.c.networkBootstrapUsed] {
+			if n.parent == udp {
+				f.c.networkBootstrapClose(n)
+			}
+		}
+	}
 	for _, h := range f.c.hostsObservations[:f.c.hostsObservationUsed] {
 		if h.root == udp {
 			f.c.hostsObservationClose(h)
@@ -396,6 +449,21 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 	f.c.mu.Unlock()
 	for i := 0; i < 64; i++ {
 		tick()
+		if held != nil {
+			for j := 0; j < 3; j++ {
+				tick()
+			}
+			for _, n := range f.c.networkBootstraps[:f.c.networkBootstrapUsed] {
+				if n.parent == udp && (n.service.cancelSent || n.released || n.service.networkCleanupRefs != 1 || n.transport.released || f.c.dnsCleanupResult() == nil) {
+					t.Fatal("held ACK lost UDP custody")
+				}
+			}
+			if e := f.c.accept(*held); e != nil {
+				t.Fatal("actual held ACK", e)
+			}
+			pipe.emit(map[string]any{"event": map[string]any{"name": "ack_release", "target": 3, "id": u64(held.body, 8), "reply": held.reply}})
+			held = nil
+		}
 	}
 	if !f.c.grantLive(tcp) || tc.closes.Load() != 0 {
 		t.Fatal("UDP cleanup invalidated TCP")
@@ -425,14 +493,20 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 		t.Fatal("actual TCP SS neighbor", tcpOpens, tc.closes.Load(), tc.neighbor.Load())
 	}
 	expected := 1
-	if cancelParent {
+	if cancelParent || foreign || badQuestion {
 		expected = 0
 	}
 	if udpOpens != expected || udpSends != expected || udpCloses != expected {
 		t.Fatal("one UDP packet", udpOpens, udpSends, udpCloses)
 	}
 	packetCancel()
+	closeNetworkIO(nil)
 	f.c.mu.Lock()
+	if network {
+		for _, n := range f.c.networkBootstraps[:f.c.networkBootstrapUsed] {
+			f.c.networkBootstrapClose(n)
+		}
+	}
 	for _, h := range f.c.hostsObservations[:f.c.hostsObservationUsed] {
 		f.c.hostsObservationClose(h)
 	}
@@ -469,5 +543,23 @@ func RunPureFranceSession(t *testing.T, consume func(context.Context, []byte, xn
 	if f.c.operations != 0 || a.credit || a.flows != 0 || u.credit || a.receiver != nil {
 		t.Fatal("owned custody not zero", f.c.operations, a.credit, a.flows, u.credit)
 	}
-	pipe.emit(map[string]any{"go_done": true, "france": true, "mode": r.mode, "tcp_opens": tcpOpens, "tcp_neighbor_writes": tc.neighbor.Load(), "tcp_closes": tc.closes.Load(), "udp_opens": udpOpens, "udp_sends": udpSends, "udp_closes": udpCloses, "udp_tasks_joined": udpJoins, "operations": f.c.operations, "cleanup": true, "kinds": kinds, "preseed_user_skipped": true, "watermark": init.Watermark, "parent_cancel": cancelParent, "second_send": second, "missing_tcp": missingTCP})
+	if network {
+		if dnsLeaf.used != 2 || dnsLeaf.factories != 2 || dnsLeaf.writes != 2 || dnsLeaf.closes != 2 || dnsLeaf.entries[0].socket == dnsLeaf.entries[1].socket || dnsLeaf.entries[0].duplicate == dnsLeaf.entries[1].duplicate {
+			t.Fatal("exchange-owned DNS leaves", dnsLeaf)
+		}
+		for _, entry := range dnsLeaf.entries {
+			if !entry.sent || !entry.duplicate.closed {
+				t.Fatal("DNS duplicate retained")
+			}
+		}
+		for _, n := range f.c.networkBootstraps[:f.c.networkBootstrapUsed] {
+			if !n.released || n.unknown || !n.context.released || n.transport.started != n.op.sent || n.peer.network != resolverProtocol {
+				t.Fatal("NETWORK custody/anchor")
+			}
+		}
+		if lateACK && !delayed {
+			t.Fatal("missing actual held ACK")
+		}
+	}
+	pipe.emit(map[string]any{"go_done": true, "france": true, "network": network, "resolver_protocol": resolverProtocol, "late_ack": delayed, "mode": r.mode, "tcp_opens": tcpOpens, "tcp_neighbor_writes": tc.neighbor.Load(), "tcp_closes": tc.closes.Load(), "udp_opens": udpOpens, "udp_sends": udpSends, "udp_closes": udpCloses, "udp_tasks_joined": udpJoins, "operations": f.c.operations, "cleanup": true, "kinds": kinds, "preseed_user_skipped": true, "watermark": init.Watermark, "parent_cancel": cancelParent, "second_send": second, "missing_tcp": missingTCP})
 }
