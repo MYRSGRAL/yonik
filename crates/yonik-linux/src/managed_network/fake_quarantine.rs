@@ -681,6 +681,11 @@ fn verify_set(
     owner: &QuarantineOwner,
 ) -> Result<Option<u64>, QuarantineVerifyError> {
     let object = set.as_object().ok_or(QuarantineVerifyError::SetsMismatch)?;
+    // nft 1.0.9 опускает настройку объединения элементов при чтении JSON.
+    // Установленные в ядре интервалы и их таймауты проверяются независимо.
+    let auto_merge_matches = set
+        .get("auto-merge")
+        .is_none_or(|value| value.as_bool() == Some(true));
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
@@ -703,7 +708,7 @@ fn verify_set(
             .and_then(Value::as_u64)
             .is_none_or(|handle| handle == 0)
         || set.get("timeout").and_then(Value::as_u64) != Some(expected.timeout_ms / 1_000)
-        || set.get("auto-merge").and_then(Value::as_bool) != Some(true)
+        || !auto_merge_matches
     {
         return Err(QuarantineVerifyError::SetsMismatch);
     }
@@ -1113,6 +1118,35 @@ mod tests {
         assert_eq!(
             policy.verify_readback(partial.to_string().as_bytes()),
             Err(QuarantineVerifyError::PartialExpiry)
+        );
+    }
+
+    #[test]
+    fn ubuntu_nftables_1_0_9_опускает_auto_merge_при_чтении_набора() {
+        let policy = quarantine(None);
+        let mut data = readback(&policy, Some(9), Some(8));
+        for index in [3, 4] {
+            data["nftables"][index]["set"]
+                .as_object_mut()
+                .expect("Набор")
+                .remove("auto-merge");
+        }
+        assert_eq!(
+            policy.verify_readback(data.to_string().as_bytes()),
+            Ok(QuarantineStatus::Active(Duration::from_secs(8)))
+        );
+
+        let mut wrong_timeout = data.clone();
+        wrong_timeout["nftables"][3]["set"]["timeout"] = json!(0);
+        assert_eq!(
+            policy.verify_readback(wrong_timeout.to_string().as_bytes()),
+            Err(QuarantineVerifyError::SetsMismatch)
+        );
+
+        data["nftables"][3]["set"]["auto-merge"] = json!(false);
+        assert_eq!(
+            policy.verify_readback(data.to_string().as_bytes()),
+            Err(QuarantineVerifyError::SetsMismatch)
         );
     }
 
