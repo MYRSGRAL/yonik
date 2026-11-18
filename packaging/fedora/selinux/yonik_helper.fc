@@ -1,0 +1,6 @@
+/usr/lib/yonik/yonik-helper -- gen_context(system_u:object_r:yonik_helper_exec_t,s0)
+/run/yonik(/.*)? gen_context(system_u:object_r:yonik_helper_run_t,s0)
+/usr/lib/systemd/system/yonik-worker(-check)?\.(service|socket) -- gen_context(system_u:object_r:yonik_worker_unit_t,s0)
+/usr/lib/systemd/system/yonik-worker(-check)?\.service\.d(/10-timeout-abort\.conf)? gen_context(system_u:object_r:yonik_worker_unit_t,s0)
+/run/yonik-worker(/.*)? gen_context(system_u:object_r:yonik_worker_run_t,s0)
+/usr/lib/yonik/yonik-worker -- gen_context(system_u:object_r:yonik_worker_exec_t,s0)

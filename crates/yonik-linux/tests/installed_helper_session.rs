@@ -414,7 +414,9 @@ async fn installed_fake_dns(
             if !matches!(result, Err(yonik_linux::system_client::ClientError::Busy))
                 || tokio::time::Instant::now() >= retry_until
             {
-                break result?;
+                break result.map_err(|error| {
+                    io::Error::other(format!("{engine:?} Fake DNS Prepare: {error:?}"))
+                })?;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
@@ -426,7 +428,9 @@ async fn installed_fake_dns(
         )?;
         let (state, drain) = client.apply_output(output, deadline, token.clone()).await;
         require(
-            state? == State::TunnelStarting,
+            state.map_err(|error| {
+                io::Error::other(format!("{engine:?} Fake DNS ApplyOutputV1: {error:?}"))
+            })? == State::TunnelStarting,
             "Сессия Fake DNS не запущена",
         )?;
         let drain = drain.ok_or_else(|| io::Error::other("Нет потока вывода ядра"))?;
