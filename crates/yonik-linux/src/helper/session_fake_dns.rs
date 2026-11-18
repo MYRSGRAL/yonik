@@ -284,6 +284,10 @@ impl PreparedFakeDns {
         self.plain.iter().map(PlainDnsRelay::peer)
     }
 
+    pub fn suffixes(&self) -> &[String] {
+        &self.suffixes
+    }
+
     /// Вызывается после проверки worker и правил nft, но до публикации DNS.
     pub async fn start(
         self: Arc<Self>,

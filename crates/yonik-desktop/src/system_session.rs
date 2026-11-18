@@ -166,7 +166,7 @@ impl SystemSession {
     ) -> Result<(), ClientError> {
         self.fence(revision)?;
         self.prepared = None;
-        yonik_engine::validate_scoped_fake_dns_policy(policy.policy().policy())
+        yonik_engine::validate_scoped_fake_dns_policy(policy.policy().policy(), suffixes)
             .map_err(|_| ClientError::Unsupported)?;
         // После Unlock собственные сетевые события могут ещё обрабатываться.
         // Prepare не выдаёт дескриптор при Busy или Stale. После Stale один

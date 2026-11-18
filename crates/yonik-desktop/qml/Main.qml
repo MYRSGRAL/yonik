@@ -425,7 +425,7 @@ ApplicationWindow {
             profile_unavailable: ["Профиль недоступен или список изменился. Выберите профиль заново.", "The profile is unavailable or the list has changed. Select the profile again."],
             engine_missing: ["Прокси-ядро не найдено. Установите выбранное ядро и перезапустите приложение.", "Proxy engine not found. Install the selected engine and restart the application."],
             system_unsupported: ["Системный режим недоступен: helper сообщает system_tun=false.", "System mode unavailable: helper reports system_tun=false."],
-            fake_dns_policy: ["Для Fake DNS нужна политика «всё через прокси» без правил по приложениям.", "Fake DNS requires a proxy-only policy without per-app rules."],
+            fake_dns_policy: ["Для Fake DNS выберите «Прокси» по умолчанию. Доменные правила должны входить в указанные суффиксы.", "Select Proxy as the default for Fake DNS. Domain rules must be covered by the configured suffixes."],
             system_denied: ["Нет разрешения на системное подключение.", "System connection authorization denied."],
             system_owner_lost: ["Helper перезапущен. Проверьте состояние сети.", "Helper restarted. Check network state."],
             system_timeout: ["Время ожидания helper истекло. Исход неизвестен.", "Helper timed out. Outcome unknown."],
@@ -1438,12 +1438,12 @@ ApplicationWindow {
                     visible: window.state.connection_mode === "system" && window.state.selected_kind !== "xray"
                     SmallLabel {
                         Layout.fillWidth: true
-                        text: window.tr("Fake DNS для указанных доменов. Разделяйте суффиксы запятыми. Пустое поле отключает Fake DNS. Требуется политика «всё через прокси».", "Fake DNS for the specified domains. Separate suffixes with commas. Leave the field empty to turn Fake DNS off. Requires a proxy-only policy.")
+                        text: window.tr("Разделяйте суффиксы запятыми. Пустое поле отключает Fake DNS. Для восстановленных имён доступны доменные правила Proxy и Block.", "Separate suffixes with commas. Leave the field empty to turn Fake DNS off. Proxy and Block domain rules can match recovered names.")
                     }
                     SmallLabel {
                         visible: (window.state.system_fake_dns || []).length > 0 && !window.systemFakeDnsEnabled
                         Layout.fillWidth: true
-                        text: window.tr("Текущая политика несовместима с Fake DNS. Выберите «Прокси» по умолчанию и проверьте правила по приложениям, Direct и Block.", "The current policy is incompatible with Fake DNS. Select Proxy as the default and check per-app, Direct and Block rules.")
+                        text: window.tr("Выберите «Прокси» по умолчанию. Для доменных правил Fake DNS используйте Proxy и Block внутри указанных суффиксов. Проверьте, что в этой политике нет CIDR и правил по приложениям.", "Select Proxy as the default. Use Proxy and Block domain rules within the configured Fake DNS suffixes. Check that this policy has no CIDR or per-app rules.")
                     }
                     RowLayout {
                         Layout.fillWidth: true

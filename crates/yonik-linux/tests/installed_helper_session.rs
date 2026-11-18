@@ -258,6 +258,8 @@ async fn wait_for_fixture_link() -> Result {
     }
 }
 
+const ECHO_PAYLOAD_BYTES: usize = 32;
+
 async fn check_tun_traffic() -> Result {
     check_tun_traffic_to([
         "198.18.0.2:40000".parse()?,
@@ -273,8 +275,7 @@ async fn check_tun_traffic_to(servers: [std::net::SocketAddr; 2]) -> Result {
     };
 
     const PREFIX: &[u8] = b"yonik-tun:";
-    const PAYLOAD_BYTES: usize = 32;
-    const REPLY_BYTES: usize = PREFIX.len() + PAYLOAD_BYTES;
+    const REPLY_BYTES: usize = PREFIX.len() + ECHO_PAYLOAD_BYTES;
 
     tokio::time::timeout(Duration::from_secs(10), async {
         for server in servers {
@@ -283,7 +284,7 @@ async fn check_tun_traffic_to(servers: [std::net::SocketAddr; 2]) -> Result {
             } else {
                 "[::]:0"
             };
-            let mut payload = [0u8; PAYLOAD_BYTES];
+            let mut payload = [0u8; ECHO_PAYLOAD_BYTES];
             getrandom::getrandom(&mut payload)
                 .map_err(|_| io::Error::other("Не удалось создать тестовую нагрузку"))?;
             let mut expected = [0u8; REPLY_BYTES];
@@ -318,21 +319,21 @@ async fn check_tun_traffic_to(servers: [std::net::SocketAddr; 2]) -> Result {
 #[tokio::test]
 #[ignore = "выделенная Debian VM с тестовой сборкой установленного helper"]
 async fn production_helper_resolved_fake_dns() -> Result {
-    installed_fake_dns(None, false, None).await
+    installed_fake_dns(None, false, None, None).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM с контролируемым DNS за veth"]
 async fn production_helper_literal_fake_dns() -> Result {
-    installed_fake_dns(Some("10.203.1.2:53".parse()?), false, None).await
+    installed_fake_dns(Some("10.203.1.2:53".parse()?), false, None, None).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM для SIGKILL и истечения Fake-IP"]
 async fn production_helper_fake_dns_survives_sigkill() -> Result {
-    installed_fake_dns(None, true, None).await
+    installed_fake_dns(None, true, None, None).await
 }
 
 #[cfg(feature = "test-support")]
@@ -351,7 +352,24 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
         })
         .to_string(),
     )?;
-    installed_fake_dns(None, false, Some(&policy)).await
+    installed_fake_dns(None, false, Some(&policy), None).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с echo peer для example.test и blocked.example.test"]
+async fn production_helper_scoped_fake_dns_domain_policy() -> Result {
+    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+        &json!({
+            "version":1, "default_action":"proxy", "lan":[], "private_networks":[], "private_domains":[],
+            "user_rules":[{"id":1,"enabled":true,"action":"proxy","ip_cidr":[],
+                "domain":["example.test"],"domain_suffix":[],"executable_paths":[]}],
+            "preset_rules":[{"id":2,"enabled":true,"action":"block","ip_cidr":[],
+                "domain":[],"domain_suffix":["example.test"],"executable_paths":[]}]
+        })
+        .to_string(),
+    )?;
+    installed_fake_dns(None, false, Some(&policy), Some("blocked.example.test")).await
 }
 
 #[cfg(feature = "test-support")]
@@ -359,6 +377,7 @@ async fn installed_fake_dns(
     literal: Option<std::net::SocketAddr>,
     crash: bool,
     policy: Option<&yonik_engine::policy_wire::SystemPolicy>,
+    blocked_name: Option<&str>,
 ) -> Result {
     guard()?;
     let _lock = vm_lock::acquire()?;
@@ -460,8 +479,8 @@ async fn installed_fake_dns(
             (v4, v6)
         } else {
             (
-                getent_fake_dns("ahostsv4").await?,
-                getent_fake_dns("ahostsv6").await?,
+                getent_fake_dns("ahostsv4", "example.test").await?,
+                getent_fake_dns("ahostsv6", "example.test").await?,
             )
         };
         require(
@@ -469,6 +488,15 @@ async fn installed_fake_dns(
             "NSS вернул неверные семейства",
         )?;
         check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+        if let Some(name) = blocked_name {
+            for database in ["ahostsv4", "ahostsv6"] {
+                check_fake_flow_blocked((getent_fake_dns(database, name).await?, 40000).into())
+                    .await?;
+            }
+            eprintln!(
+                "{engine:?} Fake DNS: точный Proxy опередил Block, поддомен заблокирован по TCP и UDP"
+            );
+        }
         if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
             check_https_through_tun(&certificate, literal.map(|_| v4)).await?;
         }
@@ -821,7 +849,7 @@ async fn check_only_fake_is_filtered(v4: std::net::IpAddr, v6: std::net::IpAddr)
 }
 
 #[cfg(feature = "test-support")]
-async fn getent_fake_dns(database: &str) -> Result<std::net::IpAddr> {
+async fn getent_fake_dns(database: &str, domain: &str) -> Result<std::net::IpAddr> {
     let output = tokio::time::timeout(
         Duration::from_secs(6),
         tokio::process::Command::new("/usr/bin/setpriv")
@@ -831,7 +859,7 @@ async fn getent_fake_dns(database: &str) -> Result<std::net::IpAddr> {
                 "--clear-groups",
                 "/usr/bin/getent",
                 database,
-                "example.test",
+                domain,
             ])
             .kill_on_drop(true)
             .output(),
@@ -847,6 +875,44 @@ async fn getent_fake_dns(database: &str) -> Result<std::net::IpAddr> {
         .next()
         .ok_or_else(|| io::Error::other("Пустой ответ NSS"))?;
     Ok(first.parse()?)
+}
+
+#[cfg(feature = "test-support")]
+async fn check_fake_flow_blocked(server: std::net::SocketAddr) -> Result {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpStream, UdpSocket},
+    };
+
+    let tcp = async {
+        let mut stream = TcpStream::connect(server).await?;
+        stream.write_all(&[0x6d; ECHO_PAYLOAD_BYTES]).await?;
+        stream.read(&mut [0; 64]).await
+    };
+    let udp = async {
+        let socket = UdpSocket::bind(if server.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })
+        .await?;
+        socket.connect(server).await?;
+        socket.send(&[0x6d; ECHO_PAYLOAD_BYTES]).await?;
+        socket.recv(&mut [0; 64]).await
+    };
+    let bound = Duration::from_secs(2);
+    let (tcp, udp) = tokio::join!(
+        tokio::time::timeout(bound, tcp),
+        tokio::time::timeout(bound, udp)
+    );
+    require(
+        !matches!(tcp, Ok(Ok(bytes)) if bytes > 0),
+        "Block пропустил TCP через Fake-IP",
+    )?;
+    require(
+        !matches!(udp, Ok(Ok(_))),
+        "Block пропустил UDP через Fake-IP",
+    )
 }
 
 async fn start_with_output(

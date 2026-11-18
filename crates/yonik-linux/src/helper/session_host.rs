@@ -1624,12 +1624,12 @@ impl Backend {
             .policy
             .as_ref()
             .is_some_and(|policy| policy.requires_attribution());
-        if request.fake_dns_domains.is_some() {
+        if let Some(suffixes) = &request.fake_dns_domains {
             if attribution_required || bundle.is_some() {
                 return Err(ServiceError::Unsupported);
             }
             if let Some(policy) = &request.policy {
-                yonik_engine::validate_scoped_fake_dns_policy(policy.policy())
+                yonik_engine::validate_scoped_fake_dns_policy(policy.policy(), suffixes)
                     .map_err(|_| ServiceError::Unsupported)?;
             }
             self.fake_dns.check_cold_start()?;
@@ -1706,6 +1706,7 @@ impl Backend {
                     policy.policy(),
                     &tun,
                     &fake_dns.config,
+                    fake_dns.suffixes(),
                 )
                 .map_err(|_| ServiceError::Unsupported)?
             } else if let Some(bundle) = &bundle {

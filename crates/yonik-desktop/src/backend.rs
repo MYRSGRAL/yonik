@@ -1424,7 +1424,7 @@ impl Snapshot {
             .routing
             .policy()
             .map_err(|_| DesktopError("fake_dns_policy"))?;
-        yonik_engine::validate_scoped_fake_dns_policy(&policy)
+        yonik_engine::validate_scoped_fake_dns_policy(&policy, &self.system_fake_dns)
             .map_err(|_| DesktopError("fake_dns_policy"))
     }
 
