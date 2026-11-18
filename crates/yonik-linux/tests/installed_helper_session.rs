@@ -370,7 +370,10 @@ async fn installed_fake_dns(
         b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
     )?;
     let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
-    tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
+    // Стенд с сохранённым журналом может повторно использовать тот же пул.
+    if std::env::var_os("YONIK_EXPECT_CLEAN_FAKE_DNS_START").is_none() {
+        tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
+    }
     for engine in [Engine::Xray, Engine::SingBox] {
         let kill_switch = engine == Engine::Xray;
         require(

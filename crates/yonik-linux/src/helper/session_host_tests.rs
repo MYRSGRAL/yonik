@@ -2,6 +2,109 @@ use super::{
     RecoveryFailure, RecoveryHost, ServiceError, endpoint, keep_after_stop, parse_worker_uid,
     recover_ordered, same_link_contract,
 };
+
+struct StartupJournal(std::path::PathBuf);
+
+impl StartupJournal {
+    fn new(case: &str) -> Self {
+        let mut random = [0; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        Self(std::env::temp_dir().join(format!(
+            "yonik-startup-{case}-{:x}",
+            u64::from_le_bytes(random)
+        )))
+    }
+
+    fn owner() -> crate::managed_network::Ownership {
+        let (dev, ino) = super::super::namespace().unwrap();
+        crate::managed_network::Ownership::new(rustix::process::getuid().as_raw(), 77, 1, dev, ino)
+            .unwrap()
+    }
+}
+
+impl Drop for StartupJournal {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0.join("journal.json"));
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+#[test]
+fn fake_dns_startup_issues_immediately_without_previous_quarantine() {
+    use yonik_engine::fake_dns::{DnsEpoch, FakeDnsQuestion};
+
+    let path = StartupJournal::new("empty");
+    let epoch = DnsEpoch {
+        network: 1,
+        engine: 1,
+        resolver: 1,
+    };
+    let question = FakeDnsQuestion::parse(
+        b"\x01\x23\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x04test\x00\x00\x01\x00\x01",
+    )
+    .unwrap();
+    for journal_exists in [false, true] {
+        if journal_exists {
+            drop(crate::managed_network::Journal::open(&path.0, StartupJournal::owner()).unwrap());
+        }
+        let (journal, mut fake_dns) = super::super::open_startup_state(&path.0).unwrap();
+        assert_eq!(journal.is_some(), journal_exists);
+        assert!(fake_dns.check_cold_start().is_ok());
+        let leases = fake_dns.leases().unwrap();
+        leases.advance_epoch(epoch).unwrap();
+        let response = leases.synthesize(&question, epoch);
+        assert_eq!(response[3] & 15, 0);
+        assert_eq!(&response[6..8], &[0, 1]);
+        let tail: [u8; 10] = response[response.len() - 10..].try_into().unwrap();
+        let ttl = u32::from_be_bytes(tail[..4].try_into().unwrap());
+        assert!((1..=30).contains(&ttl));
+        assert_eq!(&tail[4..6], &[0, 4]);
+        let address = std::net::Ipv4Addr::new(tail[6], tail[7], tail[8], tail[9]);
+        assert_eq!(
+            leases.lookup(address.into(), epoch).unwrap().name.as_str(),
+            "example.test"
+        );
+    }
+}
+
+#[test]
+fn fake_dns_startup_waits_when_journal_contains_quarantine_intent() {
+    use crate::managed_network::{Journal, QuarantineIntent};
+
+    let path = StartupJournal::new("quarantine");
+    let owner = StartupJournal::owner();
+    let mut journal = Journal::open(&path.0, owner).unwrap();
+    journal
+        .begin_fake_quarantine(
+            owner,
+            42,
+            QuarantineIntent {
+                tun: None,
+                horizon_ms: 90_000,
+            },
+        )
+        .unwrap();
+    drop(journal);
+
+    let (_, mut fake_dns) = super::super::open_startup_state(&path.0).unwrap();
+    assert!(matches!(
+        fake_dns.check_cold_start(),
+        Err(ServiceError::Busy)
+    ));
+    assert!(matches!(fake_dns.leases(), Err(ServiceError::Busy)));
+}
+
+#[test]
+fn fake_dns_startup_fails_closed_when_journal_is_corrupt() {
+    let path = StartupJournal::new("corrupt");
+    drop(crate::managed_network::Journal::open(&path.0, StartupJournal::owner()).unwrap());
+    std::fs::write(path.0.join("journal.json"), b"{").unwrap();
+    assert!(matches!(
+        super::super::open_startup_state(&path.0),
+        Err(ServiceError::Unavailable)
+    ));
+}
+
 #[test]
 fn dns_proxy_static_route_facts_are_exact_and_never_uid_only() {
     let facts = crate::helper::native_profile_channel::dns_transport::fake_facts(
@@ -72,7 +175,7 @@ fn actor_fixture() -> super::super::SystemProtectionHost {
             active: None,
             tun_custody: None,
             registry: None,
-            fake_dns: super::session_fake_dns::FakeDnsState::new(),
+            fake_dns: super::session_fake_dns::FakeDnsState::new(None),
             fake_dns_reap: None,
             exited: std::sync::Arc::new(tokio::sync::Notify::new()),
             isolated: true,
@@ -326,7 +429,7 @@ async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_wor
         active: None,
         tun_custody: None,
         registry: None,
-        fake_dns: super::session_fake_dns::FakeDnsState::new(),
+        fake_dns: super::session_fake_dns::FakeDnsState::new(None),
         fake_dns_reap: None,
         exited: std::sync::Arc::new(tokio::sync::Notify::new()),
         isolated: true,

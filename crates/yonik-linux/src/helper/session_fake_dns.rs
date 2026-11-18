@@ -4,6 +4,7 @@ use crate::{
     Cancellation,
     fake_flow::WorkerOnlyLoopbackIsolation,
     fake_service::{FakeDnsBridgeListeners, FakeDnsLeases, MAX_FAKE_TTL},
+    managed_network::Journal,
     resolver::{
         PlainResolverSnapshot, ResolvConfLayout, ResolverError,
         forward::forward_query_name,
@@ -107,6 +108,7 @@ pub(super) fn canonical_suffixes(input: &[String]) -> Result<Vec<String>, Servic
 
 pub(super) struct FakeDnsState {
     started_at: Instant,
+    reuse_delay: Duration,
     leases: Option<Arc<FakeDnsLeases>>,
 }
 
@@ -147,15 +149,23 @@ impl PublicationHorizon {
 }
 
 impl FakeDnsState {
-    pub fn new() -> Self {
+    pub fn new(startup_journal: Option<&Journal>) -> Self {
+        // Даже незавершённый карантин сохраняет задержку после перезапуска.
+        // Фиксируем её до того, как восстановление может очистить запись.
+        let reuse_delay = if startup_journal.and_then(Journal::fake_quarantine).is_some() {
+            MAX_FAKE_TTL
+        } else {
+            Duration::ZERO
+        };
         Self {
             started_at: Instant::now(),
+            reuse_delay,
             leases: None,
         }
     }
 
     pub fn check_cold_start(&self) -> Result<(), ServiceError> {
-        if self.started_at.elapsed() >= MAX_FAKE_TTL {
+        if self.started_at.elapsed() >= self.reuse_delay {
             Ok(())
         } else {
             Err(ServiceError::Busy)
@@ -167,13 +177,13 @@ impl FakeDnsState {
         if let Some(leases) = &self.leases {
             return Ok(Arc::clone(leases));
         }
-        let leases = Arc::new(make_leases(self.started_at)?);
+        let leases = Arc::new(make_leases(self.started_at, self.reuse_delay)?);
         self.leases = Some(Arc::clone(&leases));
         Ok(leases)
     }
 }
 
-fn make_leases(started_at: Instant) -> Result<FakeDnsLeases, ServiceError> {
+fn make_leases(started_at: Instant, reuse_delay: Duration) -> Result<FakeDnsLeases, ServiceError> {
     let (IpAddr::V4(v4), IpAddr::V6(v6)) = (POOLS[0].0, POOLS[1].0) else {
         return Err(ServiceError::Unavailable);
     };
@@ -183,7 +193,11 @@ fn make_leases(started_at: Instant) -> Result<FakeDnsLeases, ServiceError> {
         (1..(1 << (128 - POOLS[1].1))).map(|offset| Ipv6Addr::from(u128::from(v6) + offset).into());
     let table = FakeIpLeaseTable::new(v4_addresses.chain(v6_addresses))
         .map_err(|_| ServiceError::Unavailable)?;
-    Ok(FakeDnsLeases::with_started_at(table, started_at))
+    Ok(FakeDnsLeases::with_startup_quarantine(
+        table,
+        started_at,
+        reuse_delay,
+    ))
 }
 
 pub(super) struct PreparedFakeDns {

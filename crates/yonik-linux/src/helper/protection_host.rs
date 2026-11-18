@@ -1,6 +1,7 @@
 //! Доверенный host public-protection IPC. Файловый I/O и nft работают в отдельной
 //! blocking-задаче: private D-Bus dispatcher не ждёт fsync на своём runtime.
 use super::service::{ProtectionHost, ProtectionState, ServiceError};
+use super::session_fake_dns::FakeDnsState;
 use super::{PreparedArtifact, PreparedContext, PreparedError};
 use crate::managed_network::{
     Journal, Ownership,
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     num::NonZeroU64,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -97,7 +98,7 @@ struct Backend {
     active: Option<ActiveSession>,
     tun_custody: Option<HelperTunCustody>,
     registry: Option<super::TrustedRegistry>,
-    fake_dns: super::session_fake_dns::FakeDnsState,
+    fake_dns: FakeDnsState,
     fake_dns_reap: Option<session_host::SafetyTask>,
     exited: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -144,6 +145,18 @@ fn namespace() -> Result<(u64, u64), ServiceError> {
     let metadata = std::fs::metadata("/proc/thread-self/ns/net").map_err(unavailable)?;
     Ok((metadata.dev(), metadata.ino()))
 }
+fn open_startup_state(path: &Path) -> Result<(Option<Journal>, FakeDnsState), ServiceError> {
+    let journal = Journal::open_existing(path).map_err(unavailable)?;
+    if journal
+        .as_ref()
+        .is_some_and(|j| Some(j.ownership().namespace()) != namespace().ok())
+    {
+        return Err(ServiceError::Unavailable);
+    }
+    let fake_dns = FakeDnsState::new(journal.as_ref());
+    Ok((journal, fake_dns))
+}
+
 impl SystemProtectionHost {
     pub async fn system(mut cancel: Cancellation) -> Result<Self, ServiceError> {
         if rustix::process::geteuid().as_raw() != 0 {
@@ -170,13 +183,7 @@ impl SystemProtectionHost {
         let exited = Arc::new(tokio::sync::Notify::new());
         let backend_exited = Arc::clone(&exited);
         let backend = tokio::task::spawn_blocking(move || {
-            let journal = Journal::open_existing(&path).map_err(unavailable)?;
-            if journal
-                .as_ref()
-                .is_some_and(|j| Some(j.ownership().namespace()) != namespace().ok())
-            {
-                return Err(ServiceError::Unavailable);
-            }
+            let (journal, fake_dns) = open_startup_state(&path)?;
             let _fixture_only = isolated;
             Ok::<_, ServiceError>(Backend {
                 profile_owner: None,
@@ -193,7 +200,7 @@ impl SystemProtectionHost {
                 active: None,
                 tun_custody: None,
                 registry: None,
-                fake_dns: super::session_fake_dns::FakeDnsState::new(),
+                fake_dns,
                 fake_dns_reap: None,
                 exited: backend_exited,
                 #[cfg(test)]

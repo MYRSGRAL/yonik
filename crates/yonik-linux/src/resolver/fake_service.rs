@@ -41,14 +41,18 @@ impl FakeDnsLeases {
     /// Холодный запуск ждёт максимальный TTL ранее опубликованных ответов.
     /// Это защищает адреса после перезапуска helper при том же пуле.
     pub fn new(table: FakeIpLeaseTable) -> Self {
-        Self::with_started_at(table, Instant::now())
+        Self::with_startup_quarantine(table, Instant::now(), MAX_FAKE_TTL)
     }
 
-    pub(crate) fn with_started_at(table: FakeIpLeaseTable, started_at: Instant) -> Self {
+    pub(crate) fn with_startup_quarantine(
+        table: FakeIpLeaseTable,
+        started_at: Instant,
+        ready_after: Duration,
+    ) -> Self {
         Self {
             table: Mutex::new(table),
             started_at,
-            ready_after: MAX_FAKE_TTL,
+            ready_after,
         }
     }
 
