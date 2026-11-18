@@ -3,6 +3,7 @@
 //! Снимок описывает daemon; наблюдения и peer credentials не дают права Apply.
 
 mod config;
+mod plain;
 mod resolve1;
 mod socket;
 mod wire;
@@ -77,6 +78,7 @@ mod host_layout_tests {
 }
 
 pub use config::*;
+pub use plain::{PlainResolverSnapshot, read_system_resolv_conf};
 #[cfg(feature = "test-support")]
 pub use resolve1::{Resolve1ApplyError, Resolve1Prepared, apply_link_dns, prepare_link_dns};
 pub use resolve1::{

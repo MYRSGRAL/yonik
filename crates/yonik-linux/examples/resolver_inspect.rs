@@ -15,6 +15,7 @@ mod linux {
         Host,
         Snapshot,
         Resolve1,
+        Plain,
         Watch,
     }
 
@@ -135,6 +136,21 @@ mod linux {
                     "atomic": false
                 }), cancel).await;
             }
+            Mode::Plain => {
+                let snapshot = tokio::task::spawn_blocking(yonik_linux::read_system_resolv_conf)
+                    .await
+                    .map_err(|_| ResolverError::Unavailable)??;
+                return emit(
+                    json!({
+                        "source": if snapshot.is_resolved_stub() { "plain_resolved_stub" } else { "plain_resolv_conf" },
+                        "servers": snapshot.nameservers().len(),
+                        "domains": snapshot.search_domains().len(),
+                        "search_configured": snapshot.search_configured(),
+                    }),
+                    cancel,
+                )
+                .await;
+            }
             Mode::Watch => {}
         }
         let mut subscription = yonik_linux::subscribe_resolver(cancel, STARTUP_TIMEOUT).await?;
@@ -168,6 +184,7 @@ mod linux {
             (None, None) => Ok(Mode::Snapshot),
             (Some(mode), None) if mode == "snapshot" => Ok(Mode::Snapshot),
             (Some(mode), None) if mode == "resolve1" => Ok(Mode::Resolve1),
+            (Some(mode), None) if mode == "plain" => Ok(Mode::Plain),
             (Some(mode), None) if mode == "watch" => Ok(Mode::Watch),
             (Some(mode), None) if mode == "host" => Ok(Mode::Host),
             _ => Err(ResolverError::Malformed),
