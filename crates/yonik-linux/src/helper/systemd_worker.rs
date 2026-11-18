@@ -1591,10 +1591,11 @@ impl SystemWorkerSupervisor {
                 (mode.socket(), SOCKET_IFACE),
             ] {
                 let unit = self.properties(name, UNIT_IFACE).await?;
+                let drop_ins = strings(&unit, "DropInPaths")?;
                 if string(&unit, "LoadState")? != "loaded"
                     || string(&unit, "FragmentPath")? != format!("/usr/lib/systemd/system/{name}")
                     || boolean(&unit, "Transient")?
-                    || !strings(&unit, "DropInPaths")?.is_empty()
+                    || !worker_drop_ins_allowed(name, &drop_ins)
                 {
                     return Err(WorkerSupervisorError::Untrusted);
                 }
@@ -1607,6 +1608,12 @@ impl SystemWorkerSupervisor {
                     }
                 }
                 let properties = self.properties(name, interface).await?;
+                if !drop_ins.is_empty() {
+                    verify_worker_timeout_abort_mask(name)?;
+                    if string(&properties, "TimeoutStopFailureMode")? != "terminate" {
+                        return Err(WorkerSupervisorError::Untrusted);
+                    }
+                }
                 if interface == SERVICE_IFACE {
                     validate_service(&properties, mode)?;
                 } else {
@@ -1616,6 +1623,44 @@ impl SystemWorkerSupervisor {
         }
         Ok(())
     }
+}
+const WORKER_TIMEOUT_ABORT_MASK: &str = "10-timeout-abort.conf";
+
+fn worker_drop_ins_allowed(name: &str, paths: &[String]) -> bool {
+    match paths {
+        [] => true,
+        [path] if matches!(name, "yonik-worker.service" | "yonik-worker-check.service") => {
+            path == &format!("/usr/lib/systemd/system/{name}.d/{WORKER_TIMEOUT_ABORT_MASK}")
+        }
+        _ => false,
+    }
+}
+
+fn verify_worker_timeout_abort_mask(name: &str) -> Result<()> {
+    // Fedora перечисляет даже замаскированный drop-in. Читаем саму ссылку
+    // из проверенного каталога по FD, не открывая её цель.
+    let directory = child(&systemd_unit_directory()?, &format!("{name}.d"))?;
+    let mask = File::from(
+        openat(
+            &directory,
+            WORKER_TIMEOUT_ABORT_MASK,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(unavailable)?,
+    );
+    let metadata = mask.metadata().map_err(unavailable)?;
+    if !metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || rustix::fs::readlinkat(&mask, "", Vec::new())
+            .map_err(unavailable)?
+            .as_bytes()
+            != b"/dev/null"
+    {
+        return Err(WorkerSupervisorError::Untrusted);
+    }
+    Ok(())
 }
 fn unavailable<T>(_: T) -> WorkerSupervisorError {
     WorkerSupervisorError::Unavailable
@@ -1880,11 +1925,16 @@ fn read_bounded(file: File) -> Result<String> {
     }
     Ok(contents)
 }
-pub(super) fn verify_installed() -> Result<()> {
+fn systemd_unit_directory() -> Result<File> {
     let mut parent = root()?;
     for component in ["usr", "lib", "systemd", "system"] {
         parent = child(&parent, component)?;
     }
+    Ok(parent)
+}
+
+pub(super) fn verify_installed() -> Result<()> {
+    let parent = systemd_unit_directory()?;
     for (name, expected) in [
         (
             "yonik-worker.service",

@@ -48,6 +48,32 @@ fn fixed_units_have_no_client_supplied_names() {
     );
 }
 
+#[test]
+fn worker_accepts_only_its_vendor_timeout_abort_mask() {
+    let worker = WorkerMode::Run.service();
+    let check = WorkerMode::Check.service();
+    let mask = |name| format!("/usr/lib/systemd/system/{name}.d/10-timeout-abort.conf");
+    assert!(worker_drop_ins_allowed(worker, &[]));
+    assert!(worker_drop_ins_allowed(worker, &[mask(worker)]));
+    assert!(worker_drop_ins_allowed(check, &[mask(check)]));
+    assert!(!worker_drop_ins_allowed(worker, &[mask(check)]));
+    assert!(!worker_drop_ins_allowed(
+        worker,
+        &[
+            mask(worker),
+            "/usr/lib/systemd/system/service.d/10-timeout-abort.conf".into()
+        ]
+    ));
+    assert!(!worker_drop_ins_allowed(
+        WorkerMode::Run.socket(),
+        &[mask(WorkerMode::Run.socket())]
+    ));
+    assert!(!worker_drop_ins_allowed(
+        worker,
+        &[mask(worker).replace("/usr/lib", "/etc")]
+    ));
+}
+
 use std::sync::Mutex;
 
 struct PrivateBus {
