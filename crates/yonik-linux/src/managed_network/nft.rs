@@ -1,10 +1,10 @@
 //! Типизированные nftables-ресурсы с durable-учётом и проверкой владения.
 //! Неоднозначность оставляет durable intent; Drop не обещает сетевую очистку.
-use super::firewall::PublicBlockPolicy;
 use super::{
     Journal, JournalError, NftFamily, Ownership, Reconciled, RecordState, Resource, Scope,
 };
-use rustix::fs::{self, FileType, Mode, OFlags};
+use super::{executable::NetworkTool, firewall::PublicBlockPolicy};
+use rustix::fs;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{fmt, fs::File, os::fd::AsRawFd, process::Stdio, sync::Arc, time::Duration};
@@ -19,10 +19,6 @@ const MAX_OUTPUT: usize = 256 * 1024;
 // удерживает общий permit до kill/wait, даже после Drop исходного executor.
 static PROCESS_LIMIT: Semaphore = Semaphore::const_new(1);
 const DEADLINE: Duration = Duration::from_secs(5);
-const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NftError {
@@ -185,47 +181,6 @@ fn observe_json(bytes: &[u8], expected: &Table) -> Result<Observation, NftError>
     Ok(found.map_or(Observation::Absent, Observation::Owned))
 }
 
-fn trusted_executable() -> Result<File, NftError> {
-    let mut directory = File::from(
-        fs::open("/", DIRECTORY_FLAGS, Mode::empty()).map_err(|_| NftError::UnsafeExecutable)?,
-    );
-    for name in ["usr", "bin"] {
-        check_trusted(&directory, false)?;
-        directory = File::from(
-            fs::openat(&directory, name, DIRECTORY_FLAGS, Mode::empty())
-                .map_err(|_| NftError::UnsafeExecutable)?,
-        );
-    }
-    check_trusted(&directory, false)?;
-    let file = File::from(
-        fs::openat(
-            &directory,
-            "nft",
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map_err(|_| NftError::UnsafeExecutable)?,
-    );
-    check_trusted(&file, true)?;
-    Ok(file)
-}
-fn check_trusted(file: &File, executable: bool) -> Result<(), NftError> {
-    let stat = fs::fstat(file).map_err(|_| NftError::UnsafeExecutable)?;
-    let expected = if executable {
-        FileType::RegularFile
-    } else {
-        FileType::Directory
-    };
-    if stat.st_uid != 0
-        || stat.st_mode & 0o022 != 0
-        || FileType::from_raw_mode(stat.st_mode) != expected
-        || executable
-            && (stat.st_nlink != 1 || stat.st_mode & 0o111 == 0 || stat.st_mode & 0o6000 != 0)
-    {
-        return Err(NftError::UnsafeExecutable);
-    }
-    Ok(())
-}
 fn namespace(file: &File) -> Result<(u64, u64), NftError> {
     let stat = fs::fstat(file).map_err(|_| NftError::Namespace)?;
     Ok((stat.st_dev, stat.st_ino))
@@ -246,7 +201,9 @@ impl NftExecutor {
             return Err(NftError::Namespace);
         }
         Ok(Self {
-            executable: trusted_executable()?,
+            executable: NetworkTool::Nft
+                .open()
+                .map_err(|_| NftError::UnsafeExecutable)?,
             netns,
             owner,
             gate: Arc::new(Semaphore::new(1)),

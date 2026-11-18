@@ -6,6 +6,7 @@
 //! Helper обязан сверить namespace, собственную метку ресурса и его атрибуты.
 //! Drop/отмена не очищает сеть и не удаляет неоднозначные намерения.
 
+mod executable;
 pub mod firewall;
 pub mod nft;
 mod policy_state;

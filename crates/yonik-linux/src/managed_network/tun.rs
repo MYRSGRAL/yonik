@@ -1,8 +1,9 @@
 //! Persistent single-queue TUN с durable intent и явной меткой владельца.
 //! Неотмеченный интерфейс после прерванного create никогда не присваивается.
+use super::executable::NetworkTool;
 use super::{Journal, JournalError, Ownership, Reconciled, RecordState, Resource, Scope};
 use crate::{Cancellation, LinuxLink, read_topology};
-use rustix::fs::{self, FileType, Mode, OFlags};
+use rustix::fs;
 use std::{
     fmt,
     fs::File,
@@ -93,47 +94,6 @@ fn namespace(file: &File) -> Result<(u64, u64), TunError> {
     let stat = fs::fstat(file).map_err(|_| TunError::Namespace)?;
     Ok((stat.st_dev, stat.st_ino))
 }
-fn trusted(file: &File, executable: bool) -> Result<(), TunError> {
-    let stat = fs::fstat(file).map_err(|_| TunError::UnsafeExecutable)?;
-    let kind = if executable {
-        FileType::RegularFile
-    } else {
-        FileType::Directory
-    };
-    if stat.st_uid != 0
-        || stat.st_mode & 0o022 != 0
-        || FileType::from_raw_mode(stat.st_mode) != kind
-        || executable
-            && (stat.st_nlink != 1 || stat.st_mode & 0o111 == 0 || stat.st_mode & 0o6000 != 0)
-    {
-        return Err(TunError::UnsafeExecutable);
-    }
-    Ok(())
-}
-fn executable() -> Result<File, TunError> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    let mut directory =
-        File::from(fs::open("/", flags, Mode::empty()).map_err(|_| TunError::UnsafeExecutable)?);
-    for name in ["usr", "bin"] {
-        trusted(&directory, false)?;
-        directory = File::from(
-            fs::openat(&directory, name, flags, Mode::empty())
-                .map_err(|_| TunError::UnsafeExecutable)?,
-        );
-    }
-    trusted(&directory, false)?;
-    let file = File::from(
-        fs::openat(
-            &directory,
-            "ip",
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map_err(|_| TunError::UnsafeExecutable)?,
-    );
-    trusted(&file, true)?;
-    Ok(file)
-}
 fn name(name_id: u32) -> Result<String, TunError> {
     if name_id == 0 {
         return Err(TunError::Invalid);
@@ -205,7 +165,9 @@ impl TunExecutor {
             return Err(TunError::Namespace);
         }
         Ok(Self {
-            executable: executable()?,
+            executable: NetworkTool::Ip
+                .open()
+                .map_err(|_| TunError::UnsafeExecutable)?,
             netns,
             owner,
         })
