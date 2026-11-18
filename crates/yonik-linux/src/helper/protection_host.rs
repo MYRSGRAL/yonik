@@ -80,6 +80,8 @@ pub struct SystemProtectionHost {
     runtime: tokio::runtime::Handle,
     _safety: Option<session_host::SafetyTask>,
 }
+const PROFILE_ADMISSION_BOUND: Duration = Duration::from_secs(2);
+
 struct Backend {
     profile_owner: Option<(std::sync::Weak<Mutex<Backend>>, tokio::runtime::Handle)>,
     path: PathBuf,
@@ -95,6 +97,8 @@ struct Backend {
     active: Option<ActiveSession>,
     tun_custody: Option<HelperTunCustody>,
     registry: Option<super::TrustedRegistry>,
+    fake_dns: super::session_fake_dns::FakeDnsState,
+    fake_dns_reap: Option<session_host::SafetyTask>,
     exited: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     isolated: bool,
@@ -189,6 +193,8 @@ impl SystemProtectionHost {
                 active: None,
                 tun_custody: None,
                 registry: None,
+                fake_dns: super::session_fake_dns::FakeDnsState::new(),
+                fake_dns_reap: None,
                 exited: backend_exited,
                 #[cfg(test)]
                 isolated,
@@ -221,8 +227,8 @@ impl SystemProtectionHost {
         cancel.check().map_err(|_| ServiceError::Cancelled)?;
         let shared = Arc::clone(&self.backend);
         let runtime = self.runtime.clone();
-        if matches!(operation, Operation::Stop(_)) {
-            // Единственный допущенный Stop ожидает FIFO gate до spawn_blocking.
+        if matches!(operation, Operation::Stop(_) | Operation::Unlock(_)) {
+            // Допущенная остановка или разблокировка ожидает FIFO gate до spawn_blocking.
             // Drop caller не отменяет уже допущенную задачу и durable cleanup.
             let slot = Arc::clone(&self.stop_admission)
                 .try_acquire_owned()
@@ -237,9 +243,15 @@ impl SystemProtectionHost {
             .await
             .map_err(unavailable)?;
         }
-        let permit = Arc::clone(&self.operations)
-            .try_acquire_owned()
-            .map_err(|_| super::service::busy_at("backend_operation_capacity"))?;
+        let operations = Arc::clone(&self.operations);
+        let permit = if matches!(operation, Operation::ApplyProfile(..)) {
+            let mut admission = cancel.clone();
+            wait_for_stop(operations, &mut admission, PROFILE_ADMISSION_BOUND).await?
+        } else {
+            operations
+                .try_acquire_owned()
+                .map_err(|_| super::service::busy_at("backend_operation_capacity"))?
+        };
         drop(self.backend.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => super::service::busy_at("backend_job_preflight"),
             _ => ServiceError::Unavailable,
@@ -527,6 +539,7 @@ impl Backend {
                 if self.has_session() || self.worker_uncertain {
                     return self.finish_session(uid, true).await.map(Reply::State);
                 }
+                self.recover_quarantine().await?;
                 if let Some(journal) = &self.journal {
                     let id = journal.public_policy().map(|p| p.id()).unwrap_or(1);
                     let mut executor = self.executor(owner)?;
@@ -657,7 +670,11 @@ impl ProtectionHost for SystemProtectionHost {
         else {
             return Err(ServiceError::Unavailable);
         };
-        let context = self.context(uid)?;
+        let context = artifact
+            .session
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .prepared_context();
         if !self._monitor.watch().current().is_current(artifact.stamp) {
             return Err(stale());
         }
@@ -688,6 +705,19 @@ impl ProtectionHost for SystemProtectionHost {
                 _ => ServiceError::Unavailable,
             })?
             .context(uid)
+    }
+    async fn context_for_apply(
+        &self,
+        uid: u32,
+        mut cancel: Cancellation,
+    ) -> Result<PreparedContext, ServiceError> {
+        let _permit = wait_for_stop(
+            Arc::clone(&self.operations),
+            &mut cancel,
+            PROFILE_ADMISSION_BOUND,
+        )
+        .await?;
+        self.context(uid)
     }
     async fn apply(
         &mut self,

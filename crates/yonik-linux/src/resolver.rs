@@ -4,7 +4,9 @@
 
 mod config;
 pub mod fake_service;
+pub mod forward;
 mod plain;
+pub(crate) mod plain_relay;
 pub(crate) mod resolve1;
 mod socket;
 mod wire;
@@ -79,6 +81,9 @@ mod host_layout_tests {
 }
 
 pub use config::*;
+#[cfg(feature = "test-support")]
+pub(crate) use plain::read_fixture_dns_source;
+pub(crate) use plain::read_managed_resolv_conf;
 pub use plain::{PlainResolverSnapshot, read_system_resolv_conf};
 #[cfg(feature = "test-support")]
 pub use resolve1::{Resolve1ApplyError, Resolve1Prepared, apply_link_dns, prepare_link_dns};

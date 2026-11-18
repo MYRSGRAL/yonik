@@ -22,7 +22,7 @@ tokio = { version = "1.48.0", features = ["rt", "macros", "process", "signal", "
 reqwest = { version = "0.12.24", default-features = false, features = ["socks", "rustls-tls-native-roots"] }
 sha2 = "0.10.9"
 hmac = "0.12.1"
-rustix = { version = "1.1.2", features = ["fs", "process", "net"] }
+rustix = { version = "1.1.2", features = ["fs", "process", "net", "time"] }
 zbus = { version = "=4.4.0", default-features = false, features = ["tokio"] }
 futures-util = "=0.3.34"
 rustls = { version = "0.23.46", default-features = false, features = ["std", "ring"] }

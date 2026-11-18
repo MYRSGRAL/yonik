@@ -82,12 +82,16 @@ impl FakeDnsLeases {
         if !question.is_supported() || !approved(&question) {
             return Some(question.refused());
         }
+        Some(self.synthesize(&question, epoch))
+    }
+
+    pub(crate) fn synthesize(&self, question: &FakeDnsQuestion, epoch: DnsEpoch) -> Vec<u8> {
         if !self.quarantine_remaining().is_zero() {
-            return Some(question.unavailable());
+            return question.unavailable();
         }
         let answer = self.table.lock().ok().and_then(|mut table| {
             answer_approved(
-                &question,
+                question,
                 &mut table,
                 epoch,
                 MAX_FAKE_TTL.as_secs() as u32,
@@ -95,7 +99,7 @@ impl FakeDnsLeases {
             )
             .ok()
         });
-        Some(answer.unwrap_or_else(|| question.unavailable()))
+        answer.unwrap_or_else(|| question.unavailable())
     }
 
     fn tick(&self) -> u64 {
@@ -233,7 +237,9 @@ impl FakeDnsListener {
             let (size, peer) = self.udp.recv_from(&mut packet).await?;
             if peer.ip().is_loopback() && size <= MAX_DNS_PACKET {
                 if let Some(response) = answer(&packet[..size]) {
-                    self.udp.send_to(&response, peer).await?;
+                    timeout(TCP_IDLE, self.udp.send_to(&response, peer))
+                        .await
+                        .map_err(|_| io::ErrorKind::TimedOut)??;
                 }
             }
         }

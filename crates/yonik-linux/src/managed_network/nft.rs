@@ -98,6 +98,7 @@ enum Action<'a> {
     InstallBlock(&'a Table, &'a PublicBlockPolicy),
     CheckBlock(&'a Table, &'a PublicBlockPolicy),
     ReplaceBlock(&'a Table, u64, &'a Table, &'a PublicBlockPolicy),
+    Quarantine(Vec<Value>),
 }
 fn request(action: Action<'_>) -> Value {
     let command = match action {
@@ -124,9 +125,13 @@ fn request(action: Action<'_>) -> Value {
             commands.extend(policy.commands(&new.name));
             return json!({"nftables": commands});
         }
+        Action::Quarantine(commands) => return json!({"nftables": commands}),
     };
     json!({"nftables":[command]})
 }
+
+#[path = "nft_quarantine.rs"]
+mod quarantine;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

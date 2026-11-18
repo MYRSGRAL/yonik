@@ -50,6 +50,23 @@ impl Journal {
         self.persist(document)
     }
 
+    /// После явной авторизации Unlock перезапуск продолжает разблокировку.
+    pub(crate) fn confirm_authorized_session_unlock(
+        &mut self,
+        ownership: Ownership,
+    ) -> Result<(), JournalError> {
+        self.check(ownership)?;
+        if !self
+            .session_recovery()
+            .is_some_and(SessionRecoveryRecord::kill_switch)
+        {
+            return Ok(());
+        }
+        let mut document = self.document.clone();
+        document.session_recovery = Some(SessionRecoveryRecord { kill_switch: false });
+        self.persist(document)
+    }
+
     /// Caller сначала доказывает пустой worker scope и завершает очистку сети.
     /// Публичная блокировка имеет независимый жизненный цикл.
     pub fn clear_session(&mut self, ownership: Ownership) -> Result<(), JournalError> {

@@ -72,6 +72,8 @@ fn actor_fixture() -> super::super::SystemProtectionHost {
             active: None,
             tun_custody: None,
             registry: None,
+            fake_dns: super::session_fake_dns::FakeDnsState::new(),
+            fake_dns_reap: None,
             exited: std::sync::Arc::new(tokio::sync::Notify::new()),
             isolated: true,
         })),
@@ -324,6 +326,8 @@ async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_wor
         active: None,
         tun_custody: None,
         registry: None,
+        fake_dns: super::session_fake_dns::FakeDnsState::new(),
+        fake_dns_reap: None,
         exited: std::sync::Arc::new(tokio::sync::Notify::new()),
         isolated: true,
     };
@@ -333,6 +337,7 @@ async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_wor
     .unwrap();
     let request = crate::helper::service::SystemProfileRequest {
         policy: None,
+        fake_dns_domains: None,
         peer: None,
         server: yonik_import::ServerIntent::from_server(&report.servers[0]).unwrap(),
         engine: yonik_engine::Engine::Xray,
@@ -773,6 +778,27 @@ async fn authorized_stop_waits_for_exact_backend_guard_used_by_safety() {
 }
 
 #[tokio::test]
+async fn prepared_context_waits_for_the_safety_operation() {
+    use crate::helper::ProtectionHost;
+
+    let host = actor_fixture();
+    let safety = std::sync::Arc::clone(&host.operations)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let (_keep, cancel) = crate::Cancellation::new();
+    let context = host.context_for_apply(1000, cancel);
+    tokio::pin!(context);
+    assert!(futures_util::poll!(context.as_mut()).is_pending());
+    drop(safety);
+    // Начальная топология тестового хоста может ещё не иметь покрытия маршрутов.
+    assert!(matches!(
+        context.await,
+        Ok(_) | Err(ServiceError::Unavailable)
+    ));
+}
+
+#[tokio::test]
 async fn dropped_authorized_stop_caller_keeps_bounded_slot_until_cleanup_ack() {
     let host = actor_fixture();
     let sweep = std::sync::Arc::clone(&host.operations)
@@ -862,6 +888,7 @@ async fn app_policy_denied_before_backend_resources() {
         engine: yonik_engine::Engine::Xray,
         kill_switch: false,
         policy: Some(policy),
+        fake_dns_domains: None,
         peer: None,
     };
     let (_keep, mut cancel) = crate::Cancellation::new();

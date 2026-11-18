@@ -7,14 +7,17 @@
 //! Drop/отмена не очищает сеть и не удаляет неоднозначные намерения.
 
 mod executable;
+mod fake_quarantine;
 pub mod firewall;
 pub mod nft;
 mod policy_state;
 pub mod private_bindings;
+mod quarantine_state;
 mod session_state;
 mod storage;
 pub mod tun;
 pub use policy_state::{PublicPolicyPhase, PublicPolicyRecord};
+pub(crate) use quarantine_state::{FAKE_POOLS, QuarantineIntent, QuarantineTun};
 pub use session_state::SessionRecoveryRecord;
 
 use serde::{Deserialize, Serialize};
@@ -273,10 +276,14 @@ struct Document {
     policy_sequence: u64,
     #[serde(deserialize_with = "session_state::deserialize_recovery")]
     session_recovery: Option<SessionRecoveryRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fake_quarantine: Option<quarantine_state::FakeQuarantineRecord>,
 }
 impl Document {
     fn validate(&self) -> Result<(), JournalError> {
-        if self.version != 3 {
+        if (self.version, self.fake_quarantine.is_some()) != (3, false)
+            && (self.version, self.fake_quarantine.is_some()) != (4, true)
+        {
             return Err(JournalError::Version);
         }
         self.ownership.validate()?;
@@ -312,6 +319,9 @@ impl Document {
         }
         if let Some(policy) = &self.public_policy {
             policy.validate(self)?;
+        }
+        if let Some(record) = &self.fake_quarantine {
+            record.validate(self)?;
         }
         Ok(())
     }
@@ -432,6 +442,7 @@ impl Journal {
             public_policy: None,
             policy_sequence: 0,
             session_recovery: None,
+            fake_quarantine: None,
         });
         if migrated {
             document.version = 3;
@@ -555,6 +566,17 @@ impl Journal {
                             return Err(JournalError::Conflict);
                         }
                         document.public_policy = None;
+                        if document
+                            .session_recovery
+                            .as_ref()
+                            .is_some_and(|session| !session.kill_switch())
+                            && !document
+                                .records
+                                .iter()
+                                .any(|record| record.scope == Scope::Session)
+                        {
+                            document.session_recovery = None;
+                        }
                     }
                 }
                 document.records.remove(index);

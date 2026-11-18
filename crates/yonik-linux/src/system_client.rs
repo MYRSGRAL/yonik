@@ -489,6 +489,34 @@ impl SystemClient {
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<Prepared, ClientError> {
+        self.prepare_profile_with_dns(server, engine, kill_switch, None, deadline, cancel)
+            .await
+    }
+
+    /// Стенд системного DNS использует обычный admission Prepare и ApplyOutputV1.
+    #[cfg(feature = "test-support")]
+    pub async fn prepare_fake_dns_profile(
+        &mut self,
+        server: &yonik_import::ServerIntent,
+        engine: yonik_engine::Engine,
+        kill_switch: bool,
+        domains: &[String],
+        deadline: Instant,
+        cancel: Cancellation,
+    ) -> Result<Prepared, ClientError> {
+        self.prepare_profile_with_dns(server, engine, kill_switch, Some(domains), deadline, cancel)
+            .await
+    }
+
+    async fn prepare_profile_with_dns(
+        &mut self,
+        server: &yonik_import::ServerIntent,
+        engine: yonik_engine::Engine,
+        kill_switch: bool,
+        domains: Option<&[String]>,
+        deadline: Instant,
+        cancel: Cancellation,
+    ) -> Result<Prepared, ClientError> {
         #[derive(serde::Serialize)]
         struct Request<'a> {
             version: u32,
@@ -496,16 +524,23 @@ impl SystemClient {
             engine: &'static str,
             kill_switch: bool,
             server: &'a yonik_import::ServerIntent,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            fake_dns_domains: Option<&'a [String]>,
         }
         let request = serde_json::to_string(&Request {
             version: 1,
-            mode: "system_profile",
+            mode: if domains.is_some() {
+                "system_profile_fake_dns"
+            } else {
+                "system_profile"
+            },
             engine: match engine {
                 yonik_engine::Engine::Xray => "xray",
                 yonik_engine::Engine::SingBox => "sing-box",
             },
             kill_switch,
             server,
+            fake_dns_domains: domains,
         })
         .map_err(|_| ClientError::InvalidRequest)?;
         let reply: PreparedReply = decode(&self.call("Prepare", request, deadline, cancel).await?)?;

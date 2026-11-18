@@ -27,8 +27,15 @@ pub struct SystemFakeDnsBridge {
     dns_port: NonZeroU16,
     lookup_port: NonZeroU16,
     reinject_port: NonZeroU16,
+    plain_dns_peers: Vec<PlainDnsPeer>,
     lookup_auth: ProbeCredentials,
     reinject_auth: ProbeCredentials,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlainDnsPeer {
+    address: IpAddr,
+    loopback_port: NonZeroU16,
 }
 
 impl SystemFakeDnsBridge {
@@ -63,6 +70,7 @@ impl SystemFakeDnsBridge {
             dns_port,
             lookup_port,
             reinject_port,
+            plain_dns_peers: Vec::new(),
             lookup_auth,
             reinject_auth,
         })
@@ -99,6 +107,64 @@ impl SystemFakeDnsBridge {
         self.loopback = address;
         Ok(self)
     }
+
+    /// Маршрутизирует точные peer:53 запросы из system-tun inbound на отдельные
+    /// listeners локального Fake DNS bridge. Порты предназначены для IPv4 lo.
+    pub fn with_plain_dns_peers(
+        mut self,
+        peers: Vec<(IpAddr, NonZeroU16)>,
+    ) -> Result<Self, CompileError> {
+        if peers.len() > 3 {
+            return Err(CompileError::InvalidParameter);
+        }
+        let mut typed = Vec::with_capacity(peers.len());
+        for (address, loopback_port) in peers {
+            if !valid_plain_dns_peer(address)
+                || address == self.dns_address
+                || self.pools.iter().any(|pool| pool.contains(address))
+                || typed
+                    .iter()
+                    .any(|existing: &PlainDnsPeer| existing.address == address)
+            {
+                return Err(CompileError::InvalidParameter);
+            }
+            if [self.dns_port, self.lookup_port, self.reinject_port].contains(&loopback_port)
+                || typed
+                    .iter()
+                    .any(|existing: &PlainDnsPeer| existing.loopback_port == loopback_port)
+            {
+                return Err(CompileError::ListenerConflict);
+            }
+            typed.push(PlainDnsPeer {
+                address,
+                loopback_port,
+            });
+        }
+        self.plain_dns_peers = typed;
+        Ok(self)
+    }
+}
+
+fn valid_plain_dns_peer(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || ip == Ipv4Addr::BROADCAST
+                || octets[0] == 0
+                || octets[0] >= 240
+                || (octets[0] == 169 && octets[1] == 254))
+        }
+        IpAddr::V6(ip) => {
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unicast_link_local()
+                || ip.to_ipv4_mapped().is_some())
+        }
+    }
 }
 
 fn reserved_prefix(address: IpAddr) -> Option<u8> {
@@ -126,6 +192,10 @@ pub fn compile_system_fake_dns_bridge(
     if remote.is_loopback()
         || bridge.dns_address == remote
         || bridge.pools.iter().any(|pool| pool.contains(remote))
+        || bridge
+            .plain_dns_peers
+            .iter()
+            .any(|peer| same_ip_address(peer.address, remote))
         || tun.addresses.iter().any(|address| {
             address.address == bridge.dns_address
                 || bridge
@@ -136,7 +206,12 @@ pub fn compile_system_fake_dns_bridge(
     {
         return Err(CompileError::InvalidParameter);
     }
-    if [bridge.dns_port, bridge.lookup_port, bridge.reinject_port].contains(&port) {
+    if [bridge.dns_port, bridge.lookup_port, bridge.reinject_port].contains(&port)
+        || bridge
+            .plain_dns_peers
+            .iter()
+            .any(|peer| peer.loopback_port == port)
+    {
         return Err(CompileError::ListenerConflict);
     }
 
@@ -159,19 +234,31 @@ pub fn compile_system_fake_dns_bridge(
 
     let (inbound, dns, socks) = match engine {
         Engine::Xray => {
+            let mut rules = Vec::with_capacity(bridge.plain_dns_peers.len() + 5);
+            for (index, peer) in bridge.plain_dns_peers.iter().enumerate() {
+                rules.push(json!({
+                    "type":"field",
+                    "inboundTag":["system-tun"],
+                    "ip":[ip_prefix(peer.address)],
+                    "port":"53",
+                    "network":"tcp,udp",
+                    "outboundTag":plain_dns_tag(index),
+                }));
+            }
+            rules.extend([
+                json!({"type":"field", "inboundTag":["system-tun"], "ip":[dns_prefix],
+                    "port":53, "network":"tcp,udp", "outboundTag":"fake-dns-stub"}),
+                json!({"type":"field", "inboundTag":["system-tun"], "ip":[dns_prefix],
+                    "outboundTag":"fake-dns-reject"}),
+                json!({"type":"field", "inboundTag":["system-tun"], "ip":pools,
+                    "outboundTag":"fake-ip-lookup"}),
+                json!({"type":"field", "inboundTag":["system-tun"], "ip":LINK_SCOPED_DESTINATIONS,
+                    "outboundTag":"fake-dns-reject"}),
+                json!({"type":"field", "inboundTag":["fake-ip-reinject"], "outboundTag":"proxy"}),
+            ]);
             config.value["routing"] = json!({
                 "domainStrategy": "AsIs",
-                "rules": [
-                    {"type":"field", "inboundTag":["system-tun"], "ip":[dns_prefix],
-                     "port":53, "network":"tcp,udp", "outboundTag":"fake-dns-stub"},
-                    {"type":"field", "inboundTag":["system-tun"], "ip":[dns_prefix],
-                     "outboundTag":"fake-dns-reject"},
-                    {"type":"field", "inboundTag":["system-tun"], "ip":pools,
-                     "outboundTag":"fake-ip-lookup"},
-                    {"type":"field", "inboundTag":["system-tun"], "ip":LINK_SCOPED_DESTINATIONS,
-                     "outboundTag":"fake-dns-reject"},
-                    {"type":"field", "inboundTag":["fake-ip-reinject"], "outboundTag":"proxy"},
-                ]
+                "rules": rules
             });
             config.value["outbounds"]
                 .as_array_mut()
@@ -192,15 +279,31 @@ pub fn compile_system_fake_dns_bridge(
             )
         }
         Engine::SingBox => {
-            config.value["route"]["rules"] = json!([
-                {"inbound":["system-tun"],"ip_cidr":[dns_prefix],"port":[53],
-                 "network":["tcp","udp"],"action":"route","outbound":"fake-dns-stub",
-                 "override_address":local,"override_port":dns_port},
-                {"inbound":["system-tun"],"ip_cidr":[dns_prefix],"action":"reject"},
-                {"inbound":["system-tun"],"ip_cidr":pools,"action":"route","outbound":"fake-ip-lookup"},
-                {"inbound":["system-tun"],"ip_cidr":LINK_SCOPED_DESTINATIONS,"action":"reject"},
-                {"inbound":["fake-ip-reinject"],"action":"route","outbound":"proxy"},
+            let mut rules = Vec::with_capacity(bridge.plain_dns_peers.len() + 5);
+            for peer in &bridge.plain_dns_peers {
+                rules.push(json!({
+                    "inbound":["system-tun"],
+                    "ip_cidr":[ip_prefix(peer.address)],
+                    "port":[53],
+                    "network":["tcp","udp"],
+                    "action":"route",
+                    "outbound":"fake-dns-stub",
+                    "override_address":local,
+                    "override_port":peer.loopback_port.get(),
+                }));
+            }
+            rules.extend([
+                json!({
+                    "inbound":["system-tun"],"ip_cidr":[dns_prefix],"port":[53],
+                    "network":["tcp","udp"],"action":"route","outbound":"fake-dns-stub",
+                    "override_address":local,"override_port":dns_port
+                }),
+                json!({"inbound":["system-tun"],"ip_cidr":[dns_prefix],"action":"reject"}),
+                json!({"inbound":["system-tun"],"ip_cidr":pools,"action":"route","outbound":"fake-ip-lookup"}),
+                json!({"inbound":["system-tun"],"ip_cidr":LINK_SCOPED_DESTINATIONS,"action":"reject"}),
+                json!({"inbound":["fake-ip-reinject"],"action":"route","outbound":"proxy"}),
             ]);
+            config.value["route"]["rules"] = json!(rules);
             (
                 json!({"type":"socks","tag":"fake-ip-reinject","listen":local,"listen_port":reinject_port,
                     "users":[{"username":reinject.username(),"password":reinject.password()}]}),
@@ -218,7 +321,44 @@ pub fn compile_system_fake_dns_bridge(
         .as_array_mut()
         .ok_or(CompileError::InvalidParameter)?
         .extend([dns, socks]);
+    if engine == Engine::Xray {
+        let outbounds = config.value["outbounds"]
+            .as_array_mut()
+            .ok_or(CompileError::InvalidParameter)?;
+        for (index, peer) in bridge.plain_dns_peers.iter().enumerate() {
+            let local_port = peer.loopback_port.get();
+            outbounds.push(json!({
+                "tag":plain_dns_tag(index),
+                "protocol":"freedom",
+                "settings":{
+                    "redirect":format!("{local}:{local_port}"),
+                    "finalRules":[
+                        {"action":"allow","network":"tcp,udp","ip":[format!("{local}/32")],
+                         "port":local_port.to_string()},
+                        {"action":"block"}
+                    ]
+                }
+            }));
+        }
+    }
     attach(config, tun)
+}
+
+fn plain_dns_tag(index: usize) -> String {
+    format!("fake-plain-dns-{index}")
+}
+
+fn ip_prefix(address: IpAddr) -> String {
+    format!("{address}/{}", if address.is_ipv4() { 32 } else { 128 })
+}
+
+fn same_ip_address(left: IpAddr, right: IpAddr) -> bool {
+    left == right
+        || matches!(
+            (left, right),
+            (IpAddr::V4(v4), IpAddr::V6(v6)) | (IpAddr::V6(v6), IpAddr::V4(v4))
+                if v6.to_ipv4_mapped() == Some(v4)
+        )
 }
 
 #[cfg(test)]
@@ -227,6 +367,20 @@ mod tests {
 
     fn port(value: u16) -> NonZeroU16 {
         NonZeroU16::new(value).unwrap()
+    }
+
+    fn empty_bridge() -> SystemFakeDnsBridge {
+        SystemFakeDnsBridge::new(
+            "198.18.0.2".parse().unwrap(),
+            vec![
+                "198.18.4.0/24".parse().unwrap(),
+                "fd10::/112".parse().unwrap(),
+            ],
+            port(12553),
+            port(12554),
+            port(12555),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -269,6 +423,7 @@ mod tests {
                 ),
                 Engine::SingBox => (&c.value["route"]["rules"], "inbound", "outbound", "ip_cidr"),
             };
+            assert_eq!(rules.as_array().unwrap().len(), 5);
             assert_eq!(rules[0][inbound], json!(["system-tun"]));
             assert_eq!(rules[0][outbound], "fake-dns-stub");
             assert_eq!(rules[1][inbound], json!(["system-tun"]));
@@ -314,6 +469,217 @@ mod tests {
                 port(1001),
                 port(1001),
                 port(1003),
+            ),
+            Err(CompileError::ListenerConflict)
+        ));
+    }
+
+    #[test]
+    fn plain_dns_peers_are_exactly_routed_to_isolated_loopback_listeners() {
+        let imported = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+        )
+        .unwrap();
+        let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        let peers = vec![
+            ("1.1.1.1".parse::<IpAddr>().unwrap(), port(12557)),
+            (
+                "2606:4700:4700::1111".parse::<IpAddr>().unwrap(),
+                port(12558),
+            ),
+        ];
+        let bridge = SystemFakeDnsBridge::new(
+            "198.18.0.2".parse().unwrap(),
+            vec![
+                "198.18.4.0/24".parse().unwrap(),
+                "fd10::/112".parse().unwrap(),
+            ],
+            port(12553),
+            port(12554),
+            port(12555),
+        )
+        .unwrap()
+        .with_isolated_loopback("127.42.7.9".parse().unwrap())
+        .unwrap()
+        .with_plain_dns_peers(peers.clone())
+        .unwrap();
+
+        for engine in [Engine::Xray, Engine::SingBox] {
+            let config = compile_system_fake_dns_bridge(
+                &imported.servers[0],
+                engine,
+                port(12556),
+                &tun,
+                &bridge,
+            )
+            .unwrap();
+            let rules = match engine {
+                Engine::Xray => &config.value["routing"]["rules"],
+                Engine::SingBox => &config.value["route"]["rules"],
+            };
+            assert_eq!(rules.as_array().unwrap().len(), 7);
+            for (index, (peer, local_port)) in peers.iter().enumerate() {
+                let rule = &rules[index];
+                let prefix = ip_prefix(*peer);
+                match engine {
+                    Engine::Xray => {
+                        let tag = plain_dns_tag(index);
+                        assert_eq!(rule["inboundTag"], json!(["system-tun"]));
+                        assert_eq!(rule["ip"], json!([prefix]));
+                        assert_eq!(rule["port"], "53");
+                        assert_eq!(rule["network"], "tcp,udp");
+                        assert_eq!(rule["outboundTag"], tag);
+                        let outbound = config.value["outbounds"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|outbound| outbound["tag"] == tag)
+                            .unwrap();
+                        assert_eq!(outbound["protocol"], "freedom");
+                        assert_eq!(
+                            outbound["settings"]["redirect"],
+                            format!("127.42.7.9:{}", local_port)
+                        );
+                        assert_eq!(
+                            outbound["settings"]["finalRules"][0],
+                            json!({
+                                "action":"allow","network":"tcp,udp","ip":["127.42.7.9/32"],
+                                "port":local_port.get().to_string()
+                            })
+                        );
+                        assert_eq!(
+                            outbound["settings"]["finalRules"][1],
+                            json!({"action":"block"})
+                        );
+                        assert!(!outbound["settings"].to_string().contains(&peer.to_string()));
+                    }
+                    Engine::SingBox => {
+                        assert_eq!(rule["inbound"], json!(["system-tun"]));
+                        assert_eq!(rule["ip_cidr"], json!([prefix]));
+                        assert_eq!(rule["port"], json!([53]));
+                        assert_eq!(rule["network"], json!(["tcp", "udp"]));
+                        assert_eq!(rule["outbound"], "fake-dns-stub");
+                        assert_eq!(rule["override_address"], "127.42.7.9");
+                        assert_eq!(rule["override_port"], local_port.get());
+                        assert!(
+                            !config.value["outbounds"]
+                                .to_string()
+                                .contains(&peer.to_string())
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                rules[2][match engine {
+                    Engine::Xray => "outboundTag",
+                    Engine::SingBox => "outbound",
+                }],
+                "fake-dns-stub"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_plain_dns_peers_and_listener_collisions() {
+        for address in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "255.255.255.255",
+            "224.0.0.1",
+            "169.254.1.1",
+            "240.0.0.1",
+            "::",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:203.0.113.1",
+            "198.18.0.2",
+            "198.18.4.5",
+            "fd10::5",
+        ] {
+            assert!(
+                matches!(
+                    empty_bridge()
+                        .with_plain_dns_peers(vec![(address.parse().unwrap(), port(12557))]),
+                    Err(CompileError::InvalidParameter)
+                ),
+                "адрес должен быть запрещён: {address}"
+            );
+        }
+        assert!(matches!(
+            empty_bridge().with_plain_dns_peers(vec![
+                ("1.1.1.1".parse().unwrap(), port(12557)),
+                ("1.1.1.1".parse().unwrap(), port(12558)),
+            ]),
+            Err(CompileError::InvalidParameter)
+        ));
+        assert!(matches!(
+            empty_bridge().with_plain_dns_peers(vec![
+                ("1.1.1.1".parse().unwrap(), port(12557)),
+                ("8.8.8.8".parse().unwrap(), port(12557)),
+            ]),
+            Err(CompileError::ListenerConflict)
+        ));
+        for reserved_port in [port(12553), port(12554), port(12555)] {
+            assert!(matches!(
+                empty_bridge()
+                    .with_plain_dns_peers(vec![("1.1.1.1".parse().unwrap(), reserved_port)]),
+                Err(CompileError::ListenerConflict)
+            ));
+        }
+        assert!(matches!(
+            empty_bridge().with_plain_dns_peers(vec![
+                ("1.1.1.1".parse().unwrap(), port(12557)),
+                ("8.8.8.8".parse().unwrap(), port(12558)),
+                ("9.9.9.9".parse().unwrap(), port(12559)),
+                ("208.67.222.222".parse().unwrap(), port(12560)),
+            ]),
+            Err(CompileError::InvalidParameter)
+        ));
+    }
+
+    #[test]
+    fn rejects_peer_collision_with_remote_and_base_listener_port() {
+        let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        let bridge = SystemFakeDnsBridge::new(
+            "198.18.0.2".parse().unwrap(),
+            vec![
+                "198.18.4.0/24".parse().unwrap(),
+                "fd10::/112".parse().unwrap(),
+            ],
+            port(12553),
+            port(12554),
+            port(12555),
+        )
+        .unwrap()
+        .with_plain_dns_peers(vec![("1.1.1.1".parse().unwrap(), port(12557))])
+        .unwrap();
+        let server = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@1.1.1.1:24443?security=none".to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            compile_system_fake_dns_bridge(
+                &server.servers[0],
+                Engine::Xray,
+                port(12556),
+                &tun,
+                &bridge,
+            ),
+            Err(CompileError::InvalidParameter)
+        ));
+
+        let server = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            compile_system_fake_dns_bridge(
+                &server.servers[0],
+                Engine::SingBox,
+                port(12557),
+                &tun,
+                &bridge,
             ),
             Err(CompileError::ListenerConflict)
         ));

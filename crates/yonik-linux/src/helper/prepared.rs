@@ -374,6 +374,24 @@ impl<A: PreparedArtifact> PreparedRequests<A> {
     where
         F: FnOnce() -> Result<PreparedContext, PreparedError>,
     {
+        self.claim_for_apply_deferred(message, handle, prompt, cancel, || {
+            std::future::ready(context())
+        })
+        .await
+    }
+
+    pub(super) async fn claim_for_apply_deferred<F, R>(
+        &self,
+        message: &Message,
+        handle: PreparedHandle,
+        prompt: Prompt,
+        cancel: Cancellation,
+        context: F,
+    ) -> Result<ClaimedArtifact<A>, PreparedError>
+    where
+        F: FnOnce() -> R,
+        R: Future<Output = Result<PreparedContext, PreparedError>>,
+    {
         let _permit = self
             .in_flight
             .try_acquire()
@@ -387,7 +405,7 @@ impl<A: PreparedArtifact> PreparedRequests<A> {
                 cancel.clone(),
             )
             .await?;
-        let current = context();
+        let current = context().await;
         let mut state = self.state.lock().map_err(|_| PreparedError::Unavailable)?;
         cancel.check().map_err(|_| PreparedError::Cancelled)?;
         state.entries.retain(|_, entry| entry.expires > self.now());

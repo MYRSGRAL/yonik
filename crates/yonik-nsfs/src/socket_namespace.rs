@@ -1,6 +1,7 @@
 //! Не ptrace и не generic ioctl: actual socket → retained network namespace FD.
 use std::{
     io,
+    num::NonZeroU32,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
 };
 trait Ops<S> {
@@ -51,6 +52,16 @@ pub fn socket_namespace(socket: impl AsFd) -> io::Result<OwnedFd> {
 /// Только чтение SO_MARK actual profile socket; не general getsockopt API.
 pub fn profile_socket_mark(socket: impl AsFd) -> io::Result<u32> {
     udp_raw::mark(socket.as_fd())
+}
+/// Устанавливает и перечитывает SO_MARK нового IP-сокета до connect.
+pub fn mark_unconnected_dns_socket(socket: impl AsFd, mark: NonZeroU32) -> io::Result<()> {
+    let fd = socket.as_fd();
+    match rustix::net::getpeername(fd) {
+        Ok(None) | Err(rustix::io::Errno::NOTCONN) => {}
+        Ok(Some(_)) => return Err(io::ErrorKind::AlreadyExists.into()),
+        Err(error) => return Err(error.into()),
+    }
+    udp_raw::mark_dns(fd, mark)
 }
 /// Consuming close ровно двух retained handles. Даже EINTR не повторяется:
 /// numeric FD после close больше не принадлежит caller. Ошибка означает Unknown.
@@ -148,7 +159,7 @@ fn udp_ancillary(bytes: &[u8]) -> io::Result<u32> {
 }
 #[allow(unsafe_code)]
 mod udp_raw {
-    use super::{UdpPeek, io, udp_ancillary};
+    use super::{NonZeroU32, UdpPeek, io, udp_ancillary};
     use std::os::fd::{AsRawFd, BorrowedFd};
     fn option(fd: BorrowedFd<'_>, level: i32, name: i32) -> io::Result<i32> {
         let mut value = 0i32;
@@ -187,6 +198,28 @@ mod udp_raw {
         } != 0
         {
             return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    pub(super) fn mark_dns(fd: BorrowedFd<'_>, value: NonZeroU32) -> io::Result<()> {
+        let domain = option(fd, libc::SOL_SOCKET, libc::SO_DOMAIN)?;
+        let socket_type = option(fd, libc::SOL_SOCKET, libc::SO_TYPE)?;
+        let protocol = option(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL)?;
+        if !matches!(domain, libc::AF_INET | libc::AF_INET6)
+            || !matches!(
+                (socket_type, protocol),
+                (libc::SOCK_DGRAM, libc::IPPROTO_UDP) | (libc::SOCK_STREAM, libc::IPPROTO_TCP)
+            )
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let current = mark(fd)?;
+        if current != 0 && current != value.get() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        set(fd, libc::SOL_SOCKET, libc::SO_MARK, value.get() as i32)?;
+        if mark(fd)? != value.get() {
+            return Err(io::ErrorKind::InvalidData.into());
         }
         Ok(())
     }

@@ -457,6 +457,7 @@ pub(super) async fn check_actual_boundaries_with_synthetic_inputs(
         )),
         memory: config_budget().reserve(1).unwrap(),
         native_owner_stamp: Some(backend.native_owner.reserve().unwrap()),
+        fake_dns: None,
     });
     // Реальный producer: отсутствие peer/canonical prerequisites не выдаёт record.
     assert!(
@@ -588,6 +589,7 @@ pub(super) async fn check_actual_boundaries_with_synthetic_inputs(
         attribution_required: false,
         peer: artifact.peer.clone(),
         memory: config_budget().reserve(1).unwrap(),
+        fake_dns: None,
         native_owner_stamp: Some(NativeArtifactStamp {
             session: artifact.native_owner_stamp.as_ref().unwrap().session,
             generation: artifact.native_owner_stamp.as_ref().unwrap().generation,

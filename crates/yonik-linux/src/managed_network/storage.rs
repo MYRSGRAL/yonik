@@ -182,6 +182,17 @@ pub(super) fn read(directory: &File) -> Result<Option<Document>, JournalError> {
         public_policy: Option<super::PublicPolicyRecord>,
         policy_sequence: u64,
     }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyV3 {
+        version: u32,
+        ownership: super::Ownership,
+        records: Vec<super::Record>,
+        public_policy: Option<super::PublicPolicyRecord>,
+        policy_sequence: u64,
+        #[serde(deserialize_with = "super::session_state::deserialize_recovery")]
+        session_recovery: Option<super::SessionRecoveryRecord>,
+    }
     let document = match value.get("version").and_then(serde_json::Value::as_u64) {
         Some(1) => {
             let legacy: LegacyV1 =
@@ -193,6 +204,7 @@ pub(super) fn read(directory: &File) -> Result<Option<Document>, JournalError> {
                 public_policy: None,
                 policy_sequence: 0,
                 session_recovery: None,
+                fake_quarantine: None,
             }
         }
         Some(2) => {
@@ -205,9 +217,23 @@ pub(super) fn read(directory: &File) -> Result<Option<Document>, JournalError> {
                 public_policy: legacy.public_policy,
                 policy_sequence: legacy.policy_sequence,
                 session_recovery: None,
+                fake_quarantine: None,
             }
         }
-        Some(3) => serde_json::from_slice(&bytes).map_err(|_| JournalError::Corrupt)?,
+        Some(3) => {
+            let legacy: LegacyV3 =
+                serde_json::from_slice(&bytes).map_err(|_| JournalError::Corrupt)?;
+            Document {
+                version: legacy.version,
+                ownership: legacy.ownership,
+                records: legacy.records,
+                public_policy: legacy.public_policy,
+                policy_sequence: legacy.policy_sequence,
+                session_recovery: legacy.session_recovery,
+                fake_quarantine: None,
+            }
+        }
+        Some(4) => serde_json::from_slice(&bytes).map_err(|_| JournalError::Corrupt)?,
         Some(_) => return Err(JournalError::Version),
         None => return Err(JournalError::Corrupt),
     };

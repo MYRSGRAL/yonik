@@ -224,7 +224,14 @@ async fn wait_for_fixture_link() -> Result {
 }
 
 async fn check_tun_traffic() -> Result {
-    use std::net::SocketAddr;
+    check_tun_traffic_to([
+        "198.18.0.2:40000".parse()?,
+        "[2001:db8:746f::2]:40000".parse()?,
+    ])
+    .await
+}
+
+async fn check_tun_traffic_to(servers: [std::net::SocketAddr; 2]) -> Result {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpStream, UdpSocket},
@@ -235,11 +242,12 @@ async fn check_tun_traffic() -> Result {
     const REPLY_BYTES: usize = PREFIX.len() + PAYLOAD_BYTES;
 
     tokio::time::timeout(Duration::from_secs(10), async {
-        for (server, bind) in [
-            ("198.18.0.2:40000", "0.0.0.0:0"),
-            ("[2001:db8:746f::2]:40000", "[::]:0"),
-        ] {
-            let server: SocketAddr = server.parse()?;
+        for server in servers {
+            let bind = if server.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
             let mut payload = [0u8; PAYLOAD_BYTES];
             getrandom::getrandom(&mut payload)
                 .map_err(|_| io::Error::other("Не удалось создать тестовую нагрузку"))?;
@@ -269,6 +277,439 @@ async fn check_tun_traffic() -> Result {
         Ok(())
     })
     .await?
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с тестовой сборкой установленного helper"]
+async fn production_helper_resolved_fake_dns() -> Result {
+    installed_fake_dns(None).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с контролируемым DNS за veth"]
+async fn production_helper_literal_fake_dns() -> Result {
+    installed_fake_dns(Some("10.203.1.2:53".parse()?)).await
+}
+
+#[cfg(feature = "test-support")]
+async fn installed_fake_dns(literal: Option<std::net::SocketAddr>) -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let empty = json!({"version":1});
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
+    for engine in [Engine::Xray, Engine::SingBox] {
+        let kill_switch = engine == Engine::Xray;
+        require(
+            state_after_route_events(&connection).await?["state"] == "no_managed_policy",
+            "VM не чистая",
+        )?;
+        let (_owner, token) = yonik_linux::Cancellation::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut client =
+            SystemClient::on_connection(connection.clone(), deadline, token.clone()).await?;
+        let domains = ["example.test".to_owned()];
+        let retry_until = tokio::time::Instant::now() + Duration::from_secs(3);
+        let prepared = loop {
+            let result = client
+                .prepare_fake_dns_profile(
+                    &server,
+                    engine,
+                    kill_switch,
+                    &domains,
+                    deadline,
+                    token.clone(),
+                )
+                .await;
+            if !matches!(result, Err(yonik_linux::system_client::ClientError::Busy))
+                || tokio::time::Instant::now() >= retry_until
+            {
+                break result?;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let output = PreparedOutput::bind(
+            prepared,
+            engine,
+            &yonik_linux::event_log::EventLog::new(),
+            1,
+        )?;
+        let (state, drain) = client.apply_output(output, deadline, token.clone()).await;
+        require(
+            state? == State::TunnelStarting,
+            "Сессия Fake DNS не запущена",
+        )?;
+        let drain = drain.ok_or_else(|| io::Error::other("Нет потока вывода ядра"))?;
+        require(
+            resolver_file_state()? == resolver_before,
+            "Запуск изменил /etc/resolv.conf",
+        )?;
+        let (v4, v6) = if let Some(peer) = literal {
+            let v4 = ask_fixture_dns(peer, "example.test", 1, false).await?;
+            let v6 = ask_fixture_dns(peer, "example.test", 28, true).await?;
+            for tcp in [false, true] {
+                require(
+                    ask_fixture_dns(peer, "real.test", 1, tcp).await?
+                        == "192.0.2.99".parse::<std::net::IpAddr>()?,
+                    "Тестовый real DNS получил неверный ответ",
+                )?;
+            }
+            (v4, v6)
+        } else {
+            (
+                getent_fake_dns("ahostsv4").await?,
+                getent_fake_dns("ahostsv6").await?,
+            )
+        };
+        require(
+            v4.is_ipv4() && v6.is_ipv6(),
+            "NSS вернул неверные семейства",
+        )?;
+        check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+        if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
+            check_https_through_tun(&certificate, literal.map(|_| v4)).await?;
+        }
+        let stopped = call(&connection, "Stop", empty.clone()).await?;
+        require(
+            if kill_switch {
+                stopped["state"] == "recovery_required" || stopped["state"] == "verified_rules"
+            } else {
+                stopped["state"] == "no_managed_policy"
+            },
+            "Stop не выполнил выбранную политику kill switch",
+        )?;
+        require(drain.drained().await, "Вывод worker не закрыт")?;
+        let mut cancel = token;
+        let snapshot =
+            yonik_linux::read_resolve1_snapshot(&mut cancel, Duration::from_secs(3)).await?;
+        require(
+            !snapshot
+                .domains
+                .iter()
+                .any(|domain| domain.name == "example.test"),
+            "Домен DNS пережил удаление TUN",
+        )?;
+        if kill_switch {
+            call(&connection, "Unlock", empty.clone()).await?;
+        }
+        check_only_fake_is_filtered(v4, v6).await?;
+        if literal.is_none() && kill_switch {
+            check_quarantine_after_firewall_reload(v4, v6).await?;
+        }
+        require(
+            resolver_file_state()? == resolver_before,
+            "Остановка изменила /etc/resolv.conf",
+        )?;
+        eprintln!(
+            "{engine:?} установленный helper, системный DNS, TCP/UDP IPv4/IPv6 и восстановление подтверждены"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn state_after_route_events(connection: &zbus::Connection) -> Result<Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let result = call(connection, "State", json!({"version":1})).await;
+        if !matches!(
+            result.as_ref().err().and_then(|error| error.downcast_ref::<zbus::Error>()),
+            Some(zbus::Error::MethodError(_, Some(body), _))
+                if serde_json::from_str::<Value>(body).is_ok_and(|body| body["error"] == "busy")
+        ) || tokio::time::Instant::now() >= deadline
+        {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn check_https_through_tun(
+    certificate: &std::ffi::OsStr,
+    fake_ip: Option<std::net::IpAddr>,
+) -> Result {
+    let certificate = reqwest::Certificate::from_pem(&fs::read(certificate)?)?;
+    let mut builder = reqwest::Client::builder()
+        .https_only(true)
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .add_root_certificate(certificate);
+    if let Some(ip) = fake_ip {
+        builder = builder.resolve("example.test", (ip, 443).into());
+    }
+    let doh_ip = "203.0.113.45:443".parse()?;
+    let client = builder.resolve("doh.test", doh_ip).build()?;
+    require(
+        client
+            .get("https://example.test/")
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .as_ref()
+            == b"YONIK_TLS_FIXTURE",
+        "Системный Fake-IP не доставил HTTPS с проверкой сертификата",
+    )?;
+    eprintln!("HTTPS с проверкой имени сертификата прошёл через Fake-IP");
+
+    let query =
+        b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04real\x04test\x00\x00\x01\x00\x01";
+    let response = client
+        .post("https://doh.test/dns-query")
+        .header(reqwest::header::CONTENT_TYPE, "application/dns-message")
+        .header(reqwest::header::ACCEPT, "application/dns-message")
+        .body(query.as_slice())
+        .send()
+        .await?
+        .error_for_status()?;
+    require(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            == Some("application/dns-message"),
+        "Контрольный DoH вернул неожиданный Content-Type",
+    )?;
+    let answer = response.bytes().await?;
+    require(
+        answer.len() == query.len() + 16
+            && answer[0..12] == b"\x00\x00\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"[..]
+            && answer[12..query.len()] == query[12..]
+            && answer.ends_with(&[192, 0, 2, 99]),
+        "Встроенный DoH не получил реальный ответ через HTTPS",
+    )?;
+    eprintln!("Контрольный DoH прошёл через TUN и вернул реальный адрес");
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn check_quarantine_after_firewall_reload(
+    v4: std::net::IpAddr,
+    v6: std::net::IpAddr,
+) -> Result {
+    let nft = if std::path::Path::new("/usr/bin/nft").is_file() {
+        "/usr/bin/nft"
+    } else {
+        "/usr/sbin/nft"
+    };
+    let output = Command::new(nft).args(["-j", "list", "tables"]).output()?;
+    require(output.status.success(), "Не прочитан список таблиц nft")?;
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let tables = document["nftables"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("Не получен список nft таблиц"))?;
+    let mut owned = tables.iter().filter_map(|entry| {
+        let table = &entry["table"];
+        let name = table["name"].as_str()?;
+        (table["family"] == "inet" && name.starts_with("yonik_q")).then_some(name)
+    });
+    let table = owned
+        .next()
+        .ok_or_else(|| io::Error::other("Нет таблицы Fake-IP"))?;
+    require(
+        owned.next().is_none(),
+        "Найдено более одной таблицы Fake-IP",
+    )?;
+    require(
+        Command::new(nft)
+            .args(["delete", "table", "inet", table])
+            .status()?
+            .success(),
+        "Не воспроизведена потеря таблицы Fake-IP",
+    )?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if Command::new(nft)
+            .args(["-j", "list", "table", "inet", table])
+            .output()?
+            .status
+            .success()
+        {
+            break;
+        }
+        require(
+            tokio::time::Instant::now() < deadline,
+            "Таблица Fake-IP не восстановилась",
+        )?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    check_only_fake_is_filtered(v4, v6).await?;
+    eprintln!("Защита выданных Fake-IP восстановилась после исчезновения таблицы nft");
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[derive(PartialEq, Eq)]
+struct ResolverFileState {
+    link: Option<std::path::PathBuf>,
+    entry: [u64; 5],
+    target: [u64; 5],
+    contents: Vec<u8>,
+}
+
+#[cfg(feature = "test-support")]
+fn resolver_file_state() -> Result<ResolverFileState> {
+    fn identity(metadata: &fs::Metadata) -> [u64; 5] {
+        [
+            metadata.dev(),
+            metadata.ino(),
+            u64::from(metadata.mode()),
+            u64::from(metadata.uid()),
+            u64::from(metadata.gid()),
+        ]
+    }
+
+    let path = "/etc/resolv.conf";
+    let entry = fs::symlink_metadata(path)?;
+    let link = entry
+        .is_symlink()
+        .then(|| fs::read_link(path))
+        .transpose()?;
+    Ok(ResolverFileState {
+        link,
+        entry: identity(&entry),
+        target: identity(&fs::metadata(path)?),
+        contents: fs::read(path)?,
+    })
+}
+
+#[cfg(feature = "test-support")]
+async fn ask_fixture_dns(
+    peer: std::net::SocketAddr,
+    name: &str,
+    qtype: u8,
+    tcp: bool,
+) -> Result<std::net::IpAddr> {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpStream, UdpSocket},
+    };
+    let mut query = b"\x22\x57\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00".to_vec();
+    for label in name.split('.') {
+        query.push(u8::try_from(label.len())?);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0, 0, qtype, 0, 1]);
+    let mut reply = [0; 512];
+    let count = tokio::time::timeout(Duration::from_secs(6), async {
+        if tcp {
+            let mut socket = TcpStream::connect(peer).await?;
+            socket.write_u16(query.len() as u16).await?;
+            socket.write_all(&query).await?;
+            let size = usize::from(socket.read_u16().await?);
+            if size > reply.len() {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            socket.read_exact(&mut reply[..size]).await?;
+            Ok(size)
+        } else {
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            socket.connect(peer).await?;
+            socket.send(&query).await?;
+            socket.recv(&mut reply).await
+        }
+    })
+    .await??;
+    let width = if qtype == 1 { 4 } else { 16 };
+    require(
+        count == query.len() + 12 + width
+            && reply[..2] == query[..2]
+            && reply[3] & 0xf == 0
+            && reply[6..8] == [0, 1]
+            && reply[12..query.len()] == query[12..],
+        "Тестовый DNS вернул ответ с другими полями",
+    )?;
+    let data = &reply[count - width..count];
+    if width == 4 {
+        Ok(<[u8; 4]>::try_from(data)?.into())
+    } else {
+        Ok(<[u8; 16]>::try_from(data)?.into())
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn check_only_fake_is_filtered(v4: std::net::IpAddr, v6: std::net::IpAddr) -> Result {
+    use tokio::net::{TcpStream, UdpSocket};
+
+    // Обычный маршрут до соседа снова работает сразу после Stop/Unlock.
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        TcpStream::connect("10.203.0.2:24443"),
+    )
+    .await??;
+    let ip = if std::path::Path::new("/usr/bin/ip").is_file() {
+        "/usr/bin/ip"
+    } else {
+        "/usr/sbin/ip"
+    };
+    for (address, family, bind, length) in [(v4, "-4", "0.0.0.0:0", 32), (v6, "-6", "[::]:0", 128)]
+    {
+        let prefix = format!("{address}/{length}");
+        // В отдельной VM намеренно создаём физический маршрут к старому адресу.
+        require(
+            Command::new(ip)
+                .args([family, "route", "add", &prefix, "dev", "yonik-outer"])
+                .status()?
+                .success(),
+            "Не создан контрольный физический маршрут",
+        )?;
+        let result = async {
+            let socket = UdpSocket::bind(bind).await?;
+            socket.send_to(b"old-fake", (address, 40_000)).await
+        }
+        .await;
+        require(
+            Command::new(ip)
+                .args([family, "route", "del", &prefix, "dev", "yonik-outer"])
+                .status()?
+                .success(),
+            "Не снят контрольный физический маршрут",
+        )?;
+        require(
+            result.is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied),
+            "Старый Fake-IP не заблокирован для физического выхода",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn getent_fake_dns(database: &str) -> Result<std::net::IpAddr> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(6),
+        tokio::process::Command::new("/usr/bin/setpriv")
+            .args([
+                "--reuid=65534",
+                "--regid=65534",
+                "--clear-groups",
+                "/usr/bin/getent",
+                database,
+                "example.test",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    require(
+        output.status.success(),
+        "NSS от имени обычного UID завершился ошибкой",
+    )?;
+    let output = std::str::from_utf8(&output.stdout)?;
+    let first = output
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| io::Error::other("Пустой ответ NSS"))?;
+    Ok(first.parse()?)
 }
 
 async fn start_with_output(

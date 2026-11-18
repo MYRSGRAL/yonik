@@ -2,10 +2,9 @@
 //!
 //! Это доказательство настроенных upstream/search-настроек, не доказательство
 //! того, что NSS/libc или другие процессы действительно читают этот файл.
-//! Симлинки, небезопасные файлы, нестабильная identity и неподдержанные директивы
-//! закрываются ошибкой без возврата частичного снимка.
+//! Обычный файл и известные пути DNS-менеджеров проверяются отдельно.
 
-use super::ResolverError;
+use super::{ResolvConfLayout, ResolverError};
 use std::{
     fs::{self, File, Metadata},
     io::Read,
@@ -65,6 +64,49 @@ pub fn read_system_resolv_conf() -> Result<PlainResolverSnapshot, ResolverError>
     read_path(Path::new(SYSTEM_RESOLV_CONF), 0)
 }
 
+pub(crate) fn read_managed_resolv_conf(
+    layout: ResolvConfLayout,
+) -> Result<PlainResolverSnapshot, ResolverError> {
+    let target = match layout {
+        ResolvConfLayout::NetworkManager => "/run/NetworkManager/resolv.conf",
+        ResolvConfLayout::Resolvconf => "/run/resolvconf/resolv.conf",
+        _ => return Err(ResolverError::Unsupported),
+    };
+    read_known_link(Path::new(SYSTEM_RESOLV_CONF), Path::new(target), 0)
+}
+
+fn read_known_link(
+    link: &Path,
+    target: &Path,
+    trusted_uid: u32,
+) -> Result<PlainResolverSnapshot, ResolverError> {
+    let parents = parent_fence(link, trusted_uid)?;
+    let identity = |path: &Path| -> Result<StatIdentity, ResolverError> {
+        let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+        if !metadata.is_symlink() || metadata.uid() != trusted_uid || metadata.nlink() != 1 {
+            return Err(ResolverError::Untrusted);
+        }
+        Ok(StatIdentity::from(&metadata))
+    };
+    let before = identity(link)?;
+    if fs::canonicalize(link).map_err(io_error)? != target {
+        return Err(ResolverError::Untrusted);
+    }
+    let parsed = read_path(target, trusted_uid)?;
+    if identity(link)? != before
+        || parent_fence(link, trusted_uid)? != parents
+        || fs::canonicalize(link).map_err(io_error)? != target
+    {
+        return Err(ResolverError::NetworkChanged);
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn read_fixture_dns_source() -> Result<PlainResolverSnapshot, ResolverError> {
+    read_path(Path::new("/run/yonik/fixture-dns-source"), 0)
+}
+
 fn read_path(path: &Path, trusted_uid: u32) -> Result<PlainResolverSnapshot, ResolverError> {
     read_path_with_hooks(path, trusted_uid, || {}, || {})
 }
@@ -85,15 +127,15 @@ where
     let initial_parents = parent_fence(path, trusted_uid)?;
 
     before_open();
-    let descriptor = rustix::fs::openat2(
-        rustix::fs::CWD,
-        path,
+    let parent = open_parent(&initial_parents, trusted_uid)?;
+    let descriptor = rustix::fs::openat(
+        &parent,
+        path.file_name().ok_or(ResolverError::Untrusted)?,
         rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::CLOEXEC
             | rustix::fs::OFlags::NONBLOCK
             | rustix::fs::OFlags::NOFOLLOW,
         rustix::fs::Mode::empty(),
-        rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|_| ResolverError::Untrusted)?;
     let mut file = File::from(descriptor);
@@ -129,6 +171,32 @@ where
     validate_file_metadata(&final_path_metadata, trusted_uid)?;
 
     parse_resolv_conf(&contents)
+}
+
+fn open_parent(
+    parents: &[(PathBuf, DirectoryIdentity)],
+    trusted_uid: u32,
+) -> Result<File, ResolverError> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let mut opened =
+        File::from(open("/", flags, Mode::empty()).map_err(|_| ResolverError::Untrusted)?);
+    for (index, (path, expected)) in parents.iter().enumerate() {
+        if index != 0 {
+            let name = path.file_name().ok_or(ResolverError::Untrusted)?;
+            opened = File::from(
+                openat(&opened, name, flags, Mode::empty())
+                    .map_err(|_| ResolverError::Untrusted)?,
+            );
+        }
+        let metadata = opened.metadata().map_err(io_error)?;
+        if DirectoryIdentity::from(&metadata) != *expected {
+            return Err(ResolverError::NetworkChanged);
+        }
+        validate_parent_metadata(&metadata, trusted_uid)?;
+    }
+    Ok(opened)
 }
 
 fn validate_file_metadata(metadata: &Metadata, trusted_uid: u32) -> Result<(), ResolverError> {
@@ -495,7 +563,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_upstream_and_directives_fail_closed() {
         for input in [
-            &b"nameserver 127.0.0.53\n"[..],
+            &b"nameserver 127.0.0.54\n"[..],
             b"nameserver ::1\n",
             b"nameserver fe80::1%eth0\n",
             b"nameserver fe80::1\n",
@@ -548,6 +616,27 @@ mod tests {
         );
         let other_uid = if fixture_uid() == 0 { u32::MAX } else { 0 };
         assert_eq!(read_path(&file, other_uid), Err(ResolverError::Untrusted));
+    }
+
+    #[test]
+    fn reads_a_managers_link_only_to_the_expected_path() {
+        let fixture = FixtureDirectory::new();
+        let expected = fixture.0.join("manager-dns");
+        let other = fixture.0.join("other-dns");
+        let link = fixture.0.join("os-dns");
+        write_file(&expected, b"nameserver 192.0.2.1\n");
+        write_file(&other, b"nameserver 192.0.2.2\n");
+        symlink(&expected, &link).unwrap();
+        let snapshot = read_known_link(&link, &expected, fixture_uid()).unwrap();
+        assert_eq!(
+            snapshot.nameservers(),
+            ["192.0.2.1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            read_known_link(&link, &other, fixture_uid()),
+            Err(ResolverError::Untrusted)
+        );
+        assert_eq!(fs::read_link(link).unwrap(), expected);
     }
 
     #[test]

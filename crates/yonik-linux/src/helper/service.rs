@@ -48,6 +48,7 @@ pub enum ServiceError {
     Cancelled,
 }
 pub(super) const STOP_WAIT_BOUND: Duration = Duration::from_secs(30);
+const APPLY_CONTEXT_BOUND: Duration = Duration::from_secs(2);
 async fn wait_for_host<'a, H>(
     host: &'a Mutex<H>,
     cancel: &mut Cancellation,
@@ -60,7 +61,7 @@ async fn wait_for_host<'a, H>(
     }
 }
 pub(super) fn busy_at(_stage: &str) -> ServiceError {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if std::env::var_os("YONIK_SESSION_DIAGNOSTICS").as_deref() == Some(std::ffi::OsStr::new("1")) {
         eprintln!("session busy stage={_stage}");
     }
@@ -107,6 +108,7 @@ pub struct SystemProfileRequest {
     pub engine: yonik_engine::Engine,
     pub kill_switch: bool,
     pub policy: Option<yonik_engine::policy_wire::SystemPolicy>,
+    pub(super) fake_dns_domains: Option<Vec<String>>,
     pub(crate) peer: Option<Arc<crate::attribution::PeerProcess>>,
 }
 impl std::fmt::Debug for SystemProfileRequest {
@@ -173,6 +175,13 @@ pub trait ProtectionHost: Send + 'static {
         async { Err(ServiceError::Unsupported) }
     }
     fn context(&self, uid: u32) -> Result<PreparedContext, ServiceError>;
+    fn context_for_apply(
+        &self,
+        uid: u32,
+        _cancel: Cancellation,
+    ) -> impl Future<Output = Result<PreparedContext, ServiceError>> + Send {
+        std::future::ready(self.context(uid))
+    }
     fn apply(
         &mut self,
         uid: u32,
@@ -245,6 +254,17 @@ struct PolicyProfilePrepareRequest<'a> {
     server: &'a serde_json::value::RawValue,
     #[serde(borrow)]
     policy: &'a serde_json::value::RawValue,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FakeDnsProfilePrepareRequest<'a> {
+    version: u32,
+    mode: String,
+    engine: ProfileEngine,
+    kill_switch: bool,
+    #[serde(borrow)]
+    server: &'a serde_json::value::RawValue,
+    fake_dns_domains: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -365,8 +385,8 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                     }
                     Ok(Request::Prepare(dto.allow_lan))
                 }
-                "system_profile" | "system_profile_policy" => {
-                    let (dto, policy) = if route.mode == "system_profile_policy" {
+                "system_profile" | "system_profile_policy" | "system_profile_fake_dns" => {
+                    let (dto, policy, fake_dns_domains) = if route.mode == "system_profile_policy" {
                         if !yonik_engine::policy_wire::bounded_depth(json, 6)
                             || !json.trim_start().starts_with('{')
                         {
@@ -386,11 +406,31 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                                 server: dto.server,
                             },
                             Some(policy),
+                            None,
+                        )
+                    } else if route.mode == "system_profile_fake_dns" {
+                        if !cfg!(feature = "test-support") {
+                            return Err(ServiceError::Unsupported);
+                        }
+                        let dto: FakeDnsProfilePrepareRequest<'_> =
+                            serde_json::from_str(json).map_err(|_| ServiceError::InvalidRequest)?;
+                        let domains =
+                            super::session_fake_dns::canonical_suffixes(&dto.fake_dns_domains)?;
+                        (
+                            ProfilePrepareRequest {
+                                version: dto.version,
+                                mode: dto.mode,
+                                engine: dto.engine,
+                                kill_switch: dto.kill_switch,
+                                server: dto.server,
+                            },
+                            None,
+                            Some(domains),
                         )
                     } else {
                         let dto: ProfilePrepareRequest<'_> =
                             serde_json::from_str(json).map_err(|_| ServiceError::InvalidRequest)?;
-                        (dto, None)
+                        (dto, None, None)
                     };
                     let dto: ProfilePrepareRequest<'_> = dto;
                     if dto.version != 1 || dto.mode != route.mode {
@@ -411,6 +451,7 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                         engine,
                         kill_switch: dto.kill_switch,
                         policy,
+                        fake_dns_domains,
                         peer: None,
                     })))
                 }
@@ -697,16 +738,26 @@ async fn dispatch<H: ProtectionHost>(
                 _ => None,
             };
             let mut guard = None;
+            let guard_slot = &mut guard;
+            let mut context_cancel = cancel.clone();
             let artifact = broker
-                .claim_for_apply(message, handle, Prompt::Allow, cancel.clone(), || {
-                    let locked = host.try_lock().map_err(|_| {
-                        let _ = busy_at("apply_outer_host");
-                        PreparedError::Capacity
-                    })?;
-                    let context = locked.context(uid).map_err(as_prepared)?;
-                    guard = Some(locked);
-                    Ok(context)
-                })
+                .claim_for_apply_deferred(
+                    message,
+                    handle,
+                    Prompt::Allow,
+                    cancel.clone(),
+                    || async move {
+                        let locked = wait_for_host(host, &mut context_cancel, APPLY_CONTEXT_BOUND)
+                            .await
+                            .map_err(as_prepared)?;
+                        let context = locked
+                            .context_for_apply(uid, context_cancel)
+                            .await
+                            .map_err(as_prepared)?;
+                        *guard_slot = Some(locked);
+                        Ok(context)
+                    },
+                )
                 .await?;
             let mut host = guard.ok_or(ServiceError::Unavailable)?;
             let state = if let Some(output) = output {

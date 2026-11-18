@@ -70,6 +70,59 @@ impl SessionNetworkPlan {
         };
         Ok(plan)
     }
+    pub(crate) fn reserve_for_fake_dns(
+        owner: Ownership,
+        baseline: &LinuxTopology,
+        engine: yonik_engine::Engine,
+        pools: &[(IpAddr, u8)],
+    ) -> Result<Self, TunError> {
+        if pools.iter().any(|&(network, length)| {
+            baseline
+                .addresses
+                .iter()
+                .any(|address| overlaps(network, length, address.address, address.prefix_len))
+                || baseline.routes.iter().any(|route| {
+                    route.destination.length != 0
+                        && overlaps(
+                            network,
+                            length,
+                            route.destination.address,
+                            route.destination.length,
+                        )
+                })
+        }) {
+            return Err(TunError::Foreign);
+        }
+        for _ in 0..ALLOCATION_ATTEMPTS {
+            let plan = Self::reserve_for_engine(owner, baseline, engine)?;
+            if plan.addresses.iter().all(|address| {
+                pools.iter().all(|&(network, length)| {
+                    !overlaps(address.address(), address.prefix_len(), network, length)
+                })
+            }) {
+                return Ok(plan);
+            }
+        }
+        Err(TunError::Foreign)
+    }
+    /// Служебный адрес назначения внутри IPv4 /30, где TUN получает .1.
+    pub(crate) fn fake_dns_marker(&self) -> Result<IpAddr, TunError> {
+        match self.addresses[0].address() {
+            IpAddr::V4(address) => {
+                let [a, b, c, 1] = address.octets() else {
+                    return Err(TunError::Invalid);
+                };
+                Ok(Ipv4Addr::new(a, b, c, 2).into())
+            }
+            _ => Err(TunError::Invalid),
+        }
+    }
+    pub(crate) fn quarantine_tun(&self, ifindex: u32) -> crate::managed_network::QuarantineTun {
+        crate::managed_network::QuarantineTun {
+            ifindex,
+            name_id: self.name,
+        }
+    }
     fn candidate(owner: Ownership, random: [u8; 24]) -> Result<Self, TunError> {
         let number = |offset| {
             u32::from_le_bytes([
