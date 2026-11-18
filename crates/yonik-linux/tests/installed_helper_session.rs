@@ -413,6 +413,105 @@ async fn production_helper_fake_dns_preserves_external_wireguard() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "выделенная Debian VM с systemd-resolved и приватным DNS за WireGuard"]
+async fn production_helper_xray_fake_dns_blocks_unbound_wireguard() -> Result {
+    installed_fake_dns_blocks_unbound_wireguard(Engine::Xray).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с systemd-resolved и приватным DNS за WireGuard"]
+async fn production_helper_sing_box_fake_dns_blocks_unbound_wireguard() -> Result {
+    installed_fake_dns_blocks_unbound_wireguard(Engine::SingBox).await
+}
+
+#[cfg(feature = "test-support")]
+async fn installed_fake_dns_blocks_unbound_wireguard(engine: Engine) -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+        r#"{"version":1,"default_action":"proxy","user_rules":[],"preset_rules":[],"lan":[],"private_networks":[],"private_domains":[]}"#,
+    )?;
+    let (_owner, token) = yonik_linux::Cancellation::new();
+    control_fixture_wireguard("connect")?;
+    control_fixture_wireguard("split-dns")?;
+    check_wireguard_traffic().await?;
+    require(
+        ask_fixture_dns("10.42.1.2:53".parse()?, "before.wg.test", 1, false).await?
+            == std::net::Ipv4Addr::new(10, 42, 1, 2),
+        "DNS-сервер стенда WireGuard не ответил напрямую",
+    )?;
+    check_wireguard_dns("before.wg.test").await?;
+    eprintln!("{engine:?}: приватные DNS и трафик доступны до запуска Fake DNS");
+
+    let drain =
+        start_fake_dns_in_vm(&connection, &server, engine, false, Some(&policy), &token).await?;
+    let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+    let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+    check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+    let dns = check_wireguard_dns("active.wg.test");
+    let block4 = check_fake_flow_blocked("10.42.1.2:40000".parse()?);
+    let block6 = check_fake_flow_blocked("[fd42:1::2]:40000".parse()?);
+    let (dns, block4, block6) = tokio::join!(dns, block4, block6);
+    call(&connection, "Stop", json!({"version":1})).await?;
+    require(
+        tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+        "Не остановлен worker",
+    )?;
+    check_wireguard_dns("after.wg.test").await?;
+    check_wireguard_traffic().await?;
+    check_only_fake_is_filtered(v4, v6).await?;
+    control_fixture_wireguard("stop-dns")?;
+    control_fixture_wireguard("disconnect")?;
+    require(
+        resolver_file_state()? == resolver_before,
+        "Проверка изменила /etc/resolv.conf",
+    )?;
+    block4?;
+    block6?;
+    require(
+        dns.is_err(),
+        "Приватный DNS неожиданно доступен во время Fake DNS",
+    )?;
+    let peer = Command::new("journalctl")
+        .args([
+            "-b",
+            "-u",
+            "yonik-dns-peer-fixture.service",
+            "-o",
+            "cat",
+            "--no-pager",
+        ])
+        .output()?;
+    require(peer.status.success(), "Не удалось прочитать журнал VLESS")?;
+    require(
+        !std::str::from_utf8(&peer.stdout)?.lines().any(|line| {
+            line.contains(" accepted ")
+                && (line.contains(":10.42.1.2:") || line.contains(":[fd42:1::2]:"))
+        }),
+        "VLESS получил пакеты приватной сети WireGuard",
+    )?;
+    eprintln!("{engine:?}: VLESS не получил приватный трафик. WireGuard восстановился после Stop");
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn check_wireguard_dns(name: &str) -> Result {
+    require(
+        getent_fake_dns("ahostsv4", name).await? == std::net::Ipv4Addr::new(10, 42, 1, 2),
+        "NSS не получил адрес от приватного DNS-сервера",
+    )
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная Debian VM с resolvconf и двумя DNS-серверами тестового peer"]
 async fn production_helper_fake_dns_after_resolvconf_update() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::Resolvconf).await

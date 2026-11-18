@@ -13,6 +13,7 @@
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
 | Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
 | Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, адрес резолвера опубликован менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock, истечение карантина и восстановление после смены адреса через `resolvconf -a` |
+| Debian 13.7, systemd-resolved и внешний WireGuard | Установленный helper, приватная DNS-зона и маршруты IPv4/IPv6 через WireGuard | Публичный Fake DNS работает, обнаруженные приватные префиксы блокируются во время сессии. Приватный DNS и TCP/UDP доступны до запуска и после Stop |
 | Debian 13.7, Xfce 4.20 и X11, ядро 6.12.117 | Обычный UID в активной сессии LightDM и штатный диалог polkit. Отдельные прогоны с systemd-resolved и resolvconf 1.94 | Системный TUN, Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и карантин Fake-IP |
 | Ubuntu 24.04.5 LTS без графической сессии | Установленный helper, ядро 6.8.0-147, nftables 1.0.9 | TUN, Fake DNS, HTTPS, DoH и восстановление правил. Отдельно проверены смена маршрута и отзыв DNS-зоны |
 | Ubuntu 24.04.5 LTS, GNOME Shell 46 и Wayland, Qt 6.4.2 | Видимый Qt-клиент в активной сессии GDM, обычный UID и штатная политика polkit | TUN, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и истечение карантина после остановки helper |
@@ -373,6 +374,18 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
   `/opt/yonik-gate/tools/fixtures` и использует `wg` в `/opt/yonik-gate/wg`.
   Передача приватного трафика через WireGuard во время активной сессии
   Yonik и приватный split DNS остаются в общей проверке VPN/G-DNS.
+- [x] Закрыть выход обнаруженных префиксов WireGuard через VLESS во время
+  системной сессии Fake DNS. До исправления в Debian 13.7 сервер VLESS
+  получил тестовые приватные TCP/UDP IPv4/IPv6 и TCP к DNS-серверу WireGuard.
+  Helper берёт маршруты с ненулевой длиной префикса из снимка топологии и
+  ставит запреты перед общим разрешением TUN. На Xray и sing-box при
+  выключенном kill switch публичные Fake A/AAAA и TCP/UDP продолжили
+  работать. В журнале VLESS отсутствовали подключения к контрольным адресам
+  WireGuard. Системный DNS обычного UID и приватные TCP/UDP прошли через
+  WireGuard до запуска и после Stop. Содержимое и метаданные
+  `/etc/resolv.conf` совпали до и после. Этот режим защищает обнаруженные
+  назначения, а доступ к ним во время сессии требует отдельной подтверждённой
+  привязки маршрута и транспорта WireGuard.
 - [ ] Для каждой принятой конфигурации проверить два порядка запуска
   стороннего VPN, сон/пробуждение, смену Wi-Fi, потерю DNS, падение ядра,
   повторное подключение, Stop и удаление пакета. Фиксировать точный состав
