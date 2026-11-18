@@ -4,6 +4,8 @@
 
 use serde_json::{Value, json};
 use std::{fs, io, os::unix::fs::MetadataExt, process::Command, time::Duration};
+use yonik_engine::Engine;
+use yonik_linux::system_client::{PreparedOutput, State, SystemClient, output::OutputDrain};
 const SERVICE_NAME: &str = "cloud.highpriority.yonik.Network1";
 const SERVICE_INTERFACE: &str = SERVICE_NAME;
 const SERVICE_PATH: &str = "/cloud/highpriority/yonik/Network";
@@ -158,19 +160,31 @@ async fn production_helper_authorized_uid_lifecycle() -> Result {
 #[tokio::test]
 #[ignore = "Root controller только в собственной disposable VM, настоящий установленный helper"]
 async fn production_helper_public_policy_survives_sigkill() -> Result {
-    lifecycle(None).await
+    lifecycle(None, false).await
 }
 
 #[tokio::test]
 #[ignore = "Только production helper VM с синтетическим peer и trusted registry"]
 async fn production_helper_system_profile_survives_sigkill() -> Result {
-    lifecycle(Some("xray")).await
+    lifecycle(Some(Engine::Xray), false).await
 }
 
 #[tokio::test]
 #[ignore = "Только production helper VM с синтетическим peer и доверенным sing-box"]
 async fn production_helper_sing_box_profile_survives_sigkill() -> Result {
-    lifecycle(Some("sing-box")).await
+    lifecycle(Some(Engine::SingBox), false).await
+}
+
+#[tokio::test]
+#[ignore = "Только disposable VM, реальный helper и дескрипторы вывода Xray"]
+async fn production_helper_xray_output_survives_sigkill() -> Result {
+    lifecycle(Some(Engine::Xray), true).await
+}
+
+#[tokio::test]
+#[ignore = "Только disposable VM, реальный helper и дескрипторы вывода sing-box"]
+async fn production_helper_sing_box_output_survives_sigkill() -> Result {
+    lifecycle(Some(Engine::SingBox), true).await
 }
 
 async fn wait_for_fixture_link() -> Result {
@@ -257,7 +271,33 @@ async fn check_tun_traffic() -> Result {
     .await?
 }
 
-async fn lifecycle(engine: Option<&str>) -> Result {
+async fn start_with_output(
+    connection: &zbus::Connection,
+    engine: Engine,
+    server: &yonik_import::ServerIntent,
+) -> Result<OutputDrain> {
+    let (_owner, cancel) = yonik_linux::Cancellation::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut client =
+        SystemClient::on_connection(connection.clone(), deadline, cancel.clone()).await?;
+    let prepared = client
+        .prepare_profile(server, engine, true, deadline, cancel.clone())
+        .await?;
+    let output = PreparedOutput::bind(
+        prepared,
+        engine,
+        &yonik_linux::event_log::EventLog::new(),
+        1,
+    )?;
+    let (state, drain) = client.apply_output(output, deadline, cancel).await;
+    require(
+        state? == State::TunnelStarting,
+        "ApplyOutputV1 не запустил TUN",
+    )?;
+    drain.ok_or_else(|| io::Error::other("Не получен поток вывода системного ядра").into())
+}
+
+async fn lifecycle(engine: Option<Engine>, with_output: bool) -> Result {
     guard()?;
     require(
         rustix::process::geteuid().is_root(),
@@ -276,33 +316,51 @@ async fn lifecycle(engine: Option<&str>) -> Result {
         "VM не чистая",
     )?;
     let original_pid = helper_pid()?;
-    let prepare = if let Some(engine) = engine {
+    let server = if profile {
         let imported = yonik_import::import_bytes(
             b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
         )?;
-        json!({"version":1,"mode":"system_profile","engine":engine,"kill_switch":true,"server":yonik_import::ServerIntent::from_server(&imported.servers[0])?})
+        Some(yonik_import::ServerIntent::from_server(
+            &imported.servers[0],
+        )?)
     } else {
-        json!({"version":1,"mode":"public_protection","allow_lan":false})
+        None
     };
-    let prepared = call(&connection, "Prepare", prepare).await?;
-    require(
-        prepared["handle"].as_array().is_some_and(|v| v.len() == 32),
-        "Неверный handle",
-    )?;
-    require(
-        call(
-            &connection,
-            "Apply",
-            json!({"version":1,"handle":prepared["handle"]}),
-        )
-        .await?["state"]
-            == if profile {
+    let drain = match (engine, server, with_output) {
+        (Some(engine), Some(server), true) => {
+            Some(start_with_output(&connection, engine, &server).await?)
+        }
+        (engine, server, false) => {
+            let prepare = if let (Some(engine), Some(server)) = (engine, server) {
+                let engine = match engine {
+                    Engine::Xray => "xray",
+                    Engine::SingBox => "sing-box",
+                };
+                json!({"version":1,"mode":"system_profile","engine":engine,"kill_switch":true,"server":server})
+            } else {
+                json!({"version":1,"mode":"public_protection","allow_lan":false})
+            };
+            let prepared = call(&connection, "Prepare", prepare).await?;
+            require(
+                prepared["handle"].as_array().is_some_and(|v| v.len() == 32),
+                "Неверный handle",
+            )?;
+            let actual = call(
+                &connection,
+                "Apply",
+                json!({"version":1,"handle":prepared["handle"]}),
+            )
+            .await?;
+            let expected = if profile {
                 "tunnel_starting"
             } else {
                 "verified_rules"
-            },
-        "Apply не подтвердил policy",
-    )?;
+            };
+            require(actual["state"] == expected, "Apply не подтвердил policy")?;
+            None
+        }
+        _ => return Err(io::Error::other("Нет профиля для ApplyOutputV1").into()),
+    };
     if !profile {
         require(
             call(&connection, "Stop", empty.clone()).await?["state"] == "verified_rules",
@@ -361,6 +419,10 @@ async fn lifecycle(engine: Option<&str>) -> Result {
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+    if let Some(drain) = drain {
+        let drained = tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?;
+        require(drained, "Чтение вывода worker не завершилось")?;
     }
     require(
         call(&connection, "Unlock", empty.clone()).await?["state"] == "no_managed_policy",
