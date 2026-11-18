@@ -5,6 +5,9 @@ use std::{fmt, net::IpAddr, num::NonZeroU16, str::FromStr};
 use yonik_domain::Policy;
 use yonik_import::ParsedServer;
 
+mod fake_bridge;
+pub use fake_bridge::{SystemFakeDnsBridge, compile_system_fake_dns_bridge};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SystemTunAddress {
     address: IpAddr,
