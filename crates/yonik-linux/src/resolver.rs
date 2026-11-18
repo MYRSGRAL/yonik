@@ -3,8 +3,9 @@
 //! Снимок описывает daemon; наблюдения и peer credentials не дают права Apply.
 
 mod config;
+pub mod fake_service;
 mod plain;
-mod resolve1;
+pub(crate) mod resolve1;
 mod socket;
 mod wire;
 

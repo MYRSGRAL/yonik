@@ -121,3 +121,6 @@ pub mod bundle_request;
 // Закрытый legacy worker output transport.
 #[cfg(target_os = "linux")]
 mod output_transport;
+
+#[cfg(target_os = "linux")]
+pub mod fake_flow;

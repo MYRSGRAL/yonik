@@ -222,7 +222,6 @@ fn bus_error(error: zbus::Error) -> ResolverError {
 /// существующие DNS/domain настройки считаются чужими и не перезаписываются.
 /// Caller предварительно обязан подтвердить, что `ifindex` принадлежит его TUN.
 /// Экспорт из `resolver.rs` отложен до интеграции caller.
-#[allow(dead_code)]
 pub async fn prepare_link_dns(
     ifindex: u32,
     marker: IpAddr,
@@ -246,7 +245,6 @@ pub async fn prepare_link_dns(
 /// interface. That interface lifetime is the cleanup mechanism for ambiguous and
 /// partial outcomes; this module deliberately never calls RevertLink or retries.
 /// Экспорт из `resolver.rs` отложен до интеграции caller.
-#[allow(dead_code)]
 pub async fn apply_link_dns(
     prepared: &Resolve1Prepared,
     timeout: Duration,
@@ -280,6 +278,37 @@ pub struct Resolve1Prepared {
     link_path: OwnedObjectPath,
     marker: IpAddr,
     route_domains: Vec<String>,
+}
+
+impl Resolve1Prepared {
+    pub(crate) async fn verify_active(&self) -> Result<(), ResolverError> {
+        let connection = &self.connection;
+        verify_owner(connection, &self.owner).await?;
+        let path = get_link_path(connection, &self.owner, self.ifindex as u32).await?;
+        if path != self.link_path {
+            return Err(ResolverError::NetworkChanged);
+        }
+        let (family, bytes) = encode_address(self.marker);
+        let expected = Resolve1LinkConfig {
+            dns: vec![(family, bytes.clone())],
+            dns_ex: vec![(family, bytes, 0, String::new())],
+            domains: self
+                .route_domains
+                .iter()
+                .map(|domain| (domain.clone(), true))
+                .collect(),
+        };
+        if read_link_config(connection, &self.owner, &path).await? != expected {
+            return Err(ResolverError::NetworkChanged);
+        }
+        ensure_manager_domains(
+            &manager_domains(connection, &self.owner).await?,
+            self.ifindex as u32,
+            &self.route_domains,
+            true,
+        )?;
+        verify_owner(connection, &self.owner).await
+    }
 }
 
 impl std::fmt::Debug for Resolve1Prepared {
@@ -355,9 +384,7 @@ async fn apply_prepared(
         .await
         .map_err(bus_error)?;
     let (family, bytes) = encode_address(prepared.marker);
-    let expected_dns = vec![(family, bytes.clone())];
-    // DNSEx stores raw s->port; zero means no override and resolves to port 53.
-    let expected_dns_ex = vec![(family, bytes, 0, String::new())];
+    let expected_dns = vec![(family, bytes)];
     let expected_domains = prepared
         .route_domains
         .iter()
@@ -391,25 +418,11 @@ async fn apply_prepared(
 
     // Mutation outcomes may be ambiguous at timeout/disconnect; never retry.
     let _: () = manager
-        .call("SetLinkDNS", &(prepared.ifindex, expected_dns.clone()))
+        .call("SetLinkDNS", &(prepared.ifindex, expected_dns))
         .await
         .map_err(bus_error)?;
 
-    verify_owner(connection, &prepared.owner).await?;
-    let readback = read_link_config(connection, &prepared.owner, &link_path).await?;
-    if readback.dns != expected_dns
-        || readback.dns_ex != expected_dns_ex
-        || readback.domains != expected_domains
-    {
-        return Err(ResolverError::NetworkChanged);
-    }
-    ensure_manager_domains(
-        &manager_domains(connection, &prepared.owner).await?,
-        prepared.ifindex as u32,
-        &prepared.route_domains,
-        true,
-    )?;
-    verify_owner(connection, &prepared.owner).await
+    prepared.verify_active().await
 }
 
 impl std::fmt::Display for Resolve1ApplyError {
@@ -419,9 +432,12 @@ impl std::fmt::Display for Resolve1ApplyError {
 }
 impl std::error::Error for Resolve1ApplyError {}
 
+type LinkDnsServerEx = (i32, Vec<u8>, u16, String);
+
+#[derive(PartialEq, Eq)]
 struct Resolve1LinkConfig {
     dns: Vec<(i32, Vec<u8>)>,
-    dns_ex: Vec<(i32, Vec<u8>, u16, String)>,
+    dns_ex: Vec<LinkDnsServerEx>,
     domains: Vec<(String, bool)>,
 }
 
@@ -454,7 +470,7 @@ async fn read_link_config(
         .await
         .map_err(bus_error)?;
     let dns = property_for::<Vec<(i32, Vec<u8>)>>(&proxy, LINK, "DNS").await?;
-    let dns_ex = property_for::<Vec<(i32, Vec<u8>, u16, String)>>(&proxy, LINK, "DNSEx").await?;
+    let dns_ex = property_for::<Vec<LinkDnsServerEx>>(&proxy, LINK, "DNSEx").await?;
     let domains = property_for::<Vec<(String, bool)>>(&proxy, LINK, "Domains").await?;
     if dns.len() > MAX_ENTRIES || dns_ex.len() > MAX_ENTRIES || domains.len() > MAX_ENTRIES {
         return Err(ResolverError::Limit);
@@ -670,7 +686,7 @@ mod tests {
     #[derive(Default)]
     struct MutationState {
         dns: Vec<(i32, Vec<u8>)>,
-        dns_ex: Vec<(i32, Vec<u8>, u16, String)>,
+        dns_ex: Vec<LinkDnsServerEx>,
         domains: Vec<(String, bool)>,
         foreign_domains: Vec<(i32, String, bool)>,
         set_dns_calls: usize,
@@ -755,7 +771,7 @@ mod tests {
             self.0.lock().unwrap().dns.clone()
         }
         #[zbus(property, name = "DNSEx")]
-        fn dns_ex(&self) -> zbus::fdo::Result<Vec<(i32, Vec<u8>, u16, String)>> {
+        fn dns_ex(&self) -> zbus::fdo::Result<Vec<LinkDnsServerEx>> {
             let state = self.0.lock().unwrap();
             if state.hide_dns_ex_after_domains && !state.domains.is_empty() {
                 return Err(zbus::fdo::Error::Failed("fixture DNSEx unavailable".into()));
@@ -855,19 +871,21 @@ mod tests {
         apply_link_dns(&prepared, Duration::from_secs(1))
             .await
             .unwrap();
-        let state = state.lock().unwrap();
-        assert_eq!(state.dns, vec![(2, vec![198, 18, 0, 1])]);
-        assert_eq!(
-            state.dns_ex,
-            vec![(2, vec![198, 18, 0, 1], 0, String::new())]
-        );
-        assert_eq!(
-            state.domains,
-            vec![("corp.example".into(), true), (".".into(), true)]
-        );
-        assert_eq!(state.set_dns_calls, 1);
-        assert_eq!(state.set_domains_calls, 1);
-        assert_eq!(state.events, vec!["domains", "dns"]);
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.dns, vec![(2, vec![198, 18, 0, 1])]);
+            assert_eq!(
+                state.dns_ex,
+                vec![(2, vec![198, 18, 0, 1], 0, String::new())]
+            );
+            assert_eq!(
+                state.domains,
+                vec![("corp.example".into(), true), (".".into(), true)]
+            );
+            assert_eq!(state.set_dns_calls, 1);
+            assert_eq!(state.set_domains_calls, 1);
+            assert_eq!(state.events, vec!["domains", "dns"]);
+        }
         server.close().await.unwrap();
     }
 
@@ -886,10 +904,12 @@ mod tests {
         )
         .await;
         assert_eq!(result.err(), Some(ResolverError::Untrusted));
-        let state = state.lock().unwrap();
-        assert_eq!(state.set_dns_calls, 0);
-        assert_eq!(state.set_domains_calls, 0);
-        assert_eq!(state.dns, vec![(2, vec![10, 0, 0, 53])]);
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.set_dns_calls, 0);
+            assert_eq!(state.set_domains_calls, 0);
+            assert_eq!(state.dns, vec![(2, vec![10, 0, 0, 53])]);
+        }
         server.close().await.unwrap();
     }
 
@@ -908,9 +928,11 @@ mod tests {
         )
         .await;
         assert_eq!(result.err(), Some(ResolverError::Untrusted));
-        let state = state.lock().unwrap();
-        assert_eq!(state.set_domains_calls, 0);
-        assert_eq!(state.set_dns_calls, 0);
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.set_domains_calls, 0);
+            assert_eq!(state.set_dns_calls, 0);
+        }
         server.close().await.unwrap();
 
         let state = std::sync::Arc::new(std::sync::Mutex::new(MutationState {
@@ -949,10 +971,12 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.error, ResolverError::Untrusted);
         assert!(failure.cleanup_required);
-        let state = state.lock().unwrap();
-        assert_eq!(state.set_domains_calls, 1);
-        assert_eq!(state.set_dns_calls, 0);
-        assert_eq!(state.events, vec!["domains"]);
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.set_domains_calls, 1);
+            assert_eq!(state.set_dns_calls, 0);
+            assert_eq!(state.events, vec!["domains"]);
+        }
         server.close().await.unwrap();
     }
 
@@ -976,9 +1000,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.error, ResolverError::Malformed);
         assert!(failure.cleanup_required);
-        let state = state.lock().unwrap();
-        assert_eq!(state.set_domains_calls, 1);
-        assert_eq!(state.set_dns_calls, 0);
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.set_domains_calls, 1);
+            assert_eq!(state.set_dns_calls, 0);
+        }
         server.close().await.unwrap();
     }
 
@@ -1002,12 +1028,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.error, ResolverError::Malformed);
         assert!(failure.cleanup_required);
-        let state = state.lock().unwrap();
-        assert!(state.dns.is_empty());
-        assert_eq!(state.domains, vec![("corp.example".into(), true)]);
-        assert_eq!(state.set_dns_calls, 1);
-        assert_eq!(state.set_domains_calls, 1);
-        assert_eq!(state.events, vec!["domains", "dns"]);
+        {
+            let state = state.lock().unwrap();
+            assert!(state.dns.is_empty());
+            assert_eq!(state.domains, vec![("corp.example".into(), true)]);
+            assert_eq!(state.set_dns_calls, 1);
+            assert_eq!(state.set_domains_calls, 1);
+            assert_eq!(state.events, vec!["domains", "dns"]);
+        }
         server.close().await.unwrap();
     }
 
