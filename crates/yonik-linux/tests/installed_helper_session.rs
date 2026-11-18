@@ -391,6 +391,199 @@ async fn production_helper_scoped_fake_dns_literal_direct_recovers() -> Result {
 }
 
 #[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с двумя путями до одного тестового VLESS peer"]
+async fn production_helper_fake_dns_after_route_switch() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::PeerRoute).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с активным systemd-resolved"]
+async fn production_helper_fake_dns_after_resolver_revert() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::ResolverLink).await
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FakeDnsNetworkChange {
+    PeerRoute,
+    ResolverLink,
+}
+
+#[cfg(feature = "test-support")]
+async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let empty = json!({"version":1});
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+        r#"{"version":1,"default_action":"proxy","user_rules":[],"preset_rules":[],"lan":[],"private_networks":[],"private_domains":[]}"#,
+    )?;
+    if std::env::var_os("YONIK_EXPECT_CLEAN_FAKE_DNS_START").is_none() {
+        tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
+    }
+    let (_owner, mut token) = yonik_linux::Cancellation::new();
+    for (engine, kill_switch) in [(Engine::Xray, true), (Engine::SingBox, false)] {
+        let drain = start_fake_dns_in_vm(
+            &connection,
+            &server,
+            engine,
+            kill_switch,
+            Some(&policy),
+            &token,
+        )
+        .await?;
+        let before_query = tokio::time::Instant::now();
+        let old_v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+        let old_v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+        check_tun_traffic_to([(old_v4, 40000).into(), (old_v6, 40000).into()]).await?;
+        match change {
+            FakeDnsNetworkChange::PeerRoute => change_fixture_peer_route("add")?,
+            FakeDnsNetworkChange::ResolverLink => revoke_fixture_link_dns(&mut token).await?,
+        }
+        // До закрытия вывода не обращаемся к helper по D-Bus. Только его
+        // наблюдатель сетевых событий может остановить этот worker.
+        require(
+            tokio::time::timeout(Duration::from_secs(10), drain.drained()).await?,
+            "Сетевой наблюдатель не остановил worker",
+        )?;
+        let state = state_after_route_events(&connection).await?;
+        require(
+            if kill_switch {
+                matches!(
+                    state["state"].as_str(),
+                    Some("recovery_required" | "verified_rules")
+                )
+            } else {
+                state["state"] == "no_managed_policy"
+            },
+            "Изменение сети нарушило выбранную политику kill switch",
+        )?;
+        let snapshot =
+            yonik_linux::read_resolve1_snapshot(&mut token, Duration::from_secs(3)).await?;
+        require(
+            !snapshot
+                .domains
+                .iter()
+                .any(|domain| domain.name == "example.test"),
+            "DNS-зона осталась после автоматической остановки",
+        )?;
+        if kill_switch {
+            call(&connection, "Unlock", empty.clone()).await?;
+        }
+        check_only_fake_is_filtered(old_v4, old_v6).await?;
+
+        let drain = start_fake_dns_in_vm(
+            &connection,
+            &server,
+            engine,
+            kill_switch,
+            Some(&policy),
+            &token,
+        )
+        .await?;
+        let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+        let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+        require(
+            before_query.elapsed() < yonik_linux::fake_service::MAX_FAKE_TTL,
+            "Повторное подключение превысило окно TTL прежних Fake-IP",
+        )?;
+        require(
+            v4 != old_v4 && v6 != old_v6,
+            "Новая сессия повторно выдала прежний Fake-IP",
+        )?;
+        check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+        for old in [old_v4, old_v6] {
+            check_fake_flow_blocked((old, 40000).into()).await?;
+        }
+        if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
+            check_https_through_tun(&certificate, None).await?;
+        }
+        call(&connection, "Stop", empty.clone()).await?;
+        require(
+            tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+            "Новый worker не остановлен",
+        )?;
+        if kill_switch {
+            call(&connection, "Unlock", empty.clone()).await?;
+        }
+        if change == FakeDnsNetworkChange::PeerRoute {
+            change_fixture_peer_route("del")?;
+        }
+        require(
+            resolver_file_state()? == resolver_before,
+            "Изменение сети повлияло на /etc/resolv.conf",
+        )?;
+        eprintln!(
+            "{engine:?} {change:?}: автоматическая остановка, отзыв DNS и повторное подключение подтверждены"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn revoke_fixture_link_dns(token: &mut yonik_linux::Cancellation) -> Result {
+    let snapshot = yonik_linux::read_resolve1_snapshot(token, Duration::from_secs(3)).await?;
+    let mut links = snapshot
+        .domains
+        .iter()
+        .filter_map(|domain| match domain.scope {
+            yonik_linux::Resolve1Scope::Link(index)
+                if domain.name == "example.test" && domain.route_only =>
+            {
+                Some(index)
+            }
+            _ => None,
+        });
+    let index = links
+        .next()
+        .ok_or_else(|| io::Error::other("DNS-зона TUN отсутствует"))?;
+    require(links.next().is_none(), "DNS-зона не уникальна в стенде")?;
+    require(
+        Command::new("/usr/bin/busctl")
+            .args([
+                "call",
+                "org.freedesktop.resolve1",
+                "/org/freedesktop/resolve1",
+                "org.freedesktop.resolve1.Manager",
+                "RevertLink",
+                "i",
+                &index.to_string(),
+            ])
+            .status()?
+            .success(),
+        "systemd-resolved не снял конфигурацию DNS TUN",
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn change_fixture_peer_route(operation: &str) -> Result {
+    require(
+        Command::new("/usr/bin/ip")
+            .args([
+                "-4",
+                "route",
+                operation,
+                "10.203.0.2/32",
+                "via",
+                "10.203.2.2",
+                "dev",
+                "yonik-alt",
+            ])
+            .status()?
+            .success(),
+        "Не удалось переключить маршрут тестового VLESS peer",
+    )
+}
+
+#[cfg(feature = "test-support")]
 async fn installed_fake_dns_with_domain_policy(
     witness: FakeDnsPolicyWitness,
     crash: bool,
@@ -460,68 +653,8 @@ async fn installed_fake_dns(
             "VM не чистая",
         )?;
         let (_owner, token) = yonik_linux::Cancellation::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut client =
-            SystemClient::on_connection(connection.clone(), deadline, token.clone()).await?;
-        let domains = ["example.test".to_owned()];
-        let retry_until = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut retried_stale = false;
-        let prepared = loop {
-            let result = if let Some(policy) = policy {
-                client
-                    .prepare_fake_dns_policy_profile(
-                        &server,
-                        engine,
-                        kill_switch,
-                        &domains,
-                        policy,
-                        deadline,
-                        token.clone(),
-                    )
-                    .await
-            } else {
-                client
-                    .prepare_fake_dns_profile(
-                        &server,
-                        engine,
-                        kill_switch,
-                        &domains,
-                        deadline,
-                        token.clone(),
-                    )
-                    .await
-            };
-            use yonik_linux::system_client::ClientError;
-            let now = tokio::time::Instant::now();
-            let retry_deadline = match result {
-                Err(ClientError::Busy) if now < retry_until => retry_until,
-                Err(ClientError::Stale) if policy.is_some() && !retried_stale && now < deadline => {
-                    retried_stale = true;
-                    eprintln!("{engine:?} Fake DNS: повтор Prepare после изменения сети");
-                    deadline
-                }
-                _ => {
-                    break result.map_err(|error| {
-                        io::Error::other(format!("{engine:?} Fake DNS Prepare: {error:?}"))
-                    })?;
-                }
-            };
-            tokio::time::sleep_until(retry_deadline.min(now + Duration::from_millis(50))).await;
-        };
-        let output = PreparedOutput::bind(
-            prepared,
-            engine,
-            &yonik_linux::event_log::EventLog::new(),
-            1,
-        )?;
-        let (state, drain) = client.apply_output(output, deadline, token.clone()).await;
-        require(
-            state.map_err(|error| {
-                io::Error::other(format!("{engine:?} Fake DNS ApplyOutputV1: {error:?}"))
-            })? == State::TunnelStarting,
-            "Сессия Fake DNS не запущена",
-        )?;
-        let drain = drain.ok_or_else(|| io::Error::other("Нет потока вывода ядра"))?;
+        let drain =
+            start_fake_dns_in_vm(&connection, &server, engine, kill_switch, policy, &token).await?;
         require(
             resolver_file_state()? == resolver_before,
             "Запуск изменил /etc/resolv.conf",
@@ -638,6 +771,79 @@ async fn installed_fake_dns(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn start_fake_dns_in_vm(
+    connection: &zbus::Connection,
+    server: &yonik_import::ServerIntent,
+    engine: Engine,
+    kill_switch: bool,
+    policy: Option<&yonik_engine::policy_wire::SystemPolicy>,
+    token: &yonik_linux::Cancellation,
+) -> Result<OutputDrain> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut client =
+        SystemClient::on_connection(connection.clone(), deadline, token.clone()).await?;
+    let domains = ["example.test".to_owned()];
+    let retry_until = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut retried_stale = false;
+    let prepared = loop {
+        let result = if let Some(policy) = policy {
+            client
+                .prepare_fake_dns_policy_profile(
+                    server,
+                    engine,
+                    kill_switch,
+                    &domains,
+                    policy,
+                    deadline,
+                    token.clone(),
+                )
+                .await
+        } else {
+            client
+                .prepare_fake_dns_profile(
+                    server,
+                    engine,
+                    kill_switch,
+                    &domains,
+                    deadline,
+                    token.clone(),
+                )
+                .await
+        };
+        use yonik_linux::system_client::ClientError;
+        let now = tokio::time::Instant::now();
+        let retry_deadline = match result {
+            Err(ClientError::Busy) if now < retry_until => retry_until,
+            Err(ClientError::Stale) if policy.is_some() && !retried_stale && now < deadline => {
+                retried_stale = true;
+                eprintln!("{engine:?} Fake DNS: повтор Prepare после изменения сети");
+                deadline
+            }
+            _ => {
+                break result.map_err(|error| {
+                    io::Error::other(format!("{engine:?} Fake DNS Prepare: {error:?}"))
+                })?;
+            }
+        };
+        tokio::time::sleep_until(retry_deadline.min(now + Duration::from_millis(50))).await;
+    };
+    let output = PreparedOutput::bind(
+        prepared,
+        engine,
+        &yonik_linux::event_log::EventLog::new(),
+        1,
+    )?;
+    let (state, drain) = client.apply_output(output, deadline, token.clone()).await;
+    require(
+        state.map_err(|error| {
+            io::Error::other(format!("{engine:?} Fake DNS ApplyOutputV1: {error:?}"))
+        })? == State::TunnelStarting,
+        "Сессия Fake DNS не запущена",
+    )?;
+    Ok(drain.ok_or_else(|| io::Error::other("Нет потока вывода ядра"))?)
 }
 
 #[cfg(feature = "test-support")]

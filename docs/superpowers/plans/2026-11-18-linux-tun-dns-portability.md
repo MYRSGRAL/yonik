@@ -11,10 +11,10 @@
 | Система | Путь проверки | Результат для Xray и sing-box |
 | --- | --- | --- |
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
-| Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP |
+| Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута и отзыв DNS-зоны |
 | Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, адрес резолвера опубликован менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock и истечение карантина после остановки helper |
 | Debian 13.7, Xfce 4.20 и X11, ядро 6.12.117 | Обычный UID в активной сессии LightDM и штатный диалог polkit. Отдельные прогоны с systemd-resolved и resolvconf 1.94 | Системный TUN, Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и карантин Fake-IP |
-| Ubuntu 24.04.5 LTS без графической сессии | Установленный helper, ядро 6.8.0-147, nftables 1.0.9 | TUN, Fake DNS, HTTPS, DoH и восстановление правил |
+| Ubuntu 24.04.5 LTS без графической сессии | Установленный helper, ядро 6.8.0-147, nftables 1.0.9 | TUN, Fake DNS, HTTPS, DoH и восстановление правил. Отдельно проверены смена маршрута и отзыв DNS-зоны |
 | Ubuntu 24.04.5 LTS, GNOME Shell 46 и Wayland, Qt 6.4.2 | Видимый Qt-клиент в активной сессии GDM, обычный UID и штатная политика polkit | TUN, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и истечение карантина после остановки helper |
 | Fedora Cloud 45, SELinux Enforcing | Установленный RPM, root-клиент на системной шине | TUN и Fake DNS, обновление при остановленном helper и удаление с истечением карантина |
 | Fedora Cloud 45 с GNOME Shell 51.1 и Wayland, SELinux Enforcing | Тот же RPM, обычный UID в активной сессии, системный D-Bus и штатный диалог polkit | TUN и Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop и удаление после пользовательской сессии |
@@ -320,6 +320,22 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
   пакетная политика polkit без этого правила. Клиент вызвал системный D-Bus
   напрямую. Интерфейс Qt, запуск из Fedora Workstation и X11 остаются за
   пределами этого прогона.
+- [x] Проверить реакцию установленного helper на смену интерфейса транспорта
+  и на отзыв DNS-зоны в Debian 13.7 и Ubuntu 24.04.5 LTS без графической
+  сессии. В первом сценарии маршрут к VLESS-серверу переключается с
+  `yonik-outer` на второй veth `yonik-alt` с локальным адресом
+  `10.203.2.1/30` и адресом сервера `10.203.2.2/30`. Журнал сервера подтверждает
+  новую точку выхода. Во втором сценарии стенд вызывает `RevertLink` у
+  systemd-resolved только для TUN. Оба движка останавливаются без вызова
+  Stop и снимают DNS-зону. Проверены сохранение kill switch на Xray и
+  автоматическое восстановление обычной сети на sing-box. Повторный
+  Prepare/Apply в пределах 30 секунд выдаёт другие Fake A/AAAA. Старые IP
+  блокируются и на физическом выходе, и в новой сессии. TCP/UDP, HTTPS и DoH
+  проходят после переподключения. Содержимое и метаданные
+  `/etc/resolv.conf` совпали до и после четырёх прогонов.
+  Тесты `production_helper_fake_dns_after_route_switch` и
+  `production_helper_fake_dns_after_resolver_revert` используют штатный
+  установленный helper и системную D-Bus шину.
 - [ ] Для каждой принятой конфигурации проверить два порядка запуска
   стороннего VPN, сон/пробуждение, смену Wi-Fi, потерю DNS, падение ядра,
   повторное подключение, Stop и удаление пакета. Фиксировать точный состав
