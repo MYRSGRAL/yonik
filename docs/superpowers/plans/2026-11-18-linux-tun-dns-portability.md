@@ -11,11 +11,11 @@
 | Система | Путь проверки | Результат для Xray и sing-box |
 | --- | --- | --- |
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
-| Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
+| Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, переподключение DHCPv4, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
 | Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, адрес резолвера опубликован менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock, истечение карантина и восстановление после смены адреса через `resolvconf -a` |
 | Debian 13.7, systemd-resolved и внешний WireGuard | Установленный helper, приватная DNS-зона и маршруты IPv4/IPv6 через WireGuard | Публичный Fake DNS работает, обнаруженные приватные префиксы блокируются во время сессии. Приватный DNS и TCP/UDP доступны до запуска и после Stop |
 | Debian 13.7, Xfce 4.20 и X11, ядро 6.12.117 | Обычный UID в активной сессии LightDM и штатный диалог polkit. Отдельные прогоны с systemd-resolved и resolvconf 1.94 | Системный TUN, Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и карантин Fake-IP |
-| Ubuntu 24.04.5 LTS без графической сессии | Установленный helper, ядро 6.8.0-147, nftables 1.0.9 | TUN, Fake DNS, HTTPS, DoH и восстановление правил. Отдельно проверены смена маршрута и отзыв DNS-зоны |
+| Ubuntu 24.04.5 LTS без графической сессии | Установленный helper, ядро 6.8.0-147, nftables 1.0.9 | TUN, Fake DNS, HTTPS, DoH и восстановление правил. Отдельно проверены смена маршрута, переподключение DHCPv4 и отзыв DNS-зоны |
 | Ubuntu 24.04.5 LTS, GNOME Shell 46 и Wayland, Qt 6.4.2 | Видимый Qt-клиент в активной сессии GDM, обычный UID и штатная политика polkit | TUN, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и истечение карантина после остановки helper |
 | Fedora Cloud 45, SELinux Enforcing | Установленный RPM, root-клиент на системной шине | TUN и Fake DNS, обновление при остановленном helper и удаление с истечением карантина |
 | Fedora Cloud 45 с GNOME Shell 51.1 и Wayland, SELinux Enforcing | Тот же RPM, обычный UID в активной сессии, системный D-Bus и штатный диалог polkit | TUN и Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop и удаление после пользовательской сессии |
@@ -140,8 +140,24 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
 выдали Fake A/AAAA через NSS и по TCP/UDP, а исходный DNS-сервер ответил на
 обычные запросы обоими транспортами. Сервер не получил запросов к тестовому
 домену Fake DNS. Содержимое и метаданные `/etc/resolv.conf` совпали до и
-после сессии. Проверки других DNS-менеджеров и смены DNS при реальном
-переподключении DHCP или VPN открыты.
+после сессии.
+
+- [x] Проверить переподключение DHCPv4 в Debian 13.7 и Ubuntu 24.04.5 LTS с
+  `systemd-networkd` и `systemd-resolved`. В тесте
+  `production_helper_fake_dns_after_dhcp_reconnect`
+  [стенд](../../../tools/fixtures/dhcp_dns_change.sh) разрывает тестовый линк.
+  Установленный helper сам останавливает worker и отзывает Fake DNS-зону.
+  После восстановления линка новый DNS из lease появляется в systemd-resolved
+  и отвечает на системный запрос с другим A-адресом. Xray с kill switch и
+  sing-box без него повторно подключаются до истечения TTL прежних Fake A/AAAA.
+  Старые адреса остаются заблокированы, оба обычных DNS-сервера обслуживают
+  свои запросы, файл `/etc/resolv.conf` сохраняет содержимое и метаданные.
+- [ ] Проверить штатное продление DHCPv4 во время активного TUN и другие
+  DNS-менеджеры. На Debian при `networkctl renew` с Xray и kill switch
+  `nft monitor trace` увидел реальный UDP-пакет с исходного порта 68 на
+  порт 67 и с выходным интерфейсом DHCP-линка. Цепочка output активной
+  сессии применила `policy drop`, до сервера запрос не дошёл. Для поддержки
+  продления требуется узкое разрешение, привязанное к DHCP-клиенту и лизу.
 
 ## 4. Fake DNS и проверка пакетов
 

@@ -527,12 +527,20 @@ async fn production_helper_fake_dns_after_resolvconf_update() -> Result {
 }
 
 #[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная VM с DHCPv4, systemd-networkd и systemd-resolved"]
+async fn production_helper_fake_dns_after_dhcp_reconnect() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::DhcpReconnect).await
+}
+
+#[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FakeDnsNetworkChange {
     PeerRoute,
     ResolverLink,
     WireGuard,
     Resolvconf,
+    DhcpReconnect,
 }
 
 #[cfg(feature = "test-support")]
@@ -555,6 +563,9 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
     }
     let (_owner, mut token) = yonik_linux::Cancellation::new();
     for (engine, kill_switch) in [(Engine::Xray, true), (Engine::SingBox, false)] {
+        if change == FakeDnsNetworkChange::DhcpReconnect {
+            check_dhcp_fixture_dns("10.203.2.1", &mut token).await?;
+        }
         let drain = start_fake_dns_in_vm(
             &connection,
             &server,
@@ -587,6 +598,7 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
                 resolver_before = published;
                 eprintln!("{engine:?}: resolvconf опубликовал новый DNS-сервер");
             }
+            FakeDnsNetworkChange::DhcpReconnect => control_dhcp_fixture("disconnect")?,
         }
         // До закрытия вывода не обращаемся к helper по D-Bus. Только его
         // наблюдатель сетевых событий может остановить этот worker.
@@ -619,6 +631,19 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         }
         if kill_switch {
             call(&connection, "Unlock", empty.clone()).await?;
+        }
+        if change == FakeDnsNetworkChange::DhcpReconnect {
+            control_dhcp_fixture("10.203.2.2")?;
+            check_dhcp_fixture_dns("10.203.2.2", &mut token).await?;
+            let answer = Command::new("/usr/bin/resolvectl")
+                .args(["query", "--cache=no", "--type=A", "real.test"])
+                .output()?;
+            require(
+                answer.status.success()
+                    && String::from_utf8_lossy(&answer.stdout).contains("192.0.2.100"),
+                "Системный резолвер не получил ответ нового DHCP DNS-сервера",
+            )?;
+            eprintln!("{engine:?}: восстановленный линк получил новый DNS через DHCP");
         }
         check_only_fake_is_filtered(old_v4, old_v6).await?;
         let wireguard = if change == FakeDnsNetworkChange::WireGuard {
@@ -686,11 +711,61 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             switch_fixture_resolver("10.203.1.2")?;
             resolver_before = resolver_file_state()?;
         }
+        if change == FakeDnsNetworkChange::DhcpReconnect {
+            control_dhcp_fixture("disconnect")?;
+            control_dhcp_fixture("10.203.2.1")?;
+            check_dhcp_fixture_dns("10.203.2.1", &mut token).await?;
+        }
         eprintln!(
             "{engine:?} {change:?}: автоматическая остановка, отзыв DNS и повторное подключение подтверждены"
         );
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn check_dhcp_fixture_dns(address: &str, token: &mut yonik_linux::Cancellation) -> Result {
+    let index = fs::read_to_string("/sys/class/net/yonik-dhcp/ifindex")?;
+    let index: u32 = index.trim().parse()?;
+    let lease_path = format!("/run/systemd/netif/leases/{index}");
+    let expected_lease = format!("DNS={address}");
+    let address = address.parse::<std::net::IpAddr>()?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        require(
+            !remaining.is_zero(),
+            "DHCP lease или DNS-контур не обновился",
+        )?;
+        let snapshot =
+            yonik_linux::read_resolve1_snapshot(token, remaining.min(Duration::from_secs(3)))
+                .await?;
+        let mut endpoints = snapshot
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.scope == yonik_linux::Resolve1Scope::Link(index));
+        if endpoints
+            .next()
+            .is_some_and(|endpoint| endpoint.address == address)
+            && endpoints.next().is_none()
+            && fs::read_to_string(&lease_path)
+                .is_ok_and(|lease| lease.lines().any(|line| line == expected_lease))
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn control_dhcp_fixture(action: &str) -> Result {
+    require(
+        Command::new("/opt/yonik-gate/dhcp-dns-change.sh")
+            .arg(action)
+            .status()?
+            .success(),
+        "Стенд не изменил состояние DHCP-линка",
+    )
 }
 
 #[cfg(feature = "test-support")]
