@@ -6,6 +6,7 @@
 
 use super::{ResolvConfLayout, ResolverError};
 use std::{
+    collections::BTreeSet,
     fs::{self, File, Metadata},
     io::Read,
     net::{IpAddr, Ipv4Addr},
@@ -26,6 +27,50 @@ pub struct PlainResolverSnapshot {
     nameservers: Vec<IpAddr>,
     search_domains: Vec<String>,
     search_configured: bool,
+    options: ResolverOptions,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct ResolverOptions {
+    flags: BTreeSet<&'static str>,
+    ndots: Option<u8>,
+    timeout: Option<u8>,
+    attempts: Option<u8>,
+}
+
+impl ResolverOptions {
+    fn observe(&mut self, option: &str) -> Result<(), ResolverError> {
+        const SUPPORTED_FLAGS: &[&str] = &[
+            "edns0",
+            "no-aaaa",
+            "no-tld-query",
+            "rotate",
+            "single-request",
+            "single-request-reopen",
+            "trust-ad",
+            "use-vc",
+        ];
+        if let Some(&flag) = SUPPORTED_FLAGS.iter().find(|flag| **flag == option) {
+            self.flags.insert(flag);
+            return Ok(());
+        }
+        let (name, value) = option.split_once(':').ok_or(ResolverError::Unsupported)?;
+        let target = match name {
+            "ndots" => (&mut self.ndots, 0..=15),
+            "timeout" => (&mut self.timeout, 1..=30),
+            "attempts" => (&mut self.attempts, 1..=5),
+            _ => return Err(ResolverError::Unsupported),
+        };
+        let number = value
+            .parse::<u8>()
+            .ok()
+            .filter(|number| {
+                value.bytes().all(|byte| byte.is_ascii_digit()) && target.1.contains(number)
+            })
+            .ok_or(ResolverError::Unsupported)?;
+        *target.0 = Some(number);
+        Ok(())
+    }
 }
 
 impl PlainResolverSnapshot {
@@ -327,7 +372,7 @@ fn parse_resolv_conf(contents: &[u8]) -> Result<PlainResolverSnapshot, ResolverE
     }
     let mut nameservers = Vec::with_capacity(GLIBC_MAX_NAMESERVERS);
     let mut nameserver_lines = 0usize;
-    let mut stub_options_seen = false;
+    let mut options = ResolverOptions::default();
     let mut search_domains = Vec::new();
     let mut search_configured = false;
 
@@ -373,28 +418,24 @@ fn parse_resolv_conf(contents: &[u8]) -> Result<PlainResolverSnapshot, ResolverE
                 search_domains = validate_search_domains(&values)?;
                 search_configured = true;
             }
-            "options"
-                if !values.is_empty()
-                    && values
-                        .iter()
-                        .all(|value| matches!(*value, "edns0" | "trust-ad")) =>
-            {
-                stub_options_seen = true;
+            "options" if !values.is_empty() => {
+                for option in values {
+                    options.observe(option)?;
+                }
             }
             _ => return Err(ResolverError::Unsupported),
         }
     }
 
     let stub_only = nameservers.as_slice() == [RESOLVED_STUB] && nameserver_lines == 1;
-    if nameservers.is_empty()
-        || (stub_options_seen || nameservers.contains(&RESOLVED_STUB)) && !stub_only
-    {
+    if nameservers.is_empty() || nameservers.contains(&RESOLVED_STUB) && !stub_only {
         return Err(ResolverError::Unsupported);
     }
     Ok(PlainResolverSnapshot {
         nameservers,
         search_domains,
         search_configured,
+        options,
     })
 }
 
@@ -537,7 +578,7 @@ mod tests {
         assert!(parse_resolv_conf(stub).unwrap().is_resolved_stub());
         let mixed = [stub.as_slice(), b"nameserver 192.0.2.1\n"].concat();
         assert_eq!(parse_resolv_conf(&mixed), Err(ResolverError::Unsupported));
-        let unknown = [stub.as_slice(), b"options rotate\n"].concat();
+        let unknown = [stub.as_slice(), b"options no-reload\n"].concat();
         assert_eq!(parse_resolv_conf(&unknown), Err(ResolverError::Unsupported));
     }
 
@@ -570,7 +611,7 @@ mod tests {
             b"nameserver 169.254.1.1\n",
             b"nameserver 0.0.0.0\n",
             b"nameserver 224.0.0.1\n",
-            b"nameserver 1.1.1.1\noptions ndots:2\n",
+            b"nameserver 1.1.1.1\noptions timeout:31\n",
             b"nameserver 1.1.1.1\ninclude /etc/resolv.conf\n",
         ] {
             assert_eq!(parse_resolv_conf(input), Err(ResolverError::Unsupported));
@@ -591,6 +632,28 @@ mod tests {
         );
         assert_eq!(
             parse_resolv_conf(b"# no configured nameservers\n"),
+            Err(ResolverError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn reads_common_options_for_literal_upstream_and_detects_option_changes() {
+        let base =
+            b"nameserver 192.0.2.1\noptions edns0 trust-ad rotate use-vc ndots:2 attempts:4\n";
+        let snapshot = parse_resolv_conf(base).unwrap();
+        assert_eq!(
+            snapshot.nameservers(),
+            ["192.0.2.1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(snapshot.options.ndots, Some(2));
+        assert_eq!(snapshot.options.attempts, Some(4));
+        assert!(snapshot.options.flags.contains("use-vc"));
+
+        let changed = [base.as_slice(), b"options ndots:3\n"].concat();
+        assert_ne!(parse_resolv_conf(&changed).unwrap(), snapshot);
+        let unsupported = [base.as_slice(), b"options no-reload\n"].concat();
+        assert_eq!(
+            parse_resolv_conf(&unsupported),
             Err(ResolverError::Unsupported)
         );
     }
