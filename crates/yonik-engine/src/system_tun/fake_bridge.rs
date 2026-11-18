@@ -2,9 +2,20 @@
 use super::{SystemTun, attach};
 use crate::{CompileError, CompiledConfig, Engine, compile, routing::ProbeCredentials};
 use serde_json::json;
-use std::{net::IpAddr, num::NonZeroU16};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
+    num::NonZeroU16,
+};
 use yonik_domain::Cidr;
 use yonik_import::ParsedServer;
+
+const LINK_SCOPED_DESTINATIONS: [&str; 5] = [
+    "169.254.0.0/16",
+    "224.0.0.0/4",
+    "255.255.255.255/32",
+    "fe80::/10",
+    "ff00::/8",
+];
 
 /// Только маршрутизация между принадлежащими сессии локальными службами.
 /// Host проверяет пересечение пулов с реальной топологией, держит службы и
@@ -12,6 +23,7 @@ use yonik_import::ParsedServer;
 pub struct SystemFakeDnsBridge {
     dns_address: IpAddr,
     pools: Vec<Cidr>,
+    loopback: Ipv4Addr,
     dns_port: NonZeroU16,
     lookup_port: NonZeroU16,
     reinject_port: NonZeroU16,
@@ -47,6 +59,7 @@ impl SystemFakeDnsBridge {
         Ok(Self {
             dns_address,
             pools,
+            loopback: Ipv4Addr::LOCALHOST,
             dns_port,
             lookup_port,
             reinject_port,
@@ -61,6 +74,30 @@ impl SystemFakeDnsBridge {
 
     pub fn reinject_auth(&self) -> &ProbeCredentials {
         &self.reinject_auth
+    }
+
+    pub fn reinject_endpoint(&self) -> SocketAddrV4 {
+        SocketAddrV4::new(self.loopback, self.reinject_port.get())
+    }
+
+    pub fn helper_endpoints(&self) -> [SocketAddrV4; 2] {
+        [
+            SocketAddrV4::new(self.loopback, self.dns_port.get()),
+            SocketAddrV4::new(self.loopback, self.lookup_port.get()),
+        ]
+    }
+
+    /// Адрес отдельно защищает host своим сетевым правилом до запуска служб.
+    pub fn with_isolated_loopback(mut self, address: Ipv4Addr) -> Result<Self, CompileError> {
+        if !address.is_loopback()
+            || address == Ipv4Addr::LOCALHOST
+            || address.octets() == [127, 255, 255, 255]
+            || address.octets() == [127, 0, 0, 0]
+        {
+            return Err(CompileError::InvalidParameter);
+        }
+        self.loopback = address;
+        Ok(self)
     }
 }
 
@@ -114,7 +151,7 @@ pub fn compile_system_fake_dns_bridge(
             128
         },
     );
-    let local = "127.0.0.1";
+    let local = bridge.loopback.to_string();
     let dns_port = bridge.dns_port.get();
     let lookup_port = bridge.lookup_port.get();
     let reinject_port = bridge.reinject_port.get();
@@ -131,6 +168,8 @@ pub fn compile_system_fake_dns_bridge(
                      "outboundTag":"fake-dns-reject"},
                     {"type":"field", "inboundTag":["system-tun"], "ip":pools,
                      "outboundTag":"fake-ip-lookup"},
+                    {"type":"field", "inboundTag":["system-tun"], "ip":LINK_SCOPED_DESTINATIONS,
+                     "outboundTag":"fake-dns-reject"},
                     {"type":"field", "inboundTag":["fake-ip-reinject"], "outboundTag":"proxy"},
                 ]
             });
@@ -144,7 +183,7 @@ pub fn compile_system_fake_dns_bridge(
                     "accounts":[{"user":reinject.username(),"pass":reinject.password()}]}}),
                 json!({"tag":"fake-dns-stub","protocol":"freedom","settings":{
                     "redirect":format!("{local}:{dns_port}"),
-                    "finalRules":[{"action":"allow","ip":["127.0.0.1/32"],"port":dns_port.to_string()}]
+                    "finalRules":[{"action":"allow","ip":[format!("{local}/32")],"port":dns_port.to_string()}]
                 }}),
                 json!({"tag":"fake-ip-lookup","protocol":"socks","settings":{"servers":[{
                     "address":local,"port":lookup_port,
@@ -159,6 +198,7 @@ pub fn compile_system_fake_dns_bridge(
                  "override_address":local,"override_port":dns_port},
                 {"inbound":["system-tun"],"ip_cidr":[dns_prefix],"action":"reject"},
                 {"inbound":["system-tun"],"ip_cidr":pools,"action":"route","outbound":"fake-ip-lookup"},
+                {"inbound":["system-tun"],"ip_cidr":LINK_SCOPED_DESTINATIONS,"action":"reject"},
                 {"inbound":["fake-ip-reinject"],"action":"route","outbound":"proxy"},
             ]);
             (
@@ -220,18 +260,24 @@ mod tests {
                 &bridge,
             )
             .unwrap();
-            let (rules, inbound, outbound) = match engine {
-                Engine::Xray => (&c.value["routing"]["rules"], "inboundTag", "outboundTag"),
-                Engine::SingBox => (&c.value["route"]["rules"], "inbound", "outbound"),
+            let (rules, inbound, outbound, prefixes) = match engine {
+                Engine::Xray => (
+                    &c.value["routing"]["rules"],
+                    "inboundTag",
+                    "outboundTag",
+                    "ip",
+                ),
+                Engine::SingBox => (&c.value["route"]["rules"], "inbound", "outbound", "ip_cidr"),
             };
             assert_eq!(rules[0][inbound], json!(["system-tun"]));
             assert_eq!(rules[0][outbound], "fake-dns-stub");
             assert_eq!(rules[1][inbound], json!(["system-tun"]));
-            assert_eq!(rules[1][inbound], json!(["system-tun"]));
             assert_eq!(rules[2][inbound], json!(["system-tun"]));
             assert_eq!(rules[2][outbound], "fake-ip-lookup");
-            assert_eq!(rules[3][inbound], json!(["fake-ip-reinject"]));
-            assert_eq!(rules[3][outbound], "proxy");
+            assert_eq!(rules[3][inbound], json!(["system-tun"]));
+            assert_eq!(rules[3][prefixes], json!(LINK_SCOPED_DESTINATIONS));
+            assert_eq!(rules[4][inbound], json!(["fake-ip-reinject"]));
+            assert_eq!(rules[4][outbound], "proxy");
             assert_eq!(c.value["inbounds"][1]["listen"], "127.0.0.1");
             let lookup = c.value["outbounds"]
                 .as_array()

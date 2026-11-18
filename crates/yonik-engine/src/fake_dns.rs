@@ -200,7 +200,7 @@ impl FakeDnsQuestion {
 }
 
 /// Выдаёт lease только после внешней policy-проверки. `now_ns` должен быть единым
-/// монотонным источником; TTL аргумент и все тики измеряются в наносекундах.
+/// монотонным источником в наносекундах. `ttl_seconds` передаётся в секундах.
 pub fn answer_approved(
     question: &FakeDnsQuestion,
     leases: &mut FakeIpLeaseTable,

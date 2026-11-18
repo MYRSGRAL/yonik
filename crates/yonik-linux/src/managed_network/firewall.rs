@@ -20,6 +20,7 @@ pub enum PolicyError {
     Limit,
     ConflictingPrivateRoute,
     PrivateTransport,
+    LoopbackAddress,
 }
 impl fmt::Display for PolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -31,6 +32,7 @@ impl fmt::Display for PolicyError {
             Self::Limit => "Превышен лимит 128 исключений",
             Self::PrivateTransport => "Служебное назначение пересекает защищённую приватную сеть",
             Self::ConflictingPrivateRoute => "Один приватный префикс связан с разными VPN",
+            Self::LoopbackAddress => "Нужен выделенный IPv4 loopback адрес для службы",
         })
     }
 }
@@ -202,7 +204,48 @@ pub struct PublicBlockPolicy {
     transport: Vec<BoundTransport>,
     bootstrap_dns: Vec<BoundTransport>,
     link_control: Vec<NonZeroU32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    isolated_loopback: Option<IsolatedLoopback>,
 }
+
+/// Выделенный 127/8 адрес, доступный через loopback helper UID 0 и одному worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "IsolatedLoopbackDto")]
+pub struct IsolatedLoopback {
+    address: std::net::Ipv4Addr,
+    worker_uid: NonZeroU32,
+}
+
+impl IsolatedLoopback {
+    fn new(address: std::net::Ipv4Addr, worker_uid: u32) -> Result<Self, PolicyError> {
+        if !address.is_loopback()
+            || address == std::net::Ipv4Addr::LOCALHOST
+            || address == std::net::Ipv4Addr::new(127, 255, 255, 255)
+        {
+            return Err(PolicyError::LoopbackAddress);
+        }
+        Ok(Self {
+            address,
+            worker_uid: interface(worker_uid)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IsolatedLoopbackDto {
+    address: std::net::Ipv4Addr,
+    worker_uid: u32,
+}
+
+impl TryFrom<IsolatedLoopbackDto> for IsolatedLoopback {
+    type Error = PolicyError;
+
+    fn try_from(value: IsolatedLoopbackDto) -> Result<Self, Self::Error> {
+        Self::new(value.address, value.worker_uid)
+    }
+}
+
 impl PublicBlockPolicy {
     pub(crate) fn permits_lan_endpoint(&self, destination: IpAddr, ifindex: u32) -> bool {
         self.lan
@@ -218,7 +261,8 @@ impl PublicBlockPolicy {
             + self.lan.len()
             + self.transport.len()
             + self.bootstrap_dns.len()
-            + self.link_control.len() * 3;
+            + self.link_control.len() * 3
+            + self.isolated_loopback.map_or(0, |_| 6);
         if extra.len() > MAX_EXCEPTIONS.saturating_sub(used) {
             return Err(PolicyError::Limit);
         }
@@ -232,7 +276,8 @@ impl PublicBlockPolicy {
             transport,
             self.bootstrap_dns.clone(),
         )?
-        .with_link_control(self.link_control.iter().map(|i| i.get()).collect())
+        .with_link_control(self.link_control.iter().map(|i| i.get()).collect())?
+        .with_isolated_loopback_config(self.isolated_loopback)
     }
     pub fn new(
         loopback_ifindex: u32,
@@ -285,6 +330,7 @@ impl PublicBlockPolicy {
             transport,
             bootstrap_dns,
             link_control: Vec::new(),
+            isolated_loopback: None,
         })
     }
 
@@ -294,7 +340,8 @@ impl PublicBlockPolicy {
         let used = self.private_routes.len()
             + self.lan.len()
             + self.transport.len()
-            + self.bootstrap_dns.len();
+            + self.bootstrap_dns.len()
+            + self.isolated_loopback.map_or(0, |_| 6);
         if interfaces.len() > MAX_EXCEPTIONS.saturating_sub(used) / 3 {
             return Err(PolicyError::Limit);
         }
@@ -304,6 +351,31 @@ impl PublicBlockPolicy {
             .collect::<Result<_, _>>()?;
         self.link_control.sort_unstable();
         self.link_control.dedup();
+        Ok(self)
+    }
+
+    /// Разрешает выделенный loopback адрес только helper и системному worker.
+    pub fn with_isolated_loopback(
+        self,
+        address: std::net::Ipv4Addr,
+        worker_uid: u32,
+    ) -> Result<Self, PolicyError> {
+        self.with_isolated_loopback_config(Some(IsolatedLoopback::new(address, worker_uid)?))
+    }
+
+    fn with_isolated_loopback_config(
+        mut self,
+        guard: Option<IsolatedLoopback>,
+    ) -> Result<Self, PolicyError> {
+        let used = self.private_routes.len()
+            + self.lan.len()
+            + self.transport.len()
+            + self.bootstrap_dns.len()
+            + self.link_control.len() * 3;
+        if guard.is_some() && used.saturating_add(6) > MAX_EXCEPTIONS {
+            return Err(PolicyError::Limit);
+        }
+        self.isolated_loopback = guard;
         Ok(self)
     }
 
@@ -320,6 +392,35 @@ impl PublicBlockPolicy {
             // превратиться в разрешённый публичный выход после нашего accept.
             json!({"add": {"chain": {"family": "inet", "table": table_name, "name": OUTPUT_CHAIN, "type": "filter", "hook": "output", "prio": 0, "policy": "drop"}}}),
         ];
+        if let Some(guard) = self.isolated_loopback {
+            for field in ["saddr", "daddr"] {
+                let address = compare(
+                    json!({"payload":{"protocol":"ip","field":field}}),
+                    json!(guard.address.to_string()),
+                );
+                for uid in [0, guard.worker_uid.get()] {
+                    commands.push(rule(
+                        table_name,
+                        vec![
+                            meta("nfproto", json!("ipv4")),
+                            meta("oif", json!(self.loopback_ifindex.get())),
+                            address.clone(),
+                            meta("skuid", json!(uid)),
+                            json!({"accept":null}),
+                        ],
+                    ));
+                }
+                commands.push(rule(
+                    table_name,
+                    vec![
+                        meta("nfproto", json!("ipv4")),
+                        meta("oif", json!(self.loopback_ifindex.get())),
+                        address,
+                        json!({"drop":null}),
+                    ],
+                ));
+            }
+        }
         commands.push(rule(
             table_name,
             vec![
@@ -490,6 +591,8 @@ struct PublicBlockPolicyDto {
     transport: Vec<BoundTransport>,
     bootstrap_dns: Vec<BoundTransport>,
     link_control: Vec<u32>,
+    #[serde(default)]
+    isolated_loopback: Option<IsolatedLoopback>,
 }
 impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
     type Error = PolicyError;
@@ -502,7 +605,8 @@ impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
             value.transport,
             value.bootstrap_dns,
         )?
-        .with_link_control(value.link_control)
+        .with_link_control(value.link_control)?
+        .with_isolated_loopback_config(value.isolated_loopback)
     }
 }
 
@@ -860,6 +964,93 @@ mod tests {
             assert!([133, 135, 136].contains(&expr[2]["match"]["right"].as_u64().unwrap()));
             assert_eq!(expr[3]["match"]["right"], 0);
         }
+    }
+
+    #[test]
+    fn isolated_loopback_guards_both_addresses_before_general_loopback_accept() {
+        let base = PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap();
+        let legacy = serde_json::to_value(&base).unwrap();
+        assert!(legacy.get("isolated_loopback").is_none());
+        assert_eq!(
+            serde_json::from_value::<PublicBlockPolicy>(legacy).unwrap(),
+            base
+        );
+        let address = std::net::Ipv4Addr::new(127, 42, 7, 9);
+        let guarded = base.clone().with_isolated_loopback(address, 987).unwrap();
+        let commands = guarded.commands("fixture");
+        assert_eq!(commands.len(), 9);
+        assert_eq!(
+            commands[1]["add"]["rule"]["expr"][2]["match"]["left"]["payload"]["field"],
+            "saddr"
+        );
+        assert_eq!(
+            commands[1]["add"]["rule"]["expr"][2]["match"]["right"],
+            address.to_string()
+        );
+        assert_eq!(
+            commands[1]["add"]["rule"]["expr"][3],
+            meta("skuid", json!(0))
+        );
+        assert_eq!(
+            commands[1]["add"]["rule"]["expr"][4],
+            json!({"accept":null})
+        );
+        assert_eq!(
+            commands[2]["add"]["rule"]["expr"][3],
+            meta("skuid", json!(987))
+        );
+        assert_eq!(commands[3]["add"]["rule"]["expr"][3], json!({"drop":null}));
+        assert_eq!(
+            commands[4]["add"]["rule"]["expr"][2]["match"]["left"]["payload"]["field"],
+            "daddr"
+        );
+        assert_eq!(commands[6]["add"]["rule"]["expr"][3], json!({"drop":null}));
+        assert_eq!(commands[7]["add"]["rule"]["expr"][0], meta("oif", json!(1)));
+
+        let encoded = serde_json::to_value(&guarded).unwrap();
+        assert_eq!(encoded["isolated_loopback"]["address"], address.to_string());
+        assert_eq!(encoded["isolated_loopback"]["worker_uid"], 987);
+        let restored: PublicBlockPolicy = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, guarded);
+        let replaced = guarded
+            .with_additional_transport(&[endpoint("203.0.113.9")])
+            .unwrap();
+        assert_eq!(replaced.isolated_loopback, guarded.isolated_loopback);
+        assert_eq!(
+            replaced.commands("fixture")[1..7],
+            guarded.commands("fixture")[1..7]
+        );
+        assert_ne!(guarded.digest(), base.digest());
+    }
+
+    #[test]
+    fn isolated_loopback_requires_a_dedicated_address_and_non_root_worker() {
+        let base = PublicBlockPolicy::new(1, None, vec![], vec![], vec![], vec![]).unwrap();
+        for address in [
+            std::net::Ipv4Addr::UNSPECIFIED,
+            std::net::Ipv4Addr::LOCALHOST,
+            std::net::Ipv4Addr::new(126, 1, 2, 3),
+            std::net::Ipv4Addr::new(127, 255, 255, 255),
+        ] {
+            assert_eq!(
+                base.clone().with_isolated_loopback(address, 987),
+                Err(PolicyError::LoopbackAddress)
+            );
+        }
+        assert_eq!(
+            base.clone()
+                .with_isolated_loopback(std::net::Ipv4Addr::new(127, 42, 7, 9), 0),
+            Err(PolicyError::Interface)
+        );
+        assert_eq!(
+            base.with_isolated_loopback(std::net::Ipv4Addr::new(127, 42, 7, 9), u32::MAX)
+                .unwrap()
+                .isolated_loopback
+                .unwrap()
+                .worker_uid
+                .get(),
+            u32::MAX
+        );
     }
     #[test]
     fn dynamic_replacement_preserves_private_lan_dns_controls_and_aggregate_cap() {
