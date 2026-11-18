@@ -5341,7 +5341,7 @@ async fn run(
             }
             _ = network_changed(&mut network) => {
                 actor.state.system_tun_available = false;
-                if let Some(flight) = system_flight.as_ref().filter(|f| f.connecting) {
+                if let Some(flight) = system_flight.as_ref().filter(|f| f.cancel_on_network_change) {
                     flight.cancel.send_replace(true);
                     system_stop = true;
                 }
@@ -7470,6 +7470,7 @@ pub(crate) struct Flight {
     pub source_generation: Option<i64>,
     pub connecting: bool,
     pub mutating: bool,
+    pub cancel_on_network_change: bool,
 }
 impl Flight {
     pub fn start(
@@ -7483,6 +7484,10 @@ impl Flight {
             operation,
             Operation::PolicyConnect(..) | Operation::FullProfile(..)
         );
+        // Helper проверяет исходную сеть, отличает свой TUN от внешних
+        // изменений и повторно сверяет маршруты перед выдачей Fake-IP.
+        let cancel_on_network_change = connecting
+            && !matches!(&operation, Operation::PolicyConnect(_, _, _, _, suffixes) if !suffixes.is_empty());
         let routing_revision = match &operation {
             Operation::PolicyConnect(_, _, _, revision, _) => Some(*revision),
             _ => None,
@@ -7567,6 +7572,7 @@ impl Flight {
             source_generation: None,
             connecting,
             mutating,
+            cancel_on_network_change,
         }
     }
 }

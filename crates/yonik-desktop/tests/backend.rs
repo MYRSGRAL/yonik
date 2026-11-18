@@ -77,6 +77,125 @@ fn system_fake_dns_is_saved_and_enables_sing_box_only_in_system_mode() {
 }
 
 #[test]
+#[ignore = "одноразовая QEMU VM со штатным helper, peer и тестовым TLS"]
+fn desktop_uses_installed_helper_for_system_fake_dns() {
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
+
+    assert_eq!(
+        std::env::var("YONIK_PRODUCTION_HELPER_VM").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+            .unwrap()
+            .trim(),
+        "QEMU"
+    );
+    let marker = "/etc/yonik-production-helper-vm";
+    let metadata = fs::symlink_metadata(marker).expect("маркер одноразовой VM");
+    assert!(metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0);
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        "yonik-production-helper-disposable-v1\n"
+    );
+    let certificate = std::env::var_os("YONIK_FAKE_DNS_TLS_CA").expect("CA тестового peer");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let addresses = Command::new("/usr/bin/ip")
+            .args([
+                "-6",
+                "-o",
+                "address",
+                "show",
+                "dev",
+                "yonik-outer",
+                "scope",
+                "link",
+                "-tentative",
+                "-dadfailed",
+            ])
+            .output()
+            .expect("IPv6 интерфейса стенда");
+        assert!(addresses.status.success());
+        if !addresses.stdout.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "IPv6 DAD стенда не завершился");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let (url, server) = fixture(vec![
+        "vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none",
+    ]);
+    let directory = Directory::new();
+    let mut app = Harness::with_hook(directory.config(), |snapshot| {
+        let value: Value = serde_json::from_str(snapshot).expect("состояние desktop");
+        if value["connection_mode"] == "system" {
+            eprintln!(
+                "DesktopHost: status={} state={} busy={} stop={} error={}",
+                value["status"],
+                value["system_state"],
+                value["system_busy"],
+                value["can_stop"],
+                value["error"]
+            );
+        }
+    });
+    app.wait(|value| value["ready"] == true);
+    app.send(json!({"command":"import_source","name":"Тестовый peer",
+        "url":url,"local_exception":true,"route":"direct"}));
+    let state =
+        app.wait(|value| value["pending"].is_null() && value["profiles"][0]["kind"] == "server");
+    server.join().expect("тестовая подписка");
+    app.send(json!({"command":"select_catalog","kind":"server","id":state["profiles"][0]["id"],"page":state["catalog_page"]}));
+    app.wait(|value| value["selected_kind"] == "server");
+    app.send(json!({"command":"set_connection_mode","mode":"system"}));
+    app.wait(|value| value["connection_mode"] == "system");
+    app.send(json!({"command":"set_system_fake_dns","suffixes":"example.test"}));
+    app.wait(|value| value["system_fake_dns_enabled"] == true);
+
+    for engine in ["xray", "sing-box"] {
+        app.send(json!({"command":"set_engine","engine":engine}));
+        app.wait(|value| value["engine"] == engine && value["can_connect"] == true);
+        app.send(json!({"command":"connect"}));
+        let state = app.wait_for(Duration::from_secs(40), |value| {
+            value["error"].is_string()
+                || (value["system_state"] == "TunnelStarting" && value["system_busy"] == false)
+        });
+        assert_eq!(state["error"], Value::Null);
+        assert_eq!(state["active_engine"], engine);
+        let response = Command::new("/usr/bin/curl")
+            .args([
+                "--noproxy",
+                "*",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                "5",
+                "--cacert",
+            ])
+            .arg(&certificate)
+            .arg("https://example.test/")
+            .output()
+            .expect("контрольный HTTPS");
+        assert!(
+            response.status.success(),
+            "{}",
+            String::from_utf8_lossy(&response.stderr)
+        );
+        assert_eq!(response.stdout, b"YONIK_TLS_FIXTURE");
+        app.send(json!({"command":"stop"}));
+        app.wait(|value| value["can_unlock"] == true && value["can_stop"] == false);
+        app.send(json!({"command":"system_unlock"}));
+        app.wait(|value| value["system_state"] == "NoManagedPolicy");
+        eprintln!("DesktopHost → установленный helper → HTTPS через Fake-IP: {engine}");
+    }
+    app.close();
+}
+
+#[test]
 fn stop_acknowledges_queued_routing_mutation_and_allows_retry() {
     let directory = Directory::new();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -210,9 +329,13 @@ impl Harness {
     }
     #[track_caller]
     pub(crate) fn wait(&mut self, predicate: impl Fn(&Value) -> bool) -> Value {
+        self.wait_for(Duration::from_secs(10), predicate)
+    }
+    #[track_caller]
+    fn wait_for(&mut self, timeout: Duration, predicate: impl Fn(&Value) -> bool) -> Value {
         let caller = std::panic::Location::caller();
         let started = Instant::now();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = started + timeout;
         loop {
             let snapshot = self
                 .receiver

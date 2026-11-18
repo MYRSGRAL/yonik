@@ -162,24 +162,38 @@ impl SystemSession {
         policy: &yonik_linux::system_policy::InlinePolicy,
         suffixes: &[String],
         deadline: Instant,
-        cancel: Cancellation,
+        mut cancel: Cancellation,
     ) -> Result<(), ClientError> {
         self.fence(revision)?;
         self.prepared = None;
         yonik_engine::validate_scoped_fake_dns_policy(policy.policy().policy())
             .map_err(|_| ClientError::Unsupported)?;
-        let prepared = self
-            .client
-            .prepare_fake_dns_policy_profile(
-                server,
-                engine,
-                true,
-                suffixes,
-                policy.policy(),
-                deadline,
-                cancel,
-            )
-            .await?;
+        // После Unlock собственные сетевые события могут ещё обрабатываться.
+        // Busy на Prepare не выдаёт дескриптор и допускает ограниченный повтор.
+        let retry_until = deadline.min(Instant::now() + std::time::Duration::from_secs(3));
+        let prepared = loop {
+            let result = self
+                .client
+                .prepare_fake_dns_policy_profile(
+                    server,
+                    engine,
+                    true,
+                    suffixes,
+                    policy.policy(),
+                    deadline,
+                    cancel.clone(),
+                )
+                .await;
+            if !matches!(result, Err(ClientError::Busy)) || Instant::now() >= retry_until {
+                break result?;
+            }
+            let retry_at = retry_until.min(Instant::now() + std::time::Duration::from_millis(50));
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(ClientError::Cancelled),
+                () = tokio::time::sleep_until(retry_at) => {}
+            }
+        };
         self.prepared = Some(
             PreparedOutput::bind(prepared, engine, &self.log, revision.generation)
                 .map_err(|_| ClientError::Unavailable)?,

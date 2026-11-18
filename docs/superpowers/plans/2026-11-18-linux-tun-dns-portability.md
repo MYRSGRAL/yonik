@@ -177,6 +177,10 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
   списком desktop отправляет текущую политику и выбранное ядро тем же
   системным способом `Prepare → ApplyOutputV1`. Для профиля сервера доступны
   оба ядра при совместимой политике. Полные Xray-профили используют своё ядро.
+  В Arch одноразовый desktop backend прошёл подключение, HTTPS к имени из
+  Fake DNS, Stop и Unlock с установленным helper на обоих ядрах. Состояние
+  `/etc/resolv.conf` совпало до и после. Изменения собственного TUN проверяет
+  helper. После Unlock desktop кратко повторяет только Prepare с ответом Busy.
 - [ ] Расширить приёмку до Ubuntu LTS с GNOME и Fedora с GNOME и SELinux.
   Проверить Plasma, GNOME, Xfce, Wayland, X11 и headless запуск helper.
   Для OpenRC/runit отдельно реализовать управление процессом worker с
