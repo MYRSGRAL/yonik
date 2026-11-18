@@ -7,8 +7,10 @@ pub(crate) use equivalence::diagnostic_class_matches;
 pub(crate) use equivalence::{
     same_captured_kernel_route, same_captured_topology, same_external_topology,
 };
+mod local_vpn;
 mod lookup;
 pub(crate) use equivalence::RouteCapture;
+pub use local_vpn::local_vpn_split_cidrs;
 pub(crate) use lookup::lookup_route_captured;
 mod read;
 mod route;

@@ -7,8 +7,43 @@ use std::sync::{
 use tokio::sync::watch;
 use yonik_linux::presets::{Error, Metadata, Store};
 
+const BUILTIN_REVISION: &str = "7e14508232595bac5881aa25d31202843a3f6021";
+pub const BUILTIN_SNAPSHOT: &str =
+    "78e4865cdcb1eb0800206ad11fb6a581546a9e5d20a2d55ad63d5b9944ab5404";
+
+#[derive(Serialize)]
+pub struct BuiltinSource {
+    snapshot: &'static str,
+    date: &'static str,
+}
+
+impl Default for BuiltinSource {
+    fn default() -> Self {
+        Self {
+            snapshot: BUILTIN_SNAPSHOT,
+            date: "2026-11-16",
+        }
+    }
+}
+
+pub fn builtin_policy(mut policy: yonik_domain::Policy) -> Result<yonik_domain::Policy, Error> {
+    const DOMAINS: &[u8] = include_bytes!("../assets/ru-direct/ru-standard.domains.txt");
+    const IPV4: &[u8] = include_bytes!("../assets/ru-direct/ru-standard.ipv4.txt");
+    const IPV6: &[u8] = include_bytes!("../assets/ru-direct/ru-standard.ipv6.txt");
+    policy.preset_rules = yonik_engine::presets::Candidate::parse(
+        BUILTIN_REVISION,
+        BUILTIN_REVISION,
+        DOMAINS,
+        &[IPV4, IPV6].concat(),
+    )
+    .map_err(|_| Error::Invalid)?
+    .into_rules([1, 2], true);
+    Ok(policy)
+}
+
 #[derive(Default, Serialize)]
 pub struct Status {
+    pub builtin: BuiltinSource,
     pub current: Option<Version>,
     pub previous: Option<Version>,
     pub current_error: bool,
@@ -91,6 +126,9 @@ impl Controller {
         mut policy: yonik_domain::Policy,
     ) -> Result<yonik_domain::Policy, Error> {
         if reference.enabled {
+            if reference.snapshot == BUILTIN_SNAPSHOT {
+                return builtin_policy(policy);
+            }
             policy.preset_rules = self
                 .store
                 .candidate(&reference.snapshot)?
@@ -113,22 +151,13 @@ impl Controller {
                 .map_err(|error| store_error(error).to_owned())?,
             None => base,
         };
-        let names = policy
-            .user_rules
-            .iter()
-            .chain(&policy.preset_rules)
-            .any(|rule| rule.enabled && !rule.conditions.domains.is_empty());
         yonik_engine::compile_policy(
             server,
             engine,
             port,
             probe_port,
             &policy,
-            if names {
-                yonik_engine::PolicyMode::Names
-            } else {
-                yonik_engine::PolicyMode::IpOnly
-            },
+            super::local_policy_mode(&policy),
         )
         .map_err(|error| format!("{error:?}"))
     }
@@ -227,7 +256,7 @@ mod tests {
             ..Default::default()
         };
         for engine in [yonik_engine::Engine::Xray, yonik_engine::Engine::SingBox] {
-            let error = controller
+            controller
                 .compile(
                     &draft,
                     &report.servers[0],
@@ -235,8 +264,7 @@ mod tests {
                     std::num::NonZeroU16::new(10808).expect("port"),
                     std::num::NonZeroU16::new(10809).expect("probe"),
                 )
-                .expect_err("mixed policy requires accepted compiler capability");
-            assert_eq!(error, "Unsupported(RequiredRealResolution)");
+                .expect("домен и IP переданы отдельными условиями DIRECT");
         }
         std::fs::remove_dir_all(path).expect("собственная fixture");
     }
@@ -704,6 +732,25 @@ mod host_gate {
             domains: vec![],
             destinations: vec!["192.0.2.0/24".into()],
             action: "block".into(),
+        });
+        for engine in [yonik_engine::Engine::Xray, yonik_engine::Engine::SingBox] {
+            let config = controller
+                .compile(
+                    &draft,
+                    &report.servers[0],
+                    engine,
+                    std::num::NonZeroU16::new(10808).expect("port"),
+                    std::num::NonZeroU16::new(10809).expect("probe"),
+                )
+                .expect("accepted compiler");
+            let mut job = Job::validate(config, root.clone().into(), 71);
+            assert_eq!(job.complete().await.error, None);
+        }
+
+        draft.rules.clear();
+        draft.ru_direct = Some(crate::editor::PresetReference {
+            snapshot: BUILTIN_SNAPSHOT.into(),
+            enabled: true,
         });
         for engine in [yonik_engine::Engine::Xray, yonik_engine::Engine::SingBox] {
             let config = controller

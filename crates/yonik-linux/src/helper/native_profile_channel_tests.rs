@@ -386,9 +386,9 @@ pub(super) fn bundle_fixture_network(
 ) -> (Issuer<Fake>, Vec<u8>) {
     use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent};
     let mut graph = if chain {
-        serde_json::json!({"outbounds":[{"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":"203.0.113.10","port":8388,"method":"aes-128-gcm","password":"fixture"}]},"proxySettings":{"tag":"direct","transportLayer":true}},{"tag":"direct","protocol":"vless","settings":{"vnext":[{"address":"203.0.113.11","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}],"dns":{"tag":"proxy","servers":["192.0.2.53"]}})
+        serde_json::json!({"outbounds":[{"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":"203.0.113.10","port":8388,"method":"aes-128-gcm","password":"fixture"}]},"proxySettings":{"tag":"direct","transportLayer":true}},{"tag":"direct","protocol":"vless","settings":{"vnext":[{"address":"203.0.113.11","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}],"dns":{"servers":["192.0.2.53"]}})
     } else {
-        serde_json::json!({"outbounds":[{"tag":"direct","protocol":"freedom"}],"dns":{"tag":"direct","servers":["192.0.2.53"]}})
+        serde_json::json!({"outbounds":[{"tag":"direct","protocol":"freedom"}],"dns":{"servers":["192.0.2.53"]}})
     };
     if tcp {
         graph["dns"]["servers"] = serde_json::json!(["tcp://192.0.2.53:53"]);
@@ -410,8 +410,14 @@ pub(super) fn bundle_fixture_network(
             .unwrap(),
         );
     }
-    let capsule = Arc::new(wire::OwnedCapsule::build(&intent, &plan, None, [3; 32], 1, 1).unwrap());
-    let cap = wire::Capsule::decode(capsule.bytes(), &[3; 32]).unwrap();
+    let digest = [3; 32];
+    let capsule = Arc::new(
+        wire::OwnedCapsule::build(&intent, &plan, None, digest, 1, 1)
+            .expect("капсула с нетегированным резолвером")
+            .with_test_resolver_subject(digest, 0, 0)
+            .expect("синтетический маршрут резолвера к первому outbound"),
+    );
+    let cap = wire::Capsule::decode(capsule.bytes(), &digest).unwrap();
     let record = LaunchRecord {
         manifest: cap.manifest,
         ..issuer(mode).record

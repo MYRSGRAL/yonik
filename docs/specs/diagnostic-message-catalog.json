@@ -365,8 +365,32 @@
     {
       "code": "EXECUTABLE",
       "message_key": "executable",
-      "ru": "Нужен абсолютный путь без . и ..",
-      "en": "An absolute path without . and .. is required",
+      "ru": "Введите абсолютный путь без . и .. или точное имя с префиксом name:",
+      "en": "Enter an absolute path without . and .. or an exact name with the name: prefix",
+      "stage": "operation",
+      "retryable": false
+    },
+    {
+      "code": "ROUTING_LOCAL_ONLY",
+      "message_key": "routing_local_only",
+      "ru": "Этот пресет применяется в режиме Local",
+      "en": "This preset applies in Local mode",
+      "stage": "operation",
+      "retryable": false
+    },
+    {
+      "code": "ROUTING_VPN_TOPOLOGY",
+      "message_key": "routing_vpn_topology",
+      "ru": "Не удалось прочитать маршруты локальных VPN",
+      "en": "Could not read local VPN routes",
+      "stage": "operation",
+      "retryable": false
+    },
+    {
+      "code": "ENGINE_UNAVAILABLE",
+      "message_key": "engine_unavailable",
+      "ru": "Sing-box пока недоступен. Выберите Xray в настройках подключения.",
+      "en": "Sing-box is currently unavailable. Select Xray in connection settings.",
       "stage": "operation",
       "retryable": false
     },

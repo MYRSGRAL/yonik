@@ -3,6 +3,7 @@
 import contextlib
 import importlib.util
 import io
+import re
 import sys
 import tempfile
 import unittest
@@ -34,7 +35,7 @@ class TranslationTests(unittest.TestCase):
                 '"Обновления подписок"',
             ),
             (
-                'window.tr("Объяснить сохранённый черновик", "Explain saved draft")',
+                'window.tr("Проверить правило", "Explain saved draft")',
                 '"Explain saved draft"',
             ),
             ("id: schedulePanel", "id: renamedPanel"),
@@ -43,18 +44,27 @@ class TranslationTests(unittest.TestCase):
                 'text: "Новая строка" + modelData.rule_id',
             ),
         ]:
-            with self.subTest(new=new), self.assertRaises(checker.CatalogError):
-                checker.check_scoped_ui(source.replace(old, new))
+            with self.subTest(new=new):
+                self.assertIn(old, source)
+                with self.assertRaises(checker.CatalogError):
+                    checker.check_scoped_ui(source.replace(old, new))
         # Вне оговорённых границ этот gate не претендует на покрытие.
         checker.check_scoped_ui(source + '\nLabel { text: "Вне scope" }')
 
     def test_p11_nested_layout_cannot_hide_untranslated_explanation(self) -> None:
         source = (ROOT / checker.CATALOG).read_text()
-        header = '                PlainLabel {\n                    objectName: "routingExplanation"'
+        header = re.search(
+            r'(?m)^( *)PlainLabel \{\n +objectName: "routingExplanation"', source
+        )
         pair = 'window.tr("причина недоступна", "reason unavailable")'
-        self.assertIn(header, source)
+        self.assertIsNotNone(header)
+        assert header is not None
         self.assertIn(pair, source)
-        changed = source.replace(header, "                RowLayout {}\n" + header)
+        changed = (
+            source[: header.start()]
+            + f"{header[1]}RowLayout {{}}\n"
+            + source[header.start() :]
+        )
         changed = changed.replace(pair, '"Причина только по-русски"')
         with self.assertRaises(checker.CatalogError):
             checker.check_scoped_ui(changed)

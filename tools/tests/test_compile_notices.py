@@ -15,7 +15,17 @@ import compile_notices as notices
 class NoticesTests(unittest.TestCase):
     def test_real_inventory(self) -> None:
         entries, texts = notices.collect(Path(__file__).parents[2])
-        self.assertEqual(len(entries), 225 + 173)
+        self.assertEqual(len(entries), 225 + 173 + 1)
+        ru_direct = next(
+            entry for entry in entries if entry["name"] == "kyoresuas/ru-direct"
+        )
+        license_file = (
+            Path(__file__).parents[2] / "crates/yonik-desktop/assets/ru-direct/LICENSE"
+        )
+        self.assertEqual(
+            [texts[digest] for digest in ru_direct["hashes"]],
+            [license_file.read_bytes()],
+        )
         self.assertTrue(texts)
 
     def test_mutations(self) -> None:

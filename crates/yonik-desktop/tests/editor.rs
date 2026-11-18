@@ -489,6 +489,7 @@ fn p07_bounds_and_v2_required_field() {
     };
     let mut draft = Draft {
         ru_direct: None,
+        local_vpn_direct: false,
         version: 2,
         rules: vec![rule.clone()],
         default_action: "direct".into(),

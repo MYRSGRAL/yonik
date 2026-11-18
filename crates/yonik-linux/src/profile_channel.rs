@@ -3313,6 +3313,33 @@ impl OwnedCapsule {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+    #[cfg(test)]
+    pub(crate) fn with_test_resolver_subject(
+        mut self,
+        digest: [u8; 32],
+        resolver: u16,
+        subject: u16,
+    ) -> Result<Self> {
+        // Стенд transport проверяет уже связанную wire-строку. Xray DNS ingress
+        // tag не задаёт такой outbound, поэтому эта запись создаётся отдельно.
+        let capsule = Capsule::decode(&self.bytes, &digest)?;
+        capsule.tables[0].row(subject)?;
+        let row = capsule.tables[4].row(resolver)?;
+        if row[0] != 1 || row[2..4] != NONE.to_be_bytes() {
+            return Err(Error::Reference);
+        }
+        let offset = row.as_ptr() as usize - self.bytes.as_ptr() as usize + 2;
+        put16(&mut self.bytes, offset, subject);
+        let mut hash = Sha256::new();
+        hash.update(b"YNKCAP-MANIFEST-v1\0");
+        hash.update(digest);
+        hash.update(&self.bytes[76..78]);
+        hash.update(&self.bytes[80..120]);
+        hash.update(&self.bytes[128..]);
+        self.bytes[..32].copy_from_slice(&hash.finalize());
+        Capsule::decode(&self.bytes, &digest)?;
+        Ok(self)
+    }
     pub(crate) fn build(
         intent: &yonik_engine::native_profile::ProfileIntent,
         plan: &yonik_engine::native_profile::OwnedRuntimePlan,

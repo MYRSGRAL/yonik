@@ -13,6 +13,8 @@ ColumnLayout {
     property double request: Date.now() * 1024
     property double pendingRequest: 0
     property string feedback: ""
+    readonly property bool builtinSelected: !!(routing.ru_direct && snapshot.builtin
+        && routing.ru_direct.snapshot === snapshot.builtin.snapshot)
     onSnapshotChanged: {
         if (snapshot.ack && snapshot.ack.request_id === pendingRequest) {
             feedback = snapshot.ack.error || tr("Готово", "Done")
@@ -26,6 +28,22 @@ ColumnLayout {
     signal command(var payload)
     spacing: 10
     function tr(ru, en) { return language === "ru" ? ru : en }
+    CheckBox {
+        objectName: "presetBuiltinActivate"
+        text: panel.tr("Российские сервисы напрямую", "Russian services direct")
+        checked: panel.builtinSelected && panel.routing.ru_direct.enabled
+        enabled: !panel.snapshot.busy && panel.pendingRequest === 0 && panel.routingRevision !== null
+        nextCheckState: function() { return checkState }
+        onClicked: panel.command({command: "preset_activate", builtin: true, enabled: !checked,
+            expected_revision: panel.routingRevision, request_id: panel.nextRequest()})
+    }
+    Label {
+        Layout.fillWidth: true
+        wrapMode: Text.Wrap
+        visible: !!panel.snapshot.builtin
+        text: panel.tr("Local · домены и IP-подсети из kyoresuas/ru-direct · ", "Local · domains and IP subnets from kyoresuas/ru-direct · ")
+            + (panel.snapshot.builtin ? panel.snapshot.builtin.date : "")
+    }
     Label {
         Layout.fillWidth: true
         wrapMode: Text.Wrap
@@ -43,8 +61,8 @@ ColumnLayout {
     }
     CheckBox {
         objectName: "presetActivate"
-        text: panel.tr("Использовать ru-direct в черновике", "Use ru-direct in draft")
-        checked: !!panel.routing.ru_direct && panel.routing.ru_direct.enabled
+        text: panel.tr("Использовать свой список", "Use custom list")
+        checked: !panel.builtinSelected && !!panel.routing.ru_direct && panel.routing.ru_direct.enabled
         enabled: !panel.snapshot.busy && panel.pendingRequest === 0 && (!!panel.snapshot.current || checked)
         onClicked: panel.command({command: "preset_activate", enabled: checked, expected_revision: panel.routingRevision, request_id: panel.nextRequest()})
     }
@@ -85,7 +103,7 @@ ColumnLayout {
     }
     Button {
         objectName: "presetValidateButton"
-        text: panel.tr("Проверить конфигурацию ядра", "Validate engine and Host")
+        text: panel.tr("Проверить списки в ядре", "Validate lists in engine")
         enabled: !panel.snapshot.busy && panel.pendingRequest === 0
         onClicked: panel.command({command: "preset_validate", expected_revision: panel.routingRevision, request_id: panel.nextRequest()})
     }
@@ -116,7 +134,7 @@ ColumnLayout {
     Button {
         objectName: "presetPrepareButton"
         text: panel.tr("Проверить маршрут", "Check route")
-        enabled: !!panel.snapshot.current && !panel.snapshot.busy
+        enabled: (panel.builtinSelected && panel.routing.ru_direct.enabled || !!panel.snapshot.current) && !panel.snapshot.busy
         onClicked: panel.command({command: "preset_prepare", target: target.text, request_id: panel.nextRequest()})
     }
     Label {

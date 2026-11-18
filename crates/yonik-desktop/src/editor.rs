@@ -34,6 +34,8 @@ pub struct Draft {
     pub default_action: String,
     #[serde(default)]
     pub ru_direct: Option<PresetReference>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_vpn_direct: bool,
 }
 impl Default for Draft {
     fn default() -> Self {
@@ -42,6 +44,7 @@ impl Default for Draft {
             rules: vec![],
             default_action: "proxy".into(),
             ru_direct: None,
+            local_vpn_direct: false,
         }
     }
 }
@@ -61,6 +64,15 @@ impl Draft {
                 return serde_json::json!({"incomplete":true,"warnings":[],"error":"unsupported_selector","rule_id":id});
             }
         }
+        if self.rules.iter().any(|rule| {
+            rule.enabled
+                && rule
+                    .executables
+                    .iter()
+                    .any(|value| yonik_domain::process_name_selector(value).is_some())
+        }) {
+            return serde_json::json!({"incomplete":true,"warnings":[]});
+        }
         use yonik_domain::policy_diagnostics::{Limits, WarningKind, diagnose};
         match self
             .base_policy()
@@ -68,7 +80,7 @@ impl Draft {
             .and_then(|p| diagnose(&p, Limits::default()).ok())
         {
             Some(report) => {
-                serde_json::json!({"incomplete": report.truncated || self.ru_direct.as_ref().is_some_and(|r| r.enabled),
+                serde_json::json!({"incomplete": report.truncated || self.local_vpn_direct || self.ru_direct.as_ref().is_some_and(|r| r.enabled),
                 "warnings": report.warnings.iter().map(|w| serde_json::json!({
                     "rule_id": w.rule_id, "earlier": format!("{:?}", w.earlier),
                     "kind": match w.kind { WarningKind::Shadowed => "shadowed", WarningKind::PotentialOverlap => "potential_overlap" }
@@ -107,6 +119,9 @@ impl Draft {
             return Ok(
                 serde_json::json!({"status":"unknown", "reason":"application_witness_missing"}),
             );
+        }
+        if self.local_vpn_direct {
+            return Ok(serde_json::json!({"status":"unknown", "reason":"vpn_topology_required"}));
         }
         let name;
         let destination = match target.parse() {
@@ -151,6 +166,9 @@ impl Draft {
     ) -> Result<yonik_engine::policy_wire::SystemPolicy, yonik_engine::policy_input::PolicyInputError>
     {
         use yonik_engine::policy_input::PolicyInputError;
+        if self.local_vpn_direct {
+            return Err(PolicyInputError::InvalidPolicy);
+        }
         let policy = self.policy().map_err(|_| PolicyInputError::InvalidPolicy)?;
         if let Some(id) = policy.unsupported_selector() {
             return Err(PolicyInputError::UnsupportedSelector(id));
@@ -268,9 +286,10 @@ impl Draft {
                 return Err("limit");
             }
             if input.executables.iter().any(|s| {
-                !s.starts_with('/')
-                    || s.contains(['\0', '\n'])
-                    || s.split('/').any(|c| c == ".." || c == ".")
+                yonik_domain::process_name_selector(s).is_none()
+                    && (!s.starts_with('/')
+                        || s.contains(['\0', '\n'])
+                        || s.split('/').any(|c| c == ".." || c == "."))
             }) {
                 return Err("executable");
             }

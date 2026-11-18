@@ -273,9 +273,10 @@ fn convert_rules(input: Vec<InputRule>) -> Result<Vec<Rule>, PolicyInputError> {
             }
 
             if conditions.executable_paths.iter().any(|path| {
-                !path.starts_with('/')
-                    || path.len() > MAX_EXECUTABLE_BYTES
-                    || path.chars().any(char::is_control)
+                yonik_domain::process_name_selector(path).is_none()
+                    && (!path.starts_with('/')
+                        || path.len() > MAX_EXECUTABLE_BYTES
+                        || path.chars().any(char::is_control))
             }) {
                 return Err(PolicyInputError::InvalidPolicy);
             }
