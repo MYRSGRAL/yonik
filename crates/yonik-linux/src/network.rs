@@ -21,7 +21,7 @@ pub use topology::{
     IpPrefix, LinuxAddress, LinuxLink, LinuxNexthop, LinuxRoute, LinuxRule, LinuxTopology,
     NexthopMember, RouteNexthop, read_topology,
 };
-pub(crate) use topology::{TopologyCapture, read_topology_captured};
+pub(crate) use topology::{TopologyCapture, read_topology_captured, reread_changed_topology};
 
 use std::fmt;
 use tokio::sync::watch;

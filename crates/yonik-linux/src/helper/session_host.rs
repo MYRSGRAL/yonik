@@ -1996,7 +1996,10 @@ impl Backend {
     ) -> Result<(), ServiceError> {
         let (current, current_capture) = diagnostic_result(
             "topology_read",
-            read_topology_captured(cancel, DEADLINE).await,
+            // Подключение worker к TUN может изменить carrier во время dump.
+            // Повторяется только чтение; baseline, generation guards и
+            // последующая проверка маршрутов остаются прежними.
+            crate::network::reread_changed_topology(cancel, DEADLINE).await,
         )
         .map_err(unavailable)?;
         let current_link = current

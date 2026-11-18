@@ -264,3 +264,53 @@ fn unsupported_data_marks_snapshot_incomplete_and_debug_only_has_counts() {
     assert!(debug.contains("routes: 1"));
     assert!(!debug.contains("sensitive"));
 }
+
+#[tokio::test]
+async fn после_событий_и_прерванного_dump_читается_новый_снимок() {
+    let (_sender, mut cancel) = Cancellation::new();
+    let timeout = Duration::from_secs(3);
+    let mut before = timeout;
+    let mut reads = [
+        Err(NetworkReadError::Changed),
+        Err(NetworkReadError::Interrupted),
+        Ok(7),
+    ]
+    .into_iter();
+    let value = retry_snapshot(&mut cancel, timeout, async |_, remaining| {
+        assert!(remaining <= before);
+        before = remaining;
+        reads.next().unwrap()
+    })
+    .await;
+    assert_eq!(value, Ok(7));
+    assert_eq!(reads.len(), 0);
+}
+
+#[tokio::test]
+async fn повтор_ограничен_и_не_маскирует_потерю_событий() {
+    for (error, expected_reads) in [(NetworkReadError::Changed, 3), (NetworkReadError::Loss, 1)] {
+        let (_sender, mut cancel) = Cancellation::new();
+        let mut reads = 0;
+        let result = retry_snapshot(&mut cancel, Duration::from_secs(3), async |_, _| {
+            reads += 1;
+            Err::<(), _>(error)
+        })
+        .await;
+        assert_eq!(result, Err(error));
+        assert_eq!(reads, expected_reads);
+    }
+}
+
+#[tokio::test]
+async fn отмена_после_изменившегося_dump_запрещает_следующее_чтение() {
+    let (sender, mut cancel) = Cancellation::new();
+    let mut reads = 0;
+    let result = retry_snapshot(&mut cancel, Duration::from_secs(3), async |_, _| {
+        reads += 1;
+        sender.send_replace(true);
+        Err::<(), _>(NetworkReadError::Changed)
+    })
+    .await;
+    assert_eq!(result, Err(NetworkReadError::Cancelled));
+    assert_eq!(reads, 1);
+}
