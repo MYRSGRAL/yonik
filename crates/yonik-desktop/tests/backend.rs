@@ -79,6 +79,14 @@ fn system_fake_dns_is_saved_and_enables_sing_box_only_in_system_mode() {
     let state = app.wait(|value| value["routing_ack"]["request_id"] == 5);
     assert!(state["routing_ack"]["error"].is_null());
     assert_eq!(state["system_fake_dns_enabled"], true);
+    app.send(
+        json!({"command":"edit_routing","expected_revision":5,"request_id":6,
+        "create":false,"confirm_broad":false,"rule":{"id":18,"enabled":true,
+        "executables":[],"domains":[],"destinations":["192.0.2.0/24"],"action":"direct"}}),
+    );
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 6);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], true);
     app.send(json!({"command":"set_engine", "engine":"sing-box"}));
     app.wait(|value| value["engine"] == "sing-box");
 

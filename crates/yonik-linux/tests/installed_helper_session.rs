@@ -359,35 +359,57 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
 #[tokio::test]
 #[ignore = "выделенная Debian VM с echo peer для example.test и blocked.example.test"]
 async fn production_helper_scoped_fake_dns_domain_policy() -> Result {
-    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::Domains).await
+    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::Domains, false).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM с проксируемыми IPv4/IPv6 echo endpoints"]
 async fn production_helper_scoped_fake_dns_literal_cidr_policy() -> Result {
-    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralBlock).await
+    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralBlock, false).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM, контроль доступности тех же буквальных IP через Proxy"]
 async fn production_helper_scoped_fake_dns_literal_cidr_control() -> Result {
-    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralProxy).await
+    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralProxy, false).await
 }
 
 #[cfg(feature = "test-support")]
-async fn installed_fake_dns_with_domain_policy(witness: FakeDnsPolicyWitness) -> Result {
+#[tokio::test]
+#[ignore = "выделенная Debian VM с отдельным физическим echo и блокировкой этих адресов на прокси"]
+async fn production_helper_scoped_fake_dns_literal_direct() -> Result {
+    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralDirect, false).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM, физический echo и перезапуск helper через SIGKILL"]
+async fn production_helper_scoped_fake_dns_literal_direct_recovers() -> Result {
+    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralDirect, true).await
+}
+
+#[cfg(feature = "test-support")]
+async fn installed_fake_dns_with_domain_policy(
+    witness: FakeDnsPolicyWitness,
+    crash: bool,
+) -> Result {
     let mut preset_rules = vec![json!({"id":2,"enabled":true,"action":"block","ip_cidr":[],
         "domain":[],"domain_suffix":["example.test"],"executable_paths":[]})];
     let literal_action = match witness {
         FakeDnsPolicyWitness::Domains => None,
-        FakeDnsPolicyWitness::LiteralBlock => Some("block"),
+        FakeDnsPolicyWitness::LiteralBlock | FakeDnsPolicyWitness::LiteralDirect => Some("block"),
         FakeDnsPolicyWitness::LiteralProxy => Some("proxy"),
     };
     if let Some(action) = literal_action {
         preset_rules.push(json!({"id":3,"enabled":true,"action":action,
             "ip_cidr":["198.18.0.2/32","2001:db8:746f::2/128"],
+            "domain":[],"domain_suffix":[],"executable_paths":[]}));
+    }
+    if matches!(witness, FakeDnsPolicyWitness::LiteralDirect) {
+        preset_rules.push(json!({"id":4,"enabled":true,"action":"direct",
+            "ip_cidr":["192.0.2.192/27","2001:db8:7471::/64"],
             "domain":[],"domain_suffix":[],"executable_paths":[]}));
     }
     let policy = yonik_engine::policy_wire::SystemPolicy::parse(
@@ -399,7 +421,7 @@ async fn installed_fake_dns_with_domain_policy(witness: FakeDnsPolicyWitness) ->
         })
         .to_string(),
     )?;
-    installed_fake_dns(None, false, Some(&policy), Some(witness)).await
+    installed_fake_dns(None, crash, Some(&policy), Some(witness)).await
 }
 
 #[cfg(feature = "test-support")]
@@ -407,6 +429,7 @@ enum FakeDnsPolicyWitness {
     Domains,
     LiteralBlock,
     LiteralProxy,
+    LiteralDirect,
 }
 
 #[cfg(feature = "test-support")]
@@ -543,6 +566,11 @@ async fn installed_fake_dns(
                     check_literal_cidr_traffic(true).await?;
                     eprintln!("{engine:?} CIDR Proxy пропустил те же IPv4/IPv6 по TCP/UDP");
                 }
+                FakeDnsPolicyWitness::LiteralDirect => {
+                    check_literal_cidr_traffic(false).await?;
+                    check_literal_direct_traffic().await?;
+                    eprintln!("{engine:?} CIDR Direct подтверждён по TCP/UDP IPv4/IPv6");
+                }
             }
         }
         if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
@@ -550,6 +578,12 @@ async fn installed_fake_dns(
         }
         if crash {
             kill_helper_and_wait_for_recovery(&connection, helper_pid()?).await?;
+            if matches!(policy_witness, Some(FakeDnsPolicyWitness::LiteralDirect)) {
+                require(
+                    literal_direct_rule_marks()?.is_empty(),
+                    "Разрешение Direct пережило аварийное восстановление",
+                )?;
+            }
         }
         let stopped = call(&connection, "Stop", empty.clone()).await?;
         require(
@@ -564,6 +598,12 @@ async fn installed_fake_dns(
             tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
             "Вывод worker не закрыт",
         )?;
+        if matches!(policy_witness, Some(FakeDnsPolicyWitness::LiteralDirect)) {
+            require(
+                literal_direct_rule_marks()?.is_empty(),
+                "Разрешение Direct пережило Stop",
+            )?;
+        }
         let mut cancel = token;
         let snapshot =
             yonik_linux::read_resolve1_snapshot(&mut cancel, Duration::from_secs(3)).await?;
@@ -576,6 +616,9 @@ async fn installed_fake_dns(
         )?;
         if kill_switch {
             call(&connection, "Unlock", empty.clone()).await?;
+        }
+        if matches!(policy_witness, Some(FakeDnsPolicyWitness::LiteralDirect)) {
+            check_tun_traffic_to(connected_direct_fixture()?).await?;
         }
         check_only_fake_is_filtered(v4, v6).await?;
         if crash {
@@ -603,6 +646,18 @@ async fn check_literal_cidr_traffic(proxy: bool) -> Result {
         "198.18.0.2:40000".parse::<std::net::SocketAddr>()?,
         "[2001:db8:746f::2]:40000".parse()?,
     ];
+    check_tun_routes(&servers)?;
+    if proxy {
+        return check_tun_traffic_to(servers).await;
+    }
+    for server in servers {
+        check_fake_flow_blocked(server).await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn check_tun_routes(servers: &[std::net::SocketAddr]) -> Result {
     for server in servers {
         let address = server.ip().to_string();
         let route = Command::new("/usr/bin/ip")
@@ -620,13 +675,101 @@ async fn check_literal_cidr_traffic(proxy: bool) -> Result {
             "Трафик контрольного IP не дошёл бы до TUN",
         )?;
     }
-    if proxy {
-        return check_tun_traffic_to(servers).await;
-    }
-    for server in servers {
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn literal_direct_rule_marks() -> Result<Vec<u64>> {
+    let output = Command::new(nft_test_binary())
+        .args(["-j", "list", "ruleset"])
+        .output()?;
+    require(
+        output.status.success(),
+        "Не удалось прочитать установленные правила",
+    )?;
+    let ruleset: Value = serde_json::from_slice(&output.stdout)?;
+    let rules = ruleset["nftables"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("Нет правил nft"))?;
+    Ok(rules
+        .iter()
+        .filter_map(|entry| {
+            let conditions = entry["rule"]["expr"].as_array()?;
+            let direct = conditions.iter().any(|condition| {
+                matches!(
+                    condition
+                        .pointer("/match/right/prefix/addr")
+                        .and_then(Value::as_str),
+                    Some("192.0.2.192" | "2001:db8:7471::")
+                )
+            });
+            if !direct {
+                return None;
+            }
+            conditions.iter().find_map(|condition| {
+                (condition.pointer("/match/left/meta/key")?.as_str()? == "mark")
+                    .then(|| condition.pointer("/match/right")?.as_u64())
+                    .flatten()
+            })
+        })
+        .collect())
+}
+
+#[cfg(feature = "test-support")]
+async fn check_literal_direct_traffic() -> Result {
+    let servers = [
+        "192.0.2.201:40000".parse()?,
+        "[2001:db8:7471::2]:40000".parse()?,
+    ];
+    let marks = literal_direct_rule_marks()?;
+    let mark = marks
+        .first()
+        .ok_or_else(|| io::Error::other("Нет разрешений Direct"))?;
+    require(
+        marks.len() >= 4 && marks.iter().all(|observed| observed == mark),
+        "Нет общей метки для TCP/UDP и обоих семейств",
+    )?;
+    check_tun_routes(&servers)?;
+    check_tun_traffic_to(servers).await?;
+    let connected = connected_direct_fixture()?;
+    check_tun_routes(&connected)?;
+    for server in connected {
         check_fake_flow_blocked(server).await?;
     }
-    Ok(())
+    let status = Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            r#"
+import errno
+import socket
+import sys
+
+for family, address in [(socket.AF_INET, '192.0.2.201'), (socket.AF_INET6, '2001:db8:7471::2')]:
+    with socket.socket(family, socket.SOCK_DGRAM) as client:
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, int(sys.argv[1]))
+        try:
+            client.sendto(b'wrong-uid', (address, 40000))
+        except OSError as error:
+            if error.errno != errno.EPERM:
+                raise
+        else:
+            raise RuntimeError('Правило Direct пропустило сокет другого UID')
+"#,
+            &mark.to_string(),
+        ])
+        .status()?;
+    require(
+        status.success(),
+        "Метка Direct без UID worker не должна пропускать трафик",
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn connected_direct_fixture() -> Result<[std::net::SocketAddr; 2]> {
+    Ok([
+        "192.0.2.202:40000".parse()?,
+        "[2001:db8:7471::3]:40000".parse()?,
+    ])
 }
 
 #[cfg(feature = "test-support")]

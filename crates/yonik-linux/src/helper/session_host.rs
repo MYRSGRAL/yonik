@@ -13,7 +13,11 @@ use crate::helper::{
 };
 use crate::{
     Cancellation, KernelRoute, LinuxLink, LinuxTopology, NetworkStamp, RouteKind, RouteQuery,
-    managed_network::{PublicPolicyPhase, QuarantineIntent, Resource, Scope, tun::TunExecutor},
+    managed_network::{
+        PublicPolicyPhase, QuarantineIntent, Resource, Scope,
+        firewall::{BoundDirect, MAX_BOUND_DIRECT},
+        tun::TunExecutor,
+    },
     network::{
         RouteCapture, TopologyCapture, lookup_route_captured, read_topology_captured,
         same_captured_kernel_route, same_captured_topology,
@@ -25,6 +29,7 @@ use crate::{
 pub(in crate::helper) mod native_owner;
 use sha2::Digest;
 use std::{
+    collections::{BTreeSet, HashMap},
     fs::File,
     io::Read,
     mem::size_of,
@@ -1107,6 +1112,81 @@ fn checked_route(route: &KernelRoute, owner: Ownership, table: u32) -> Result<u3
         .map(|index| index.get())
         .ok_or(ServiceError::Unsupported)
 }
+
+fn bound_fake_literal_direct(
+    policy: &yonik_engine::policy_wire::SystemPolicy,
+    baseline: &LinuxTopology,
+    worker_uid: u32,
+    mark: u32,
+) -> Result<Vec<BoundDirect>, ServiceError> {
+    let mut prefixes = BTreeSet::new();
+    for (address, length) in policy.enabled_direct_prefixes() {
+        prefixes.insert((address, length));
+        if prefixes.len() > MAX_BOUND_DIRECT {
+            return Err(ServiceError::Unsupported);
+        }
+    }
+    if prefixes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uplinks: HashMap<_, _> = baseline
+        .links
+        .iter()
+        .filter(|link| {
+            link.flags & IFF_UP != 0
+                && link.flags & IFF_LOOPBACK == 0
+                && link.link_type == ARPHRD_ETHER
+                && matches!(
+                    link.kind.as_deref(),
+                    None | Some(
+                        b"veth" | b"vlan" | b"bridge" | b"bond" | b"team" | b"macvlan" | b"ipvlan"
+                    )
+                )
+        })
+        .map(|link| (link.index, &link.name))
+        .collect();
+    let mut egress = BTreeSet::new();
+    for (address, length) in prefixes {
+        let prefix = IpPrefix::new(address, length).map_err(|_| ServiceError::Unsupported)?;
+        let before = egress.len();
+        // Снимок ограничивает допустимые uplink и шлюзы. nft сверяет
+        // фактический маршрут каждого пакета и отсекает connected-сети.
+        for route in baseline.routes.iter().filter(|route| {
+            RouteKind::from(route.kind) == RouteKind::Unicast
+                && route.nexthop_id.is_none()
+                && route.destination.address.is_ipv4() == address.is_ipv4()
+                && (route.destination.length == 0
+                    || prefix.contains(route.destination.address)
+                    || IpPrefix::new(route.destination.address, route.destination.length)
+                        .is_ok_and(|routed| routed.contains(address)))
+        }) {
+            let gateways = route.output_interface.zip(route.gateway).into_iter().chain(
+                route
+                    .multipath
+                    .iter()
+                    .filter_map(|hop| hop.gateway.map(|gateway| (hop.output_interface, gateway))),
+            );
+            for (index, gateway) in gateways {
+                let Some(name) = uplinks.get(&index) else {
+                    continue;
+                };
+                let name = std::str::from_utf8(name).map_err(|_| ServiceError::Unsupported)?;
+                egress.insert(
+                    BoundDirect::new(prefix, index, name, worker_uid, mark, gateway)
+                        .map_err(|_| ServiceError::Unsupported)?,
+                );
+                if egress.len() > MAX_BOUND_DIRECT {
+                    return Err(ServiceError::Unsupported);
+                }
+            }
+        }
+        if egress.len() == before {
+            return Err(ServiceError::Unsupported);
+        }
+    }
+    Ok(egress.into_iter().collect())
+}
+
 fn fresh_cancel() -> (tokio::sync::watch::Sender<bool>, Cancellation) {
     Cancellation::new()
 }
@@ -1681,8 +1761,16 @@ impl Backend {
             SessionNetworkPlan::reserve_for_engine(owner, &baseline, request.engine)
         }
         .map_err(unavailable)?;
+        let direct_egress = match (fake_dns_requested, &request.policy) {
+            (true, Some(policy)) => {
+                bound_fake_literal_direct(policy, &baseline, worker_uid, plan.socket_mark())?
+            }
+            _ => Vec::new(),
+        };
         let fake_dns = match request.fake_dns_domains {
-            Some(domains) => Some(Arc::new(PreparedFakeDns::new(&plan, domains).await?)),
+            Some(domains) => Some(Arc::new(
+                PreparedFakeDns::new(&plan, domains, direct_egress).await?,
+            )),
             None => None,
         };
         let port = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -2060,6 +2148,7 @@ impl Backend {
         if let Some(fake_dns) = &artifact.fake_dns {
             policy = policy
                 .with_isolated_loopback(fake_dns.loopback, artifact.worker_uid)
+                .and_then(|policy| policy.with_bound_direct(fake_dns.direct_egress.clone()))
                 .map_err(unavailable)?;
         }
         let policy_fingerprint = policy.digest();

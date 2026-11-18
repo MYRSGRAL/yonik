@@ -1443,7 +1443,7 @@ ApplicationWindow {
                     SmallLabel {
                         visible: (window.state.system_fake_dns || []).length > 0 && !window.systemFakeDnsEnabled
                         Layout.fillWidth: true
-                        text: window.tr("Выберите «Прокси» по умолчанию. Чтобы применять CIDR к буквальным IP, покройте все суффиксы Fake DNS правилами Proxy или Block до первого CIDR. Правила Direct и правила по приложениям здесь недоступны.", "Select Proxy as the default. To match literal IPs with CIDR, cover all Fake DNS suffixes with Proxy or Block rules before the first CIDR rule. Direct and per-app rules are unavailable here.")
+                        text: window.tr("Выберите «Прокси» по умолчанию. До первого CIDR покройте все суффиксы Fake DNS правилами Proxy или Block. Для Direct укажите CIDR с ненулевым префиксом. Правила по приложениям недоступны.", "Select Proxy as the default. Cover all Fake DNS suffixes with Proxy or Block rules before the first CIDR rule. For Direct, use CIDRs with a nonzero prefix length. Per-app rules are unavailable.")
                     }
                     RowLayout {
                         Layout.fillWidth: true

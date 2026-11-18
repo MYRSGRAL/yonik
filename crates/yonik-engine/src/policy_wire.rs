@@ -68,6 +68,17 @@ impl Serialize for SystemPolicy {
     }
 }
 impl SystemPolicy {
+    /// Явные IP-префиксы включённых Direct-правил из той же политики, что компилируется.
+    pub fn enabled_direct_prefixes(&self) -> impl Iterator<Item = (std::net::IpAddr, u8)> + '_ {
+        self.policy
+            .user_rules
+            .iter()
+            .chain(&self.policy.preset_rules)
+            .filter(|rule| rule.enabled && rule.action == yonik_domain::Action::Direct)
+            .flat_map(|rule| &rule.conditions.destinations)
+            .map(|cidr| (cidr.network(), cidr.prefix_len()))
+    }
+
     pub fn parse(text: &str) -> Result<Self, PolicyInputError> {
         if !bounded_depth(text, 6) {
             return Err(PolicyInputError::InvalidJson);

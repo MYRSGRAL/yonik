@@ -425,8 +425,7 @@ fn scoped_fake_dns_policy_mode(
         || !policy.private_domains.is_empty()
         || !policy.lan.is_empty()
         || rules().any(|rule| {
-            rule.action == Action::Direct
-                || !rule.conditions.executables.is_empty()
+            !rule.conditions.executables.is_empty()
                 || !rule.conditions.platform_sources.is_empty()
                 || rule.conditions.transport.constrained()
         })
@@ -445,6 +444,13 @@ fn scoped_fake_dns_policy_mode(
         .map_err(|_| PolicyCompileError::InvalidPolicy)?;
     if rules().any(|rule| {
         (!rule.conditions.destinations.is_empty() && !rule.conditions.domains.is_empty())
+            || (rule.action == Action::Direct
+                && (rule.conditions.destinations.is_empty()
+                    || rule
+                        .conditions
+                        .destinations
+                        .iter()
+                        .any(|cidr| cidr.prefix_len() == 0)))
             || (rule.action == Action::Block
                 && rule.conditions.domains.is_empty()
                 && rule.conditions.destinations.is_empty())
@@ -1153,7 +1159,10 @@ mod tests {
             assert_eq!(rules[cidr][inbound], json!(["system-tun"]));
         }
         policy.user_rules[1].action = Action::Direct;
+        assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_ok());
+        policy.user_rules[1].conditions.destinations = vec!["0.0.0.0/0".parse().unwrap()];
         assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_err());
+        policy.user_rules[1].conditions.destinations = vec!["192.0.2.0/24".parse().unwrap()];
         policy.user_rules[1].action = Action::Block;
         policy.preset_rules.push(policy.user_rules.pop().unwrap());
         assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_ok());

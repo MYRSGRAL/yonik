@@ -4,7 +4,7 @@ use crate::{
     Cancellation,
     fake_flow::WorkerOnlyLoopbackIsolation,
     fake_service::{FakeDnsBridgeListeners, FakeDnsLeases, MAX_FAKE_TTL},
-    managed_network::Journal,
+    managed_network::{Journal, firewall::BoundDirect},
     resolver::{
         PlainResolverSnapshot, ResolvConfLayout, ResolverError,
         forward::forward_query_name,
@@ -204,6 +204,7 @@ fn make_leases(started_at: Instant, reuse_delay: Duration) -> Result<FakeDnsLeas
 pub(super) struct PreparedFakeDns {
     pub config: SystemFakeDnsBridge,
     pub loopback: Ipv4Addr,
+    pub direct_egress: Vec<BoundDirect>,
     marker: IpAddr,
     suffixes: Vec<String>,
     listeners: Mutex<Option<FakeDnsBridgeListeners>>,
@@ -215,6 +216,7 @@ impl PreparedFakeDns {
     pub async fn new(
         plan: &SessionNetworkPlan,
         suffixes: Vec<String>,
+        direct_egress: Vec<BoundDirect>,
     ) -> Result<Self, ServiceError> {
         let source = resolver_source().await?;
         let mut random = [0; 3];
@@ -263,6 +265,7 @@ impl PreparedFakeDns {
         Ok(Self {
             config,
             loopback,
+            direct_egress,
             marker,
             suffixes,
             listeners: Mutex::new(Some(listeners)),

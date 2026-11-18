@@ -9,6 +9,9 @@ use std::{
 };
 
 const MAX_EXCEPTIONS: usize = 128;
+pub(crate) const MAX_BOUND_DIRECT: usize = MAX_EXCEPTIONS / 2;
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
 const OUTPUT_CHAIN: &str = "output";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +24,7 @@ pub enum PolicyError {
     ConflictingPrivateRoute,
     PrivateTransport,
     LoopbackAddress,
+    Gateway,
 }
 impl fmt::Display for PolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -33,6 +37,7 @@ impl fmt::Display for PolicyError {
             Self::PrivateTransport => "Служебное назначение пересекает защищённую приватную сеть",
             Self::ConflictingPrivateRoute => "Один приватный префикс связан с разными VPN",
             Self::LoopbackAddress => "Нужен выделенный IPv4 loopback адрес для службы",
+            Self::Gateway => "Шлюз должен быть заданного семейства и не быть специальным адресом",
         })
     }
 }
@@ -174,6 +179,47 @@ pub struct BoundTransport {
     uid: u32,
     mark: NonZeroU32,
 }
+
+/// Выход worker через проверенный физический интерфейс к заданной сети.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "BoundDirectDto")]
+pub(crate) struct BoundDirect {
+    prefix: IpPrefix,
+    gateway: IpAddr,
+    ifindex: NonZeroU32,
+    ifname: InterfaceName,
+    uid: NonZeroU32,
+    mark: NonZeroU32,
+}
+impl BoundDirect {
+    pub(crate) fn new(
+        prefix: IpPrefix,
+        ifindex: u32,
+        ifname: &str,
+        uid: u32,
+        mark: u32,
+        gateway: IpAddr,
+    ) -> Result<Self, PolicyError> {
+        if prefix.address.is_ipv4() != gateway.is_ipv4()
+            || gateway.is_unspecified()
+            || gateway.is_loopback()
+            || gateway.is_multicast()
+        {
+            return Err(PolicyError::Gateway);
+        }
+        if ifname.ends_with('*') {
+            return Err(PolicyError::Interface);
+        }
+        Ok(Self {
+            prefix,
+            gateway,
+            ifindex: interface(ifindex)?,
+            ifname: InterfaceName::try_from(ifname.to_owned())?,
+            uid: interface(uid)?,
+            mark: NonZeroU32::new(mark).ok_or(PolicyError::Mark)?,
+        })
+    }
+}
 impl BoundTransport {
     pub fn new(
         destination: IpAddr,
@@ -203,6 +249,8 @@ pub struct PublicBlockPolicy {
     lan: Vec<LanException>,
     transport: Vec<BoundTransport>,
     bootstrap_dns: Vec<BoundTransport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bound_direct: Vec<BoundDirect>,
     link_control: Vec<NonZeroU32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     isolated_loopback: Option<IsolatedLoopback>,
@@ -247,6 +295,47 @@ impl TryFrom<IsolatedLoopbackDto> for IsolatedLoopback {
 }
 
 impl PublicBlockPolicy {
+    pub(crate) fn with_bound_direct(
+        mut self,
+        mut entries: Vec<BoundDirect>,
+    ) -> Result<Self, PolicyError> {
+        if entries.len() > MAX_BOUND_DIRECT {
+            return Err(PolicyError::Limit);
+        }
+        if !entries.is_empty() && self.tun_ifindex.is_none() {
+            return Err(PolicyError::Interface);
+        }
+        let loopback = InterfaceName::try_from("lo".to_owned())?;
+        if entries.iter().any(|entry| {
+            entry.ifindex == self.loopback_ifindex
+                || entry.ifname == loopback
+                || self.tun_ifindex == Some(entry.ifindex)
+        }) {
+            return Err(PolicyError::Interface);
+        }
+        if entries.iter().any(|entry| {
+            self.private_routes
+                .iter()
+                .any(|route| prefixes_overlap(entry.prefix, route.prefix))
+        }) {
+            return Err(PolicyError::PrivateTransport);
+        }
+        let used = self.private_routes.len()
+            + self.lan.len()
+            + self.transport.len()
+            + self.bootstrap_dns.len()
+            + self.link_control.len() * 3
+            + self.isolated_loopback.map_or(0, |_| 6)
+            + entries.len() * 2;
+        if used > MAX_EXCEPTIONS {
+            return Err(PolicyError::Limit);
+        }
+        entries.sort_unstable();
+        entries.dedup();
+        self.bound_direct = entries;
+        Ok(self)
+    }
+
     pub(crate) fn permits_lan_endpoint(&self, destination: IpAddr, ifindex: u32) -> bool {
         self.lan
             .iter()
@@ -262,7 +351,8 @@ impl PublicBlockPolicy {
             + self.transport.len()
             + self.bootstrap_dns.len()
             + self.link_control.len() * 3
-            + self.isolated_loopback.map_or(0, |_| 6);
+            + self.isolated_loopback.map_or(0, |_| 6)
+            + self.bound_direct.len() * 2;
         if extra.len() > MAX_EXCEPTIONS.saturating_sub(used) {
             return Err(PolicyError::Limit);
         }
@@ -277,7 +367,8 @@ impl PublicBlockPolicy {
             self.bootstrap_dns.clone(),
         )?
         .with_link_control(self.link_control.iter().map(|i| i.get()).collect())?
-        .with_isolated_loopback_config(self.isolated_loopback)
+        .with_isolated_loopback_config(self.isolated_loopback)?
+        .with_bound_direct(self.bound_direct.clone())
     }
     pub fn new(
         loopback_ifindex: u32,
@@ -329,6 +420,7 @@ impl PublicBlockPolicy {
             lan,
             transport,
             bootstrap_dns,
+            bound_direct: Vec::new(),
             link_control: Vec::new(),
             isolated_loopback: None,
         })
@@ -342,6 +434,7 @@ impl PublicBlockPolicy {
             + self.transport.len()
             + self.bootstrap_dns.len()
             + self.isolated_loopback.map_or(0, |_| 6);
+        let used = used + self.bound_direct.len() * 2;
         if interfaces.len() > MAX_EXCEPTIONS.saturating_sub(used) / 3 {
             return Err(PolicyError::Limit);
         }
@@ -372,6 +465,7 @@ impl PublicBlockPolicy {
             + self.transport.len()
             + self.bootstrap_dns.len()
             + self.link_control.len() * 3;
+        let used = used + self.bound_direct.len() * 2;
         if guard.is_some() && used.saturating_add(6) > MAX_EXCEPTIONS {
             return Err(PolicyError::Limit);
         }
@@ -493,6 +587,27 @@ impl PublicBlockPolicy {
                 ],
             ));
         }
+        for direct in &self.bound_direct {
+            for protocol in [IPPROTO_TCP, IPPROTO_UDP] {
+                commands.push(rule(
+                    table_name,
+                    vec![
+                        destination(direct.prefix.address, direct.prefix.expression()),
+                        destination_not_equal(direct.prefix.address, direct.gateway),
+                        compare(
+                            json!({"rt":{"key":"nexthop","family":if direct.gateway.is_ipv4() {"ip"} else {"ip6"}}}),
+                            json!(direct.gateway.to_string()),
+                        ),
+                        meta("oif", json!(direct.ifindex.get())),
+                        meta("oifname", json!(String::from(direct.ifname))),
+                        meta("l4proto", json!(protocol)),
+                        meta("skuid", json!(direct.uid.get())),
+                        meta("mark", json!(direct.mark.get())),
+                        json!({"accept": null}),
+                    ],
+                ));
+            }
+        }
         for exception in &self.lan {
             commands.push(rule(
                 table_name,
@@ -568,6 +683,30 @@ struct BoundTransportDto {
     uid: u32,
     mark: u32,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundDirectDto {
+    prefix: IpPrefix,
+    gateway: IpAddr,
+    ifindex: u32,
+    ifname: String,
+    uid: u32,
+    mark: u32,
+}
+impl TryFrom<BoundDirectDto> for BoundDirect {
+    type Error = PolicyError;
+
+    fn try_from(value: BoundDirectDto) -> Result<Self, Self::Error> {
+        Self::new(
+            value.prefix,
+            value.ifindex,
+            &value.ifname,
+            value.uid,
+            value.mark,
+            value.gateway,
+        )
+    }
+}
 impl TryFrom<BoundTransportDto> for BoundTransport {
     type Error = PolicyError;
     fn try_from(value: BoundTransportDto) -> Result<Self, Self::Error> {
@@ -590,6 +729,8 @@ struct PublicBlockPolicyDto {
     lan: Vec<LanException>,
     transport: Vec<BoundTransport>,
     bootstrap_dns: Vec<BoundTransport>,
+    #[serde(default)]
+    bound_direct: Vec<BoundDirect>,
     link_control: Vec<u32>,
     #[serde(default)]
     isolated_loopback: Option<IsolatedLoopback>,
@@ -606,12 +747,16 @@ impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
             value.bootstrap_dns,
         )?
         .with_link_control(value.link_control)?
-        .with_isolated_loopback_config(value.isolated_loopback)
+        .with_isolated_loopback_config(value.isolated_loopback)?
+        .with_bound_direct(value.bound_direct)
     }
 }
 
 fn interface(value: u32) -> Result<NonZeroU32, PolicyError> {
     NonZeroU32::new(value).ok_or(PolicyError::Interface)
+}
+fn prefixes_overlap(first: IpPrefix, second: IpPrefix) -> bool {
+    first.contains(second.address) || second.contains(first.address)
 }
 fn compare(left: Value, right: Value) -> Value {
     json!({"match": {"op": "==", "left": left, "right": right}})
@@ -624,6 +769,13 @@ fn destination(address: IpAddr, right: Value) -> Value {
         json!({"payload": {"protocol": if address.is_ipv4() { "ip" } else { "ip6" }, "field": "daddr"}}),
         right,
     )
+}
+fn destination_not_equal(address: IpAddr, gateway: IpAddr) -> Value {
+    json!({"match": {
+        "op": "!=",
+        "left": {"payload": {"protocol": if address.is_ipv4() {"ip"} else {"ip6"}, "field": "daddr"}},
+        "right": gateway.to_string()
+    }})
 }
 fn rule(table: &str, mut expr: Vec<Value>) -> Value {
     let family = match expr
@@ -666,6 +818,227 @@ mod tests {
             11,
         )
         .expect("Тестовый endpoint")
+    }
+    fn direct(prefix: IpPrefix, ifindex: u32, ifname: &str) -> BoundDirect {
+        let gateway: IpAddr = if prefix.address.is_ipv4() {
+            "192.0.2.1".parse().unwrap()
+        } else {
+            "2001:db8::1".parse().unwrap()
+        };
+        BoundDirect::new(prefix, ifindex, ifname, 987, 11, gateway).expect("Тестовый Direct")
+    }
+    #[test]
+    fn bound_direct_is_scoped_ordered_serialized_and_preserved() {
+        let network = prefix("192.0.2.0", 24);
+        let first = direct(network, 2, "enp1s0");
+        let base = policy(vec![], vec![], vec![])
+            .with_bound_direct(vec![first])
+            .unwrap();
+        let rules = base.commands("fixture");
+        assert_eq!(rules.len(), 5);
+        for (rule, protocol) in rules[2..4].iter().zip([IPPROTO_TCP, IPPROTO_UDP]) {
+            let expressions = rule["add"]["rule"]["expr"].as_array().unwrap();
+            assert_eq!(expressions[0], meta("nfproto", json!("ipv4")));
+            assert_eq!(
+                expressions[1],
+                destination("192.0.2.0".parse().unwrap(), network.expression())
+            );
+            assert_eq!(
+                expressions[2],
+                json!({"match":{"op":"!=","left":{"payload":{"protocol":"ip","field":"daddr"}},"right":"192.0.2.1"}})
+            );
+            assert_eq!(
+                expressions[3],
+                compare(
+                    json!({"rt":{"key":"nexthop","family":"ip"}}),
+                    json!("192.0.2.1")
+                )
+            );
+            assert_eq!(expressions[4], meta("oif", json!(2)));
+            assert_eq!(expressions[5], meta("oifname", json!("enp1s0")));
+            assert_eq!(expressions[6], meta("l4proto", json!(protocol)));
+            assert_eq!(expressions[7], meta("skuid", json!(987)));
+            assert_eq!(expressions[8], meta("mark", json!(11)));
+            assert_eq!(expressions[9], json!({"accept":null}));
+        }
+        assert_eq!(
+            BoundDirect::new(network, 2, "enp1s0*", 987, 11, "192.0.2.1".parse().unwrap()),
+            Err(PolicyError::Interface)
+        );
+        assert_eq!(
+            BoundDirect::new(network, 2, "enp1s0", 0, 11, "192.0.2.1".parse().unwrap()),
+            Err(PolicyError::Interface)
+        );
+        assert_eq!(
+            BoundDirect::new(network, 2, "enp1s0", 987, 0, "192.0.2.1".parse().unwrap()),
+            Err(PolicyError::Mark)
+        );
+        let encoded = serde_json::to_value(&base).unwrap();
+        assert!(
+            serde_json::to_value(policy(vec![], vec![], vec![]))
+                .unwrap()
+                .get("bound_direct")
+                .is_none()
+        );
+        let mut invalid = encoded.clone();
+        invalid["bound_direct"][0]["unknown"] = json!(true);
+        assert!(serde_json::from_value::<PublicBlockPolicy>(invalid).is_err());
+        let mut missing_gateway = encoded.clone();
+        missing_gateway["bound_direct"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("gateway");
+        assert!(serde_json::from_value::<PublicBlockPolicy>(missing_gateway).is_err());
+        let restored: PublicBlockPolicy = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, base);
+        assert_eq!(restored.digest(), base.digest());
+        let updated = base
+            .with_additional_transport(&[endpoint("203.0.113.4")])
+            .unwrap();
+        assert_ne!(updated.digest(), base.digest());
+        let direct_rules = |commands: &[Value]| {
+            commands
+                .iter()
+                .filter(|command| {
+                    command.pointer("/add/rule/expr").is_some_and(|expr| {
+                        expr.as_array().is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item.pointer("/match/left/meta/key").and_then(Value::as_str)
+                                    == Some("oifname")
+                                    && item.pointer("/match/right").and_then(Value::as_str)
+                                        == Some("enp1s0")
+                            })
+                        })
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            direct_rules(&updated.commands("fixture")),
+            direct_rules(&base.commands("fixture"))
+        );
+
+        let duplicate = base.clone().with_bound_direct(vec![first, first]).unwrap();
+        assert_eq!(duplicate.digest(), base.digest());
+        assert_eq!(duplicate.commands("fixture"), base.commands("fixture"));
+        let second = direct(prefix("198.51.100.0", 24), 3, "enp2s0");
+        let ordered = policy(vec![], vec![], vec![])
+            .with_bound_direct(vec![first, second])
+            .unwrap();
+        let reversed = policy(vec![], vec![], vec![])
+            .with_bound_direct(vec![second, first])
+            .unwrap();
+        assert_eq!(ordered.digest(), reversed.digest());
+        assert_ne!(
+            base.digest(),
+            policy(vec![], vec![], vec![])
+                .with_bound_direct(vec![direct(network, 3, "enp1s0")])
+                .unwrap()
+                .digest()
+        );
+        assert_ne!(
+            base.digest(),
+            policy(vec![], vec![], vec![])
+                .with_bound_direct(vec![
+                    BoundDirect::new(network, 2, "enp1s0", 987, 11, "192.0.2.2".parse().unwrap(),)
+                        .unwrap()
+                ])
+                .unwrap()
+                .digest()
+        );
+    }
+
+    #[test]
+    fn bound_direct_requires_a_distinct_physical_link_and_respects_limits_and_private_routes() {
+        let route = prefix("10.0.0.0", 8);
+        let private = PrivateRoute::bound(route, 7, "wg0").unwrap();
+        let base = policy(vec![private], vec![], vec![]);
+        let make = |prefix| direct(prefix, 2, "enp1s0");
+        assert_eq!(
+            base.clone().with_bound_direct(vec![make(route)]),
+            Err(PolicyError::PrivateTransport)
+        );
+        assert_eq!(
+            PublicBlockPolicy::new(1, None, vec![], vec![], vec![], vec![])
+                .unwrap()
+                .with_bound_direct(vec![make(prefix("192.0.2.0", 24))]),
+            Err(PolicyError::Interface)
+        );
+        assert_eq!(
+            policy(vec![], vec![], vec![]).with_bound_direct(vec![direct(
+                prefix("192.0.2.0", 24),
+                1,
+                "lo"
+            )]),
+            Err(PolicyError::Interface)
+        );
+        assert_eq!(
+            policy(vec![], vec![], vec![]).with_bound_direct(vec![direct(
+                prefix("192.0.2.0", 24),
+                8,
+                "tofu"
+            )]),
+            Err(PolicyError::Interface)
+        );
+        let bounded = policy(vec![], vec![], vec![])
+            .with_link_control(vec![2])
+            .unwrap();
+        assert_eq!(
+            bounded
+                .clone()
+                .with_bound_direct(vec![make(prefix("192.0.2.0", 24)); MAX_BOUND_DIRECT + 1]),
+            Err(PolicyError::Limit)
+        );
+        let maximum = (1..=MAX_BOUND_DIRECT)
+            .map(|last| direct(prefix(&format!("198.18.{}.0", last), 24), 2, "enp1s0"))
+            .collect();
+        assert_eq!(bounded.with_bound_direct(maximum), Err(PolicyError::Limit));
+    }
+
+    #[test]
+    fn bound_direct_gateway_is_family_checked_and_encoded_for_both_families() {
+        let network = prefix("2001:db8:5::", 64);
+        let gateway: IpAddr = "fe80::1".parse().unwrap();
+        let entry = BoundDirect::new(network, 2, "enp1s0", 987, 11, gateway).unwrap();
+        let policy_with_gateway = policy(vec![], vec![], vec![])
+            .with_bound_direct(vec![entry])
+            .unwrap();
+        let encoded = policy_with_gateway.commands("fixture");
+        let expressions = encoded[2]["add"]["rule"]["expr"].as_array().unwrap();
+        assert_eq!(expressions[0], meta("nfproto", json!("ipv6")));
+        assert_eq!(
+            expressions[2],
+            json!({"match":{"op":"!=","left":{"payload":{"protocol":"ip6","field":"daddr"}},"right":"fe80::1"}})
+        );
+        assert_eq!(
+            expressions[3],
+            compare(
+                json!({"rt":{"key":"nexthop","family":"ip6"}}),
+                json!("fe80::1")
+            )
+        );
+        assert_eq!(
+            serde_json::from_value::<PublicBlockPolicy>(
+                serde_json::to_value(&policy_with_gateway).unwrap()
+            )
+            .unwrap(),
+            policy_with_gateway
+        );
+        assert_ne!(
+            policy_with_gateway.digest(),
+            policy(vec![], vec![], vec![]).digest()
+        );
+
+        for invalid in ["::", "::1", "ff02::1", "192.0.2.1"] {
+            assert!(
+                BoundDirect::new(network, 2, "enp1s0", 987, 11, invalid.parse().unwrap()).is_err()
+            );
+        }
+        let v4 = prefix("192.0.2.0", 24);
+        for invalid in ["0.0.0.0", "127.0.0.1", "224.0.0.1", "2001:db8::1"] {
+            assert!(BoundDirect::new(v4, 2, "enp1s0", 987, 11, invalid.parse().unwrap()).is_err());
+        }
     }
     #[test]
     fn bound_identity_is_additive_and_legacy_codec_stays_canonical() {
