@@ -169,7 +169,7 @@ fn same_topology(
             )
         })
 }
-fn same_link(left: &LinuxLink, right: &LinuxLink) -> bool {
+pub(super) fn same_link(left: &LinuxLink, right: &LinuxLink) -> bool {
     equal_record!(LinuxLink,left,right,unknown,Context::Link;index,link_type,flags,name,alias,mtu,master,parent,kind,operational_state)
 }
 fn same_address(

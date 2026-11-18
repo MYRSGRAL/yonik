@@ -223,6 +223,8 @@ async fn production_helper_sing_box_output_survives_sigkill() -> Result {
 }
 
 async fn wait_for_fixture_link() -> Result {
+    use yonik_linux::NetworkReadError;
+
     const DEADLINE: Duration = Duration::from_secs(5);
     const IFA_F_DADFAILED: u32 = 0x08;
     const IFA_F_TENTATIVE: u32 = 0x40;
@@ -233,7 +235,14 @@ async fn wait_for_fixture_link() -> Result {
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         require(!remaining.is_zero(), "IPv6 DAD стенда не завершился")?;
-        let topology = yonik_linux::read_topology(&mut cancel, remaining).await?;
+        let topology = match yonik_linux::read_topology(&mut cancel, remaining).await {
+            Ok(topology) => topology,
+            Err(NetworkReadError::Changed | NetworkReadError::Interrupted) => {
+                tokio::time::sleep(Duration::from_millis(50).min(remaining)).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let ready = topology
             .links
             .iter()
@@ -719,6 +728,183 @@ async fn check_fixture_real_resolver(peer: &str, answer: &str) -> Result {
 
 #[cfg(feature = "test-support")]
 const FIXTURE_WG_LINK: &str = "yonik-wg";
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная QEMU VM с WireGuard и отдельными veth для смены маршрута"]
+async fn wireguard_transport_route_proof_revokes_changed_path() -> Result {
+    use yonik_linux::{NetworkReadError, WireGuardUdpRouteSnapshot};
+
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    control_fixture_wireguard("connect")?;
+    let (_owner, mut cancel) = yonik_linux::Cancellation::new();
+    let index = fs::read_to_string(format!("/sys/class/net/{FIXTURE_WG_LINK}/ifindex"))?
+        .trim()
+        .parse()?;
+    let ip = |args: &[&str]| -> Result {
+        let output = Command::new("/usr/bin/ip").args(args).output()?;
+        require(
+            output.status.success(),
+            &format!(
+                "Ошибка команды ip: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    };
+    ip(&[
+        "link",
+        "add",
+        "yonik-wg-alt",
+        "type",
+        "veth",
+        "peer",
+        "name",
+        "yonik-wg-peer",
+    ])?;
+    ip(&["link", "set", "dev", "yonik-wg-alt", "addrgenmode", "none"])?;
+    ip(&["link", "set", "dev", "yonik-wg-peer", "addrgenmode", "none"])?;
+    ip(&["addr", "add", "192.0.2.1/24", "dev", "yonik-wg-alt"])?;
+    ip(&["link", "set", "dev", "yonik-wg-alt", "up"])?;
+    ip(&["link", "set", "dev", "yonik-wg-peer", "up"])?;
+    eprintln!("Проверка исходного IPv4 маршрута");
+    let mut original = WireGuardUdpRouteSnapshot::capture(index, &mut cancel).await?;
+    let (original_end, paths) = original
+        .paths()
+        .ok_or_else(|| io::Error::other("Нет проверенного IPv4 пути"))?;
+    require(
+        paths.len() == 1
+            && paths[0].source() == "10.203.0.1:24177".parse()?
+            && paths[0].endpoint() == "10.203.0.2:24177".parse()?
+            && paths[0].ifname() == b"yonik-outer"
+            && paths[0].fwmark().get() == 24177,
+        "IPv4 связка WireGuard не соответствует выбранному маршруту",
+    )?;
+    eprintln!("Повторная проверка неизменного маршрута");
+    original.revalidate(&mut cancel).await?;
+    require(
+        original
+            .paths()
+            .is_some_and(|(deadline, _)| deadline > original_end),
+        "Повторная проверка не продлила срок",
+    )?;
+
+    ip(&[
+        "-4",
+        "route",
+        "add",
+        "10.203.0.2/32",
+        "dev",
+        "yonik-wg-alt",
+        "src",
+        "192.0.2.1",
+        "table",
+        "24001",
+    ])?;
+    let rule = [
+        "priority", "9050", "fwmark", "24177", "ipproto", "udp", "sport", "24177", "dport",
+        "24177", "lookup", "24001",
+    ];
+    let mut add = vec!["-4", "rule", "add"];
+    add.extend(rule);
+    ip(&add)?;
+    eprintln!("Проверка IPv4 маршрута с отдельным правилом RPDB");
+    let alternate = WireGuardUdpRouteSnapshot::capture(index, &mut cancel).await?;
+    require(
+        alternate
+            .paths()
+            .is_some_and(|(_, paths)| paths.len() == 1 && paths[0].ifname() == b"yonik-wg-alt"),
+        "Проверка проигнорировала правило RPDB по UDP-портам и метке",
+    )?;
+    require(
+        original.revalidate(&mut cancel).await == Err(NetworkReadError::Changed)
+            && original.paths().is_none(),
+        "Старый маршрут WireGuard пережил переключение",
+    )?;
+    let mut remove = vec!["-4", "rule", "del"];
+    remove.extend(rule);
+    ip(&remove)?;
+    require(
+        original.revalidate(&mut cancel).await.is_err() && original.paths().is_none(),
+        "Старая связка возобновилась после возврата маршрута",
+    )?;
+
+    let mut previous_transport = WireGuardUdpRouteSnapshot::capture(index, &mut cancel).await?;
+    let keys = Command::new("/opt/yonik-gate/wg")
+        .args(["show", FIXTURE_WG_LINK, "peers"])
+        .output()?;
+    let key = std::str::from_utf8(&keys.stdout)?.trim();
+    require(
+        keys.status.success() && key.len() == 44,
+        "Не подтверждён peer стенда",
+    )?;
+    let change = Command::new("/opt/yonik-gate/wg")
+        .args([
+            "set",
+            FIXTURE_WG_LINK,
+            "listen-port",
+            "24178",
+            "peer",
+            key,
+            "endpoint",
+            "[2001:db8:7470::2]:24179",
+        ])
+        .status()?;
+    require(change.success(), "Смена endpoint WireGuard не выполнена")?;
+    require(
+        previous_transport.revalidate(&mut cancel).await.is_err()
+            && previous_transport.paths().is_none(),
+        "Старый UDP транспорт остался доступен",
+    )?;
+    eprintln!("Проверка маршрута после смены endpoint на IPv6");
+    let current = WireGuardUdpRouteSnapshot::capture(index, &mut cancel).await?;
+    let (expires, paths) = current
+        .paths()
+        .ok_or_else(|| io::Error::other("Нет проверенного IPv6 пути"))?;
+    require(
+        paths.len() == 1
+            && paths[0].source() == "[2001:db8:7470::1]:24178".parse()?
+            && paths[0].endpoint() == "[2001:db8:7470::2]:24179".parse()?
+            && paths[0].ifname() == b"yonik-outer",
+        "IPv6 связка WireGuard не соответствует выбранному маршруту",
+    )?;
+    tokio::time::sleep_until(expires).await;
+    require(
+        current.paths().is_none(),
+        "Проверенный маршрут пережил срок",
+    )?;
+    let (stop, mut lifetime) = yonik_linux::Cancellation::new();
+    let cancelled = WireGuardUdpRouteSnapshot::capture(index, &mut lifetime).await?;
+    require(cancelled.paths().is_some(), "Новый IPv6 снимок недоступен")?;
+    stop.send(true)?;
+    require(
+        cancelled.paths().is_none(),
+        "Отмена не закрыла доступ к снимку",
+    )?;
+    require(
+        Command::new("/opt/yonik-gate/wg")
+            .args(["set", FIXTURE_WG_LINK, "fwmark", "0"])
+            .status()?
+            .success(),
+        "Не сброшен fwmark WireGuard",
+    )?;
+    require(
+        WireGuardUdpRouteSnapshot::capture(index, &mut cancel)
+            .await
+            .err()
+            == Some(NetworkReadError::Unsupported),
+        "Маршрут WireGuard без метки допущен",
+    )?;
+    control_fixture_wireguard("disconnect")?;
+    require(
+        resolver_file_state()? == resolver_before,
+        "Проверка изменила /etc/resolv.conf",
+    )?;
+    eprintln!("WireGuard UDP: оба семейства, выбор RPDB, отзыв и истечение срока подтверждены");
+    Ok(())
+}
 
 #[cfg(feature = "test-support")]
 #[tokio::test]

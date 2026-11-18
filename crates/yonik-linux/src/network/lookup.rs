@@ -349,6 +349,14 @@ fn parse_reply(
                 let table = u32_value(value)?;
                 route.table = (table != 0).then_some(table);
             }
+            // RTA_PREF — предпочтение маршрутизатора IPv6. Храним для сравнения.
+            20 if bytes[0] == 10 && matches!(value, [0 | 1 | 3]) => {
+                route.attributes.push(NetworkAttribute {
+                    kind,
+                    value: value.to_vec(),
+                });
+            }
+            20 => return Err(NetworkReadError::Malformed),
             30 => {
                 let id = u32_value(value)?;
                 if id == 0 {
@@ -377,9 +385,9 @@ fn parse_reply(
     let cache_info =
         |attribute: &NetworkAttribute| attribute.kind == 12 && attribute.value.len() == 32;
     if route.attributes.iter().any(|attribute| {
-        attribute.kind != 9
-            && !cache_info(attribute)
-            && !(attribute.kind == 23 && attribute.value.len() == 4)
+        !(matches!(attribute.kind, 9 | 20)
+            || cache_info(attribute)
+            || attribute.kind == 23 && attribute.value.len() == 4)
     }) {
         route.incomplete.push(LookupIncomplete::UnknownAttributes);
     }

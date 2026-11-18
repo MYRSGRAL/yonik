@@ -51,7 +51,8 @@ pub use network::{
     IpPrefix, KernelRoute, LinuxAddress, LinuxLink, LinuxNexthop, LinuxRoute, LinuxRule,
     LinuxTopology, LookupIncomplete, NetworkAttribute, NetworkNamespace, NetworkReadError,
     NexthopMember, RouteKind, RouteNexthop, RouteQuery, TransportProtocol, WireGuardDevice,
-    WireGuardPeer, lookup_route, read_topology, read_wireguard_device,
+    WireGuardPeer, WireGuardUdpPath, WireGuardUdpRouteSnapshot, lookup_route, read_topology,
+    read_wireguard_device,
 };
 #[cfg(target_os = "linux")]
 mod resolver;

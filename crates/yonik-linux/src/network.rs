@@ -14,6 +14,7 @@ mod read;
 mod route;
 mod topology;
 mod wireguard;
+mod wireguard_transport;
 pub use lookup::{
     KernelRoute, LookupIncomplete, RouteKind, RouteQuery, TransportProtocol, lookup_route,
 };
@@ -24,6 +25,7 @@ pub use topology::{
 };
 pub(crate) use topology::{TopologyCapture, read_topology_captured, reread_changed_topology};
 pub use wireguard::{WireGuardDevice, WireGuardPeer, read_wireguard_device};
+pub use wireguard_transport::{WireGuardUdpPath, WireGuardUdpRouteSnapshot};
 
 use std::fmt;
 use tokio::sync::watch;
