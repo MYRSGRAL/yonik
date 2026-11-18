@@ -14,6 +14,7 @@ mod linux {
     enum Mode {
         Host,
         Snapshot,
+        Resolve1,
         Watch,
     }
 
@@ -117,6 +118,23 @@ mod linux {
                 let snapshot = yonik_linux::read_resolver_snapshot(cancel, STARTUP_TIMEOUT).await?;
                 return emit_snapshot(&snapshot, cancel).await;
             }
+            Mode::Resolve1 => {
+                let snapshot = yonik_linux::read_resolve1_snapshot(cancel, STARTUP_TIMEOUT).await?;
+                return emit(json!({
+                    "source": "system_bus_org.freedesktop.resolve1",
+                    "links": snapshot.endpoints.iter().filter_map(|endpoint| match endpoint.scope {
+                        yonik_linux::Resolve1Scope::Link(index) => Some(index),
+                        yonik_linux::Resolve1Scope::Global => None,
+                    }).chain(snapshot.domains.iter().filter_map(|domain| match domain.scope {
+                        yonik_linux::Resolve1Scope::Link(index) => Some(index),
+                        yonik_linux::Resolve1Scope::Global => None,
+                    })).collect::<std::collections::BTreeSet<_>>().len(),
+                    "servers": snapshot.endpoints.len(),
+                    "domains": snapshot.domains.len(),
+                    "route_only_domains": snapshot.domains.iter().filter(|domain| domain.route_only).count(),
+                    "atomic": false
+                }), cancel).await;
+            }
             Mode::Watch => {}
         }
         let mut subscription = yonik_linux::subscribe_resolver(cancel, STARTUP_TIMEOUT).await?;
@@ -149,6 +167,7 @@ mod linux {
         let mode = match (args.next(), args.next()) {
             (None, None) => Ok(Mode::Snapshot),
             (Some(mode), None) if mode == "snapshot" => Ok(Mode::Snapshot),
+            (Some(mode), None) if mode == "resolve1" => Ok(Mode::Resolve1),
             (Some(mode), None) if mode == "watch" => Ok(Mode::Watch),
             (Some(mode), None) if mode == "host" => Ok(Mode::Host),
             _ => Err(ResolverError::Malformed),

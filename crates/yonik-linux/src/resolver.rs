@@ -3,6 +3,7 @@
 //! Снимок описывает daemon; наблюдения и peer credentials не дают права Apply.
 
 mod config;
+mod resolve1;
 mod socket;
 mod wire;
 
@@ -76,6 +77,9 @@ mod host_layout_tests {
 }
 
 pub use config::*;
+pub use resolve1::{
+    Resolve1Domain, Resolve1Endpoint, Resolve1Scope, Resolve1Snapshot, read_resolve1_snapshot,
+};
 pub use socket::ResolverPeer;
 
 /// Раскладка файла, которую видит процесс. Активность DNS-службы и путь
