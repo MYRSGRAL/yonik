@@ -359,17 +359,54 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
 #[tokio::test]
 #[ignore = "выделенная Debian VM с echo peer для example.test и blocked.example.test"]
 async fn production_helper_scoped_fake_dns_domain_policy() -> Result {
+    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::Domains).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с проксируемыми IPv4/IPv6 echo endpoints"]
+async fn production_helper_scoped_fake_dns_literal_cidr_policy() -> Result {
+    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralBlock).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM, контроль доступности тех же буквальных IP через Proxy"]
+async fn production_helper_scoped_fake_dns_literal_cidr_control() -> Result {
+    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralProxy).await
+}
+
+#[cfg(feature = "test-support")]
+async fn installed_fake_dns_with_domain_policy(witness: FakeDnsPolicyWitness) -> Result {
+    let mut preset_rules = vec![json!({"id":2,"enabled":true,"action":"block","ip_cidr":[],
+        "domain":[],"domain_suffix":["example.test"],"executable_paths":[]})];
+    let literal_action = match witness {
+        FakeDnsPolicyWitness::Domains => None,
+        FakeDnsPolicyWitness::LiteralBlock => Some("block"),
+        FakeDnsPolicyWitness::LiteralProxy => Some("proxy"),
+    };
+    if let Some(action) = literal_action {
+        preset_rules.push(json!({"id":3,"enabled":true,"action":action,
+            "ip_cidr":["198.18.0.2/32","2001:db8:746f::2/128"],
+            "domain":[],"domain_suffix":[],"executable_paths":[]}));
+    }
     let policy = yonik_engine::policy_wire::SystemPolicy::parse(
         &json!({
             "version":1, "default_action":"proxy", "lan":[], "private_networks":[], "private_domains":[],
             "user_rules":[{"id":1,"enabled":true,"action":"proxy","ip_cidr":[],
                 "domain":["example.test"],"domain_suffix":[],"executable_paths":[]}],
-            "preset_rules":[{"id":2,"enabled":true,"action":"block","ip_cidr":[],
-                "domain":[],"domain_suffix":["example.test"],"executable_paths":[]}]
+            "preset_rules":preset_rules
         })
         .to_string(),
     )?;
-    installed_fake_dns(None, false, Some(&policy), Some("blocked.example.test")).await
+    installed_fake_dns(None, false, Some(&policy), Some(witness)).await
+}
+
+#[cfg(feature = "test-support")]
+enum FakeDnsPolicyWitness {
+    Domains,
+    LiteralBlock,
+    LiteralProxy,
 }
 
 #[cfg(feature = "test-support")]
@@ -377,7 +414,7 @@ async fn installed_fake_dns(
     literal: Option<std::net::SocketAddr>,
     crash: bool,
     policy: Option<&yonik_engine::policy_wire::SystemPolicy>,
-    blocked_name: Option<&str>,
+    policy_witness: Option<FakeDnsPolicyWitness>,
 ) -> Result {
     guard()?;
     let _lock = vm_lock::acquire()?;
@@ -488,14 +525,25 @@ async fn installed_fake_dns(
             "NSS вернул неверные семейства",
         )?;
         check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
-        if let Some(name) = blocked_name {
+        if let Some(witness) = &policy_witness {
             for database in ["ahostsv4", "ahostsv6"] {
-                check_fake_flow_blocked((getent_fake_dns(database, name).await?, 40000).into())
-                    .await?;
+                let blocked = getent_fake_dns(database, "blocked.example.test").await?;
+                check_fake_flow_blocked((blocked, 40000).into()).await?;
             }
             eprintln!(
                 "{engine:?} Fake DNS: точный Proxy опередил Block, поддомен заблокирован по TCP и UDP"
             );
+            match witness {
+                FakeDnsPolicyWitness::Domains => {}
+                FakeDnsPolicyWitness::LiteralBlock => {
+                    check_literal_cidr_traffic(false).await?;
+                    eprintln!("{engine:?} CIDR Block подтверждён по TCP/UDP IPv4/IPv6");
+                }
+                FakeDnsPolicyWitness::LiteralProxy => {
+                    check_literal_cidr_traffic(true).await?;
+                    eprintln!("{engine:?} CIDR Proxy пропустил те же IPv4/IPv6 по TCP/UDP");
+                }
+            }
         }
         if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
             check_https_through_tun(&certificate, literal.map(|_| v4)).await?;
@@ -545,6 +593,38 @@ async fn installed_fake_dns(
         if crash {
             break;
         }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn check_literal_cidr_traffic(proxy: bool) -> Result {
+    let servers = [
+        "198.18.0.2:40000".parse::<std::net::SocketAddr>()?,
+        "[2001:db8:746f::2]:40000".parse()?,
+    ];
+    for server in servers {
+        let address = server.ip().to_string();
+        let route = Command::new("/usr/bin/ip")
+            .args(["-j", "route", "get", &address])
+            .output()?;
+        require(
+            route.status.success(),
+            "Не удалось получить маршрут к контрольному IP",
+        )?;
+        let routes: Value = serde_json::from_slice(&route.stdout)?;
+        require(
+            routes[0]["dev"]
+                .as_str()
+                .is_some_and(|dev| dev.starts_with("tofu")),
+            "Трафик контрольного IP не дошёл бы до TUN",
+        )?;
+    }
+    if proxy {
+        return check_tun_traffic_to(servers).await;
+    }
+    for server in servers {
+        check_fake_flow_blocked(server).await?;
     }
     Ok(())
 }
@@ -907,11 +987,11 @@ async fn check_fake_flow_blocked(server: std::net::SocketAddr) -> Result {
     );
     require(
         !matches!(tcp, Ok(Ok(bytes)) if bytes > 0),
-        "Block пропустил TCP через Fake-IP",
+        "Block пропустил TCP к контрольному адресу",
     )?;
     require(
         !matches!(udp, Ok(Ok(_))),
-        "Block пропустил UDP через Fake-IP",
+        "Block пропустил UDP к контрольному адресу",
     )
 }
 

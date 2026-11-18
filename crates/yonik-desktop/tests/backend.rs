@@ -63,6 +63,22 @@ fn system_fake_dns_is_saved_and_enables_sing_box_only_in_system_mode() {
     app.send(json!({"command":"set_system_fake_dns","suffixes":"example.test, sub.example.test"}));
     let state = app.wait(|value| value["system_fake_dns"] == expected);
     assert_eq!(state["system_fake_dns_enabled"], true);
+    app.send(
+        json!({"command":"edit_routing","expected_revision":3,"request_id":4,
+        "create":true,"confirm_broad":false,"rule":{"id":18,"enabled":true,
+        "executables":[],"domains":[],"destinations":["192.0.2.0/24"],"action":"block"}}),
+    );
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 4);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], false);
+    app.send(
+        json!({"command":"edit_routing","expected_revision":4,"request_id":5,
+        "create":false,"confirm_broad":false,"rule":{"id":17,"enabled":true,
+        "executables":[],"domains":["*.example.test"],"destinations":[],"action":"proxy"}}),
+    );
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 5);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], true);
     app.send(json!({"command":"set_engine", "engine":"sing-box"}));
     app.wait(|value| value["engine"] == "sing-box");
 

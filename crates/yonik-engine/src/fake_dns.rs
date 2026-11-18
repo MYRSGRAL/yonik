@@ -13,6 +13,7 @@ const TYPE_OPT: u16 = 41;
 const CLASS_IN: u16 = 1;
 pub const MAX_DNS_PACKET: usize = 4096;
 const MAX_EDNS_UDP_SIZE: u16 = 4096;
+pub const SYSTEM_FAKE_DNS_PROBE_NAME: &str = "probe.invalid";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FakeDnsError {

@@ -183,6 +183,56 @@ pub(crate) fn compile_tun_policy(
     )
 }
 
+/// Вызывающая сторона проверяет, что восстановленное имя получает решение до CIDR.
+/// CIDR применимы только к пакетному входу с буквальным IP.
+pub(crate) fn compile_tun_fake_literal_policy(
+    server: &ParsedServer,
+    engine: Engine,
+    port: NonZeroU16,
+    probe_port: NonZeroU16,
+    policy: &Policy,
+) -> Result<CompiledConfig, PolicyCompileError> {
+    if port == probe_port {
+        return Err(PolicyCompileError::ProbePort);
+    }
+    validate_policy_inputs(policy, false)?;
+    let checkpoint = Checkpoint::new(&|| true);
+    let mut config = emit_policy(
+        server,
+        engine,
+        port,
+        probe_port,
+        policy,
+        PolicyMode::Names,
+        false,
+        None,
+        false,
+        &checkpoint,
+    )
+    .map_err(|error| match error {
+        BoundCompileError::Policy(error) => error,
+        BoundCompileError::Cancelled => PolicyCompileError::InvalidPolicy,
+    })?;
+    let (routing, ip, ingress) = match engine {
+        Engine::Xray => ("routing", "ip", "inboundTag"),
+        Engine::SingBox => ("route", "ip_cidr", "inbound"),
+    };
+    let rules = config.value[routing]["rules"]
+        .as_array_mut()
+        .ok_or(PolicyCompileError::InvalidPolicy)?;
+    for rule in rules {
+        if rule.get(ip).is_some() {
+            rule[ingress] = json!(["system-tun"]);
+        } else if ["domain", "domain_suffix", "domain_regex"]
+            .iter()
+            .any(|key| rule.get(*key).is_some())
+        {
+            rule[ingress] = json!(["fake-ip-reinject"]);
+        }
+    }
+    Ok(config)
+}
+
 pub(crate) fn compile_tun_policy_resources<C: crate::resource_bundle::VerifiedCatalog>(
     server: &ParsedServer,
     engine: Engine,
@@ -585,11 +635,7 @@ fn route_rule(
     }
 }
 
-fn validate_policy(
-    policy: &Policy,
-    mode: PolicyMode,
-    tun_sources: bool,
-) -> Result<(), PolicyCompileError> {
+fn validate_policy_inputs(policy: &Policy, tun_sources: bool) -> Result<(), PolicyCompileError> {
     if let Some(id) = policy.unsupported_transport() {
         return Err(PolicyCompileError::UnsupportedTransport(id));
     }
@@ -634,6 +680,15 @@ fn validate_policy(
             PolicyCapability::PrivateNetworkBinding,
         ));
     }
+    Ok(())
+}
+
+fn validate_policy(
+    policy: &Policy,
+    mode: PolicyMode,
+    tun_sources: bool,
+) -> Result<(), PolicyCompileError> {
+    validate_policy_inputs(policy, tun_sources)?;
     let rules = || {
         policy
             .user_rules

@@ -2,6 +2,7 @@
 use super::{SystemTun, attach};
 use crate::{
     CompileError, CompiledConfig, Engine, PolicyCompileError, compile,
+    fake_dns::SYSTEM_FAKE_DNS_PROBE_NAME,
     routing::{PolicyMode, ProbeCredentials},
 };
 use serde_json::{Value, json};
@@ -19,6 +20,13 @@ const LINK_SCOPED_DESTINATIONS: [&str; 5] = [
     "fe80::/10",
     "ff00::/8",
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopedFakePolicy {
+    ProxyOnly,
+    Names,
+    NamesAndLiteral,
+}
 
 /// Только маршрутизация между принадлежащими сессии локальными службами.
 /// Host проверяет пересечение пулов с реальной топологией, держит службы и
@@ -192,7 +200,7 @@ pub fn compile_system_fake_dns_bridge(
         compile(server, engine, port)?,
         tun,
         bridge,
-        PolicyMode::IpOnly,
+        ScopedFakePolicy::ProxyOnly,
     )
 }
 
@@ -239,7 +247,7 @@ fn attach_fake_dns(
     mut config: CompiledConfig,
     tun: &SystemTun,
     bridge: &SystemFakeDnsBridge,
-    mode: PolicyMode,
+    mode: ScopedFakePolicy,
 ) -> Result<CompiledConfig, CompileError> {
     let engine = config.engine;
     let pools: Vec<_> = bridge.pools.iter().map(ToString::to_string).collect();
@@ -281,8 +289,11 @@ fn attach_fake_dns(
                 json!({"type":"field", "inboundTag":["system-tun"], "ip":LINK_SCOPED_DESTINATIONS,
                     "outboundTag":"fake-dns-reject"}),
             ]);
-            if mode == PolicyMode::IpOnly {
+            if mode == ScopedFakePolicy::ProxyOnly {
                 rules.push(json!({"type":"field", "inboundTag":["fake-ip-reinject"], "outboundTag":"proxy"}));
+            } else if mode == ScopedFakePolicy::NamesAndLiteral {
+                rules.push(json!({"type":"field", "inboundTag":["fake-ip-reinject"],
+                    "domain":[format!("full:{SYSTEM_FAKE_DNS_PROBE_NAME}")], "outboundTag":"fake-dns-reject"}));
             }
             if config.value.get("routing").is_none() {
                 config.value["routing"] = json!({"domainStrategy":"AsIs"});
@@ -330,10 +341,13 @@ fn attach_fake_dns(
                 json!({"inbound":["system-tun"],"ip_cidr":pools,"action":"route","outbound":"fake-ip-lookup"}),
                 json!({"inbound":["system-tun"],"ip_cidr":LINK_SCOPED_DESTINATIONS,"action":"reject"}),
             ]);
-            if mode == PolicyMode::IpOnly {
+            if mode == ScopedFakePolicy::ProxyOnly {
                 rules.push(
                     json!({"inbound":["fake-ip-reinject"],"action":"route","outbound":"proxy"}),
                 );
+            } else if mode == ScopedFakePolicy::NamesAndLiteral {
+                rules.push(json!({"inbound":["fake-ip-reinject"],
+                    "domain":[SYSTEM_FAKE_DNS_PROBE_NAME], "action":"reject"}));
             }
             prepend_rules(&mut config.value["route"]["rules"], rules)?;
             (
@@ -398,7 +412,7 @@ pub fn validate_scoped_fake_dns_policy(
 fn scoped_fake_dns_policy_mode(
     policy: &Policy,
     suffixes: &[String],
-) -> Result<PolicyMode, PolicyCompileError> {
+) -> Result<ScopedFakePolicy, PolicyCompileError> {
     let rules = || {
         policy
             .user_rules
@@ -420,19 +434,20 @@ fn scoped_fake_dns_policy_mode(
         return Err(PolicyCompileError::InvalidPolicy);
     }
     if rules().all(|rule| rule.action == Action::Proxy && rule.conditions.domains.is_empty()) {
-        return Ok(PolicyMode::IpOnly);
+        return Ok(ScopedFakePolicy::ProxyOnly);
     }
 
     // SOCKS reinjection получает каноническое имя из живой Fake-IP записи.
-    // Для CIDR нужен отдельный доверенный снимок реальных адресов этого имени.
     let suffixes = suffixes
         .iter()
         .map(|suffix| suffix.parse().map(DomainPattern::Suffix))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| PolicyCompileError::InvalidPolicy)?;
     if rules().any(|rule| {
-        !rule.conditions.destinations.is_empty()
-            || (rule.action == Action::Block && rule.conditions.domains.is_empty())
+        (!rule.conditions.destinations.is_empty() && !rule.conditions.domains.is_empty())
+            || (rule.action == Action::Block
+                && rule.conditions.domains.is_empty()
+                && rule.conditions.destinations.is_empty())
             || rule
                 .conditions
                 .domains
@@ -441,7 +456,27 @@ fn scoped_fake_dns_policy_mode(
     }) {
         return Err(PolicyCompileError::InvalidPolicy);
     }
-    Ok(PolicyMode::Names)
+    if !rules().any(|rule| !rule.conditions.destinations.is_empty()) {
+        return Ok(ScopedFakePolicy::Names);
+    }
+    // Каждая возможная запись для выбранных суффиксов должна получить
+    // решение в порядке user/preset до первого правила, которому нужен IP.
+    if suffixes.is_empty()
+        || suffixes.iter().any(|suffix| {
+            !rules()
+                .take_while(|rule| rule.conditions.destinations.is_empty())
+                .any(|rule| {
+                    rule.conditions.domains.is_empty()
+                        || rule.conditions.domains.iter().any(|pattern| {
+                            matches!(pattern, DomainPattern::Suffix(_))
+                                && pattern.matches(suffix.name())
+                        })
+                })
+        })
+    {
+        return Err(PolicyCompileError::InvalidPolicy);
+    }
+    Ok(ScopedFakePolicy::NamesAndLiteral)
 }
 
 /// Ставит правила транспортировки Fake-IP перед правилами политики.
@@ -469,12 +504,20 @@ pub fn compile_system_fake_dns_policy(
 
     validate_bridge(server, port, tun, bridge).map_err(crate::PolicyCompileError::Server)?;
     let config = match mode {
-        PolicyMode::IpOnly => {
+        ScopedFakePolicy::ProxyOnly => {
             crate::routing::compile_tun_policy(server, engine, port, probe_port, policy)
         }
-        PolicyMode::Names => {
-            crate::routing::compile_policy(server, engine, port, probe_port, policy, mode)
-        }
+        ScopedFakePolicy::Names => crate::routing::compile_policy(
+            server,
+            engine,
+            port,
+            probe_port,
+            policy,
+            PolicyMode::Names,
+        ),
+        ScopedFakePolicy::NamesAndLiteral => crate::routing::compile_tun_fake_literal_policy(
+            server, engine, port, probe_port, policy,
+        ),
     }?;
     attach_fake_dns(config, tun, bridge, mode).map_err(PolicyCompileError::Server)
 }
@@ -1023,6 +1066,118 @@ mod tests {
         assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_err());
         policy.preset_rules[0].enabled = false;
         assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_ok());
+    }
+
+    #[test]
+    fn literal_cidr_policy_requires_a_prior_terminal_rule_for_every_fake_suffix() {
+        use yonik_domain::{Conditions, DomainPattern, Rule};
+
+        let suffixes = ["example.test".to_owned()];
+        let mut policy = Policy {
+            user_rules: vec![
+                Rule {
+                    id: 1,
+                    enabled: true,
+                    conditions: Conditions {
+                        domains: vec![DomainPattern::Suffix("example.test".parse().unwrap())],
+                        ..Default::default()
+                    },
+                    action: Action::Proxy,
+                },
+                Rule {
+                    id: 2,
+                    enabled: true,
+                    conditions: Conditions {
+                        destinations: vec!["192.0.2.0/24".parse().unwrap()],
+                        ..Default::default()
+                    },
+                    action: Action::Block,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_ok());
+        let imported = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+        )
+        .unwrap();
+        let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        for engine in [Engine::Xray, Engine::SingBox] {
+            let config = compile_system_fake_dns_policy(
+                &imported.servers[0],
+                engine,
+                port(12556),
+                port(12552),
+                &policy,
+                &tun,
+                &empty_bridge(),
+                &suffixes,
+            )
+            .unwrap();
+            let (routing, inbound, literal, suffix, name, probe, action, reject) = match engine {
+                Engine::Xray => (
+                    "routing",
+                    "inboundTag",
+                    "ip",
+                    "domain",
+                    "domain:example.test",
+                    "full:probe.invalid",
+                    "outboundTag",
+                    "fake-dns-reject",
+                ),
+                Engine::SingBox => (
+                    "route",
+                    "inbound",
+                    "ip_cidr",
+                    "domain_suffix",
+                    "example.test",
+                    "probe.invalid",
+                    "action",
+                    "reject",
+                ),
+            };
+            let rules = config.value[routing]["rules"].as_array().unwrap();
+            let index = |key: &str, entry: &str| {
+                rules
+                    .iter()
+                    .position(|rule| rule[key] == json!([entry]))
+                    .unwrap()
+            };
+            let probe = index("domain", probe);
+            let named = index(suffix, name);
+            let cidr = index(literal, "192.0.2.0/24");
+            assert!(probe < named && named < cidr);
+            assert_eq!(rules[probe][inbound], json!(["fake-ip-reinject"]));
+            assert_eq!(rules[probe][action], reject);
+            assert_eq!(rules[named][inbound], json!(["fake-ip-reinject"]));
+            assert_eq!(rules[cidr][inbound], json!(["system-tun"]));
+        }
+        policy.user_rules[1].action = Action::Direct;
+        assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_err());
+        policy.user_rules[1].action = Action::Block;
+        policy.preset_rules.push(policy.user_rules.pop().unwrap());
+        assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_ok());
+        std::mem::swap(&mut policy.user_rules, &mut policy.preset_rules);
+        assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_err());
+        std::mem::swap(&mut policy.user_rules, &mut policy.preset_rules);
+        policy.user_rules.push(policy.preset_rules.pop().unwrap());
+        policy.user_rules.swap(0, 1);
+        assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_err());
+        policy.user_rules.swap(0, 1);
+        assert!(
+            validate_scoped_fake_dns_policy(
+                &policy,
+                &[suffixes[0].clone(), "other.test".to_owned()],
+            )
+            .is_err()
+        );
+        policy.user_rules[0].conditions.domains =
+            vec![DomainPattern::Exact("example.test".parse().unwrap())];
+        assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_err());
+        policy.user_rules[0].conditions.domains =
+            vec![DomainPattern::Suffix("example.test".parse().unwrap())];
+        policy.user_rules[0].enabled = false;
+        assert!(validate_scoped_fake_dns_policy(&policy, &suffixes).is_err());
     }
 
     #[test]

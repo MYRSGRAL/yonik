@@ -28,7 +28,9 @@ use tokio::{
 };
 use yonik_engine::{
     SystemFakeDnsBridge,
-    fake_dns::{DnsEpoch, DomainName, FakeDnsQuestion, FakeIpLeaseTable},
+    fake_dns::{
+        DnsEpoch, DomainName, FakeDnsQuestion, FakeIpLeaseTable, SYSTEM_FAKE_DNS_PROBE_NAME,
+    },
 };
 
 pub(super) use crate::managed_network::FAKE_POOLS as POOLS;
@@ -38,7 +40,6 @@ pub(super) const HOLD_MS: u32 = 90_000;
 const REFRESH_BEFORE: Duration = Duration::from_secs(60);
 const REFRESH_CHECK: Duration = Duration::from_secs(20);
 const MAX_SUFFIXES: usize = 32;
-const DNS_PROBE_NAME: &str = "probe.invalid";
 const DNS_PROBE: &[u8] =
     b"\x11\x27\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05probe\x07invalid\x00\x00\x01\x00\x01";
 
@@ -271,7 +272,7 @@ impl PreparedFakeDns {
     }
 
     fn approves(&self, name: &str) -> bool {
-        name == DNS_PROBE_NAME
+        name == SYSTEM_FAKE_DNS_PROBE_NAME
             || self.suffixes.iter().any(|suffix| {
                 name == suffix
                     || name
@@ -444,7 +445,7 @@ async fn probe_through_tun(
         .map_err(|_| ServiceError::Unavailable)?;
     if leases
         .lookup(Ipv4Addr::from(ip).into(), epoch)
-        .is_none_or(|mapping| mapping.name.as_str() != DNS_PROBE_NAME)
+        .is_none_or(|mapping| mapping.name.as_str() != SYSTEM_FAKE_DNS_PROBE_NAME)
     {
         return Err(ServiceError::Unavailable);
     }
