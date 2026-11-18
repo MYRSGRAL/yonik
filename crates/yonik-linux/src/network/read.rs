@@ -1,4 +1,4 @@
-//! Общий транспорт только для read-only RTNETLINK GET-операций.
+//! Общий транспорт только для чтения kernel-снимков через netlink.
 
 use super::super::Cancellation;
 use rustix::net::{
@@ -10,6 +10,7 @@ use std::{
     os::{fd::OwnedFd, unix::fs::MetadataExt},
 };
 use tokio::{io::unix::AsyncFd, time::Instant};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkReadError {
@@ -28,7 +29,7 @@ pub enum NetworkReadError {
 impl fmt::Display for NetworkReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Unavailable => "Недоступен RTNETLINK",
+            Self::Unavailable => "Недоступен netlink",
             Self::Cancelled => "Чтение отменено",
             Self::Timeout => "Истёк срок чтения сети",
             Self::Changed => "Сеть изменилась во время чтения",
@@ -73,6 +74,8 @@ pub(super) enum ReadOperation {
     Rules,
     Nexthops,
     RouteGet,
+    WireGuardFamily,
+    WireGuardDevice(u16),
 }
 
 impl ReadOperation {
@@ -83,15 +86,36 @@ impl ReadOperation {
             Self::Routes | Self::RouteGet => 26,
             Self::Rules => 34,
             Self::Nexthops => 106,
+            Self::WireGuardFamily => 16, // GENL_ID_CTRL.
+            Self::WireGuardDevice(family) => family,
         }
     }
     fn dump(self) -> bool {
-        !matches!(self, Self::RouteGet)
+        !matches!(self, Self::RouteGet | Self::WireGuardFamily)
+    }
+    fn response_kind(self) -> u16 {
+        if self.generic() {
+            self.kind()
+        } else {
+            self.kind() - 2
+        }
+    }
+    fn generic(self) -> bool {
+        matches!(self, Self::WireGuardFamily | Self::WireGuardDevice(_))
     }
 }
 
 pub(super) struct Message {
     pub payload: Vec<u8>,
+}
+
+fn copy_message(payload: &[u8]) -> Result<Message, NetworkReadError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(payload.len())
+        .map_err(|_| NetworkReadError::Limit)?;
+    bytes.extend_from_slice(payload);
+    Ok(Message { payload: bytes })
 }
 
 const DATAGRAM_LIMIT: usize = 65_536;
@@ -104,20 +128,33 @@ struct Budget {
     records: usize,
 }
 
-struct Exchange {
+struct Exchange<T> {
     operation: ReadOperation,
     sequence: u32,
     port: u32,
     done: bool,
-    messages: Vec<Message>,
+    decode: fn(&[u8]) -> Result<T, NetworkReadError>,
+    messages: Vec<T>,
 }
-impl Exchange {
+impl Exchange<Message> {
     fn new(operation: ReadOperation, sequence: u32, port: u32) -> Self {
+        Self::decoded(operation, sequence, port, copy_message)
+    }
+}
+
+impl<T> Exchange<T> {
+    fn decoded(
+        operation: ReadOperation,
+        sequence: u32,
+        port: u32,
+        decode: fn(&[u8]) -> Result<T, NetworkReadError>,
+    ) -> Self {
         Self {
             operation,
             sequence,
             port,
             done: false,
+            decode,
             messages: Vec::new(),
         }
     }
@@ -167,7 +204,8 @@ impl Exchange {
                 return Err(NetworkReadError::Interrupted);
             }
             if groups != 0
-                || (sequence == 0
+                || (!self.operation.generic()
+                    && sequence == 0
                     && matches!(
                         kind,
                         16 | 17 | 20 | 21 | 24 | 25 | 32 | 33 | 104 | 105 | 108 | 109
@@ -212,13 +250,11 @@ impl Exchange {
                     }
                     self.done = true;
                 }
-                kind if kind == self.operation.kind() - 2 => {
+                kind if kind == self.operation.response_kind() => {
                     if (flags & 2 != 0) != self.operation.dump() {
                         return Err(NetworkReadError::Malformed);
                     }
-                    self.messages.push(Message {
-                        payload: payload.to_vec(),
-                    });
+                    self.messages.push((self.decode)(payload)?);
                     self.done = !self.operation.dump();
                 }
                 _ => return Err(NetworkReadError::Malformed),
@@ -250,10 +286,17 @@ pub(super) struct NetlinkReader {
     namespace: NetworkNamespace,
     port: u32,
     sequence: u32,
+    generic: bool,
     budget: Budget,
 }
 impl NetlinkReader {
     pub fn open() -> Result<Self, NetworkReadError> {
+        Self::open_socket(false)
+    }
+    pub fn open_generic() -> Result<Self, NetworkReadError> {
+        Self::open_socket(true)
+    }
+    fn open_socket(generic: bool) -> Result<Self, NetworkReadError> {
         tokio::runtime::Handle::try_current().map_err(|_| NetworkReadError::Unavailable)?;
         // Нет await между идентификацией namespace и созданием его socket.
         let ns = std::fs::metadata("/proc/thread-self/ns/net")
@@ -262,10 +305,11 @@ impl NetlinkReader {
             AddressFamily::NETLINK,
             SocketType::RAW,
             SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-            None,
+            generic.then_some(net::netlink::GENERIC),
         )
         .map_err(io_error)?;
-        net::bind(&socket, &SocketAddrNetlink::new(0, super::route::GROUPS)).map_err(io_error)?;
+        let groups = if generic { 0 } else { super::route::GROUPS };
+        net::bind(&socket, &SocketAddrNetlink::new(0, groups)).map_err(io_error)?;
         let address = net::getsockname(&socket).map_err(io_error)?;
         let port = SocketAddrNetlink::try_from(address)
             .map_err(|_| NetworkReadError::Unavailable)?
@@ -283,6 +327,7 @@ impl NetlinkReader {
             },
             port,
             sequence: u32::from_ne_bytes(sequence).max(1),
+            generic,
             budget: Budget::default(),
         })
     }
@@ -299,7 +344,7 @@ impl NetlinkReader {
         exchange.done = true;
         self.drain(
             &mut exchange,
-            &mut vec![0; DATAGRAM_LIMIT],
+            &mut Zeroizing::new(vec![0; DATAGRAM_LIMIT]),
             deadline,
             cancel,
         )
@@ -311,6 +356,23 @@ impl NetlinkReader {
         cancel: &mut Cancellation,
         deadline: Instant,
     ) -> Result<Vec<Message>, NetworkReadError> {
+        if operation.generic() {
+            return Err(NetworkReadError::Unsupported);
+        }
+        self.request_decoded(operation, payload, cancel, deadline, copy_message)
+            .await
+    }
+    pub async fn request_decoded<T>(
+        &mut self,
+        operation: ReadOperation,
+        payload: &[u8],
+        cancel: &mut Cancellation,
+        deadline: Instant,
+        decode: fn(&[u8]) -> Result<T, NetworkReadError>,
+    ) -> Result<Vec<T>, NetworkReadError> {
+        if operation.generic() != self.generic {
+            return Err(NetworkReadError::Unsupported);
+        }
         cancel.check().map_err(|_| NetworkReadError::Cancelled)?;
         if Instant::now() >= deadline {
             return Err(NetworkReadError::Timeout);
@@ -322,22 +384,24 @@ impl NetlinkReader {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(NetworkReadError::Cancelled),
-            result = tokio::time::timeout_at(deadline, self.exchange(operation,payload,deadline,&operation_cancel)) => result.map_err(|_| NetworkReadError::Timeout)?,
+            result = tokio::time::timeout_at(deadline, self.exchange(operation,payload,deadline,&operation_cancel,decode)) => result.map_err(|_| NetworkReadError::Timeout)?,
         }
     }
-    async fn exchange(
+    async fn exchange<T>(
         &mut self,
         operation: ReadOperation,
         payload: &[u8],
         deadline: Instant,
         cancel: &Cancellation,
-    ) -> Result<Vec<Message>, NetworkReadError> {
+        decode: fn(&[u8]) -> Result<T, NetworkReadError>,
+    ) -> Result<Vec<T>, NetworkReadError> {
         self.sequence = self
             .sequence
             .checked_add(1)
             .ok_or(NetworkReadError::Limit)?;
-        let mut exchange = Exchange::new(operation, self.sequence, self.port);
-        let mut buffer = vec![0; DATAGRAM_LIMIT];
+        let mut exchange = Exchange::decoded(operation, self.sequence, self.port, decode);
+        // WireGuard GET может вернуть private/preshared keys в том же сообщении.
+        let mut buffer = Zeroizing::new(vec![0; DATAGRAM_LIMIT]);
         // Остаток предыдущего запроса/новое multicast-событие не скрывается.
         self.drain(&mut exchange, &mut buffer, deadline, cancel)?;
         let mut bytes = Vec::with_capacity(payload.len() + 16);
@@ -402,9 +466,9 @@ impl NetlinkReader {
             }
         }
     }
-    fn drain(
+    fn drain<T>(
         &mut self,
-        exchange: &mut Exchange,
+        exchange: &mut Exchange<T>,
         buffer: &mut [u8],
         deadline: Instant,
         cancel: &Cancellation,
@@ -577,7 +641,7 @@ mod tests {
         bytes
     }
     fn accept(
-        state: &mut Exchange,
+        state: &mut Exchange<Message>,
         bytes: &[u8],
         budget: &mut Budget,
     ) -> Result<(), NetworkReadError> {

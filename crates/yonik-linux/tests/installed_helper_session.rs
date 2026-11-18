@@ -721,6 +721,109 @@ async fn check_fixture_real_resolver(peer: &str, answer: &str) -> Result {
 const FIXTURE_WG_LINK: &str = "yonik-wg";
 
 #[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная QEMU VM с tools/fixtures/wireguard_vm.py и wg"]
+async fn wireguard_netlink_observes_transport_and_multipart_allowed_ips() -> Result {
+    // 2048 записей IPv6 больше предельной длины одной netlink-датаграммы.
+    const PREFIX_COUNT: u16 = 2048;
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    control_fixture_wireguard("connect")?;
+    let (_owner, mut cancel) = yonik_linux::Cancellation::new();
+    let deadline = Duration::from_secs(3);
+    let topology = yonik_linux::read_topology(&mut cancel, deadline).await?;
+    let link = topology
+        .links
+        .iter()
+        .find(|link| link.name == FIXTURE_WG_LINK.as_bytes())
+        .ok_or_else(|| io::Error::other("Интерфейс стенда WireGuard не найден"))?;
+    let before = yonik_linux::read_wireguard_device(link.index, &mut cancel, deadline).await?;
+    require(
+        before.namespace == topology.namespace
+            && before.ifindex == link.index
+            && before.ifname == link.name
+            && before.fwmark == 24177
+            && before.listen_port == 24177
+            && before.peers.len() == 1
+            && before.peers[0].endpoint == Some("10.203.0.2:24177".parse()?)
+            && before.peers[0].allowed_ips.len() == 2,
+        "Снимок WireGuard не соответствует конфигурации стенда",
+    )?;
+
+    let keys = Command::new("/opt/yonik-gate/wg")
+        .args(["show", FIXTURE_WG_LINK, "peers"])
+        .output()?;
+    let key = std::str::from_utf8(&keys.stdout)?.trim();
+    require(
+        keys.status.success() && key.len() == 44,
+        "Не подтверждён peer стенда",
+    )?;
+    let prefixes: Vec<_> = (0..PREFIX_COUNT)
+        .map(|number| format!("2001:db8:1200:{number:x}::/64"))
+        .collect();
+    let configured = Command::new("/opt/yonik-gate/wg")
+        .args([
+            "set",
+            FIXTURE_WG_LINK,
+            "listen-port",
+            "24178",
+            "fwmark",
+            "0",
+            "peer",
+            key,
+            "endpoint",
+            "[2001:db8:7470::2]:24179",
+            "allowed-ips",
+            &prefixes.join(","),
+        ])
+        .output()?;
+    require(
+        configured.status.success(),
+        "Не изменён транспорт стенда WireGuard",
+    )?;
+    let after = yonik_linux::read_wireguard_device(link.index, &mut cancel, deadline).await?;
+    let expected = (0..PREFIX_COUNT).map(|number| {
+        (
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0xdb8, 0x1200, number, 0, 0, 0, 0,
+            )),
+            64,
+        )
+    });
+    require(
+        after != before
+            && after.fwmark == 0
+            && after.listen_port == 24178
+            && after.peers.len() == 1
+            && after.peers[0].endpoint == Some("[2001:db8:7470::2]:24179".parse()?)
+            && after.peers[0]
+                .allowed_ips
+                .iter()
+                .map(|prefix| (prefix.address, prefix.length))
+                .eq(expected),
+        "Многочастный снимок WireGuard потерял обновлённые атрибуты",
+    )?;
+    require(
+        after == yonik_linux::read_wireguard_device(link.index, &mut cancel, deadline).await?,
+        "Стабильный транспорт WireGuard изменился между чтениями",
+    )?;
+    control_fixture_wireguard("disconnect")?;
+    require(
+        yonik_linux::read_wireguard_device(link.index, &mut cancel, deadline)
+            .await
+            .is_err()
+            && resolver_file_state()? == resolver_before,
+        "Снимок принял удалённый интерфейс или проверка изменила /etc/resolv.conf",
+    )?;
+    eprintln!(
+        "WireGuard netlink: IPv4/IPv6 endpoint, {PREFIX_COUNT} AllowedIPs, смена порта и fwmark подтверждены"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
 fn control_fixture_wireguard(operation: &str) -> Result {
     require(
         Command::new("/usr/bin/python3")
