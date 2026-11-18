@@ -386,6 +386,7 @@ async fn installed_fake_dns(
             SystemClient::on_connection(connection.clone(), deadline, token.clone()).await?;
         let domains = ["example.test".to_owned()];
         let retry_until = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut retried_stale = false;
         let prepared = loop {
             let result = if let Some(policy) = policy {
                 client
@@ -411,14 +412,22 @@ async fn installed_fake_dns(
                     )
                     .await
             };
-            if !matches!(result, Err(yonik_linux::system_client::ClientError::Busy))
-                || tokio::time::Instant::now() >= retry_until
-            {
-                break result.map_err(|error| {
-                    io::Error::other(format!("{engine:?} Fake DNS Prepare: {error:?}"))
-                })?;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            use yonik_linux::system_client::ClientError;
+            let now = tokio::time::Instant::now();
+            let retry_deadline = match result {
+                Err(ClientError::Busy) if now < retry_until => retry_until,
+                Err(ClientError::Stale) if policy.is_some() && !retried_stale && now < deadline => {
+                    retried_stale = true;
+                    eprintln!("{engine:?} Fake DNS: повтор Prepare после изменения сети");
+                    deadline
+                }
+                _ => {
+                    break result.map_err(|error| {
+                        io::Error::other(format!("{engine:?} Fake DNS Prepare: {error:?}"))
+                    })?;
+                }
+            };
+            tokio::time::sleep_until(retry_deadline.min(now + Duration::from_millis(50))).await;
         };
         let output = PreparedOutput::bind(
             prepared,

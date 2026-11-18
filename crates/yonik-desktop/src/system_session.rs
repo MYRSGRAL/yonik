@@ -169,8 +169,10 @@ impl SystemSession {
         yonik_engine::validate_scoped_fake_dns_policy(policy.policy().policy())
             .map_err(|_| ClientError::Unsupported)?;
         // После Unlock собственные сетевые события могут ещё обрабатываться.
-        // Busy на Prepare не выдаёт дескриптор и допускает ограниченный повтор.
+        // Prepare не выдаёт дескриптор при Busy или Stale. После Stale один
+        // раз запрашиваем новый снимок сети в пределах общего дедлайна.
         let retry_until = deadline.min(Instant::now() + std::time::Duration::from_secs(3));
+        let mut retried_stale = false;
         let prepared = loop {
             let result = self
                 .client
@@ -184,10 +186,16 @@ impl SystemSession {
                     cancel.clone(),
                 )
                 .await;
-            if !matches!(result, Err(ClientError::Busy)) || Instant::now() >= retry_until {
-                break result?;
-            }
-            let retry_at = retry_until.min(Instant::now() + std::time::Duration::from_millis(50));
+            let now = Instant::now();
+            let retry_deadline = match result {
+                Err(ClientError::Busy) if now < retry_until => retry_until,
+                Err(ClientError::Stale) if !retried_stale && now < deadline => {
+                    retried_stale = true;
+                    deadline
+                }
+                _ => break result?,
+            };
+            let retry_at = retry_deadline.min(now + std::time::Duration::from_millis(50));
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(ClientError::Cancelled),
