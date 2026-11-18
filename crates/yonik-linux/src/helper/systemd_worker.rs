@@ -35,6 +35,7 @@ const UNIT_IFACE: &str = "org.freedesktop.systemd1.Unit";
 const SERVICE_IFACE: &str = "org.freedesktop.systemd1.Service";
 const SOCKET_IFACE: &str = "org.freedesktop.systemd1.Socket";
 const DEADLINE: Duration = Duration::from_secs(8);
+const CHECK_DEADLINE: Duration = Duration::from_secs(15);
 static OWNED: AtomicBool = AtomicBool::new(false);
 type Properties = HashMap<String, OwnedValue>;
 type TransferResult = Result<(WorkerAck, Option<InvocationBinding>)>;
@@ -781,7 +782,7 @@ impl SystemWorkerSupervisor {
         payload: Arc<WorkerPayload>,
         cancel: &mut Cancellation,
     ) -> Result<()> {
-        let deadline = Instant::now() + DEADLINE;
+        let deadline = Instant::now() + CHECK_DEADLINE;
         self.begin(WorkerMode::Check, cancel, deadline).await?;
         let ack = self
             .send(payload, WorkerMode::Check, cancel, deadline)

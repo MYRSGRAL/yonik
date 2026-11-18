@@ -46,6 +46,8 @@ mod native_data;
 pub mod role_handoff;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+// Холодная проверка большого образа sing-box может занять больше пяти секунд.
+const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 fn remaining_budget(deadline: Instant) -> Result<Duration, WorkerError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -1222,7 +1224,7 @@ async fn check_assets(
         }
         Ok(())
     };
-    tokio::time::timeout(TIMEOUT, operation)
+    tokio::time::timeout(CONFIG_CHECK_TIMEOUT, operation)
         .await
         .map_err(|_| WorkerError::Timeout)?
 }
