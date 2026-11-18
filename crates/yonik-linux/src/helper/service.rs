@@ -265,6 +265,8 @@ struct FakeDnsProfilePrepareRequest<'a> {
     #[serde(borrow)]
     server: &'a serde_json::value::RawValue,
     fake_dns_domains: Vec<String>,
+    #[serde(default, borrow)]
+    policy: Option<&'a serde_json::value::RawValue>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -416,6 +418,13 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                             serde_json::from_str(json).map_err(|_| ServiceError::InvalidRequest)?;
                         let domains =
                             super::session_fake_dns::canonical_suffixes(&dto.fake_dns_domains)?;
+                        let policy = dto
+                            .policy
+                            .map(|policy| {
+                                yonik_engine::policy_wire::SystemPolicy::parse(policy.get())
+                            })
+                            .transpose()
+                            .map_err(|_| ServiceError::InvalidRequest)?;
                         (
                             ProfilePrepareRequest {
                                 version: dto.version,
@@ -424,7 +433,7 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                                 kill_switch: dto.kill_switch,
                                 server: dto.server,
                             },
-                            None,
+                            policy,
                             Some(domains),
                         )
                     } else {

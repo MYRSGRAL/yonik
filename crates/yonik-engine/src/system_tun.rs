@@ -6,7 +6,10 @@ use yonik_domain::Policy;
 use yonik_import::ParsedServer;
 
 mod fake_bridge;
-pub use fake_bridge::{SystemFakeDnsBridge, compile_system_fake_dns_bridge};
+pub use fake_bridge::{
+    SystemFakeDnsBridge, compile_system_fake_dns_bridge, compile_system_fake_dns_policy,
+    validate_scoped_fake_dns_policy,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SystemTunAddress {

@@ -1624,10 +1624,14 @@ impl Backend {
             .policy
             .as_ref()
             .is_some_and(|policy| policy.requires_attribution());
-        if request.fake_dns_domains.is_some() && (request.policy.is_some() || bundle.is_some()) {
-            return Err(ServiceError::Unsupported);
-        }
         if request.fake_dns_domains.is_some() {
+            if attribution_required || bundle.is_some() {
+                return Err(ServiceError::Unsupported);
+            }
+            if let Some(policy) = &request.policy {
+                yonik_engine::validate_scoped_fake_dns_policy(policy.policy())
+                    .map_err(|_| ServiceError::Unsupported)?;
+            }
             self.fake_dns.check_cold_start()?;
         }
         if attribution_required {
@@ -1687,21 +1691,24 @@ impl Backend {
             .map_err(unavailable)?
             .port();
         let port = NonZeroU16::new(port).ok_or(ServiceError::Unavailable)?;
-        let config = if let Some(fake_dns) = &fake_dns {
-            yonik_engine::compile_system_fake_dns_bridge(
-                &server,
-                request.engine,
-                port,
-                &plan.compiler_tun().map_err(unavailable)?,
-                &fake_dns.config,
-            )
-            .map_err(|_| ServiceError::Unsupported)?
-        } else if let Some(policy) = request.policy.as_ref() {
+        let tun = plan.compiler_tun().map_err(unavailable)?;
+        let config = if let Some(policy) = request.policy.as_ref() {
             let probe =
                 TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(unavailable)?;
             let probe_port = NonZeroU16::new(probe.local_addr().map_err(unavailable)?.port())
                 .ok_or(ServiceError::Unavailable)?;
-            if let Some(bundle) = &bundle {
+            if let Some(fake_dns) = &fake_dns {
+                yonik_engine::compile_system_fake_dns_policy(
+                    &server,
+                    request.engine,
+                    port,
+                    probe_port,
+                    policy.policy(),
+                    &tun,
+                    &fake_dns.config,
+                )
+                .map_err(|_| ServiceError::Unsupported)?
+            } else if let Some(bundle) = &bundle {
                 let bound = yonik_engine::resource_bundle::BoundPolicy::bind(
                     policy.policy(),
                     bundle.revision,
@@ -1718,7 +1725,7 @@ impl Backend {
                     &bound,
                     bundle.revision,
                     &bundle.identity,
-                    &plan.compiler_tun().map_err(unavailable)?,
+                    &tun,
                 )
                 .map_err(|_| ServiceError::Unsupported)?
             } else {
@@ -1728,18 +1735,22 @@ impl Backend {
                     port,
                     probe_port,
                     policy.policy(),
-                    &plan.compiler_tun().map_err(unavailable)?,
+                    &tun,
                 )
                 .map_err(|_| ServiceError::Unsupported)?
             }
-        } else {
-            yonik_engine::compile_system(
+        } else if let Some(fake_dns) = &fake_dns {
+            yonik_engine::compile_system_fake_dns_bridge(
                 &server,
                 request.engine,
                 port,
-                &plan.compiler_tun().map_err(unavailable)?,
+                &tun,
+                &fake_dns.config,
             )
             .map_err(|_| ServiceError::Unsupported)?
+        } else {
+            yonik_engine::compile_system(&server, request.engine, port, &tun)
+                .map_err(|_| ServiceError::Unsupported)?
         };
         let config = config.with_local_runtime_logging();
         if self.registry.is_none() {

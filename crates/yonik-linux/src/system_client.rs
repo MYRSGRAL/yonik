@@ -14,6 +14,11 @@ const SERVICE_INTERFACE: &str = SERVICE_NAME;
 
 const MAX_JSON: usize = 64 * 1024;
 
+struct FakeDnsProfile<'a> {
+    domains: &'a [String],
+    policy: Option<&'a yonik_engine::policy_wire::SystemPolicy>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientError {
     InvalidRequest,
@@ -504,8 +509,45 @@ impl SystemClient {
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<Prepared, ClientError> {
-        self.prepare_profile_with_dns(server, engine, kill_switch, Some(domains), deadline, cancel)
-            .await
+        self.prepare_profile_with_dns(
+            server,
+            engine,
+            kill_switch,
+            Some(FakeDnsProfile {
+                domains,
+                policy: None,
+            }),
+            deadline,
+            cancel,
+        )
+        .await
+    }
+
+    /// Проверочный вход пути Fake DNS с обычной упорядоченной политикой.
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::too_many_arguments)] // Явные границы IPC и отмены.
+    pub async fn prepare_fake_dns_policy_profile(
+        &mut self,
+        server: &yonik_import::ServerIntent,
+        engine: yonik_engine::Engine,
+        kill_switch: bool,
+        domains: &[String],
+        policy: &yonik_engine::policy_wire::SystemPolicy,
+        deadline: Instant,
+        cancel: Cancellation,
+    ) -> Result<Prepared, ClientError> {
+        self.prepare_profile_with_dns(
+            server,
+            engine,
+            kill_switch,
+            Some(FakeDnsProfile {
+                domains,
+                policy: Some(policy),
+            }),
+            deadline,
+            cancel,
+        )
+        .await
     }
 
     async fn prepare_profile_with_dns(
@@ -513,7 +555,7 @@ impl SystemClient {
         server: &yonik_import::ServerIntent,
         engine: yonik_engine::Engine,
         kill_switch: bool,
-        domains: Option<&[String]>,
+        fake_dns: Option<FakeDnsProfile<'_>>,
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<Prepared, ClientError> {
@@ -526,10 +568,12 @@ impl SystemClient {
             server: &'a yonik_import::ServerIntent,
             #[serde(skip_serializing_if = "Option::is_none")]
             fake_dns_domains: Option<&'a [String]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            policy: Option<&'a yonik_engine::policy_wire::SystemPolicy>,
         }
         let request = serde_json::to_string(&Request {
             version: 1,
-            mode: if domains.is_some() {
+            mode: if fake_dns.is_some() {
                 "system_profile_fake_dns"
             } else {
                 "system_profile"
@@ -540,7 +584,8 @@ impl SystemClient {
             },
             kill_switch,
             server,
-            fake_dns_domains: domains,
+            fake_dns_domains: fake_dns.as_ref().map(|profile| profile.domains),
+            policy: fake_dns.and_then(|profile| profile.policy),
         })
         .map_err(|_| ClientError::InvalidRequest)?;
         let reply: PreparedReply = decode(&self.call("Prepare", request, deadline, cancel).await?)?;

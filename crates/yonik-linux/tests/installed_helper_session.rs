@@ -318,25 +318,48 @@ async fn check_tun_traffic_to(servers: [std::net::SocketAddr; 2]) -> Result {
 #[tokio::test]
 #[ignore = "выделенная Debian VM с тестовой сборкой установленного helper"]
 async fn production_helper_resolved_fake_dns() -> Result {
-    installed_fake_dns(None, false).await
+    installed_fake_dns(None, false, None).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM с контролируемым DNS за veth"]
 async fn production_helper_literal_fake_dns() -> Result {
-    installed_fake_dns(Some("10.203.1.2:53".parse()?), false).await
+    installed_fake_dns(Some("10.203.1.2:53".parse()?), false, None).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM для SIGKILL и истечения Fake-IP"]
 async fn production_helper_fake_dns_survives_sigkill() -> Result {
-    installed_fake_dns(None, true).await
+    installed_fake_dns(None, true, None).await
 }
 
 #[cfg(feature = "test-support")]
-async fn installed_fake_dns(literal: Option<std::net::SocketAddr>, crash: bool) -> Result {
+#[tokio::test]
+#[ignore = "выделенная Debian VM с обычным Prepare и политикой Proxy"]
+async fn production_helper_scoped_fake_dns_policy() -> Result {
+    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+        &json!({
+            "version":1, "default_action":"proxy", "preset_rules":[],
+            "lan":[], "private_networks":[], "private_domains":[],
+            "user_rules":[{
+                "id":1, "enabled":true, "action":"proxy",
+                "ip_cidr":["203.0.113.45/32"], "domain":[],
+                "domain_suffix":[], "executable_paths":[]
+            }]
+        })
+        .to_string(),
+    )?;
+    installed_fake_dns(None, false, Some(&policy)).await
+}
+
+#[cfg(feature = "test-support")]
+async fn installed_fake_dns(
+    literal: Option<std::net::SocketAddr>,
+    crash: bool,
+    policy: Option<&yonik_engine::policy_wire::SystemPolicy>,
+) -> Result {
     guard()?;
     let _lock = vm_lock::acquire()?;
     wait_for_fixture_link().await?;
@@ -361,16 +384,30 @@ async fn installed_fake_dns(literal: Option<std::net::SocketAddr>, crash: bool) 
         let domains = ["example.test".to_owned()];
         let retry_until = tokio::time::Instant::now() + Duration::from_secs(3);
         let prepared = loop {
-            let result = client
-                .prepare_fake_dns_profile(
-                    &server,
-                    engine,
-                    kill_switch,
-                    &domains,
-                    deadline,
-                    token.clone(),
-                )
-                .await;
+            let result = if let Some(policy) = policy {
+                client
+                    .prepare_fake_dns_policy_profile(
+                        &server,
+                        engine,
+                        kill_switch,
+                        &domains,
+                        policy,
+                        deadline,
+                        token.clone(),
+                    )
+                    .await
+            } else {
+                client
+                    .prepare_fake_dns_profile(
+                        &server,
+                        engine,
+                        kill_switch,
+                        &domains,
+                        deadline,
+                        token.clone(),
+                    )
+                    .await
+            };
             if !matches!(result, Err(yonik_linux::system_client::ClientError::Busy))
                 || tokio::time::Instant::now() >= retry_until
             {

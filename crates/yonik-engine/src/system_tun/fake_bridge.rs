@@ -1,12 +1,12 @@
 //! Замкнутый маршрут Fake-IP через внешний DNS и SOCKS-обработчик helper.
 use super::{SystemTun, attach};
 use crate::{CompileError, CompiledConfig, Engine, compile, routing::ProbeCredentials};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
     num::NonZeroU16,
 };
-use yonik_domain::Cidr;
+use yonik_domain::{Action, Cidr, Policy};
 use yonik_import::ParsedServer;
 
 const LINK_SCOPED_DESTINATIONS: [&str; 5] = [
@@ -184,6 +184,16 @@ pub fn compile_system_fake_dns_bridge(
     tun: &SystemTun,
     bridge: &SystemFakeDnsBridge,
 ) -> Result<CompiledConfig, CompileError> {
+    validate_bridge(server, port, tun, bridge)?;
+    attach_fake_dns(compile(server, engine, port)?, tun, bridge)
+}
+
+fn validate_bridge(
+    server: &ParsedServer,
+    port: NonZeroU16,
+    tun: &SystemTun,
+    bridge: &SystemFakeDnsBridge,
+) -> Result<(), CompileError> {
     let remote: IpAddr = server
         .endpoint()
         .host()
@@ -214,8 +224,15 @@ pub fn compile_system_fake_dns_bridge(
     {
         return Err(CompileError::ListenerConflict);
     }
+    Ok(())
+}
 
-    let mut config = compile(server, engine, port)?;
+fn attach_fake_dns(
+    mut config: CompiledConfig,
+    tun: &SystemTun,
+    bridge: &SystemFakeDnsBridge,
+) -> Result<CompiledConfig, CompileError> {
+    let engine = config.engine;
     let pools: Vec<_> = bridge.pools.iter().map(ToString::to_string).collect();
     let dns_prefix = format!(
         "{}/{}",
@@ -256,10 +273,10 @@ pub fn compile_system_fake_dns_bridge(
                     "outboundTag":"fake-dns-reject"}),
                 json!({"type":"field", "inboundTag":["fake-ip-reinject"], "outboundTag":"proxy"}),
             ]);
-            config.value["routing"] = json!({
-                "domainStrategy": "AsIs",
-                "rules": rules
-            });
+            if config.value.get("routing").is_none() {
+                config.value["routing"] = json!({"domainStrategy":"AsIs"});
+            }
+            prepend_rules(&mut config.value["routing"]["rules"], rules)?;
             config.value["outbounds"]
                 .as_array_mut()
                 .ok_or(CompileError::InvalidParameter)?
@@ -303,7 +320,7 @@ pub fn compile_system_fake_dns_bridge(
                 json!({"inbound":["system-tun"],"ip_cidr":LINK_SCOPED_DESTINATIONS,"action":"reject"}),
                 json!({"inbound":["fake-ip-reinject"],"action":"route","outbound":"proxy"}),
             ]);
-            config.value["route"]["rules"] = json!(rules);
+            prepend_rules(&mut config.value["route"]["rules"], rules)?;
             (
                 json!({"type":"socks","tag":"fake-ip-reinject","listen":local,"listen_port":reinject_port,
                     "users":[{"username":reinject.username(),"password":reinject.password()}]}),
@@ -342,6 +359,63 @@ pub fn compile_system_fake_dns_bridge(
         }
     }
     attach(config, tun)
+}
+
+fn prepend_rules(target: &mut Value, rules: Vec<Value>) -> Result<(), CompileError> {
+    if target.is_null() {
+        *target = Value::Array(rules);
+    } else {
+        target
+            .as_array_mut()
+            .ok_or(CompileError::InvalidParameter)?
+            .splice(0..0, rules);
+    }
+    Ok(())
+}
+
+/// Первая фаза reinjection допустима только когда policy доказывает Proxy
+/// для любого IP и имени: без более специфичных решений Direct/Block/VPN.
+pub fn validate_scoped_fake_dns_policy(policy: &Policy) -> Result<(), crate::PolicyCompileError> {
+    if policy.default_action != Action::Proxy
+        || !policy.private_networks.is_empty()
+        || !policy.private_domains.is_empty()
+        || !policy.lan.is_empty()
+        || policy
+            .user_rules
+            .iter()
+            .chain(&policy.preset_rules)
+            .any(|rule| rule.enabled && rule.action != Action::Proxy)
+    {
+        return Err(crate::PolicyCompileError::InvalidPolicy);
+    }
+    Ok(())
+}
+
+/// Компилирует обычную IP-only policy и ставит Fake-IP bridge rules перед ней.
+/// Базовые routing rules, domainStrategy и final остаются принадлежащими policy compiler.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_system_fake_dns_policy(
+    server: &ParsedServer,
+    engine: Engine,
+    port: NonZeroU16,
+    probe_port: NonZeroU16,
+    policy: &Policy,
+    tun: &SystemTun,
+    bridge: &SystemFakeDnsBridge,
+) -> Result<CompiledConfig, crate::PolicyCompileError> {
+    validate_scoped_fake_dns_policy(policy)?;
+    if [bridge.dns_port, bridge.lookup_port, bridge.reinject_port].contains(&probe_port)
+        || bridge
+            .plain_dns_peers
+            .iter()
+            .any(|peer| peer.loopback_port == probe_port)
+    {
+        return Err(crate::PolicyCompileError::ProbePort);
+    }
+
+    validate_bridge(server, port, tun, bridge).map_err(crate::PolicyCompileError::Server)?;
+    let config = crate::routing::compile_tun_policy(server, engine, port, probe_port, policy)?;
+    attach_fake_dns(config, tun, bridge).map_err(crate::PolicyCompileError::Server)
 }
 
 fn plain_dns_tag(index: usize) -> String {
@@ -682,6 +756,137 @@ mod tests {
                 &bridge,
             ),
             Err(CompileError::ListenerConflict)
+        ));
+    }
+
+    #[test]
+    fn fake_policy_prepends_scoped_rules_and_preserves_ip_policy_rules() {
+        let imported = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+        )
+        .unwrap();
+        let server = &imported.servers[0];
+        let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        let bridge = empty_bridge()
+            .with_plain_dns_peers(vec![("1.1.1.1".parse().unwrap(), port(12557))])
+            .unwrap();
+        let mut policy = Policy::default();
+        policy.user_rules.push(yonik_domain::Rule {
+            id: 10,
+            enabled: true,
+            conditions: yonik_domain::Conditions {
+                destinations: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+            action: Action::Proxy,
+        });
+
+        for engine in [Engine::Xray, Engine::SingBox] {
+            let base = crate::routing::compile_tun_policy(
+                server,
+                engine,
+                port(12556),
+                port(12552),
+                &policy,
+            )
+            .unwrap();
+            let compiled = compile_system_fake_dns_policy(
+                server,
+                engine,
+                port(12556),
+                port(12552),
+                &policy,
+                &tun,
+                &bridge,
+            )
+            .unwrap();
+            let route_key = if engine == Engine::Xray {
+                "routing"
+            } else {
+                "route"
+            };
+            let baseline_rules = base.value[route_key]["rules"].as_array().unwrap();
+            let actual_rules = compiled.value[route_key]["rules"].as_array().unwrap();
+            let injected = bridge.plain_dns_peers.len() + 5;
+            assert_eq!(&actual_rules[injected..], baseline_rules);
+            assert_eq!(
+                actual_rules[0]["inboundTag"].as_array().is_some(),
+                engine == Engine::Xray
+            );
+            if engine == Engine::Xray {
+                assert_eq!(
+                    compiled.value["routing"]["domainStrategy"],
+                    base.value["routing"]["domainStrategy"]
+                );
+            } else {
+                assert_eq!(
+                    compiled.value["route"]["final"],
+                    base.value["route"]["final"]
+                );
+            }
+            assert!(
+                actual_rules[..injected]
+                    .iter()
+                    .any(|rule| rule["inboundTag"] == json!(["system-tun"])
+                        || rule["inbound"] == json!(["system-tun"]))
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_fake_policy_rejects_non_proxy_decisions_and_probe_port_collisions() {
+        let mut policy = Policy::default();
+        assert!(validate_scoped_fake_dns_policy(&policy).is_ok());
+        policy.default_action = Action::Direct;
+        assert!(matches!(
+            validate_scoped_fake_dns_policy(&policy),
+            Err(crate::PolicyCompileError::InvalidPolicy)
+        ));
+        policy.default_action = Action::Proxy;
+        policy.preset_rules.push(yonik_domain::Rule {
+            id: 1,
+            enabled: true,
+            conditions: Default::default(),
+            action: Action::Block,
+        });
+        assert!(matches!(
+            validate_scoped_fake_dns_policy(&policy),
+            Err(crate::PolicyCompileError::InvalidPolicy)
+        ));
+        policy.preset_rules[0].enabled = false;
+        assert!(validate_scoped_fake_dns_policy(&policy).is_ok());
+        policy.lan.push("192.168.50.0/24".parse().unwrap());
+        assert!(matches!(
+            validate_scoped_fake_dns_policy(&policy),
+            Err(crate::PolicyCompileError::InvalidPolicy)
+        ));
+        policy.lan.clear();
+        policy.private_networks.push(yonik_domain::PrivateNetwork {
+            network: "10.0.0.0/8".parse().unwrap(),
+            available: false,
+            vpn: yonik_domain::VpnId::new(1).unwrap(),
+        });
+        assert!(matches!(
+            validate_scoped_fake_dns_policy(&policy),
+            Err(crate::PolicyCompileError::InvalidPolicy)
+        ));
+
+        let imported = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+        )
+        .unwrap();
+        let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        assert!(matches!(
+            compile_system_fake_dns_policy(
+                &imported.servers[0],
+                Engine::Xray,
+                port(12556),
+                port(12553),
+                &Policy::default(),
+                &tun,
+                &empty_bridge(),
+            ),
+            Err(crate::PolicyCompileError::ProbePort)
         ));
     }
 }

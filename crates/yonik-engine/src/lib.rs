@@ -15,7 +15,8 @@ pub use routing::{
 };
 pub use system_tun::{
     SystemFakeDnsBridge, SystemTun, SystemTunAddress, compile_system, compile_system_bound_policy,
-    compile_system_fake_dns_bridge, compile_system_policy,
+    compile_system_fake_dns_bridge, compile_system_fake_dns_policy, compile_system_policy,
+    validate_scoped_fake_dns_policy,
 };
 
 use std::{
