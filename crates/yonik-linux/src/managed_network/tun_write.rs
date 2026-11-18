@@ -121,18 +121,16 @@ impl Action {
                     0,
                     0,
                     253,
-                    if route.destination().is_ipv4() {
-                        253
-                    } else {
-                        0
-                    },
-                    1,
+                    route.scope(),
+                    route.kind(),
                 ];
                 value.extend_from_slice(&0_u32.to_ne_bytes());
                 if route.prefix_len() != 0 {
                     attribute(&mut value, 1, &address_bytes(route.destination()));
                 }
-                attribute(&mut value, 4, &index.to_ne_bytes());
+                if !route.is_throw() {
+                    attribute(&mut value, 4, &index.to_ne_bytes());
+                }
                 attribute(&mut value, 6, &route.priority().to_ne_bytes());
                 attribute(&mut value, 15, &route.table().to_ne_bytes());
                 value

@@ -1,7 +1,7 @@
 //! Чистая проекция внешней топологии: исключает только доказанные эффекты сессии.
 use super::{
-    Journal, RecordState, Resource, Scope, TunAddress, TunError, TunRoute, TunRule, alias, config,
-    observed, rule,
+    Journal, RecordState, Resource, Scope, TunAddress, TunError, TunRule, alias, config, observed,
+    rule,
 };
 use crate::{LinuxRoute, LinuxTopology};
 use std::collections::{BTreeMap, BTreeSet};
@@ -181,19 +181,14 @@ fn project(
                     return Err(TunError::Evidence);
                 }
             }
-            Resource::Route {
-                table,
-                destination,
-                prefix_len,
-                priority,
-                protocol: 253,
-                ifindex,
-            } if *ifindex == index => {
-                tables.insert(*table);
+            resource @ (Resource::Route { .. } | Resource::ThrowRoute { .. }) => {
+                let route =
+                    config::recorded_route(resource, tun_id, index).ok_or(TunError::Evidence)?;
+                tables.insert(route.table());
                 if routes
                     .insert(
-                        (*table, *destination, *prefix_len),
-                        TunRoute::new(*destination, *prefix_len, *table, *priority)?,
+                        (route.table(), route.destination(), route.prefix_len()),
+                        route,
                     )
                     .is_some()
                 {
@@ -254,6 +249,7 @@ fn project(
     let mut remaining_routes = Vec::new();
     let mut consumed_routes = BTreeSet::new();
     let mut derived_local = BTreeSet::new();
+    let loopback = config::loopback_ifindex(&topology);
     for route in topology.routes {
         let key = (
             route.table,
@@ -261,7 +257,9 @@ fn project(
             route.destination.length,
         );
         if let Some(expected) = routes.get(&key) {
-            if !config::route_matches(&route, index, *expected) || !consumed_routes.insert(key) {
+            if !config::route_matches(&route, index, loopback, *expected)
+                || !consumed_routes.insert(key)
+            {
                 return Err(TunError::Foreign);
             }
         } else if derived_address_route(&route, index, &configured) {

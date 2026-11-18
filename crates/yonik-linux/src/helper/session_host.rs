@@ -10,6 +10,7 @@ use crate::helper::{
     memory::{ByteLease, config_budget},
     service::SystemProfileRequest,
     session_fake_dns::{self, ActiveFakeDns, PreparedFakeDns, PublicationHorizon},
+    session_network::{FIRST_THROW_ROUTE, LAST_THROW_ROUTE},
 };
 use crate::{
     Cancellation, KernelRoute, LinuxLink, LinuxTopology, NetworkStamp, RouteKind, RouteQuery,
@@ -2704,15 +2705,22 @@ async fn cleanup_records(owner: Ownership, journal: &mut Journal) -> Result<(), 
                 | (17 | 18, Resource::Address { tun_id: 16, .. })
                 | (19 | 20, Resource::Route { .. })
                 | (21 | 22, Resource::TunRule { tun_id: 16, .. })
+                | (
+                    FIRST_THROW_ROUTE..=LAST_THROW_ROUTE,
+                    Resource::ThrowRoute { tun_id: 16, .. }
+                )
         )
     }) {
         return Err(ServiceError::Unavailable);
     }
-    records.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
+    records.sort_by_key(|(id, resource)| {
+        std::cmp::Reverse((matches!(resource, Resource::TunRule { .. }), *id))
+    });
     let mut executor = TunExecutor::open(owner).map_err(unavailable)?;
     for (id, resource) in records {
         match resource {
             Resource::TunRule { tun_id, .. } => executor.remove_rule(journal, tun_id, id).await,
+            Resource::ThrowRoute { tun_id, .. } => executor.remove_route(journal, tun_id, id).await,
             Resource::Route { .. } => executor.remove_route(journal, TUN_ID, id).await,
             Resource::Address { tun_id, .. } => executor.remove_address(journal, tun_id, id).await,
             Resource::Tun { .. } => executor.remove_tun(journal, id).await,

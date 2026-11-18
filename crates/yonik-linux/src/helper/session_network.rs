@@ -25,6 +25,9 @@ const TUN: u64 = 16;
 const ADDRESSES: u64 = TUN + 1;
 const ROUTES: u64 = TUN + 3;
 const RULES: u64 = TUN + 5;
+pub(super) const FIRST_THROW_ROUTE: u64 = RULES + 2;
+const MAX_THROW_ROUTES: usize = 64;
+pub(super) const LAST_THROW_ROUTE: u64 = FIRST_THROW_ROUTE + MAX_THROW_ROUTES as u64 - 1;
 const ALLOCATION_ATTEMPTS: usize = 8;
 
 /// Числа ресурсов выбираются helper, а не десериализуются из запроса UI.
@@ -37,6 +40,7 @@ pub struct SessionNetworkPlan {
     priority: u32,
     mark: u32,
     addresses: [TunAddress; 2],
+    throw_routes: Vec<TunRoute>,
 }
 impl fmt::Debug for SessionNetworkPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -158,6 +162,7 @@ impl SessionNetworkPlan {
                     126,
                 )?,
             ],
+            throw_routes: Vec::new(),
         })
     }
     fn available(&self, topology: &LinuxTopology) -> bool {
@@ -214,6 +219,35 @@ impl SessionNetworkPlan {
     pub fn routing_table(&self) -> u32 {
         self.table
     }
+    /// Вызывающий заранее проверяет внешние префиксы и защиту следующего
+    /// маршрута RPDB. Дескрипторы относятся только к таблице этого плана.
+    pub fn with_throw_routes(mut self, prefixes: &[(IpAddr, u8)]) -> Result<Self, TunError> {
+        if prefixes.len() > MAX_THROW_ROUTES {
+            return Err(TunError::Invalid);
+        }
+        let mut prefixes = prefixes.to_vec();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        self.throw_routes = prefixes
+            .into_iter()
+            .map(|(address, length)| {
+                let route = TunRoute::new_throw(address, length, self.table, 100)?;
+                if self
+                    .addresses
+                    .iter()
+                    .any(|own| overlaps(own.address(), own.prefix_len(), address, length))
+                {
+                    return Err(TunError::Invalid);
+                }
+                Ok(route)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(self)
+    }
+
+    fn configured_count(&self) -> usize {
+        5 + self.throw_routes.len()
+    }
     fn routes(&self) -> Result<[TunRoute; 2], TunError> {
         Ok([
             TunRoute::new(Ipv4Addr::UNSPECIFIED.into(), 0, self.table, 100)?,
@@ -269,6 +303,19 @@ impl SessionNetworkPlan {
                 },
             ));
         }
+        for (offset, route) in self.throw_routes.iter().enumerate() {
+            resources.push((
+                FIRST_THROW_ROUTE + offset as u64,
+                Resource::ThrowRoute {
+                    tun_id: TUN,
+                    ifindex: index,
+                    table: route.table(),
+                    destination: route.destination(),
+                    prefix_len: route.prefix_len(),
+                    priority: route.priority(),
+                },
+            ));
+        }
         resources
     }
     fn check_records(
@@ -281,9 +328,12 @@ impl SessionNetworkPlan {
             return Err(TunError::Foreign);
         }
         let expected = self.resources(index);
-        if journal.records().iter().any(|record| {
-            record.scope() == Scope::PublicBlock && (TUN..RULES + 2).contains(&record.id())
-        }) {
+        let end = FIRST_THROW_ROUTE + self.throw_routes.len() as u64;
+        if journal
+            .records()
+            .iter()
+            .any(|record| record.scope() == Scope::PublicBlock && (TUN..end).contains(&record.id()))
+        {
             return Err(TunError::Foreign);
         }
         let mut count = 0;
@@ -332,7 +382,12 @@ impl SessionNetworkPlan {
                 .ensure_route(journal, TUN, ROUTES + offset as u64, route)
                 .await?;
         }
-        self.check_records(journal, index, Some(5))?;
+        for (offset, &route) in self.throw_routes.iter().enumerate() {
+            executor
+                .ensure_route(journal, TUN, FIRST_THROW_ROUTE + offset as u64, route)
+                .await?;
+        }
+        self.check_records(journal, index, Some(self.configured_count()))?;
         Ok(index)
     }
     /// Вызывать после подготовки защиты и проверки transport escape. Успех этого
@@ -343,13 +398,13 @@ impl SessionNetworkPlan {
         journal: &mut Journal,
         index: u32,
     ) -> Result<(), TunError> {
-        self.check_records(journal, index, Some(5))?;
+        self.check_records(journal, index, Some(self.configured_count()))?;
         for (offset, rule) in self.rules()?.into_iter().enumerate() {
             executor
                 .ensure_rule(journal, TUN, RULES + offset as u64, rule)
                 .await?;
         }
-        self.check_records(journal, index, Some(7))
+        self.check_records(journal, index, Some(self.configured_count() + 2))
     }
     /// Проверяет только внешнюю топологию. Per-link devconf/token своего TUN
     /// требуют отдельного binding; этот результат нельзя публиковать как Applied.
@@ -360,7 +415,7 @@ impl SessionNetworkPlan {
         journal: &Journal,
         index: u32,
     ) -> Result<(), TunError> {
-        self.check_records(journal, index, Some(7))?;
+        self.check_records(journal, index, Some(self.configured_count() + 2))?;
         let projected =
             session_external_topology_with_framing(current, journal, TUN, MTU, self.vnet_hdr)?;
         if !crate::network::same_external_topology(&projected, baseline) {
@@ -377,7 +432,7 @@ impl SessionNetworkPlan {
         journal: &Journal,
         index: u32,
     ) -> Result<(), TunError> {
-        let records = self.check_records(journal, index, Some(7));
+        let records = self.check_records(journal, index, Some(self.configured_count() + 2));
         #[cfg(test)]
         let records = records.inspect_err(|&error| {
             diagnostics::failure(
@@ -461,7 +516,12 @@ impl SessionNetworkPlan {
         index: u32,
     ) -> Result<(), TunError> {
         self.check_records(journal, index, None)?;
-        for id in (TUN..RULES + 2).rev() {
+        let throw_end = FIRST_THROW_ROUTE + self.throw_routes.len() as u64;
+        let order = (RULES..FIRST_THROW_ROUTE)
+            .rev()
+            .chain((FIRST_THROW_ROUTE..throw_end).rev())
+            .chain((TUN..RULES).rev());
+        for id in order {
             if !journal
                 .records()
                 .iter()
@@ -469,7 +529,7 @@ impl SessionNetworkPlan {
             {
                 continue;
             }
-            if id >= RULES {
+            if (RULES..FIRST_THROW_ROUTE).contains(&id) {
                 executor.remove_rule(journal, TUN, id).await?;
             } else if id >= ROUTES {
                 executor.remove_route(journal, TUN, id).await?;

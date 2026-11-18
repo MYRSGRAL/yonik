@@ -29,6 +29,164 @@ impl Drop for StartupJournal {
     }
 }
 
+#[tokio::test]
+#[ignore = "Одноразовая QEMU VM в отдельном сетевом namespace"]
+async fn throw_routes_resume_cleanup_after_reopen() {
+    use crate::{
+        Cancellation,
+        helper::SessionNetworkPlan,
+        managed_network::{Journal, Resource, tun::TunExecutor},
+    };
+    use std::{fs, process::Command, time::Duration};
+
+    assert_eq!(
+        std::env::var("YONIK_PRODUCTION_HELPER_VM").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+            .unwrap()
+            .trim(),
+        "QEMU"
+    );
+    assert_eq!(
+        fs::read_to_string("/etc/yonik-production-helper-vm").unwrap(),
+        "yonik-production-helper-disposable-v1\n"
+    );
+    assert_ne!(
+        fs::read_link("/proc/thread-self/ns/net").unwrap(),
+        fs::read_link("/proc/1/ns/net").unwrap()
+    );
+    let ip = |arguments: &[&str]| {
+        let output = Command::new("/usr/bin/ip")
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    ip(&["link", "set", "lo", "up"]);
+    ip(&["link", "add", "throw-outer", "type", "dummy"]);
+    ip(&["link", "set", "throw-outer", "up"]);
+    ip(&["-4", "addr", "add", "192.0.2.1/24", "dev", "throw-outer"]);
+    ip(&[
+        "-6",
+        "addr",
+        "add",
+        "2001:db8:42::1/64",
+        "dev",
+        "throw-outer",
+        "nodad",
+    ]);
+
+    let journal_path = StartupJournal::new("throw-routes");
+    let owner = StartupJournal::owner();
+    let (_keep, mut cancel) = Cancellation::new();
+    let read_topology = |mut cancel| async move {
+        crate::read_topology(&mut cancel, Duration::from_secs(3))
+            .await
+            .unwrap()
+    };
+    let baseline = read_topology(cancel.clone()).await;
+    let plan = SessionNetworkPlan::reserve(owner, &baseline)
+        .unwrap()
+        .with_throw_routes(&[
+            ("192.0.2.0".parse().unwrap(), 24),
+            ("2001:db8:42::".parse().unwrap(), 64),
+        ])
+        .unwrap();
+    let mut journal = Journal::open(&journal_path.0, owner).unwrap();
+    let mut executor = TunExecutor::open(owner).unwrap();
+    let index = plan.configure(&mut executor, &mut journal).await.unwrap();
+    plan.capture(&mut executor, &mut journal, index)
+        .await
+        .unwrap();
+    let current = read_topology(cancel.clone()).await;
+    let tun_name = std::str::from_utf8(
+        &current
+            .links
+            .iter()
+            .find(|link| link.index == index)
+            .unwrap()
+            .name,
+    )
+    .unwrap()
+    .to_owned();
+    plan.verify_external(&baseline, current, &journal, index)
+        .unwrap();
+    for (family, destination) in [("-4", "192.0.2.2"), ("-6", "2001:db8:42::2")] {
+        let result: serde_json::Value =
+            serde_json::from_slice(&ip(&[family, "-j", "route", "get", destination])).unwrap();
+        assert_eq!(result[0]["dev"], "throw-outer");
+    }
+    assert_eq!(
+        journal
+            .records()
+            .iter()
+            .filter(|record| matches!(record.resource(), Resource::ThrowRoute { .. }))
+            .count(),
+        2
+    );
+
+    let table = plan.routing_table().to_string();
+    drop(executor);
+    drop(journal);
+    drop(plan);
+    let mut journal = Journal::open(&journal_path.0, owner).unwrap();
+    let foreign = [
+        "throw",
+        "203.0.113.0/24",
+        "table",
+        &table,
+        "proto",
+        "253",
+        "metric",
+        "77",
+    ];
+    for operation in ["add", "del"] {
+        let mut arguments = vec!["-4", "route", operation];
+        arguments.extend(foreign);
+        ip(&arguments);
+        if operation == "add" {
+            let before = ip(&["-4", "-j", "route", "show", "table", &table]);
+            assert!(super::cleanup_records(owner, &mut journal).await.is_err());
+            let after = ip(&["-4", "-j", "route", "show", "table", &table]);
+            assert_eq!(before, after);
+        }
+    }
+    let anchor = [
+        "default", "dev", &tun_name, "table", &table, "proto", "253", "scope", "link", "metric",
+        "100",
+    ];
+    for operation in ["del", "add"] {
+        let mut arguments = vec!["-4", "route", operation];
+        arguments.extend(anchor);
+        ip(&arguments);
+        if operation == "del" {
+            assert!(super::cleanup_records(owner, &mut journal).await.is_err());
+            assert!(journal.records().iter().any(|record| matches!(
+                record.resource(), Resource::ThrowRoute { destination, .. } if destination.is_ipv4()
+            )));
+            let routes: serde_json::Value =
+                serde_json::from_slice(&ip(&["-4", "-j", "route", "show", "table", &table]))
+                    .unwrap();
+            assert_eq!(routes[0]["type"], "throw");
+            assert_eq!(routes[0]["dst"], "192.0.2.0/24");
+        }
+    }
+    super::cleanup_records(owner, &mut journal).await.unwrap();
+    assert!(journal.records().is_empty());
+    let after = crate::read_topology(&mut cancel, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(crate::network::same_external_topology(&baseline, &after));
+    eprintln!("Оба маршрута throw удалены после переоткрытия журнала. Чужая запись не изменилась");
+}
+
 #[test]
 fn fake_dns_startup_issues_immediately_without_previous_quarantine() {
     use yonik_engine::fake_dns::{DnsEpoch, FakeDnsQuestion};

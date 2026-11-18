@@ -206,7 +206,7 @@ fn table_requires_actual_confirmed_default_for_correct_family_and_no_foreign_rou
     let (mut journal, mut snapshot) = owned_fixture(&area);
     let expected = TunRule::new(100, 1001, 47, false).unwrap();
     assert_eq!(
-        check_table(&snapshot, &journal, 7, expected, true),
+        check_table(&snapshot, &journal, 1, 7, expected, true),
         Err(TunError::Evidence)
     );
     let route = crate::LinuxRoute {
@@ -236,7 +236,7 @@ fn table_requires_actual_confirmed_default_for_correct_family_and_no_foreign_rou
     };
     snapshot.routes.push(route);
     assert_eq!(
-        check_table(&snapshot, &journal, 7, expected, true),
+        check_table(&snapshot, &journal, 1, 7, expected, true),
         Err(TunError::Foreign)
     );
     let owner = journal.ownership();
@@ -256,15 +256,16 @@ fn table_requires_actual_confirmed_default_for_correct_family_and_no_foreign_rou
         )
         .unwrap();
     assert_eq!(
-        check_table(&snapshot, &journal, 7, expected, true),
+        check_table(&snapshot, &journal, 1, 7, expected, true),
         Err(TunError::Foreign)
     );
     journal.reconcile(owner, 2, Reconciled::Owned).unwrap();
-    assert!(check_table(&snapshot, &journal, 7, expected, true).is_ok());
+    assert!(check_table(&snapshot, &journal, 1, 7, expected, true).is_ok());
     assert_eq!(
         check_table(
             &snapshot,
             &journal,
+            1,
             7,
             TunRule::new(100, 1001, 47, true).unwrap(),
             true
@@ -275,7 +276,7 @@ fn table_requires_actual_confirmed_default_for_correct_family_and_no_foreign_rou
     foreign.priority = Some(48);
     snapshot.routes.push(foreign);
     assert_eq!(
-        check_table(&snapshot, &journal, 7, expected, true),
+        check_table(&snapshot, &journal, 1, 7, expected, true),
         Err(TunError::Foreign)
     );
 }

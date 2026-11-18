@@ -315,9 +315,11 @@ impl TunExecutor {
         if journal.ownership() != self.owner {
             return Err(JournalError::WrongOwnership.into());
         }
-        if journal.records().iter().any(
-            |record| matches!(record.resource(), Resource::Address { tun_id, .. } | Resource::TunRule { tun_id, .. } if *tun_id == id),
-        ) {
+        if journal
+            .records()
+            .iter()
+            .any(|record| record.resource().parent_tun_id() == Some(id))
+        {
             return Err(JournalError::Conflict.into());
         }
         let record = journal

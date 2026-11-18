@@ -1,4 +1,5 @@
 use super::*;
+use crate::managed_network::tun::TunRoute;
 use crate::managed_network::{Ownership, Reconciled};
 use crate::{IpPrefix, LinuxAddress, LinuxLink, LinuxRoute, LinuxRule, NetworkNamespace};
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
