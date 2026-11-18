@@ -1,4 +1,4 @@
-//! Read-only snapshot/watch systemd-resolved без адресов, доменов и SNI.
+//! Раскладка resolv.conf и snapshot/watch systemd-resolved без адресов, доменов и SNI.
 //! Факты daemon не подтверждают netns, Apply или strict DNS.
 
 #[cfg(target_os = "linux")]
@@ -10,6 +10,12 @@ mod linux {
     };
 
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+    enum Mode {
+        Host,
+        Snapshot,
+        Watch,
+    }
 
     fn error_code(error: ResolverError) -> &'static str {
         match error {
@@ -101,10 +107,17 @@ mod linux {
         .await
     }
 
-    async fn inspect(watch: bool, cancel: &mut Cancellation) -> Result<(), ResolverError> {
-        if !watch {
-            let snapshot = yonik_linux::read_resolver_snapshot(cancel, STARTUP_TIMEOUT).await?;
-            return emit_snapshot(&snapshot, cancel).await;
+    async fn inspect(mode: Mode, cancel: &mut Cancellation) -> Result<(), ResolverError> {
+        match mode {
+            Mode::Host => {
+                let layout = yonik_linux::inspect_host_resolv_conf();
+                return emit(json!({"resolv_conf_layout": layout}), cancel).await;
+            }
+            Mode::Snapshot => {
+                let snapshot = yonik_linux::read_resolver_snapshot(cancel, STARTUP_TIMEOUT).await?;
+                return emit_snapshot(&snapshot, cancel).await;
+            }
+            Mode::Watch => {}
         }
         let mut subscription = yonik_linux::subscribe_resolver(cancel, STARTUP_TIMEOUT).await?;
         emit_snapshot(subscription.last_observation(), cancel).await?;
@@ -113,14 +126,14 @@ mod linux {
         }
     }
 
-    async fn run(watch: bool) -> Result<(), ResolverError> {
+    async fn run(mode: Mode) -> Result<(), ResolverError> {
         use tokio::signal::unix::{SignalKind, signal};
         let mut interrupt =
             signal(SignalKind::interrupt()).map_err(|_| ResolverError::Unavailable)?;
         let mut terminate =
             signal(SignalKind::terminate()).map_err(|_| ResolverError::Unavailable)?;
         let (sender, mut cancel) = Cancellation::new();
-        let operation = inspect(watch, &mut cancel);
+        let operation = inspect(mode, &mut cancel);
         tokio::pin!(operation);
         tokio::select! {
             result = &mut operation => return result,
@@ -133,10 +146,11 @@ mod linux {
 
     pub fn main() {
         let mut args = std::env::args_os().skip(1);
-        let watch = match (args.next(), args.next()) {
-            (None, None) => Ok(false),
-            (Some(mode), None) if mode == "snapshot" => Ok(false),
-            (Some(mode), None) if mode == "watch" => Ok(true),
+        let mode = match (args.next(), args.next()) {
+            (None, None) => Ok(Mode::Snapshot),
+            (Some(mode), None) if mode == "snapshot" => Ok(Mode::Snapshot),
+            (Some(mode), None) if mode == "watch" => Ok(Mode::Watch),
+            (Some(mode), None) if mode == "host" => Ok(Mode::Host),
             _ => Err(ResolverError::Malformed),
         };
         let result = match tokio::runtime::Builder::new_current_thread()
@@ -144,8 +158,8 @@ mod linux {
             .build()
         {
             Ok(runtime) => runtime.block_on(async {
-                let result = match watch {
-                    Ok(watch) => run(watch).await,
+                let result = match mode {
+                    Ok(mode) => run(mode).await,
                     Err(error) => Err(error),
                 };
                 if let Err(error) = result {
