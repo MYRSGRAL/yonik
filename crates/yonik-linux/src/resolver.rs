@@ -77,6 +77,8 @@ mod host_layout_tests {
 }
 
 pub use config::*;
+#[cfg(feature = "test-support")]
+pub use resolve1::{Resolve1ApplyError, Resolve1Prepared, apply_link_dns, prepare_link_dns};
 pub use resolve1::{
     Resolve1Domain, Resolve1Endpoint, Resolve1Scope, Resolve1Snapshot, read_resolve1_snapshot,
 };
