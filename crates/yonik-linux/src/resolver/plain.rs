@@ -14,7 +14,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-const SYSTEM_RESOLV_CONF: &str = "/etc/resolv.conf";
+pub(crate) const SYSTEM_RESOLV_CONF: &str = "/etc/resolv.conf";
+#[cfg(feature = "test-support")]
+pub(crate) const FIXTURE_DNS_SOURCE: &str = "/run/yonik/fixture-dns-source";
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 const MAX_LINE_BYTES: usize = 4096;
 const GLIBC_MAX_NAMESERVERS: usize = 3;
@@ -112,12 +114,19 @@ pub fn read_system_resolv_conf() -> Result<PlainResolverSnapshot, ResolverError>
 pub(crate) fn read_managed_resolv_conf(
     layout: ResolvConfLayout,
 ) -> Result<PlainResolverSnapshot, ResolverError> {
-    let target = match layout {
-        ResolvConfLayout::NetworkManager => "/run/NetworkManager/resolv.conf",
-        ResolvConfLayout::Resolvconf => "/run/resolvconf/resolv.conf",
-        _ => return Err(ResolverError::Unsupported),
-    };
+    let target = plain_resolver_path(layout)
+        .filter(|target| *target != SYSTEM_RESOLV_CONF)
+        .ok_or(ResolverError::Unsupported)?;
     read_known_link(Path::new(SYSTEM_RESOLV_CONF), Path::new(target), 0)
+}
+
+pub(crate) fn plain_resolver_path(layout: ResolvConfLayout) -> Option<&'static str> {
+    match layout {
+        ResolvConfLayout::RegularFile => Some(SYSTEM_RESOLV_CONF),
+        ResolvConfLayout::NetworkManager => Some("/run/NetworkManager/resolv.conf"),
+        ResolvConfLayout::Resolvconf => Some("/run/resolvconf/resolv.conf"),
+        _ => None,
+    }
 }
 
 fn read_known_link(
@@ -149,7 +158,7 @@ fn read_known_link(
 
 #[cfg(feature = "test-support")]
 pub(crate) fn read_fixture_dns_source() -> Result<PlainResolverSnapshot, ResolverError> {
-    read_path(Path::new("/run/yonik/fixture-dns-source"), 0)
+    read_path(Path::new(FIXTURE_DNS_SOURCE), 0)
 }
 
 fn read_path(path: &Path, trusted_uid: u32) -> Result<PlainResolverSnapshot, ResolverError> {

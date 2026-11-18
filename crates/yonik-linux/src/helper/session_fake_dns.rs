@@ -6,10 +6,12 @@ use crate::{
     fake_service::{FakeDnsBridgeListeners, FakeDnsLeases, MAX_FAKE_TTL},
     managed_network::{Journal, firewall::BoundDirect},
     resolver::{
-        PlainResolverSnapshot, ResolvConfLayout, ResolverError,
+        PlainResolverSnapshot, ResolvConfLayout, ResolverError, SYSTEM_RESOLV_CONF,
+        file_watch::ResolverFileWatch,
         forward::forward_query_name,
         inspect_host_resolv_conf,
         plain_relay::{PlainDnsRelay, TCP_IDLE},
+        plain_resolver_path,
         resolve1::{Resolve1Prepared, apply_link_dns, prepare_link_dns},
     },
 };
@@ -17,6 +19,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4},
     num::{NonZeroU16, NonZeroU32},
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -46,7 +49,25 @@ const DNS_PROBE: &[u8] =
 #[derive(Clone, PartialEq, Eq)]
 enum ResolverSource {
     Resolved(Option<PlainResolverSnapshot>),
-    Literal(PlainResolverSnapshot),
+    Literal(PlainResolverSnapshot, &'static str),
+}
+
+impl ResolverSource {
+    fn watch_file(&self) -> Result<Option<ResolverFileWatch>, ServiceError> {
+        let Self::Literal(_, source) = *self else {
+            return Ok(None);
+        };
+        let host_entry = Path::new(SYSTEM_RESOLV_CONF);
+        let source = Path::new(source);
+        let paths = [host_entry, source];
+        ResolverFileWatch::new(if source == host_entry {
+            &paths[..1]
+        } else {
+            &paths
+        })
+        .map(Some)
+        .map_err(|_| ServiceError::Unavailable)
+    }
 }
 
 async fn resolver_source() -> Result<ResolverSource, ServiceError> {
@@ -55,7 +76,7 @@ async fn resolver_source() -> Result<ResolverSource, ServiceError> {
         return tokio::task::spawn_blocking(crate::resolver::read_fixture_dns_source)
             .await
             .map_err(|_| ServiceError::Unavailable)?
-            .map(ResolverSource::Literal)
+            .map(|snapshot| ResolverSource::Literal(snapshot, crate::resolver::FIXTURE_DNS_SOURCE))
             .map_err(|_| ServiceError::Unsupported);
     }
     match inspect_host_resolv_conf() {
@@ -83,7 +104,8 @@ async fn resolver_source() -> Result<ResolverSource, ServiceError> {
             if snapshot.is_resolved_stub() {
                 Ok(ResolverSource::Resolved(Some(snapshot)))
             } else {
-                Ok(ResolverSource::Literal(snapshot))
+                let source = plain_resolver_path(layout).ok_or(ServiceError::Unsupported)?;
+                Ok(ResolverSource::Literal(snapshot, source))
             }
         }
         _ => Err(ServiceError::Unsupported),
@@ -247,7 +269,7 @@ impl PreparedFakeDns {
                 .and_then(|config| config.with_isolated_loopback(loopback))
                 .map_err(|_| ServiceError::Unavailable)?;
         let mut plain = Vec::new();
-        if let ResolverSource::Literal(snapshot) = &source {
+        if let ResolverSource::Literal(snapshot, _) = &source {
             let mark = NonZeroU32::new(plan.socket_mark()).ok_or(ServiceError::Unavailable)?;
             let mut peers = Vec::with_capacity(snapshot.nameservers().len());
             for &peer in snapshot.nameservers() {
@@ -302,6 +324,9 @@ impl PreparedFakeDns {
         horizon: PublicationHorizon,
         failed: Arc<Notify>,
     ) -> Result<ActiveFakeDns, ServiceError> {
+        // Подписка предшествует повторной проверке, чтобы не пропустить
+        // замену конфигурации между сверкой и запуском DNS relay.
+        let file_watch = self.source.watch_file()?;
         if resolver_source().await? != self.source {
             return Err(ServiceError::Unavailable);
         }
@@ -311,7 +336,7 @@ impl PreparedFakeDns {
                     .await
                     .map_err(|_| ServiceError::Unsupported)?,
             ),
-            ResolverSource::Literal(_) => None,
+            ResolverSource::Literal(..) => None,
         };
         leases
             .advance_epoch(epoch)
@@ -363,13 +388,33 @@ impl PreparedFakeDns {
                 cancel,
             );
             tokio::pin!(serving);
+            let mut refresh = tokio::time::interval_at(
+                tokio::time::Instant::now() + REFRESH_CHECK,
+                REFRESH_CHECK,
+            );
+            refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let result = loop {
                 tokio::select! {
+                    biased;
+                    _ = refresh.tick() => failed.notify_one(),
+                    change = async {
+                        match &file_watch {
+                            Some(watch) => watch.changed().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        // Во время повторного чтения relay не отправляет запросы.
+                        if change.is_err() || !matches!(
+                            timeout(LIMIT, resolver_source()).await,
+                            Ok(Ok(current)) if current == for_task.source
+                        ) {
+                            break Err(std::io::ErrorKind::BrokenPipe.into());
+                        }
+                    }
                     result = &mut serving => break result,
                     result = real.next(), if !real.is_empty() => {
                         break result.unwrap_or_else(|| Err(std::io::ErrorKind::BrokenPipe.into()));
                     }
-                    () = tokio::time::sleep(REFRESH_CHECK) => failed.notify_one(),
                 }
             };
             failed.notify_one();

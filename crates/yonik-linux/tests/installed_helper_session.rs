@@ -412,11 +412,19 @@ async fn production_helper_fake_dns_preserves_external_wireguard() -> Result {
 }
 
 #[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с resolvconf и двумя DNS-серверами тестового peer"]
+async fn production_helper_fake_dns_after_resolvconf_update() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::Resolvconf).await
+}
+
+#[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FakeDnsNetworkChange {
     PeerRoute,
     ResolverLink,
     WireGuard,
+    Resolvconf,
 }
 
 #[cfg(feature = "test-support")]
@@ -424,7 +432,7 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
     guard()?;
     let _lock = vm_lock::acquire()?;
     wait_for_fixture_link().await?;
-    let resolver_before = resolver_file_state()?;
+    let mut resolver_before = resolver_file_state()?;
     let connection = zbus::Connection::system().await?;
     let empty = json!({"version":1});
     let imported = yonik_import::import_bytes(
@@ -452,10 +460,25 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         let old_v4 = getent_fake_dns("ahostsv4", "example.test").await?;
         let old_v6 = getent_fake_dns("ahostsv6", "example.test").await?;
         check_tun_traffic_to([(old_v4, 40000).into(), (old_v6, 40000).into()]).await?;
+        require(
+            resolver_file_state()? == resolver_before,
+            "Сессия изменила /etc/resolv.conf до вмешательства стенда",
+        )?;
         match change {
             FakeDnsNetworkChange::PeerRoute => change_fixture_peer_route("add")?,
             FakeDnsNetworkChange::ResolverLink => revoke_fixture_link_dns(&mut token).await?,
             FakeDnsNetworkChange::WireGuard => control_fixture_wireguard("connect")?,
+            FakeDnsNetworkChange::Resolvconf => {
+                check_fixture_real_resolver("10.203.1.2:53", "192.0.2.99").await?;
+                switch_fixture_resolver("10.203.1.6")?;
+                let published = resolver_file_state()?;
+                require(
+                    published.contents != resolver_before.contents,
+                    "resolvconf не опубликовал новый адрес DNS",
+                )?;
+                resolver_before = published;
+                eprintln!("{engine:?}: resolvconf опубликовал новый DNS-сервер");
+            }
         }
         // До закрытия вывода не обращаемся к helper по D-Bus. Только его
         // наблюдатель сетевых событий может остановить этот worker.
@@ -475,15 +498,17 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             },
             "Изменение сети нарушило выбранную политику kill switch",
         )?;
-        let snapshot =
-            yonik_linux::read_resolve1_snapshot(&mut token, Duration::from_secs(3)).await?;
-        require(
-            !snapshot
-                .domains
-                .iter()
-                .any(|domain| domain.name == "example.test"),
-            "DNS-зона осталась после автоматической остановки",
-        )?;
+        if change != FakeDnsNetworkChange::Resolvconf {
+            let snapshot =
+                yonik_linux::read_resolve1_snapshot(&mut token, Duration::from_secs(3)).await?;
+            require(
+                !snapshot
+                    .domains
+                    .iter()
+                    .any(|domain| domain.name == "example.test"),
+                "DNS-зона осталась после автоматической остановки",
+            )?;
+        }
         if kill_switch {
             call(&connection, "Unlock", empty.clone()).await?;
         }
@@ -515,6 +540,9 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             "Новая сессия повторно выдала прежний Fake-IP",
         )?;
         check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+        if change == FakeDnsNetworkChange::Resolvconf {
+            check_fixture_real_resolver("10.203.1.6:53", "192.0.2.100").await?;
+        }
         for old in [old_v4, old_v6] {
             check_fake_flow_blocked((old, 40000).into()).await?;
         }
@@ -546,9 +574,46 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             resolver_file_state()? == resolver_before,
             "Изменение сети повлияло на /etc/resolv.conf",
         )?;
+        if change == FakeDnsNetworkChange::Resolvconf {
+            switch_fixture_resolver("10.203.1.2")?;
+            resolver_before = resolver_file_state()?;
+        }
         eprintln!(
             "{engine:?} {change:?}: автоматическая остановка, отзыв DNS и повторное подключение подтверждены"
         );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn switch_fixture_resolver(address: &str) -> Result {
+    use std::{io::Write, process::Stdio};
+
+    let mut manager = Command::new("/usr/sbin/resolvconf")
+        .args(["-a", "yonik-outer.qa"])
+        .stdin(Stdio::piped())
+        .spawn()?;
+    let mut input = manager
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("Нет stdin resolvconf"))?;
+    writeln!(input, "nameserver {address}")?;
+    drop(input);
+    require(
+        manager.wait()?.success(),
+        "resolvconf не обновил источник DNS",
+    )
+}
+
+#[cfg(feature = "test-support")]
+async fn check_fixture_real_resolver(peer: &str, answer: &str) -> Result {
+    let peer = peer.parse()?;
+    let answer = answer.parse::<std::net::IpAddr>()?;
+    for tcp in [false, true] {
+        require(
+            ask_fixture_dns(peer, "real.test", 1, tcp).await? == answer,
+            "Ответ реального DNS не совпал с ответом контрольного сервера",
+        )?;
     }
     Ok(())
 }

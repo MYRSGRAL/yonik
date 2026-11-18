@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
 | Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута и отзыв DNS-зоны |
-| Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, адрес резолвера опубликован менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock и истечение карантина после остановки helper |
+| Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, адрес резолвера опубликован менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock, истечение карантина и восстановление после смены адреса через `resolvconf -a` |
 | Debian 13.7, Xfce 4.20 и X11, ядро 6.12.117 | Обычный UID в активной сессии LightDM и штатный диалог polkit. Отдельные прогоны с systemd-resolved и resolvconf 1.94 | Системный TUN, Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и карантин Fake-IP |
 | Ubuntu 24.04.5 LTS без графической сессии | Установленный helper, ядро 6.8.0-147, nftables 1.0.9 | TUN, Fake DNS, HTTPS, DoH и восстановление правил. Отдельно проверены смена маршрута и отзыв DNS-зоны |
 | Ubuntu 24.04.5 LTS, GNOME Shell 46 и Wayland, Qt 6.4.2 | Видимый Qt-клиент в активной сессии GDM, обычный UID и штатная политика polkit | TUN, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и истечение карантина после остановки helper |
@@ -139,7 +139,8 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
 выдали Fake A/AAAA через NSS и по TCP/UDP, а исходный DNS-сервер ответил на
 обычные запросы обоими транспортами. Сервер не получил запросов к тестовому
 домену Fake DNS. Содержимое и метаданные `/etc/resolv.conf` совпали до и
-после сессии. Проверки других DNS-менеджеров и смены DNS при DHCP/VPN открыты.
+после сессии. Проверки других DNS-менеджеров и смены DNS при реальном
+переподключении DHCP или VPN открыты.
 
 ## 4. Fake DNS и проверка пакетов
 
@@ -336,6 +337,16 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
   Тесты `production_helper_fake_dns_after_route_switch` и
   `production_helper_fake_dns_after_resolver_revert` используют штатный
   установленный helper и системную D-Bus шину.
+- [x] Проверить смену файлового DNS в Debian 13.7 с `resolvconf` 1.94.
+  Helper наблюдает за каталогами `/etc/resolv.conf` и поддерживаемого
+  файла DNS-менеджера, поэтому замечает атомарную замену и перечитывает
+  снимок перед продолжением DNS-обслуживания. После `resolvconf -a` оба
+  движка останавливаются без Stop в пределах 10 секунд. После повторного
+  Prepare/Apply старые Fake-IP блокируются, выдаются новые Fake A/AAAA,
+  а новый реальный резолвер отвечает по UDP и TCP. Ни один из исходных
+  резолверов не получил запросов к тестовому домену Fake DNS. Стенд
+  также проверил HTTPS и DoH. Содержимое и метаданные `/etc/resolv.conf`
+  сверены до и после действий Yonik, отдельно от обновления менеджером.
 - [x] Проверить сохранность внешнего WireGuard при обоих порядках запуска
   в Debian 13.7 и Ubuntu 24.04.5 LTS. Появление WireGuard во время сессии
   привело к автоматической остановке Xray и sing-box и снятию зоны Fake DNS.
