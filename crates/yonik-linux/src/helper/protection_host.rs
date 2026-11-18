@@ -374,7 +374,13 @@ impl Backend {
         if self.has_session() || self.worker_uncertain {
             return self.observe_session(uid).await;
         }
-        if self.journal.is_none() {
+        // Карантин Fake-IP может пережить сессию и сохранить UID её владельца.
+        // Для этого случая State не нужен executor от имени текущего клиента.
+        if self.journal.as_ref().is_none_or(|journal| {
+            journal.records().is_empty()
+                && journal.public_policy().is_none()
+                && journal.session_recovery().is_none()
+        }) {
             return Ok(ProtectionState::NoManagedPolicy);
         }
         let mut executor = self.executor(owner)?;

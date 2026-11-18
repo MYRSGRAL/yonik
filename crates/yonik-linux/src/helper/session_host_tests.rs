@@ -342,6 +342,39 @@ async fn background_tasks_keep_running_after_blocking_job_returns() {
 }
 
 #[tokio::test]
+async fn state_reports_no_managed_policy_with_another_users_quarantine() {
+    use crate::helper::service::{ProtectionHost, ProtectionState};
+    use crate::managed_network::{Journal, Ownership, QuarantineIntent};
+
+    let path = StartupJournal::new("state-quarantine-owner");
+    let (dev, ino) = super::super::namespace().unwrap();
+    let owner = Ownership::new(1000, 77, 1, dev, ino).unwrap();
+    let mut journal = Journal::open(&path.0, owner).unwrap();
+    journal
+        .begin_fake_quarantine(
+            owner,
+            42,
+            QuarantineIntent {
+                tun: None,
+                horizon_ms: 90_000,
+            },
+        )
+        .unwrap();
+
+    let mut host = actor_fixture();
+    host.backend.lock().unwrap().journal = Some(journal);
+    let (_keep, cancel) = crate::Cancellation::new();
+    assert_eq!(
+        host.state(0, cancel).await,
+        Ok(ProtectionState::NoManagedPolicy)
+    );
+    let backend = host.backend.lock().unwrap();
+    let journal = backend.journal.as_ref().unwrap();
+    assert_eq!(journal.ownership(), owner);
+    assert!(journal.fake_quarantine().is_some());
+}
+
+#[tokio::test]
 async fn dropping_caller_does_not_release_backend_before_effect_finishes() {
     let host = std::sync::Arc::new(actor_fixture());
     let (_keep, cancel) = crate::Cancellation::new();
