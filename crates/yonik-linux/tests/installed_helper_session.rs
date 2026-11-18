@@ -405,10 +405,18 @@ async fn production_helper_fake_dns_after_resolver_revert() -> Result {
 }
 
 #[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с tools/fixtures/wireguard_vm.py и wg"]
+async fn production_helper_fake_dns_preserves_external_wireguard() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::WireGuard).await
+}
+
+#[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FakeDnsNetworkChange {
     PeerRoute,
     ResolverLink,
+    WireGuard,
 }
 
 #[cfg(feature = "test-support")]
@@ -447,6 +455,7 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         match change {
             FakeDnsNetworkChange::PeerRoute => change_fixture_peer_route("add")?,
             FakeDnsNetworkChange::ResolverLink => revoke_fixture_link_dns(&mut token).await?,
+            FakeDnsNetworkChange::WireGuard => control_fixture_wireguard("connect")?,
         }
         // До закрытия вывода не обращаемся к helper по D-Bus. Только его
         // наблюдатель сетевых событий может остановить этот worker.
@@ -479,6 +488,12 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             call(&connection, "Unlock", empty.clone()).await?;
         }
         check_only_fake_is_filtered(old_v4, old_v6).await?;
+        let wireguard = if change == FakeDnsNetworkChange::WireGuard {
+            check_wireguard_traffic().await?;
+            Some(fixture_wireguard_snapshot()?)
+        } else {
+            None
+        };
 
         let drain = start_fake_dns_in_vm(
             &connection,
@@ -517,6 +532,16 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         if change == FakeDnsNetworkChange::PeerRoute {
             change_fixture_peer_route("del")?;
         }
+        if let Some(snapshot) = wireguard {
+            require(
+                fixture_wireguard_snapshot()? == snapshot,
+                "Yonik изменил настройки внешнего WireGuard",
+            )?;
+            check_wireguard_traffic().await?;
+            reject_overlapping_wireguard_route(&connection, &server, engine, &policy, &token)
+                .await?;
+            control_fixture_wireguard("disconnect")?;
+        }
         require(
             resolver_file_state()? == resolver_before,
             "Изменение сети повлияло на /etc/resolv.conf",
@@ -525,6 +550,156 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             "{engine:?} {change:?}: автоматическая остановка, отзыв DNS и повторное подключение подтверждены"
         );
     }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+const FIXTURE_WG_LINK: &str = "yonik-wg";
+
+#[cfg(feature = "test-support")]
+fn control_fixture_wireguard(operation: &str) -> Result {
+    require(
+        Command::new("/usr/bin/python3")
+            .args(["/opt/yonik-gate/tools/fixtures/wireguard_vm.py", operation])
+            .status()?
+            .success(),
+        "Не удалось изменить состояние WireGuard в стенде",
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn fixture_wireguard_snapshot() -> Result<Vec<Vec<u8>>> {
+    [
+        (
+            "/usr/bin/ip",
+            vec!["-j", "link", "show", "dev", FIXTURE_WG_LINK],
+        ),
+        (
+            "/usr/bin/ip",
+            vec!["-4", "-j", "route", "show", "dev", FIXTURE_WG_LINK],
+        ),
+        (
+            "/usr/bin/ip",
+            vec!["-6", "-j", "route", "show", "dev", FIXTURE_WG_LINK],
+        ),
+        (
+            "/opt/yonik-gate/wg",
+            vec!["show", FIXTURE_WG_LINK, "allowed-ips"],
+        ),
+        (
+            "/opt/yonik-gate/wg",
+            vec!["show", FIXTURE_WG_LINK, "endpoints"],
+        ),
+    ]
+    .into_iter()
+    .map(|(command, args)| {
+        let result = Command::new(command).args(args).output()?;
+        require(
+            result.status.success(),
+            "Не удалось прочитать состояние WireGuard",
+        )?;
+        Ok(result.stdout)
+    })
+    .collect()
+}
+
+#[cfg(feature = "test-support")]
+async fn check_wireguard_traffic() -> Result {
+    check_tun_traffic_to(["10.42.1.2:40000".parse()?, "[fd42:1::2]:40000".parse()?]).await?;
+    let output = Command::new("/opt/yonik-gate/wg")
+        .args(["show", FIXTURE_WG_LINK, "latest-handshakes"])
+        .output()?;
+    require(
+        output.status.success(),
+        "Не удалось проверить WireGuard handshake",
+    )?;
+    require(
+        std::str::from_utf8(&output.stdout)?
+            .split_whitespace()
+            .nth(1)
+            .and_then(|time| time.parse::<u64>().ok())
+            .is_some_and(|time| time > 0),
+        "У WireGuard нет подтверждённого handshake",
+    )
+}
+
+#[cfg(feature = "test-support")]
+async fn reject_overlapping_wireguard_route(
+    connection: &zbus::Connection,
+    server: &yonik_import::ServerIntent,
+    engine: Engine,
+    policy: &yonik_engine::policy_wire::SystemPolicy,
+    token: &yonik_linux::Cancellation,
+) -> Result {
+    use yonik_linux::system_client::ClientError;
+
+    let change_route = |action| {
+        require(
+            Command::new("/usr/bin/ip")
+                .args([
+                    "-4",
+                    "route",
+                    action,
+                    "198.19.224.0/19",
+                    "dev",
+                    FIXTURE_WG_LINK,
+                ])
+                .status()?
+                .success(),
+            "Не удалось изменить маршрут, пересекающий пул Fake-IP",
+        )
+    };
+    change_route("add")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut client =
+        SystemClient::on_connection(connection.clone(), deadline, token.clone()).await?;
+    let domains = ["example.test".to_owned()];
+    let result = loop {
+        let result = client
+            .prepare_fake_dns_policy_profile(
+                server,
+                engine,
+                false,
+                &domains,
+                policy,
+                deadline,
+                token.clone(),
+            )
+            .await;
+        if matches!(&result, Err(ClientError::Busy | ClientError::Stale))
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        } else {
+            break result;
+        }
+    };
+    let routes = Command::new("/usr/bin/ip")
+        .args([
+            "-4",
+            "route",
+            "show",
+            "exact",
+            "198.19.224.0/19",
+            "dev",
+            FIXTURE_WG_LINK,
+        ])
+        .output()?;
+    require(
+        routes.status.success() && !routes.stdout.is_empty(),
+        "Помощник снял чужой маршрут",
+    )?;
+    change_route("del")?;
+    require(
+        matches!(
+            result,
+            Err(ClientError::Unavailable | ClientError::Unsupported)
+        ),
+        "Prepare не отклонил пересечение пула Fake-IP с маршрутом WireGuard",
+    )?;
+    eprintln!(
+        "{engine:?}: WireGuard сохранил интерфейс и маршруты, пересечение с Fake-IP отклонено"
+    );
     Ok(())
 }
 

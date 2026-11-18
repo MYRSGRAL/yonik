@@ -336,6 +336,20 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
   Тесты `production_helper_fake_dns_after_route_switch` и
   `production_helper_fake_dns_after_resolver_revert` используют штатный
   установленный helper и системную D-Bus шину.
+- [x] Проверить сохранность внешнего WireGuard при обоих порядках запуска
+  в Debian 13.7 и Ubuntu 24.04.5 LTS. Появление WireGuard во время сессии
+  привело к автоматической остановке Xray и sing-box и снятию зоны Fake DNS.
+  Новая сессия с уже работающим WireGuard выдала другие Fake A/AAAA.
+  Публичный путь прошёл TCP/UDP, HTTPS и DoH. После Stop и Unlock состояние
+  интерфейса, маршрутов, конечной точки и AllowedIPs WireGuard совпало с
+  исходным. Тестовый TCP/UDP по IPv4/IPv6 прошёл через WireGuard до и после
+  новой сессии. При конфликте его маршрута с пулом Fake-IP Prepare отклонён
+  с сохранением маршрута. `/etc/resolv.conf` сохранил содержимое и метаданные.
+  Сценарий `production_helper_fake_dns_preserves_external_wireguard` запускает
+  [стенд WireGuard](../../../tools/fixtures/wireguard_vm.py) из
+  `/opt/yonik-gate/tools/fixtures` и использует `wg` в `/opt/yonik-gate/wg`.
+  Передача приватного трафика через WireGuard во время активной сессии
+  Yonik и приватный split DNS остаются в общей проверке VPN/G-DNS.
 - [ ] Для каждой принятой конфигурации проверить два порядка запуска
   стороннего VPN, сон/пробуждение, смену Wi-Fi, потерю DNS, падение ядра,
   повторное подключение, Stop и удаление пакета. Фиксировать точный состав
