@@ -523,8 +523,7 @@ impl SystemClient {
         .await
     }
 
-    /// Проверочный вход пути Fake DNS с обычной упорядоченной политикой.
-    #[cfg(feature = "test-support")]
+    /// Системный Fake DNS для явно заданных суффиксов с проверяемой политикой.
     #[allow(clippy::too_many_arguments)] // Явные границы IPC и отмены.
     pub async fn prepare_fake_dns_policy_profile(
         &mut self,

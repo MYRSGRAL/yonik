@@ -637,10 +637,6 @@ fn fake_dns_keeps_the_supplied_inline_policy_and_suffixes() {
     frame["fake_dns_domains"] = serde_json::json!(["Example.test", "example.test"]);
     frame["policy"] = serde_json::json!({"version":1,"default_action":"proxy","user_rules":[],"preset_rules":[],"lan":[],"private_networks":[],"private_domains":[]});
     let request = parse(&prepare_message(&frame.to_string()));
-    if !cfg!(feature = "test-support") {
-        assert!(matches!(request, Err(ServiceError::Unsupported)));
-        return;
-    }
     let Ok(Request::PrepareProfile(request)) = request else {
         panic!("Допустимая политика Fake DNS должна пройти декодирование");
     };
@@ -655,6 +651,23 @@ fn fake_dns_keeps_the_supplied_inline_policy_and_suffixes() {
         parse(&prepare_message(&frame.to_string())),
         Err(ServiceError::InvalidRequest)
     ));
+}
+
+#[cfg(not(feature = "test-support"))]
+#[test]
+fn fake_dns_requires_explicit_policy_in_the_standard_build() {
+    let mut frame: serde_json::Value = serde_json::from_str(&profile_frame()).unwrap();
+    frame["mode"] = serde_json::json!("system_profile_fake_dns");
+    frame["fake_dns_domains"] = serde_json::json!(["example.test"]);
+    for policy in [None, Some(serde_json::Value::Null)] {
+        if let Some(policy) = policy {
+            frame["policy"] = policy;
+        }
+        assert!(matches!(
+            parse(&prepare_message(&frame.to_string())),
+            Err(ServiceError::Unsupported)
+        ));
+    }
 }
 
 #[tokio::test]

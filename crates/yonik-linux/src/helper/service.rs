@@ -411,11 +411,11 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                             None,
                         )
                     } else if route.mode == "system_profile_fake_dns" {
-                        if !cfg!(feature = "test-support") {
-                            return Err(ServiceError::Unsupported);
-                        }
                         let dto: FakeDnsProfilePrepareRequest<'_> =
                             serde_json::from_str(json).map_err(|_| ServiceError::InvalidRequest)?;
+                        if dto.policy.is_none() && !cfg!(feature = "test-support") {
+                            return Err(ServiceError::Unsupported);
+                        }
                         let domains =
                             super::session_fake_dns::canonical_suffixes(&dto.fake_dns_domains)?;
                         let policy = dto
