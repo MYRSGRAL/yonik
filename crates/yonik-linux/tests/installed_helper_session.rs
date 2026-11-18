@@ -70,6 +70,41 @@ fn helper_pid() -> Result<u32> {
     Ok(pid)
 }
 
+async fn kill_helper_and_wait_for_recovery(
+    connection: &zbus::Connection,
+    original_pid: u32,
+) -> Result {
+    require(
+        Command::new("/usr/bin/systemctl")
+            .args([
+                "kill",
+                "--kill-whom=main",
+                "--signal=SIGKILL",
+                "yonik-helper.service",
+            ])
+            .status()?
+            .success(),
+        "SIGKILL не выполнен",
+    )?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if helper_pid().is_ok_and(|pid| pid != original_pid) {
+            if let Ok(state) = call(connection, "State", json!({"version":1})).await {
+                return require(
+                    state["state"] == "recovery_required",
+                    "Журнал не восстановлен",
+                );
+            }
+        }
+        require(
+            tokio::time::Instant::now() < deadline,
+            "Helper не восстановился",
+        )?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn call(connection: &zbus::Connection, method: &str, value: Value) -> Result<Value> {
     let request = value.to_string();
     let response = tokio::time::timeout(
@@ -283,18 +318,25 @@ async fn check_tun_traffic_to(servers: [std::net::SocketAddr; 2]) -> Result {
 #[tokio::test]
 #[ignore = "выделенная Debian VM с тестовой сборкой установленного helper"]
 async fn production_helper_resolved_fake_dns() -> Result {
-    installed_fake_dns(None).await
+    installed_fake_dns(None, false).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM с контролируемым DNS за veth"]
 async fn production_helper_literal_fake_dns() -> Result {
-    installed_fake_dns(Some("10.203.1.2:53".parse()?)).await
+    installed_fake_dns(Some("10.203.1.2:53".parse()?), false).await
 }
 
 #[cfg(feature = "test-support")]
-async fn installed_fake_dns(literal: Option<std::net::SocketAddr>) -> Result {
+#[tokio::test]
+#[ignore = "выделенная Debian VM для SIGKILL и истечения Fake-IP"]
+async fn production_helper_fake_dns_survives_sigkill() -> Result {
+    installed_fake_dns(None, true).await
+}
+
+#[cfg(feature = "test-support")]
+async fn installed_fake_dns(literal: Option<std::net::SocketAddr>, crash: bool) -> Result {
     guard()?;
     let _lock = vm_lock::acquire()?;
     wait_for_fixture_link().await?;
@@ -377,6 +419,9 @@ async fn installed_fake_dns(literal: Option<std::net::SocketAddr>) -> Result {
         if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
             check_https_through_tun(&certificate, literal.map(|_| v4)).await?;
         }
+        if crash {
+            kill_helper_and_wait_for_recovery(&connection, helper_pid()?).await?;
+        }
         let stopped = call(&connection, "Stop", empty.clone()).await?;
         require(
             if kill_switch {
@@ -386,7 +431,10 @@ async fn installed_fake_dns(literal: Option<std::net::SocketAddr>) -> Result {
             },
             "Stop не выполнил выбранную политику kill switch",
         )?;
-        require(drain.drained().await, "Вывод worker не закрыт")?;
+        require(
+            tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+            "Вывод worker не закрыт",
+        )?;
         let mut cancel = token;
         let snapshot =
             yonik_linux::read_resolve1_snapshot(&mut cancel, Duration::from_secs(3)).await?;
@@ -401,7 +449,9 @@ async fn installed_fake_dns(literal: Option<std::net::SocketAddr>) -> Result {
             call(&connection, "Unlock", empty.clone()).await?;
         }
         check_only_fake_is_filtered(v4, v6).await?;
-        if literal.is_none() && kill_switch {
+        if crash {
+            wait_for_quarantine_expiry().await?;
+        } else if literal.is_none() && kill_switch {
             check_quarantine_after_firewall_reload(v4, v6).await?;
         }
         require(
@@ -411,6 +461,9 @@ async fn installed_fake_dns(literal: Option<std::net::SocketAddr>) -> Result {
         eprintln!(
             "{engine:?} установленный helper, системный DNS, TCP/UDP IPv4/IPv6 и восстановление подтверждены"
         );
+        if crash {
+            break;
+        }
     }
     Ok(())
 }
@@ -493,15 +546,16 @@ async fn check_https_through_tun(
 }
 
 #[cfg(feature = "test-support")]
-async fn check_quarantine_after_firewall_reload(
-    v4: std::net::IpAddr,
-    v6: std::net::IpAddr,
-) -> Result {
-    let nft = if std::path::Path::new("/usr/bin/nft").is_file() {
+fn nft_test_binary() -> &'static str {
+    if std::path::Path::new("/usr/bin/nft").is_file() {
         "/usr/bin/nft"
     } else {
         "/usr/sbin/nft"
-    };
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn quarantine_table_name(nft: &str) -> Result<Option<String>> {
     let output = Command::new(nft).args(["-j", "list", "tables"]).output()?;
     require(output.status.success(), "Не прочитан список таблиц nft")?;
     let document: Value = serde_json::from_slice(&output.stdout)?;
@@ -513,16 +567,46 @@ async fn check_quarantine_after_firewall_reload(
         let name = table["name"].as_str()?;
         (table["family"] == "inet" && name.starts_with("yonik_q")).then_some(name)
     });
-    let table = owned
-        .next()
-        .ok_or_else(|| io::Error::other("Нет таблицы Fake-IP"))?;
+    let table = owned.next().map(str::to_owned);
     require(
         owned.next().is_none(),
         "Найдено более одной таблицы Fake-IP",
     )?;
+    Ok(table)
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_quarantine_expiry() -> Result {
+    let nft = nft_test_binary();
+    require(
+        quarantine_table_name(nft)?.is_some(),
+        "После SIGKILL и Unlock таблица Fake-IP должна действовать",
+    )?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
+    loop {
+        if quarantine_table_name(nft)?.is_none() {
+            eprintln!("Таблица защиты Fake-IP снята после истечения срока в ядре");
+            return Ok(());
+        }
+        require(
+            tokio::time::Instant::now() < deadline,
+            "Таблица Fake-IP осталась после истечения срока",
+        )?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn check_quarantine_after_firewall_reload(
+    v4: std::net::IpAddr,
+    v6: std::net::IpAddr,
+) -> Result {
+    let nft = nft_test_binary();
+    let table =
+        quarantine_table_name(nft)?.ok_or_else(|| io::Error::other("Нет таблицы Fake-IP"))?;
     require(
         Command::new(nft)
-            .args(["delete", "table", "inet", table])
+            .args(["delete", "table", "inet", &table])
             .status()?
             .success(),
         "Не воспроизведена потеря таблицы Fake-IP",
@@ -530,7 +614,7 @@ async fn check_quarantine_after_firewall_reload(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if Command::new(nft)
-            .args(["-j", "list", "table", "inet", table])
+            .args(["-j", "list", "table", "inet", &table])
             .output()?
             .status
             .success()
@@ -817,36 +901,7 @@ async fn lifecycle(engine: Option<Engine>, with_output: bool) -> Result {
             "Worker не работает перед SIGKILL",
         )?;
     }
-    require(
-        Command::new("/usr/bin/systemctl")
-            .args([
-                "kill",
-                "--kill-whom=main",
-                "--signal=SIGKILL",
-                "yonik-helper.service",
-            ])
-            .status()?
-            .success(),
-        "SIGKILL не выполнен",
-    )?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        if helper_pid().is_ok_and(|pid| pid != original_pid) {
-            if let Ok(state) = call(&connection, "State", empty.clone()).await {
-                require(
-                    state["state"] == "recovery_required",
-                    "Журнал не восстановлен",
-                )?;
-                break;
-            }
-        }
-        require(
-            tokio::time::Instant::now() < deadline,
-            "Helper не восстановился",
-        )?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    kill_helper_and_wait_for_recovery(&connection, original_pid).await?;
     require(
         call(&connection, "Stop", empty.clone()).await?["state"] == "recovery_required",
         "Stop после recovery",
