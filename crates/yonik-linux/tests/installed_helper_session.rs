@@ -167,6 +167,42 @@ async fn production_helper_system_profile_survives_sigkill() -> Result {
     lifecycle(true).await
 }
 
+async fn wait_for_fixture_link() -> Result {
+    const DEADLINE: Duration = Duration::from_secs(5);
+    const IFA_F_DADFAILED: u32 = 0x08;
+    const IFA_F_TENTATIVE: u32 = 0x40;
+    const LOCAL_TABLE: u32 = 255;
+
+    let (_sender, mut cancel) = yonik_linux::Cancellation::new();
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        require(!remaining.is_zero(), "IPv6 DAD стенда не завершился")?;
+        let topology = yonik_linux::read_topology(&mut cancel, remaining).await?;
+        let ready = topology
+            .links
+            .iter()
+            .find(|link| link.name == b"yonik-outer")
+            .is_some_and(|link| {
+                topology.addresses.iter().any(|address| {
+                    address.index == link.index
+                        && matches!(address.address, std::net::IpAddr::V6(ip) if ip.is_unicast_link_local())
+                        && address.flags & (IFA_F_DADFAILED | IFA_F_TENTATIVE) == 0
+                        && topology.routes.iter().any(|route| {
+                            route.table == LOCAL_TABLE
+                                && route.output_interface == Some(link.index)
+                                && route.destination.length == 128
+                                && route.destination.address == address.address
+                        })
+                })
+            });
+        if ready {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50).min(remaining)).await;
+    }
+}
+
 async fn lifecycle(profile: bool) -> Result {
     guard()?;
     require(
@@ -174,6 +210,10 @@ async fn lifecycle(profile: bool) -> Result {
         "Требуется VM root controller",
     )?;
     let _lock = vm_lock::acquire()?;
+    if profile {
+        // Первое завершение DAD меняет адрес и маршрут между снимками Prepare.
+        wait_for_fixture_link().await?;
+    }
     let connection = zbus::Connection::system().await?;
     let empty = json!({"version":1});
     require(
