@@ -374,7 +374,7 @@ fn prepend_rules(target: &mut Value, rules: Vec<Value>) -> Result<(), CompileErr
 }
 
 /// Первая фаза reinjection допустима только когда policy доказывает Proxy
-/// для любого IP и имени: без более специфичных решений Direct/Block/VPN.
+/// для любого IP и имени и обходится без определения процесса.
 pub fn validate_scoped_fake_dns_policy(policy: &Policy) -> Result<(), crate::PolicyCompileError> {
     if policy.default_action != Action::Proxy
         || !policy.private_networks.is_empty()
@@ -384,7 +384,10 @@ pub fn validate_scoped_fake_dns_policy(policy: &Policy) -> Result<(), crate::Pol
             .user_rules
             .iter()
             .chain(&policy.preset_rules)
-            .any(|rule| rule.enabled && rule.action != Action::Proxy)
+            .any(|rule| {
+                rule.enabled
+                    && (rule.action != Action::Proxy || !rule.conditions.executables.is_empty())
+            })
     {
         return Err(crate::PolicyCompileError::InvalidPolicy);
     }
@@ -853,6 +856,12 @@ mod tests {
             validate_scoped_fake_dns_policy(&policy),
             Err(crate::PolicyCompileError::InvalidPolicy)
         ));
+        policy.preset_rules[0].enabled = false;
+        assert!(validate_scoped_fake_dns_policy(&policy).is_ok());
+        policy.preset_rules[0].enabled = true;
+        policy.preset_rules[0].action = Action::Proxy;
+        policy.preset_rules[0].conditions.executables = vec!["/usr/bin/firefox".into()];
+        assert!(validate_scoped_fake_dns_policy(&policy).is_err());
         policy.preset_rules[0].enabled = false;
         assert!(validate_scoped_fake_dns_policy(&policy).is_ok());
         policy.lan.push("192.168.50.0/24".parse().unwrap());

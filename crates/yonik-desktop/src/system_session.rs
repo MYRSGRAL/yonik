@@ -153,6 +153,39 @@ impl SystemSession {
         );
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)] // Явные границы IPC и отмены.
+    pub(crate) async fn prepare_fake_dns_policy(
+        &mut self,
+        revision: ProfileRevision,
+        server: &ServerIntent,
+        engine: Engine,
+        policy: &yonik_linux::system_policy::InlinePolicy,
+        suffixes: &[String],
+        deadline: Instant,
+        cancel: Cancellation,
+    ) -> Result<(), ClientError> {
+        self.fence(revision)?;
+        self.prepared = None;
+        yonik_engine::validate_scoped_fake_dns_policy(policy.policy().policy())
+            .map_err(|_| ClientError::Unsupported)?;
+        let prepared = self
+            .client
+            .prepare_fake_dns_policy_profile(
+                server,
+                engine,
+                true,
+                suffixes,
+                policy.policy(),
+                deadline,
+                cancel,
+            )
+            .await?;
+        self.prepared = Some(
+            PreparedOutput::bind(prepared, engine, &self.log, revision.generation)
+                .map_err(|_| ClientError::Unavailable)?,
+        );
+        Ok(())
+    }
     pub async fn prepare_full_profile(
         &mut self,
         revision: ProfileRevision,

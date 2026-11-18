@@ -23,6 +23,60 @@ mod harness_diagnostics;
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 #[test]
+fn system_fake_dns_is_saved_and_enables_sing_box_only_in_system_mode() {
+    let directory = Directory::new();
+    let mut app = Harness::new(directory.config());
+    app.wait(|value| value["ready"] == true);
+    app.send(json!({"command":"set_system_fake_dns", "suffixes":"127.0.0.1"}));
+    let rejected = app.wait(|value| value["error"] == "invalid_input");
+    assert_eq!(rejected["system_fake_dns"], json!([]));
+
+    app.send(json!({"command":"set_system_fake_dns", "suffixes":"Sub.example.test, EXAMPLE.test, example.test."}));
+    let expected = json!(["example.test", "sub.example.test"]);
+    app.wait(|value| value["system_fake_dns"] == expected);
+    app.send(json!({"command":"set_engine", "engine":"sing-box"}));
+    app.wait(|value| value["error"] == "engine_unavailable");
+    app.send(json!({"command":"set_connection_mode", "mode":"system"}));
+    app.wait(|value| value["connection_mode"] == "system");
+    app.send(json!({"command":"routing_default", "expected_revision":0, "request_id":1, "action":"direct"}));
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 1);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], false);
+    app.send(json!({"command":"set_engine", "engine":"sing-box"}));
+    let state = app.wait(|value| value["error"] == "fake_dns_policy");
+    assert_eq!(state["engine"], "xray");
+    app.send(json!({"command":"routing_default", "expected_revision":1, "request_id":2, "action":"proxy"}));
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 2);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], true);
+    app.send(json!({"command":"set_engine", "engine":"sing-box"}));
+    app.wait(|value| value["engine"] == "sing-box");
+
+    let (url, server) = fixture(vec![
+        r#"[{"remarks":"Xray","outbounds":[{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":"physical.invalid","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]}]"#,
+    ]);
+    app.send(json!({"command":"import_source","name":"Xray","url":url,"local_exception":true,"route":"direct"}));
+    app.wait(|value| value["pending"]["native_json"] == true && value["busy"] == false);
+    app.send(json!({"command":"approve_refresh"}));
+    let state =
+        app.wait(|value| value["pending"].is_null() && value["profiles"][0]["kind"] == "xray");
+    app.send(json!({"command":"select_catalog","kind":"xray","id":state["profiles"][0]["id"],"page":state["catalog_page"]}));
+    let state = app.wait(|value| value["selected_kind"] == "xray");
+    assert_eq!(state["engine"], "sing-box");
+    assert_eq!(state["system_fake_dns_enabled"], false);
+    assert_eq!(state["can_connect"], true);
+    app.close();
+    server.join().expect("тестовый источник Xray");
+
+    let mut reopened = Harness::new(directory.config());
+    let state = reopened.wait(|value| value["ready"] == true);
+    assert_eq!(state["system_fake_dns"], expected);
+    assert_eq!(state["engine"], "sing-box");
+    assert_eq!(state["connection_mode"], "local");
+    reopened.close();
+}
+
+#[test]
 fn stop_acknowledges_queued_routing_mutation_and_allows_retry() {
     let directory = Directory::new();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));

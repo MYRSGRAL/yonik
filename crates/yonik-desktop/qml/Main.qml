@@ -9,6 +9,8 @@ import cloud.highpriority.yonik
 ApplicationWindow {
     readonly property var backendForDiagnostics: backend
     id: window
+
+    readonly property bool systemFakeDnsEnabled: state.system_fake_dns_enabled === true
     width: 420
     height: 760
     minimumWidth: 380
@@ -423,6 +425,7 @@ ApplicationWindow {
             profile_unavailable: ["Профиль недоступен или список изменился. Выберите профиль заново.", "The profile is unavailable or the list has changed. Select the profile again."],
             engine_missing: ["Прокси-ядро не найдено. Установите выбранное ядро и перезапустите приложение.", "Proxy engine not found. Install the selected engine and restart the application."],
             system_unsupported: ["Системный режим недоступен: helper сообщает system_tun=false.", "System mode unavailable: helper reports system_tun=false."],
+            fake_dns_policy: ["Для Fake DNS нужна политика «всё через прокси» без правил по приложениям.", "Fake DNS requires a proxy-only policy without per-app rules."],
             system_denied: ["Нет разрешения на системное подключение.", "System connection authorization denied."],
             system_owner_lost: ["Helper перезапущен. Проверьте состояние сети.", "Helper restarted. Check network state."],
             system_timeout: ["Время ожидания helper истекло. Исход неизвестен.", "Helper timed out. Outcome unknown."],
@@ -1240,7 +1243,7 @@ ApplicationWindow {
                         ActionButton {
                             objectName: "routingApplyButton"
                             text: window.tr("Применить к сети", "Apply to network")
-                            enabled: window.state.selected_kind !== "xray" && window.state.ready && !window.state.busy && !window.routingPending && window.state.engine === "xray" && window.state.connection_mode === "system" && window.state.system_tun_available && !window.state.system_busy && !window.state.can_stop && !window.state.system_recovery_pending && !!window.state.selected_profile && window.state.source_generation !== null
+                            enabled: window.state.selected_kind !== "xray" && window.state.ready && !window.state.busy && !window.routingPending && window.state.connection_mode === "system" && (window.systemFakeDnsEnabled || (!(window.state.system_fake_dns || []).length && window.state.engine === "xray" && window.state.system_tun_available)) && !window.state.system_busy && !window.state.can_stop && !window.state.system_recovery_pending && !!window.state.selected_profile && window.state.source_generation !== null
                             onClicked: window.sendRouting({command: "routing_apply", source_generation: window.state.source_generation, snapshot_revision: window.state.revision, selected_profile_id: window.state.selected_profile})
                         }
                         SmallLabel { Layout.fillWidth: true; text: window.tr("Для применения правил системный помощник должен подтвердить доступ. Проверка правил сама по себе не проверяет подключение и привязку приложений.", "The system helper must confirm access before applying rules. Rule validation alone does not verify connectivity or application attribution.") }
@@ -1399,10 +1402,10 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         PlainLabel { Layout.fillWidth: true; text: window.tr("Ядро", "Engine") }
                         PlainLabel { visible: window.state.selected_kind === "xray"; text: "Xray · Full Xray" }
-                        ChoiceBox { visible: window.state.selected_kind !== "xray"; objectName: "engineChoice"; model: ["xray"]; currentIndex: window.state.engine === "xray" ? 0 : -1; enabled: window.state.selected_kind !== "xray" && window.editable; onActivated: window.send({command: "set_engine", engine: currentText}); Accessible.name: window.tr("Прокси-ядро", "Proxy engine") }
+                        ChoiceBox { visible: window.state.selected_kind !== "xray"; objectName: "engineChoice"; model: window.systemFakeDnsEnabled ? ["xray", "sing-box"] : ["xray"]; currentIndex: window.state.engine === "xray" ? 0 : (window.systemFakeDnsEnabled ? 1 : -1); enabled: window.state.selected_kind !== "xray" && window.editable; onActivated: window.send({command: "set_engine", engine: currentText}); Accessible.name: window.tr("Прокси-ядро", "Proxy engine") }
                         HelpButton { explanation: window.tr("Обрабатывает подключение к серверу. Меняется после отключения и действует до закрытия приложения.", "Handles the server connection. Change after disconnecting; applies until the app exits.") }
                     }
-                    PlainLabel { visible: window.state.engine === "sing-box"; Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Сохранённое ядро Sing-box пока недоступно. Выберите Xray для подключения.", "The saved Sing-box engine is currently unavailable. Select Xray to connect.") }
+                    PlainLabel { visible: window.state.selected_kind !== "xray" && window.state.engine === "sing-box" && !window.systemFakeDnsEnabled; Layout.fillWidth: true; wrapMode: Text.Wrap; text: window.tr("Sing-box доступен для системного подключения с Fake DNS.", "Sing-box is available for system connections with Fake DNS.") }
                     PlainLabel { visible: window.state.selected_kind === "xray"; Layout.fillWidth: true; text: window.tr("Для полного профиля Xray параметры доступны только для просмотра.", "Settings for full Xray profiles are read-only.") }
                 }
                 SmallLabel { text: window.tr("Локальный прокси", "Local proxy"); color: window.mint; Layout.topMargin: 4 }
@@ -1429,6 +1432,35 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         TextField { id: proxyFetchDns; objectName: "proxyFetchDns"; Layout.fillWidth: true; maximumLength: 128; text: window.state.proxy_fetch_dns || ""; enabled: window.state.selected_kind !== "xray" && window.editable && !window.state.can_stop; Accessible.name: window.tr("DNS для обновлений через прокси", "Proxy update DNS") }
                         ActionButton { objectName: "saveProxyFetchDns"; text: window.tr("Сохранить", "Save"); enabled: window.state.selected_kind !== "xray" && window.editable && !window.state.can_stop; onClicked: window.send({command: "set_proxy_fetch_dns", upstream: proxyFetchDns.text}) }
+                    }
+                }
+                SettingsGroup {
+                    visible: window.state.connection_mode === "system" && window.state.selected_kind !== "xray"
+                    SmallLabel {
+                        Layout.fillWidth: true
+                        text: window.tr("Fake DNS для указанных доменов. Разделяйте суффиксы запятыми. Пустое поле отключает Fake DNS. Требуется политика «всё через прокси».", "Fake DNS for the specified domains. Separate suffixes with commas. Leave the field empty to turn Fake DNS off. Requires a proxy-only policy.")
+                    }
+                    SmallLabel {
+                        visible: (window.state.system_fake_dns || []).length > 0 && !window.systemFakeDnsEnabled
+                        Layout.fillWidth: true
+                        text: window.tr("Текущая политика несовместима с Fake DNS. Выберите «Прокси» по умолчанию и проверьте правила по приложениям, Direct и Block.", "The current policy is incompatible with Fake DNS. Select Proxy as the default and check per-app, Direct and Block rules.")
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: window.editable && !window.state.can_stop && !window.state.system_busy && !window.state.system_recovery_pending
+                        TextField {
+                            id: systemFakeDns
+                            objectName: "systemFakeDns"
+                            Layout.fillWidth: true
+                            maximumLength: 1024
+                            text: (window.state.system_fake_dns || []).join(", ")
+                            Accessible.name: window.tr("Доменные суффиксы Fake DNS", "Fake DNS domain suffixes")
+                        }
+                        ActionButton {
+                            objectName: "saveSystemFakeDns"
+                            text: window.tr("Сохранить", "Save")
+                            onClicked: window.send({command: "set_system_fake_dns", suffixes: systemFakeDns.text})
+                        }
                     }
                 }
                 SmallLabel {
