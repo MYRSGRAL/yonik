@@ -11,7 +11,7 @@
 | Система | Путь проверки | Результат для Xray и sing-box |
 | --- | --- | --- |
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
-| Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута и отзыв DNS-зоны |
+| Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
 | Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, адрес резолвера опубликован менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock, истечение карантина и восстановление после смены адреса через `resolvconf -a` |
 | Debian 13.7, Xfce 4.20 и X11, ядро 6.12.117 | Обычный UID в активной сессии LightDM и штатный диалог polkit. Отдельные прогоны с systemd-resolved и resolvconf 1.94 | Системный TUN, Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и карантин Fake-IP |
 | Ubuntu 24.04.5 LTS без графической сессии | Установленный helper, ядро 6.8.0-147, nftables 1.0.9 | TUN, Fake DNS, HTTPS, DoH и восстановление правил. Отдельно проверены смена маршрута и отзыв DNS-зоны |
@@ -190,7 +190,19 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
   `example.test` из списка исключений был открыт через системный DNS.
   Стенд подтвердил HTTPS-запрос для обоих профилей и отсутствие DoH-запросов
   для исключённого имени. Содержимое и метаданные `/etc/resolv.conf` совпали
-  до и после. HTTP/3 остаётся отдельной проверкой.
+  до и после.
+- [x] Проверить HTTP/3 в Firefox ESR 153.7.0 на Debian 13.7 с установленными
+  helper и worker на Xray и sing-box. HTTPS-сервер объявлял `Alt-Svc` для
+  UDP/443. Стенд принимал сценарий только при записи `HTTP/3.0` со статусом
+  200 в журнале Caddy 2.6.2. В профиле с системным DNS захват на TUN показал
+  UDP/443 к Fake IPv6, а VLESS-сервер получил исходное имя `example.test`.
+  В профиле со строгим DoH резолвер вернул реальный IPv4, который браузер
+  использовал для HTTP/3 через TUN. Оба сценария прошли на обоих движках.
+  В одноразовых профилях отключили ограничение HTTP/3 для сторонних корневых
+  CA, поскольку стенд использовал собственный тестовый CA. Проверка цепочки
+  и имени сертификата действовала. Содержимое и метаданные `/etc/resolv.conf`
+  совпали до и после прогона.
+  [Проверка стороннего корневого CA в Firefox](https://github.com/mozilla-firefox/firefox/blob/main/netwerk/protocol/http/Http3Session.cpp)
 - [x] Проверить установку Fake DNS поверх штатной IP-only политики через
   `Prepare → ApplyOutputV1` с обоими ядрами. Правила DNS добавляются перед
   обычным списком, а его порядок и действие по умолчанию сохраняются.
