@@ -158,13 +158,19 @@ async fn production_helper_authorized_uid_lifecycle() -> Result {
 #[tokio::test]
 #[ignore = "Root controller только в собственной disposable VM, настоящий установленный helper"]
 async fn production_helper_public_policy_survives_sigkill() -> Result {
-    lifecycle(false).await
+    lifecycle(None).await
 }
 
 #[tokio::test]
 #[ignore = "Только production helper VM с синтетическим peer и trusted registry"]
 async fn production_helper_system_profile_survives_sigkill() -> Result {
-    lifecycle(true).await
+    lifecycle(Some("xray")).await
+}
+
+#[tokio::test]
+#[ignore = "Только production helper VM с синтетическим peer и доверенным sing-box"]
+async fn production_helper_sing_box_profile_survives_sigkill() -> Result {
+    lifecycle(Some("sing-box")).await
 }
 
 async fn wait_for_fixture_link() -> Result {
@@ -203,13 +209,62 @@ async fn wait_for_fixture_link() -> Result {
     }
 }
 
-async fn lifecycle(profile: bool) -> Result {
+async fn check_tun_traffic() -> Result {
+    use std::net::SocketAddr;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpStream, UdpSocket},
+    };
+
+    const PREFIX: &[u8] = b"yonik-tun:";
+    const PAYLOAD_BYTES: usize = 32;
+    const REPLY_BYTES: usize = PREFIX.len() + PAYLOAD_BYTES;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for (server, bind) in [
+            ("198.18.0.2:40000", "0.0.0.0:0"),
+            ("[2001:db8:746f::2]:40000", "[::]:0"),
+        ] {
+            let server: SocketAddr = server.parse()?;
+            let mut payload = [0u8; PAYLOAD_BYTES];
+            getrandom::getrandom(&mut payload)
+                .map_err(|_| io::Error::other("Не удалось создать тестовую нагрузку"))?;
+            let mut expected = [0u8; REPLY_BYTES];
+            expected[..PREFIX.len()].copy_from_slice(PREFIX);
+            expected[PREFIX.len()..].copy_from_slice(&payload);
+
+            let mut tcp = TcpStream::connect(server).await?;
+            tcp.write_all(&payload).await?;
+            let mut reply = [0u8; REPLY_BYTES];
+            tcp.read_exact(&mut reply).await?;
+            require(reply == expected, "Неверный TCP-ответ через TUN")?;
+
+            let udp = UdpSocket::bind(bind).await?;
+            udp.connect(server).await?;
+            require(
+                udp.send(&payload).await? == payload.len(),
+                "Неполная UDP-отправка",
+            )?;
+            let mut reply = [0u8; REPLY_BYTES + 1];
+            let received = udp.recv(&mut reply).await?;
+            require(
+                reply[..received] == expected,
+                "Неверный UDP-ответ через TUN",
+            )?;
+        }
+        Ok(())
+    })
+    .await?
+}
+
+async fn lifecycle(engine: Option<&str>) -> Result {
     guard()?;
     require(
         rustix::process::geteuid().is_root(),
         "Требуется VM root controller",
     )?;
     let _lock = vm_lock::acquire()?;
+    let profile = engine.is_some();
     if profile {
         // Первое завершение DAD меняет адрес и маршрут между снимками Prepare.
         wait_for_fixture_link().await?;
@@ -221,11 +276,11 @@ async fn lifecycle(profile: bool) -> Result {
         "VM не чистая",
     )?;
     let original_pid = helper_pid()?;
-    let prepare = if profile {
+    let prepare = if let Some(engine) = engine {
         let imported = yonik_import::import_bytes(
             b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
         )?;
-        json!({"version":1,"mode":"system_profile","engine":"xray","kill_switch":true,"server":yonik_import::ServerIntent::from_server(&imported.servers[0])?})
+        json!({"version":1,"mode":"system_profile","engine":engine,"kill_switch":true,"server":yonik_import::ServerIntent::from_server(&imported.servers[0])?})
     } else {
         json!({"version":1,"mode":"public_protection","allow_lan":false})
     };
@@ -255,6 +310,7 @@ async fn lifecycle(profile: bool) -> Result {
         )?;
     }
     if profile {
+        check_tun_traffic().await?;
         require(
             !fs::read_to_string("/sys/fs/cgroup/system.slice/yonik-worker.service/cgroup.procs")?
                 .trim()
