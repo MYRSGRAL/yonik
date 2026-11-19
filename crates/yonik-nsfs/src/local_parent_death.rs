@@ -1,12 +1,15 @@
 //! Fixed SIGKILL при потере родителя локального sealed core; не worker API.
-// Target guard не доказывает backend: требуется отдельный exact-build receipt.
+// Проверка цели не заменяет проверку backend rustix в конкретной сборке.
 #[cfg(not(all(
     target_os = "linux",
-    target_arch = "x86_64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
     target_pointer_width = "64",
     target_env = "gnu"
 )))]
-compile_error!("local parent-death: требуется verified x86_64-unknown-linux-gnu/raw backend");
+compile_error!(
+    "local parent-death требует проверенный Linux GNU ABI x86_64 или AArch64 и backend linux_raw"
+);
 
 use rustix::process::{Signal, getpid, getppid, set_parent_process_death_signal};
 use std::{io, os::unix::process::CommandExt, process::Command};

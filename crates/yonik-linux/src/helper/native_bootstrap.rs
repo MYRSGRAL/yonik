@@ -55,7 +55,7 @@ impl VerifiedPendingRun {
         }
         let profile =
             CandidateInstalledProfile::verify(supervisor, observation, cancel, deadline).await?;
-        if profile.policy_digest() != yonik_nsfs::fixed_self_fence::PROFILE_DIGEST {
+        if Some(profile.policy_digest()) != kernel_evidence::fixed_profile_digest() {
             return Err(Error::Untrusted);
         }
         let (nonce, session, generation) = authorization
