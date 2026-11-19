@@ -7,6 +7,7 @@ use crate::{
     LinuxTopology,
     managed_network::{
         Journal, Ownership, RecordState, Resource, Scope,
+        firewall::PublicBlockPolicy,
         tun::{
             TunAddress, TunError, TunExecutor, TunRoute, TunRule,
             session_external_topology_with_framing,
@@ -29,6 +30,12 @@ pub(super) const FIRST_THROW_ROUTE: u64 = RULES + 2;
 const MAX_THROW_ROUTES: usize = 64;
 pub(super) const LAST_THROW_ROUTE: u64 = FIRST_THROW_ROUTE + MAX_THROW_ROUTES as u64 - 1;
 const ALLOCATION_ATTEMPTS: usize = 8;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ExternalTopologyCheck {
+    Verified,
+    RetryDhcpLifetimes,
+}
 
 /// Числа ресурсов выбираются helper, а не десериализуются из запроса UI.
 /// Существование плана не доказывает готовность транспорта или DNS.
@@ -423,15 +430,16 @@ impl SessionNetworkPlan {
         }
         Ok(())
     }
-    pub(crate) fn verify_external_captured(
+    pub(super) fn verify_external_captured(
         &self,
         baseline: (&LinuxTopology, crate::network::TopologyCapture),
-        current: LinuxTopology,
-        current_capture: crate::network::TopologyCapture,
+        current: (LinuxTopology, crate::network::TopologyCapture),
         journal: &Journal,
         index: u32,
         dhcp: &[crate::network::RenewedDhcpAddress],
-    ) -> Result<(), TunError> {
+        dhcp_retry_policy: Option<&PublicBlockPolicy>,
+    ) -> Result<ExternalTopologyCheck, TunError> {
+        let (current, current_capture) = current;
         #[cfg(test)]
         let (baseline, baseline_capture) = baseline;
         let records = self.check_records(journal, index, Some(self.configured_count() + 2));
@@ -483,6 +491,21 @@ impl SessionNetworkPlan {
             (&projected, current_capture),
             dhcp,
         ) {
+            if let Some(policy) = dhcp_retry_policy {
+                let known = |address: &crate::LinuxAddress| {
+                    let IpAddr::V4(local) = address.local.unwrap_or(address.address) else {
+                        return false;
+                    };
+                    policy.has_dhcp_rule_for_address(address.index, local)
+                };
+                if crate::network::only_dhcp_lifetimes_changed(
+                    baseline_pair,
+                    (&projected, current_capture),
+                    &known,
+                ) {
+                    return Ok(ExternalTopologyCheck::RetryDhcpLifetimes);
+                }
+            }
             #[cfg(test)]
             diagnostics::failure(
                 "equivalence",
@@ -495,7 +518,7 @@ impl SessionNetworkPlan {
             );
             return Err(TunError::Evidence);
         }
-        Ok(())
+        Ok(ExternalTopologyCheck::Verified)
     }
     pub(crate) async fn bind_queue(
         &self,

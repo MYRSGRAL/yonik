@@ -685,6 +685,12 @@ impl PublicBlockPolicy {
         self.dhcp_rules().get(position)
     }
 
+    pub(crate) fn has_dhcp_rule_for_address(&self, index: u32, address: Ipv4Addr) -> bool {
+        NonZeroU32::new(index)
+            .and_then(|index| self.dhcp_rule(index))
+            .is_some_and(|rule| rule.address == address)
+    }
+
     pub(super) fn dhcp_renewal_key(&self, index: NonZeroU32) -> Option<DhcpRenewalKey> {
         let rule = self.dhcp_rule(index)?;
         Some(DhcpRenewalKey {

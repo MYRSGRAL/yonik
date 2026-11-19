@@ -1,5 +1,115 @@
 use super::*;
 
+#[test]
+fn dhcp_lifetime_drift_requires_a_new_complete_snapshot() {
+    use crate::network::equivalence::{
+        CaptureWindow, RenewedDhcpAddress, RouteCapture, only_dhcp_lifetimes_changed,
+        same_session_topology,
+    };
+
+    let now = tokio::time::Instant::now();
+    let stamp = |instant| TopologyCapture {
+        addresses: [CaptureWindow {
+            start: instant,
+            end: instant,
+        }; 2],
+        routes: [RouteCapture::new(instant, instant); 2],
+    };
+    let lifetimes = |seconds: u32, created: u32, updated: u32| NetworkAttribute {
+        kind: 6,
+        value: [seconds, seconds, created, updated]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect(),
+    };
+    let address = "192.0.2.10".parse::<std::net::Ipv4Addr>().unwrap();
+    let baseline = LinuxTopology {
+        namespace: NetworkNamespace {
+            device: 3,
+            inode: 11,
+        },
+        links: vec![],
+        addresses: vec![LinuxAddress {
+            family: 2,
+            index: 3,
+            address: address.into(),
+            local: None,
+            prefix_len: 24,
+            scope: 0,
+            flags: 0,
+            unknown: vec![lifetimes(280, 7, 10)],
+        }],
+        routes: vec![],
+        rules: vec![],
+        nexthops: vec![],
+    };
+    let mut before_ack = baseline.clone();
+    before_ack.addresses[0].unknown[0] = lifetimes(290, 7, 15);
+    let mut after_ack = before_ack.clone();
+    after_ack.addresses[0].unknown[0] = lifetimes(300, 7, 20);
+    let old = (&baseline, stamp(now - Duration::from_secs(30)));
+    let current = stamp(now);
+    let renewal = [RenewedDhcpAddress {
+        index: 3,
+        local: address,
+        prefix: 24,
+        expiries: [now + Duration::from_secs(300); 2],
+    }];
+    let known = |link: &LinuxAddress| link.index == 3 && link.address == address;
+    assert!(!same_session_topology(
+        old,
+        (&before_ack, current),
+        &renewal
+    ));
+    assert!(only_dhcp_lifetimes_changed(
+        old,
+        (&before_ack, current),
+        &known
+    ));
+    assert!(same_session_topology(old, (&after_ack, current), &renewal));
+    assert!(!same_session_topology(old, (&after_ack, current), &[]));
+    assert!(!only_dhcp_lifetimes_changed(
+        old,
+        (&before_ack, current),
+        &|_| false
+    ));
+
+    for change in [
+        lifetimes(290, 8, 15),
+        lifetimes(0, 7, 15),
+        lifetimes(u32::MAX, 7, 15),
+    ] {
+        let mut changed = before_ack.clone();
+        changed.addresses[0].unknown[0] = change;
+        assert!(!only_dhcp_lifetimes_changed(
+            old,
+            (&changed, current),
+            &known
+        ));
+    }
+    let mut replaced = before_ack.clone();
+    replaced.addresses[0].flags ^= 0x20;
+    assert!(!only_dhcp_lifetimes_changed(
+        old,
+        (&replaced, current),
+        &known
+    ));
+    let mut rerouted = before_ack.clone();
+    rerouted.routes.push(parse_route(&route(2, 0)).unwrap());
+    assert!(!only_dhcp_lifetimes_changed(
+        old,
+        (&rerouted, current),
+        &known
+    ));
+    let mut rerouted = before_ack.clone();
+    rerouted.rules.push(parse_rule(&route(2, 0)).unwrap());
+    assert!(!only_dhcp_lifetimes_changed(
+        old,
+        (&rerouted, current),
+        &known
+    ));
+}
+
 fn attr(kind: u16, value: &[u8]) -> Vec<u8> {
     let mut result = ((value.len() + 4) as u16).to_ne_bytes().to_vec();
     result.extend(kind.to_ne_bytes());

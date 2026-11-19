@@ -10,7 +10,7 @@ use crate::helper::{
     memory::{ByteLease, config_budget},
     service::SystemProfileRequest,
     session_fake_dns::{self, ActiveFakeDns, PreparedFakeDns, PublicationHorizon},
-    session_network::{FIRST_THROW_ROUTE, LAST_THROW_ROUTE},
+    session_network::{ExternalTopologyCheck, FIRST_THROW_ROUTE, LAST_THROW_ROUTE},
 };
 use crate::{
     Cancellation, KernelRoute, LinuxLink, LinuxTopology, NetworkStamp, RouteKind, RouteQuery,
@@ -112,6 +112,7 @@ fn diagnostic_link(stage: &str, expected: &LinuxLink, actual: &LinuxLink) {
 }
 
 const DEADLINE: Duration = Duration::from_secs(3);
+const DHCP_TOPOLOGY_RETRY_BUDGET: Duration = Duration::from_millis(300);
 const MAX_BASELINE_BYTES: usize = 3 * 1024 * 1024;
 const MAX_PASSWD_BYTES: u64 = 1024 * 1024;
 const TUN_ID: u64 = 16;
@@ -2363,13 +2364,14 @@ impl Backend {
         self.bindings = None;
         Ok(ProtectionState::TunnelStarting)
     }
-    async fn verify_network_facts(
-        &mut self,
+    async fn check_external_network_facts(
+        &self,
         artifact: &SessionArtifact,
         index: u32,
         link: &LinuxLink,
+        dhcp_retry_policy: Option<&PublicBlockPolicy>,
         cancel: &mut Cancellation,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<ExternalTopologyCheck, ServiceError> {
         let (current, current_capture) = diagnostic_result(
             "topology_read",
             // Подключение worker к TUN может изменить carrier во время dump.
@@ -2390,18 +2392,49 @@ impl Backend {
             return diagnostic_result("same_link_contract", Err(stale()));
         }
         let dhcp = self.verified_dhcp_addresses(cancel).await;
-        diagnostic_result(
+        diagnostic_value(
             "external_verification",
             artifact.plan.verify_external_captured(
                 (&artifact.baseline, artifact.baseline_capture),
-                current,
-                current_capture,
+                (current, current_capture),
                 self.journal.as_ref().ok_or(ServiceError::Unavailable)?,
                 index,
                 &dhcp,
+                dhcp_retry_policy,
             ),
         )
-        .map_err(unavailable)?;
+        .map_err(unavailable)
+    }
+
+    async fn verify_network_facts(
+        &mut self,
+        artifact: &SessionArtifact,
+        index: u32,
+        link: &LinuxLink,
+        cancel: &mut Cancellation,
+    ) -> Result<(), ServiceError> {
+        let mut check = self
+            .check_external_network_facts(
+                artifact,
+                index,
+                link,
+                self.dhcp_topology_retry_policy(),
+                cancel,
+            )
+            .await?;
+        if check == ExternalTopologyCheck::RetryDhcpLifetimes {
+            // Снимок ядра и DHCP-ответ могли прийти по разные стороны ACK.
+            // Новый снимок проходит полную проверку, повторно пробовать нельзя.
+            check = tokio::time::timeout(
+                DHCP_TOPOLOGY_RETRY_BUDGET,
+                self.check_external_network_facts(artifact, index, link, None, cancel),
+            )
+            .await
+            .map_err(unavailable)??;
+        }
+        if check != ExternalTopologyCheck::Verified {
+            return Err(ServiceError::Unavailable);
+        }
         artifact.revalidate_routes(cancel, Some(index)).await?;
         let owner = self
             .journal

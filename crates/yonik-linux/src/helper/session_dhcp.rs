@@ -165,6 +165,11 @@ pub(super) fn spawn_refresh(
 }
 
 impl Backend {
+    pub(super) fn dhcp_topology_retry_policy(&self) -> Option<&PublicBlockPolicy> {
+        self.active.as_ref()?.dhcp_refresh.as_ref()?;
+        self.dhcp_policy().map(|(_, _, policy)| policy)
+    }
+
     pub(super) async fn verified_dhcp_addresses(
         &self,
         cancel: &Cancellation,
