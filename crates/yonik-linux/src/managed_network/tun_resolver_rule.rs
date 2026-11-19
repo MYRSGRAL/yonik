@@ -106,6 +106,16 @@ impl ResolverRouteRule {
         }
     }
 
+    pub(crate) fn expected_resource(
+        self,
+        owner: Ownership,
+        id: u64,
+        tun_id: u64,
+        ifindex: u32,
+    ) -> Resource {
+        self.with_owner(owner, id).journal_resource(tun_id, ifindex)
+    }
+
     fn digest(self) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"Yonik Resolver RPDB v2\0");

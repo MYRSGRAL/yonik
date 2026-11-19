@@ -9,14 +9,14 @@ use crate::{
         Journal, Ownership, RecordState, Resource, Scope,
         firewall::PublicBlockPolicy,
         tun::{
-            TunAddress, TunError, TunExecutor, TunRoute, TunRule,
+            ResolverRouteRule, TunAddress, TunError, TunExecutor, TunRoute, TunRule,
             session_external_topology_with_framing,
         },
     },
 };
 use std::{
     fmt,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 use yonik_engine::{SystemTun, SystemTunAddress};
 
@@ -30,7 +30,8 @@ pub(super) const FIRST_THROW_ROUTE: u64 = RULES + 2;
 const MAX_THROW_ROUTES: usize = 64;
 pub(super) const LAST_THROW_ROUTE: u64 = FIRST_THROW_ROUTE + MAX_THROW_ROUTES as u64 - 1;
 pub(super) const FIRST_RESOLVER_RULE: u64 = LAST_THROW_ROUTE + 1;
-pub(super) const LAST_RESOLVER_RULE: u64 = FIRST_RESOLVER_RULE + 15;
+const MAX_RESOLVER_RULES: usize = 16;
+pub(super) const LAST_RESOLVER_RULE: u64 = FIRST_RESOLVER_RULE + MAX_RESOLVER_RULES as u64 - 1;
 const ALLOCATION_ATTEMPTS: usize = 8;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,6 +51,7 @@ pub struct SessionNetworkPlan {
     mark: u32,
     addresses: [TunAddress; 2],
     throw_routes: Vec<TunRoute>,
+    resolver_rules: Vec<ResolverRouteRule>,
 }
 impl fmt::Debug for SessionNetworkPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -172,6 +174,7 @@ impl SessionNetworkPlan {
                 )?,
             ],
             throw_routes: Vec::new(),
+            resolver_rules: Vec::new(),
         })
     }
     fn available(&self, topology: &LinuxTopology) -> bool {
@@ -254,8 +257,60 @@ impl SessionNetworkPlan {
         Ok(self)
     }
 
+    /// Вызывающий подтверждает физический маршрут, UID резолвера и защиту nft
+    /// для каждого TCP-сокета перед вызовом capture.
+    pub fn with_resolver_routes(
+        mut self,
+        baseline: &LinuxTopology,
+        uid: u32,
+        routes: &[(SocketAddr, u32)],
+    ) -> Result<Self, TunError> {
+        if self.owner.namespace() != (baseline.namespace.device, baseline.namespace.inode) {
+            return Err(TunError::Namespace);
+        }
+        if routes.len() > MAX_RESOLVER_RULES || routes.iter().any(|(_, table)| *table == self.table)
+        {
+            return Err(TunError::Invalid);
+        }
+        let mut routes = routes.to_vec();
+        routes.sort_unstable();
+        routes.dedup();
+        if routes.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(TunError::Foreign);
+        }
+        let previous = baseline
+            .rules
+            .iter()
+            .filter_map(|rule| rule.priority)
+            .filter(|&priority| priority < self.priority)
+            .max()
+            .unwrap_or(0);
+        if routes.len() as u32 >= self.priority - previous {
+            return Err(TunError::Foreign);
+        }
+        self.resolver_rules = routes
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (endpoint, table))| {
+                ResolverRouteRule::new(self.priority - 1 - offset as u32, table, uid, endpoint)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(self)
+    }
+
+    fn planned_resolver_rules(&self) -> impl Iterator<Item = (u64, ResolverRouteRule)> + '_ {
+        self.resolver_rules
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(offset, rule)| (FIRST_RESOLVER_RULE + offset as u64, rule))
+    }
+
     fn configured_count(&self) -> usize {
         5 + self.throw_routes.len()
+    }
+    fn captured_count(&self) -> usize {
+        self.configured_count() + 2 + self.resolver_rules.len()
     }
     fn routes(&self) -> Result<[TunRoute; 2], TunError> {
         Ok([
@@ -325,6 +380,10 @@ impl SessionNetworkPlan {
                 },
             ));
         }
+        resources.extend(
+            self.planned_resolver_rules()
+                .map(|(id, rule)| (id, rule.expected_resource(self.owner, id, TUN, index))),
+        );
         resources
     }
     fn check_records(
@@ -337,12 +396,10 @@ impl SessionNetworkPlan {
             return Err(TunError::Foreign);
         }
         let expected = self.resources(index);
-        let end = FIRST_THROW_ROUTE + self.throw_routes.len() as u64;
-        if journal
-            .records()
-            .iter()
-            .any(|record| record.scope() == Scope::PublicBlock && (TUN..end).contains(&record.id()))
-        {
+        if journal.records().iter().any(|record| {
+            record.scope() == Scope::PublicBlock
+                && expected.iter().any(|(id, _)| *id == record.id())
+        }) {
             return Err(TunError::Foreign);
         }
         let mut count = 0;
@@ -408,12 +465,17 @@ impl SessionNetworkPlan {
         index: u32,
     ) -> Result<(), TunError> {
         self.check_records(journal, index, Some(self.configured_count()))?;
+        for (id, rule) in self.planned_resolver_rules() {
+            executor
+                .ensure_resolver_rule(journal, TUN, id, rule)
+                .await?;
+        }
         for (offset, rule) in self.rules()?.into_iter().enumerate() {
             executor
                 .ensure_rule(journal, TUN, RULES + offset as u64, rule)
                 .await?;
         }
-        self.check_records(journal, index, Some(self.configured_count() + 2))
+        self.check_records(journal, index, Some(self.captured_count()))
     }
     /// Проверяет только внешнюю топологию. Per-link devconf/token своего TUN
     /// требуют отдельного binding; этот результат нельзя публиковать как Applied.
@@ -424,7 +486,7 @@ impl SessionNetworkPlan {
         journal: &Journal,
         index: u32,
     ) -> Result<(), TunError> {
-        self.check_records(journal, index, Some(self.configured_count() + 2))?;
+        self.check_records(journal, index, Some(self.captured_count()))?;
         let projected =
             session_external_topology_with_framing(current, journal, TUN, MTU, self.vnet_hdr)?;
         if !crate::network::same_external_topology(&projected, baseline) {
@@ -444,7 +506,7 @@ impl SessionNetworkPlan {
         let (current, current_capture) = current;
         #[cfg(test)]
         let (baseline, baseline_capture) = baseline;
-        let records = self.check_records(journal, index, Some(self.configured_count() + 2));
+        let records = self.check_records(journal, index, Some(self.captured_count()));
         #[cfg(test)]
         let records = records.inspect_err(|&error| {
             diagnostics::failure(
@@ -547,8 +609,10 @@ impl SessionNetworkPlan {
     ) -> Result<(), TunError> {
         self.check_records(journal, index, None)?;
         let throw_end = FIRST_THROW_ROUTE + self.throw_routes.len() as u64;
-        let order = (RULES..FIRST_THROW_ROUTE)
+        let resolver_end = FIRST_RESOLVER_RULE + self.resolver_rules.len() as u64;
+        let order = (FIRST_RESOLVER_RULE..resolver_end)
             .rev()
+            .chain((RULES..FIRST_THROW_ROUTE).rev())
             .chain((FIRST_THROW_ROUTE..throw_end).rev())
             .chain((TUN..RULES).rev());
         for id in order {
@@ -559,7 +623,9 @@ impl SessionNetworkPlan {
             {
                 continue;
             }
-            if (RULES..FIRST_THROW_ROUTE).contains(&id) {
+            if id >= FIRST_RESOLVER_RULE {
+                executor.remove_resolver_rule(journal, TUN, id).await?;
+            } else if (RULES..FIRST_THROW_ROUTE).contains(&id) {
                 executor.remove_rule(journal, TUN, id).await?;
             } else if id >= ROUTES {
                 executor.remove_route(journal, TUN, id).await?;
