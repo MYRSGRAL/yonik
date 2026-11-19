@@ -29,6 +29,7 @@
 | Ubuntu 24.04.5 LTS, GNOME Shell 46 и Wayland, Qt 6.4.2 | Видимый Qt-клиент в активной сессии GDM, обычный UID и штатная политика polkit | TUN, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и истечение карантина после остановки helper |
 | Fedora Cloud 45, SELinux Enforcing | Установленный RPM, root-клиент на системной шине | TUN и Fake DNS, продление двух лизингов systemd-networkd 262, S3 через logind, обновление при остановленном helper и удаление с истечением карантина |
 | Fedora Cloud 45, QEMU, AArch64, SELinux Enforcing | Установленный RPM, ядро 7.2.11, systemd 262.1, nftables 1.1.6, systemd-resolved с FallbackDNS. Штатный helper в `yonik_helper_t` с `NoNewPrivs=1` | Xray и закреплённый sing-box прошли Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS, DoH и восстановление DNS после Stop. Карантин старых Fake-IP сохранился. Содержимое и метаданные `/etc/resolv.conf` совпали до и после |
+| Fedora Cloud 45, QEMU, AArch64, SELinux Enforcing | Обновление RPM с ревизии 1 на 2 при остановленном helper, затем удаление RPM | Удаление при активном Xray TUN отклонено. После обновления полный сетевой сценарий прошли Xray и sing-box. После удаления IPv4- и IPv6-элементы карантина остались в nftables и истекли через 82,7 с при остановленном helper. Содержимое и метаданные `/etc/resolv.conf` совпали до и после |
 | Fedora Cloud 45 с GNOME Shell 51.1 и Wayland, SELinux Enforcing | Тот же RPM, обычный UID в активной сессии, системный D-Bus и штатный диалог polkit | TUN и Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop и удаление после пользовательской сессии |
 
 В этих прогонах содержимое и метаданные `/etc/resolv.conf` совпали до и
@@ -810,6 +811,15 @@ IPv4-сценарий с теми же проверками прошёл пов�
   и Unlock RPM и модуль удалились, элементы карантина истекли в nftables
   при остановленном helper. `/etc/resolv.conf` сохранил содержимое и
   метаданные.
+  На AArch64 повторён сценарий с ревизиями `0.1.0-1.fc45` и
+  `0.1.0-2.fc45`. После отказа `rpm -e` активный Xray TUN сохранился.
+  После обновления прошли `rpm -V`, проверка домена `yonik_helper_t`
+  и `NoNewPrivs=1`, затем сетевой прогон на обоих движках. При
+  удалении helper остановился с IPv4- и IPv6-элементами карантина в
+  nftables. Их максимальный оставшийся TTL перед удалением составлял
+  82 с, а через 82,7 с стенд увидел пустые наборы. RPM, helper, worker
+  и SELinux-модуль удалились. SELinux остался в режиме Enforcing,
+  содержимое и метаданные `/etc/resolv.conf` совпали до и после.
 - [x] Проверить установленный RPM из обычной сессии Fedora GNOME Wayland.
   На базе Fedora Cloud 45 с GNOME Shell 51.1 и SELinux Enforcing клиент
   выполнил Prepare, Apply и Stop на обоих движках со штатной аутентификацией
