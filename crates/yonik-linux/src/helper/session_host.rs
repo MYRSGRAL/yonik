@@ -407,10 +407,10 @@ impl ResolvedTlsEgress {
         let mut routes = Vec::with_capacity(peers.len());
         let mut rules = Vec::with_capacity(peers.len());
         let mut endpoints = Vec::with_capacity(peers.len());
-        for &(peer, route_link) in peers {
+        for &(peer, transport, route_link) in peers {
             let query = RouteQuery::new(peer.ip(), daemon.uid)
                 .with_interfaces(None, route_link.and_then(NonZeroU32::new))
-                .with_transport(crate::TransportProtocol::Tcp, None, Some(peer.port()));
+                .with_transport(transport, None, Some(peer.port()));
             let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
                 .await
                 .map_err(unavailable)?;
@@ -427,8 +427,8 @@ impl ResolvedTlsEgress {
                 .ok_or(ServiceError::Unsupported)?;
             let name = String::from_utf8(link.name.clone()).map_err(unavailable)?;
             let table = route.table.ok_or(ServiceError::Unsupported)?;
-            endpoints.push((peer, index, name));
-            rules.push((peer, table));
+            endpoints.push((peer, transport, index, name));
+            rules.push((peer, transport, table));
             routes.push((route, capture));
         }
         let policy = ResolverTls::new(daemon.uid, daemon.group.1, owner.namespace(), endpoints)

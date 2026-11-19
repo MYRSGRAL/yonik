@@ -4,7 +4,7 @@
 #[path = "external_diagnostics.rs"]
 pub(in crate::helper) mod diagnostics;
 use crate::{
-    LinuxTopology,
+    LinuxTopology, TransportProtocol,
     managed_network::{
         Journal, Ownership, RecordState, Resource, Scope,
         firewall::PublicBlockPolicy,
@@ -258,24 +258,28 @@ impl SessionNetworkPlan {
     }
 
     /// Вызывающий подтверждает физический маршрут, UID резолвера и защиту nft
-    /// для каждого TCP-сокета перед вызовом capture.
+    /// для каждого сокета перед вызовом capture.
     pub fn with_resolver_routes(
         mut self,
         baseline: &LinuxTopology,
         uid: u32,
-        routes: &[(SocketAddr, u32)],
+        routes: &[(SocketAddr, TransportProtocol, u32)],
     ) -> Result<Self, TunError> {
         if self.owner.namespace() != (baseline.namespace.device, baseline.namespace.inode) {
             return Err(TunError::Namespace);
         }
-        if routes.len() > MAX_RESOLVER_RULES || routes.iter().any(|(_, table)| *table == self.table)
+        if routes.len() > MAX_RESOLVER_RULES
+            || routes.iter().any(|(_, _, table)| *table == self.table)
         {
             return Err(TunError::Invalid);
         }
         let mut routes = routes.to_vec();
         routes.sort_unstable();
         routes.dedup();
-        if routes.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        if routes
+            .windows(2)
+            .any(|pair| (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1))
+        {
             return Err(TunError::Foreign);
         }
         let previous = baseline
@@ -291,8 +295,9 @@ impl SessionNetworkPlan {
         self.resolver_rules = routes
             .into_iter()
             .enumerate()
-            .map(|(offset, (endpoint, table))| {
+            .map(|(offset, (endpoint, transport, table))| {
                 ResolverRouteRule::new(self.priority - 1 - offset as u32, table, uid, endpoint)
+                    .map(|rule| rule.with_transport(transport))
             })
             .collect::<Result<_, _>>()?;
         Ok(self)

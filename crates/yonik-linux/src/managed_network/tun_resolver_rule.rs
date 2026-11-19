@@ -1,9 +1,9 @@
-//! Журналируемое правило RPDB для точного TCP-сокета системного резолвера.
+//! Журналируемое правило RPDB для точного сокета системного резолвера.
 use super::{TunError, TunExecutor, config, lease, rule, write};
 use crate::managed_network::{
     Journal, JournalError, Ownership, Reconciled, RecordState, Resource, Scope,
 };
-use crate::{LinuxRule, LinuxTopology};
+use crate::{LinuxRule, LinuxTopology, TransportProtocol};
 use sha2::{Digest, Sha256};
 use std::{
     fmt,
@@ -11,7 +11,6 @@ use std::{
 };
 
 const RULE_PROTOCOL: u8 = 253;
-const TCP: u8 = 6;
 const FRA_DPORT_MASK: u16 = 29;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -20,6 +19,7 @@ pub struct ResolverRouteRule {
     table: u32,
     uid: u32,
     endpoint: SocketAddr,
+    transport: TransportProtocol,
     mark: u32,
 }
 
@@ -56,6 +56,7 @@ impl ResolverRouteRule {
             table,
             uid,
             endpoint,
+            transport: TransportProtocol::Tcp,
             mark: 0,
         })
     }
@@ -71,6 +72,18 @@ impl ResolverRouteRule {
     }
     pub fn endpoint(self) -> SocketAddr {
         self.endpoint
+    }
+
+    pub fn with_transport(mut self, transport: TransportProtocol) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    pub(super) fn ip_protocol(self) -> u8 {
+        match self.transport {
+            TransportProtocol::Tcp => 6,
+            TransportProtocol::Udp => 17,
+        }
     }
 
     pub(super) fn mark(self) -> u32 {
@@ -119,7 +132,7 @@ impl ResolverRouteRule {
     fn digest(self) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"Yonik Resolver RPDB v2\0");
-        hash.update([self.family(), RULE_PROTOCOL, TCP]);
+        hash.update([self.family(), RULE_PROTOCOL, self.ip_protocol()]);
         hash.update(self.priority.to_be_bytes());
         hash.update(self.table.to_be_bytes());
         hash.update(self.uid.to_be_bytes());
@@ -136,8 +149,14 @@ impl ResolverRouteRule {
         let ip = value.destination.address;
         let (uid, last_uid) = value.uid_range?;
         let (port, last_port) = value.destination_ports?;
-        let mut expected =
-            Self::new(value.priority?, value.table, uid, SocketAddr::new(ip, port)).ok()?;
+        let transport = match value.ip_protocol? {
+            6 => TransportProtocol::Tcp,
+            17 => TransportProtocol::Udp,
+            _ => return None,
+        };
+        let mut expected = Self::new(value.priority?, value.table, uid, SocketAddr::new(ip, port))
+            .ok()?
+            .with_transport(transport);
         expected.mark = value.fwmark.filter(|mark| *mark != 0)?;
         // Новые ядра дополняют точный диапазон порта полной маской.
         let expected_mask = match value.unknown.as_slice() {
@@ -162,7 +181,6 @@ impl ResolverRouteRule {
             && value.input_interface.is_none()
             && value.output_interface.is_none()
             && value.protocol == Some(RULE_PROTOCOL)
-            && value.ip_protocol == Some(TCP)
             && value.source_ports.is_none()
             && value
                 .suppress_prefix_len
@@ -367,7 +385,7 @@ mod tests {
             input_interface: None,
             output_interface: None,
             protocol: Some(RULE_PROTOCOL),
-            ip_protocol: Some(TCP),
+            ip_protocol: Some(selector.ip_protocol()),
             source_ports: None,
             destination_ports: Some((selector.endpoint().port(), selector.endpoint().port())),
             suppress_prefix_len: Some(u32::MAX),

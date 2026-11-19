@@ -244,9 +244,11 @@ pub(super) struct PreparedFakeDns {
     listeners: Mutex<Option<FakeDnsBridgeListeners>>,
     source: ResolverSource,
     resolved: Option<Arc<Resolve1TunSnapshot>>,
-    tls_peers: Vec<(SocketAddr, Option<u32>)>,
+    tls_peers: Vec<ResolverPeer>,
     plain: Vec<(PlainDnsRelay, ResolverBinding)>,
 }
+
+type ResolverPeer = (SocketAddr, TransportProtocol, Option<u32>);
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct ResolverBinding {
@@ -342,28 +344,25 @@ async fn verify_resolved_baseline(
     Ok(())
 }
 
-fn strict_tls_peers(
+fn native_resolver_peers(
     snapshot: &Resolve1TunSnapshot,
-) -> Result<Vec<(SocketAddr, Option<u32>)>, ServiceError> {
+) -> Result<Vec<ResolverPeer>, ServiceError> {
     use Resolve1Transport::{OpportunisticTls, Plain, StrictTls};
-    if snapshot
+    let strict = snapshot
         .sockets
         .iter()
-        .any(|socket| socket.transport == OpportunisticTls)
-    {
-        return Err(ServiceError::Unsupported);
-    }
-    if !snapshot
+        .any(|socket| socket.transport == StrictTls);
+    let opportunistic = snapshot
         .sockets
         .iter()
-        .any(|socket| socket.transport == StrictTls)
-    {
+        .any(|socket| socket.transport == OpportunisticTls);
+    if !strict && !opportunistic {
         return Ok(Vec::new());
     }
     // На старых resolved проверка сертификата зависит от глобального режима.
     // FallbackDNS теряет свою область при появлении DNS на новом линке.
     if snapshot.fallback_only
-        || snapshot.global_transport != Some(StrictTls)
+        || (strict && snapshot.global_transport != Some(StrictTls))
         || snapshot.daemon.is_none()
     {
         return Err(ServiceError::Unsupported);
@@ -374,17 +373,42 @@ fn strict_tls_peers(
         let peer = SocketAddr::new(endpoint.address, endpoint.port);
         if socket.transport == Plain {
             plain.insert(peer);
-        } else if tls
-            .insert(peer, socket.route_link)
-            .is_some_and(|previous| previous != socket.route_link)
-        {
-            return Err(ServiceError::Unsupported);
+            continue;
+        }
+        let fallback = SocketAddr::new(
+            endpoint.address,
+            if endpoint.port_inferred {
+                DNS_PORT
+            } else {
+                endpoint.port
+            },
+        );
+        let candidates = [
+            (peer, TransportProtocol::Tcp),
+            (fallback, TransportProtocol::Tcp),
+            (fallback, TransportProtocol::Udp),
+        ];
+        let count = if socket.transport == OpportunisticTls {
+            candidates.len()
+        } else {
+            1
+        };
+        for &candidate in &candidates[..count] {
+            if tls
+                .insert(candidate, socket.route_link)
+                .is_some_and(|previous| previous != socket.route_link)
+            {
+                return Err(ServiceError::Unsupported);
+            }
         }
     }
-    if tls.len() > MAX_RESOLVER_RULES || tls.keys().any(|peer| plain.contains(peer)) {
+    if tls.len() > MAX_RESOLVER_RULES || tls.keys().any(|(peer, _)| plain.contains(peer)) {
         return Err(ServiceError::Unsupported);
     }
-    Ok(tls.into_iter().collect())
+    Ok(tls
+        .into_iter()
+        .map(|((peer, protocol), link)| (peer, protocol, link))
+        .collect())
 }
 
 fn permits_resolver_name(domains: &[Resolve1Domain], name: &str, link: Option<u32>) -> bool {
@@ -461,7 +485,7 @@ impl PreparedFakeDns {
         };
         let tls_peers = resolved
             .as_deref()
-            .map(strict_tls_peers)
+            .map(native_resolver_peers)
             .transpose()?
             .unwrap_or_default();
         let mut upstreams = match (&source, &resolved) {
@@ -568,7 +592,7 @@ impl PreparedFakeDns {
         self.resolved.as_ref()?.daemon.as_ref()
     }
 
-    pub fn tls_peers(&self) -> &[(SocketAddr, Option<u32>)] {
+    pub fn tls_peers(&self) -> &[ResolverPeer] {
         &self.tls_peers
     }
 

@@ -43,7 +43,10 @@ fn правило_dot_проверяет_cgroup_и_защищает_физиче
     let mut wire = serde_json::to_value(&base).unwrap();
     wire["resolver_tls"] = json!({
         "uid": 991, "cgroup_id": 2500, "namespace_device": 3, "namespace_inode": 11,
-        "endpoints": [{"peer": "192.0.2.53:1853", "ifindex": 7, "ifname": "test-dhcp"}],
+        "endpoints": [
+            {"peer": "192.0.2.53:1853", "ifindex": 7, "ifname": "test-dhcp"},
+            {"peer": "192.0.2.53:1853", "ifindex": 7, "ifname": "test-dhcp", "protocol": "Udp"},
+        ],
     });
     let active: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
     assert_ne!(base.digest(), active.digest());
@@ -56,6 +59,7 @@ fn правило_dot_проверяет_cgroup_и_защищает_физиче
     assert!(script.contains(
         "meta skuid 991 meta mark 0 socket cgroupv2 level 2 \"../../../proc/self/fd/9\" accept"
     ));
+    assert!(script.contains("meta l4proto udp udp dport 1853 meta skuid 991"));
     let mut observed = listing(&table, &active);
     assert_eq!(check(&observed, &table, &active), Ok(()));
     let rules = observed["nftables"].as_array_mut().unwrap();

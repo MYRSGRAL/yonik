@@ -2073,6 +2073,7 @@ async fn installed_fake_dns(
         tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
     }
     let fallback_dns = std::env::var("YONIK_CHECK_FALLBACK_DNS");
+    let opportunistic_dot = std::env::var_os("YONIK_CHECK_OPPORTUNISTIC_DOT").is_some();
     let strict_dot = std::env::var("YONIK_CHECK_STRICT_DOT")
         .ok()
         .map(|peer| peer.parse::<std::net::SocketAddr>())
@@ -2109,6 +2110,18 @@ async fn installed_fake_dns(
             resolver_file_state()? == resolver_before,
             "Запуск изменил /etc/resolv.conf",
         )?;
+        if opportunistic_dot {
+            let result = tokio::process::Command::new("/usr/bin/resolvectl")
+                .arg("reset-server-features")
+                .output()
+                .await?;
+            require(
+                result.status.success(),
+                "Не удалось сбросить состояние DoT в resolved",
+            )?;
+            check_fallback_dns_in_vm("real.test").await?;
+            eprintln!("{engine:?}: resolved повторно выбрал транспорт для opportunistic DoT");
+        }
         if fallback_dns.is_ok() {
             check_fallback_dns_in_vm("real.test").await?;
             check_fallback_dns_local_names_in_vm().await?;

@@ -162,12 +162,17 @@ impl LanException {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TransportProtocol {
+    #[default]
     Tcp,
     Udp,
 }
 impl TransportProtocol {
+    fn is_tcp(&self) -> bool {
+        *self == Self::Tcp
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
@@ -382,7 +387,7 @@ impl ResolverTls {
         uid: u32,
         cgroup_id: NonZeroU64,
         (namespace_device, namespace_inode): (u64, u64),
-        endpoints: impl IntoIterator<Item = (SocketAddr, u32, String)>,
+        endpoints: impl IntoIterator<Item = (SocketAddr, crate::TransportProtocol, u32, String)>,
     ) -> Result<Self, PolicyError> {
         Ok(Self {
             uid: interface(uid)?,
@@ -391,9 +396,13 @@ impl ResolverTls {
             namespace_inode: NonZeroU64::new(namespace_inode).ok_or(PolicyError::Interface)?,
             endpoints: endpoints
                 .into_iter()
-                .map(|(peer, ifindex, ifname)| {
+                .map(|(peer, protocol, ifindex, ifname)| {
                     Ok(ResolverTlsEndpoint {
                         peer,
+                        protocol: match protocol {
+                            crate::TransportProtocol::Tcp => TransportProtocol::Tcp,
+                            crate::TransportProtocol::Udp => TransportProtocol::Udp,
+                        },
                         ifindex: interface(ifindex)?,
                         ifname: InterfaceName::try_from(ifname)?,
                     })
@@ -409,18 +418,21 @@ struct ResolverTlsEndpoint {
     peer: SocketAddr,
     ifindex: NonZeroU32,
     ifname: InterfaceName,
+    #[serde(default, skip_serializing_if = "TransportProtocol::is_tcp")]
+    protocol: TransportProtocol,
 }
 
 impl ResolverTlsEndpoint {
     fn selectors(self) -> Vec<Value> {
         let ip = self.peer.ip();
+        let protocol = self.protocol.name();
         vec![
             destination(ip, json!(ip.to_string())),
             meta("oif", json!(self.ifindex.get())),
             meta("oifname", json!(String::from(self.ifname))),
-            meta("l4proto", json!("tcp")),
+            meta("l4proto", json!(protocol)),
             compare(
-                json!({"payload":{"protocol":"tcp","field":"dport"}}),
+                json!({"payload":{"protocol":protocol,"field":"dport"}}),
                 json!(self.peer.port()),
             ),
         ]

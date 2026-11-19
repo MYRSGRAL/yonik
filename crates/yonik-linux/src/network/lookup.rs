@@ -9,7 +9,7 @@ use std::{fmt, net::IpAddr, num::NonZeroU32, time::Duration};
 use tokio::time::Instant;
 
 /// Порты имеют смысл только вместе с явным транспортным протоколом.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TransportProtocol {
     Tcp,
     Udp,

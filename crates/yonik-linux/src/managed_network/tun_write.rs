@@ -131,7 +131,7 @@ impl Action {
                 attribute(&mut value, 16, &0_u32.to_ne_bytes()); // FRA_FWMASK.
                 attribute(&mut value, 20, &uid_range); // FRA_UID_RANGE.
                 attribute(&mut value, 21, &[253]); // FRA_PROTOCOL.
-                attribute(&mut value, 22, &[6]); // FRA_IP_PROTO: TCP.
+                attribute(&mut value, 22, &[rule.ip_protocol()]); // FRA_IP_PROTO.
                 attribute(&mut value, 24, &port_range); // FRA_DPORT_RANGE.
                 value
             }

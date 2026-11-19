@@ -151,7 +151,15 @@ fn маршруты_resolved_ограничены_сокетом_и_свобод
     let v6 = "[2001:db8::53]:853".parse().unwrap();
     let candidate = || SessionNetworkPlan::candidate(owner(), [1; 24]).unwrap();
     let plan = candidate()
-        .with_resolver_routes(&topology, 991, &[(v6, 254), (v4, 254), (v4, 254)])
+        .with_resolver_routes(
+            &topology,
+            991,
+            &[
+                (v6, TransportProtocol::Tcp, 254),
+                (v4, TransportProtocol::Tcp, 254),
+                (v4, TransportProtocol::Tcp, 254),
+            ],
+        )
         .unwrap();
     assert_eq!(plan.configured_count(), 5);
     assert_eq!(plan.captured_count(), 9);
@@ -161,16 +169,34 @@ fn маршруты_resolved_ограничены_сокетом_и_свобод
     assert_eq!(plan.resolver_rules[1].priority(), plan.priority - 2);
     assert_eq!(plan.resolver_rules[0].uid(), 991);
     assert!(matches!(
-        candidate().with_resolver_routes(&topology, 991, &[(v4, 254), (v4, 253)]),
+        candidate().with_resolver_routes(
+            &topology,
+            991,
+            &[
+                (v4, TransportProtocol::Tcp, 254),
+                (v4, TransportProtocol::Tcp, 253)
+            ]
+        ),
         Err(TunError::Foreign)
     ));
     assert!(matches!(
-        candidate().with_resolver_routes(&topology, 991, &[(v4, plan.table)]),
+        candidate().with_resolver_routes(
+            &topology,
+            991,
+            &[(v4, TransportProtocol::Tcp, plan.table)]
+        ),
         Err(TunError::Invalid)
     ));
     topology.rules.push(test_rule(254, Some(plan.priority - 2)));
     assert!(matches!(
-        candidate().with_resolver_routes(&topology, 991, &[(v4, 254), (v6, 254)]),
+        candidate().with_resolver_routes(
+            &topology,
+            991,
+            &[
+                (v4, TransportProtocol::Tcp, 254),
+                (v6, TransportProtocol::Tcp, 254)
+            ]
+        ),
         Err(TunError::Foreign)
     ));
 }
@@ -178,7 +204,7 @@ fn маршруты_resolved_ограничены_сокетом_и_свобод
 #[tokio::test]
 #[ignore = "Требует отдельную network namespace и тестовые маршруты IPv4 и IPv6"]
 async fn план_tun_устанавливает_и_снимает_точные_маршруты_resolved() {
-    use crate::{Cancellation, RouteQuery, TransportProtocol, lookup_route, read_topology};
+    use crate::{Cancellation, RouteQuery, lookup_route, read_topology};
     use std::time::Duration;
 
     let (_operation, mut cancel) = Cancellation::new();
@@ -193,13 +219,22 @@ async fn план_tun_устанавливает_и_снимает_точные_
     )
     .unwrap();
     let mut executor = TunExecutor::isolated_fixture(owner).unwrap();
-    let endpoints: [SocketAddr; 2] = [
-        "192.0.2.53:1853".parse().unwrap(),
-        "[2001:db8::53]:853".parse().unwrap(),
+    let endpoints: [(SocketAddr, TransportProtocol); 4] = [
+        ("192.0.2.53:1853".parse().unwrap(), TransportProtocol::Tcp),
+        (
+            "[2001:db8::53]:853".parse().unwrap(),
+            TransportProtocol::Tcp,
+        ),
+        ("192.0.2.53:53".parse().unwrap(), TransportProtocol::Udp),
+        ("[2001:db8::53]:53".parse().unwrap(), TransportProtocol::Udp),
     ];
     let plan = SessionNetworkPlan::reserve(owner, &baseline)
         .unwrap()
-        .with_resolver_routes(&baseline, 991, &endpoints.map(|endpoint| (endpoint, 254)))
+        .with_resolver_routes(
+            &baseline,
+            991,
+            &endpoints.map(|(endpoint, protocol)| (endpoint, protocol, 254)),
+        )
         .unwrap();
     let path = std::env::temp_dir().join(format!("yonik-plan-dot-{}", std::process::id()));
     fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
@@ -224,21 +259,22 @@ async fn план_tun_устанавливает_и_снимает_точные_
         index,
     )
     .unwrap();
-    for endpoint in endpoints {
-        let socket = |uid, port| {
-            RouteQuery::new(endpoint.ip(), uid).with_transport(
-                TransportProtocol::Tcp,
-                None,
-                Some(port),
-            )
+    for (endpoint, protocol) in endpoints {
+        let socket = |uid, port, protocol| {
+            RouteQuery::new(endpoint.ip(), uid).with_transport(protocol, None, Some(port))
         };
-        let resolved = lookup_route(socket(991, endpoint.port()), &mut cancel, timeout)
+        let other_protocol = match protocol {
+            TransportProtocol::Tcp => TransportProtocol::Udp,
+            TransportProtocol::Udp => TransportProtocol::Tcp,
+        };
+        let resolved = lookup_route(socket(991, endpoint.port(), protocol), &mut cancel, timeout)
             .await
             .unwrap();
         assert_eq!(resolved.table, Some(254));
         for query in [
-            socket(992, endpoint.port()),
-            socket(991, endpoint.port() + 1),
+            socket(992, endpoint.port(), protocol),
+            socket(991, endpoint.port() + 1, protocol),
+            socket(991, endpoint.port(), other_protocol),
         ] {
             let caught = lookup_route(query, &mut cancel, timeout).await.unwrap();
             assert_eq!(

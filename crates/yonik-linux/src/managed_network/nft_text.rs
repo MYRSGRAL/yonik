@@ -261,11 +261,19 @@ fn require_dot_selectors(expressions: &[Value]) -> Result<()> {
     require(
         text(op)? == "==" && selector(left)? == "meta nfproto" && right.as_str() == Some(protocol),
     )?;
+    let [_, _, transport, ..] = matches else {
+        return Err(NftError::Invalid);
+    };
+    let port_selector = match transport.pointer("/match/right").and_then(Value::as_str) {
+        Some("tcp") => "tcp dport",
+        Some("udp") => "udp dport",
+        _ => return Err(NftError::Invalid),
+    };
     let expected = [
         "meta oif",
         "meta oifname",
         "meta l4proto",
-        "tcp dport",
+        port_selector,
         "meta skuid",
         "meta mark",
     ];
@@ -277,7 +285,6 @@ fn require_dot_selectors(expressions: &[Value]) -> Result<()> {
         let [op, left, right] = exact(fields, ["op", "left", "right"])?;
         require(text(op)? == "==" && selector(left)? == expected)?;
         require(match expected {
-            "meta l4proto" => right.as_str() == Some("tcp"),
             "meta skuid" => right
                 .as_u64()
                 .is_some_and(|uid| (1..u64::from(u32::MAX)).contains(&uid)),

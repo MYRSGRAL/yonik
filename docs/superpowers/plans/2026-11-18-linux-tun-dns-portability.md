@@ -274,8 +274,17 @@ IPv4-сценарий с теми же проверками прошёл пов�
   зоне. Сокет с тем же UID вне cgroup резолвера заблокирован. После Stop
   исходный DoT ответил для нового имени. HTTPS, DoH и карантин Fake-IP
   прошли по сценарию установленного helper. Содержимое и метаданные
-  `/etc/resolv.conf` совпали. Зашифрованный `FallbackDNS` и режим
-  `opportunistic` остаются отдельными сценариями.
+  `/etc/resolv.conf` совпали.
+
+  Настроенный `DNSOverTLS=opportunistic` проверен с установленным helper
+  на Xray и sing-box. В Ubuntu 24.04.5 доступный сервер отвечал по TLS 1.3.
+  В Debian 13.7 и Ubuntu 24.04.5 стенд отклонял TLS. При активной сессии
+  resolved повторял попытку TLS, затем получал усечённый ответ по UDP и
+  полный ответ по TCP. В Debian оба транспорта сохраняли явный порт
+  1853. В Ubuntu с неявным портом переход шёл с TLS 853 на DNS 53.
+  Fake A/AAAA, восстановление после Stop и неизменность `/etc/resolv.conf`
+  подтверждены. Зашифрованный `FallbackDNS` остаётся отдельным сценарием.
+  [Выбор порта в systemd](https://github.com/systemd/systemd/blob/v255/src/resolve/resolved-dns-transaction.c#L600-L606)
 
 - [x] Проверить переподключение DHCPv4 в Debian 13.7 и Ubuntu 24.04.5 LTS с
   `systemd-networkd` и `systemd-resolved`. В тесте

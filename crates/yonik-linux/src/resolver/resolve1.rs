@@ -167,7 +167,7 @@ async fn read_snapshot(
             result = async {
                 let connection = Connection::system().await.map_err(bus_error)?;
                 let mut snapshot = read_connection(&connection, scope).await?;
-                if snapshot.sockets.iter().any(|socket| socket.transport == Resolve1Transport::StrictTls) {
+                if snapshot.sockets.iter().any(|socket| socket.transport != Resolve1Transport::Plain) {
                     let (verified, daemon) = bind_resolved(async |connection, expected_owner| {
                         read_connection_for_owner(connection, scope, expected_owner).await
                     }).await?;
