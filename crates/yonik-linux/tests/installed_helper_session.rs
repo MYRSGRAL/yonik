@@ -2133,10 +2133,19 @@ async fn restart_fixture_resolver(connection: &zbus::Connection) -> Result {
     )
     .await??;
     require(status.success(), "Стенд не перезапустил systemd-resolved")?;
-    require(
-        bus.get_name_owner(name).await? != before,
-        "Владелец имени systemd-resolved на D-Bus не сменился",
-    )?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match bus.get_name_owner(name.clone()).await {
+                Ok(owner) if owner != before => return Ok(()),
+                Ok(_) | Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("Владелец имени systemd-resolved на D-Bus не сменился"))??;
     eprintln!("Стенд подтвердил нового владельца systemd-resolved на D-Bus");
     Ok(())
 }
