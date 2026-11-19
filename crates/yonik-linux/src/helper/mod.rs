@@ -4,6 +4,7 @@
 //! `PeerIdentity` — снимок, а не разрешение на будущий Apply: перед каждым
 //! Prepare/Apply нужна новая проверка непосредственно перед эффектами.
 
+pub mod dhcp_networkd;
 pub mod fence;
 mod kernel_evidence;
 pub(crate) mod native_bootstrap;

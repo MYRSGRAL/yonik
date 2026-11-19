@@ -562,6 +562,75 @@ async fn dhcp_cgroup_socket_rule_has_exact_kernel_identity() -> Result {
 }
 
 #[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная VM с DHCP-клиентом systemd-networkd и двумя ответами DNS"]
+async fn dhcp_networkd_lease_is_bound_to_kernel_socket_and_revoked_after_renewal() -> Result {
+    use yonik_linux::{NetworkReadError, helper::dhcp_networkd::DhcpNetworkdLease};
+
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    let resolver_before = resolver_file_state()?;
+    let index = fs::read_to_string("/sys/class/net/yonik-dhcp/ifindex")?
+        .trim()
+        .parse()?;
+    let (_owner, mut token) = yonik_linux::Cancellation::new();
+    check_dhcp_fixture_dns("10.203.2.1", &mut token).await?;
+    let mut original = DhcpNetworkdLease::capture(index, &mut token).await?;
+    let original_path = original
+        .path()
+        .ok_or_else(|| io::Error::other("Недоступен путь DHCP"))?;
+    let group = fs::metadata("/sys/fs/cgroup/system.slice/systemd-networkd.service")?;
+    require(
+        original_path.ifname == "yonik-dhcp"
+            && original_path.address == std::net::Ipv4Addr::new(10, 203, 2, 10)
+            && original_path.server == std::net::Ipv4Addr::new(10, 203, 2, 1)
+            && original_path.cgroup_id.get() == group.ino(),
+        "Ядро и лизинг DHCP указывают на разные пути",
+    )?;
+    original.revalidate(&mut token).await?;
+    require(
+        original.path().is_some(),
+        "Не перепроверен неизменный лизинг",
+    )?;
+    require(
+        Command::new("/usr/bin/systemctl")
+            .args(["start", "yonik-dhcp-fixture-renew.service"])
+            .status()?
+            .success(),
+        "Стенд не обновил DHCP-лизинг",
+    )?;
+    check_dhcp_fixture_dns("10.203.2.2", &mut token).await?;
+    require(
+        original.path().is_some(),
+        "Снимок истёк до проверки смены лизинга",
+    )?;
+    require(
+        original.revalidate(&mut token).await == Err(NetworkReadError::Changed)
+            && original.path().is_none(),
+        "Предыдущий DHCP-лизинг принят после продления",
+    )?;
+    let updated = DhcpNetworkdLease::capture(index, &mut token).await?;
+    require(updated.path().is_some(), "Новый DHCP-лизинг не принят")?;
+    require(
+        Command::new("/usr/bin/systemctl")
+            .args(["stop", "systemd-networkd.service"])
+            .status()?
+            .success(),
+        "Не удалось остановить тестовый DHCP-клиент",
+    )?;
+    require(
+        updated.path().is_none(),
+        "Снимок доступен после выхода процесса DHCP-клиента",
+    )?;
+    require(
+        resolver_file_state()? == resolver_before,
+        "Изменился /etc/resolv.conf",
+    )?;
+    eprintln!("Ядро подтвердило сокет DHCP, а продление и выход клиента отозвали старый снимок");
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FakeDnsNetworkChange {
     PeerRoute,

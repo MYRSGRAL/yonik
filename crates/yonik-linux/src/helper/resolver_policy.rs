@@ -636,17 +636,14 @@ pub(super) mod production {
     }
     #[derive(Debug)]
     struct BoundedWrite(tokio::net::unix::OwnedWriteHalf);
-    fn bounded_socket(
+    pub(in crate::helper) fn bounded_socket(
         stream: tokio::net::UnixStream,
     ) -> std::io::Result<zbus::connection::socket::BoxedSplit> {
-        // В zbus 4.4 Split fields закрыты, constructor отсутствует. Создаём
-        // штатный Split и заменяем обе половины до старта executor. Временный
-        // dup того же соединения покрыт FD credit; второго connect здесь нет.
-        let original = stream.into_std()?;
-        let duplicate = tokio::net::UnixStream::from_std(original.try_clone()?)?;
-        let mut split: zbus::connection::socket::BoxedSplit =
-            tokio::net::UnixStream::from_std(original)?.into();
-        let (read, write) = duplicate.into_split();
+        // У BoxedSplit нет публичного конструктора. Заполнитель должен иметь
+        // отдельный сокет: Drop его OwnedWriteHalf вызывает shutdown(SHUT_WR).
+        let (placeholder, _) = tokio::net::UnixStream::pair()?;
+        let mut split: zbus::connection::socket::BoxedSplit = placeholder.into();
+        let (read, write) = stream.into_split();
         *split.read_mut() = Box::new(BoundedRead {
             io: read,
             fence: FrameFence::default(),
@@ -1218,6 +1215,28 @@ pub(super) mod production {
             }
             assert!(fence.accept(b"x").is_err());
         }
+        #[tokio::test]
+        async fn wrapping_socket_preserves_the_write_half() {
+            use tokio::io::AsyncReadExt;
+
+            let (local, mut peer) = tokio::net::UnixStream::pair().expect("Тестовая пара Unix");
+            let mut wrapped = bounded_socket(local).expect("Обёртка D-Bus");
+            let bytes = b"AUTH\r\n";
+            assert_eq!(
+                wrapped
+                    .write_mut()
+                    .sendmsg(bytes, &[])
+                    .await
+                    .expect("Запись"),
+                bytes.len()
+            );
+            let mut expected = [0; 6];
+            peer.read_exact(&mut expected)
+                .await
+                .expect("Чтение второй стороной");
+            assert_eq!(&expected, bytes);
+        }
+
         struct FakeBus {
             samples: std::collections::VecDeque<Result<Service>>,
         }
