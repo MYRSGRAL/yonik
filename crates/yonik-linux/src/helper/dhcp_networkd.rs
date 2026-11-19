@@ -223,6 +223,13 @@ impl DhcpNetworkdLease {
         })
     }
 
+    pub(crate) fn remaining(&self) -> Option<Duration> {
+        let path = self.path()?;
+        Some(Duration::from_micros(
+            path.expires_boottime_micros.checked_sub(boottime().ok()?)?,
+        ))
+    }
+
     /// Ошибка чтения, изменения лизинга или завершение проверки через Drop
     /// отзывают предыдущий снимок до следующего await.
     pub async fn revalidate(&mut self, cancel: &mut Cancellation) -> Result<(), Error> {

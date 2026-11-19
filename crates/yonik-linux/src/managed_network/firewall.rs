@@ -258,6 +258,13 @@ struct DhcpRule {
     namespace_inode: NonZeroU64,
 }
 
+pub(super) struct DhcpRenewalKey {
+    pub(super) address: Ipv4Addr,
+    pub(super) server: Ipv4Addr,
+    pub(super) ifindex: NonZeroU32,
+    pub(super) ifname: String,
+}
+
 impl DhcpRule {
     fn command(&self, table: &str) -> Value {
         let payload = |protocol, field| json!({"payload":{"protocol":protocol,"field":field}});
@@ -600,6 +607,16 @@ impl PublicBlockPolicy {
             (rule.namespace_device, rule.namespace_inode.get()),
             rule.cgroup_id,
         ))
+    }
+
+    pub(super) fn dhcp_renewal_key(&self) -> Option<DhcpRenewalKey> {
+        let rule = self.dhcp_renewal_rule.as_ref()?;
+        Some(DhcpRenewalKey {
+            address: rule.address,
+            server: rule.server,
+            ifindex: rule.ifindex,
+            ifname: String::from(rule.ifname),
+        })
     }
 
     /// Отпечаток канонических правил не зависит от имени принадлежащей helper таблицы.

@@ -239,6 +239,15 @@ impl NftExecutor {
         } else {
             serde_json::to_vec(&request).map_err(|_| NftError::Invalid)?
         };
+        self.run_batch(bytes, text_input, check_only).await
+    }
+
+    async fn run_batch(
+        &mut self,
+        bytes: Vec<u8>,
+        text_input: bool,
+        check_only: bool,
+    ) -> Result<Vec<u8>, NftError> {
         if bytes.len() > MAX_OUTPUT {
             return Err(NftError::Invalid);
         }

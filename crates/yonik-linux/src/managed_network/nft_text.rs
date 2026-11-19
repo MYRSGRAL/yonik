@@ -2,7 +2,8 @@
 
 use super::{MAX_OUTPUT, NftError};
 use crate::managed_network::firewall::{
-    DHCP_CGROUP_PATH as DHCP_CGROUP, DHCP_RENEWAL_CHAIN as DHCP_CHAIN, DHCP_RENEWAL_SET as DHCP_SET,
+    DHCP_CGROUP_PATH as DHCP_CGROUP, DHCP_RENEWAL_CHAIN as DHCP_CHAIN,
+    DHCP_RENEWAL_SET as DHCP_SET, DhcpRenewalKey,
 };
 use serde_json::Value;
 use std::{fmt::Write as _, net::IpAddr};
@@ -14,6 +15,23 @@ const DHCP_KEY_TYPES: [&str; 4] = ["ipv4_addr", "ipv4_addr", "iface_index", "ifn
 const DHCP_KEY_FIELDS: [&str; 4] = ["ip saddr", "ip daddr", "meta oif", "meta oifname"];
 
 type Result<T> = std::result::Result<T, NftError>;
+
+pub(super) fn dhcp_renewal(
+    table: &str,
+    element: Option<(&DhcpRenewalKey, u64)>,
+) -> Result<Vec<u8>> {
+    check_table_name(table)?;
+    let mut script = format!("flush set inet {table} {DHCP_SET}\n");
+    if let Some((key, timeout_ms)) = element {
+        require((1..1000).contains(&timeout_ms) && safe_ifname(&key.ifname))?;
+        write_fmt(writeln!(
+            script,
+            "add element inet {table} {DHCP_SET} {{ {} . {} . {} . \"{}\" timeout {timeout_ms}ms }}",
+            key.address, key.server, key.ifindex, key.ifname
+        ))?;
+    }
+    Ok(script.into_bytes())
+}
 
 pub(super) fn render(commands: &[Value]) -> Result<Vec<u8>> {
     if commands.is_empty() || commands.len() > MAX_COMMANDS {
@@ -231,13 +249,7 @@ fn render_match(script: &mut String, fields: &Value) -> Result<()> {
         "meta l4proto" => keyword(script, right, &["tcp", "udp", "ipv6-icmp"]),
         "meta oifname" => {
             let name = text(right)?;
-            require(
-                !name.is_empty()
-                    && name.len() <= 15
-                    && name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_.+@".contains(&b)),
-            )?;
+            require(safe_ifname(name))?;
             write_fmt(write!(script, "\"{name}\""))
         }
         "udp sport" | "udp dport" | "tcp dport" => {
@@ -337,18 +349,30 @@ fn single(value: &Value) -> Result<(&str, &Value)> {
 
 fn table_name(value: &Value) -> Result<&str> {
     let name = text(value)?;
+    check_table_name(name)?;
+    Ok(name)
+}
+
+fn check_table_name(name: &str) -> Result<()> {
     let id = name.strip_prefix("yonik_").ok_or(NftError::Invalid)?;
     require(
         id.len() == 16
             && id
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-    )?;
-    Ok(name)
+    )
 }
 
 fn text(value: &Value) -> Result<&str> {
     value.as_str().ok_or(NftError::Invalid)
+}
+
+fn safe_ifname(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+@".contains(&byte))
 }
 
 fn keyword(script: &mut String, value: &Value, allowed: &[&str]) -> Result<()> {

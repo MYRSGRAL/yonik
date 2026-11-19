@@ -23,13 +23,17 @@ fn listing(table: &Table, policy: &PublicBlockPolicy) -> Value {
     json!({"nftables":items})
 }
 fn check(value: &Value, table: &Table, policy: &PublicBlockPolicy) -> Result<(), NftError> {
-    verify_rules(&serde_json::to_vec(value).unwrap(), table, policy, |name| {
-        if name == "lo" {
-            Ok(1)
-        } else {
-            Err(NftError::Evidence)
-        }
-    })
+    verify_rules(
+        &serde_json::to_vec(value).unwrap(),
+        table,
+        policy,
+        |name| match name {
+            "lo" => Ok(1),
+            "test-dhcp" => Ok(7),
+            "другой-интерфейс" => Ok(8),
+            _ => Err(NftError::Evidence),
+        },
+    )
     .map(|_| ())
 }
 
@@ -108,6 +112,62 @@ fn dhcp_rule_keeps_cgroup_inode_in_durable_identity() {
     assert_ne!(first.digest(), second.digest());
     policy["dhcp_renewal_rule"]["ifname"] = json!("bad*");
     assert!(serde_json::from_value::<PublicBlockPolicy>(policy).is_err());
+}
+
+#[test]
+fn dhcp_rule_only_accepts_the_exact_short_lived_element() {
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![])
+            .expect("Активная политика"),
+    )
+    .expect("Запись политики");
+    wire["dhcp_renewal_anchor"] = json!(true);
+    wire["dhcp_renewal_rule"] = json!({
+        "ifindex": 7, "ifname": "test-dhcp", "address": "192.0.2.10", "server": "192.0.2.1",
+        "uid": 999, "cgroup_id": 2500, "dscp": 32, "mark": 0,
+        "namespace_device":3,"namespace_inode":11
+    });
+    let policy = serde_json::from_value::<PublicBlockPolicy>(wire).expect("Политика DHCP");
+    let table = block_table(owner(), 2, 5, &policy);
+    let mut live = listing(&table, &policy);
+    let set = live["nftables"]
+        .as_array_mut()
+        .expect("Список nftables")
+        .iter_mut()
+        .find_map(|object| object.get_mut("set"))
+        .expect("Набор DHCP");
+    let value = json!({"concat":["192.0.2.10","192.0.2.1",7,"test-dhcp"]});
+    let allowed = json!({"elem":{"val":value,"timeout":0,"expires":0}});
+    set["elem"] = json!([allowed]);
+    let read = |listing: &Value| check(listing, &table, &policy);
+    assert_eq!(read(&live), Ok(()));
+    let with_elements = |elements: Value| {
+        let mut modified = live.clone();
+        modified["nftables"]
+            .as_array_mut()
+            .expect("Список nftables")
+            .iter_mut()
+            .find_map(|object| object.get_mut("set"))
+            .expect("Набор DHCP")["elem"] = elements;
+        modified
+    };
+    for index in ["7", "test-dhcp"] {
+        let element = json!({"elem":{"val":{"concat":["192.0.2.10","192.0.2.1",index,"test-dhcp"]},"timeout":0,"expires":0}});
+        assert_eq!(read(&with_elements(json!([element]))), Ok(()));
+    }
+
+    for forbidden in [
+        json!([value]),
+        json!([{"elem":{"val":value,"timeout":0}}]),
+        json!([{"elem":{"val":value,"timeout":1,"expires":0}}]),
+        json!([{"elem":{"val":value,"timeout":0,"expires":1}}]),
+        json!([{"elem":{"val":value,"timeout":0,"expires":0,"comment":"изменено"}}]),
+        json!([{"elem":{"val":{"concat":["192.0.2.10","192.0.2.2",7,"test-dhcp"]},"timeout":0,"expires":0}}]),
+        json!([{"elem":{"val":{"concat":["192.0.2.10","192.0.2.1","другой-интерфейс","test-dhcp"]},"timeout":0,"expires":0}}]),
+        json!([allowed, allowed]),
+    ] {
+        assert_eq!(read(&with_elements(forbidden)), Err(NftError::Evidence));
+    }
 }
 
 #[test]

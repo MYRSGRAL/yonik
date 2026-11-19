@@ -615,15 +615,88 @@ async fn dhcp_rule_is_verified_through_durable_public_policy() -> Result {
             == PublicPolicyRecovery::DesiredRules { revision },
         "Правило DHCP не принято после повторного открытия журнала",
     )?;
+    let table = "yonik_0000000000000005";
+    let set_contains_lease = || -> Result<bool> {
+        let output = Command::new(nft_test_binary())
+            .args([
+                "-n",
+                "-j",
+                "list",
+                "set",
+                "inet",
+                table,
+                "dhcp_renewal_leases",
+            ])
+            .output()?;
+        require(output.status.success(), "Не прочитан набор DHCP")?;
+        eprintln!("{}", std::str::from_utf8(&output.stdout)?);
+        let listing: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let set = listing["nftables"]
+            .as_array()
+            .and_then(|items| items.iter().find_map(|item| item.get("set")))
+            .ok_or_else(|| io::Error::other("Нет набора DHCP"))?;
+        Ok(set["elem"]
+            .as_array()
+            .is_some_and(|elements| !elements.is_empty()))
+    };
+    let mut lease = DhcpNetworkdLease::capture(index, &mut cancel).await?;
+    require(
+        nft.refresh_dhcp_renewal(&journal, initial_revision, &mut lease, &mut cancel)
+            .await
+            .is_err()
+            && !set_contains_lease()?,
+        "Устаревшая ревизия выдала разрешение DHCP",
+    )?;
+    eprintln!("Проверена устаревшая ревизия DHCP");
+    nft.refresh_dhcp_renewal(&journal, revision, &mut lease, &mut cancel)
+        .await?;
+    require(set_contains_lease()?, "Нет временного элемента DHCP")?;
+    eprintln!("Установлен первый временный элемент DHCP");
+    nft.refresh_dhcp_renewal(&journal, revision, &mut lease, &mut cancel)
+        .await?;
+    require(set_contains_lease()?, "Не обновился временный элемент DHCP")?;
+    require(
+        nft.recover_public_policy(&mut journal).await?
+            == PublicPolicyRecovery::DesiredRules { revision },
+        "Временный элемент изменил ревизию или сорвал проверку",
+    )?;
+    nft.revoke_dhcp_renewal(&journal, revision).await?;
+    require(!set_contains_lease()?, "После отзыва остался элемент DHCP")?;
+    nft.refresh_dhcp_renewal(&journal, revision, &mut lease, &mut cancel)
+        .await?;
+    require(
+        set_contains_lease()?,
+        "Нет элемента перед проверкой таймера",
+    )?;
+    tokio::time::sleep(std::time::Duration::from_millis(850)).await;
+    require(!set_contains_lease()?, "Элемент DHCP пережил таймер ядра")?;
+    eprintln!("Элемент DHCP обновлён, отозван и удалён по таймеру ядра");
+
     require(
         Command::new("/usr/bin/systemctl")
-            .args(["start", "yonik-dhcp-fixture-renew.service"])
+            .args(["start", "yonik-dhcp-fixture-change-dns.service"])
             .status()?
             .success(),
-        "Стенд не запросил продление DHCP",
+        "Стенд не сменил DNS DHCP-сервера",
     )?;
+    let mut lease = DhcpNetworkdLease::capture(index, &mut cancel).await?;
+    nft.refresh_dhcp_renewal(&journal, revision, &mut lease, &mut cancel)
+        .await?;
+    let renew = || -> Result {
+        require(
+            Command::new("/usr/bin/networkctl")
+                .args(["renew", "yonik-dhcp"])
+                .status()?
+                .success(),
+            "Не запрошено продление DHCP",
+        )
+    };
+    renew()?;
+    check_dhcp_fixture_dns("10.203.2.2", &mut cancel).await?;
+    eprintln!("Временное разрешение пропустило продление DHCP и обновление DNS");
+    nft.revoke_dhcp_renewal(&journal, revision).await?;
+    renew()?;
 
-    let table = "yonik_0000000000000005";
     let chain = "dhcp_renewal";
     let output = Command::new(nft_test_binary())
         .args(["-a", "list", "chain", "inet", table, chain])
