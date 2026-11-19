@@ -2,7 +2,7 @@ use super::*;
 use crate::helper::dhcp_networkd::{DHCP_PROBE_CONCURRENCY, DHCP_PROBE_TIMEOUT, DhcpNetworkdLease};
 use crate::managed_network::PublicPolicyPhase;
 use crate::managed_network::firewall::{
-    DHCP_CGROUP_PATH, DHCP_RENEWAL_CHAIN, DHCP_RENEWAL_SET, MAX_DHCP_RENEWALS,
+    DHCP_CGROUP_PATH, DHCP_RENEWAL_CHAIN, DHCP_RENEWAL_SET, MAX_DHCP_RENEWALS, RESOLVED_CGROUP_PATH,
 };
 use futures_util::{StreamExt, stream};
 use sha2::{Digest, Sha256};
@@ -124,23 +124,27 @@ fn resolve_nft_ifindex(
     })
 }
 
-fn normalize_dhcp_cgroup(rule: &mut Value, cgroup: NonZeroU64) -> Result<(), NftError> {
+fn is_cgroup_match(entry: &Value) -> bool {
+    entry
+        .pointer("/match/left/socket/key")
+        .and_then(Value::as_str)
+        == Some("cgroupv2")
+}
+
+fn normalize_cgroup(rule: &mut Value, path: &str, cgroup: NonZeroU64) -> Result<(), NftError> {
     let expressions = rule
         .get_mut("expr")
         .and_then(Value::as_array_mut)
         .ok_or(NftError::Evidence)?;
-    let mut matches = expressions.iter_mut().filter(|entry| {
-        entry
-            .pointer("/match/left/socket/key")
-            .and_then(Value::as_str)
-            == Some("cgroupv2")
-    });
+    let mut matches = expressions
+        .iter_mut()
+        .filter(|entry| is_cgroup_match(entry));
     let entry = matches.next().ok_or(NftError::Evidence)?;
     if matches.next().is_some() {
         return Err(NftError::Evidence);
     }
     let right = entry.pointer("/match/right").ok_or(NftError::Evidence)?;
-    if right != DHCP_CGROUP_PATH
+    if right != path
         && right.as_u64() != Some(cgroup.get())
         && right.as_str() != Some(cgroup.to_string().as_str())
     {
@@ -153,7 +157,11 @@ fn normalize_dhcp_cgroup(rule: &mut Value, cgroup: NonZeroU64) -> Result<(), Nft
     if left.remove("level").is_some_and(|value| value != 2) {
         return Err(NftError::Evidence);
     }
-    entry["match"]["right"] = json!(DHCP_CGROUP_PATH);
+    entry["match"]["right"] = if path == RESOLVED_CGROUP_PATH {
+        json!(cgroup)
+    } else {
+        json!(path)
+    };
     Ok(())
 }
 
@@ -193,20 +201,46 @@ fn verify_dhcp_element(
     Ok(())
 }
 
+#[derive(Default, PartialEq, Eq)]
+struct CgroupHandles {
+    dhcp: BTreeSet<NonZeroU64>,
+    resolver_tls: BTreeSet<NonZeroU64>,
+}
+
+fn normalize_policy_rule(
+    rule: &mut Value,
+    policy: &PublicBlockPolicy,
+    resolve: &impl Fn(&str) -> Result<u32, NftError>,
+) -> Result<Option<&'static str>, NftError> {
+    normalize_rule(rule, resolve)?;
+    let (path, identity) = if rule["chain"] == DHCP_RENEWAL_CHAIN {
+        (DHCP_CGROUP_PATH, policy.dhcp_rule_identity())
+    } else if rule["chain"] == "output"
+        && rule["expr"]
+            .as_array()
+            .is_some_and(|expr| expr.iter().any(is_cgroup_match))
+    {
+        (RESOLVED_CGROUP_PATH, policy.resolver_tls_identity())
+    } else {
+        return Ok(None);
+    };
+    normalize_cgroup(rule, path, identity.ok_or(NftError::Evidence)?.1)?;
+    Ok(Some(path))
+}
+
 fn verify_rules(
     bytes: &[u8],
     table: &Table,
     policy: &PublicBlockPolicy,
     resolve: impl Fn(&str) -> Result<u32, NftError>,
-) -> Result<BTreeSet<NonZeroU64>, NftError> {
+) -> Result<CgroupHandles, NftError> {
     if bytes.len() > MAX_OUTPUT {
         return Err(NftError::OutputLimit);
     }
     let listing: Listing = serde_json::from_slice(bytes).map_err(|_| NftError::Evidence)?;
     let mut tables = Vec::new();
     let mut actual = Vec::new();
-    let mut dhcp_handles = BTreeSet::new();
-    let cgroup = policy.dhcp_rule_identity().map(|(_, id)| id);
+    let mut handles = CgroupHandles::default();
     for item in listing.nftables {
         let object = item.as_object().ok_or(NftError::Evidence)?;
         if object.len() != 1 {
@@ -246,12 +280,13 @@ fn verify_rules(
             }
         }
         if kind == "rule" {
-            normalize_rule(&mut data, &resolve)?;
-            if data["chain"] == DHCP_RENEWAL_CHAIN {
-                normalize_dhcp_cgroup(&mut data, cgroup.ok_or(NftError::Evidence)?)?;
-                if !dhcp_handles.insert(handle) {
-                    return Err(NftError::Evidence);
-                }
+            let matched = match normalize_policy_rule(&mut data, policy, &resolve)? {
+                Some(DHCP_CGROUP_PATH) => handles.dhcp.insert(handle),
+                Some(RESOLVED_CGROUP_PATH) => handles.resolver_tls.insert(handle),
+                _ => true,
+            };
+            if !matched {
+                return Err(NftError::Evidence);
             }
         }
         actual.push(json!({kind: data}));
@@ -271,10 +306,7 @@ fn verify_rules(
     for command in policy.commands(&table.name) {
         let mut data = command.get("add").cloned().ok_or(NftError::Evidence)?;
         if let Some(rule) = data.get_mut("rule") {
-            normalize_rule(rule, &resolve)?;
-            if rule["chain"] == DHCP_RENEWAL_CHAIN {
-                normalize_dhcp_cgroup(rule, cgroup.ok_or(NftError::Evidence)?)?;
-            }
+            normalize_policy_rule(rule, policy, &resolve)?;
         }
         expected.push(data);
     }
@@ -302,7 +334,7 @@ fn verify_rules(
     if actual != expected {
         return Err(NftError::Evidence);
     }
-    Ok(dhcp_handles)
+    Ok(handles)
 }
 
 impl NftExecutor {
@@ -380,7 +412,7 @@ impl NftExecutor {
                 text::dhcp_renewal(&table.name, &keys, DHCP_ELEMENT_TIMEOUT.as_millis() as u64)?;
             tokio::time::timeout(
                 DHCP_NFT_BUDGET,
-                self.run_batch(batch, true, false, dhcp_sleep),
+                self.run_batch(batch, true, false, dhcp_sleep, None),
             )
             .await
             .map_err(|_| NftError::Timeout)??;
@@ -397,9 +429,12 @@ impl NftExecutor {
                 .collect();
             if !stale.is_empty() {
                 let delete = text::delete_dhcp_renewals(&table.name, &stale)?;
-                tokio::time::timeout(DHCP_NFT_BUDGET, self.run_batch(delete, true, false, None))
-                    .await
-                    .map_err(|_| NftError::Timeout)??;
+                tokio::time::timeout(
+                    DHCP_NFT_BUDGET,
+                    self.run_batch(delete, true, false, None, None),
+                )
+                .await
+                .map_err(|_| NftError::Timeout)??;
                 cancel.check().map_err(|_| NftError::Evidence)?;
             }
             Ok(keys.len() - stale.len())
@@ -447,6 +482,7 @@ impl NftExecutor {
             text::dhcp_renewal(&table.name, &[], DHCP_ELEMENT_TIMEOUT.as_millis() as u64)?,
             true,
             false,
+            None,
             None,
         )
         .await?;
@@ -515,19 +551,31 @@ impl NftExecutor {
             })
         };
         let handles = verify(&bytes)?;
-        if let Some((namespace, id)) = policy.dhcp_rule_identity() {
-            let (_owner, mut cancel) = crate::Cancellation::new();
-            let (observed, matches) = crate::read_nft_socket_cgroup_matches(
-                &table.name,
+        let mut checked_kernel = false;
+        for (chain, expected, identity) in [
+            (
                 DHCP_RENEWAL_CHAIN,
-                &mut cancel,
-                DEADLINE,
-            )
-            .await
-            .map_err(|_| NftError::Evidence)?;
+                &handles.dhcp,
+                policy.dhcp_rule_identity(),
+            ),
+            (
+                "output",
+                &handles.resolver_tls,
+                policy.resolver_tls_identity(),
+            ),
+        ] {
+            let Some((namespace, id)) = identity else {
+                continue;
+            };
+            checked_kernel = true;
+            let (_owner, mut cancel) = crate::Cancellation::new();
+            let (observed, matches) =
+                crate::read_nft_socket_cgroup_matches(&table.name, chain, &mut cancel, DEADLINE)
+                    .await
+                    .map_err(|_| NftError::Evidence)?;
             if namespace != self.owner.namespace()
                 || namespace != (observed.device, observed.inode)
-                || matches.len() != handles.len()
+                || matches.len() != expected.len()
                 || matches
                     .iter()
                     .any(|rule| rule.level != 2 || rule.cgroup_id != id)
@@ -535,11 +583,13 @@ impl NftExecutor {
                     .iter()
                     .map(|rule| rule.rule_handle)
                     .collect::<BTreeSet<_>>()
-                    != handles
-                || verify(&self.run(Action::ListTable(table)).await?)? != handles
+                    != *expected
             {
                 return Err(NftError::Evidence);
             }
+        }
+        if checked_kernel && verify(&self.run(Action::ListTable(table)).await?)? != handles {
+            return Err(NftError::Evidence);
         }
         Ok(())
     }

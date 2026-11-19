@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fmt,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
 };
 
@@ -18,6 +18,8 @@ pub(super) const DHCP_RENEWAL_CHAIN: &str = "dhcp_renewal";
 pub(super) const DHCP_RENEWAL_SET: &str = "dhcp_renewal_leases";
 pub(super) const DHCP_CGROUP_PATH: &str = "system.slice/systemd-networkd.service";
 pub(crate) const MAX_DHCP_RENEWALS: usize = 8;
+pub(super) const RESOLVED_CGROUP_PATH: &str = "system.slice/systemd-resolved.service";
+const MAX_RESOLVER_TLS_ENDPOINTS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyError {
@@ -361,6 +363,42 @@ pub struct PublicBlockPolicy {
     dhcp_renewal_anchor: bool,
     #[serde(rename = "dhcp_renewal_rule", skip_serializing_if = "Option::is_none")]
     dhcp_renewal_rules: Option<Box<DhcpRules>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolver_tls: Option<Box<ResolverTls>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResolverTls {
+    uid: NonZeroU32,
+    cgroup_id: NonZeroU64,
+    namespace_device: u64,
+    namespace_inode: NonZeroU64,
+    endpoints: Vec<ResolverTlsEndpoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolverTlsEndpoint {
+    peer: SocketAddr,
+    ifindex: NonZeroU32,
+    ifname: InterfaceName,
+}
+
+impl ResolverTlsEndpoint {
+    fn selectors(self) -> Vec<Value> {
+        let ip = self.peer.ip();
+        vec![
+            destination(ip, json!(ip.to_string())),
+            meta("oif", json!(self.ifindex.get())),
+            meta("oifname", json!(String::from(self.ifname))),
+            meta("l4proto", json!("tcp")),
+            compare(
+                json!({"payload":{"protocol":"tcp","field":"dport"}}),
+                json!(self.peer.port()),
+            ),
+        ]
+    }
 }
 
 /// Выделенный 127/8 адрес, доступный через loopback helper UID 0 и одному worker.
@@ -410,6 +448,10 @@ impl PublicBlockPolicy {
             + self.link_control.len() * 3
             + self.isolated_loopback.map_or(0, |_| 6)
             + self.bound_direct.len() * 2
+            + self
+                .resolver_tls
+                .as_ref()
+                .map_or(0, |tls| tls.endpoints.len() * 2)
             + usize::from(self.dhcp_renewal_anchor)
             + self
                 .dhcp_rules()
@@ -481,7 +523,8 @@ impl PublicBlockPolicy {
         .with_isolated_loopback_config(self.isolated_loopback)?
         .with_bound_direct(self.bound_direct.clone())?
         .with_dhcp_renewal_anchor(self.dhcp_renewal_anchor)?
-        .with_dhcp_rule_config(self.dhcp_rules().to_vec())
+        .with_dhcp_rule_config(self.dhcp_rules().to_vec())?
+        .with_resolver_tls(self.resolver_tls.as_deref().cloned())
     }
     pub fn new(
         loopback_ifindex: u32,
@@ -538,6 +581,7 @@ impl PublicBlockPolicy {
             isolated_loopback: None,
             dhcp_renewal_anchor: false,
             dhcp_renewal_rules: None,
+            resolver_tls: None,
         })
     }
 
@@ -728,11 +772,84 @@ impl PublicBlockPolicy {
     }
 
     /// Отпечаток канонических правил не зависит от имени принадлежащей helper таблицы.
+    pub(crate) fn with_resolver_tls(
+        mut self,
+        mut tls: Option<ResolverTls>,
+    ) -> Result<Self, PolicyError> {
+        if let Some(tls) = &mut tls {
+            if tls.endpoints.is_empty() || tls.endpoints.len() > MAX_RESOLVER_TLS_ENDPOINTS {
+                return Err(PolicyError::Limit);
+            }
+            if self.tun_ifindex.is_none() || tls.uid.get() == u32::MAX {
+                return Err(PolicyError::Interface);
+            }
+            tls.endpoints.sort_unstable();
+            tls.endpoints.dedup();
+            for endpoint in &tls.endpoints {
+                let name = String::from(endpoint.ifname);
+                if endpoint.ifindex == self.loopback_ifindex
+                    || Some(endpoint.ifindex) == self.tun_ifindex
+                    || name == "lo"
+                    || !name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+                {
+                    return Err(PolicyError::Interface);
+                }
+                let address = endpoint.peer.ip();
+                if endpoint.peer.port() == 0 {
+                    return Err(PolicyError::Port);
+                }
+                if address.is_unspecified()
+                    || address.is_loopback()
+                    || address.is_multicast()
+                    || match endpoint.peer {
+                        SocketAddr::V4(addr) => {
+                            addr.ip().is_broadcast() || addr.ip().is_link_local()
+                        }
+                        SocketAddr::V6(addr) => {
+                            addr.scope_id() != 0
+                                || addr.flowinfo() != 0
+                                || addr.ip().is_unicast_link_local()
+                                || addr.ip().to_ipv4().is_some()
+                        }
+                    }
+                    || self
+                        .private_routes
+                        .iter()
+                        .any(|route| route.prefix.contains(address))
+                {
+                    return Err(PolicyError::PrivateTransport);
+                }
+            }
+        }
+        self.resolver_tls = tls.map(Box::new);
+        if self.exception_count() > MAX_EXCEPTIONS {
+            return Err(PolicyError::Limit);
+        }
+        Ok(self)
+    }
+
+    pub(super) fn resolver_tls_identity(&self) -> Option<((u64, u64), NonZeroU64)> {
+        self.resolver_tls.as_ref().map(|tls| {
+            (
+                (tls.namespace_device, tls.namespace_inode.get()),
+                tls.cgroup_id,
+            )
+        })
+    }
+
     pub fn digest(&self) -> [u8; 32] {
         // Value сериализуется однозначно; здесь не бывает пользовательских map/чисел float.
         let mut hash = Sha256::new();
         hash.update(Value::Array(self.commands("policy")).to_string().as_bytes());
         if let Some(((device, inode), cgroup)) = self.dhcp_rule_identity() {
+            hash.update(device.to_le_bytes());
+            hash.update(inode.to_le_bytes());
+            hash.update(cgroup.get().to_le_bytes());
+        }
+        if let Some(((device, inode), cgroup)) = self.resolver_tls_identity() {
+            hash.update(b"resolver-tls\0");
             hash.update(device.to_le_bytes());
             hash.update(inode.to_le_bytes());
             hash.update(cgroup.get().to_le_bytes());
@@ -842,6 +959,25 @@ impl PublicBlockPolicy {
                     json!({"accept": null}),
                 ],
             ));
+        }
+        if let Some(tls) = &self.resolver_tls {
+            for endpoint in &tls.endpoints {
+                let selectors = endpoint.selectors();
+                let mut allow = selectors.clone();
+                allow.extend([
+                    meta("skuid", json!(tls.uid)),
+                    meta("mark", json!(0)),
+                    compare(
+                        json!({"socket":{"key":"cgroupv2","level":2}}),
+                        json!(tls.cgroup_id),
+                    ),
+                    json!({"accept":null}),
+                ]);
+                commands.push(rule(table_name, allow));
+                let mut deny = selectors;
+                deny.push(json!({"drop":null}));
+                commands.push(rule(table_name, deny));
+            }
         }
         for route in &self.private_routes {
             if let Some(ifindex) = route.vpn_ifindex {
@@ -1021,6 +1157,8 @@ struct PublicBlockPolicyDto {
     dhcp_renewal_anchor: bool,
     #[serde(default)]
     dhcp_renewal_rule: Option<DhcpRulesDto>,
+    #[serde(default)]
+    resolver_tls: Option<ResolverTls>,
 }
 impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
     type Error = PolicyError;
@@ -1041,7 +1179,8 @@ impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
             None => Vec::new(),
             Some(DhcpRulesDto::Single(rule)) => vec![rule],
             Some(DhcpRulesDto::Multiple(rules)) => rules,
-        })
+        })?
+        .with_resolver_tls(value.resolver_tls)
     }
 }
 

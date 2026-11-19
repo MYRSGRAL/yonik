@@ -38,6 +38,126 @@ fn check(value: &Value, table: &Table, policy: &PublicBlockPolicy) -> Result<(),
 }
 
 #[test]
+fn правило_dot_проверяет_cgroup_и_защищает_физический_сокет() {
+    let base = PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap();
+    let mut wire = serde_json::to_value(&base).unwrap();
+    wire["resolver_tls"] = json!({
+        "uid": 991, "cgroup_id": 2500, "namespace_device": 3, "namespace_inode": 11,
+        "endpoints": [{"peer": "192.0.2.53:1853", "ifindex": 7, "ifname": "test-dhcp"}],
+    });
+    let active: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    assert_ne!(base.digest(), active.digest());
+    assert_eq!(active.with_additional_transport(&[]).unwrap(), active);
+    let table = block_table(owner(), 2, 5, &active);
+    let request = request(Action::InstallBlock(&table, &active));
+    let commands = request["nftables"].as_array().unwrap();
+    assert_eq!(text::render(commands, None), Err(NftError::Evidence));
+    let script = String::from_utf8(text::render(commands, Some((2500, 9))).unwrap()).unwrap();
+    assert!(script.contains(
+        "meta skuid 991 meta mark 0 socket cgroupv2 level 2 \"../../../proc/self/fd/9\" accept"
+    ));
+    let mut observed = listing(&table, &active);
+    assert_eq!(check(&observed, &table, &active), Ok(()));
+    let rules = observed["nftables"].as_array_mut().unwrap();
+    let position = rules
+        .iter()
+        .position(|rule| {
+            rule["rule"]["expr"].as_array().is_some_and(|expr| {
+                expr.iter()
+                    .any(|entry| entry.pointer("/match/left/socket").is_some())
+            })
+        })
+        .unwrap();
+    let guard = &rules[position + 1]["rule"]["expr"];
+    assert_eq!(
+        guard.as_array().unwrap().last(),
+        Some(&json!({"drop":null}))
+    );
+    let expr = rules[position]["rule"]["expr"].as_array_mut().unwrap();
+    let socket = expr
+        .iter_mut()
+        .find(|entry| entry.pointer("/match/left/socket").is_some())
+        .unwrap();
+    socket["match"]["right"] = json!(2501);
+    assert_eq!(check(&observed, &table, &active), Err(NftError::Evidence));
+    wire["resolver_tls"]["endpoints"][0]["ifindex"] = json!(8);
+    assert!(serde_json::from_value::<PublicBlockPolicy>(wire).is_err());
+}
+
+#[tokio::test]
+#[ignore = "Требует изолированную network namespace и cgroup службы resolved"]
+async fn ядро_nft_подтверждает_точную_cgroup_dot() {
+    use std::os::unix::fs::MetadataExt;
+
+    let netns = File::open("/proc/thread-self/ns/net").unwrap();
+    let (device, inode) = namespace(&netns).unwrap();
+    let host = std::env::var("YONIK_NFT_TEST_HOST_NETNS").unwrap();
+    assert_ne!(host, format!("{device}:{inode}"));
+    let owner = Ownership::new(1000, 7, 9, device, inode).unwrap();
+    let mut executor = NftExecutor::open(owner).unwrap();
+    let socket = rustix::net::socket(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        None,
+    )
+    .unwrap();
+    let index = |name| rustix::net::netdevice::name_to_index(&socket, name).unwrap();
+    let id = std::fs::metadata(format!("/sys/fs/cgroup/{RESOLVED_CGROUP_PATH}"))
+        .unwrap()
+        .ino();
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(
+            index("lo"),
+            Some(index("dottun0")),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    wire["resolver_tls"] = json!({
+        "uid": 991, "cgroup_id": id, "namespace_device": device, "namespace_inode": inode,
+        "endpoints": [
+            {"peer": "192.0.2.53:1853", "ifindex": index("dottest0"), "ifname": "dottest0"},
+            {"peer": "[2001:db8::53]:853", "ifindex": index("dottest0"), "ifname": "dottest0"}
+        ],
+    });
+    let policy: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    let path = std::env::temp_dir().join(format!("yonik-dot-nft-{}", std::process::id()));
+    let mut journal = Journal::open(&path, owner).unwrap();
+    executor
+        .ensure_public_block(&mut journal, 2, 5, &policy)
+        .await
+        .unwrap();
+    let table = block_table(owner, 2, 5, &policy);
+    let (_operation, mut cancel) = crate::Cancellation::new();
+    let (_, observed) =
+        crate::read_nft_socket_cgroup_matches(&table.name, "output", &mut cancel, DEADLINE)
+            .await
+            .unwrap();
+    assert_eq!(observed.len(), 2);
+    assert!(
+        observed
+            .iter()
+            .all(|entry| entry.cgroup_id.get() == id && entry.level == 2)
+    );
+    wire["resolver_tls"]["cgroup_id"] = json!(id ^ 1);
+    let wrong = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        executor.verify_public_block(&table, &wrong).await,
+        Err(NftError::Evidence)
+    );
+    executor
+        .remove_public_block(&mut journal, 2, &policy)
+        .await
+        .unwrap();
+    drop(journal);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn dhcp_anchor_is_inert_and_rejects_unexpected_kernel_contents() {
     let prefix = IpPrefix::new("192.0.2.0".parse().expect("Префикс"), 24).expect("CIDR");
     let route = PrivateRoute::new(prefix, None).expect("Защита приватной сети");

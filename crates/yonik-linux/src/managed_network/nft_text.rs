@@ -15,6 +15,7 @@ const DHCP_KEY_TYPES: [&str; 4] = ["ipv4_addr", "ipv4_addr", "iface_index", "ifn
 const DHCP_KEY_FIELDS: [&str; 4] = ["ip saddr", "ip daddr", "meta oif", "meta oifname"];
 
 type Result<T> = std::result::Result<T, NftError>;
+type ResolverCgroup = (u64, std::os::fd::RawFd);
 
 pub(super) fn dhcp_renewal(
     table: &str,
@@ -56,13 +57,13 @@ fn dhcp_element_key(key: &DhcpRenewalKey) -> Result<String> {
     ))
 }
 
-pub(super) fn render(commands: &[Value]) -> Result<Vec<u8>> {
+pub(super) fn render(commands: &[Value], resolver: Option<ResolverCgroup>) -> Result<Vec<u8>> {
     if commands.is_empty() || commands.len() > MAX_COMMANDS {
         return Err(NftError::Invalid);
     }
     let mut script = String::new();
     for command in commands {
-        render_command(&mut script, command)?;
+        render_command(&mut script, command, resolver)?;
         if script.len() > MAX_OUTPUT {
             return Err(NftError::Invalid);
         }
@@ -70,7 +71,11 @@ pub(super) fn render(commands: &[Value]) -> Result<Vec<u8>> {
     Ok(script.into_bytes())
 }
 
-fn render_command(script: &mut String, command: &Value) -> Result<()> {
+fn render_command(
+    script: &mut String,
+    command: &Value,
+    resolver: Option<ResolverCgroup>,
+) -> Result<()> {
     let (action, body) = single(command)?;
     let (kind, fields) = single(body)?;
     match (action, kind) {
@@ -138,12 +143,16 @@ fn render_command(script: &mut String, command: &Value) -> Result<()> {
                 "add set inet {table} {DHCP_SET} {{ type ipv4_addr . ipv4_addr . iface_index . ifname; flags timeout; size 16; }}"
             ))
         }
-        ("add", "rule") => render_rule(script, fields),
+        ("add", "rule") => render_rule(script, fields, resolver),
         _ => Err(NftError::Invalid),
     }
 }
 
-fn render_rule(script: &mut String, fields: &Value) -> Result<()> {
+fn render_rule(
+    script: &mut String,
+    fields: &Value,
+    resolver: Option<ResolverCgroup>,
+) -> Result<()> {
     let [family, table, chain, expr] = exact(fields, ["family", "table", "chain", "expr"])?;
     let chain = text(chain)?;
     require(text(family)? == "inet" && matches!(chain, "output" | DHCP_CHAIN))?;
@@ -168,6 +177,14 @@ fn render_rule(script: &mut String, fields: &Value) -> Result<()> {
     } else {
         require((action == "jump") == matches.is_empty())?;
     }
+    let dot = chain == "output"
+        && matches
+            .iter()
+            .any(|expr| expr.pointer("/match/left/socket").is_some());
+    if dot {
+        require(verdict == "accept")?;
+        require_dot_selectors(matches)?;
+    }
     write_fmt(write!(script, "add rule inet {table} {chain}"))?;
     for expr in matches {
         let ("match", fields) = single(expr)? else {
@@ -176,10 +193,10 @@ fn render_rule(script: &mut String, fields: &Value) -> Result<()> {
         if chain == "output" {
             let [_, left, _] = exact(fields, ["op", "left", "right"])?;
             let (kind, _) = single(left)?;
-            require(!matches!(kind, "socket" | "concat"))?;
+            require(kind != "concat" && (dot || kind != "socket"))?;
         }
         script.push(' ');
-        render_match(script, fields)?;
+        render_match(script, fields, resolver)?;
     }
     write_fmt(writeln!(script, " {verdict}"))
 }
@@ -216,13 +233,70 @@ fn require_dhcp_selectors(expressions: &[Value]) -> Result<()> {
             "ip saddr" | "ip daddr" => right.is_string(),
             "udp sport" => right.as_u64() == Some(68),
             "udp dport" => right.as_u64() == Some(67),
+            "socket" => right.as_str() == Some(DHCP_CGROUP),
             _ => true,
         })?;
     }
     Ok(())
 }
 
-fn render_match(script: &mut String, fields: &Value) -> Result<()> {
+fn require_dot_selectors(expressions: &[Value]) -> Result<()> {
+    let [family, destination, matches @ .., socket] = expressions else {
+        return Err(NftError::Invalid);
+    };
+    let ("match", fields) = single(destination)? else {
+        return Err(NftError::Invalid);
+    };
+    let [op, left, right] = exact(fields, ["op", "left", "right"])?;
+    let protocol = match selector(left)? {
+        "ip daddr" => "ipv4",
+        "ip6 daddr" => "ipv6",
+        _ => return Err(NftError::Invalid),
+    };
+    require(text(op)? == "==" && right.is_string())?;
+    let ("match", fields) = single(family)? else {
+        return Err(NftError::Invalid);
+    };
+    let [op, left, right] = exact(fields, ["op", "left", "right"])?;
+    require(
+        text(op)? == "==" && selector(left)? == "meta nfproto" && right.as_str() == Some(protocol),
+    )?;
+    let expected = [
+        "meta oif",
+        "meta oifname",
+        "meta l4proto",
+        "tcp dport",
+        "meta skuid",
+        "meta mark",
+    ];
+    require(matches.len() == expected.len())?;
+    for (expr, expected) in matches.iter().zip(expected) {
+        let ("match", fields) = single(expr)? else {
+            return Err(NftError::Invalid);
+        };
+        let [op, left, right] = exact(fields, ["op", "left", "right"])?;
+        require(text(op)? == "==" && selector(left)? == expected)?;
+        require(match expected {
+            "meta l4proto" => right.as_str() == Some("tcp"),
+            "meta skuid" => right
+                .as_u64()
+                .is_some_and(|uid| (1..u64::from(u32::MAX)).contains(&uid)),
+            "meta mark" => right.as_u64() == Some(0),
+            _ => true,
+        })?;
+    }
+    let ("match", fields) = single(socket)? else {
+        return Err(NftError::Invalid);
+    };
+    let [_, left, right] = exact(fields, ["op", "left", "right"])?;
+    require(single(left)?.0 == "socket" && right.as_u64().is_some_and(|id| id != 0))
+}
+
+fn render_match(
+    script: &mut String,
+    fields: &Value,
+    resolver: Option<ResolverCgroup>,
+) -> Result<()> {
     let [op, left, right] = exact(fields, ["op", "left", "right"])?;
     let op = text(op)?;
     require(matches!(op, "==" | "!="))?;
@@ -230,12 +304,24 @@ fn render_match(script: &mut String, fields: &Value) -> Result<()> {
     match kind {
         "socket" => {
             let [name, level] = exact(data, ["key", "level"])?;
-            require(op == "==" && text(name)? == "cgroupv2" && text(right)? == DHCP_CGROUP)?;
+            require(op == "==" && text(name)? == "cgroupv2")?;
             let level = number(level, 2, 2)?;
-            return write_fmt(write!(
-                script,
-                "socket cgroupv2 level {level} \"{DHCP_CGROUP}\""
-            ));
+            return if right.as_str() == Some(DHCP_CGROUP) {
+                write_fmt(write!(
+                    script,
+                    "socket cgroupv2 level {level} \"{DHCP_CGROUP}\""
+                ))
+            } else {
+                let id = number(right, 1, u64::MAX)?;
+                let (expected, fd) = resolver.ok_or(NftError::Evidence)?;
+                require(id == expected && fd >= 3)?;
+                // Старый nft принимает только путь относительно /sys/fs/cgroup.
+                // Этот путь открывает удерживаемый inode даже после замены каталога службы.
+                write_fmt(write!(
+                    script,
+                    "socket cgroupv2 level {level} \"../../../proc/self/fd/{fd}\""
+                ))
+            };
         }
         "concat" => {
             let concat = data.as_array().ok_or(NftError::Invalid)?;
@@ -555,8 +641,8 @@ mod tests {
             ),
             child_rule(),
         ];
-        let script =
-            String::from_utf8(render(&commands).expect("Точная транзакция")).expect("Текст nft");
+        let script = String::from_utf8(render(&commands, None).expect("Точная транзакция"))
+            .expect("Текст nft");
         assert_eq!(
             script,
             format!(
@@ -610,22 +696,22 @@ mod tests {
             rule("output", vec![json!({"jump":{"target":"other"}})]),
         ];
         for command in cases {
-            assert_eq!(render(&[command]), Err(NftError::Invalid));
+            assert_eq!(render(&[command], None), Err(NftError::Invalid));
         }
         let mut child = child_rule();
         child["add"]["rule"]["expr"][10]["match"]["left"]["socket"]["level"] = json!(3);
-        assert_eq!(render(&[child]), Err(NftError::Invalid));
+        assert_eq!(render(&[child], None), Err(NftError::Invalid));
         let mut child = child_rule();
         child["add"]["rule"]["expr"][11]["match"]["right"] = json!("@different_set");
-        assert_eq!(render(&[child]), Err(NftError::Invalid));
+        assert_eq!(render(&[child], None), Err(NftError::Invalid));
         let mut child = child_rule();
         child["add"]["rule"]["expr"][6]["match"]["right"] = json!(69);
-        assert_eq!(render(&[child]), Err(NftError::Invalid));
+        assert_eq!(render(&[child], None), Err(NftError::Invalid));
         let mut child = child_rule();
         child["add"]["rule"]["expr"]
             .as_array_mut()
             .expect("Правило")
             .remove(11);
-        assert_eq!(render(&[child]), Err(NftError::Invalid));
+        assert_eq!(render(&[child], None), Err(NftError::Invalid));
     }
 }

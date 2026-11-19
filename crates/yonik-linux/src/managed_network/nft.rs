@@ -3,12 +3,22 @@
 use super::{
     Journal, JournalError, NftFamily, Ownership, Reconciled, RecordState, Resource, Scope,
 };
-use super::{executable::NetworkTool, firewall::PublicBlockPolicy};
+use super::{
+    executable::NetworkTool,
+    firewall::{PublicBlockPolicy, RESOLVED_CGROUP_PATH},
+};
 use crate::helper::dhcp_sleep::DhcpSleepTicket;
 use rustix::fs;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{fmt, fs::File, os::fd::AsRawFd, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    fs::File,
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
@@ -228,19 +238,53 @@ impl NftExecutor {
     }
     async fn run(&mut self, action: Action<'_>) -> Result<Vec<u8>, NftError> {
         let check_only = matches!(&action, Action::CheckBlock(..));
-        let text_input = match &action {
+        let policy = match &action {
             Action::InstallBlock(_, policy)
             | Action::CheckBlock(_, policy)
-            | Action::ReplaceBlock(_, _, _, policy) => policy.dhcp_rule_identity().is_some(),
-            _ => false,
+            | Action::ReplaceBlock(_, _, _, policy) => Some(*policy),
+            _ => None,
         };
+        let resolver = policy.and_then(PublicBlockPolicy::resolver_tls_identity);
+        let pinned_cgroup = if let Some((namespace, id)) = resolver {
+            if namespace != self.owner.namespace() {
+                return Err(NftError::Namespace);
+            }
+            let file = File::from(
+                fs::open(
+                    format!("/sys/fs/cgroup/{RESOLVED_CGROUP_PATH}"),
+                    fs::OFlags::PATH
+                        | fs::OFlags::DIRECTORY
+                        | fs::OFlags::NOFOLLOW
+                        | fs::OFlags::CLOEXEC,
+                    fs::Mode::empty(),
+                )
+                .map_err(|_| NftError::Evidence)?,
+            );
+            if file.metadata().map_err(|_| NftError::Evidence)?.ino() != id.get()
+                || fs::fstatfs(&file).map_err(|_| NftError::Evidence)?.f_type as u64 != 0x6367_7270
+            {
+                return Err(NftError::Evidence);
+            }
+            Some(file)
+        } else {
+            None
+        };
+        let text_input = pinned_cgroup.is_some()
+            || policy.is_some_and(|policy| policy.dhcp_rule_identity().is_some());
         let request = request(action);
         let bytes = if text_input {
-            text::render(request["nftables"].as_array().ok_or(NftError::Invalid)?)?
+            let anchor = resolver
+                .zip(pinned_cgroup.as_ref())
+                .map(|((_, id), file)| (id.get(), file.as_raw_fd()));
+            text::render(
+                request["nftables"].as_array().ok_or(NftError::Invalid)?,
+                anchor,
+            )?
         } else {
             serde_json::to_vec(&request).map_err(|_| NftError::Invalid)?
         };
-        self.run_batch(bytes, text_input, check_only, None).await
+        self.run_batch(bytes, text_input, check_only, None, pinned_cgroup)
+            .await
     }
 
     async fn run_batch(
@@ -249,6 +293,7 @@ impl NftExecutor {
         text_input: bool,
         check_only: bool,
         dhcp_sleep: Option<&DhcpSleepTicket>,
+        pinned_cgroup: Option<File>,
     ) -> Result<Vec<u8>, NftError> {
         if bytes.len() > MAX_OUTPUT {
             return Err(NftError::Invalid);
@@ -271,6 +316,13 @@ impl NftExecutor {
             DEADLINE
         };
         let mut command = Command::new(format!("/proc/self/fd/{}", self.executable.as_raw_fd()));
+        if let Some(directory) = pinned_cgroup {
+            yonik_nsfs::nft_cgroup_fd::install_nft_cgroup_fd(
+                command.as_std_mut(),
+                directory.into(),
+            )
+            .map_err(|_| NftError::Io)?;
+        }
         command.arg("-n");
         if !text_input {
             command.arg("-j");
@@ -288,6 +340,7 @@ impl NftExecutor {
             .kill_on_drop(true)
             .spawn()
             .map_err(|_| NftError::Io)?;
+        drop(command);
         own_child(child, bytes, gate, global, dhcp_write, deadline)?
             .wait()
             .await

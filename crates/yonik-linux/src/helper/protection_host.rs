@@ -112,7 +112,7 @@ enum Operation {
     PrepareProfile(u32, Box<super::service::SystemProfileRequest>),
     PrepareFullProfile(u32, Box<super::profile_intent::FullProfileRequest>),
     PrepareBundle(u32, Box<super::service::SystemBundleRequest>),
-    Apply(u32, GuardPlan, NetworkStamp),
+    Apply(u32, Box<GuardPlan>, NetworkStamp),
     ApplyProfile(
         u32,
         Arc<SessionArtifact>,
@@ -760,7 +760,10 @@ impl ProtectionHost for SystemProtectionHost {
         let plan: GuardPlan =
             serde_json::from_slice(&artifact.bytes).map_err(|_| ServiceError::InvalidRequest)?;
         match self
-            .job(Operation::Apply(uid, plan, artifact.stamp), cancel)
+            .job(
+                Operation::Apply(uid, Box::new(plan), artifact.stamp),
+                cancel,
+            )
             .await?
         {
             Reply::State(state) => Ok(state),
