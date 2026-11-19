@@ -719,6 +719,10 @@ async fn cancelled_cleanup_retains_transfer_until_recovery_waits_for_it() {
                 pid: 42,
                 status: WorkerStatus::Accepted,
             },
+            WorkerTicket {
+                pid: 42,
+                invocation: [3; 16],
+            },
             None,
         ))
     }));

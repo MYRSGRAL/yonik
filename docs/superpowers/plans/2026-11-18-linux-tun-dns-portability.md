@@ -671,9 +671,15 @@ IPv4-сценарий с теми же проверками прошёл пов�
   cgroup и capabilities до передачи конфигурации. Для Xray и sing-box
   TCP-запрос через TUN получил ответ от локального SOCKS-сервера, счётчики
   RX и TX интерфейса выросли. После `cgroup.kill` стенд подтвердил выход
-  ядра и пустоту cgroup перед удалением интерфейса. Для приёмки OpenRC/runit
-  остаются подключение launcher к helper, проверка полного sandbox и
-  прогоны системного TUN и Fake DNS в обеих init-средах.
+  ядра и пустоту cgroup перед удалением интерфейса. Штатная передача FD
+  в systemd Check и Run теперь проверяет pidfd, время запуска, UID/GID
+  и cgroup перед отправкой, отклоняет завершившийся процесс и сверяет
+  PID в ACK. Run сохраняет исходный InvocationID до подтверждения.
+  Этот код передачи использует и автономный стенд. В Debian и Fedora
+  RPM с SELinux Enforcing штатные TUN и Fake DNS прошли с Xray и sing-box
+  при неизменном `/etc/resolv.conf`. Для приёмки OpenRC/runit остаются
+  подключение launcher к helper, проверка полного sandbox и прогоны
+  системного TUN и Fake DNS в обеих init-средах.
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
   `Unavailable` до запуска ядра. Политики Fedora 45.23 и 45.24 отклонили

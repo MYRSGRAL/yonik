@@ -1,15 +1,18 @@
 //! Проверка установленных Check и Run вне socket-активации systemd.
 
 use super::{WorkerCgroups, WorkerMode, WorkerPayload, WorkerStatus, require_cgroup_fixture_vm};
-use crate::helper::TrustedRegistry;
-use rustix::process::{Pid, PidfdFlags, pidfd_open};
+use crate::helper::{
+    TrustedRegistry,
+    worker_identity::{WorkerCredentials, WorkerProcess},
+};
+use crate::worker::WorkerAck;
 use std::{
     fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     num::NonZeroU16,
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::OwnedFd,
         unix::{
             fs::{DirBuilderExt, MetadataExt},
             net::{UnixListener, UnixStream},
@@ -128,10 +131,10 @@ impl Fixture {
         self.socket_dir.join("worker.sock")
     }
 
-    fn await_image(&mut self, image: (u64, u64)) -> (u32, OwnedFd) {
+    fn await_image(&mut self, image: (u64, u64)) -> WorkerProcess {
         let child = self.child.as_mut().unwrap();
         let pid = child.id();
-        let pidfd = pidfd_open(Pid::from_raw(pid as i32).unwrap(), PidfdFlags::empty()).unwrap();
+        let process = WorkerProcess::capture(pid).unwrap();
         let deadline = Instant::now() + LIMIT;
         while inode(format!("/proc/{pid}/exe")).ok() != Some(image) {
             assert!(
@@ -140,18 +143,36 @@ impl Fixture {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        (pid, pidfd)
+        process
     }
 
     fn verify(
         &self,
-        pid: u32,
-        pidfd: &OwnedFd,
+        process: &WorkerProcess,
         image: (u64, u64),
-        uid: u32,
-        gid: u32,
+        credentials: WorkerCredentials,
     ) -> io::Result<()> {
-        verify_worker(self.mode, &self.root, (uid, gid), pid, pidfd, image)
+        verify_worker(self.mode, &self.root, credentials, process, image)
+    }
+
+    fn send(
+        &self,
+        process: &WorkerProcess,
+        payload: &WorkerPayload,
+        credentials: WorkerCredentials,
+    ) -> WorkerAck {
+        let stream = UnixStream::connect(self.socket()).unwrap();
+        process
+            .transfer(
+                credentials,
+                &format!("/{}/{}", self.root, group(self.mode)),
+                || {
+                    payload
+                        .send(&stream, self.mode)
+                        .map_err(|_| super::WorkerSupervisorError::Protocol)
+                },
+            )
+            .unwrap()
     }
 
     fn wait_for_exit(&mut self) -> std::process::ExitStatus {
@@ -194,34 +215,21 @@ fn field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-fn has_ids(status: &str, name: &str, expected: u32) -> bool {
-    field(status, name).is_some_and(|value| {
-        value
-            .split_whitespace()
-            .map(|id| id.parse::<u32>().ok())
-            .eq([Some(expected); 4])
-    })
-}
-
 fn verify_worker(
     mode: WorkerMode,
     root: &str,
-    (uid, gid): (u32, u32),
-    pid: u32,
-    pidfd: &OwnedFd,
+    credentials: WorkerCredentials,
+    process: &WorkerProcess,
     image: (u64, u64),
 ) -> io::Result<()> {
-    let process = PathBuf::from(format!("/proc/{pid}"));
-    let descriptor = fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?;
+    process
+        .verify(credentials, &format!("/{root}/{}", group(mode)))
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+    let process = PathBuf::from(format!("/proc/{}", process.pid));
     let status = fs::read_to_string(process.join("status"))?;
-    let member = fs::read_to_string(process.join("cgroup"))?;
     let check = mode == WorkerMode::Check;
     let capabilities = if check { 0 } else { 1 << 12 };
-    if field(&descriptor, "Pid:").and_then(|pid| pid.parse().ok()) != Some(pid)
-        || inode(process.join("exe"))? != image
-        || member != format!("0::/{root}/{}\n", group(mode))
-        || !has_ids(&status, "Uid:", uid)
-        || !has_ids(&status, "Gid:", gid)
+    if inode(process.join("exe"))? != image
         || field(&status, "Groups:") != Some("")
         || field(&status, "NoNewPrivs:") != Some("1")
         || ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"]
@@ -259,8 +267,10 @@ fn installed_id(option: &str) -> u32 {
 #[ignore = "Только одноразовая QEMU VM, установленный worker и доверенные ядра"]
 fn installed_standalone_check_on_both_engines() {
     require_cgroup_fixture_vm();
-    let uid = installed_id("-u");
-    let gid = installed_id("-g");
+    let credentials = WorkerCredentials {
+        uid: installed_id("-u"),
+        gid: installed_id("-g"),
+    };
     let image = inode(IMAGE).unwrap();
     let wrong_image = inode("/usr/bin/sleep").unwrap();
     let registry = TrustedRegistry::system().unwrap();
@@ -271,11 +281,11 @@ fn installed_standalone_check_on_both_engines() {
 
     for engine in [yonik_engine::Engine::Xray, yonik_engine::Engine::SingBox] {
         let mut fixture = Fixture::start(WorkerMode::Check);
-        let (pid, pidfd) = fixture.await_image(image);
-        fixture.verify(pid, &pidfd, image, uid, gid).unwrap();
+        let process = fixture.await_image(image);
+        fixture.verify(&process, image, credentials).unwrap();
         assert_eq!(
             fixture
-                .verify(pid, &pidfd, wrong_image, uid, gid)
+                .verify(&process, wrong_image, credentials)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
@@ -283,9 +293,8 @@ fn installed_standalone_check_on_both_engines() {
         let config =
             yonik_engine::compile(&server, engine, NonZeroU16::new(10808).unwrap()).unwrap();
         let payload = WorkerPayload::new(registry.snapshot(engine).unwrap(), config).unwrap();
-        let stream = UnixStream::connect(fixture.socket()).unwrap();
-        let ack = payload.send(&stream, WorkerMode::Check).unwrap();
-        assert_eq!((ack.pid, ack.status), (pid, WorkerStatus::Checked));
+        let ack = fixture.send(&process, &payload, credentials);
+        assert_eq!((ack.pid, ack.status), (process.pid, WorkerStatus::Checked));
         assert!(fixture.wait_for_exit().success());
         assert!(
             WorkerCgroups::open(&fixture.root)
@@ -363,8 +372,10 @@ fn installed_standalone_run_passes_tcp_through_tun_on_both_engines() {
     require_cgroup_fixture_vm();
     require_private_network();
     require_ip(&["link", "set", "lo", "up"]);
-    let uid = installed_id("-u");
-    let gid = installed_id("-g");
+    let credentials = WorkerCredentials {
+        uid: installed_id("-u"),
+        gid: installed_id("-g"),
+    };
     let image = inode(IMAGE).unwrap();
     let registry = TrustedRegistry::system().unwrap();
     let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
@@ -395,24 +406,22 @@ fn installed_standalone_run_passes_tcp_through_tun_on_both_engines() {
             compile_system(&server, engine, NonZeroU16::new(10808).unwrap(), &tun).unwrap();
         let payload = WorkerPayload::new(registry.snapshot(engine).unwrap(), config).unwrap();
         let mut fixture = Fixture::start(WorkerMode::Run);
-        let (pid, pidfd) = fixture.await_image(image);
-        fixture.verify(pid, &pidfd, image, uid, gid).unwrap();
+        let process = fixture.await_image(image);
+        fixture.verify(&process, image, credentials).unwrap();
         assert_eq!(
             verify_worker(
                 WorkerMode::Check,
                 &fixture.root,
-                (uid, gid),
-                pid,
-                &pidfd,
+                credentials,
+                &process,
                 image
             )
             .unwrap_err()
             .kind(),
             io::ErrorKind::PermissionDenied
         );
-        let stream = UnixStream::connect(fixture.socket()).unwrap();
-        let ack = payload.send(&stream, WorkerMode::Run).unwrap();
-        assert_eq!((ack.pid, ack.status), (pid, WorkerStatus::Accepted));
+        let ack = fixture.send(&process, &payload, credentials);
+        assert_eq!((ack.pid, ack.status), (process.pid, WorkerStatus::Accepted));
         let deadline = Instant::now() + LIMIT;
         while TcpStream::connect_timeout(&local, Duration::from_millis(100)).is_err() {
             assert!(
