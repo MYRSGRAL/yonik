@@ -212,8 +212,12 @@ fn decode_plain_fallback(
     let plain = rows
         .into_iter()
         .filter_map(|(index, family, address, port, name)| {
-            (index == 0 && matches!(port, 0 | 53) && name.is_empty())
-                .then_some((index, family, address))
+            // Вызывающий код уже подтвердил DNSOverTLS=no. Имя сертификата
+            // из штатного списка resolved тогда не меняет транспорт и порт.
+            (index == 0
+                && matches!(port, 0 | 53)
+                && (name.is_empty() || (name != "." && valid_domain(&name))))
+            .then_some((index, family, address))
         })
         .collect();
     Ok(decode(plain, Vec::new())?.endpoints)
@@ -1078,6 +1082,7 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
                 IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)),
                 IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12)),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 14)),
             ]
         );
         assert!(snapshot.config.domains.is_empty());
