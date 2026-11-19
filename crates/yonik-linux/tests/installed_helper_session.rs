@@ -497,6 +497,13 @@ async fn production_helper_fake_dns_after_resolver_revert() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "выделенная VM с активным systemd-resolved и постоянным DNS-стендом"]
+async fn production_helper_fake_dns_after_resolver_restart() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::ResolverRestart).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная Debian VM с tools/fixtures/wireguard_vm.py и wg"]
 async fn production_helper_fake_dns_preserves_external_wireguard() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::WireGuard).await
@@ -970,6 +977,7 @@ async fn dhcp_networkd_lease_is_bound_to_kernel_socket_and_revoked_after_renewal
 enum FakeDnsNetworkChange {
     PeerRoute,
     ResolverLink,
+    ResolverRestart,
     WireGuard,
     NetworkManagerDns,
     Resolvconf {
@@ -1143,6 +1151,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         match change {
             FakeDnsNetworkChange::PeerRoute => change_fixture_peer_route("add")?,
             FakeDnsNetworkChange::ResolverLink => revoke_fixture_link_dns(&mut token).await?,
+            FakeDnsNetworkChange::ResolverRestart => restart_fixture_resolver(&connection).await?,
             FakeDnsNetworkChange::WireGuard => control_fixture_wireguard("connect")?,
             FakeDnsNetworkChange::NetworkManagerDns => {
                 check_networkmanager_dns("192.0.2.99").await?;
@@ -1164,8 +1173,14 @@ async fn installed_fake_dns_after_network_change_in_vm(
         }
         // До закрытия вывода не обращаемся к helper по D-Bus. Только его
         // наблюдатель сетевых событий может остановить этот worker.
+        let drain_timeout = if change == FakeDnsNetworkChange::ResolverRestart {
+            // Смена владельца D-Bus подтверждается и плановой сверкой DNS.
+            Duration::from_secs(25)
+        } else {
+            Duration::from_secs(10)
+        };
         require(
-            tokio::time::timeout(Duration::from_secs(10), drain.drained()).await?,
+            tokio::time::timeout(drain_timeout, drain.drained()).await?,
             "Сетевой наблюдатель не остановил worker",
         )?;
         let state =
@@ -1252,6 +1267,9 @@ async fn installed_fake_dns_after_network_change_in_vm(
         for old in [old_v4, old_v6] {
             check_fake_flow_blocked((old, 40000).into()).await?;
         }
+        if change == FakeDnsNetworkChange::ResolverRestart {
+            check_fallback_dns_in_vm("real.test").await?;
+        }
         if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
             check_https_through_tun(&certificate, None).await?;
         }
@@ -1262,6 +1280,9 @@ async fn installed_fake_dns_after_network_change_in_vm(
         )?;
         if kill_switch {
             call(&connection, "Unlock", empty.clone()).await?;
+        }
+        if change == FakeDnsNetworkChange::ResolverRestart {
+            check_fallback_dns_in_vm("restored.test").await?;
         }
         if change == FakeDnsNetworkChange::PeerRoute {
             change_fixture_peer_route("del")?;
@@ -2065,6 +2086,28 @@ async fn revoke_fixture_link_dns(token: &mut yonik_linux::Cancellation) -> Resul
             .success(),
         "systemd-resolved не снял конфигурацию DNS TUN",
     )
+}
+
+#[cfg(feature = "test-support")]
+async fn restart_fixture_resolver(connection: &zbus::Connection) -> Result {
+    let bus = zbus::fdo::DBusProxy::new(connection).await?;
+    let name = zbus::names::BusName::try_from("org.freedesktop.resolve1")?;
+    let before = bus.get_name_owner(name.clone()).await?;
+    let status = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new("/usr/bin/systemctl")
+            .args(["restart", "systemd-resolved.service"])
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await??;
+    require(status.success(), "Стенд не перезапустил systemd-resolved")?;
+    require(
+        bus.get_name_owner(name).await? != before,
+        "Владелец имени systemd-resolved на D-Bus не сменился",
+    )?;
+    eprintln!("Стенд подтвердил нового владельца systemd-resolved на D-Bus");
+    Ok(())
 }
 
 #[cfg(feature = "test-support")]
