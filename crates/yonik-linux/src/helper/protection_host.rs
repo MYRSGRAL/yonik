@@ -177,6 +177,15 @@ impl SystemProtectionHost {
         }
         let mut supervisor = StandaloneSupervisor::open().map_err(unavailable)?;
         supervisor.recover(&mut cancel).await.map_err(unavailable)?;
+        StandaloneSupervisor::ensure_tun_device(&mut cancel)
+            .await
+            .map_err(unavailable)?;
+        super::PeerAuthorizer::system(cancel.clone())
+            .await
+            .map_err(ServiceError::Authorization)?
+            .activate_authority(&mut cancel)
+            .await
+            .map_err(ServiceError::Authorization)?;
         Self::create(
             PathBuf::from(STATE_PATH),
             &mut cancel,

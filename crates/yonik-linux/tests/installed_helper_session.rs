@@ -21,6 +21,10 @@ fn require(value: bool, reason: &str) -> Result {
 }
 
 fn guard() -> Result {
+    guard_init("systemd")
+}
+
+fn guard_init(expected: &str) -> Result {
     require(
         std::env::var("YONIK_PRODUCTION_HELPER_VM").as_deref() == Ok("1"),
         "Нет явного VM opt-in",
@@ -30,8 +34,8 @@ fn guard() -> Result {
         "Требуется QEMU",
     )?;
     require(
-        fs::read_to_string("/proc/1/comm")?.trim() == "systemd",
-        "Требуется systemd PID 1",
+        fs::read_to_string("/proc/1/comm")?.trim() == expected,
+        "PID 1 не соответствует стенду",
     )?;
     let marker = fs::symlink_metadata("/etc/yonik-production-helper-vm")?;
     require(
@@ -374,7 +378,32 @@ async fn production_helper_standalone_shutdown_restores_network() -> Result {
         "Пакетный вход автономного helper открылся при systemd PID 1",
     )?;
     let policy = scoped_fake_dns_proxy_policy()?;
-    installed_fake_dns(None, HelperLifecycle::Shutdown, Some(&policy), None).await
+    installed_fake_dns(
+        None,
+        HelperLifecycle::Shutdown(StandaloneService::SystemdFixture),
+        Some(&policy),
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с OpenRC или runit"]
+async fn production_helper_native_init_dns_and_shutdown() -> Result {
+    let service = match fs::read_to_string("/proc/1/comm")?.trim() {
+        "openrc-init" => StandaloneService::OpenRc,
+        "runit" => StandaloneService::Runit,
+        _ => return Err(io::Error::other("Стенду нужен OpenRC или runit в PID 1").into()),
+    };
+    let policy = scoped_fake_dns_proxy_policy()?;
+    installed_fake_dns(
+        None,
+        HelperLifecycle::Shutdown(service),
+        Some(&policy),
+        None,
+    )
+    .await
 }
 
 #[cfg(feature = "test-support")]
@@ -2095,7 +2124,59 @@ enum FakeDnsPolicyWitness {
 enum HelperLifecycle {
     Normal,
     Crash(Engine),
-    Shutdown,
+    Shutdown(StandaloneService),
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StandaloneService {
+    SystemdFixture,
+    OpenRc,
+    Runit,
+}
+
+#[cfg(feature = "test-support")]
+impl StandaloneService {
+    fn init(self) -> &'static str {
+        match self {
+            Self::SystemdFixture => "systemd",
+            Self::OpenRc => "openrc-init",
+            Self::Runit => "runit",
+        }
+    }
+
+    async fn manage(self, start: bool) -> Result {
+        let action = if start { "start" } else { "stop" };
+        let mut command = match self {
+            Self::SystemdFixture => {
+                let mut command = tokio::process::Command::new("/usr/bin/systemctl");
+                command.args([action, "yonik-standalone-fixture.service"]);
+                command
+            }
+            Self::OpenRc => {
+                let mut command = tokio::process::Command::new("/usr/sbin/rc-service");
+                command.args(["yonik-helper", action]);
+                command
+            }
+            Self::Runit => {
+                let mut command = tokio::process::Command::new("/usr/bin/sv");
+                command.args([
+                    "-w",
+                    "65",
+                    if start { "up" } else { "down" },
+                    "/etc/sv/yonik-helper",
+                ]);
+                command
+            }
+        };
+        let status =
+            tokio::time::timeout(Duration::from_secs(70), command.kill_on_drop(true).status())
+                .await??;
+        require(
+            status.success(),
+            "Штатное управление службой завершилось ошибкой",
+        )
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -2105,13 +2186,17 @@ async fn installed_fake_dns(
     policy: Option<&yonik_engine::policy_wire::SystemPolicy>,
     policy_witness: Option<FakeDnsPolicyWitness>,
 ) -> Result {
-    guard()?;
+    let standalone = match lifecycle {
+        HelperLifecycle::Shutdown(service) => Some(service),
+        _ => None,
+    };
+    guard_init(standalone.map_or("systemd", StandaloneService::init))?;
     let _lock = vm_lock::acquire()?;
     wait_for_fixture_link().await?;
     let resolver_before = resolver_file_state()?;
     let connection = zbus::Connection::system().await?;
     let empty = json!({"version":1});
-    if lifecycle == HelperLifecycle::Shutdown {
+    if standalone.is_some() {
         require(
             call(&connection, "Capabilities", empty.clone()).await?["system_tun"] == true,
             "Автономный helper не объявляет TUN клиенту",
@@ -2280,8 +2365,9 @@ async fn installed_fake_dns(
         if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
             check_https_through_tun(&certificate, literal.map(|_| v4)).await?;
         }
-        let restarted_at = if lifecycle == HelperLifecycle::Shutdown {
-            stop_standalone_fixture(v4, v6, kill_switch).await?;
+        let restarted_at = if let Some(service) = standalone {
+            stop_standalone_fixture(service, v4, v6, kill_switch).await?;
+            wait_for_helper_name(&connection).await?;
             eprintln!("{engine:?}: служба очистила сеть и остановила worker до перезапуска");
             Some(tokio::time::Instant::now())
         } else {
@@ -2376,11 +2462,11 @@ async fn installed_fake_dns(
 
 #[cfg(feature = "test-support")]
 async fn stop_standalone_fixture(
+    service: StandaloneService,
     v4: std::net::IpAddr,
     v6: std::net::IpAddr,
     kill_switch: bool,
 ) -> Result {
-    const UNIT: &str = "yonik-standalone-fixture.service";
     let tun_links = || -> Result<Vec<Value>> {
         let output = Command::new("/usr/sbin/ip")
             .args(["-j", "link", "show", "type", "tun"])
@@ -2389,21 +2475,7 @@ async fn stop_standalone_fixture(
         Ok(serde_json::from_slice(&output.stdout)?)
     };
     require(tun_links()?.len() == 1, "Нет единственного TUN стенда")?;
-    let manage_fixture = |operation: &'static str| async move {
-        let status = tokio::time::timeout(
-            Duration::from_secs(40),
-            tokio::process::Command::new("/usr/bin/systemctl")
-                .args([operation, UNIT])
-                .kill_on_drop(true)
-                .status(),
-        )
-        .await??;
-        require(
-            status.success(),
-            "Штатное управление службой завершилось ошибкой",
-        )
-    };
-    manage_fixture("stop").await?;
+    service.manage(false).await?;
     for role in ["check", "run"] {
         let events = fs::read_to_string(format!(
             "/sys/fs/cgroup/yonik-worker-standalone/{role}/cgroup.events"
@@ -2436,7 +2508,21 @@ async fn stop_standalone_fixture(
     } else {
         check_only_fake_is_filtered(v4, v6).await?;
     }
-    manage_fixture("start").await
+    service.manage(true).await
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_helper_name(connection: &zbus::Connection) -> Result {
+    let bus = zbus::fdo::DBusProxy::new(connection).await?;
+    let name = zbus::names::BusName::try_from(SERVICE_NAME)?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !bus.name_has_owner(name.clone()).await? {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<(), zbus::fdo::Error>(())
+    })
+    .await??;
+    Ok(())
 }
 
 #[cfg(feature = "test-support")]

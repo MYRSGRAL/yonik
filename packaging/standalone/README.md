@@ -21,6 +21,10 @@ sysusers дистрибутива или создать указанную си�
 конфигурации сборки. Helper создаёт защищённые каталоги в `/run`.
 [Документация setpriv](https://raw.githubusercontent.com/util-linux/util-linux/v2.41/sys-utils/setpriv.1.adoc)
 
+При старте helper проверяет устройство `/dev/net/tun`. Если его ещё нет,
+helper вызывает штатный `/sbin/modprobe tun`. Polkit активируется через
+системный D-Bus перед публикацией сервиса Yonik.
+
 OpenRC ставит сценарий в `/etc/init.d/yonik-helper`. Он запускает helper
 после D-Bus и управляет процессом через `supervise-daemon`.
 
@@ -43,3 +47,7 @@ D-Bus использует общую политику доступа Yonik. И�
 worker перед удалением сетевой сессии и сохраняет действующий карантин Fake-IP.
 Системный TUN и scoped Fake DNS доступны через обычный API. Атрибуция
 приложений и транспорт канонических ресурсов требуют systemd.
+
+Для управления из графического клиента polkit должен видеть активную
+локальную сессию. В OpenRC и runit сведения о сеансе может предоставлять
+elogind. [Политика активных сеансов](https://polkit.pages.freedesktop.org/polkit/polkit.8.html) · [Документация elogind](https://github.com/elogind/elogind)

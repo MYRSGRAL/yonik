@@ -26,7 +26,7 @@ use std::{
     os::{
         fd::OwnedFd,
         unix::{
-            fs::{MetadataExt, PermissionsExt},
+            fs::{FileTypeExt, MetadataExt, PermissionsExt},
             net::UnixListener,
         },
     },
@@ -44,6 +44,7 @@ use tokio::{
 type Result<T> = std::result::Result<T, Error>;
 const LIMIT: Duration = Duration::from_secs(15);
 const ROLES: [WorkerMode; 2] = [WorkerMode::Check, WorkerMode::Run];
+const TUN_DEVICE: &str = "/dev/net/tun";
 
 pub(super) struct StandaloneSupervisor {
     runtime: File,
@@ -101,6 +102,25 @@ impl StandaloneSupervisor {
             job: None,
             clean: false,
         })
+    }
+
+    pub(super) async fn ensure_tun_device(cancel: &mut Cancellation) -> Result<()> {
+        if !tun_device_present()? {
+            let mut loader = Command::new("/sbin/modprobe");
+            loader
+                .arg("tun")
+                .env_clear()
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            let status = bounded(cancel, Instant::now() + LIMIT, async {
+                loader.status().await.map_err(unavailable)
+            })
+            .await?;
+            if !status.success() || !tun_device_present()? {
+                return Err(Error::Unavailable);
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn check(
@@ -375,6 +395,20 @@ fn open_runtime() -> Result<File> {
         return Err(Error::Untrusted);
     }
     Ok(runtime)
+}
+
+fn tun_device_present() -> Result<bool> {
+    match fs::symlink_metadata(TUN_DEVICE) {
+        Ok(metadata)
+            if metadata.file_type().is_char_device()
+                && metadata.rdev() == rustix::fs::makedev(10, 200) =>
+        {
+            Ok(true)
+        }
+        Ok(_) => Err(Error::Untrusted),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(unavailable(error)),
+    }
 }
 
 fn socket(mode: WorkerMode) -> PathBuf {

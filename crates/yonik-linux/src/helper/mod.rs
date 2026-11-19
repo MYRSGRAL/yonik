@@ -240,6 +240,25 @@ impl PeerAuthorizer {
         })
     }
 
+    async fn activate_authority(
+        &self,
+        cancel: &mut Cancellation,
+    ) -> Result<(), AuthorizationError> {
+        bounded(cancel, Instant::now() + SETUP_TIMEOUT, async {
+            let daemon = zbus::fdo::DBusProxy::new(&self.connection)
+                .await
+                .map_err(|_| AuthorizationError::Unavailable)?;
+            let authority = zbus::names::WellKnownName::try_from(AUTHORITY)
+                .map_err(|_| AuthorizationError::InvalidReply)?;
+            daemon
+                .start_service_by_name(authority, 0)
+                .await
+                .map_err(|_| AuthorizationError::Unavailable)?;
+            self.trusted_owner().await.map(|_| ())
+        })
+        .await
+    }
+
     /// `message` должен происходить из входящего вызова доверенного server transport.
     /// UID из тела сообщения никогда не используется. Details всегда пусты.
     pub async fn authorize(
@@ -264,11 +283,7 @@ impl PeerAuthorizer {
         .await?;
         let (uid, owner) = bounded(&mut cancel, setup_deadline(deadline), async {
             let uid = self.uid(&sender).await?;
-            let owner = self.owner().await?;
-            let authority_uid = self.uid(&owner).await?;
-            if authority_uid != 0 && authority_uid != self.expected_authority_uid {
-                return Err(AuthorizationError::UntrustedAuthority);
-            }
+            let owner = self.trusted_owner().await?;
             Ok((uid, owner))
         })
         .await?;
@@ -419,6 +434,15 @@ impl PeerAuthorizer {
             .and_then(|v| u32::try_from(v).ok())
             .filter(|pid| *pid != 0)
             .ok_or(AuthorizationError::PeerGone)
+    }
+
+    async fn trusted_owner(&self) -> Result<String, AuthorizationError> {
+        let owner = self.owner().await?;
+        let uid = self.uid(&owner).await?;
+        if uid != 0 && uid != self.expected_authority_uid {
+            return Err(AuthorizationError::UntrustedAuthority);
+        }
+        Ok(owner)
     }
 
     async fn owner(&self) -> Result<String, AuthorizationError> {
