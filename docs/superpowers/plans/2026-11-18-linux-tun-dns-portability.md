@@ -16,6 +16,7 @@
 | Arch Linux ARM, QEMU, AArch64, systemd 262.2 | Установленный helper, uplink-файл, глобальный DNS и opportunistic DoT, тестовый сервер обслуживает только обычный DNS | После сброса обнаруженных возможностей сервера NSS и релей прямых запросов получили ответы с переходом на обычный DNS. Fake DNS, HTTPS, DoH и восстановление прошли на обоих движках. Ссылка и содержимое `/etc/resolv.conf` совпали до и после |
 | Arch Linux ARM, QEMU, AArch64, systemd 262.2 и nftables 1.1.7 | Установленные ELF helper и worker, uplink-файл с обычным FallbackDNS, счётчики на обоих внешних интерфейсах | Оба движка прошли сетевой цикл. На внешних интерфейсах прошли TCP к VLESS и обычный DNS по TCP и UDP, пакетов с Fake-IP не зафиксировано. После остановки helper карантин IPv4 и IPv6 сохранился и истёк в ядре. Ссылка и содержимое `/etc/resolv.conf` совпали до и после |
 | Arch Linux ARM, QEMU, AArch64, systemd 262.2 | Установленный helper, отзыв DNS-зоны активного TUN через resolve1, uplink-файл | На обоих движках старый worker завершился автоматически. После повторного подключения прошли новые Fake A/AAAA, TCP/UDP и HTTPS. Старые Fake-IP остались заблокированы в пределах исходного TTL. Ссылка и содержимое `/etc/resolv.conf` совпали до и после |
+| Arch Linux ARM, QEMU, AArch64, systemd 262.2 | Установленный helper, SIGKILL и автоматический перезапуск при активном TUN, обычный FallbackDNS | Xray сохранил kill switch до Unlock. В сценарии sing-box обычная сеть восстановилась без Unlock. После перезапуска прежние Fake-IP фильтровались до истечения карантина. Системный DNS отвечал после восстановления, ссылка и содержимое `/etc/resolv.conf` совпали до и после |
 | Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, переподключение DHCPv4, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
 | Debian 13.7, QEMU, x86-64 | Установленный стендовый helper с автономным worker, отдельным mount namespace, seccomp и системным D-Bus | Восстановление после прежнего worker, Prepare, Apply, Stop, Unlock, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS по Fake-IP и DoH через TUN. При остановке службы с активной сессией TUN удаляется, cgroup пустеют, карантин Fake-IP сохраняется |
 | Debian 13.7, QEMU, AArch64, systemd 257 и nftables 1.1.3 | Установленные GNU helper и worker без `test-support`, systemd-resolved с FallbackDNS, явная политика Proxy. Xray 26.10.31 и закреплённый адаптер sing-box 1.14.4 | Fake A/AAAA, TCP/UDP по IPv4 и IPv6, HTTPS с проверкой имени, DoH, Stop, Unlock, блокировка старых Fake-IP и восстановление DNS. На Xray также проверено восстановление карантина после удаления таблицы nftables. Содержимое и метаданные `/etc/resolv.conf` совпали до и после |
@@ -535,6 +536,10 @@ IPv4-сценарий с теми же проверками прошёл пов�
   добавленным физическим маршрутам получила `EPERM`. Таблица карантина
   снялась после истечения таймера. Содержимое и идентичность
   `/etc/resolv.conf` совпали до и после всех четырёх сценариев.
+  Архитектурный прогон на Arch Linux ARM повторил оба сценария через
+  установленный helper с uplink-файлом systemd-resolved. После восстановления
+  Xray требовал Unlock, а sing-box вернул состояние `no_managed_policy`.
+  Прежние Fake IPv4/IPv6 фильтровались до истечения карантина.
   [Тесты установленного helper](../../../crates/yonik-linux/tests/installed_helper_session.rs)
 - [ ] Пройти G-DNS для Xray и sing-box. Проверять конечный сервер соединения,
   внешние DNS-пакеты и отсутствие пакетов к синтетическим адресам вне TUN.
