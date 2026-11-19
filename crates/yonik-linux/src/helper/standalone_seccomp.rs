@@ -221,7 +221,6 @@ pub(super) fn write_filter(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(feature = "test-support")]
 pub(super) fn filter_count(status: &str) -> Result<u32, Error> {
     let field = |key: &str| {
         status

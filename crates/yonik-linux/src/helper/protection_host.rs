@@ -81,7 +81,6 @@ pub struct SystemProtectionHost {
     runtime: tokio::runtime::Handle,
     _safety: Option<session_host::SafetyTask>,
     _dhcp_sleep: Option<super::dhcp_sleep::DhcpSleepTask>,
-    #[cfg(feature = "test-support")]
     standalone: bool,
 }
 const PROFILE_ADMISSION_BOUND: Duration = Duration::from_secs(2);
@@ -169,7 +168,6 @@ impl SystemProtectionHost {
         Self::create(PathBuf::from(STATE_PATH), &mut cancel, false, None).await
     }
 
-    #[cfg(feature = "test-support")]
     pub async fn system_standalone(mut cancel: Cancellation) -> Result<Self, ServiceError> {
         use super::{
             session_supervisor::SessionSupervisor, standalone_supervisor::StandaloneSupervisor,
@@ -207,7 +205,6 @@ impl SystemProtectionHost {
         let seed = u64::from_le_bytes(random).max(1);
         let exited = Arc::new(tokio::sync::Notify::new());
         let backend_exited = Arc::clone(&exited);
-        #[cfg(feature = "test-support")]
         let standalone = matches!(
             &supervisor,
             Some(super::session_supervisor::SessionSupervisor::Standalone(_))
@@ -263,7 +260,6 @@ impl SystemProtectionHost {
             runtime,
             _safety: Some(safety),
             _dhcp_sleep: sleep_watch,
-            #[cfg(feature = "test-support")]
             standalone,
         })
     }
@@ -340,7 +336,6 @@ async fn execute_job(
     .map_err(unavailable)?
 }
 impl Backend {
-    #[cfg(feature = "test-support")]
     async fn shutdown_standalone(&mut self, cancel: &mut Cancellation) -> Result<(), ServiceError> {
         use super::session_supervisor::SessionSupervisor;
         if self.has_session() {
@@ -680,7 +675,6 @@ fn compile_protection(
 impl ProtectionHost for SystemProtectionHost {
     type Artifact = GuardArtifact;
 
-    #[cfg(feature = "test-support")]
     async fn shutdown(&mut self) -> Result<(), ServiceError> {
         if !self.standalone {
             return Ok(());
@@ -729,13 +723,20 @@ impl ProtectionHost for SystemProtectionHost {
         &mut self,
         cancel: Cancellation,
     ) -> Result<bool, ServiceError> {
+        if self.standalone {
+            cancel.check().map_err(|_| ServiceError::Cancelled)?;
+            return Ok(false);
+        }
         match self.job(Operation::NativeEligibility, cancel).await? {
             Reply::NativeEligibility(value) => Ok(value),
             _ => Err(ServiceError::Unavailable),
         }
     }
     fn bundle_transport(&self) -> bool {
-        true
+        !self.standalone
+    }
+    fn system_tun(&self) -> bool {
+        self.standalone
     }
     async fn prepare_bundle(
         &mut self,

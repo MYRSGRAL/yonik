@@ -68,7 +68,6 @@ impl WorkerCgroups {
         Self::from_mount(cgroup_mount()?, parent_name)
     }
 
-    #[cfg(feature = "test-support")]
     pub(super) fn prepare(parent_name: &str, names: &[&str]) -> Result<Self> {
         let mount = cgroup_mount()?;
         ensure_directory(&mount, parent_name, Mode::from_bits_truncate(0o755))?;
@@ -78,6 +77,8 @@ impl WorkerCgroups {
             let directory = directory_in_mount(&cgroups.parent, name, cgroups.mount_id)?
                 .ok_or(WorkerSupervisorError::Unavailable)?;
             trusted(&directory, true)?;
+            // Остановка должна быть доступна ещё до запуска первого worker.
+            cgroups.open_control(&directory, "cgroup.kill")?;
         }
         Ok(cgroups)
     }
@@ -128,7 +129,6 @@ impl WorkerCgroups {
         self.write_worker_control(name, "cgroup.procs", b"0")
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn kill_group(&self, name: &str) -> Result<()> {
         self.write_worker_control(name, "cgroup.kill", b"1")
     }
@@ -138,11 +138,7 @@ impl WorkerCgroups {
         let group = directory_in_mount(&self.parent, name, self.mount_id)?
             .ok_or(WorkerSupervisorError::Unavailable)?;
         trusted(&group, true)?;
-        let flags = (FILE_FLAGS - OFlags::RDONLY) | OFlags::WRONLY;
-        let mut control =
-            File::from(openat(&group, attribute, flags, Mode::empty()).map_err(unavailable)?);
-        verify_mount(&control, self.mount_id)?;
-        trusted(&control, false)?;
+        let mut control = self.open_control(&group, attribute)?;
         let present = directory_in_mount(&self.parent, name, self.mount_id)?;
         let parent = directory_in_mount(&self.mount, &self.parent_name, self.mount_id)?;
         if !same_directory(Some(&group), present.as_ref())?
@@ -152,9 +148,17 @@ impl WorkerCgroups {
         }
         control.write_all(value).map_err(unavailable)
     }
+
+    fn open_control(&self, group: &File, attribute: &str) -> Result<File> {
+        let flags = (FILE_FLAGS - OFlags::RDONLY) | OFlags::WRONLY;
+        let control =
+            File::from(openat(group, attribute, flags, Mode::empty()).map_err(unavailable)?);
+        verify_mount(&control, self.mount_id)?;
+        trusted(&control, false)?;
+        Ok(control)
+    }
 }
 
-#[cfg(feature = "test-support")]
 pub(super) fn ensure_directory(parent: &File, name: &str, mode: Mode) -> Result<()> {
     match rustix::fs::mkdirat(parent, name, mode) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => Ok(()),

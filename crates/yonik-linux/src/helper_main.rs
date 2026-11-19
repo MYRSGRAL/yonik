@@ -17,7 +17,9 @@ fn main() -> ExitCode {
         if args.next().is_some() {
             return ExitCode::from(64);
         }
-        if argument == "--standalone-test-service" && standalone_test_vm() {
+        if (argument == "--standalone-service" && standalone_service_init())
+            || (argument == "--standalone-test-service" && standalone_test_vm())
+        {
             standalone = true;
         } else if argument == "--check-worker-fence" {
             return if verify_worker_fence().is_ok() {
@@ -72,14 +74,11 @@ fn main() -> ExitCode {
             tokio::select! {_ = tokio::signal::ctrl_c()=>{},_ = term.recv()=>{}}
             signal.send_replace(true);
         });
-        #[cfg(feature = "test-support")]
         let host = if standalone {
             SystemSessionHost::system_standalone(cancel.clone()).await
         } else {
             SystemSessionHost::system(cancel.clone()).await
         };
-        #[cfg(not(feature = "test-support"))]
-        let host = SystemSessionHost::system(cancel.clone()).await;
         let result = match host {
             Ok(host) => run_system_service(host, cancel).await,
             Err(error) => Err(error),
@@ -92,6 +91,11 @@ fn main() -> ExitCode {
             ExitCode::from(69)
         }
     })
+}
+
+#[cfg(target_os = "linux")]
+fn standalone_service_init() -> bool {
+    std::fs::read_to_string("/proc/1/comm").is_ok_and(|init| !matches!(init.trim(), "" | "systemd"))
 }
 
 #[cfg(target_os = "linux")]

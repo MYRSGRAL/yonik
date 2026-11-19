@@ -155,6 +155,9 @@ pub trait ProtectionHost: Send + 'static {
     fn bundle_transport(&self) -> bool {
         false
     }
+    fn system_tun(&self) -> bool {
+        false
+    }
     fn prepare_bundle(
         &mut self,
         _uid: u32,
@@ -539,6 +542,7 @@ pub(super) async fn serve_with_broker<H: ProtectionHost>(
         .request_name(SERVICE_NAME)
         .await
         .map_err(|_| ServiceError::Unavailable)?;
+    let system_tun = host.system_tun();
     let host = Arc::new(Mutex::new(host));
     let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
     let (stop, worker_cancel) = Cancellation::new();
@@ -562,7 +566,7 @@ pub(super) async fn serve_with_broker<H: ProtectionHost>(
                 let broker = broker.clone(); let host = host.clone(); let peers=Arc::clone(&peers); let child_cancel = worker_cancel.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let result = dispatch(&broker, &host, &peers, &message, child_cancel).await;
+                    let result = dispatch(&broker, &host, &peers, &message, child_cancel, system_tun).await;
                     send_result(broker.connection(), &message, result).await;
                 });
             }
@@ -607,6 +611,7 @@ async fn dispatch<H: ProtectionHost>(
     peers: &PeerTracker,
     message: &Message,
     mut cancel: Cancellation,
+    system_tun: bool,
 ) -> Result<String, ServiceError> {
     let request = parse(message)?;
     let sender = super::sender(message)?;
@@ -645,7 +650,7 @@ async fn dispatch<H: ProtectionHost>(
         }
         Request::Introspect => return Ok(INTROSPECTION.to_owned()),
         Request::Capabilities => {
-            serde_json::json!({"version":1,"public_protection":true,"system_tun":false,"allow_lan":false})
+            serde_json::json!({"version":1,"public_protection":true,"system_tun":system_tun,"allow_lan":false})
         }
         Request::NativePrepareEligibility => {
             cancel.check().map_err(|_| ServiceError::Cancelled)?;

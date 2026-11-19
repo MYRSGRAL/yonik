@@ -83,6 +83,12 @@ impl StandaloneSupervisor {
             return Err(Error::Untrusted);
         }
         flock(&owner, FlockOperation::NonBlockingLockExclusive).map_err(unavailable)?;
+        ensure_directory(&run, "yonik", Mode::from_bits_truncate(0o700))?;
+        let state = child(&run, "yonik")?.metadata().map_err(unavailable)?;
+        if state.mode() & 0o7777 != 0o700 || state.gid() != 0 {
+            return Err(Error::Untrusted);
+        }
+        installed_worker_credentials()?;
         let installed = child(&child(&child(&system_root, "usr")?, "lib")?, "yonik")?;
         verify_executable(&installed, "yonik-helper")?;
         verify_executable(&installed, "yonik-worker")?;

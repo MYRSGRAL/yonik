@@ -13,6 +13,7 @@
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
 | Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, переподключение DHCPv4, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
 | Debian 13.7, QEMU, x86-64 | Установленный стендовый helper с автономным worker, отдельным mount namespace, seccomp и системным D-Bus | Восстановление после прежнего worker, Prepare, Apply, Stop, Unlock, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS по Fake-IP и DoH через TUN. При остановке службы с активной сессией TUN удаляется, cgroup пустеют, карантин Fake-IP сохраняется |
+| Debian 13.7, OpenRC 0.56 и runit 2.2, две QEMU VM | Установленный helper из дерева пакета, запуск штатным менеджером каждой VM | Проверены PID 1, cgroup v2, запуск службы, объявление TUN по системному D-Bus и исходное состояние. Сетевые прогоны на этих загрузках ожидаются |
 | Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, отдельные прогоны с IPv4- и IPv6-адресами резолвера, опубликованными менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock и восстановление после смены адреса через `resolvconf -a`. Истечение карантина проверено в сценарии с IPv4-резолвером |
 | Debian 13.7, systemd-resolved и внешний WireGuard | Установленный helper, приватная DNS-зона и маршруты IPv4/IPv6 через WireGuard | Публичный Fake DNS работает, обнаруженные приватные префиксы блокируются во время сессии. Приватный DNS и TCP/UDP доступны до запуска и после Stop |
 | Debian 13.7, Xfce 4.20 и X11, ядро 6.12.117 | Обычный UID в активной сессии LightDM и штатный диалог polkit. Отдельные прогоны с systemd-resolved и resolvconf 1.94 | Системный TUN, Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и карантин Fake-IP |
@@ -714,9 +715,18 @@ IPv4-сценарий с теми же проверками прошёл пов�
   исполняемой памяти и установки setuid через `fchmod`. Обычные потоки
   и сокеты AF_UNIX, AF_INET, AF_INET6 и AF_NETLINK работают.
   [Документация setpriv 2.41](https://raw.githubusercontent.com/util-linux/util-linux/v2.41/sys-utils/setpriv.1.adoc)
-  Для пакетной поддержки OpenRC/runit остаются интеграция с init и
-  приёмочные прогоны в обеих средах. Для AArch64 задан отдельный ABI
-  фильтра, который пока не проверен в VM.
+  Для OpenRC и runit есть отдельные сценарии служб и сборка дерева
+  пакета с общей политикой D-Bus и polkit. Служба объявляет системный
+  TUN через обычный API возможностей, графический клиент использует
+  его для допуска подключения. Путь с атрибуцией и каноническими
+  ресурсами сохраняет требования systemd. Стенд Debian проверил
+  объявления возможностей перед полной сессией на обоих движках.
+  Две Debian VM загрузились с `openrc-init` и `runit` в PID 1.
+  Установленная служба запустилась под соответствующим менеджером
+  и ответила по системному D-Bus. Для полной приёмки остаются
+  сетевые прогоны на обоих движках в этих init-средах. Для AArch64
+  задан отдельный ABI фильтра, который пока не проверен в VM.
+  [Пакет helper для OpenRC и runit](../../../packaging/standalone/README.md)
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
   `Unavailable` до запуска ядра. Политики Fedora 45.23 и 45.24 отклонили

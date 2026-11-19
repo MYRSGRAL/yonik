@@ -20,7 +20,6 @@ mod session_supervisor;
 mod standalone_launcher;
 mod standalone_mounts;
 mod standalone_seccomp;
-#[cfg(feature = "test-support")]
 mod standalone_supervisor;
 pub use session_network::SessionNetworkPlan;
 pub use standalone_launcher::{

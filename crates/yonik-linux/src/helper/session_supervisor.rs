@@ -1,4 +1,3 @@
-#[cfg(feature = "test-support")]
 use super::standalone_supervisor::StandaloneSupervisor;
 use super::{SystemWorkerSupervisor, WorkerLiveness, WorkerSupervisorError as Error, WorkerTicket};
 use crate::{Cancellation, output_transport::ValidatedWriters, worker::WorkerPayload};
@@ -8,7 +7,6 @@ type Result<T> = std::result::Result<T, Error>;
 
 pub(super) enum SessionSupervisor {
     Systemd(Box<SystemWorkerSupervisor>),
-    #[cfg(feature = "test-support")]
     Standalone(Box<StandaloneSupervisor>),
 }
 
@@ -16,7 +14,6 @@ impl SessionSupervisor {
     pub(super) fn systemd(&mut self) -> Result<&mut SystemWorkerSupervisor> {
         match self {
             Self::Systemd(supervisor) => Ok(supervisor),
-            #[cfg(feature = "test-support")]
             Self::Standalone(_) => Err(Error::UnitProofGap),
         }
     }
@@ -28,7 +25,6 @@ impl SessionSupervisor {
     ) -> Result<()> {
         match self {
             Self::Systemd(supervisor) => supervisor.check(payload, cancel).await,
-            #[cfg(feature = "test-support")]
             Self::Standalone(supervisor) => supervisor.check(payload, cancel).await,
         }
     }
@@ -41,7 +37,6 @@ impl SessionSupervisor {
     ) -> Result<WorkerTicket> {
         match self {
             Self::Systemd(supervisor) => supervisor.start_output(payload, output, cancel).await,
-            #[cfg(feature = "test-support")]
             Self::Standalone(supervisor) => supervisor.start_output(payload, output, cancel).await,
         }
     }
@@ -49,7 +44,6 @@ impl SessionSupervisor {
     pub(super) async fn observe(&self, ticket: &WorkerTicket) -> Result<WorkerLiveness> {
         match self {
             Self::Systemd(supervisor) => supervisor.observe(ticket).await,
-            #[cfg(feature = "test-support")]
             Self::Standalone(supervisor) => supervisor.observe(ticket),
         }
     }
@@ -57,7 +51,6 @@ impl SessionSupervisor {
     pub(super) async fn recover(&mut self, cancel: &mut Cancellation) -> Result<()> {
         match self {
             Self::Systemd(supervisor) => supervisor.recover(cancel).await,
-            #[cfg(feature = "test-support")]
             Self::Standalone(supervisor) => supervisor.recover(cancel).await,
         }
     }
@@ -65,7 +58,6 @@ impl SessionSupervisor {
     pub(super) fn confirm_profile_rules_retired(&mut self) -> Result<()> {
         match self {
             Self::Systemd(supervisor) => supervisor.confirm_profile_rules_retired(),
-            #[cfg(feature = "test-support")]
             Self::Standalone(supervisor) => supervisor.confirm_profile_rules_retired(),
         }
     }

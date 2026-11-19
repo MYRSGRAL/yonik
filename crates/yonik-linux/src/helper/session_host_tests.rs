@@ -343,7 +343,6 @@ fn actor_fixture() -> super::super::SystemProtectionHost {
         runtime: tokio::runtime::Handle::current(),
         _safety: None,
         _dhcp_sleep: None,
-        #[cfg(feature = "test-support")]
         standalone: false,
     }
 }

@@ -364,6 +364,15 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
 #[tokio::test]
 #[ignore = "выделенная Debian VM с автономным helper и остановкой службы после Apply"]
 async fn production_helper_standalone_shutdown_restores_network() -> Result {
+    guard()?;
+    require(
+        Command::new("/usr/lib/yonik/yonik-helper")
+            .arg("--standalone-service")
+            .status()?
+            .code()
+            == Some(64),
+        "Пакетный вход автономного helper открылся при systemd PID 1",
+    )?;
     let policy = scoped_fake_dns_proxy_policy()?;
     installed_fake_dns(None, HelperLifecycle::Shutdown, Some(&policy), None).await
 }
@@ -2102,6 +2111,22 @@ async fn installed_fake_dns(
     let resolver_before = resolver_file_state()?;
     let connection = zbus::Connection::system().await?;
     let empty = json!({"version":1});
+    if lifecycle == HelperLifecycle::Shutdown {
+        require(
+            call(&connection, "Capabilities", empty.clone()).await?["system_tun"] == true,
+            "Автономный helper не объявляет TUN клиенту",
+        )?;
+        require(
+            call(&connection, "NativePrepareEligibilityV1", empty.clone()).await?["can_prepare_attribution"]
+                == false,
+            "Автономный helper объявил недоступную атрибуцию",
+        )?;
+        require(
+            call(&connection, "BundleCapabilitiesV1", empty.clone()).await?["canonical_fd_transport"]
+                == false,
+            "Автономный helper объявил недоступный транспорт ресурсов",
+        )?;
+    }
     let imported = yonik_import::import_bytes(
         b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
     )?;
