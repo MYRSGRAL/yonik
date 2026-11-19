@@ -1,4 +1,5 @@
 use super::*;
+use crate::managed_network::firewall::{DHCP_RENEWAL_CHAIN, DHCP_RENEWAL_SET};
 use sha2::{Digest, Sha256};
 
 pub(super) fn block_table(
@@ -138,6 +139,11 @@ fn verify_rules(
             ("chain", chain.clone())
         } else if let Some(rule) = object.get("rule") {
             ("rule", rule.clone())
+        } else if let Some(set) = object.get("set").filter(|set| {
+            policy.has_dhcp_renewal_anchor()
+                && set.get("name").and_then(Value::as_str) == Some(DHCP_RENEWAL_SET)
+        }) {
+            ("set", set.clone())
         } else {
             return Err(NftError::Evidence);
         };
@@ -149,6 +155,14 @@ fn verify_rules(
             .is_none()
         {
             return Err(NftError::Evidence);
+        }
+        if kind == "set"
+            && data_object
+                .get("elem")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        {
+            data_object.remove("elem");
         }
         if kind == "rule" {
             normalize_rule(&mut data, &resolve)?;
@@ -173,6 +187,23 @@ fn verify_rules(
             normalize_rule(rule, &resolve)?;
         }
         expected.push(data);
+    }
+    if policy.has_dhcp_renewal_anchor() {
+        // Порядок объектов разных типов зависит от nft. Порядок правил
+        // внутри output остаётся частью проверки.
+        let rank = |item: &Value| {
+            if item.get("set").is_some() {
+                0
+            } else if item.pointer("/chain/name").and_then(Value::as_str)
+                == Some(DHCP_RENEWAL_CHAIN)
+            {
+                1
+            } else {
+                2
+            }
+        };
+        actual.sort_by_key(rank);
+        expected.sort_by_key(rank);
     }
     if actual != expected {
         return Err(NftError::Evidence);

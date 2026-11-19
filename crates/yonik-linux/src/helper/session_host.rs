@@ -2211,6 +2211,7 @@ impl Backend {
             policy = policy
                 .with_isolated_loopback(fake_dns.loopback, artifact.worker_uid)
                 .and_then(|policy| policy.with_bound_direct(fake_dns.direct_egress.clone()))
+                .and_then(|policy| policy.with_dhcp_renewal_anchor(true))
                 .map_err(unavailable)?;
         }
         let policy_fingerprint = policy.digest();

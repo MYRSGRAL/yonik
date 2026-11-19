@@ -677,6 +677,9 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             &token,
         )
         .await?;
+        if change == FakeDnsNetworkChange::DhcpReconnect {
+            check_empty_dhcp_renewal_anchor(true)?;
+        }
         let before_query = tokio::time::Instant::now();
         let old_v4 = getent_fake_dns("ahostsv4", "example.test").await?;
         let old_v6 = getent_fake_dns("ahostsv6", "example.test").await?;
@@ -735,6 +738,7 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             call(&connection, "Unlock", empty.clone()).await?;
         }
         if change == FakeDnsNetworkChange::DhcpReconnect {
+            check_empty_dhcp_renewal_anchor(false)?;
             control_dhcp_fixture("10.203.2.2")?;
             check_dhcp_fixture_dns("10.203.2.2", &mut token).await?;
             let answer = Command::new("/usr/bin/resolvectl")
@@ -764,6 +768,9 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             &token,
         )
         .await?;
+        if change == FakeDnsNetworkChange::DhcpReconnect {
+            check_empty_dhcp_renewal_anchor(true)?;
+        }
         let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
         let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
         require(
@@ -814,6 +821,7 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             resolver_before = resolver_file_state()?;
         }
         if change == FakeDnsNetworkChange::DhcpReconnect {
+            check_empty_dhcp_renewal_anchor(false)?;
             control_dhcp_fixture("disconnect")?;
             control_dhcp_fixture("10.203.2.1")?;
             check_dhcp_fixture_dns("10.203.2.1", &mut token).await?;
@@ -822,6 +830,44 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             "{engine:?} {change:?}: автоматическая остановка, отзыв DNS и повторное подключение подтверждены"
         );
     }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn check_empty_dhcp_renewal_anchor(expected: bool) -> Result {
+    let output = Command::new(nft_test_binary())
+        .args(["-j", "list", "ruleset"])
+        .output()?;
+    require(output.status.success(), "Не прочитан ruleset nftables")?;
+    let ruleset: Value = serde_json::from_slice(&output.stdout)?;
+    let items = ruleset["nftables"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("Нет списка правил nftables"))?;
+    let mut sets = items
+        .iter()
+        .filter_map(|item| item.get("set"))
+        .filter(|set| set["family"] == "inet" && set["name"] == "dhcp_renewal_leases");
+    let Some(set) = sets.next() else {
+        return require(!expected, "Активная политика не содержит набора DHCP");
+    };
+    require(
+        expected
+            && sets.next().is_none()
+            && set["flags"] == json!(["timeout"])
+            && set
+                .get("elem")
+                .is_none_or(|elem| elem.as_array().is_some_and(Vec::is_empty)),
+        "Набор DHCP дублируется, содержит элементы или пережил снятие политики",
+    )?;
+    require(
+        items.iter().any(|entry| {
+            entry["chain"]["table"] == set["table"] && entry["chain"]["name"] == "dhcp_renewal"
+        }) && !items.iter().any(|entry| {
+            entry["rule"]["table"] == set["table"] && entry["rule"]["chain"] == "dhcp_renewal"
+        }),
+        "Цепочка DHCP отсутствует или содержит правила до разрешения",
+    )?;
+    eprintln!("Установленный helper создал пустую цепочку DHCP и набор с таймером");
     Ok(())
 }
 

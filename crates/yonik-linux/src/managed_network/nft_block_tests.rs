@@ -33,6 +33,61 @@ fn check(value: &Value, table: &Table, policy: &PublicBlockPolicy) -> Result<(),
 }
 
 #[test]
+fn dhcp_anchor_is_inert_and_rejects_unexpected_kernel_contents() {
+    let prefix = IpPrefix::new("192.0.2.0".parse().expect("Префикс"), 24).expect("CIDR");
+    let route = PrivateRoute::new(prefix, None).expect("Защита приватной сети");
+    let active = PublicBlockPolicy::new(1, Some(8), vec![route], vec![], vec![], vec![])
+        .expect("Активная политика");
+    let mut wire = serde_json::to_value(&active).expect("Запись политики");
+    assert!(wire.get("dhcp_renewal_anchor").is_none());
+    wire["dhcp_renewal_anchor"] = json!(true);
+    let reserved = serde_json::from_value::<PublicBlockPolicy>(wire.clone())
+        .expect("Политика с пустой DHCP-цепочкой");
+    assert_ne!(active.digest(), reserved.digest());
+    assert_eq!(
+        reserved
+            .with_additional_transport(&[])
+            .expect("Пересобранная политика"),
+        reserved
+    );
+    let table = block_table(owner(), 2, 5, &reserved);
+    let original = listing(&table, &reserved);
+    assert_eq!(check(&original, &table, &reserved), Ok(()));
+    let data = original["nftables"].as_array().expect("Список nftables");
+    let set = data
+        .iter()
+        .position(|object| object.get("set").is_some())
+        .expect("Пустой набор DHCP");
+    let position = |verdict: &str| {
+        data.iter()
+            .position(|entry| {
+                entry
+                    .pointer("/rule/expr")
+                    .and_then(Value::as_array)
+                    .is_some_and(|expr| expr.iter().any(|item| item.get(verdict).is_some()))
+            })
+            .expect("Вердикт output")
+    };
+    assert!(position("drop") < position("jump"));
+    let mut populated = original.clone();
+    populated["nftables"][set]["set"]["elem"] = json!(["192.0.2.10"]);
+    assert_eq!(
+        check(&populated, &table, &reserved),
+        Err(NftError::Evidence)
+    );
+    let mut unexpected_rule = original;
+    unexpected_rule["nftables"].as_array_mut().expect("Список nftables").push(json!({
+        "rule":{"family":"inet","table":table.name,"chain":"dhcp_renewal","handle":200,"expr":[{"accept":null}]}
+    }));
+    assert_eq!(
+        check(&unexpected_rule, &table, &reserved),
+        Err(NftError::Evidence)
+    );
+    wire["tun_ifindex"] = Value::Null;
+    assert!(serde_json::from_value::<PublicBlockPolicy>(wire).is_err());
+}
+
+#[test]
 fn applied_requires_exact_rules_not_only_ownership_comment() {
     let policy = policy();
     let table = block_table(owner(), 2, 5, &policy);
