@@ -8,13 +8,12 @@
 
 [Implementation plan and current progress](docs/PLAN.md) (Russian).
 
-A native, open source proxy client in development. Linux first (CachyOS/Arch,
-KDE Plasma, Wayland), Android later. Planned features include Xray-core and
-sing-box, TUN, Fake DNS, subscriptions, per-application routing and a system tray.
-
-**Early development:** this repository includes a native Linux GUI prototype,
-portable Rust libraries, CLIs and isolated engine tests. The GUI manages subscriptions
-and local SOCKS sessions; TUN, system network integration and an installer are still pending.
+A native, open source proxy client in development. Linux first, Android later.
+The Linux client manages subscriptions, local SOCKS5 and system connections
+through an installed helper. System TUN with Fake DNS has been tested with
+Xray and sing-box. The matrix covers Debian, Ubuntu, Fedora, Arch Linux and
+Arch Linux ARM, with graphical sessions tested on GNOME Wayland and Xfce X11.
+[System TUN and Fake DNS test matrix](docs/superpowers/plans/2026-11-18-linux-tun-dns-portability.md#матрица-проверенных-конфигураций)
 
 ### Implemented
 
