@@ -22,6 +22,11 @@ case "${YONIK_DHCP_FIXTURE:-primary}" in
         ;;
     *) exit 2 ;;
 esac
+service_type=${YONIK_DHCP_SERVICE_TYPE:-CS6}
+case "$service_type" in
+    none|CS4|CS6) ;;
+    *) exit 2 ;;
+esac
 unit="$client-fixture.service"
 state="/run/$client-fixture"
 
@@ -64,6 +69,7 @@ DNSDefaultRoute=no
 LinkLocalAddressing=no
 IPv6AcceptRA=no
 [DHCPv4]
+IPServiceType=$service_type
 ClientIdentifier=mac
 UseDNS=$publish_dns
 RoutesToDNS=no

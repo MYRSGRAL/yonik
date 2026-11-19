@@ -5,8 +5,8 @@ use super::{
     resolver_stub::{CaptureCredits, bounded_socket},
 };
 use crate::{
-    Cancellation, KernelRoute, NetworkNamespace, NetworkReadError as Error, RouteKind, RouteQuery,
-    TransportProtocol,
+    Cancellation, KernelRoute, LookupIncomplete, NetworkNamespace, NetworkReadError as Error,
+    RouteKind, RouteQuery, TransportProtocol,
     attribution::broker::{
         Unavailable as SocketReadError,
         kernel::{Listener, listener_census},
@@ -50,7 +50,7 @@ const NETWORKD: &str = "org.freedesktop.network1";
 const SYSTEMD: &str = "org.freedesktop.systemd1";
 const CLIENT_PORT: u16 = 68;
 const SERVER_PORT: u16 = 67;
-const NETWORKD_DEFAULT_TOS: u8 = 48 << 2; // DSCP CS6.
+pub(crate) const NETWORKD_DSCPS: [u8; 3] = [0, 32, 48]; // none, CS4, CS6.
 const DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
@@ -194,7 +194,7 @@ pub struct DhcpNetworkdLease {
     daemon: Daemon,
     namespace: NetworkNamespace,
     socket: Option<Listener>,
-    route: (KernelRoute, RouteCapture),
+    routes: Vec<(KernelRoute, RouteCapture)>,
     pidfd: OwnedFd,
     expires: u64,
     cancellation: Cancellation,
@@ -228,6 +228,7 @@ impl DhcpNetworkdLease {
         {
             return None;
         }
+        let route = &self.routes.last()?.0;
         Some(DhcpRenewalPath {
             interface: self.lease.index,
             ifname: &self.lease.name,
@@ -238,8 +239,15 @@ impl DhcpNetworkdLease {
             uid: self.daemon.uid,
             cgroup_id: self.daemon.group.1,
             namespace: self.namespace,
-            route_tos: self.route.0.query.tos(),
-            route_mark: self.route.0.query.mark(),
+            route_tos: self
+                .socket
+                .and_then(|socket| socket.tos)
+                .unwrap_or(route.query.tos()),
+            route_mark: route.query.mark(),
+            route_dscps: self
+                .routes
+                .iter()
+                .fold(0, |mask, (route, _)| mask | (1 << (route.query.tos() >> 2))),
             expires_boottime_micros: self.expires.min(self.lease.t2),
         })
     }
@@ -279,11 +287,14 @@ impl DhcpNetworkdLease {
             || self.daemon != current.daemon
             || self.lease != current.lease
             || self.socket != current.socket
-            || !same_captured_kernel_route(
-                &self.route.0,
-                &current.route.0,
-                Some((self.route.1, current.route.1)),
-            )
+            || self.routes.len() != current.routes.len()
+            || !self
+                .routes
+                .iter()
+                .zip(&current.routes)
+                .all(|(before, after)| {
+                    same_captured_kernel_route(&before.0, &after.0, Some((before.1, after.1)))
+                })
         {
             return Err(Error::Changed);
         }
@@ -306,6 +317,7 @@ pub struct DhcpRenewalPath<'a> {
     /// Параметры поиска маршрута проверяются по DSCP и метке пакета в nftables.
     pub route_tos: u8,
     pub route_mark: u32,
+    pub(crate) route_dscps: u64,
     pub expires_boottime_micros: u64,
 }
 
@@ -358,19 +370,60 @@ async fn collect(
         return Err(Error::Changed);
     }
     let socket = sample_socket(topology.namespace, &lease, &daemon, deadline).await?;
-    let (tos, mark) = route_selectors(socket)?;
+    let observed = socket
+        .map(|socket| socket.tos.zip(socket.mark).ok_or(Error::Unsupported))
+        .transpose()?;
+    let mark = observed.map_or(0, |(_, mark)| mark);
+    let standard = NETWORKD_DSCPS.map(|dscp| dscp << 2);
+    // networkd может открыть сокет вместе с первой отправкой. Проверяем
+    // каждый штатный DSCP, который nftables сможет проверить на самом пакете.
+    let candidates = match &observed {
+        Some((tos, mark)) if *mark != 0 || !standard.contains(tos) => std::slice::from_ref(tos),
+        _ => &standard,
+    };
     let query = RouteQuery::new(lease.server.into(), daemon.uid)
         .with_source(lease.address.into())?
         .with_interfaces(None, Some(index))
-        .with_tos(tos)
         .with_mark(mark)
         .with_transport(TransportProtocol::Udp, Some(CLIENT_PORT), Some(SERVER_PORT));
-    let route = lookup_route_captured(query, cancel, remaining(deadline)?).await?;
-    if route.0.namespace != topology.namespace
-        || route.0.kind != RouteKind::Unicast
-        || route.0.output_interface != Some(index)
-        || !route.0.incomplete.is_empty()
-    {
+    let mut routes = Vec::with_capacity(candidates.len());
+    for &tos in candidates {
+        let observed_tos = observed.is_some_and(|(actual, _)| actual == tos);
+        let route =
+            match lookup_route_captured(query.clone().with_tos(tos), cancel, remaining(deadline)?)
+                .await
+            {
+                Ok(route) => route,
+                Err(Error::Kernel(code))
+                    if !observed_tos
+                        && [
+                            rustix::io::Errno::NETUNREACH,
+                            rustix::io::Errno::HOSTUNREACH,
+                        ]
+                        .iter()
+                        .any(|error| error.raw_os_error() == code) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+        if route.0.namespace != topology.namespace {
+            return Err(Error::Unsupported);
+        }
+        // При неудачном FIB lookup Linux может построить on-link маршрут
+        // только из заданного oif. У синтетического ответа нет таблицы FIB.
+        match route.0.incomplete.as_slice() {
+            [] => {}
+            [LookupIncomplete::MissingTable] if !observed_tos => continue,
+            _ => return Err(Error::Unsupported),
+        }
+        if route.0.kind == RouteKind::Unicast && route.0.output_interface == Some(index) {
+            routes.push(route);
+        } else if observed_tos {
+            return Err(Error::Unsupported);
+        }
+    }
+    if routes.is_empty() {
         return Err(Error::Unsupported);
     }
     let (after, after_timing) = read_topology_captured(cancel, remaining(deadline)?).await?;
@@ -388,22 +441,12 @@ async fn collect(
         daemon,
         namespace: topology.namespace,
         socket,
-        route,
+        routes,
         pidfd,
         expires,
         cancellation: cancel.clone(),
         revoked: false,
     })
-}
-
-fn route_selectors(socket: Option<Listener>) -> Result<(u8, u32), Error> {
-    match socket {
-        Some(socket) => socket.tos.zip(socket.mark).ok_or(Error::Unsupported),
-        // networkd может открыть UDP-сокет вместе с отправкой первого DHCPREQUEST.
-        // До отправки проверяем маршрут для стандартного CS6 без метки. Допуск
-        // действует только для пакета с этими полями и сокетом UID/cgroup networkd.
-        None => Ok((NETWORKD_DEFAULT_TOS, 0)),
-    }
 }
 
 async fn sample_socket(

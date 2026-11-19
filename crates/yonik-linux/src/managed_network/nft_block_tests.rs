@@ -175,6 +175,57 @@ fn dhcp_rules_accept_independent_keys_and_keep_the_legacy_single_rule() {
 }
 
 #[test]
+fn dhcp_dscps_share_one_timed_key_and_require_each_exact_rule() {
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap(),
+    )
+    .unwrap();
+    wire["dhcp_renewal_anchor"] = json!(true);
+    wire["dhcp_renewal_rule"] = json!({
+        "ifindex":7,"ifname":"test-dhcp","address":"192.0.2.10","server":"192.0.2.1",
+        "uid":999,"cgroup_id":2500,"dscp":0,"mark":0,"namespace_device":3,"namespace_inode":11
+    });
+    let legacy: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&legacy).unwrap(), wire);
+    wire["dhcp_renewal_rule"]["additional_dscps"] = json!((1u64 << 32) | (1u64 << 48));
+    let policy: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&policy).unwrap(), wire);
+    assert_eq!(policy.dhcp_rule_count(), 1);
+    assert_ne!(legacy.digest(), policy.digest());
+    let table = block_table(owner(), 2, 5, &policy);
+    let mut state = listing(&table, &policy);
+    let entries = state["nftables"].as_array_mut().unwrap();
+    let set = entries
+        .iter_mut()
+        .find_map(|entry| entry.get_mut("set"))
+        .unwrap();
+    set["elem"] = json!([{"elem":{"val":{"concat":["192.0.2.10","192.0.2.1",7,"test-dhcp"]},"timeout":0,"expires":0}}]);
+    let rules: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry["rule"]["chain"] == DHCP_RENEWAL_CHAIN)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(rules.len(), 3);
+    for (&index, expected) in rules.iter().zip([0, 32, 48]) {
+        let comparison = entries[index]["rule"]["expr"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|expr| expr.pointer("/match/left/payload/field") == Some(&json!("dscp")))
+            .unwrap();
+        assert_eq!(comparison["match"]["right"], expected);
+    }
+    assert_eq!(check(&state, &table, &policy), Ok(()));
+    state["nftables"].as_array_mut().unwrap().remove(rules[1]);
+    assert_eq!(check(&state, &table, &policy), Err(NftError::Evidence));
+    for invalid in [1u64, 1 << 1, 1 << 63] {
+        wire["dhcp_renewal_rule"]["additional_dscps"] = json!(invalid);
+        assert!(serde_json::from_value::<PublicBlockPolicy>(wire.clone()).is_err());
+    }
+}
+
+#[test]
 fn dhcp_rule_only_accepts_the_exact_short_lived_element() {
     let mut wire = serde_json::to_value(
         PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![])

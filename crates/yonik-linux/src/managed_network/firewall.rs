@@ -1,4 +1,5 @@
 //! Типизированная публичная блокировка. Проверка принадлежности интерфейсов — задача адаптера.
+use crate::helper::dhcp_networkd::NETWORKD_DSCPS;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -257,6 +258,8 @@ struct DhcpRule {
     mark: u32,
     namespace_device: u64,
     namespace_inode: NonZeroU64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    additional_dscps: Option<NonZeroU64>,
 }
 
 pub(super) struct DhcpRenewalKey {
@@ -271,6 +274,7 @@ impl DhcpRule {
         lease: &crate::helper::dhcp_networkd::DhcpNetworkdLease,
     ) -> Result<Self, PolicyError> {
         let path = lease.path().ok_or(PolicyError::Interface)?;
+        let mask = NonZeroU64::new(path.route_dscps).ok_or(PolicyError::Interface)?;
         Ok(Self {
             ifindex: interface(path.interface)?,
             ifname: InterfaceName::try_from(path.ifname.to_owned())?,
@@ -278,14 +282,19 @@ impl DhcpRule {
             server: path.server,
             uid: interface(path.uid)?,
             cgroup_id: path.cgroup_id,
-            dscp: path.route_tos >> 2,
+            dscp: mask.trailing_zeros() as u8,
             mark: path.route_mark,
             namespace_device: path.namespace.device,
             namespace_inode: NonZeroU64::new(path.namespace.inode).ok_or(PolicyError::Interface)?,
+            additional_dscps: NonZeroU64::new(mask.get() & (mask.get() - 1)),
         })
     }
 
-    fn command(&self, table: &str) -> Value {
+    fn dscp_mask(&self) -> u64 {
+        (1 << self.dscp) | self.additional_dscps.map_or(0, NonZeroU64::get)
+    }
+
+    fn command(&self, table: &str, dscp: u8) -> Value {
         let payload = |protocol, field| json!({"payload":{"protocol":protocol,"field":field}});
         let addresses_and_link = json!({"concat":[
             payload("ip", "saddr"), payload("ip", "daddr"),
@@ -302,7 +311,7 @@ impl DhcpRule {
                 meta("skuid", json!(self.uid.get())),
                 compare(payload("udp", "sport"), json!(68)),
                 compare(payload("udp", "dport"), json!(67)),
-                compare(payload("ip", "dscp"), json!(self.dscp)),
+                compare(payload("ip", "dscp"), json!(dscp)),
                 meta("mark", json!(self.mark)),
                 compare(
                     json!({"socket":{"key":"cgroupv2","level":2}}),
@@ -402,7 +411,11 @@ impl PublicBlockPolicy {
             + self.isolated_loopback.map_or(0, |_| 6)
             + self.bound_direct.len() * 2
             + usize::from(self.dhcp_renewal_anchor)
-            + self.dhcp_rule_count()
+            + self
+                .dhcp_rules()
+                .iter()
+                .map(|rule| rule.dscp_mask().count_ones() as usize)
+                .sum::<usize>()
     }
 
     pub(crate) fn with_bound_direct(
@@ -623,6 +636,17 @@ impl PublicBlockPolicy {
             {
                 return Err(PolicyError::Interface);
             }
+            if let Some(additional) = rule.additional_dscps {
+                let supported = NETWORKD_DSCPS
+                    .into_iter()
+                    .fold(0, |mask, dscp| mask | (1 << dscp));
+                if rule.mark != 0
+                    || additional.get().trailing_zeros() <= u32::from(rule.dscp)
+                    || rule.dscp_mask() & !supported != 0
+                {
+                    return Err(PolicyError::Interface);
+                }
+            }
             if rule.address == rule.server
                 || [rule.address, rule.server].into_iter().any(|address| {
                     address.is_unspecified()
@@ -686,7 +710,15 @@ impl PublicBlockPolicy {
         lease: &crate::helper::dhcp_networkd::DhcpNetworkdLease,
     ) -> Option<NonZeroU32> {
         let observed = DhcpRule::from_lease(lease).ok()?;
-        (self.dhcp_rule(observed.ifindex)? == &observed).then_some(observed.ifindex)
+        let rule = self.dhcp_rule(observed.ifindex)?;
+        (rule.dscp_mask() & !observed.dscp_mask() == 0
+            && *rule
+                == DhcpRule {
+                    dscp: rule.dscp,
+                    additional_dscps: rule.additional_dscps,
+                    ..observed
+                })
+        .then_some(rule.ifindex)
     }
 
     /// Отпечаток канонических правил не зависит от имени принадлежащей helper таблицы.
@@ -715,7 +747,9 @@ impl PublicBlockPolicy {
                 "family":"inet","table":table_name,"name":DHCP_RENEWAL_CHAIN
             }}}));
             for rule in self.dhcp_rules() {
-                commands.push(rule.command(table_name));
+                for dscp in (rule.dscp..64).filter(|dscp| rule.dscp_mask() & (1 << dscp) != 0) {
+                    commands.push(rule.command(table_name, dscp));
+                }
             }
         }
         commands.push(
