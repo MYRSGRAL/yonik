@@ -225,8 +225,8 @@ IPv4-сценарий с теми же проверками прошёл пов�
 
   В Ubuntu 24.04.5 строгий `DNSOverTLS=yes` получил ответ с исходного DNS
   на порту 1853 по TLS 1.3 и отклонил неверное имя сертификата. В этой
-  конфигурации штатный установленный helper пока вернул `Unavailable`
-  на Prepare. [Тестовый DNS-over-TLS сервер](../../../tools/fixtures/fake_dns_dot.py)
+  конфигурации в исходном прогоне установленный helper вернул
+  `Unavailable` на Prepare. [Тестовый DNS-over-TLS сервер](../../../tools/fixtures/fake_dns_dot.py)
 
   Отдельный стенд на Ubuntu 24.04.5 и Debian 13.7 проверил точное правило
   RPDB по UID резолвера, адресу, TCP и порту. При общем маршруте в тестовый
@@ -240,6 +240,13 @@ IPv4-сценарий с теми же проверками прошёл пов�
   проверка имени в TLS зависит от глобального режима. Для отдельного
   режима на линке нужна проверка реализации конкретного пакета.
   [Проверка TLS в systemd 257](https://github.com/systemd/systemd/blob/v257/src/resolve/resolved-dnstls-openssl.c#L94-L108)
+
+  В Debian 13.7 с systemd 257, Ubuntu 24.04.5 с systemd 255 и Fedora
+  Cloud 45 с systemd 262 и SELinux Enforcing адаптер resolve1 проверил
+  `SetLinkDNSOverTLS("no")` на собственном тестовом TUN. После публикации
+  локального DNS снимок исходных резолверов сохранился, включая строгий
+  TLS и имя сервера. После удаления TUN запись линка исчезла из resolve1.
+  Содержимое и метаданные `/etc/resolv.conf` совпали.
 
 - [x] Проверить переподключение DHCPv4 в Debian 13.7 и Ubuntu 24.04.5 LTS с
   `systemd-networkd` и `systemd-resolved`. В тесте

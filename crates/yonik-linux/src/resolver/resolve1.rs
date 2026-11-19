@@ -548,7 +548,7 @@ async fn prepare_dns_on_owned_link(
     .map_err(|_| ResolverError::Timeout)?
 }
 
-/// Apply errors after dispatching SetLinkDomains require dropping the caller-owned TUN
+/// Apply errors after dispatching the first write require dropping the caller-owned TUN
 /// interface. That interface lifetime is the cleanup mechanism for ambiguous and
 /// partial outcomes; this module deliberately never calls RevertLink or retries.
 /// Экспорт из `resolver.rs` отложен до интеграции caller.
@@ -585,6 +585,7 @@ pub struct Resolve1Prepared {
     link_path: OwnedObjectPath,
     dns_ex: Vec<LinkDnsServerEx>,
     default_route: bool,
+    initial_transport: Resolve1Transport,
     domains: Resolve1DomainPublication,
 }
 
@@ -600,6 +601,7 @@ impl Resolve1Prepared {
             dns: self.legacy_dns(),
             dns_ex: self.dns_ex.clone(),
             default_route: self.default_route,
+            transport: Resolve1Transport::Plain,
             domains: self.domains.link.clone(),
         };
         if read_link_config(connection, &self.owner, &path).await? != expected {
@@ -678,6 +680,7 @@ async fn prepare_on_connection(
             })
             .collect(),
         default_route,
+        initial_transport: state.transport,
         domains,
     })
 }
@@ -696,6 +699,9 @@ async fn apply_prepared(
     if !current.dns.is_empty() || !current.dns_ex.is_empty() || !current.domains.is_empty() {
         return Err(ResolverError::Untrusted);
     }
+    if current.transport != prepared.initial_transport {
+        return Err(ResolverError::NetworkChanged);
+    }
     ensure_manager_domains(
         &manager_domains(connection, &prepared.owner).await?,
         prepared.ifindex as u32,
@@ -709,6 +715,14 @@ async fn apply_prepared(
     let expected_domains = &prepared.domains.link;
     // Routing is installed first, before this interface receives DNS queries.
     *mutation_started = true;
+    if current.transport != Resolve1Transport::Plain {
+        // Маркер DNS обслуживается локально по обычному DNS. Настройка
+        // касается только собственного TUN, остальные области сохраняют TLS.
+        let _: () = manager
+            .call("SetLinkDNSOverTLS", &(prepared.ifindex, "no"))
+            .await
+            .map_err(bus_error)?;
+    }
     let _: () = manager
         .call(
             "SetLinkDefaultRoute",
@@ -726,6 +740,7 @@ async fn apply_prepared(
     if !after_domains.dns.is_empty()
         || !after_domains.dns_ex.is_empty()
         || after_domains.default_route != prepared.default_route
+        || after_domains.transport != Resolve1Transport::Plain
         || &after_domains.domains != expected_domains
     {
         return Err(ResolverError::NetworkChanged);
@@ -767,6 +782,7 @@ struct Resolve1LinkConfig {
     dns: Vec<(i32, Vec<u8>)>,
     dns_ex: Vec<LinkDnsServerEx>,
     default_route: bool,
+    transport: Resolve1Transport,
     domains: Vec<(String, bool)>,
 }
 
@@ -801,6 +817,8 @@ async fn read_link_config(
     let dns = property_for::<Vec<(i32, Vec<u8>)>>(&proxy, LINK, "DNS").await?;
     let dns_ex = property_for::<Vec<LinkDnsServerEx>>(&proxy, LINK, "DNSEx").await?;
     let default_route = property_for::<bool>(&proxy, LINK, "DefaultRoute").await?;
+    let transport =
+        Resolve1Transport::parse(&property_for::<String>(&proxy, LINK, "DNSOverTLS").await?)?;
     let domains = property_for::<Vec<(String, bool)>>(&proxy, LINK, "Domains").await?;
     if dns.len() > MAX_ENTRIES || dns_ex.len() > MAX_ENTRIES || domains.len() > MAX_ENTRIES {
         return Err(ResolverError::Limit);
@@ -827,6 +845,7 @@ async fn read_link_config(
         dns,
         dns_ex,
         default_route,
+        transport,
         domains,
     })
 }
@@ -1106,6 +1125,8 @@ mod tests {
         set_domains_calls: usize,
         fail_dns: bool,
         fail_domains: bool,
+        uses_tls: bool,
+        ignore_plain_request: bool,
         inject_conflict_after_domains: bool,
         flip_global_flag_after_domains: bool,
         hide_dns_ex_after_domains: bool,
@@ -1181,6 +1202,16 @@ mod tests {
             state.events.push("default_route");
             state.default_route = default_route;
         }
+        #[zbus(name = "SetLinkDNSOverTLS")]
+        fn set_link_dns_over_tls(&self, ifindex: i32, mode: &str) {
+            assert_eq!(ifindex, TEST_IFINDEX);
+            assert_eq!(mode, "no");
+            let mut state = self.0.lock().unwrap();
+            state.events.push("plain");
+            if !state.ignore_plain_request {
+                state.uses_tls = false;
+            }
+        }
         #[zbus(name = "SetLinkDomains")]
         fn set_link_domains(
             &self,
@@ -1208,6 +1239,14 @@ mod tests {
     struct MutationLink(std::sync::Arc<std::sync::Mutex<MutationState>>);
     #[zbus::interface(name = "org.freedesktop.resolve1.Link")]
     impl MutationLink {
+        #[zbus(property, name = "DNSOverTLS")]
+        fn dns_over_tls(&self) -> &str {
+            if self.0.lock().unwrap().uses_tls {
+                "yes"
+            } else {
+                "no"
+            }
+        }
         #[zbus(property, name = "DefaultRoute")]
         fn default_route(&self) -> bool {
             self.0.lock().unwrap().default_route
@@ -1247,6 +1286,120 @@ mod tests {
             .unwrap();
         let client = bus.connect().await;
         (bus, server, client)
+    }
+
+    #[tokio::test]
+    async fn локальный_dns_отключает_tls_до_публикации_и_следит_за_режимом() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MutationState {
+            uses_tls: true,
+            ..MutationState::default()
+        }));
+        let (_bus, server, client) = mutation_fixture(state.clone()).await;
+        let prepared = prepare_on_connection(
+            client,
+            TEST_IFINDEX as u32,
+            &["198.18.0.2:53".parse().unwrap()],
+            Resolve1DomainPublication::scoped(&["example.test".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+        apply_link_dns(&prepared, Duration::from_secs(1))
+            .await
+            .unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            assert_eq!(state.events, ["plain", "default_route", "domains", "dns"]);
+            state.uses_tls = true;
+        }
+        assert_eq!(
+            prepared.verify_active().await,
+            Err(ResolverError::NetworkChanged)
+        );
+        server.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn локальный_dns_не_публикуется_если_tls_остался_включён() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MutationState {
+            uses_tls: true,
+            ignore_plain_request: true,
+            ..MutationState::default()
+        }));
+        let (_bus, server, client) = mutation_fixture(state.clone()).await;
+        let prepared = prepare_on_connection(
+            client,
+            TEST_IFINDEX as u32,
+            &["198.18.0.2:53".parse().unwrap()],
+            Resolve1DomainPublication::scoped(&["example.test".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            apply_link_dns(&prepared, Duration::from_secs(1)).await,
+            Err(Resolve1ApplyError {
+                error: ResolverError::NetworkChanged,
+                cleanup_required: true
+            }),
+        );
+        assert_eq!(state.lock().unwrap().set_dns_calls, 0);
+        server.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "Требует одноразовую VM, строгий DNSOverTLS и отдельный тестовый TUN"]
+    async fn resolved_сохраняет_tls_для_исходных_серверов_при_публикации_локального_dns() {
+        assert_eq!(
+            std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+                .unwrap()
+                .trim(),
+            "QEMU"
+        );
+        assert_eq!(
+            std::fs::read_to_string("/etc/yonik-production-helper-vm")
+                .unwrap()
+                .trim(),
+            "yonik-production-helper-disposable-v1"
+        );
+        assert_eq!(
+            std::fs::read_to_string("/run/yonik-vm-gate")
+                .unwrap()
+                .trim(),
+            "yonik-disposable-systemd-gate-v1"
+        );
+        let index = std::fs::read_to_string("/sys/class/net/tofudotproof/ifindex")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let connection = Connection::system().await.unwrap();
+        let scope = SnapshotScope::Tun {
+            own_link: Some(index),
+        };
+        let before = read_connection(&connection, scope).await.unwrap();
+        assert_eq!(before.global_transport, Some(Resolve1Transport::StrictTls));
+        assert!(
+            before
+                .sockets
+                .iter()
+                .any(|socket| socket.transport == Resolve1Transport::StrictTls)
+        );
+
+        let prepared = prepare_link_dns(
+            index,
+            "198.18.0.2".parse().unwrap(),
+            &["yonik-dot-proof.test".into()],
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.initial_transport, Resolve1Transport::StrictTls);
+        apply_link_dns(&prepared, Duration::from_secs(3))
+            .await
+            .unwrap();
+        prepared.verify_active().await.unwrap();
+        assert_eq!(read_connection(&connection, scope).await.unwrap(), before);
     }
 
     #[tokio::test]
