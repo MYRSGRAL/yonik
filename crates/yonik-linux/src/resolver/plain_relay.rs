@@ -4,7 +4,7 @@ use super::{
     dot::DotPeer,
     forward::{forward_framed, forward_tcp, forward_udp},
 };
-use crate::{Cancellation, managed_network::FAKE_POOLS};
+use crate::{Cancellation, TransportProtocol, managed_network::FAKE_POOLS};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
     io,
@@ -21,6 +21,7 @@ use yonik_engine::fake_dns::MAX_DNS_PACKET;
 use yonik_nsfs::socket_namespace::mark_unconnected_dns_socket;
 
 const LIMIT: Duration = Duration::from_secs(3);
+const OPPORTUNISTIC_HANDSHAKE_LIMIT: Duration = Duration::from_secs(1);
 pub(crate) const TCP_IDLE: Duration = Duration::from_secs(8);
 const MAX_PENDING: usize = 64;
 type PendingReply = (SocketAddr, Result<Vec<u8>, ResolverError>);
@@ -32,6 +33,24 @@ pub(crate) struct PlainDnsRelay {
     peer: SocketAddr,
     mark: NonZeroU32,
     dot: Option<DotPeer>,
+    plain: Option<SocketAddr>,
+}
+
+pub(crate) fn relay_paths(
+    peer: SocketAddr,
+    tls: bool,
+    plain: Option<SocketAddr>,
+) -> impl Iterator<Item = (SocketAddr, TransportProtocol)> {
+    use TransportProtocol::{Tcp, Udp};
+    [
+        tls.then_some((peer, Tcp)),
+        plain
+            .filter(|&address| !tls || address != peer)
+            .map(|address| (address, Tcp)),
+        plain.map(|address| (address, Udp)),
+    ]
+    .into_iter()
+    .flatten()
 }
 
 impl PlainDnsRelay {
@@ -51,25 +70,18 @@ impl PlainDnsRelay {
             peer,
             mark,
             dot: None,
+            plain: Some(peer),
         })
     }
 
-    pub fn peer(&self) -> SocketAddr {
-        self.peer
-    }
-
-    pub fn with_dot(mut self, dot: DotPeer) -> Self {
+    pub fn with_dot(mut self, dot: DotPeer, plain: Option<SocketAddr>) -> Self {
         self.dot = Some(dot);
+        self.plain = plain;
         self
     }
 
-    pub fn upstream_protocols(&self) -> &'static [crate::TransportProtocol] {
-        use crate::TransportProtocol::{Tcp, Udp};
-        if self.dot.is_some() {
-            &[Tcp]
-        } else {
-            &[Tcp, Udp]
-        }
+    pub fn upstreams(&self) -> impl Iterator<Item = (SocketAddr, TransportProtocol)> {
+        relay_paths(self.peer, self.dot.is_some(), self.plain)
     }
 
     pub fn port(&self) -> io::Result<NonZeroU16> {
@@ -185,29 +197,41 @@ impl PlainDnsRelay {
         tcp: bool,
         mut cancel: Cancellation,
     ) -> Result<Vec<u8>, ResolverError> {
-        let endpoint = self.peer;
         let transport = async {
-            if tcp || self.dot.is_some() {
-                let socket = if endpoint.is_ipv4() {
-                    TcpSocket::new_v4()
+            if let Some(dot) = &self.dot {
+                let limit = if self.plain.is_some() {
+                    OPPORTUNISTIC_HANDSHAKE_LIMIT
                 } else {
-                    TcpSocket::new_v6()
+                    LIMIT
+                };
+                let negotiated = timeout(limit, async {
+                    let mut stream = self.connect_tcp(self.peer).await?;
+                    let tls = dot.handshake(&mut stream).await?;
+                    Ok((stream, tls))
+                })
+                .await
+                .map_err(|_| ResolverError::Timeout)
+                .and_then(std::convert::identity);
+                match negotiated {
+                    Ok((mut stream, tls)) => {
+                        return forward_framed(query, LIMIT, &mut cancel, async |outbound| {
+                            dot.exchange(&mut stream, tls, outbound).await
+                        })
+                        .await;
+                    }
+                    Err(
+                        ResolverError::Unavailable
+                        | ResolverError::Closed
+                        | ResolverError::Timeout
+                        | ResolverError::Untrusted,
+                    ) if self.plain.is_some() => {}
+                    Err(error) => return Err(error),
                 }
-                .map_err(|_| ResolverError::Unavailable)?;
-                mark_unconnected_dns_socket(&socket, self.mark)
-                    .map_err(|_| ResolverError::Untrusted)?;
-                let mut stream = timeout(LIMIT, socket.connect(endpoint))
-                    .await
-                    .map_err(|_| ResolverError::Timeout)?
-                    .map_err(|_| ResolverError::Unavailable)?;
-                if let Some(dot) = &self.dot {
-                    forward_framed(query, LIMIT, &mut cancel, async |outbound| {
-                        dot.exchange(&mut stream, outbound).await
-                    })
-                    .await
-                } else {
-                    forward_tcp(&mut stream, endpoint, query, LIMIT, &mut cancel).await
-                }
+            }
+            let endpoint = self.plain.ok_or(ResolverError::Unavailable)?;
+            if tcp {
+                let mut stream = self.connect_tcp(endpoint).await?;
+                forward_tcp(&mut stream, endpoint, query, LIMIT, &mut cancel).await
             } else {
                 let bind = if endpoint.is_ipv4() {
                     IpAddr::from(Ipv4Addr::UNSPECIFIED)
@@ -232,6 +256,21 @@ impl PlainDnsRelay {
         response.reject_addresses(is_reserved_fake)?;
         Ok(response.packet)
     }
+
+    async fn connect_tcp(&self, endpoint: SocketAddr) -> Result<TcpStream, ResolverError> {
+        let socket = if endpoint.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }
+        .map_err(|_| ResolverError::Unavailable)?;
+        mark_unconnected_dns_socket(&socket, self.mark)
+            .map_err(|_| ResolverError::PermissionDenied)?;
+        socket
+            .connect(endpoint)
+            .await
+            .map_err(|_| ResolverError::Unavailable)
+    }
 }
 
 fn is_reserved_fake(address: IpAddr) -> bool {
@@ -247,4 +286,28 @@ fn is_reserved_fake(address: IpAddr) -> bool {
             }
             _ => false,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opportunistic_routes_cover_both_transports_without_duplicate_tcp() {
+        use TransportProtocol::{Tcp, Udp};
+        let tls = SocketAddr::from(([192, 0, 2, 1], 853));
+        let plain = SocketAddr::from(([192, 0, 2, 1], 53));
+        assert_eq!(
+            relay_paths(tls, true, Some(plain)).collect::<Vec<_>>(),
+            [(tls, Tcp), (plain, Tcp), (plain, Udp)]
+        );
+        assert_eq!(
+            relay_paths(tls, true, Some(tls)).collect::<Vec<_>>(),
+            [(tls, Tcp), (tls, Udp)]
+        );
+        assert_eq!(
+            relay_paths(tls, true, None).collect::<Vec<_>>(),
+            [(tls, Tcp)]
+        );
+    }
 }

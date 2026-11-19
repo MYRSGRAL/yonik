@@ -18,6 +18,7 @@
 | Ubuntu 24.04.5 LTS без графической сессии | Установленный helper, ядро 6.8.0-147, nftables 1.0.9 | TUN, Fake DNS, HTTPS, DoH и восстановление правил. Отдельно проверены смена маршрута, переподключение DHCPv4 и отзыв DNS-зоны |
 | Ubuntu 24.04.5 с systemd 255 и Debian 13.7 с systemd 257 | Установленный helper, четыре обычных `FallbackDNS`, без настроенного глобального или per-link DNS | На обоих движках получены реальные ответы NSS и Fake A/AAAA. HTTPS и DoH прошли через TUN. После Stop резервный DNS ответил для нового имени |
 | Debian 13.7, Ubuntu 24.04.5 и Fedora Cloud 45 с SELinux Enforcing | Установленный helper и строгий DoT при использовании только `FallbackDNS` | Реальный NSS во время активной сессии и после Stop, Fake A/AAAA, HTTPS и DoH прошли на обоих движках |
+| Debian 13.7, Ubuntu 24.04.5 и Fedora Cloud 45 с SELinux Enforcing | Установленный helper и `opportunistic` DoT при использовании только `FallbackDNS` | TLS подтверждён в Ubuntu и Fedora. Переход с TLS на UDP и TCP подтверждён в Debian и Ubuntu. Fake DNS и восстановление прошли на обоих движках |
 | Ubuntu 24.04.5 LTS, GNOME Shell 46 и Wayland, Qt 6.4.2 | Видимый Qt-клиент в активной сессии GDM, обычный UID и штатная политика polkit | TUN, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и истечение карантина после остановки helper |
 | Fedora Cloud 45, SELinux Enforcing | Установленный RPM, root-клиент на системной шине | TUN и Fake DNS, продление двух лизингов systemd-networkd 262, S3 через logind, обновление при остановленном helper и удаление с истечением карантина |
 | Fedora Cloud 45 с GNOME Shell 51.1 и Wayland, SELinux Enforcing | Тот же RPM, обычный UID в активной сессии, системный D-Bus и штатный диалог polkit | TUN и Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop и удаление после пользовательской сессии |
@@ -302,9 +303,26 @@ IPv4-сценарий с теми же проверками прошёл пов�
   TLS helper публикует обычный DNS на порту 53, а релей сохраняет
   исходное TLS-назначение на порту 853. Установленный RPM под SELinux
   Enforcing прошёл тот же сценарий на обоих движках с неизменным
-  `/etc/resolv.conf`. Резервный DNS с `DNSOverTLS=opportunistic`
-  остаётся отдельным сценарием приёмки.
+  `/etc/resolv.conf`.
   [Нормализация DNS-порта в systemd 262.1](https://github.com/systemd/systemd/blob/v262.1/src/shared/bus-message-util.c#L142-L150)
+
+- [x] Проверить `DNSOverTLS=opportunistic` в конфигурации только с
+  `FallbackDNS`. Helper пробует TLS с ограничением одной секунды на
+  подключение и рукопожатие в пределах общего тайм-аута DNS. Режим
+  сохраняет проверку подписей TLS, имя сервера и цепочка доверия в нём
+  не проверяются. При отказе рукопожатия helper использует исходный
+  обычный DNS. После успешного рукопожатия ответ DNS проходит обычные
+  проверки релея, ошибка ответа завершает запрос.
+  Установленный helper на Ubuntu 24.04.5 получил ответ по TLS от сервера
+  с несовпадающим именем сертификата. Тот же сценарий прошёл с
+  установленным RPM в Fedora Cloud 45 под SELinux Enforcing на порту 853.
+  При отказе TLS стенд подтвердил
+  переход с TCP/853 на UDP/53, а затем на TCP/53 после усечённого UDP.
+  На Debian 13.7 при такой же последовательности все три запроса
+  использовали явно заданный порт 1853. Fake A/AAAA, HTTPS, DoH и реальный
+  NSS после Stop прошли на обоих движках. Содержимое и метаданные
+  `/etc/resolv.conf` совпали.
+  [Режим opportunistic в systemd](https://www.freedesktop.org/software/systemd/man/latest/resolved.conf.html#DNSOverTLS=)
 
 - [x] Проверить переподключение DHCPv4 в Debian 13.7 и Ubuntu 24.04.5 LTS с
   `systemd-networkd` и `systemd-resolved`. В тесте

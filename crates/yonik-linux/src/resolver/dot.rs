@@ -2,8 +2,10 @@
 
 use super::ResolverError;
 use rustls::{
-    ClientConfig, ClientConnection, RootCertStore,
-    pki_types::{CertificateDer, ServerName, pem::PemObject},
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature},
+    pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject},
 };
 use std::{
     fs::{File, Metadata},
@@ -115,14 +117,81 @@ impl SystemDotTrust {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum DotPolicy {
+    Strict(Arc<SystemDotTrust>),
+    Opportunistic(Arc<ClientConfig>),
+}
+
+impl DotPolicy {
+    pub(crate) fn opportunistic() -> Result<Self, ResolverError> {
+        let provider = rustls::crypto::ring::default_provider();
+        let verifier = OpportunisticVerifier(provider.signature_verification_algorithms);
+        let config = ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|_| ResolverError::Unsupported)?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        Ok(Self::Opportunistic(Arc::new(config)))
+    }
+
+    fn verify_trust(&self) -> Result<(), ResolverError> {
+        match self {
+            Self::Strict(trust) => trust.verify(),
+            Self::Opportunistic(_) => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OpportunisticVerifier(WebPkiSupportedAlgorithms);
+
+impl ServerCertVerifier for OpportunisticVerifier {
+    fn verify_server_cert(
+        &self,
+        _certificate: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        // resolve1 в opportunistic не проверяет имя и цепочку доверия.
+        // Подписи рукопожатия проверяются ключом сертификата.
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, certificate, signature, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, certificate, signature, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
+    }
+}
+
 pub(crate) struct DotPeer {
-    trust: Arc<SystemDotTrust>,
+    policy: DotPolicy,
     server_name: ServerName<'static>,
 }
 
 impl DotPeer {
     pub(crate) fn new(
-        trust: Arc<SystemDotTrust>,
+        policy: DotPolicy,
         address: IpAddr,
         name: Option<&str>,
     ) -> Result<Self, ResolverError> {
@@ -131,19 +200,23 @@ impl DotPeer {
                 .map_err(|_| ResolverError::Malformed)?,
             None => ServerName::from(address),
         };
-        Ok(Self { trust, server_name })
+        Ok(Self {
+            policy,
+            server_name,
+        })
     }
 
-    /// Вызывается с дедлайном и отменой после проверки DNS-вопроса.
-    pub(super) async fn exchange(
+    pub(super) async fn handshake(
         &self,
         stream: &mut TcpStream,
-        query: &[u8],
-    ) -> Result<Vec<u8>, ResolverError> {
-        self.trust.verify()?;
-        let mut tls =
-            ClientConnection::new(Arc::clone(&self.trust.config), self.server_name.clone())
-                .map_err(|_| ResolverError::Untrusted)?;
+    ) -> Result<ClientConnection, ResolverError> {
+        self.policy.verify_trust()?;
+        let config = match &self.policy {
+            DotPolicy::Strict(trust) => &trust.config,
+            DotPolicy::Opportunistic(config) => config,
+        };
+        let mut tls = ClientConnection::new(Arc::clone(config), self.server_name.clone())
+            .map_err(|_| ResolverError::Untrusted)?;
         tls.set_buffer_limit(Some(MAX_DNS_PACKET + 2048));
         let mut encrypted = Vec::new();
         while tls.is_handshaking() {
@@ -152,7 +225,18 @@ impl DotPeer {
                 receive(&mut tls, stream).await?;
             }
         }
-        self.trust.verify()?;
+        self.policy.verify_trust()?;
+        Ok(tls)
+    }
+
+    /// Вызывается с дедлайном и отменой после проверки DNS-вопроса.
+    pub(super) async fn exchange(
+        &self,
+        stream: &mut TcpStream,
+        mut tls: ClientConnection,
+        query: &[u8],
+    ) -> Result<Vec<u8>, ResolverError> {
+        let mut encrypted = Vec::new();
         let len = u16::try_from(query.len()).map_err(|_| ResolverError::Limit)?;
         tls.writer()
             .write_all(&len.to_be_bytes())
@@ -168,7 +252,7 @@ impl DotPeer {
         }
         let mut response = vec![0; size];
         receive_exact(&mut tls, stream, &mut encrypted, &mut response).await?;
-        self.trust.verify()?;
+        self.policy.verify_trust()?;
         Ok(response)
     }
 }

@@ -13,14 +13,14 @@ use crate::{
     network::{LinuxTopology, reread_changed_route},
     resolver::{
         PlainResolverSnapshot, ResolvConfLayout, ResolverError, SYSTEM_RESOLV_CONF,
-        dot::{DotPeer, SystemDotTrust},
+        dot::{DotPeer, DotPolicy, SystemDotTrust},
         file_watch::ResolverFileWatch,
         forward::forward_query_name,
         inspect_host_resolv_conf,
-        plain_relay::{PlainDnsRelay, TCP_IDLE},
+        plain_relay::{PlainDnsRelay, TCP_IDLE, relay_paths},
         plain_resolver_path,
         resolve1::{
-            Resolve1Domain, Resolve1Prepared, Resolve1Scope, Resolve1Transport,
+            Resolve1Domain, Resolve1Endpoint, Resolve1Prepared, Resolve1Scope, Resolve1Transport,
             Resolve1TunSnapshot, apply_link_dns, prepare_fallback_link_dns, prepare_link_dns,
             read_resolve1_tun_snapshot,
         },
@@ -319,12 +319,11 @@ fn resolved_peers(
 async fn fallback_peer_reachable(
     peer: SocketAddr,
     mark: u32,
-    dot: bool,
+    tls: bool,
+    plain: Option<SocketAddr>,
     cancel: &mut Cancellation,
 ) -> Result<bool, ServiceError> {
-    use TransportProtocol::{Tcp, Udp};
-    let protocols: &[_] = if dot { &[Tcp] } else { &[Tcp, Udp] };
-    for &protocol in protocols {
+    for (peer, protocol) in relay_paths(peer, tls, plain) {
         let query = RouteQuery::new(peer.ip(), 0)
             .with_mark(mark)
             .with_transport(protocol, None, Some(peer.port()));
@@ -342,14 +341,25 @@ async fn fallback_peer_reachable(
     Ok(true)
 }
 
-fn strict_fallback(snapshot: &Resolve1TunSnapshot) -> bool {
-    snapshot.fallback_only
-        && snapshot.global_transport == Some(Resolve1Transport::StrictTls)
+fn fallback_tls(snapshot: &Resolve1TunSnapshot) -> Option<Resolve1Transport> {
+    let mode = snapshot.global_transport?;
+    (mode != Resolve1Transport::Plain
+        && snapshot.fallback_only
         && !snapshot.sockets.is_empty()
         && snapshot
             .sockets
             .iter()
-            .all(|socket| socket.transport == Resolve1Transport::StrictTls)
+            .all(|socket| socket.transport == mode))
+    .then_some(mode)
+}
+
+fn plaintext_peer(endpoint: &Resolve1Endpoint) -> SocketAddr {
+    let port = if endpoint.port_inferred {
+        DNS_PORT
+    } else {
+        endpoint.port
+    };
+    SocketAddr::new(endpoint.address, port)
 }
 
 async fn verify_resolved_baseline(
@@ -381,7 +391,7 @@ fn native_resolver_peers(
     if !strict && !opportunistic {
         return Ok(Vec::new());
     }
-    if strict_fallback(snapshot) {
+    if fallback_tls(snapshot).is_some() {
         return Ok(Vec::new());
     }
     // На старых resolved проверка сертификата зависит от глобального режима.
@@ -400,14 +410,7 @@ fn native_resolver_peers(
             plain.insert(peer);
             continue;
         }
-        let fallback = SocketAddr::new(
-            endpoint.address,
-            if endpoint.port_inferred {
-                DNS_PORT
-            } else {
-                endpoint.port
-            },
-        );
+        let fallback = plaintext_peer(endpoint);
         let candidates = [
             (peer, TransportProtocol::Tcp),
             (fallback, TransportProtocol::Tcp),
@@ -547,9 +550,9 @@ impl PreparedFakeDns {
             // Обычная блокировка DNS на порту 53 не защищает такой сервер.
             return Err(ServiceError::Unsupported);
         }
-        let mut trust = None;
+        let fallback_mode = resolved.as_deref().and_then(fallback_tls);
         if let Some(snapshot) = resolved.as_ref().filter(|snapshot| snapshot.fallback_only) {
-            let dot = strict_fallback(snapshot);
+            let dot = fallback_mode.is_some();
             if (dot && snapshot.config.endpoints.len() > SystemFakeDnsBridge::MAX_PLAIN_DNS_PEERS)
                 || (!dot && upstreams.len() != snapshot.config.endpoints.len())
             {
@@ -561,21 +564,27 @@ impl PreparedFakeDns {
             // для которых ядро подтвердило недостижимость сети.
             for endpoint in &snapshot.config.endpoints {
                 let peer = SocketAddr::new(endpoint.address, endpoint.port);
-                if fallback_peer_reachable(peer, plan.socket_mark(), dot, cancel).await? {
+                let plain = (fallback_mode != Some(Resolve1Transport::StrictTls))
+                    .then(|| plaintext_peer(endpoint));
+                if fallback_peer_reachable(peer, plan.socket_mark(), dot, plain, cancel).await? {
                     upstreams.push((peer, ResolverBinding::default()));
                 }
             }
             if upstreams.is_empty() {
                 return Err(ServiceError::Unsupported);
             }
-            if dot {
-                trust = Some(
-                    SystemDotTrust::load()
-                        .await
-                        .map_err(|_| ServiceError::Unavailable)?,
-                );
-            }
         }
+        let dot_policy = match fallback_mode {
+            Some(Resolve1Transport::StrictTls) => Some(DotPolicy::Strict(
+                SystemDotTrust::load()
+                    .await
+                    .map_err(|_| ServiceError::Unavailable)?,
+            )),
+            Some(Resolve1Transport::OpportunisticTls) => {
+                Some(DotPolicy::opportunistic().map_err(|_| ServiceError::Unsupported)?)
+            }
+            _ => None,
+        };
         let mark = NonZeroU32::new(plan.socket_mark()).ok_or(ServiceError::Unavailable)?;
         let mut plain = Vec::with_capacity(upstreams.len());
         let mut peers = Vec::with_capacity(upstreams.len());
@@ -583,7 +592,7 @@ impl PreparedFakeDns {
             .iter()
             .map(|&(peer, _)| peer)
             .collect::<BTreeSet<_>>();
-        if trust.is_some() && client_endpoints.len() != upstreams.len() {
+        if dot_policy.is_some() && client_endpoints.len() != upstreams.len() {
             return Err(ServiceError::Unsupported);
         }
         for (peer, binding) in upstreams {
@@ -591,17 +600,19 @@ impl PreparedFakeDns {
                 .await
                 .map_err(|_| ServiceError::Unavailable)?;
             let mut client = peer;
-            if let (Some(trust), Some(snapshot)) = (&trust, &resolved) {
-                let (_, socket) = snapshot
+            if let (Some(policy), Some(snapshot)) = (&dot_policy, &resolved) {
+                let (endpoint, socket) = snapshot
                     .config
                     .endpoints
                     .iter()
                     .zip(&snapshot.sockets)
                     .find(|(endpoint, _)| SocketAddr::new(endpoint.address, endpoint.port) == peer)
                     .ok_or(ServiceError::Unavailable)?;
-                let dot = DotPeer::new(Arc::clone(trust), peer.ip(), socket.server_name())
+                let dot = DotPeer::new(policy.clone(), peer.ip(), socket.server_name())
                     .map_err(|_| ServiceError::Unsupported)?;
-                relay = relay.with_dot(dot);
+                let plain = (socket.transport == Resolve1Transport::OpportunisticTls)
+                    .then(|| plaintext_peer(endpoint));
+                relay = relay.with_dot(dot, plain);
                 client = fallback_dot_client(peer, &mut client_endpoints)?;
             }
             peers.push((client, relay.port().map_err(|_| ServiceError::Unavailable)?));
@@ -647,9 +658,8 @@ impl PreparedFakeDns {
         self.plain.iter().flat_map(|entry| {
             entry
                 .relay
-                .upstream_protocols()
-                .iter()
-                .map(move |&protocol| (entry.relay.peer(), protocol, entry.binding.route_link))
+                .upstreams()
+                .map(move |(peer, protocol)| (peer, protocol, entry.binding.route_link))
         })
     }
 
