@@ -109,6 +109,7 @@ impl Resolve1Transport {
 pub(crate) struct Resolve1Socket {
     pub(crate) route_link: Option<u32>,
     pub(crate) transport: Resolve1Transport,
+    pub(crate) default_route: bool,
     // Учитываем изменение SNI при сверке, даже если IP и порт совпадают.
     server_name: Option<String>,
 }
@@ -224,7 +225,7 @@ async fn read_connection_for_owner(
             let scope = Resolve1Scope::Link(index);
             snapshot.domains.retain(|domain| domain.scope != scope);
         }
-        if !has_default_dns(connection, owner_name, &snapshot).await? {
+        if !sockets.iter().any(|socket| socket.default_route) {
             let fallback = property::<Vec<ManagerDnsServerEx>>(&proxy, "FallbackDNSEx").await?;
             if !fallback.is_empty() {
                 fallback_only = snapshot.endpoints.is_empty();
@@ -239,7 +240,7 @@ async fn read_connection_for_owner(
                         continue;
                     }
                     let mut endpoint = decode_ex_endpoint(&row)?;
-                    sockets.push(tun_socket(&mut endpoint, None, transport, row.4));
+                    sockets.push(tun_socket(&mut endpoint, None, transport, true, row.4));
                     snapshot.endpoints.push(endpoint);
                 }
             }
@@ -255,30 +256,6 @@ async fn read_connection_for_owner(
         sockets,
         daemon: None,
     })
-}
-
-async fn has_default_dns(
-    connection: &Connection,
-    owner: &str,
-    snapshot: &Resolve1Snapshot,
-) -> Result<bool, ResolverError> {
-    let mut links = HashSet::new();
-    for endpoint in &snapshot.endpoints {
-        let Resolve1Scope::Link(index) = endpoint.scope else {
-            return Ok(true);
-        };
-        links.insert(index);
-    }
-    for index in links {
-        let path = get_link_path(connection, owner, index).await?;
-        let proxy = Proxy::new(connection, owner, path.as_str(), PROPERTIES)
-            .await
-            .map_err(bus_error)?;
-        if property_for::<bool>(&proxy, LINK, "DefaultRoute").await? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 async fn read_tun_endpoints(
@@ -307,6 +284,7 @@ async fn read_tun_endpoints(
         // Только сервер из Link.DNSEx использует транспорт этого линка.
         let (_, family, bytes, port, name) = row;
         let mut transport = global_transport;
+        let mut default_route = true;
         let key = (family, bytes, port, name);
         if let Some(index) = physical_link {
             if let std::collections::hash_map::Entry::Vacant(slot) = interfaces.entry(index) {
@@ -319,25 +297,37 @@ async fn read_tun_endpoints(
                     return Err(ResolverError::Limit);
                 }
                 let mode = property_for::<String>(&proxy, LINK, "DNSOverTLS").await?;
+                let default_route = property_for::<bool>(&proxy, LINK, "DefaultRoute").await?;
                 slot.insert((
                     entries.into_iter().collect::<HashSet<_>>(),
                     Resolve1Transport::parse(&mode)?,
+                    default_route,
                 ));
             }
-            let (entries, link_transport) =
+            let (entries, link_transport, link_default_route) =
                 interfaces.get_mut(&index).ok_or(ResolverError::Malformed)?;
             if entries.remove(&key) {
                 transport = *link_transport;
+                default_route = *link_default_route;
             } else {
                 endpoint.scope = Resolve1Scope::Global;
             }
         }
-        sockets.push(tun_socket(&mut endpoint, physical_link, transport, key.3));
+        sockets.push(tun_socket(
+            &mut endpoint,
+            physical_link,
+            transport,
+            default_route,
+            key.3,
+        ));
         endpoints.push(endpoint);
     }
     // Чтения неатомарны: остаточная запись на линке означает, что
     // список Manager и список Link не описывают одну и ту же конфигурацию.
-    if interfaces.values().any(|(entries, _)| !entries.is_empty()) {
+    if interfaces
+        .values()
+        .any(|(entries, _, _)| !entries.is_empty())
+    {
         return Err(ResolverError::NetworkChanged);
     }
     Ok((endpoints, sockets))
@@ -347,6 +337,7 @@ fn tun_socket(
     endpoint: &mut Resolve1Endpoint,
     route_link: Option<u32>,
     transport: Resolve1Transport,
+    default_route: bool,
     name: String,
 ) -> Resolve1Socket {
     let tls = transport != Resolve1Transport::Plain;
@@ -356,6 +347,7 @@ fn tun_socket(
     Resolve1Socket {
         route_link,
         transport,
+        default_route,
         server_name: (tls && !name.is_empty()).then_some(name),
     }
 }
@@ -1556,6 +1548,12 @@ mod tests {
         );
         assert!(snapshot.config.domains.is_empty());
         assert!(!snapshot.fallback_only);
+        assert!(!snapshot.sockets[0].default_route);
+        assert!(
+            snapshot.sockets[1..]
+                .iter()
+                .all(|socket| socket.default_route)
+        );
         is_default.store(true, std::sync::atomic::Ordering::Relaxed);
         let updated = read_connection(&client, SnapshotScope::Tun { own_link: Some(13) })
             .await
@@ -1568,12 +1566,14 @@ mod tests {
         assert_eq!(link_tls.config.endpoints[0].scope, Resolve1Scope::Link(7));
         assert_eq!(link_tls.config.endpoints[0].port, 1053);
         assert_eq!(link_tls.sockets[0].transport, Resolve1Transport::StrictTls);
+        assert!(link_tls.sockets[0].default_route);
         assert_eq!(
             link_tls.sockets[0].server_name.as_deref(),
             Some("dns.example.")
         );
         assert_eq!(link_tls.global_transport, Some(Resolve1Transport::Plain));
         // Тот же ifindex может относиться к глобальной записи DNS=…%link.
+        is_default.store(false, std::sync::atomic::Ordering::Relaxed);
         no_link_dns.store(true, std::sync::atomic::Ordering::Relaxed);
         let pinned_global = read_connection(&client, SnapshotScope::Tun { own_link: Some(13) })
             .await
@@ -1583,6 +1583,7 @@ mod tests {
             Resolve1Scope::Global
         );
         assert_eq!(pinned_global.sockets[0].route_link, Some(7));
+        assert!(pinned_global.sockets[0].default_route);
         assert_eq!(pinned_global.sockets[0].transport, Resolve1Transport::Plain);
         uses_tls.store(false, std::sync::atomic::Ordering::Relaxed);
         global_tls.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1604,7 +1605,7 @@ mod tests {
             for (port, expected) in [(0, default_port), (53, 53), (1853, 1853)] {
                 let row = (0, 2, vec![192, 0, 2, 53], port, "resolver.test".into());
                 let mut endpoint = decode_ex_endpoint(&row).unwrap();
-                let socket = tun_socket(&mut endpoint, None, transport, row.4);
+                let socket = tun_socket(&mut endpoint, None, transport, true, row.4);
                 assert_eq!(endpoint.port, expected);
                 assert_eq!(endpoint.port_inferred, port == 0);
                 assert_eq!(

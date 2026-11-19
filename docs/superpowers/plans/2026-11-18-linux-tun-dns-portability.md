@@ -12,6 +12,7 @@
 | --- | --- | --- |
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
 | Arch Linux ARM, QEMU, AArch64, ядро 7.3.5 | Установленные GNU helper и worker, systemd 262.2, nftables 1.1.7. Штатная ссылка `/etc/resolv.conf` на upstream-файл systemd-resolved. Отдельные прогоны с глобальным DNS и FallbackDNS | NSS и прямые DNS-запросы по TCP/UDP на порт 53, HTTPS, DoH, Stop и Unlock. Ссылка `/etc/resolv.conf` и содержимое файла совпали до и после. В сценарии с глобальным DNS systemd-resolved при Stop пересоздал свой файл в `/run` |
+| Arch Linux ARM, QEMU, AArch64, systemd 262.2 | Установленный helper, uplink-файл, глобальный DNS и строгий DoT | Оба движка обслужили NSS, реальные и синтетические ответы при прямом подключении по TCP/UDP на порт 53, HTTPS, DoH и восстановление после Stop. Для реальных DNS-запросов стенд подтвердил TLS 1.3. Ссылка и содержимое `/etc/resolv.conf` совпали до и после |
 | Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, переподключение DHCPv4, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
 | Debian 13.7, QEMU, x86-64 | Установленный стендовый helper с автономным worker, отдельным mount namespace, seccomp и системным D-Bus | Восстановление после прежнего worker, Prepare, Apply, Stop, Unlock, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS по Fake-IP и DoH через TUN. При остановке службы с активной сессией TUN удаляется, cgroup пустеют, карантин Fake-IP сохраняется |
 | Debian 13.7, QEMU, AArch64, systemd 257 и nftables 1.1.3 | Установленные GNU helper и worker без `test-support`, systemd-resolved с FallbackDNS, явная политика Proxy. Xray 26.10.31 и закреплённый адаптер sing-box 1.14.4 | Fake A/AAAA, TCP/UDP по IPv4 и IPv6, HTTPS с проверкой имени, DoH, Stop, Unlock, блокировка старых Fake-IP и восстановление DNS. На Xray также проверено восстановление карантина после удаления таблицы nftables. Содержимое и метаданные `/etc/resolv.conf` совпали до и после |
@@ -789,8 +790,12 @@ IPv4-сценарий с теми же проверками прошёл пов�
   `/run/systemd/resolve/resolv.conf`. Helper использует проверенную
   конфигурацию systemd-resolved, прямые запросы к её адресам обрабатывает
   существующий DNS-релей. Установку проводили в QEMU по раскладке
-  системных файлов из дерева пакетирования. Полный Arch-пакет с Qt для
-  AArch64 и DoT в режиме upstream-файла требуют отдельных проверок.
+  системных файлов из дерева пакетирования. Для строгого DoT на
+  глобальном сервере проверены оба DNS-пути в режиме uplink. Прямые
+  запросы клиентов к опубликованному адресу на порту 53 проходят через
+  TLS-релей. Доменная привязка DNS сохраняется по снимку
+  systemd-resolved, в том числе `DefaultRoute` исходных интерфейсов.
+  Полный Arch-пакет с Qt для AArch64 требует отдельной проверки.
   [Режимы resolv.conf в systemd-resolved](https://www.freedesktop.org/software/systemd/man/261/systemd-resolved.html)
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
