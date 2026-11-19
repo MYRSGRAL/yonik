@@ -39,6 +39,7 @@ pub struct SystemFakeDnsBridge {
     lookup_port: NonZeroU16,
     reinject_port: NonZeroU16,
     plain_dns_peers: Vec<PlainDnsPeer>,
+    reject_unbound_dns: bool,
     lookup_auth: ProbeCredentials,
     reinject_auth: ProbeCredentials,
 }
@@ -50,6 +51,8 @@ struct PlainDnsPeer {
 }
 
 impl SystemFakeDnsBridge {
+    pub const MAX_PLAIN_DNS_PEERS: usize = 3;
+
     pub fn new(
         dns_address: IpAddr,
         pools: Vec<Cidr>,
@@ -82,6 +85,7 @@ impl SystemFakeDnsBridge {
             lookup_port,
             reinject_port,
             plain_dns_peers: Vec::new(),
+            reject_unbound_dns: false,
             lookup_auth,
             reinject_auth,
         })
@@ -125,7 +129,7 @@ impl SystemFakeDnsBridge {
         mut self,
         peers: Vec<(IpAddr, NonZeroU16)>,
     ) -> Result<Self, CompileError> {
-        if peers.len() > 3 {
+        if peers.len() > Self::MAX_PLAIN_DNS_PEERS {
             return Err(CompileError::InvalidParameter);
         }
         let mut typed = Vec::with_capacity(peers.len());
@@ -153,6 +157,11 @@ impl SystemFakeDnsBridge {
         }
         self.plain_dns_peers = typed;
         Ok(self)
+    }
+
+    pub fn reject_unbound_system_dns(mut self) -> Self {
+        self.reject_unbound_dns = true;
+        self
     }
 }
 
@@ -268,7 +277,7 @@ fn attach_fake_dns(
 
     let (inbound, dns, socks) = match engine {
         Engine::Xray => {
-            let mut rules = Vec::with_capacity(bridge.plain_dns_peers.len() + 5);
+            let mut rules = Vec::with_capacity(bridge.plain_dns_peers.len() + 6);
             for (index, peer) in bridge.plain_dns_peers.iter().enumerate() {
                 rules.push(json!({
                     "type":"field",
@@ -284,6 +293,12 @@ fn attach_fake_dns(
                     "port":53, "network":"tcp,udp", "outboundTag":"fake-dns-stub"}),
                 json!({"type":"field", "inboundTag":["system-tun"], "ip":[dns_prefix],
                     "outboundTag":"fake-dns-reject"}),
+            ]);
+            if bridge.reject_unbound_dns {
+                rules.push(json!({"type":"field", "inboundTag":["system-tun"],
+                    "port":"53", "network":"tcp,udp", "outboundTag":"fake-dns-reject"}));
+            }
+            rules.extend([
                 json!({"type":"field", "inboundTag":["system-tun"], "ip":pools,
                     "outboundTag":"fake-ip-lookup"}),
                 json!({"type":"field", "inboundTag":["system-tun"], "ip":LINK_SCOPED_DESTINATIONS,
@@ -318,7 +333,7 @@ fn attach_fake_dns(
             )
         }
         Engine::SingBox => {
-            let mut rules = Vec::with_capacity(bridge.plain_dns_peers.len() + 5);
+            let mut rules = Vec::with_capacity(bridge.plain_dns_peers.len() + 6);
             for peer in &bridge.plain_dns_peers {
                 rules.push(json!({
                     "inbound":["system-tun"],
@@ -338,6 +353,12 @@ fn attach_fake_dns(
                     "override_address":local,"override_port":dns_port
                 }),
                 json!({"inbound":["system-tun"],"ip_cidr":[dns_prefix],"action":"reject"}),
+            ]);
+            if bridge.reject_unbound_dns {
+                rules.push(json!({"inbound":["system-tun"],"port":[53],
+                    "network":["tcp","udp"],"action":"reject"}));
+            }
+            rules.extend([
                 json!({"inbound":["system-tun"],"ip_cidr":pools,"action":"route","outbound":"fake-ip-lookup"}),
                 json!({"inbound":["system-tun"],"ip_cidr":LINK_SCOPED_DESTINATIONS,"action":"reject"}),
             ]);
@@ -686,7 +707,8 @@ mod tests {
         .with_isolated_loopback("127.42.7.9".parse().unwrap())
         .unwrap()
         .with_plain_dns_peers(peers.clone())
-        .unwrap();
+        .unwrap()
+        .reject_unbound_system_dns();
 
         for engine in [Engine::Xray, Engine::SingBox] {
             let config = compile_system_fake_dns_bridge(
@@ -701,7 +723,7 @@ mod tests {
                 Engine::Xray => &config.value["routing"]["rules"],
                 Engine::SingBox => &config.value["route"]["rules"],
             };
-            assert_eq!(rules.as_array().unwrap().len(), 7);
+            assert_eq!(rules.as_array().unwrap().len(), 8);
             for (index, (peer, local_port)) in peers.iter().enumerate() {
                 let rule = &rules[index];
                 let prefix = ip_prefix(*peer);
@@ -759,6 +781,15 @@ mod tests {
                     Engine::SingBox => "outbound",
                 }],
                 "fake-dns-stub"
+            );
+            assert_eq!(
+                rules[4],
+                match engine {
+                    Engine::Xray => json!({"type":"field","inboundTag":["system-tun"],"port":"53",
+                        "network":"tcp,udp","outboundTag":"fake-dns-reject"}),
+                    Engine::SingBox => json!({"inbound":["system-tun"],"port":[53],
+                        "network":["tcp","udp"],"action":"reject"}),
+                }
             );
         }
     }

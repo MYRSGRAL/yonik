@@ -1824,7 +1824,7 @@ impl Backend {
         };
         let fake_dns = match request.fake_dns_domains {
             Some(domains) => Some(Arc::new(
-                PreparedFakeDns::new(&plan, domains, direct_egress).await?,
+                PreparedFakeDns::new(&plan, &baseline, domains, direct_egress, cancel).await?,
             )),
             None => None,
         };
@@ -1936,7 +1936,7 @@ impl Backend {
             capture: route_capture,
         }];
         if let Some(fake_dns) = &fake_dns {
-            for peer in fake_dns.plain_peers() {
+            for (peer, expected_link) in fake_dns.plain_peers() {
                 for protocol in [crate::TransportProtocol::Tcp, crate::TransportProtocol::Udp] {
                     let query = RouteQuery::new(peer.ip(), 0)
                         .with_mark(plan.socket_mark())
@@ -1944,7 +1944,13 @@ impl Backend {
                     let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
                         .await
                         .map_err(unavailable)?;
-                    checked_route(&route, owner, plan.routing_table())?;
+                    let index = checked_route(&route, owner, plan.routing_table())?;
+                    if expected_link.is_some_and(|expected| expected != index)
+                        || fake_dns.uses_resolve1()
+                            && !session_fake_dns::usable_resolver_link(&baseline, index)
+                    {
+                        return Err(ServiceError::Unsupported);
+                    }
                     routes.push(ProfileRoute {
                         dns: true,
                         endpoint: peer.ip(),
@@ -2435,7 +2441,10 @@ impl Backend {
         if check != ExternalTopologyCheck::Verified {
             return Err(ServiceError::Unavailable);
         }
-        artifact.revalidate_routes(cancel, Some(index)).await?;
+        diagnostic_result(
+            "profile_routes",
+            artifact.revalidate_routes(cancel, Some(index)).await,
+        )?;
         let owner = self
             .journal
             .as_ref()
@@ -2462,7 +2471,7 @@ impl Backend {
         let active = self.active.as_ref().ok_or(ServiceError::Unavailable)?;
         let horizon = active.fake_dns.as_ref().map(|dns| dns.horizon.clone());
         if let Some(dns) = &active.fake_dns {
-            dns.verify().await?;
+            diagnostic_result("fake_dns_active", dns.verify().await)?;
         }
         let supervisor = self.supervisor.as_ref().ok_or(ServiceError::Unavailable)?;
         if diagnostic_value("observe_before", supervisor.observe(&active.ticket).await)

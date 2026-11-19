@@ -28,8 +28,8 @@ const MAX_PLAN_BYTES: usize = 64 * 1024;
 const RT_SCOPE_LINK: u8 = 253;
 const RT_TABLE_MAIN: u32 = 254;
 const RTPROT_KERNEL: u8 = 2;
-const ARPHRD_ETHER: u16 = 1;
-const IFF_UP: u32 = 1;
+pub(super) const ARPHRD_ETHER: u16 = 1;
+pub(super) const IFF_UP: u32 = 1;
 const IFF_LOOPBACK: u32 = 8;
 
 #[derive(Serialize, Deserialize)]
