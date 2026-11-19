@@ -545,7 +545,22 @@ async fn check_wireguard_dns(name: &str) -> Result {
 #[tokio::test]
 #[ignore = "выделенная Debian VM с resolvconf и двумя DNS-серверами тестового peer"]
 async fn production_helper_fake_dns_after_resolvconf_update() -> Result {
-    installed_fake_dns_after_network_change(FakeDnsNetworkChange::Resolvconf).await
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::Resolvconf {
+        initial: "10.203.1.2".parse()?,
+        updated: "10.203.1.6".parse()?,
+    })
+    .await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с resolvconf и двумя IPv6 DNS-серверами тестового peer"]
+async fn production_helper_fake_dns_after_ipv6_resolvconf_update() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::Resolvconf {
+        initial: "2001:db8:7472:1::2".parse()?,
+        updated: "2001:db8:7472:2::2".parse()?,
+    })
+    .await
 }
 
 #[cfg(feature = "test-support")]
@@ -874,7 +889,10 @@ enum FakeDnsNetworkChange {
     PeerRoute,
     ResolverLink,
     WireGuard,
-    Resolvconf,
+    Resolvconf {
+        initial: std::net::IpAddr,
+        updated: std::net::IpAddr,
+    },
     DhcpReconnect,
     DhcpRenewal,
 }
@@ -1035,9 +1053,9 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             FakeDnsNetworkChange::PeerRoute => change_fixture_peer_route("add")?,
             FakeDnsNetworkChange::ResolverLink => revoke_fixture_link_dns(&mut token).await?,
             FakeDnsNetworkChange::WireGuard => control_fixture_wireguard("connect")?,
-            FakeDnsNetworkChange::Resolvconf => {
-                check_fixture_real_resolver("10.203.1.2:53", "192.0.2.99").await?;
-                switch_fixture_resolver("10.203.1.6")?;
+            FakeDnsNetworkChange::Resolvconf { initial, updated } => {
+                check_fixture_resolver(initial, "192.0.2.99", old_v4, old_v6).await?;
+                switch_fixture_resolver(updated)?;
                 let published = resolver_file_state()?;
                 require(
                     published.contents != resolver_before.contents,
@@ -1067,7 +1085,7 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             },
             "Изменение сети нарушило выбранную политику kill switch",
         )?;
-        if change != FakeDnsNetworkChange::Resolvconf {
+        if !matches!(change, FakeDnsNetworkChange::Resolvconf { .. }) {
             let snapshot =
                 yonik_linux::read_resolve1_snapshot(&mut token, Duration::from_secs(3)).await?;
             require(
@@ -1129,8 +1147,8 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             "Новая сессия повторно выдала прежний Fake-IP",
         )?;
         check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
-        if change == FakeDnsNetworkChange::Resolvconf {
-            check_fixture_real_resolver("10.203.1.6:53", "192.0.2.100").await?;
+        if let FakeDnsNetworkChange::Resolvconf { updated, .. } = change {
+            check_fixture_resolver(updated, "192.0.2.100", v4, v6).await?;
         }
         for old in [old_v4, old_v6] {
             check_fake_flow_blocked((old, 40000).into()).await?;
@@ -1163,8 +1181,8 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             resolver_file_state()? == resolver_before,
             "Изменение сети повлияло на /etc/resolv.conf",
         )?;
-        if change == FakeDnsNetworkChange::Resolvconf {
-            switch_fixture_resolver("10.203.1.2")?;
+        if let FakeDnsNetworkChange::Resolvconf { initial, .. } = change {
+            switch_fixture_resolver(initial)?;
             resolver_before = resolver_file_state()?;
         }
         if dhcp {
@@ -1414,7 +1432,7 @@ fn control_dhcp_fixture(action: &str) -> Result {
 }
 
 #[cfg(feature = "test-support")]
-fn switch_fixture_resolver(address: &str) -> Result {
+fn switch_fixture_resolver(address: std::net::IpAddr) -> Result {
     use std::{io::Write, process::Stdio};
 
     let mut manager = Command::new("/usr/sbin/resolvconf")
@@ -1434,14 +1452,25 @@ fn switch_fixture_resolver(address: &str) -> Result {
 }
 
 #[cfg(feature = "test-support")]
-async fn check_fixture_real_resolver(peer: &str, answer: &str) -> Result {
-    let peer = peer.parse()?;
+async fn check_fixture_resolver(
+    address: std::net::IpAddr,
+    answer: &str,
+    fake_v4: std::net::IpAddr,
+    fake_v6: std::net::IpAddr,
+) -> Result {
+    let peer = (address, 53).into();
     let answer = answer.parse::<std::net::IpAddr>()?;
     for tcp in [false, true] {
         require(
             ask_fixture_dns(peer, "real.test", 1, tcp).await? == answer,
             "Ответ реального DNS не совпал с ответом контрольного сервера",
         )?;
+        for (qtype, expected) in [(1, fake_v4), (28, fake_v6)] {
+            require(
+                ask_fixture_dns(peer, "example.test", qtype, tcp).await? == expected,
+                "Прямой DNS-запрос не вернул Fake-IP, выданный через NSS",
+            )?;
+        }
     }
     Ok(())
 }
@@ -2570,7 +2599,12 @@ async fn ask_fixture_dns(
             socket.read_exact(&mut reply[..size]).await?;
             Ok(size)
         } else {
-            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            let bind = if peer.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            let socket = UdpSocket::bind(bind).await?;
             socket.connect(peer).await?;
             socket.send(&query).await?;
             socket.recv(&mut reply).await

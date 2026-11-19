@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
 | Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, переподключение DHCPv4, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
-| Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, адрес резолвера опубликован менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock, истечение карантина и восстановление после смены адреса через `resolvconf -a` |
+| Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, отдельные прогоны с IPv4- и IPv6-адресами резолвера, опубликованными менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock и восстановление после смены адреса через `resolvconf -a`. Истечение карантина проверено в сценарии с IPv4-резолвером |
 | Debian 13.7, systemd-resolved и внешний WireGuard | Установленный helper, приватная DNS-зона и маршруты IPv4/IPv6 через WireGuard | Публичный Fake DNS работает, обнаруженные приватные префиксы блокируются во время сессии. Приватный DNS и TCP/UDP доступны до запуска и после Stop |
 | Debian 13.7, Xfce 4.20 и X11, ядро 6.12.117 | Обычный UID в активной сессии LightDM и штатный диалог polkit. Отдельные прогоны с systemd-resolved и resolvconf 1.94 | Системный TUN, Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и карантин Fake-IP |
 | Ubuntu 24.04.5 LTS без графической сессии | Установленный helper, ядро 6.8.0-147, nftables 1.0.9 | TUN, Fake DNS, HTTPS, DoH и восстановление правил. Отдельно проверены смена маршрута, переподключение DHCPv4 и отзыв DNS-зоны |
@@ -141,6 +141,18 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
 обычные запросы обоими транспортами. Сервер не получил запросов к тестовому
 домену Fake DNS. Содержимое и метаданные `/etc/resolv.conf` совпали до и
 после сессии.
+
+На Debian 13.7 с ядром 6.12.117 и `resolvconf` 1.94 повторили смену адреса
+при работающем TUN с единственным IPv6-резолвером. На Xray и sing-box
+прямые запросы UDP/TCP давали те же Fake A/AAAA, что NSS. Оба исходных
+IPv6-резолвера ответили на обычные запросы по обоим транспортам. Их журналы
+подтвердили отсутствие запросов к синтетическому имени. После публикации
+нового адреса helper остановил старую сессию. Повторное подключение
+до истечения TTL выдало новые Fake A/AAAA, старые адреса блокировались.
+IPv4-сценарий с теми же проверками прошёл повторно. Запись в
+`/etc/resolv.conf` выполнял `resolvconf` при публикации адресов. Между этими
+событиями содержимое и идентичность файла сохранялись.
+[Интеграционные тесты IPv4 и IPv6](../../../crates/yonik-linux/tests/installed_helper_session.rs)
 
 - [x] Проверить переподключение DHCPv4 в Debian 13.7 и Ubuntu 24.04.5 LTS с
   `systemd-networkd` и `systemd-resolved`. В тесте
