@@ -504,6 +504,13 @@ async fn production_helper_fake_dns_after_resolver_restart() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "выделенная VM с активным systemd-resolved и постоянным DNS-стендом"]
+async fn production_helper_fake_dns_after_resolver_restart_and_ttl() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::ResolverRestartAfterTtl).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная Debian VM с tools/fixtures/wireguard_vm.py и wg"]
 async fn production_helper_fake_dns_preserves_external_wireguard() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::WireGuard).await
@@ -978,6 +985,7 @@ enum FakeDnsNetworkChange {
     PeerRoute,
     ResolverLink,
     ResolverRestart,
+    ResolverRestartAfterTtl,
     WireGuard,
     NetworkManagerDns,
     Resolvconf {
@@ -1015,6 +1023,8 @@ async fn installed_fake_dns_after_network_change_in_vm(
         tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
     }
     let (_owner, mut token) = yonik_linux::Cancellation::new();
+    let after_ttl = change == FakeDnsNetworkChange::ResolverRestartAfterTtl;
+    let resolver_restart = change == FakeDnsNetworkChange::ResolverRestart || after_ttl;
     let dhcp = matches!(
         change,
         FakeDnsNetworkChange::DhcpReconnect | FakeDnsNetworkChange::DhcpRenewal
@@ -1074,6 +1084,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         let before_query = tokio::time::Instant::now();
         let old_v4 = getent_fake_dns("ahostsv4", "example.test").await?;
         let old_v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+        let issued_by = tokio::time::Instant::now();
         check_tun_traffic_to([(old_v4, 40000).into(), (old_v6, 40000).into()]).await?;
         require(
             resolver_file_state()? == resolver_before,
@@ -1151,7 +1162,10 @@ async fn installed_fake_dns_after_network_change_in_vm(
         match change {
             FakeDnsNetworkChange::PeerRoute => change_fixture_peer_route("add")?,
             FakeDnsNetworkChange::ResolverLink => revoke_fixture_link_dns(&mut token).await?,
-            FakeDnsNetworkChange::ResolverRestart => restart_fixture_resolver(&connection).await?,
+            FakeDnsNetworkChange::ResolverRestart
+            | FakeDnsNetworkChange::ResolverRestartAfterTtl => {
+                restart_fixture_resolver(&connection).await?
+            }
             FakeDnsNetworkChange::WireGuard => control_fixture_wireguard("connect")?,
             FakeDnsNetworkChange::NetworkManagerDns => {
                 check_networkmanager_dns("192.0.2.99").await?;
@@ -1173,7 +1187,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         }
         // До закрытия вывода не обращаемся к helper по D-Bus. Только его
         // наблюдатель сетевых событий может остановить этот worker.
-        let drain_timeout = if change == FakeDnsNetworkChange::ResolverRestart {
+        let drain_timeout = if resolver_restart {
             // Смена владельца D-Bus подтверждается и плановой сверкой DNS.
             Duration::from_secs(25)
         } else {
@@ -1225,6 +1239,11 @@ async fn installed_fake_dns_after_network_change_in_vm(
             eprintln!("{engine:?}: восстановленный линк получил новый DNS через DHCP");
         }
         check_only_fake_is_filtered(old_v4, old_v6).await?;
+        if after_ttl {
+            tokio::time::sleep_until(issued_by + yonik_linux::fake_service::MAX_FAKE_TTL).await;
+            check_only_fake_is_filtered(old_v4, old_v6).await?;
+            eprintln!("{engine:?}: после DNS TTL прежние Fake-IP закрыты на физическом выходе");
+        }
         let wireguard = if change == FakeDnsNetworkChange::WireGuard {
             check_wireguard_traffic().await?;
             Some(fixture_wireguard_snapshot()?)
@@ -1247,16 +1266,26 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 "Нет набора DHCP после переподключения",
             )?;
         }
+        if after_ttl {
+            // После TTL адрес может быть выдан заново. В новой сессии проверяем
+            // старые назначения до первого запроса к имени.
+            for old in [old_v4, old_v6] {
+                check_fake_flow_blocked((old, 40000).into()).await?;
+            }
+            eprintln!("{engine:?}: новая сессия блокирует прежние Fake-IP до выдачи ответа DNS");
+        }
         let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
         let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
-        require(
-            before_query.elapsed() < yonik_linux::fake_service::MAX_FAKE_TTL,
-            "Повторное подключение превысило окно TTL прежних Fake-IP",
-        )?;
-        require(
-            v4 != old_v4 && v6 != old_v6,
-            "Новая сессия повторно выдала прежний Fake-IP",
-        )?;
+        if !after_ttl {
+            require(
+                before_query.elapsed() < yonik_linux::fake_service::MAX_FAKE_TTL,
+                "Повторное подключение превысило окно TTL прежних Fake-IP",
+            )?;
+            require(
+                v4 != old_v4 && v6 != old_v6,
+                "Новая сессия повторно выдала прежний Fake-IP",
+            )?;
+        }
         check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
         if let FakeDnsNetworkChange::Resolvconf { updated, .. } = change {
             check_fixture_resolver(updated, "192.0.2.100", v4, v6).await?;
@@ -1264,10 +1293,12 @@ async fn installed_fake_dns_after_network_change_in_vm(
         if change == FakeDnsNetworkChange::NetworkManagerDns {
             check_networkmanager_dns("192.0.2.100").await?;
         }
-        for old in [old_v4, old_v6] {
-            check_fake_flow_blocked((old, 40000).into()).await?;
+        if !after_ttl {
+            for old in [old_v4, old_v6] {
+                check_fake_flow_blocked((old, 40000).into()).await?;
+            }
         }
-        if change == FakeDnsNetworkChange::ResolverRestart {
+        if resolver_restart {
             check_fallback_dns_in_vm("real.test").await?;
         }
         if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
@@ -1281,7 +1312,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         if kill_switch {
             call(&connection, "Unlock", empty.clone()).await?;
         }
-        if change == FakeDnsNetworkChange::ResolverRestart {
+        if resolver_restart {
             check_fallback_dns_in_vm("restored.test").await?;
         }
         if change == FakeDnsNetworkChange::PeerRoute {
