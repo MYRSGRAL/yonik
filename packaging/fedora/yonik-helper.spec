@@ -19,7 +19,7 @@ Summary:        Системный сетевой помощник Yonik
 License:        GPL-3.0-only
 URL:            https://github.com/MYRSGRAL/yonik
 Source0:        %{name}-%{version}.tar.gz
-ExclusiveArch:  x86_64
+ExclusiveArch:  x86_64 aarch64
 
 BuildRequires:  make
 BuildRequires:  selinux-policy-devel

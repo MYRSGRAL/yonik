@@ -28,6 +28,7 @@
 | Debian 13.7, Ubuntu 24.04.5 и Fedora Cloud 45 с SELinux Enforcing | Установленный helper и `opportunistic` DoT при использовании только `FallbackDNS` | TLS подтверждён в Ubuntu и Fedora. Переход с TLS на UDP и TCP подтверждён в Debian и Ubuntu. Fake DNS и восстановление прошли на обоих движках |
 | Ubuntu 24.04.5 LTS, GNOME Shell 46 и Wayland, Qt 6.4.2 | Видимый Qt-клиент в активной сессии GDM, обычный UID и штатная политика polkit | TUN, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и истечение карантина после остановки helper |
 | Fedora Cloud 45, SELinux Enforcing | Установленный RPM, root-клиент на системной шине | TUN и Fake DNS, продление двух лизингов systemd-networkd 262, S3 через logind, обновление при остановленном helper и удаление с истечением карантина |
+| Fedora Cloud 45, QEMU, AArch64, SELinux Enforcing | Установленный RPM, ядро 7.2.11, systemd 262.1, nftables 1.1.6, systemd-resolved с FallbackDNS. Штатный helper в `yonik_helper_t` с `NoNewPrivs=1` | Xray и закреплённый sing-box прошли Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS, DoH и восстановление DNS после Stop. Карантин старых Fake-IP сохранился. Содержимое и метаданные `/etc/resolv.conf` совпали до и после |
 | Fedora Cloud 45 с GNOME Shell 51.1 и Wayland, SELinux Enforcing | Тот же RPM, обычный UID в активной сессии, системный D-Bus и штатный диалог polkit | TUN и Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop и удаление после пользовательской сессии |
 
 В этих прогонах содержимое и метаданные `/etc/resolv.conf` совпали до и
@@ -774,7 +775,12 @@ IPv4-сценарий с теми же проверками прошёл пов�
   а TUN исчез. Карантин остался в ядре. После перезапуска службы
   прошли Stop, Unlock и повторная проверка реального DNS. Содержимое и
   метаданные `/etc/resolv.conf` совпали до и после каждого сценария.
-  RPM для Fedora и пакет Arch на AArch64 требуют отдельных прогонов.
+  На Fedora Cloud 45 AArch64 официальный образ проверен по
+  подписанной сумме. Штатный spec с AArch64 собрал RPM в гостевой
+  системе. Установка и `rpm -V` прошли, байты ELF в RPM совпали
+  с проверенной GNU-сборкой. В режиме SELinux Enforcing проверены
+  полный сетевой цикл, восстановление DNS и карантин с обоими
+  движками. Пакет Arch на AArch64 требует отдельного прогона.
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
   `Unavailable` до запуска ядра. Политики Fedora 45.23 и 45.24 отклонили
