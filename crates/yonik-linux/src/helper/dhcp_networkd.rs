@@ -42,6 +42,8 @@ use zbus::{
 };
 
 const VALIDITY: Duration = Duration::from_secs(2);
+pub(crate) const DHCP_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const DHCP_PROBE_CONCURRENCY: usize = 4;
 const MAX_REPLY: usize = 64 * 1024;
 const GROUP: &str = "/system.slice/systemd-networkd.service";
 const NETWORKD: &str = "org.freedesktop.network1";

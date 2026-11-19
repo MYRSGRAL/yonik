@@ -83,7 +83,7 @@ macro_rules! equal_record {
     }};
 }
 pub(crate) fn same_external_topology(left: &LinuxTopology, right: &LinuxTopology) -> bool {
-    same_topology(left, right, None, None)
+    same_topology(left, right, None, &[])
 }
 pub(crate) fn same_captured_topology(
     left: &LinuxTopology,
@@ -91,7 +91,7 @@ pub(crate) fn same_captured_topology(
     right: &LinuxTopology,
     right_time: TopologyCapture,
 ) -> bool {
-    same_topology(left, right, Some((left_time, right_time)), None)
+    same_topology(left, right, Some((left_time, right_time)), &[])
 }
 #[derive(Clone, Copy)]
 pub(crate) struct RenewedDhcpAddress {
@@ -104,7 +104,7 @@ pub(crate) struct RenewedDhcpAddress {
 pub(crate) fn same_session_topology(
     left: (&LinuxTopology, TopologyCapture),
     right: (&LinuxTopology, TopologyCapture),
-    dhcp: Option<RenewedDhcpAddress>,
+    dhcp: &[RenewedDhcpAddress],
 ) -> bool {
     same_topology(left.0, right.0, Some((left.1, right.1)), dhcp)
 }
@@ -150,7 +150,7 @@ fn same_topology(
     left: &LinuxTopology,
     right: &LinuxTopology,
     times: Option<(TopologyCapture, TopologyCapture)>,
-    dhcp: Option<RenewedDhcpAddress>,
+    dhcp: &[RenewedDhcpAddress],
 ) -> bool {
     let LinuxTopology {
         namespace: _,
@@ -171,7 +171,11 @@ fn same_topology(
             .all(|(a, b)| same_link(a, b))
         && left.addresses.len() == right.addresses.len()
         && left.addresses.iter().zip(&right.addresses).all(|(a, b)| {
-            if let (Some(address), Some((_, capture))) = (dhcp, times) {
+            let renewal = dhcp
+                .binary_search_by_key(&a.index, |address| address.index)
+                .ok();
+            if let (Some(position), Some((_, capture))) = (renewal, times) {
+                let address = &dhcp[position];
                 if a.family == 2
                     && a.index == address.index
                     && a.prefix_len == address.prefix

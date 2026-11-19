@@ -115,6 +115,66 @@ fn dhcp_rule_keeps_cgroup_inode_in_durable_identity() {
 }
 
 #[test]
+fn dhcp_rules_accept_independent_keys_and_keep_the_legacy_single_rule() {
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap(),
+    )
+    .unwrap();
+    wire["dhcp_renewal_anchor"] = json!(true);
+    let first = json!({
+        "ifindex":7,"ifname":"test-dhcp","address":"192.0.2.10","server":"192.0.2.1",
+        "uid":999,"cgroup_id":2500,"dscp":32,"mark":0,"namespace_device":3,"namespace_inode":11
+    });
+    let mut second = first.clone();
+    second["ifindex"] = json!(9);
+    second["ifname"] = json!("second-dhcp");
+    second["address"] = json!("192.0.2.20");
+    wire["dhcp_renewal_rule"] = first.clone();
+    let single: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(single).unwrap(), wire);
+    wire["dhcp_renewal_rule"] = json!([second, first]);
+    let policy: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    let table = block_table(owner(), 2, 5, &policy);
+    let mut active = listing(&table, &policy);
+    assert_eq!(check(&active, &table, &policy), Ok(()));
+    let set = active["nftables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|item| item.get("set").is_some())
+        .unwrap();
+    let first_element = json!({"elem":{"val":{"concat":["192.0.2.10","192.0.2.1",7,"test-dhcp"]},"timeout":0,"expires":0}});
+    let second_element = json!({"elem":{"val":{"concat":["192.0.2.20","192.0.2.1",9,"second-dhcp"]},"timeout":0,"expires":0}});
+    for elements in [
+        json!([second_element, first_element]),
+        json!([second_element]),
+        json!([]),
+    ] {
+        active["nftables"][set]["set"]["elem"] = elements;
+        assert_eq!(check(&active, &table, &policy), Ok(()));
+    }
+    let mut cross_link = first_element.clone();
+    cross_link["elem"]["val"]["concat"][2] = json!(9);
+    for elements in [
+        json!([second_element, first_element, second_element]),
+        json!([second_element, cross_link]),
+    ] {
+        active["nftables"][set]["set"]["elem"] = elements;
+        assert_eq!(check(&active, &table, &policy), Err(NftError::Evidence));
+    }
+
+    for (field, invalid) in [
+        ("ifindex", json!(7)),
+        ("cgroup_id", json!(2501)),
+        ("namespace_device", json!(4)),
+    ] {
+        let mut bad = wire.clone();
+        bad["dhcp_renewal_rule"][0][field] = invalid;
+        assert!(serde_json::from_value::<PublicBlockPolicy>(bad).is_err());
+    }
+}
+
+#[test]
 fn dhcp_rule_only_accepts_the_exact_short_lived_element() {
     let mut wire = serde_json::to_value(
         PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![])

@@ -430,7 +430,7 @@ impl SessionNetworkPlan {
         current_capture: crate::network::TopologyCapture,
         journal: &Journal,
         index: u32,
-        dhcp: Option<crate::network::RenewedDhcpAddress>,
+        dhcp: &[crate::network::RenewedDhcpAddress],
     ) -> Result<(), TunError> {
         #[cfg(test)]
         let (baseline, baseline_capture) = baseline;

@@ -3,7 +3,7 @@
 use super::{MAX_OUTPUT, NftError};
 use crate::managed_network::firewall::{
     DHCP_CGROUP_PATH as DHCP_CGROUP, DHCP_RENEWAL_CHAIN as DHCP_CHAIN,
-    DHCP_RENEWAL_SET as DHCP_SET, DhcpRenewalKey,
+    DHCP_RENEWAL_SET as DHCP_SET, DhcpRenewalKey, MAX_DHCP_RENEWALS,
 };
 use serde_json::Value;
 use std::{fmt::Write as _, net::IpAddr};
@@ -18,19 +18,42 @@ type Result<T> = std::result::Result<T, NftError>;
 
 pub(super) fn dhcp_renewal(
     table: &str,
-    element: Option<(&DhcpRenewalKey, u64)>,
+    keys: &[DhcpRenewalKey],
+    timeout_ms: u64,
 ) -> Result<Vec<u8>> {
     check_table_name(table)?;
     let mut script = format!("flush set inet {table} {DHCP_SET}\n");
-    if let Some((key, timeout_ms)) = element {
-        require((1..1000).contains(&timeout_ms) && safe_ifname(&key.ifname))?;
+    require(keys.len() <= MAX_DHCP_RENEWALS && (1..1000).contains(&timeout_ms))?;
+    for key in keys {
+        let key = dhcp_element_key(key)?;
         write_fmt(writeln!(
             script,
-            "add element inet {table} {DHCP_SET} {{ {} . {} . {} . \"{}\" timeout {timeout_ms}ms }}",
-            key.address, key.server, key.ifindex, key.ifname
+            "add element inet {table} {DHCP_SET} {{ {key} timeout {timeout_ms}ms }}"
         ))?;
     }
     Ok(script.into_bytes())
+}
+
+pub(super) fn delete_dhcp_renewals(table: &str, keys: &[&DhcpRenewalKey]) -> Result<Vec<u8>> {
+    check_table_name(table)?;
+    require(!keys.is_empty() && keys.len() <= MAX_DHCP_RENEWALS)?;
+    let elements = keys
+        .iter()
+        .map(|key| dhcp_element_key(key))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!(
+        "delete element inet {table} {DHCP_SET} {{ {} }}\n",
+        elements.join(", ")
+    )
+    .into_bytes())
+}
+
+fn dhcp_element_key(key: &DhcpRenewalKey) -> Result<String> {
+    require(safe_ifname(&key.ifname))?;
+    Ok(format!(
+        "{} . {} . {} . \"{}\"",
+        key.address, key.server, key.ifindex, key.ifname
+    ))
 }
 
 pub(super) fn render(commands: &[Value]) -> Result<Vec<u8>> {
@@ -417,6 +440,24 @@ mod tests {
     use serde_json::{Value, json};
 
     const TABLE: &str = "yonik_0000000000000001";
+
+    #[test]
+    fn deletion_targets_only_the_stale_dhcp_key() {
+        let stale = super::DhcpRenewalKey {
+            address: "192.0.2.20".parse().unwrap(),
+            server: "192.0.2.1".parse().unwrap(),
+            ifindex: std::num::NonZeroU32::new(9).unwrap(),
+            ifname: "second-dhcp".into(),
+        };
+        assert_eq!(
+            super::delete_dhcp_renewals(TABLE, &[&stale]).unwrap(),
+            format!("delete element inet {TABLE} {DHCP_SET} {{ 192.0.2.20 . 192.0.2.1 . 9 . \"second-dhcp\" }}\n").into_bytes()
+        );
+        assert_eq!(
+            super::delete_dhcp_renewals(TABLE, &[]),
+            Err(NftError::Invalid)
+        );
+    }
 
     fn add(kind: &str, fields: Value) -> Value {
         json!({"add":{kind:fields}})

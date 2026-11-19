@@ -16,6 +16,7 @@ const OUTPUT_CHAIN: &str = "output";
 pub(super) const DHCP_RENEWAL_CHAIN: &str = "dhcp_renewal";
 pub(super) const DHCP_RENEWAL_SET: &str = "dhcp_renewal_leases";
 pub(super) const DHCP_CGROUP_PATH: &str = "system.slice/systemd-networkd.service";
+pub(crate) const MAX_DHCP_RENEWALS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyError {
@@ -266,6 +267,24 @@ pub(super) struct DhcpRenewalKey {
 }
 
 impl DhcpRule {
+    fn from_lease(
+        lease: &crate::helper::dhcp_networkd::DhcpNetworkdLease,
+    ) -> Result<Self, PolicyError> {
+        let path = lease.path().ok_or(PolicyError::Interface)?;
+        Ok(Self {
+            ifindex: interface(path.interface)?,
+            ifname: InterfaceName::try_from(path.ifname.to_owned())?,
+            address: path.address,
+            server: path.server,
+            uid: interface(path.uid)?,
+            cgroup_id: path.cgroup_id,
+            dscp: path.route_tos >> 2,
+            mark: path.route_mark,
+            namespace_device: path.namespace.device,
+            namespace_inode: NonZeroU64::new(path.namespace.inode).ok_or(PolicyError::Interface)?,
+        })
+    }
+
     fn command(&self, table: &str) -> Value {
         let payload = |protocol, field| json!({"payload":{"protocol":protocol,"field":field}});
         let addresses_and_link = json!({"concat":[
@@ -296,6 +315,25 @@ impl DhcpRule {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DhcpRulesDto {
+    Single(DhcpRule),
+    Multiple(Vec<DhcpRule>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DhcpRules(Vec<DhcpRule>);
+
+impl Serialize for DhcpRules {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0.as_slice() {
+            [rule] => rule.serialize(serializer),
+            rules => rules.serialize(serializer),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "PublicBlockPolicyDto")]
 pub struct PublicBlockPolicy {
@@ -312,8 +350,8 @@ pub struct PublicBlockPolicy {
     isolated_loopback: Option<IsolatedLoopback>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     dhcp_renewal_anchor: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    dhcp_renewal_rule: Option<Box<DhcpRule>>,
+    #[serde(rename = "dhcp_renewal_rule", skip_serializing_if = "Option::is_none")]
+    dhcp_renewal_rules: Option<Box<DhcpRules>>,
 }
 
 /// Выделенный 127/8 адрес, доступный через loopback helper UID 0 и одному worker.
@@ -364,7 +402,7 @@ impl PublicBlockPolicy {
             + self.isolated_loopback.map_or(0, |_| 6)
             + self.bound_direct.len() * 2
             + usize::from(self.dhcp_renewal_anchor)
-            + usize::from(self.dhcp_renewal_rule.is_some())
+            + self.dhcp_rule_count()
     }
 
     pub(crate) fn with_bound_direct(
@@ -430,7 +468,7 @@ impl PublicBlockPolicy {
         .with_isolated_loopback_config(self.isolated_loopback)?
         .with_bound_direct(self.bound_direct.clone())?
         .with_dhcp_renewal_anchor(self.dhcp_renewal_anchor)?
-        .with_dhcp_rule_config(self.dhcp_renewal_rule.clone())
+        .with_dhcp_rule_config(self.dhcp_rules().to_vec())
     }
     pub fn new(
         loopback_ifindex: u32,
@@ -486,7 +524,7 @@ impl PublicBlockPolicy {
             link_control: Vec::new(),
             isolated_loopback: None,
             dhcp_renewal_anchor: false,
-            dhcp_renewal_rule: None,
+            dhcp_renewal_rules: None,
         })
     }
 
@@ -529,7 +567,8 @@ impl PublicBlockPolicy {
 
     /// Резервирует пустую цепочку продления DHCP в активной политике TUN.
     pub(crate) fn with_dhcp_renewal_anchor(mut self, enabled: bool) -> Result<Self, PolicyError> {
-        if (enabled && self.tun_ifindex.is_none()) || (!enabled && self.dhcp_renewal_rule.is_some())
+        if (enabled && self.tun_ifindex.is_none())
+            || (!enabled && self.dhcp_renewal_rules.is_some())
         {
             return Err(PolicyError::Interface);
         }
@@ -546,28 +585,33 @@ impl PublicBlockPolicy {
 
     /// Добавляет правило для проверенного сокета. Набор разрешённых лизингов пуст.
     pub fn with_dhcp_renewal_rule(
-        self,
+        mut self,
         lease: &crate::helper::dhcp_networkd::DhcpNetworkdLease,
     ) -> Result<Self, PolicyError> {
-        let path = lease.path().ok_or(PolicyError::Interface)?;
+        let mut rules = self
+            .dhcp_renewal_rules
+            .take()
+            .map_or_else(Vec::new, |rules| rules.0);
+        rules.push(DhcpRule::from_lease(lease)?);
         self.with_dhcp_renewal_anchor(true)?
-            .with_dhcp_rule_config(Some(Box::new(DhcpRule {
-                ifindex: interface(path.interface)?,
-                ifname: InterfaceName::try_from(path.ifname.to_owned())?,
-                address: path.address,
-                server: path.server,
-                uid: interface(path.uid)?,
-                cgroup_id: path.cgroup_id,
-                dscp: path.route_tos >> 2,
-                mark: path.route_mark,
-                namespace_device: path.namespace.device,
-                namespace_inode: NonZeroU64::new(path.namespace.inode)
-                    .ok_or(PolicyError::Interface)?,
-            })))
+            .with_dhcp_rule_config(rules)
     }
 
-    fn with_dhcp_rule_config(mut self, rule: Option<Box<DhcpRule>>) -> Result<Self, PolicyError> {
-        if let Some(rule) = &rule {
+    fn with_dhcp_rule_config(mut self, mut rules: Vec<DhcpRule>) -> Result<Self, PolicyError> {
+        if rules.len() > MAX_DHCP_RENEWALS {
+            return Err(PolicyError::Limit);
+        }
+        rules.sort_unstable_by_key(|rule| rule.ifindex);
+        if rules.windows(2).any(|pair| {
+            pair[0].ifindex == pair[1].ifindex
+                || pair[0].cgroup_id != pair[1].cgroup_id
+                || pair[0].uid != pair[1].uid
+                || pair[0].namespace_device != pair[1].namespace_device
+                || pair[0].namespace_inode != pair[1].namespace_inode
+        }) {
+            return Err(PolicyError::Interface);
+        }
+        for rule in &rules {
             let name = String::from(rule.ifname);
             if !self.dhcp_renewal_anchor
                 || rule.ifindex == self.loopback_ifindex
@@ -594,7 +638,7 @@ impl PublicBlockPolicy {
                 return Err(PolicyError::PrivateTransport);
             }
         }
-        self.dhcp_renewal_rule = rule;
+        self.dhcp_renewal_rules = (!rules.is_empty()).then(|| Box::new(DhcpRules(rules)));
         if self.exception_count() > MAX_EXCEPTIONS {
             return Err(PolicyError::Limit);
         }
@@ -602,15 +646,23 @@ impl PublicBlockPolicy {
     }
 
     pub(super) fn dhcp_rule_identity(&self) -> Option<((u64, u64), NonZeroU64)> {
-        let rule = self.dhcp_renewal_rule.as_ref()?;
+        let rule = self.dhcp_rules().first()?;
         Some((
             (rule.namespace_device, rule.namespace_inode.get()),
             rule.cgroup_id,
         ))
     }
 
-    pub(super) fn dhcp_renewal_key(&self) -> Option<DhcpRenewalKey> {
-        let rule = self.dhcp_renewal_rule.as_ref()?;
+    fn dhcp_rule(&self, index: NonZeroU32) -> Option<&DhcpRule> {
+        let position = self
+            .dhcp_rules()
+            .binary_search_by_key(&index, |rule| rule.ifindex)
+            .ok()?;
+        self.dhcp_rules().get(position)
+    }
+
+    pub(super) fn dhcp_renewal_key(&self, index: NonZeroU32) -> Option<DhcpRenewalKey> {
+        let rule = self.dhcp_rule(index)?;
         Some(DhcpRenewalKey {
             address: rule.address,
             server: rule.server,
@@ -619,8 +671,22 @@ impl PublicBlockPolicy {
         })
     }
 
-    pub(crate) fn dhcp_renewal_ifindex(&self) -> Option<NonZeroU32> {
-        self.dhcp_renewal_rule.as_ref().map(|rule| rule.ifindex)
+    fn dhcp_rules(&self) -> &[DhcpRule] {
+        self.dhcp_renewal_rules
+            .as_deref()
+            .map_or(&[], |rules| &rules.0)
+    }
+
+    pub(crate) fn dhcp_rule_count(&self) -> usize {
+        self.dhcp_rules().len()
+    }
+
+    pub(crate) fn matches_dhcp_lease(
+        &self,
+        lease: &crate::helper::dhcp_networkd::DhcpNetworkdLease,
+    ) -> Option<NonZeroU32> {
+        let observed = DhcpRule::from_lease(lease).ok()?;
+        (self.dhcp_rule(observed.ifindex)? == &observed).then_some(observed.ifindex)
     }
 
     /// Отпечаток канонических правил не зависит от имени принадлежащей helper таблицы.
@@ -648,7 +714,7 @@ impl PublicBlockPolicy {
             commands.push(json!({"add":{"chain":{
                 "family":"inet","table":table_name,"name":DHCP_RENEWAL_CHAIN
             }}}));
-            if let Some(rule) = &self.dhcp_renewal_rule {
+            for rule in self.dhcp_rules() {
                 commands.push(rule.command(table_name));
             }
         }
@@ -914,7 +980,7 @@ struct PublicBlockPolicyDto {
     #[serde(default)]
     dhcp_renewal_anchor: bool,
     #[serde(default)]
-    dhcp_renewal_rule: Option<Box<DhcpRule>>,
+    dhcp_renewal_rule: Option<DhcpRulesDto>,
 }
 impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
     type Error = PolicyError;
@@ -931,7 +997,11 @@ impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
         .with_isolated_loopback_config(value.isolated_loopback)?
         .with_bound_direct(value.bound_direct)?
         .with_dhcp_renewal_anchor(value.dhcp_renewal_anchor)?
-        .with_dhcp_rule_config(value.dhcp_renewal_rule)
+        .with_dhcp_rule_config(match value.dhcp_renewal_rule {
+            None => Vec::new(),
+            Some(DhcpRulesDto::Single(rule)) => vec![rule],
+            Some(DhcpRulesDto::Multiple(rules)) => rules,
+        })
     }
 }
 

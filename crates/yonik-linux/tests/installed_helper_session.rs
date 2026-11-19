@@ -880,6 +880,10 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         change,
         FakeDnsNetworkChange::DhcpReconnect | FakeDnsNetworkChange::DhcpRenewal
     );
+    let mut dhcp_links = vec![("yonik-dhcp", "10.203.2.10", "10.203.2.1")];
+    if std::env::var_os("YONIK_DHCP_SECOND_FIXTURE").is_some() {
+        dhcp_links.push(("yonik-dhcp2", "10.203.3.10", "10.203.3.1"));
+    }
     for (engine, kill_switch) in [(Engine::Xray, true), (Engine::SingBox, false)] {
         if dhcp {
             check_dhcp_fixture_dns("10.203.2.1", &mut token).await?;
@@ -900,32 +904,33 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             )?;
         }
         if change == FakeDnsNetworkChange::DhcpRenewal {
-            check_running_dhcp_renewal().await?;
-            let index = fs::read_to_string("/sys/class/net/yonik-dhcp/ifindex")?;
-            let index: i32 = index.trim().parse()?;
-            let networkd = zbus::Proxy::new(
-                &connection,
-                "org.freedesktop.network1",
-                "/org/freedesktop/network1",
-                "org.freedesktop.network1.Manager",
-            )
-            .await?;
-            let before = dhcp_lease_timestamp(&networkd, index).await?;
-            require(
-                Command::new("/usr/bin/networkctl")
-                    .args(["renew", "yonik-dhcp"])
-                    .status()?
-                    .success(),
-                "Стенд не запросил продление DHCP",
-            )?;
-            tokio::time::timeout(Duration::from_secs(6), async {
-                while dhcp_lease_timestamp(&networkd, index).await? <= before {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Ok::<_, Box<dyn std::error::Error>>(())
-            })
-            .await??;
-            eprintln!("{engine:?}: DHCP продлён при работающей TUN-сессии");
+            check_running_dhcp_renewal(&dhcp_links).await?;
+            renew_dhcp_links(&connection, &dhcp_links, None).await?;
+            eprintln!(
+                "{engine:?}: DHCP продлён на {} интерфейсах при работающем TUN",
+                dhcp_links.len()
+            );
+            if dhcp_links.len() == 2 && !kill_switch {
+                let signal_server = |signal: &str| {
+                    Command::new("/usr/bin/systemctl")
+                        .args([
+                            "kill",
+                            "--kill-whom=main",
+                            signal,
+                            "yonik-dhcp2-fixture.service",
+                        ])
+                        .status()
+                };
+                require(
+                    signal_server("--signal=STOP")?.success(),
+                    "Стенд не приостановил второй DHCP-сервер",
+                )?;
+                let renewed = renew_dhcp_links(&connection, &dhcp_links, Some("yonik-dhcp2")).await;
+                let resumed = signal_server("--signal=CONT")?;
+                renewed?;
+                require(resumed.success(), "Стенд не восстановил второй DHCP-сервер")?;
+                eprintln!("{engine:?}: первый лизинг продлён при недоступном втором DHCP-сервере");
+            }
         }
         let before_query = tokio::time::Instant::now();
         let old_v4 = getent_fake_dns("ahostsv4", "example.test").await?;
@@ -936,7 +941,7 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             "Сессия изменила /etc/resolv.conf до вмешательства стенда",
         )?;
         if change == FakeDnsNetworkChange::DhcpRenewal {
-            check_running_dhcp_renewal().await?;
+            check_running_dhcp_renewal(&dhcp_links).await?;
             call(&connection, "Stop", empty.clone()).await?;
             require(
                 tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
@@ -1125,20 +1130,42 @@ fn dhcp_renewal_set() -> Result<Option<Value>> {
 }
 
 #[cfg(feature = "test-support")]
-async fn check_running_dhcp_renewal() -> Result {
+async fn check_running_dhcp_renewal(links: &[(&str, &str, &str)]) -> Result {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(set) = dhcp_renewal_set()? {
                 require(set["flags"] == json!(["timeout"]), "Нет таймера DHCP")?;
-                if let Some([element]) = set["elem"].as_array().map(Vec::as_slice) {
+                if let Some(elements) = set["elem"].as_array() {
+                    let matches =
+                        |element: &Value, (name, address, server): &(&str, &str, &str)| {
+                            element
+                                .pointer("/elem/val/concat/0")
+                                .and_then(Value::as_str)
+                                == Some(*address)
+                                && element
+                                    .pointer("/elem/val/concat/1")
+                                    .and_then(Value::as_str)
+                                    == Some(*server)
+                                && element
+                                    .pointer("/elem/val/concat/3")
+                                    .and_then(Value::as_str)
+                                    == Some(*name)
+                                && element.pointer("/elem/timeout") == Some(&json!(0))
+                                && element.pointer("/elem/expires") == Some(&json!(0))
+                        };
                     require(
-                        element.pointer("/elem/val/concat/0") == Some(&json!("10.203.2.10"))
-                            && element.pointer("/elem/val/concat/1") == Some(&json!("10.203.2.1"))
-                            && element.pointer("/elem/timeout") == Some(&json!(0))
-                            && element.pointer("/elem/expires") == Some(&json!(0)),
+                        elements
+                            .iter()
+                            .all(|element| links.iter().any(|link| matches(element, link))),
                         "Активный DHCP-элемент содержит другой лизинг или таймер",
                     )?;
-                    return Ok::<_, Box<dyn std::error::Error>>(());
+                    if elements.len() == links.len()
+                        && links
+                            .iter()
+                            .all(|link| elements.iter().any(|element| matches(element, link)))
+                    {
+                        return Ok::<_, Box<dyn std::error::Error>>(());
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1146,6 +1173,64 @@ async fn check_running_dhcp_renewal() -> Result {
     })
     .await
     .map_err(|_| io::Error::other("Установленный helper не обновляет допуск DHCP"))?
+}
+
+#[cfg(feature = "test-support")]
+async fn renew_dhcp_links(
+    connection: &zbus::Connection,
+    links: &[(&str, &str, &str)],
+    offline: Option<&str>,
+) -> Result {
+    let networkd = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.network1",
+        "/org/freedesktop/network1",
+        "org.freedesktop.network1.Manager",
+    )
+    .await?;
+    let mut pending = std::collections::BTreeMap::new();
+    for (name, _, _) in links {
+        let index: i32 = fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))?
+            .trim()
+            .parse()?;
+        pending.insert(
+            index,
+            (*name, dhcp_lease_timestamp(&networkd, index).await?),
+        );
+    }
+    require(
+        Command::new("/usr/bin/networkctl")
+            .arg("renew")
+            .args(links.iter().map(|(name, _, _)| name))
+            .status()?
+            .success(),
+        "Стенд не запросил продление DHCP",
+    )?;
+    for (&index, &(name, original)) in &pending {
+        if Some(name) == offline {
+            continue;
+        }
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while dhcp_lease_timestamp(&networkd, index).await? <= original {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })
+        .await
+        .map_err(|_| io::Error::other(format!("Не продлён лизинг интерфейса {index}")))??;
+    }
+    if let Some(offline) = offline {
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let Some((&index, &(_, original))) = pending.iter().find(|(_, (name, _))| *name == offline)
+        else {
+            return Err(io::Error::other("Нет отключённого DHCP-линка в стенде").into());
+        };
+        require(
+            dhcp_lease_timestamp(&networkd, index).await? == original,
+            "Лизинг изменился при отключённом DHCP-сервере",
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "test-support")]

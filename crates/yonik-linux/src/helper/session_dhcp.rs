@@ -4,12 +4,16 @@ use super::{
 };
 use crate::{
     Cancellation,
-    helper::dhcp_networkd::DhcpNetworkdLease,
-    managed_network::nft::{NftError, NftExecutor},
+    helper::dhcp_networkd::{DHCP_PROBE_CONCURRENCY, DHCP_PROBE_TIMEOUT, DhcpNetworkdLease},
+    managed_network::{
+        firewall::MAX_DHCP_RENEWALS,
+        nft::{NftError, NftExecutor},
+    },
     network::RenewedDhcpAddress,
 };
+use futures_util::{StreamExt, stream};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroU32,
     sync::{Mutex, TryLockError, Weak},
     time::Duration,
@@ -17,19 +21,47 @@ use std::{
 
 const ADMISSION_TIMEOUT: Duration = Duration::from_millis(450);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(300);
-const REFRESH_BUDGET: Duration = Duration::from_millis(550);
-const MAX_CANDIDATES: usize = 8;
+// По две волны на чтение и повторную сверку восьми лизингов, отдельно nft.
+const REFRESH_BUDGET: Duration = Duration::from_millis(900);
+const REVOKE_BUDGET: Duration = Duration::from_millis(550);
+pub(super) type DhcpInterfaces = BTreeMap<NonZeroU32, u64>;
 
 pub(super) struct DhcpRefresh {
     _task: SafetyTask,
-    initial_lease: u64,
+    initial_leases: DhcpInterfaces,
+}
+
+async fn capture_leases(
+    indices: impl IntoIterator<Item = NonZeroU32>,
+    cancel: &Cancellation,
+) -> Vec<DhcpNetworkdLease> {
+    stream::iter(indices)
+        .map(|index| {
+            let mut token = cancel.clone();
+            async move {
+                diagnostic_result(
+                    "dhcp_capture_lease",
+                    tokio::time::timeout(
+                        DHCP_PROBE_TIMEOUT,
+                        DhcpNetworkdLease::capture(index, &mut token),
+                    )
+                    .await
+                    .unwrap_or(Err(crate::NetworkReadError::Timeout)),
+                )
+                .ok()
+            }
+        })
+        .buffer_unordered(DHCP_PROBE_CONCURRENCY)
+        .filter_map(std::future::ready)
+        .collect()
+        .await
 }
 
 pub(super) async fn select_policy(
     baseline: &LinuxTopology,
     policy: &PublicBlockPolicy,
     cancel: &mut Cancellation,
-) -> Option<(NonZeroU32, u64, PublicBlockPolicy)> {
+) -> Option<(DhcpInterfaces, PublicBlockPolicy)> {
     let ipv4: BTreeSet<_> = baseline
         .addresses
         .iter()
@@ -46,34 +78,25 @@ pub(super) async fn select_policy(
                 && !matches!(link.kind.as_deref(), Some(b"tun" | b"wireguard"))
         })
         .filter_map(|link| NonZeroU32::new(link.index))
-        .take(MAX_CANDIDATES + 1)
+        .take(MAX_DHCP_RENEWALS + 1)
         .collect();
-    if candidates.len() > MAX_CANDIDATES {
+    if candidates.len() > MAX_DHCP_RENEWALS {
         return None;
     }
-    tokio::time::timeout(ADMISSION_TIMEOUT, async {
-        let mut selected = None;
-        for index in candidates {
-            if let Ok(lease) = diagnostic_result(
-                "dhcp_admission",
-                DhcpNetworkdLease::capture(index, cancel).await,
-            ) {
-                if let (Some(path), Ok(bound)) =
-                    (lease.path(), policy.clone().with_dhcp_renewal_rule(&lease))
-                {
-                    // Текущий формат политики хранит одно правило. При двух
-                    // проверенных лизингах выбор зависел бы от порядка линков.
-                    if selected.replace((index, path.acquired, bound)).is_some() {
-                        return None;
-                    }
-                }
+    let leases = capture_leases(candidates, cancel).await;
+    let mut policy = policy.clone();
+    let mut selected = BTreeMap::new();
+    for lease in &leases {
+        if let (Some(path), Ok(bound)) =
+            (lease.path(), policy.clone().with_dhcp_renewal_rule(lease))
+        {
+            if let Some(index) = NonZeroU32::new(path.interface) {
+                selected.insert(index, path.acquired);
+                policy = bound;
             }
         }
-        selected
-    })
-    .await
-    .ok()
-    .flatten()
+    }
+    (!selected.is_empty()).then_some((selected, policy))
 }
 
 pub(super) async fn check_policy(nft: &mut NftExecutor, policy: &PublicBlockPolicy) -> bool {
@@ -90,8 +113,7 @@ pub(super) fn spawn_refresh(
     backend: Weak<Mutex<Backend>>,
     runtime: &tokio::runtime::Handle,
     epoch: u64,
-    index: NonZeroU32,
-    initial_lease: u64,
+    initial_leases: DhcpInterfaces,
 ) -> DhcpRefresh {
     let task_runtime = runtime.clone();
     let task = runtime.spawn(async move {
@@ -120,7 +142,7 @@ pub(super) fn spawn_refresh(
                     }
                     runtime.block_on(async {
                         let _tick =
-                            tokio::time::timeout(REFRESH_BUDGET, backend.refresh_dhcp(index)).await;
+                            tokio::time::timeout(REFRESH_BUDGET, backend.refresh_dhcp()).await;
                     });
                     true
                 })
@@ -133,71 +155,79 @@ pub(super) fn spawn_refresh(
     });
     DhcpRefresh {
         _task: SafetyTask(task),
-        initial_lease,
+        initial_leases,
     }
 }
 
 impl Backend {
-    pub(super) async fn verified_dhcp_address(
+    pub(super) async fn verified_dhcp_addresses(
         &self,
-        cancel: &mut Cancellation,
-    ) -> Option<RenewedDhcpAddress> {
-        let refresh = self.active.as_ref()?.dhcp_refresh.as_ref()?;
-        let (journal, _) = self.dhcp_policy()?;
-        let PublicPolicyPhase::Stable { policy } = journal.public_policy()?.phase() else {
-            return None;
+        cancel: &Cancellation,
+    ) -> Vec<RenewedDhcpAddress> {
+        let Some((_, _, policy)) = self.dhcp_policy() else {
+            return Vec::new();
         };
-        let index = policy.dhcp_renewal_ifindex()?;
-        let lease =
-            tokio::time::timeout(ADMISSION_TIMEOUT, DhcpNetworkdLease::capture(index, cancel))
-                .await
-                .ok()?
-                .ok()?;
-        let actual = policy.clone().with_dhcp_renewal_rule(&lease).ok()?;
-        if &actual != policy {
-            return None;
-        }
-        let path = lease.path()?;
-        if path.acquired <= refresh.initial_lease {
-            return None;
-        }
-        Some(RenewedDhcpAddress {
-            index: path.interface,
-            local: path.address,
-            prefix: path.prefix_len,
-            expiries: lease.address_expiries()?,
-        })
+        let Some(refresh) = self
+            .active
+            .as_ref()
+            .and_then(|session| session.dhcp_refresh.as_ref())
+        else {
+            return Vec::new();
+        };
+        let mut addresses: Vec<_> = capture_leases(refresh.initial_leases.keys().copied(), cancel)
+            .await
+            .iter()
+            .filter_map(|lease| {
+                let index = policy.matches_dhcp_lease(lease)?;
+                let path = lease.path()?;
+                if path.acquired <= *refresh.initial_leases.get(&index)? {
+                    return None;
+                }
+                Some(RenewedDhcpAddress {
+                    index: path.interface,
+                    local: path.address,
+                    prefix: path.prefix_len,
+                    expiries: lease.address_expiries()?,
+                })
+            })
+            .collect();
+        addresses.sort_unstable_by_key(|address| address.index);
+        addresses
     }
 
-    async fn refresh_dhcp(&self, index: NonZeroU32) {
+    async fn refresh_dhcp(&self) {
         let snapshot = self.watch.current();
         if !snapshot.coverage.routes || snapshot.exhausted {
             return;
         }
-        let Some((journal, revision)) = self.dhcp_policy() else {
+        let Some((journal, revision, _)) = self.dhcp_policy() else {
+            return;
+        };
+        let Some(refresh) = self
+            .active
+            .as_ref()
+            .and_then(|session| session.dhcp_refresh.as_ref())
+        else {
             return;
         };
         let (_owner, mut cancel) = fresh_cancel();
-        let Ok(mut lease) = DhcpNetworkdLease::capture(index, &mut cancel).await else {
-            return;
-        };
+        let mut leases = capture_leases(refresh.initial_leases.keys().copied(), &cancel).await;
         if let Ok(mut nft) = self.executor(journal.ownership()) {
             let _refresh = diagnostic_result(
                 "dhcp_refresh",
-                nft.refresh_dhcp_renewal(journal, revision, &mut lease, &mut cancel)
+                nft.refresh_dhcp_renewals(journal, revision, &mut leases, &mut cancel)
                     .await,
             );
         }
     }
 
-    fn dhcp_policy(&self) -> Option<(&Journal, u64)> {
+    fn dhcp_policy(&self) -> Option<(&Journal, u64, &PublicBlockPolicy)> {
         let journal = self.journal.as_ref()?;
         let record = journal.public_policy()?;
         let PublicPolicyPhase::Stable { policy } = record.phase() else {
             return None;
         };
-        policy.dhcp_renewal_ifindex()?;
-        Some((journal, record.revision()))
+        (policy.dhcp_rule_count() != 0).then_some((journal, record.revision(), policy))
     }
 
     pub(super) async fn revoke_session_dhcp(&mut self) {
@@ -206,16 +236,13 @@ impl Backend {
         }
         // После crash элемент может прожить остаток таймера ядра.
         // При восстановлении также пробуем отозвать его сразу.
-        if let Some((journal, revision)) = self.dhcp_policy() {
+        if let Some((journal, revision, _)) = self.dhcp_policy() {
             if let Ok(mut nft) = self.executor(journal.ownership()) {
                 let _revoke = diagnostic_result(
                     "dhcp_revoke",
-                    tokio::time::timeout(
-                        REFRESH_BUDGET,
-                        nft.revoke_dhcp_renewal(journal, revision),
-                    )
-                    .await
-                    .unwrap_or(Err(NftError::Timeout)),
+                    tokio::time::timeout(REVOKE_BUDGET, nft.revoke_dhcp_renewal(journal, revision))
+                        .await
+                        .unwrap_or(Err(NftError::Timeout)),
                 );
             }
         }

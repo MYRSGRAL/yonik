@@ -8,19 +8,33 @@ test "$(id -u)" = 0
 client=yonik-dhcp
 server=yonik-dhcp-peer
 peer=yonik-peer
-unit=yonik-dhcp-fixture.service
-state=/run/yonik-dhcp-fixture
+subnet=10.203.2
+domain='~real.test'
+publish_dns=yes
+case "${YONIK_DHCP_FIXTURE:-primary}" in
+    primary) ;;
+    second)
+        client=yonik-dhcp2
+        server=yonik-dhcp2-srv
+        subnet=10.203.3
+        domain=
+        publish_dns=no
+        ;;
+    *) exit 2 ;;
+esac
+unit="$client-fixture.service"
+state="/run/$client-fixture"
 
 start_server() {
     local dns=$1
     case "$dns" in
-        10.203.2.1|10.203.2.2) ;;
+        "$subnet.1"|"$subnet.2") ;;
         *) return 1 ;;
     esac
     cat > "$state/udhcpd.conf" <<EOF
 interface $server
-start 10.203.2.10
-end 10.203.2.10
+start $subnet.10
+end $subnet.10
 max_leases 1
 pidfile $state/udhcpd.pid
 lease_file $state/udhcpd.leases
@@ -38,20 +52,20 @@ case "${1:-}" in
     prepare)
         install -d -m 0700 "$state"
         install -d -m 0755 /run/systemd/network
-        cat > /run/systemd/network/00-yonik-dhcp.network <<EOF
+        cat > "/run/systemd/network/00-$client.network" <<EOF
 [Match]
 Name=$client
 [Link]
 RequiredForOnline=no
 [Network]
 DHCP=ipv4
-Domains=~real.test
+Domains=$domain
 DNSDefaultRoute=no
 LinkLocalAddressing=no
 IPv6AcceptRA=no
 [DHCPv4]
 ClientIdentifier=mac
-UseDNS=yes
+UseDNS=$publish_dns
 RoutesToDNS=no
 UseRoutes=no
 UseGateway=no
@@ -59,20 +73,20 @@ UseNTP=no
 EOF
         ip link add "$client" type veth peer name "$server"
         ip link set "$server" netns "$peer"
-        ip -n "$peer" address add 10.203.2.1/24 dev "$server"
-        ip -n "$peer" address add 10.203.2.2/24 dev "$server"
+        ip -n "$peer" address add "$subnet.1/24" dev "$server"
+        ip -n "$peer" address add "$subnet.2/24" dev "$server"
         ip -n "$peer" link set "$server" up
-        start_server 10.203.2.1
+        start_server "$subnet.1"
         systemctl start systemd-networkd.service
         networkctl reload
         ip link set "$client" up
         ;;
     disconnect)
-        ip -4 route get 10.203.2.1 from 10.203.2.10 uid "$(id -u systemd-network)" \
+        ip -4 route get "$subnet.1" from "$subnet.10" uid "$(id -u systemd-network)" \
             ipproto udp sport 68 dport 67 || true
         ip -n "$peer" link set "$server" down
         ;;
-    10.203.2.1|10.203.2.2)
+    "$subnet.1"|"$subnet.2")
         start_server "$1"
         ip -n "$peer" link set "$server" up
         ;;

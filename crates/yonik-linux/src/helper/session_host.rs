@@ -2218,13 +2218,13 @@ impl Backend {
                 .and_then(|policy| policy.with_dhcp_renewal_anchor(true))
                 .map_err(unavailable)?;
             if self.profile_owner.is_some() {
-                if let Some((index, acquired, bound)) =
+                if let Some((indices, bound)) =
                     session_dhcp::select_policy(&artifact.baseline, &policy, cancel).await
                 {
                     let mut executor = self.executor(owner)?;
                     if session_dhcp::check_policy(&mut executor, &bound).await {
                         policy = bound;
-                        dhcp_interface = Some((index, acquired));
+                        dhcp_interface = Some(indices);
                     }
                 }
             }
@@ -2327,7 +2327,7 @@ impl Backend {
                 .fake_dns = Some(active_dns);
         }
         if let Some((backend, runtime)) = &self.profile_owner {
-            if let Some((index, acquired)) = dhcp_interface {
+            if let Some(indices) = dhcp_interface {
                 self.active
                     .as_mut()
                     .ok_or(ServiceError::Unavailable)?
@@ -2335,8 +2335,7 @@ impl Backend {
                     backend.clone(),
                     runtime,
                     self.epoch,
-                    index,
-                    acquired,
+                    indices,
                 ));
             }
         }
@@ -2390,7 +2389,7 @@ impl Backend {
             diagnostic_link("raw", link, current_link);
             return diagnostic_result("same_link_contract", Err(stale()));
         }
-        let dhcp = self.verified_dhcp_address(cancel).await;
+        let dhcp = self.verified_dhcp_addresses(cancel).await;
         diagnostic_result(
             "external_verification",
             artifact.plan.verify_external_captured(
@@ -2399,7 +2398,7 @@ impl Backend {
                 current_capture,
                 self.journal.as_ref().ok_or(ServiceError::Unavailable)?,
                 index,
-                dhcp,
+                &dhcp,
             ),
         )
         .map_err(unavailable)?;
