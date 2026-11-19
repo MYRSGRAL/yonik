@@ -9,7 +9,10 @@
 //! so another network manager can still race between the last read and a write.
 
 use super::ResolverError;
-use crate::Cancellation;
+use crate::{
+    Cancellation,
+    helper::systemd_network_service::{Daemon, bind_resolved},
+};
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -81,6 +84,7 @@ pub(crate) struct Resolve1TunSnapshot {
     pub(crate) global_transport: Option<Resolve1Transport>,
     /// По одному элементу на config.endpoints, включая глобальные DNS с %ifindex.
     pub(crate) sockets: Vec<Resolve1Socket>,
+    pub(crate) daemon: Option<Daemon>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,7 +166,17 @@ async fn read_snapshot(
             _ = cancel.cancelled() => Err(ResolverError::Cancelled),
             result = async {
                 let connection = Connection::system().await.map_err(bus_error)?;
-                read_connection(&connection, scope).await
+                let mut snapshot = read_connection(&connection, scope).await?;
+                if snapshot.sockets.iter().any(|socket| socket.transport == Resolve1Transport::StrictTls) {
+                    let (verified, daemon) = bind_resolved(async |connection, expected_owner| {
+                        read_connection_for_owner(connection, scope, expected_owner).await
+                    }).await?;
+                    if verified != snapshot {
+                        return Err(ResolverError::NetworkChanged);
+                    }
+                    snapshot.daemon = Some(daemon);
+                }
+                Ok(snapshot)
             } => result,
         }
     })
@@ -175,7 +189,15 @@ async fn read_connection(
     scope: SnapshotScope,
 ) -> Result<Resolve1TunSnapshot, ResolverError> {
     let owner_name = owner(connection).await?;
-    let proxy = Proxy::new(connection, owner_name.as_str(), PATH, PROPERTIES)
+    read_connection_for_owner(connection, scope, &owner_name).await
+}
+
+async fn read_connection_for_owner(
+    connection: &Connection,
+    scope: SnapshotScope,
+    owner_name: &str,
+) -> Result<Resolve1TunSnapshot, ResolverError> {
+    let proxy = Proxy::new(connection, owner_name, PATH, PROPERTIES)
         .await
         .map_err(bus_error)?;
     let domains = property::<Vec<(i32, String, bool)>>(&proxy, "Domains").await?;
@@ -191,12 +213,12 @@ async fn read_connection(
         let transport = Resolve1Transport::parse(&property::<String>(&proxy, "DNSOverTLS").await?)?;
         global_transport = Some(transport);
         (snapshot.endpoints, sockets) =
-            read_tun_endpoints(connection, &owner_name, rows, own_link, transport).await?;
+            read_tun_endpoints(connection, owner_name, rows, own_link, transport).await?;
         if let Some(index) = own_link {
             let scope = Resolve1Scope::Link(index);
             snapshot.domains.retain(|domain| domain.scope != scope);
         }
-        if !has_default_dns(connection, &owner_name, &snapshot).await? {
+        if !has_default_dns(connection, owner_name, &snapshot).await? {
             let fallback = property::<Vec<ManagerDnsServerEx>>(&proxy, "FallbackDNSEx").await?;
             if !fallback.is_empty() {
                 fallback_only = snapshot.endpoints.is_empty();
@@ -225,6 +247,7 @@ async fn read_connection(
         fallback_only,
         global_transport,
         sockets,
+        daemon: None,
     })
 }
 
@@ -1386,6 +1409,15 @@ mod tests {
                 .any(|socket| socket.transport == Resolve1Transport::StrictTls)
         );
 
+        let (_operation, mut cancel) = Cancellation::new();
+        let trusted = read_resolve1_tun_snapshot(&mut cancel, Duration::from_secs(4), Some(index))
+            .await
+            .unwrap();
+        let daemon = trusted.daemon.as_ref().expect("Личность systemd-resolved");
+        assert_ne!(daemon.uid, 0);
+        assert_ne!(daemon.pid, 1);
+        assert_eq!(daemon.owner.as_str(), owner(&connection).await.unwrap());
+
         let prepared = prepare_link_dns(
             index,
             "198.18.0.2".parse().unwrap(),
@@ -1400,6 +1432,12 @@ mod tests {
             .unwrap();
         prepared.verify_active().await.unwrap();
         assert_eq!(read_connection(&connection, scope).await.unwrap(), before);
+        assert_eq!(
+            read_resolve1_tun_snapshot(&mut cancel, Duration::from_secs(4), Some(index))
+                .await
+                .unwrap(),
+            trusted
+        );
     }
 
     #[tokio::test]

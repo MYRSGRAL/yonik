@@ -18,6 +18,7 @@ mod session_fake_dns;
 mod session_network;
 pub use session_network::SessionNetworkPlan;
 pub(crate) mod run_authorization;
+pub(crate) mod systemd_network_service;
 mod systemd_worker;
 pub use protection_host::SystemProtectionHost as SystemSessionHost;
 pub use protection_host::{GuardArtifact, SystemProtectionHost};

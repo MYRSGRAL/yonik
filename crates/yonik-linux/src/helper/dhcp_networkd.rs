@@ -2,7 +2,10 @@
 
 use super::{
     memory::ByteBudget,
-    resolver_stub::{CaptureCredits, bounded_socket},
+    resolver_stub::CaptureCredits,
+    systemd_network_service::{
+        Daemon, NetworkService, daemon as capture_daemon, same_pid, trusted_connection,
+    },
 };
 use crate::{
     Cancellation, KernelRoute, LookupIncomplete, NetworkNamespace, NetworkReadError as Error,
@@ -17,44 +20,27 @@ use crate::{
     },
 };
 use rustix::{
-    fs::{Mode, OFlags, open, openat},
     process::{Pid, PidfdFlags, pidfd_open},
     time::{ClockId, clock_gettime},
 };
 use serde::Deserialize;
 use std::{
-    fs::File,
-    io::Read,
     net::Ipv4Addr,
     num::{NonZeroU32, NonZeroU64},
-    os::{
-        fd::{AsRawFd, OwnedFd},
-        unix::fs::MetadataExt,
-    },
+    os::fd::OwnedFd,
     sync::{LazyLock, atomic::AtomicBool},
     time::Duration,
 };
 use tokio::time::Instant;
-use zbus::{
-    Connection,
-    fdo::DBusProxy,
-    names::{BusName, OwnedUniqueName},
-};
+use zbus::{Connection, fdo::DBusProxy, names::OwnedUniqueName};
 
 const VALIDITY: Duration = Duration::from_secs(2);
 pub(crate) const DHCP_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 pub(crate) const DHCP_PROBE_CONCURRENCY: usize = 4;
 const MAX_REPLY: usize = 64 * 1024;
-const GROUP: &str = "/system.slice/systemd-networkd.service";
-const NETWORKD: &str = "org.freedesktop.network1";
-const SYSTEMD: &str = "org.freedesktop.systemd1";
 const CLIENT_PORT: u16 = 68;
 const SERVER_PORT: u16 = 67;
 pub(crate) const NETWORKD_DSCPS: [u8; 3] = [0, 32, 48]; // none, CS4, CS6.
-const DIRECTORY: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
 static CAPTURE_BUDGET: LazyLock<(ByteBudget, ByteBudget, ByteBudget)> = LazyLock::new(|| {
     (
         ByteBudget::new(16),
@@ -178,15 +164,6 @@ fn ipv4(bytes: Vec<u8>) -> Result<Ipv4Addr, Error> {
         return Err(Error::Unsupported);
     }
     Ok(ip)
-}
-
-#[derive(PartialEq, Eq)]
-struct Daemon {
-    owner: OwnedUniqueName,
-    uid: u32,
-    pid: u32,
-    invocation: [u8; 16],
-    group: (u64, NonZeroU64),
 }
 
 pub struct DhcpNetworkdLease {
@@ -327,21 +304,9 @@ async fn collect(
     deadline: Instant,
     expires: u64,
 ) -> Result<DhcpNetworkdLease, Error> {
-    let stream = tokio::net::UnixStream::connect("/run/dbus/system_bus_socket")
-        .await
-        .map_err(unavailable)?;
-    if stream.peer_cred().map_err(unavailable)?.uid() != 0 {
-        return Err(Error::Unsupported);
-    }
-    let connection =
-        zbus::connection::Builder::socket(bounded_socket(stream).map_err(unavailable)?)
-            .auth_mechanism(zbus::AuthMechanism::External)
-            .max_queued(1)
-            .build()
-            .await
-            .map_err(unavailable)?;
+    let connection = trusted_connection().await?;
     let bus = DBusProxy::new(&connection).await.map_err(unavailable)?;
-    let daemon = daemon(&connection, &bus).await?;
+    let daemon = capture_daemon(&connection, &bus, NetworkService::Networkd).await?;
     let raw = i32::try_from(daemon.pid).map_err(unavailable)?;
     let pidfd = pidfd_open(
         Pid::from_raw(raw).ok_or(Error::Malformed)?,
@@ -429,7 +394,7 @@ async fn collect(
     let (after, after_timing) = read_topology_captured(cancel, remaining(deadline)?).await?;
     if !same_captured_topology(&topology, timing, &after, after_timing)
         || lease != describe(&connection, &daemon.owner, index.get()).await?
-        || daemon != self::daemon(&connection, &bus).await?
+        || daemon != capture_daemon(&connection, &bus, NetworkService::Networkd).await?
         || socket != sample_socket(topology.namespace, &lease, &daemon, deadline).await?
         || !same_pid(&pidfd, daemon.pid)?
         || boottime()? >= expires.min(lease.t2)
@@ -499,111 +464,6 @@ async fn sample_socket(
     .map_err(unavailable)?
 }
 
-async fn daemon(connection: &Connection, bus: &DBusProxy<'_>) -> Result<Daemon, Error> {
-    let name = |value| BusName::try_from(value).map_err(unavailable);
-    let systemd = bus
-        .get_name_owner(name(SYSTEMD)?)
-        .await
-        .map_err(unavailable)?;
-    if bus
-        .get_connection_unix_user(name(systemd.as_str())?)
-        .await
-        .map_err(unavailable)?
-        != 0
-        || bus
-            .get_connection_unix_process_id(name(systemd.as_str())?)
-            .await
-            .map_err(unavailable)?
-            != 1
-    {
-        return Err(Error::Unsupported);
-    }
-    let owner = bus
-        .get_name_owner(name(NETWORKD)?)
-        .await
-        .map_err(unavailable)?;
-    // GetConnectionCredentials может включать ProcessFD на новых версиях шины.
-    // Здесь транспорт принимает только числовые credentials.
-    let pid = bus
-        .get_connection_unix_process_id(name(owner.as_str())?)
-        .await
-        .map_err(unavailable)?;
-    let uid = bus
-        .get_connection_unix_user(name(owner.as_str())?)
-        .await
-        .map_err(unavailable)?;
-    if pid <= 1 || uid == 0 {
-        return Err(Error::Unsupported);
-    }
-    let properties = zbus::Proxy::new(
-        connection,
-        systemd.as_str(),
-        "/org/freedesktop/systemd1/unit/systemd_2dnetworkd_2eservice",
-        "org.freedesktop.DBus.Properties",
-    )
-    .await
-    .map_err(unavailable)?;
-    let invocation: Vec<u8> =
-        property(&properties, "org.freedesktop.systemd1.Unit", "InvocationID").await?;
-    let invocation: [u8; 16] = invocation.try_into().map_err(|_| Error::Malformed)?;
-    if invocation == [0; 16]
-        || property::<String>(&properties, "org.freedesktop.systemd1.Unit", "ActiveState").await?
-            != "active"
-        || property::<u32>(&properties, "org.freedesktop.systemd1.Service", "MainPID").await? != pid
-        || property::<String>(
-            &properties,
-            "org.freedesktop.systemd1.Service",
-            "ControlGroup",
-        )
-        .await?
-            != GROUP
-        || read_proc(&format!("/proc/{pid}/cgroup"))? != format!("0::{GROUP}\n")
-    {
-        return Err(Error::Changed);
-    }
-    let cgroup = open("/sys/fs/cgroup", DIRECTORY, Mode::empty()).map_err(unavailable)?;
-    let slice = openat(&cgroup, "system.slice", DIRECTORY, Mode::empty()).map_err(unavailable)?;
-    let unit = File::from(
-        openat(&slice, "systemd-networkd.service", DIRECTORY, Mode::empty())
-            .map_err(unavailable)?,
-    );
-    let metadata = unit.metadata().map_err(unavailable)?;
-    if usize::BITS != 64
-        || metadata.uid() != 0
-        || metadata.mode() & 0o022 != 0
-        || rustix::fs::fstatfs(&unit).map_err(unavailable)?.f_type as u64 != 0x6367_7270
-    {
-        return Err(Error::Unsupported);
-    }
-    let group = (
-        metadata.dev(),
-        NonZeroU64::new(metadata.ino()).ok_or(Error::Unsupported)?,
-    );
-    Ok(Daemon {
-        owner,
-        uid,
-        pid,
-        invocation,
-        group,
-    })
-}
-
-async fn property<T: TryFrom<zbus::zvariant::OwnedValue>>(
-    proxy: &zbus::Proxy<'_>,
-    interface: &str,
-    key: &str,
-) -> Result<T, Error> {
-    let reply = proxy
-        .call_method("Get", &(interface, key))
-        .await
-        .map_err(unavailable)?;
-    if reply.body().len() > MAX_REPLY {
-        return Err(Error::Limit);
-    }
-    let value: zbus::zvariant::OwnedValue = reply.body().deserialize().map_err(unavailable)?;
-    T::try_from(value).map_err(|_| Error::Malformed)
-}
-
 async fn describe(
     connection: &Connection,
     owner: &OwnedUniqueName,
@@ -628,41 +488,6 @@ async fn describe(
     let body = reply.body();
     let json: &str = body.deserialize().map_err(unavailable)?;
     parse_lease(json, index, boottime()?)
-}
-
-fn read_proc(path: &str) -> Result<String, Error> {
-    let mut buffer = String::new();
-    File::open(path)
-        .map_err(unavailable)?
-        .take(4097)
-        .read_to_string(&mut buffer)
-        .map_err(unavailable)?;
-    if buffer.len() > 4096 {
-        return Err(Error::Limit);
-    }
-    Ok(buffer)
-}
-
-fn same_pid(fd: &OwnedFd, pid: u32) -> Result<bool, Error> {
-    let fdinfo = format!("/proc/self/fdinfo/{}", fd.as_raw_fd());
-    let equal = || -> Result<bool, Error> {
-        Ok(read_proc(&fdinfo)?
-            .lines()
-            .find_map(|line| line.strip_prefix("Pid:\t"))
-            .and_then(|value| value.parse().ok())
-            == Some(pid))
-    };
-    if !equal()? {
-        return Ok(false);
-    }
-    // До wait/reap fdinfo сохраняет PID завершённого процесса.
-    let stat = read_proc(&format!("/proc/{pid}/stat"))?;
-    let (_, tail) = stat.rsplit_once(") ").ok_or(Error::Malformed)?;
-    let state = tail
-        .split_ascii_whitespace()
-        .next()
-        .ok_or(Error::Malformed)?;
-    Ok(!matches!(state, "Z" | "X" | "x") && equal()?)
 }
 
 fn boottime() -> Result<u64, Error> {
