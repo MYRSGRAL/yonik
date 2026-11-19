@@ -14,6 +14,7 @@
 | Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, переподключение DHCPv4, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
 | Debian 13.7, QEMU, x86-64 | Установленный стендовый helper с автономным worker, отдельным mount namespace, seccomp и системным D-Bus | Восстановление после прежнего worker, Prepare, Apply, Stop, Unlock, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS по Fake-IP и DoH через TUN. При остановке службы с активной сессией TUN удаляется, cgroup пустеют, карантин Fake-IP сохраняется |
 | Debian 13.7, QEMU, AArch64, systemd 257 и nftables 1.1.3 | Установленные GNU helper и worker без `test-support`, systemd-resolved с FallbackDNS, явная политика Proxy. Xray 26.10.31 и закреплённый адаптер sing-box 1.14.4 | Fake A/AAAA, TCP/UDP по IPv4 и IPv6, HTTPS с проверкой имени, DoH, Stop, Unlock, блокировка старых Fake-IP и восстановление DNS. На Xray также проверено восстановление карантина после удаления таблицы nftables. Содержимое и метаданные `/etc/resolv.conf` совпали до и после |
+| Debian 13.7, QEMU, AArch64, OpenRC 0.56 и runit 2.2, resolvconf 1.94 | Тестовый `.deb` из дерева пакетирования, установленный через `dpkg`. Штатные helper и worker без `test-support`. Доступ root выдан правилом одноразовой VM | В обеих VM служба открыла TUN после загрузки нужного PID 1. На Xray и sing-box смена резолвера закрыла прежний worker, старые Fake-IP остались заблокированы. Прошли реальные DNS-запросы по UDP и TCP, Fake A/AAAA, HTTPS и DoH. Ссылка и содержимое `/etc/resolv.conf` совпали после возврата DNS через resolvconf |
 | Debian 13.7, OpenRC 0.56 и runit 2.2, две QEMU VM | Установленный helper, запуск штатным менеджером, systemd-resolved с обычным FallbackDNS | На обоих движках прошли загрузка TUN, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS по Fake-IP, DoH через TUN, остановка службы и восстановление. Polkit использовал временное правило стенда для root. Обычному UID вызов Prepare отклонён |
 | Debian 13.7, OpenRC 0.56 и runit 2.2, resolvconf 1.94 | Установленный helper, DNS опубликован resolvconf, systemd-resolved удалён средствами пакета. Доступ root выдан правилом одноразовой VM | На обоих движках смена DNS остановила прежний worker. Новые Fake A/AAAA, реальные ответы DNS по TCP/UDP, HTTPS и DoH прошли. Старые Fake-IP остались заблокированы. Ссылка и исходное содержимое `/etc/resolv.conf` совпали после возврата настроек менеджером |
 | Debian 13.7, OpenRC 0.56 и runit 2.2, elogind 255.17 и polkit 126 | Обычный UID в локальном PAM-сеансе на `seat0`, установленный helper и штатная политика `auth_admin` | В обеих VM без агента `Prepare` отклонён. После проверки пароля отдельной учётной записи администратора через `pkttyagent` helper вернул дескриптор подготовки |
@@ -759,8 +760,12 @@ IPv4-сценарий с теми же проверками прошёл пов�
   Xray и закреплённом адаптере sing-box, который принимает
   `external_configuration`. Проверка профиля v4 с
   подтверждённым фильтром seccomp применяется только на x86-64.
-  Пакетные сборки и автономный запуск OpenRC/runit на AArch64 требуют
-  отдельных прогонов.
+  На AArch64 отдельно собраны и установлены тестовые `.deb` для OpenRC
+  и runit. В обоих образах контрольные суммы установленных ELF совпали
+  с обычной сборкой для systemd. После загрузки менеджеры запустили
+  helper, который поднял TUN и опубликовал возможности на системном
+  D-Bus. Оба ядра прошли смену DNS через resolvconf и восстановление.
+  RPM для Fedora и пакет Arch на AArch64 требуют отдельных прогонов.
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
   `Unavailable` до запуска ядра. Политики Fedora 45.23 и 45.24 отклонили
