@@ -391,11 +391,7 @@ async fn production_helper_standalone_shutdown_restores_network() -> Result {
 #[tokio::test]
 #[ignore = "выделенная Debian VM с OpenRC или runit"]
 async fn production_helper_native_init_dns_and_shutdown() -> Result {
-    let service = match fs::read_to_string("/proc/1/comm")?.trim() {
-        "openrc-init" => StandaloneService::OpenRc,
-        "runit" => StandaloneService::Runit,
-        _ => return Err(io::Error::other("Стенду нужен OpenRC или runit в PID 1").into()),
-    };
+    let service = StandaloneService::native()?;
     let policy = scoped_fake_dns_proxy_policy()?;
     installed_fake_dns(
         None,
@@ -613,6 +609,21 @@ async fn production_helper_fake_dns_after_resolvconf_update() -> Result {
         initial: "10.203.1.2".parse()?,
         updated: "10.203.1.6".parse()?,
     })
+    .await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная VM с OpenRC или runit, resolvconf и двумя DNS-серверами"]
+async fn production_helper_native_init_after_resolvconf_update() -> Result {
+    let init = StandaloneService::native()?.init();
+    installed_fake_dns_after_network_change_in_vm(
+        FakeDnsNetworkChange::Resolvconf {
+            initial: "10.203.1.2".parse()?,
+            updated: "10.203.1.6".parse()?,
+        },
+        init,
+    )
     .await
 }
 
@@ -971,7 +982,15 @@ enum FakeDnsNetworkChange {
 
 #[cfg(feature = "test-support")]
 async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -> Result {
-    guard()?;
+    installed_fake_dns_after_network_change_in_vm(change, "systemd").await
+}
+
+#[cfg(feature = "test-support")]
+async fn installed_fake_dns_after_network_change_in_vm(
+    change: FakeDnsNetworkChange,
+    init: &str,
+) -> Result {
+    guard_init(init)?;
     let _lock = vm_lock::acquire()?;
     wait_for_fixture_link().await?;
     let mut resolver_before = resolver_file_state()?;
@@ -2137,6 +2156,14 @@ enum StandaloneService {
 
 #[cfg(feature = "test-support")]
 impl StandaloneService {
+    fn native() -> Result<Self> {
+        match fs::read_to_string("/proc/1/comm")?.trim() {
+            "openrc-init" => Ok(Self::OpenRc),
+            "runit" => Ok(Self::Runit),
+            _ => Err(io::Error::other("Стенду нужен OpenRC или runit в PID 1").into()),
+        }
+    }
+
     fn init(self) -> &'static str {
         match self {
             Self::SystemdFixture => "systemd",

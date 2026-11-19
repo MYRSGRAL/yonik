@@ -14,6 +14,7 @@
 | Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, переподключение DHCPv4, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
 | Debian 13.7, QEMU, x86-64 | Установленный стендовый helper с автономным worker, отдельным mount namespace, seccomp и системным D-Bus | Восстановление после прежнего worker, Prepare, Apply, Stop, Unlock, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS по Fake-IP и DoH через TUN. При остановке службы с активной сессией TUN удаляется, cgroup пустеют, карантин Fake-IP сохраняется |
 | Debian 13.7, OpenRC 0.56 и runit 2.2, две QEMU VM | Установленный helper, запуск штатным менеджером, systemd-resolved с обычным FallbackDNS | На обоих движках прошли загрузка TUN, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS по Fake-IP, DoH через TUN, остановка службы и восстановление. Polkit использовал временное правило стенда для root. Обычному UID вызов Prepare отклонён |
+| Debian 13.7, OpenRC 0.56 и runit 2.2, resolvconf 1.94 | Установленный helper, DNS опубликован resolvconf, systemd-resolved удалён средствами пакета. Доступ root выдан правилом одноразовой VM | На обоих движках смена DNS остановила прежний worker. Новые Fake A/AAAA, реальные ответы DNS по TCP/UDP, HTTPS и DoH прошли. Старые Fake-IP остались заблокированы. Ссылка и исходное содержимое `/etc/resolv.conf` совпали после возврата настроек менеджером |
 | Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, отдельные прогоны с IPv4- и IPv6-адресами резолвера, опубликованными менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock и восстановление после смены адреса через `resolvconf -a`. Истечение карантина проверено в сценарии с IPv4-резолвером |
 | Debian 13.7, systemd-resolved и внешний WireGuard | Установленный helper, приватная DNS-зона и маршруты IPv4/IPv6 через WireGuard | Публичный Fake DNS работает, обнаруженные приватные префиксы блокируются во время сессии. Приватный DNS и TCP/UDP доступны до запуска и после Stop |
 | Debian 13.7, Xfce 4.20 и X11, ядро 6.12.117 | Обычный UID в активной сессии LightDM и штатный диалог polkit. Отдельные прогоны с systemd-resolved и resolvconf 1.94 | Системный TUN, Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и карантин Fake-IP |
@@ -730,9 +731,16 @@ IPv4-сценарий с теми же проверками прошёл пов�
   в карантине. Проверены обычный DNS до и после сессии и сохранность
   содержимого и метаданных `/etc/resolv.conf`. Правило polkit для
   фонового root-клиента было только в одноразовой VM.
-  Вход пользователя через PAM/elogind с обычным диалогом polkit,
-  альтернативный DNS-менеджер в этих init-средах и ABI AArch64
-  требуют отдельных прогонов.
+  С resolvconf 1.94 на обеих init-средах DNS менялся через API менеджера
+  во время активного TUN. На Xray и sing-box прежний worker останавливался,
+  заново выданные Fake A/AAAA отличались, карантин блокировал прежние
+  адреса. На обоих DNS-серверах проверены UDP и TCP, а после смены DNS
+  проверены HTTPS и DoH. Тест сверял содержимое и метаданные
+  `/etc/resolv.conf` между изменениями, которые публиковал resolvconf.
+  Отдельный вход PAM/elogind в обеих VM зарегистрировал обычный UID
+  на активном локальном `seat0`. Polkit в стенде ответил отказом без
+  запроса аутентификации. Штатный диалог polkit и ABI AArch64 требуют
+  отдельных прогонов.
   [Пакет helper для OpenRC и runit](../../../packaging/standalone/README.md)
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
