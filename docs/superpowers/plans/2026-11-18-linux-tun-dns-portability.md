@@ -154,6 +154,19 @@ IPv4-сценарий с теми же проверками прошёл пов�
 событиями содержимое и идентичность файла сохранялись.
 [Интеграционные тесты IPv4 и IPv6](../../../crates/yonik-linux/tests/installed_helper_session.rs)
 
+- [ ] Пройти смену DNS на физическом линке NetworkManager 1.58.1 и
+  systemd-resolved 262.1 в Fedora Cloud 45 с SELinux Enforcing. В отдельном
+  прогоне без TUN команда `nmcli device reapply` обновила DNS на том же
+  ifindex и сохранила маршрутный домен `~real.test`. Со штатным RPM и Xray
+  Fake A/AAAA и контрольный TCP/UDP дошли до VLESS-peer. Запрос
+  `real.test` для физического резолвера `10.233.42.2:53` также дошёл до
+  изолированного VLESS-peer. Стенд прочитал DNS-вопрос на стороне peer.
+  NSS завершился по таймауту до шага смены DNS. `/etc/resolv.conf`
+  сохранил содержимое и идентичность. Для приёмки нужны ограниченный
+  подтверждённым линком путь до реального DNS, запрет передачи такого
+  DNS-вопроса VLESS-peer и повтор проверки на обоих движках.
+  [Тест установленного helper](../../../crates/yonik-linux/tests/installed_helper_session.rs)
+
 - [x] Проверить переподключение DHCPv4 в Debian 13.7 и Ubuntu 24.04.5 LTS с
   `systemd-networkd` и `systemd-resolved`. В тесте
   `production_helper_fake_dns_after_dhcp_reconnect`

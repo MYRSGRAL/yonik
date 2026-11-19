@@ -565,6 +565,13 @@ async fn production_helper_fake_dns_after_ipv6_resolvconf_update() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "выделенная Fedora VM с NetworkManager и DNS-профилем yonik-nm"]
+async fn production_helper_fake_dns_after_networkmanager_dns_update() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::NetworkManagerDns).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная VM с DHCPv4, systemd-networkd и systemd-resolved"]
 async fn production_helper_fake_dns_after_dhcp_reconnect() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::DhcpReconnect).await
@@ -889,6 +896,7 @@ enum FakeDnsNetworkChange {
     PeerRoute,
     ResolverLink,
     WireGuard,
+    NetworkManagerDns,
     Resolvconf {
         initial: std::net::IpAddr,
         updated: std::net::IpAddr,
@@ -1053,6 +1061,10 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             FakeDnsNetworkChange::PeerRoute => change_fixture_peer_route("add")?,
             FakeDnsNetworkChange::ResolverLink => revoke_fixture_link_dns(&mut token).await?,
             FakeDnsNetworkChange::WireGuard => control_fixture_wireguard("connect")?,
+            FakeDnsNetworkChange::NetworkManagerDns => {
+                check_networkmanager_dns("192.0.2.99").await?;
+                switch_networkmanager_dns("10.233.42.3")?;
+            }
             FakeDnsNetworkChange::Resolvconf { initial, updated } => {
                 check_fixture_resolver(initial, "192.0.2.99", old_v4, old_v6).await?;
                 switch_fixture_resolver(updated)?;
@@ -1150,6 +1162,9 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         if let FakeDnsNetworkChange::Resolvconf { updated, .. } = change {
             check_fixture_resolver(updated, "192.0.2.100", v4, v6).await?;
         }
+        if change == FakeDnsNetworkChange::NetworkManagerDns {
+            check_networkmanager_dns("192.0.2.100").await?;
+        }
         for old in [old_v4, old_v6] {
             check_fake_flow_blocked((old, 40000).into()).await?;
         }
@@ -1184,6 +1199,9 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         if let FakeDnsNetworkChange::Resolvconf { initial, .. } = change {
             switch_fixture_resolver(initial)?;
             resolver_before = resolver_file_state()?;
+        }
+        if change == FakeDnsNetworkChange::NetworkManagerDns {
+            switch_networkmanager_dns("10.233.42.2")?;
         }
         if dhcp {
             require(
@@ -1428,6 +1446,31 @@ fn control_dhcp_fixture(action: &str) -> Result {
             .status()?
             .success(),
         "Стенд не изменил состояние DHCP-линка",
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn switch_networkmanager_dns(address: &str) -> Result {
+    for args in [
+        &["connection", "modify", "yonik-nm", "ipv4.dns", address][..],
+        &["device", "reapply", "yonik-nm"][..],
+    ] {
+        require(
+            Command::new("/usr/bin/nmcli")
+                .args(args)
+                .status()?
+                .success(),
+            "NetworkManager не обновил DNS на тестовом линке",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn check_networkmanager_dns(expected: &str) -> Result {
+    require(
+        getent_fake_dns("ahostsv4", "real.test").await? == expected.parse::<std::net::IpAddr>()?,
+        "Системный резолвер не получил ответ DNS с тестового линка NetworkManager",
     )
 }
 
