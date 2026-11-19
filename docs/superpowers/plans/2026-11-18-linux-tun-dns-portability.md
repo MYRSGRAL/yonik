@@ -12,6 +12,7 @@
 | --- | --- | --- |
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
 | Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, переподключение DHCPv4, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
+| Debian 13.7, QEMU | Установленный стендовый helper с автономным worker и системным D-Bus | Восстановление после прежнего worker, Prepare, Apply, Stop, Unlock, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS по Fake-IP и DoH через TUN |
 | Debian 13.7, resolvconf 1.94, systemd-resolved неактивен | Установленный helper, отдельные прогоны с IPv4- и IPv6-адресами резолвера, опубликованными менеджером в `/etc/resolv.conf` | NSS, Fake DNS A/AAAA и реальные ответы по TCP/UDP, HTTPS, DoH, Stop, Unlock и восстановление после смены адреса через `resolvconf -a`. Истечение карантина проверено в сценарии с IPv4-резолвером |
 | Debian 13.7, systemd-resolved и внешний WireGuard | Установленный helper, приватная DNS-зона и маршруты IPv4/IPv6 через WireGuard | Публичный Fake DNS работает, обнаруженные приватные префиксы блокируются во время сессии. Приватный DNS и TCP/UDP доступны до запуска и после Stop |
 | Debian 13.7, Xfce 4.20 и X11, ядро 6.12.117 | Обычный UID в активной сессии LightDM и штатный диалог polkit. Отдельные прогоны с systemd-resolved и resolvconf 1.94 | Системный TUN, Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и карантин Fake-IP |
@@ -683,10 +684,14 @@ IPv4-сценарий с теми же проверками прошёл пов�
   отклоняет лишние наследуемые FD, входит в нужную cgroup до `exec` и
   назначает права по роли. Debian VM подтвердила отказы для неверного
   stdin, неблокирующего listener и FD 3 без CLOEXEC, затем проверила
-  Check и TCP через TUN на обоих установленных движках. Для приёмки
-  OpenRC/runit остаются выбор этого launcher в сетевой сессии helper,
-  управление временем жизни сокета и cgroup, полный sandbox и
-  приёмочные прогоны TUN и Fake DNS в обеих init-средах.
+  Check и TCP через TUN на обоих установленных движках. Автономный
+  backend подключён к сетевой сессии стендовой сборки helper в QEMU.
+  Debian VM подтвердила остановку прежнего worker при старте, а также
+  Prepare, Apply, Stop и Unlock через D-Bus с Xray и sing-box. Проверены
+  NSS, Fake DNS, HTTPS по Fake-IP, DoH через TUN и неизменность
+  `/etc/resolv.conf`. Для пакетной поддержки OpenRC/runit остаются
+  изоляция файловой системы и устройств, интеграция с init и
+  приёмочные прогоны в обеих средах.
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
   `Unavailable` до запуска ядра. Политики Fedora 45.23 и 45.24 отклонили

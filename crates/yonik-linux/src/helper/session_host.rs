@@ -5,6 +5,7 @@ use super::{
     PreparedContext, ProtectionState, PublicBlockPolicy, PublicPolicyRecovery, ServiceError,
     compile_protection, stale, unavailable,
 };
+use crate::helper::session_supervisor::SessionSupervisor;
 use crate::helper::{
     SessionNetworkPlan, SystemWorkerSupervisor, TrustedRegistry, WorkerLiveness, WorkerTicket,
     memory::{ByteLease, config_budget},
@@ -1719,13 +1720,13 @@ impl Backend {
                         .any(|record| record.scope() == Scope::Session)
             })
     }
-    async fn supervisor(&mut self) -> Result<&mut SystemWorkerSupervisor, ServiceError> {
+    async fn supervisor(&mut self) -> Result<&mut SessionSupervisor, ServiceError> {
         if self.supervisor.is_none() {
-            self.supervisor = Some(
+            self.supervisor = Some(SessionSupervisor::Systemd(Box::new(
                 SystemWorkerSupervisor::system()
                     .await
                     .map_err(unavailable)?,
-            );
+            )));
         }
         self.supervisor.as_mut().ok_or(ServiceError::Unavailable)
     }
@@ -1820,6 +1821,8 @@ impl Backend {
             result=self.supervisor()=>result?,
         };
         supervisor
+            .systemd()
+            .map_err(unavailable)?
             .attest_preparation(peer, source, cancel, deadline)
             .await
             .map_err(|_| ServiceError::Unsupported)
@@ -2461,6 +2464,8 @@ impl Backend {
                 .supervisor
                 .as_mut()
                 .ok_or(ServiceError::Unavailable)?
+                .systemd()
+                .map_err(unavailable)?
                 .native_attached(ticket)
                 .await
                 .map_err(unavailable)?
@@ -2656,6 +2661,8 @@ impl Backend {
                     .supervisor
                     .as_mut()
                     .ok_or(ServiceError::Unavailable)?
+                    .systemd()
+                    .map_err(unavailable)?
                     .native_attached(ticket)
                     .await
                 {

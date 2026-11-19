@@ -65,13 +65,24 @@ pub(super) struct WorkerCgroups {
 
 impl WorkerCgroups {
     pub(super) fn open(parent_name: &str) -> Result<Self> {
-        let mut mount = root()?;
-        for component in ["sys", "fs", "cgroup"] {
-            mount = child(&mount, component)?;
+        Self::from_mount(cgroup_mount()?, parent_name)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(super) fn prepare(parent_name: &str, names: &[&str]) -> Result<Self> {
+        let mount = cgroup_mount()?;
+        ensure_directory(&mount, parent_name, Mode::from_bits_truncate(0o755))?;
+        let cgroups = Self::from_mount(mount, parent_name)?;
+        for &name in names {
+            ensure_directory(&cgroups.parent, name, Mode::from_bits_truncate(0o755))?;
+            let directory = directory_in_mount(&cgroups.parent, name, cgroups.mount_id)?
+                .ok_or(WorkerSupervisorError::Unavailable)?;
+            trusted(&directory, true)?;
         }
-        if fstatfs(&mount).map_err(unavailable)?.f_type as u64 != CGROUP2_MAGIC {
-            return Err(WorkerSupervisorError::Untrusted);
-        }
+        Ok(cgroups)
+    }
+
+    fn from_mount(mount: File, parent_name: &str) -> Result<Self> {
         let mount_id = mount_identity(&mount)?;
         let parent = directory_in_mount(&mount, parent_name, mount_id)?
             .ok_or(WorkerSupervisorError::Unavailable)?;
@@ -117,7 +128,7 @@ impl WorkerCgroups {
         self.write_worker_control(name, "cgroup.procs", b"0")
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn kill_group(&self, name: &str) -> Result<()> {
         self.write_worker_control(name, "cgroup.kill", b"1")
     }
@@ -141,6 +152,25 @@ impl WorkerCgroups {
         }
         control.write_all(value).map_err(unavailable)
     }
+}
+
+#[cfg(feature = "test-support")]
+pub(super) fn ensure_directory(parent: &File, name: &str, mode: Mode) -> Result<()> {
+    match rustix::fs::mkdirat(parent, name, mode) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => Ok(()),
+        Err(error) => Err(unavailable(error)),
+    }
+}
+
+fn cgroup_mount() -> Result<File> {
+    let mut mount = root()?;
+    for component in ["sys", "fs", "cgroup"] {
+        mount = child(&mount, component)?;
+    }
+    if fstatfs(&mount).map_err(unavailable)?.f_type as u64 != CGROUP2_MAGIC {
+        return Err(WorkerSupervisorError::Untrusted);
+    }
+    Ok(mount)
 }
 
 pub(super) fn open_worker_directory(parent: &File, name: &str) -> Result<Option<File>> {

@@ -4,7 +4,7 @@ use super::{WorkerCgroups, WorkerMode, WorkerPayload, WorkerStatus, require_cgro
 use crate::helper::{
     TrustedRegistry,
     standalone_launcher::{
-        STANDALONE_PARENT, STANDALONE_RUNTIME, WORKER_IMAGE, group, socket_name,
+        CONTROLLER_PID, STANDALONE_PARENT, STANDALONE_RUNTIME, WORKER_IMAGE, group, socket_name,
     },
     standalone_worker_argument,
     worker_identity::{WorkerCredentials, WorkerProcess},
@@ -62,15 +62,18 @@ impl Fixture {
         fs::create_dir(cgroup.join(group(mode))).unwrap();
         let listener = UnixListener::bind(fixture.socket()).unwrap();
         fs::set_permissions(fixture.socket(), fs::Permissions::from_mode(0o600)).unwrap();
+        let controller = std::process::id().to_string();
         require_denied(
             Command::new(HELPER_IMAGE)
                 .arg(standalone_worker_argument(mode))
+                .env(CONTROLLER_PID, &controller)
                 .stdin(Stdio::null()),
         );
         listener.set_nonblocking(true).unwrap();
         require_denied(
             Command::new(HELPER_IMAGE)
                 .arg(standalone_worker_argument(mode))
+                .env(CONTROLLER_PID, &controller)
                 .stdin(Stdio::from(OwnedFd::from(listener.try_clone().unwrap()))),
         );
         listener.set_nonblocking(false).unwrap();
@@ -83,11 +86,13 @@ impl Fixture {
                     HELPER_IMAGE,
                     standalone_worker_argument(mode),
                 ])
+                .env(CONTROLLER_PID, &controller)
                 .stdin(Stdio::from(OwnedFd::from(listener.try_clone().unwrap()))),
         );
         fixture.child = Some(
             Command::new(HELPER_IMAGE)
                 .arg(standalone_worker_argument(mode))
+                .env(CONTROLLER_PID, &controller)
                 .stdin(Stdio::from(OwnedFd::from(listener)))
                 .spawn()
                 .unwrap(),

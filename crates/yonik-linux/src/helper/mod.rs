@@ -16,7 +16,10 @@ mod protection_host;
 pub(crate) mod resolver_stub;
 mod session_fake_dns;
 mod session_network;
+mod session_supervisor;
 mod standalone_launcher;
+#[cfg(feature = "test-support")]
+mod standalone_supervisor;
 pub use session_network::SessionNetworkPlan;
 pub use standalone_launcher::{launch_standalone_worker, standalone_worker_argument};
 pub(crate) mod run_authorization;

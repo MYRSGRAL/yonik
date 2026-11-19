@@ -9,7 +9,7 @@ use crate::worker::WorkerMode;
 use rustix::{
     fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, fcntl_getfl, flock, openat, statat},
     net::{SocketAddrUnix, SocketType, getsockname, sockopt},
-    process::{geteuid, umask},
+    process::{geteuid, getppid, umask},
 };
 use std::{
     fs::File,
@@ -21,6 +21,7 @@ type Result<T> = std::result::Result<T, WorkerSupervisorError>;
 pub(super) const STANDALONE_PARENT: &str = "yonik-worker-standalone";
 pub(super) const STANDALONE_RUNTIME: &str = "/run/yonik-worker-standalone";
 pub(super) const WORKER_IMAGE: &str = "/usr/lib/yonik/yonik-worker";
+pub(super) const CONTROLLER_PID: &str = "YONIK_WORKER_CONTROLLER_PID";
 
 pub(super) fn group(mode: WorkerMode) -> &'static str {
     match mode {
@@ -56,6 +57,14 @@ pub fn launch_standalone_worker(mode: WorkerMode) -> Result<std::convert::Infall
         return Err(WorkerSupervisorError::Untrusted);
     }
     flock(&runtime, FlockOperation::NonBlockingLockExclusive).map_err(unavailable)?;
+    let controller = std::env::var(CONTROLLER_PID)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|&pid| pid > 1)
+        .ok_or(WorkerSupervisorError::Untrusted)?;
+    if getppid().map(|pid| pid.as_raw_pid()) != Some(controller) {
+        return Err(WorkerSupervisorError::Stale);
+    }
     verify_listener(mode, &runtime)?;
     verify_inherited_descriptors()?;
 
@@ -149,7 +158,7 @@ fn verify_inherited_descriptors() -> Result<()> {
     Ok(())
 }
 
-fn verify_executable(parent: &File, name: &str) -> Result<()> {
+pub(super) fn verify_executable(parent: &File, name: &str) -> Result<()> {
     let file = File::from(openat(parent, name, FILE_FLAGS, Mode::empty()).map_err(unavailable)?);
     trusted(&file, false)?;
     let mode = file.metadata().map_err(unavailable)?.mode();

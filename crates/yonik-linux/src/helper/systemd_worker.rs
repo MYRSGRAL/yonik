@@ -93,10 +93,10 @@ impl Drop for Permit {
 }
 
 /// Неподделываемая локальная ссылка на конкретную invocation, не только PID.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct WorkerTicket {
-    pid: u32,
-    invocation: [u8; 16],
+    pub(super) pid: u32,
+    pub(super) invocation: [u8; 16],
 }
 impl WorkerTicket {
     pub fn pid(&self) -> u32 {
@@ -477,7 +477,7 @@ fn native_activation_ready(active: &str, pid: u32) -> Result<bool> {
     }
 }
 /// Отмена выигрывает select, но завершённый неполученный результат остаётся owning.
-async fn wait_owned<T>(
+pub(super) async fn wait_owned<T>(
     slot: &mut Option<JoinHandle<T>>,
     cancel: &mut Cancellation,
     deadline: Instant,

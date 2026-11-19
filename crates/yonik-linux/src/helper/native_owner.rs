@@ -325,6 +325,8 @@ impl super::Backend {
         self.supervisor
             .as_mut()
             .ok_or(ServiceError::Unavailable)?
+            .systemd()
+            .map_err(super::unavailable)?
             .start_native(
                 Arc::clone(&pending.artifact.payload),
                 &pending.authority,

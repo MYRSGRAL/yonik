@@ -94,7 +94,7 @@ struct Backend {
     native_eligibility: Option<super::native_profile::VerifiedStaticInstalledImage>,
     native_owner: session_host::native_owner::NativeOwnerState,
     bindings: Option<NetworkStamp>,
-    supervisor: Option<super::SystemWorkerSupervisor>,
+    supervisor: Option<super::session_supervisor::SessionSupervisor>,
     worker_uncertain: bool,
     active: Option<ActiveSession>,
     tun_custody: Option<HelperTunCustody>,
@@ -164,12 +164,33 @@ impl SystemProtectionHost {
         if rustix::process::geteuid().as_raw() != 0 {
             return Err(ServiceError::Unavailable);
         }
-        Self::create(PathBuf::from(STATE_PATH), &mut cancel, false).await
+        Self::create(PathBuf::from(STATE_PATH), &mut cancel, false, None).await
     }
+
+    #[cfg(feature = "test-support")]
+    pub async fn system_standalone(mut cancel: Cancellation) -> Result<Self, ServiceError> {
+        use super::{
+            session_supervisor::SessionSupervisor, standalone_supervisor::StandaloneSupervisor,
+        };
+        if !rustix::process::geteuid().is_root() {
+            return Err(ServiceError::Unavailable);
+        }
+        let mut supervisor = StandaloneSupervisor::open().map_err(unavailable)?;
+        supervisor.recover(&mut cancel).await.map_err(unavailable)?;
+        Self::create(
+            PathBuf::from(STATE_PATH),
+            &mut cancel,
+            false,
+            Some(SessionSupervisor::Standalone(Box::new(supervisor))),
+        )
+        .await
+    }
+
     async fn create(
         path: PathBuf,
         cancel: &mut Cancellation,
         isolated: bool,
+        supervisor: Option<super::session_supervisor::SessionSupervisor>,
     ) -> Result<Self, ServiceError> {
         let monitor = NetworkMonitor::start().map_err(unavailable)?;
         let mut watch = monitor.watch();
@@ -200,7 +221,7 @@ impl SystemProtectionHost {
                 native_eligibility: None,
                 native_owner: session_host::native_owner::NativeOwnerState::fresh(),
                 bindings: None,
-                supervisor: None,
+                supervisor,
                 worker_uncertain: false,
                 active: None,
                 tun_custody: None,
@@ -277,7 +298,7 @@ impl SystemProtectionHost {
         path: PathBuf,
         mut cancel: Cancellation,
     ) -> Result<Self, ServiceError> {
-        Self::create(path, &mut cancel, true).await
+        Self::create(path, &mut cancel, true, None).await
     }
 }
 async fn wait_for_stop(
