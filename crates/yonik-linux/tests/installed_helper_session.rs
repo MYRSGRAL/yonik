@@ -2073,6 +2073,7 @@ async fn installed_fake_dns(
         tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
     }
     let fallback_dns = std::env::var("YONIK_CHECK_FALLBACK_DNS");
+    let fallback_search = std::env::var_os("YONIK_CHECK_FALLBACK_SEARCH").is_some();
     let fallback_engine = match fallback_dns.as_deref() {
         Ok("xray") => Some(Engine::Xray),
         Ok("sing-box") => Some(Engine::SingBox),
@@ -2090,6 +2091,9 @@ async fn installed_fake_dns(
             state_after_route_events(&connection).await?["state"] == "no_managed_policy",
             "VM не чистая",
         )?;
+        if fallback_search {
+            check_fallback_search_in_vm("printer", true).await?;
+        }
         let (_owner, token) = yonik_linux::Cancellation::new();
         let drain =
             start_fake_dns_in_vm(&connection, &server, engine, kill_switch, policy, &token).await?;
@@ -2101,6 +2105,12 @@ async fn installed_fake_dns(
             check_fallback_dns_in_vm("real.test").await?;
             check_fallback_dns_local_names_in_vm().await?;
             eprintln!("{engine:?}: NSS получил реальный ответ от FallbackDNS");
+        }
+        if fallback_search {
+            check_fallback_search_in_vm("printer-active", true).await?;
+            check_fallback_search_in_vm("only-route.route.test", true).await?;
+            check_fallback_search_in_vm("only-route", false).await?;
+            eprintln!("{engine:?}: resolved дополнил короткое имя при активном TUN");
         }
         let (v4, v6) = if let Some(peer) = literal {
             let v4 = ask_fixture_dns(peer, "example.test", 1, false).await?;
@@ -2205,6 +2215,10 @@ async fn installed_fake_dns(
             check_fallback_dns_in_vm("restored.test").await?;
             eprintln!("{engine:?}: NSS получил ответ от FallbackDNS после остановки");
         }
+        if fallback_search {
+            check_fallback_search_in_vm("printer-restored", true).await?;
+            eprintln!("{engine:?}: исходный поисковый домен работает после Stop");
+        }
         if matches!(policy_witness, Some(FakeDnsPolicyWitness::LiteralDirect)) {
             check_tun_traffic_to(connected_direct_fixture()?).await?;
         }
@@ -2223,6 +2237,25 @@ async fn installed_fake_dns(
         );
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn check_fallback_search_in_vm(name: &str, expected: bool) -> Result {
+    let output = tokio::time::timeout(
+        Duration::from_secs(6),
+        tokio::process::Command::new("/usr/bin/resolvectl")
+            .args(["-4", "--protocol=dns", "--cache=no", "query", name])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    let matched = std::str::from_utf8(&output.stdout)?
+        .split_whitespace()
+        .any(|field| field == "192.0.2.99");
+    require(
+        output.status.success() == expected && matched == expected,
+        "Resolved изменил правила поиска имени или маршрутного домена",
+    )
 }
 
 #[cfg(feature = "test-support")]

@@ -333,7 +333,8 @@ pub async fn prepare_link_dns(
     route_domains: &[String],
     timeout: Duration,
 ) -> Result<Resolve1Prepared, ResolverError> {
-    prepare_dns_on_owned_link(ifindex, &[marker], route_domains, false, timeout).await
+    let domains = Resolve1DomainPublication::scoped(route_domains);
+    prepare_dns_on_owned_link(ifindex, &[marker], domains, false, timeout).await
 }
 
 /// В режиме FallbackDNS переносим выбор сервера на собственный TUN, иначе
@@ -342,20 +343,59 @@ pub(crate) async fn prepare_fallback_link_dns(
     ifindex: u32,
     servers: &[IpAddr],
     route_domains: &[String],
+    original_domains: &[Resolve1Domain],
     timeout: Duration,
 ) -> Result<Resolve1Prepared, ResolverError> {
-    // ~. имеет приоритет над обычными исключениями .local и link-local PTR.
-    prepare_dns_on_owned_link(ifindex, servers, route_domains, true, timeout).await
+    let domains = Resolve1DomainPublication::fallback(route_domains, original_domains);
+    prepare_dns_on_owned_link(ifindex, servers, domains, true, timeout).await
+}
+
+type LinkDomain = (String, bool);
+
+struct Resolve1DomainPublication {
+    link: Vec<LinkDomain>,
+    mirrored_global: Option<Vec<LinkDomain>>,
+}
+
+impl Resolve1DomainPublication {
+    fn scoped(route_domains: &[String]) -> Self {
+        Self {
+            link: route_domains
+                .iter()
+                .cloned()
+                .map(|name| (name, true))
+                .collect(),
+            mirrored_global: None,
+        }
+    }
+
+    fn fallback(route_domains: &[String], original: &[Resolve1Domain]) -> Self {
+        let global = original
+            .iter()
+            .filter(|domain| domain.scope == Resolve1Scope::Global)
+            .map(|domain| (domain.name.clone(), domain.route_only))
+            .collect::<Vec<_>>();
+        // Порядок и флаги определяют поиск коротких имён. Копируем только
+        // существующие настройки, в том числе ~. лишь при наличии у resolved.
+        Self {
+            link: global
+                .iter()
+                .cloned()
+                .chain(route_domains.iter().cloned().map(|name| (name, true)))
+                .collect(),
+            mirrored_global: Some(global),
+        }
+    }
 }
 
 async fn prepare_dns_on_owned_link(
     ifindex: u32,
     servers: &[IpAddr],
-    route_domains: &[String],
+    domains: Resolve1DomainPublication,
     default_route: bool,
     timeout: Duration,
 ) -> Result<Resolve1Prepared, ResolverError> {
-    validate_link_request(ifindex, route_domains)?;
+    validate_link_request(ifindex, &domains.link)?;
     if servers.is_empty() || servers.len() > MAX_ENTRIES {
         return Err(ResolverError::Limit);
     }
@@ -367,7 +407,7 @@ async fn prepare_dns_on_owned_link(
     }
     tokio::time::timeout(timeout, async {
         let connection = Connection::system().await.map_err(bus_error)?;
-        prepare_on_connection(connection, ifindex, servers, route_domains, default_route).await
+        prepare_on_connection(connection, ifindex, servers, domains, default_route).await
     })
     .await
     .map_err(|_| ResolverError::Timeout)?
@@ -410,7 +450,7 @@ pub struct Resolve1Prepared {
     link_path: OwnedObjectPath,
     dns: Vec<(i32, Vec<u8>)>,
     default_route: bool,
-    route_domains: Vec<String>,
+    domains: Resolve1DomainPublication,
 }
 
 impl Resolve1Prepared {
@@ -430,11 +470,7 @@ impl Resolve1Prepared {
                 .map(|(family, bytes)| (family, bytes, 0, String::new()))
                 .collect(),
             default_route: self.default_route,
-            domains: self
-                .route_domains
-                .iter()
-                .map(|domain| (domain.clone(), true))
-                .collect(),
+            domains: self.domains.link.clone(),
         };
         if read_link_config(connection, &self.owner, &path).await? != expected {
             return Err(ResolverError::NetworkChanged);
@@ -442,7 +478,7 @@ impl Resolve1Prepared {
         ensure_manager_domains(
             &manager_domains(connection, &self.owner).await?,
             self.ifindex as u32,
-            &self.route_domains,
+            &self.domains,
             true,
         )?;
         verify_owner(connection, &self.owner).await
@@ -453,7 +489,7 @@ impl std::fmt::Debug for Resolve1Prepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Resolve1Prepared")
             .field("ifindex", &self.ifindex)
-            .field("route_domain_count", &self.route_domains.len())
+            .field("domain_count", &self.domains.link.len())
             .field("dns_count", &self.dns.len())
             .finish()
     }
@@ -470,10 +506,10 @@ async fn prepare_on_connection(
     connection: Connection,
     ifindex: u32,
     servers: &[IpAddr],
-    route_domains: &[String],
+    domains: Resolve1DomainPublication,
     default_route: bool,
 ) -> Result<Resolve1Prepared, ResolverError> {
-    validate_link_request(ifindex, route_domains)?;
+    validate_link_request(ifindex, &domains.link)?;
     let owner = owner(&connection).await?;
     let link_path = get_link_path(&connection, &owner, ifindex).await?;
     let state = read_link_config(&connection, &owner, &link_path).await?;
@@ -483,7 +519,7 @@ async fn prepare_on_connection(
     ensure_manager_domains(
         &manager_domains(&connection, &owner).await?,
         ifindex,
-        route_domains,
+        &domains,
         false,
     )?;
     verify_owner(&connection, &owner).await?;
@@ -494,7 +530,7 @@ async fn prepare_on_connection(
         link_path,
         dns: servers.iter().copied().map(encode_address).collect(),
         default_route,
-        route_domains: route_domains.to_vec(),
+        domains,
     })
 }
 
@@ -515,19 +551,14 @@ async fn apply_prepared(
     ensure_manager_domains(
         &manager_domains(connection, &prepared.owner).await?,
         prepared.ifindex as u32,
-        &prepared.route_domains,
+        &prepared.domains,
         false,
     )?;
 
     let manager = Proxy::new(connection, prepared.owner.as_str(), PATH, MANAGER)
         .await
         .map_err(bus_error)?;
-    let expected_domains = prepared
-        .route_domains
-        .iter()
-        .cloned()
-        .map(|domain| (domain, true))
-        .collect::<Vec<_>>();
+    let expected_domains = &prepared.domains.link;
     // Routing is installed first, before this interface receives DNS queries.
     *mutation_started = true;
     let _: () = manager
@@ -538,10 +569,7 @@ async fn apply_prepared(
         .await
         .map_err(bus_error)?;
     let _: () = manager
-        .call(
-            "SetLinkDomains",
-            &(prepared.ifindex, expected_domains.clone()),
-        )
+        .call("SetLinkDomains", &(prepared.ifindex, expected_domains))
         .await
         .map_err(bus_error)?;
 
@@ -550,14 +578,14 @@ async fn apply_prepared(
     if !after_domains.dns.is_empty()
         || !after_domains.dns_ex.is_empty()
         || after_domains.default_route != prepared.default_route
-        || after_domains.domains != expected_domains
+        || &after_domains.domains != expected_domains
     {
         return Err(ResolverError::NetworkChanged);
     }
     ensure_manager_domains(
         &manager_domains(connection, &prepared.owner).await?,
         prepared.ifindex as u32,
-        &prepared.route_domains,
+        &prepared.domains,
         true,
     )?;
 
@@ -668,37 +696,51 @@ async fn manager_domains(
 fn ensure_manager_domains(
     current: &[(i32, String, bool)],
     ifindex: u32,
-    requested: &[String],
+    publication: &Resolve1DomainPublication,
     must_be_present: bool,
 ) -> Result<(), ResolverError> {
-    if !requested.is_empty()
+    if let Some(global) = &publication.mirrored_global {
+        let actual_global = current
+            .iter()
+            .filter(|(index, _, _)| *index == 0)
+            .map(|(_, name, route_only)| (name, route_only));
+        if actual_global.ne(global.iter().map(|(name, route_only)| (name, route_only))) {
+            return Err(ResolverError::NetworkChanged);
+        }
+    } else if !publication.link.is_empty()
         && current
             .iter()
             .any(|(index, name, _)| *index == 0 && name == ".")
     {
         return Err(ResolverError::Untrusted);
     }
-    for expected in requested {
-        let matching = current
-            .iter()
-            .filter(|(_, name, _)| name.eq_ignore_ascii_case(expected))
-            .collect::<Vec<_>>();
-        if must_be_present {
-            if matching.len() != 1 || matching[0].0 != ifindex as i32 || !matching[0].2 {
-                return Err(
-                    if matching
-                        .iter()
-                        .any(|(index, _, _)| *index != ifindex as i32)
-                    {
-                        ResolverError::Untrusted
-                    } else {
-                        ResolverError::NetworkChanged
-                    },
-                );
-            }
-        } else if !matching.is_empty() {
-            return Err(ResolverError::Untrusted);
-        }
+    let owned_index = ifindex as i32;
+    let names = publication
+        .link
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    if current.iter().any(|(index, name, _)| {
+        *index != owned_index
+            && (*index != 0 || publication.mirrored_global.is_none())
+            && names.contains(&name.to_ascii_lowercase())
+    }) {
+        return Err(ResolverError::Untrusted);
+    }
+    let expected_link = if must_be_present {
+        publication.link.as_slice()
+    } else {
+        &[]
+    };
+    let actual_link = current
+        .iter()
+        .filter(|(index, _, _)| *index == owned_index)
+        .map(|(_, name, route_only)| (name, route_only));
+    if actual_link.ne(expected_link
+        .iter()
+        .map(|(name, route_only)| (name, route_only)))
+    {
+        return Err(ResolverError::NetworkChanged);
     }
     Ok(())
 }
@@ -736,13 +778,16 @@ fn link_object_path(ifindex: i32) -> String {
     format!("{PATH}/link/{component}")
 }
 
-fn validate_link_request(ifindex: u32, domains: &[String]) -> Result<(), ResolverError> {
+fn validate_link_request(ifindex: u32, domains: &[LinkDomain]) -> Result<(), ResolverError> {
     if ifindex == 0 || i32::try_from(ifindex).is_err() || domains.len() > MAX_ROUTE_DOMAINS {
         return Err(ResolverError::Limit);
     }
     let mut seen = HashSet::with_capacity(domains.len());
-    for domain in domains {
-        if !valid_domain(domain) || !seen.insert(domain.to_ascii_lowercase()) {
+    for (domain, route_only) in domains {
+        if !valid_domain(domain)
+            || (domain == "." && !route_only)
+            || !seen.insert(domain.to_ascii_lowercase())
+        {
             return Err(ResolverError::Malformed);
         }
     }
@@ -871,6 +916,7 @@ mod tests {
         fail_dns: bool,
         fail_domains: bool,
         inject_conflict_after_domains: bool,
+        flip_global_flag_after_domains: bool,
         hide_dns_ex_after_domains: bool,
         events: Vec<&'static str>,
     }
@@ -943,6 +989,9 @@ mod tests {
             state.domains = domains;
             if state.inject_conflict_after_domains {
                 state.foreign_domains.push((0, "corp.example".into(), true));
+            }
+            if state.flip_global_flag_after_domains {
+                state.foreign_domains[0].2 = true;
             }
             Ok(())
         }
@@ -1097,7 +1146,16 @@ mod tests {
 
     #[tokio::test]
     async fn публикует_резервные_серверы_на_tun_в_исходном_порядке() {
-        let state = std::sync::Arc::new(std::sync::Mutex::new(MutationState::default()));
+        let original = vec![
+            (0, "second.test".into(), false),
+            (0, "first.test".into(), false),
+            (0, ".".into(), true),
+        ];
+        let domains = decode(Vec::new(), original.clone()).unwrap().domains;
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MutationState {
+            foreign_domains: original.clone(),
+            ..MutationState::default()
+        }));
         let (_bus, server, client) = mutation_fixture(state.clone()).await;
         let servers = [
             "192.0.2.11".parse().unwrap(),
@@ -1108,7 +1166,7 @@ mod tests {
             client,
             TEST_IFINDEX as u32,
             &servers,
-            &["fake.test".into()],
+            Resolve1DomainPublication::fallback(&["fake.test".into()], &domains),
             true,
         )
         .await
@@ -1119,9 +1177,47 @@ mod tests {
         {
             let state = state.lock().unwrap();
             assert_eq!(state.dns, servers.map(encode_address));
-            assert_eq!(state.domains, [("fake.test".into(), true)]);
+            assert_eq!(
+                state.domains,
+                [
+                    ("second.test".into(), false),
+                    ("first.test".into(), false),
+                    (".".into(), true),
+                    ("fake.test".into(), true),
+                ]
+            );
+            assert_eq!(state.foreign_domains, original);
             assert!(state.default_route);
         }
+        server.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn изменение_поискового_домена_прерывает_публикацию_резервных_dns() {
+        let original = vec![(0, "corp.test".into(), false)];
+        let domains = decode(Vec::new(), original.clone()).unwrap().domains;
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MutationState {
+            foreign_domains: original,
+            flip_global_flag_after_domains: true,
+            ..MutationState::default()
+        }));
+        let (_bus, server, client) = mutation_fixture(state.clone()).await;
+        let request = Resolve1DomainPublication::fallback(&["fake.test".into()], &domains);
+        let prepared = prepare_on_connection(
+            client,
+            TEST_IFINDEX as u32,
+            &["192.0.2.11".parse().unwrap()],
+            request,
+            true,
+        )
+        .await
+        .unwrap();
+        let failure = apply_link_dns(&prepared, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error, ResolverError::NetworkChanged);
+        assert!(failure.cleanup_required);
+        assert_eq!(state.lock().unwrap().set_dns_calls, 0);
         server.close().await.unwrap();
     }
 
@@ -1134,7 +1230,7 @@ mod tests {
             client,
             TEST_IFINDEX as u32,
             &["198.18.0.1".parse().unwrap()],
-            &domains,
+            Resolve1DomainPublication::scoped(&domains),
             false,
         )
         .await
@@ -1172,7 +1268,7 @@ mod tests {
             client,
             TEST_IFINDEX as u32,
             &["198.18.0.1".parse().unwrap()],
-            &[],
+            Resolve1DomainPublication::scoped(&[]),
             false,
         )
         .await;
@@ -1197,7 +1293,7 @@ mod tests {
             client,
             TEST_IFINDEX as u32,
             &["198.18.0.1".parse().unwrap()],
-            &["corp.example".into()],
+            Resolve1DomainPublication::scoped(&["corp.example".into()]),
             false,
         )
         .await;
@@ -1218,7 +1314,7 @@ mod tests {
             client,
             TEST_IFINDEX as u32,
             &["198.18.0.1".parse().unwrap()],
-            &["corp.example".into()],
+            Resolve1DomainPublication::scoped(&["corp.example".into()]),
             false,
         )
         .await;
@@ -1237,7 +1333,7 @@ mod tests {
             client,
             TEST_IFINDEX as u32,
             &["198.18.0.1".parse().unwrap()],
-            &["corp.example".into()],
+            Resolve1DomainPublication::scoped(&["corp.example".into()]),
             false,
         )
         .await
@@ -1267,7 +1363,7 @@ mod tests {
             client,
             TEST_IFINDEX as u32,
             &["198.18.0.1".parse().unwrap()],
-            &["corp.example".into()],
+            Resolve1DomainPublication::scoped(&["corp.example".into()]),
             false,
         )
         .await
@@ -1296,7 +1392,7 @@ mod tests {
             client,
             TEST_IFINDEX as u32,
             &["198.18.0.1".parse().unwrap()],
-            &["corp.example".into()],
+            Resolve1DomainPublication::scoped(&["corp.example".into()]),
             false,
         )
         .await
@@ -1319,18 +1415,27 @@ mod tests {
 
     #[test]
     fn route_domains_are_validated_and_root_requires_explicit_dot() {
-        assert!(validate_link_request(13, &["corp.example".into(), ".".into()]).is_ok());
+        assert!(
+            validate_link_request(13, &[("corp.example".into(), false), (".".into(), true)])
+                .is_ok()
+        );
         assert_eq!(
-            validate_link_request(13, &["".into()]),
+            validate_link_request(13, &[("".into(), false)]),
             Err(ResolverError::Malformed)
         );
         assert_eq!(
-            validate_link_request(13, &["~corp.example".into()]),
+            validate_link_request(13, &[("~corp.example".into(), true)]),
             Err(ResolverError::Malformed)
         );
         assert_eq!(validate_link_request(0, &[]), Err(ResolverError::Limit));
         assert_eq!(
-            validate_link_request(13, &["corp.example".into(), "CORP.EXAMPLE".into()]),
+            validate_link_request(
+                13,
+                &[
+                    ("corp.example".into(), false),
+                    ("CORP.EXAMPLE".into(), true)
+                ]
+            ),
             Err(ResolverError::Malformed)
         );
         assert_eq!(

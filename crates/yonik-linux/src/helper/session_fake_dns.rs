@@ -407,14 +407,7 @@ impl PreparedFakeDns {
             return Err(ServiceError::Unsupported);
         }
         if let Some(snapshot) = resolved.as_ref().filter(|snapshot| snapshot.fallback_only) {
-            // При переносе fallback на линк resolved меняет набор search domains.
-            if upstreams.len() != snapshot.config.endpoints.len()
-                || snapshot
-                    .config
-                    .domains
-                    .iter()
-                    .any(|domain| domain.scope == Resolve1Scope::Global)
-            {
+            if upstreams.len() != snapshot.config.endpoints.len() {
                 return Err(ServiceError::Unsupported);
             }
             upstreams.clear();
@@ -507,9 +500,15 @@ impl PreparedFakeDns {
                     .map(|(peer, _)| peer.ip())
                     .collect::<Vec<_>>();
                 Some(
-                    prepare_fallback_link_dns(ifindex, &servers, &self.suffixes, LIMIT)
-                        .await
-                        .map_err(|_| ServiceError::Unsupported)?,
+                    prepare_fallback_link_dns(
+                        ifindex,
+                        &servers,
+                        &self.suffixes,
+                        &snapshot.config.domains,
+                        LIMIT,
+                    )
+                    .await
+                    .map_err(|_| ServiceError::Unsupported)?,
                 )
             }
             Some(_) => Some(
@@ -542,7 +541,10 @@ impl PreparedFakeDns {
                 let name = forward_query_name(packet)?;
                 if !for_task.approves(&name) {
                     if for_task.resolved.as_ref().is_some_and(|snapshot| {
-                        !permits_resolver_name(&snapshot.config.domains, &name, link)
+                        // В fallback-only ни один внешний link не имеет DNS.
+                        // Его домены не участвуют в выборе области у resolved.
+                        !snapshot.fallback_only
+                            && !permits_resolver_name(&snapshot.config.domains, &name, link)
                     }) {
                         return Err(ResolverError::Untrusted);
                     }
