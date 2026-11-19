@@ -4,11 +4,11 @@ use super::{
     protection_host::{ARPHRD_ETHER, IFF_UP},
 };
 use crate::{
-    Cancellation,
+    Cancellation, NetworkReadError, RouteQuery, TransportProtocol,
     fake_flow::WorkerOnlyLoopbackIsolation,
     fake_service::{FakeDnsBridgeListeners, FakeDnsLeases, MAX_FAKE_TTL},
     managed_network::{Journal, firewall::BoundDirect},
-    network::LinuxTopology,
+    network::{LinuxTopology, reread_changed_route},
     resolver::{
         PlainResolverSnapshot, ResolvConfLayout, ResolverError, SYSTEM_RESOLV_CONF,
         file_watch::ResolverFileWatch,
@@ -283,6 +283,30 @@ fn resolved_peers(
         .collect()
 }
 
+async fn fallback_peer_reachable(
+    address: IpAddr,
+    mark: u32,
+    cancel: &mut Cancellation,
+) -> Result<bool, ServiceError> {
+    for protocol in [TransportProtocol::Tcp, TransportProtocol::Udp] {
+        let query =
+            RouteQuery::new(address, 0)
+                .with_mark(mark)
+                .with_transport(protocol, None, Some(53));
+        match reread_changed_route(query, cancel, LIMIT).await {
+            Ok(_) => {}
+            Err(NetworkReadError::Kernel(errno))
+                if errno == rustix::io::Errno::NETUNREACH.raw_os_error() =>
+            {
+                return Ok(false);
+            }
+            Err(NetworkReadError::Cancelled) => return Err(ServiceError::Cancelled),
+            Err(_) => return Err(ServiceError::Unavailable),
+        }
+    }
+    Ok(true)
+}
+
 async fn verify_resolved_baseline(
     expected: &Resolve1TunSnapshot,
     own_link: Option<u32>,
@@ -370,7 +394,7 @@ impl PreparedFakeDns {
         } else {
             None
         };
-        let upstreams = match (&source, &resolved) {
+        let mut upstreams = match (&source, &resolved) {
             (ResolverSource::Literal(snapshot, _), _) => snapshot
                 .nameservers()
                 .iter()
@@ -382,17 +406,29 @@ impl PreparedFakeDns {
         if upstreams.len() > SystemFakeDnsBridge::MAX_PLAIN_DNS_PEERS {
             return Err(ServiceError::Unsupported);
         }
-        if resolved.as_ref().is_some_and(|snapshot| {
-            snapshot.fallback_only
-                && (upstreams.len() != snapshot.config.endpoints.len()
-                    || snapshot
-                        .config
-                        .domains
-                        .iter()
-                        .any(|domain| domain.scope == Resolve1Scope::Global))
-        }) {
+        if let Some(snapshot) = resolved.as_ref().filter(|snapshot| snapshot.fallback_only) {
             // При переносе fallback на линк resolved меняет набор search domains.
-            return Err(ServiceError::Unsupported);
+            if upstreams.len() != snapshot.config.endpoints.len()
+                || snapshot
+                    .config
+                    .domains
+                    .iter()
+                    .any(|domain| domain.scope == Resolve1Scope::Global)
+            {
+                return Err(ServiceError::Unsupported);
+            }
+            upstreams.clear();
+            // Сохраняем исходный порядок. Неполные снимки и потеря событий
+            // по-прежнему закрывают Prepare. Отбор пропускает только адреса,
+            // для которых ядро подтвердило недостижимость сети.
+            for endpoint in &snapshot.config.endpoints {
+                if fallback_peer_reachable(endpoint.address, plan.socket_mark(), cancel).await? {
+                    upstreams.push((endpoint.address, None));
+                }
+            }
+            if upstreams.is_empty() {
+                return Err(ServiceError::Unsupported);
+            }
         }
         let mark = NonZeroU32::new(plan.socket_mark()).ok_or(ServiceError::Unavailable)?;
         let mut plain = Vec::with_capacity(upstreams.len());
@@ -466,11 +502,9 @@ impl PreparedFakeDns {
             Some(snapshot) if snapshot.fallback_only => {
                 // Сохраняем порядок резервных серверов из resolved. Каждый адрес
                 // уже имеет отдельный релей и проверенный физический маршрут.
-                let servers = snapshot
-                    .config
-                    .endpoints
-                    .iter()
-                    .map(|server| server.address)
+                let servers = self
+                    .plain_peers()
+                    .map(|(peer, _)| peer.ip())
                     .collect::<Vec<_>>();
                 Some(
                     prepare_fallback_link_dns(ifindex, &servers, &self.suffixes, LIMIT)
