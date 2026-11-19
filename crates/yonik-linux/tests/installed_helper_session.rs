@@ -2260,6 +2260,10 @@ async fn installed_fake_dns(
         .ok()
         .map(|peer| peer.parse::<std::net::SocketAddr>())
         .transpose()?;
+    let uplink_split_peer = std::env::var("YONIK_CHECK_UPLINK_SPLIT_PEER")
+        .ok()
+        .map(|peer| peer.parse::<std::net::SocketAddr>())
+        .transpose()?;
     let fallback_engine = match fallback_dns.as_deref() {
         Ok("xray") => Some(Engine::Xray),
         Ok("sing-box") => Some(Engine::SingBox),
@@ -2363,6 +2367,23 @@ async fn installed_fake_dns(
                 "{engine:?}: реальный DNS и Fake DNS подтверждены по TCP и UDP на порту {}",
                 peer.port()
             );
+        }
+        if let Some(peer) = uplink_split_peer {
+            let name = match engine {
+                Engine::Xray => "xray.private.test",
+                Engine::SingBox => "sing-box.private.test",
+            };
+            require(
+                getent_fake_dns("ahostsv4", name).await? == std::net::Ipv4Addr::new(192, 0, 2, 100),
+                "NSS не получил ответ от приватного DoT-сервера",
+            )?;
+            for tcp in [false, true] {
+                require(
+                    ask_fixture_dns(peer, "example.test", 1, tcp).await.is_err(),
+                    "Прямой запрос к неопубликованному split-DNS получил Fake-IP",
+                )?;
+            }
+            eprintln!("{engine:?}: приватный DoT ответил через NSS, прямой DNS закрыт");
         }
         check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
         if let Some(witness) = &policy_witness {
