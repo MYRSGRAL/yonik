@@ -645,6 +645,17 @@ IPv4-сценарий с теми же проверками прошёл пов�
   cgroup перед очисткой сети. При перезапуске helper идентификация области
   worker требуется до использования журнала восстановления. Режим Check
   запускается без сетевых полномочий, а Run получает TUN и CAP_NET_ADMIN.
+  Проверка пустой cgroup v2 выделена из systemd supervisor и применяется
+  также к отдельному lookup worker. Она сверяет ID монтирования по
+  открытому дескриптору и повторно сверяет inode каталога перед
+  подтверждением пустоты. В Debian 13.7 с ядром 6.12.117 стенд увидел
+  процесс во вложенной cgroup после повторного открытия, подтвердил
+  пустоту после `cgroup.kill` и отклонил замену каталога и bind mount.
+  В sandbox systemd отдельно проверены запуск Check и Recover с
+  подтверждением пустоты. Установленный helper в Debian и Fedora RPM
+  под SELinux Enforcing прошли Prepare, Apply, Stop и восстановление на
+  Xray и sing-box с неизменным `/etc/resolv.conf`.
+  [Семантика cgroup.events и cgroup.kill](https://docs.kernel.org/admin-guide/cgroup-v2.html#core-interface-files)
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
   `Unavailable` до запуска ядра. Политики Fedora 45.23 и 45.24 отклонили

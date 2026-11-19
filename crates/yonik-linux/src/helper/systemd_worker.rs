@@ -1,16 +1,17 @@
 //! Владелец двух фиксированных systemd worker, с подтверждением пустой cgroup.
 //! Accepted подтверждает передачу FD, но не готовность сети и не Applied.
 use super::run_authorization::{RunAuthority, RunAuthorization, RunRevocationGuard};
+pub(super) use super::worker_paths::{FILE_FLAGS, child, root, trusted};
+use super::worker_paths::{WorkerCgroups, read_bounded};
 use crate::{
     Cancellation,
     worker::{WorkerAck, WorkerMode, WorkerPayload, WorkerStatus},
 };
 use futures_util::StreamExt;
-use rustix::fs::{Mode, OFlags, fstatfs, open, openat};
+use rustix::fs::{Mode, OFlags, openat};
 use std::{
     collections::HashMap,
     fs::File,
-    io::Read,
     os::unix::fs::MetadataExt,
     sync::{
         Arc,
@@ -423,7 +424,7 @@ trait WorkerFence: Send + Sync {
 struct SystemFence;
 impl WorkerFence for SystemFence {
     fn empty(&self, mode: WorkerMode) -> Result<bool> {
-        cgroup_empty(mode)
+        WorkerCgroups::open("system.slice")?.empty(mode.service())
     }
 }
 impl WorkerState {
@@ -1624,6 +1625,7 @@ impl SystemWorkerSupervisor {
         Ok(())
     }
 }
+
 const WORKER_TIMEOUT_ABORT_MASK: &str = "10-timeout-abort.conf";
 
 fn worker_drop_ins_allowed(name: &str, paths: &[String]) -> bool {
@@ -1889,42 +1891,6 @@ async fn bounded<T>(
     tokio::select! {biased; _=cancel.cancelled()=>Err(WorkerSupervisorError::Cancelled),_=tokio::time::sleep_until(deadline)=>Err(WorkerSupervisorError::Timeout),result=operation=>result}
 }
 
-pub(super) const FILE_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::CLOEXEC)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::NONBLOCK);
-const DIR_FLAGS: OFlags = FILE_FLAGS.union(OFlags::DIRECTORY);
-pub(super) fn trusted(file: &File, directory: bool) -> Result<()> {
-    let m = file.metadata().map_err(unavailable)?;
-    if m.uid() != 0
-        || m.mode() & 0o022 != 0
-        || (directory && !m.is_dir())
-        || (!directory && !m.is_file())
-    {
-        return Err(WorkerSupervisorError::Untrusted);
-    }
-    Ok(())
-}
-pub(super) fn child(parent: &File, name: &str) -> Result<File> {
-    let file = File::from(openat(parent, name, DIR_FLAGS, Mode::empty()).map_err(unavailable)?);
-    trusted(&file, true)?;
-    Ok(file)
-}
-pub(super) fn root() -> Result<File> {
-    let file = File::from(open("/", DIR_FLAGS, Mode::empty()).map_err(unavailable)?);
-    trusted(&file, true)?;
-    Ok(file)
-}
-fn read_bounded(file: File) -> Result<String> {
-    let mut contents = String::new();
-    file.take(16 * 1024 + 1)
-        .read_to_string(&mut contents)
-        .map_err(unavailable)?;
-    if contents.len() > 16 * 1024 {
-        return Err(WorkerSupervisorError::Untrusted);
-    }
-    Ok(contents)
-}
 fn systemd_unit_directory() -> Result<File> {
     let mut parent = root()?;
     for component in ["usr", "lib", "systemd", "system"] {
@@ -2001,57 +1967,6 @@ fn verify_socket(mode: WorkerMode) -> Result<()> {
     }
     // Каталог root не позволяет UID worker подменить сокет после stat.
     Ok(())
-}
-fn cgroup_empty(mode: WorkerMode) -> Result<bool> {
-    let mut directory = root()?;
-    for component in ["sys", "fs", "cgroup"] {
-        directory = child(&directory, component)?;
-    }
-    if fstatfs(&directory).map_err(unavailable)?.f_type as u64 != 0x6367_7270 {
-        return Err(WorkerSupervisorError::Untrusted);
-    }
-    let parent = child(&directory, "system.slice")?;
-    let Some(group) = open_worker_group(&parent, mode)? else {
-        return Ok(true);
-    };
-    trusted(&group, true)?;
-    let events = File::from(
-        openat(&group, "cgroup.events", FILE_FLAGS, Mode::empty()).map_err(unavailable)?,
-    );
-    empty_events(&read_bounded(events)?)
-}
-// Вызывающий проверяет root-владельца parent и cgroup2fs до интерпретации ENOENT.
-fn open_worker_group(parent: &File, mode: WorkerMode) -> Result<Option<File>> {
-    match openat(parent, mode.service(), DIR_FLAGS, Mode::empty()) {
-        Ok(fd) => Ok(Some(File::from(fd))),
-        Err(rustix::io::Errno::NOENT) => Ok(None),
-        Err(_) => Err(WorkerSupervisorError::Unavailable),
-    }
-}
-fn empty_events(contents: &str) -> Result<bool> {
-    if !contents.ends_with('\n') {
-        return Err(WorkerSupervisorError::Untrusted);
-    }
-    let mut populated = None;
-    for line in contents.lines() {
-        let (name, value) = line
-            .split_once(' ')
-            .ok_or(WorkerSupervisorError::Untrusted)?;
-        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(WorkerSupervisorError::Untrusted);
-        }
-        if name == "populated" {
-            if populated.is_some() {
-                return Err(WorkerSupervisorError::Untrusted);
-            }
-            populated = Some(match value {
-                "0" => true,
-                "1" => false,
-                _ => return Err(WorkerSupervisorError::Untrusted),
-            });
-        }
-    }
-    populated.ok_or(WorkerSupervisorError::Untrusted)
 }
 #[cfg(test)]
 #[path = "systemd_worker_tests.rs"]

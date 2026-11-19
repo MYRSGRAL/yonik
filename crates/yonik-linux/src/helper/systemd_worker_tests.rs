@@ -1,4 +1,142 @@
 use super::*;
+use crate::helper::worker_paths::{empty_events, open_worker_directory};
+
+fn require_cgroup_fixture_vm() {
+    assert_eq!(
+        std::env::var("YONIK_PRODUCTION_HELPER_VM").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        std::fs::read_to_string("/etc/yonik-production-helper-vm").unwrap(),
+        "yonik-production-helper-disposable-v1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+            .unwrap()
+            .trim(),
+        "QEMU"
+    );
+    assert_eq!(rustix::process::getuid().as_raw(), 0);
+}
+
+#[test]
+#[ignore = "Только disposable QEMU VM с доступной для записи cgroup v2"]
+fn worker_cgroup_recovery_observes_nested_process() {
+    use std::{process::Command, time::Instant as StdInstant};
+    require_cgroup_fixture_vm();
+    struct Fixture {
+        root: std::path::PathBuf,
+        process: Option<std::process::Child>,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(process) = self.process.as_mut() {
+                let _ = process.kill();
+                let _ = process.wait();
+            }
+            let _ = std::fs::remove_dir(self.root.join("worker/nested"));
+            let _ = std::fs::remove_dir(self.root.join("worker"));
+            let _ = std::fs::remove_dir(self.root.join("replacement"));
+            let _ = std::fs::remove_dir(&self.root);
+        }
+    }
+
+    let parent = format!("yonik-fence-test-{}", std::process::id());
+    let root = std::path::Path::new("/sys/fs/cgroup").join(&parent);
+    std::fs::create_dir(&root).unwrap();
+    let mut fixture = Fixture {
+        root,
+        process: None,
+    };
+    let initial = WorkerCgroups::open(&parent).unwrap();
+    assert!(initial.empty("worker").unwrap());
+    let nested = fixture.root.join("worker/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let mut process = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+    let pid = process.id();
+    assert!(process.try_wait().unwrap().is_none());
+    fixture.process = Some(process);
+    std::fs::write(nested.join("cgroup.procs"), pid.to_string()).unwrap();
+    drop(initial);
+
+    let recovered = WorkerCgroups::open(&parent).unwrap();
+    assert!(!recovered.empty("worker").unwrap());
+    std::fs::write(fixture.root.join("worker/cgroup.kill"), "1").unwrap();
+    let process = fixture.process.as_mut().unwrap();
+    let deadline = StdInstant::now() + Duration::from_secs(2);
+    while process.try_wait().unwrap().is_none() || !recovered.empty("worker").unwrap() {
+        assert!(StdInstant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::remove_dir(nested).unwrap();
+    let worker = fixture.root.join("worker");
+    let replacement = fixture.root.join("replacement");
+    std::fs::create_dir(&replacement).unwrap();
+    assert!(
+        Command::new("/usr/bin/mount")
+            .arg("--bind")
+            .arg(&replacement)
+            .arg(&worker)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mount_result = recovered.empty("worker");
+    assert!(
+        Command::new("/usr/bin/umount")
+            .arg(&worker)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(mount_result, Err(WorkerSupervisorError::Untrusted));
+    std::fs::remove_dir(replacement).unwrap();
+    std::fs::remove_dir(worker).unwrap();
+    assert!(recovered.empty("worker").unwrap());
+    std::fs::remove_dir(&fixture.root).unwrap();
+    std::fs::create_dir(&fixture.root).unwrap();
+    assert_eq!(recovered.empty("worker"), Err(WorkerSupervisorError::Stale));
+    assert!(
+        WorkerCgroups::open(&parent)
+            .unwrap()
+            .empty("worker")
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+#[ignore = "Только disposable QEMU VM с установленными worker units"]
+async fn recover_confirms_cgroup_in_systemd_sandbox() -> Result<()> {
+    require_cgroup_fixture_vm();
+    let mut supervisor = SystemWorkerSupervisor::system().await?;
+    let (_sender, mut cancel) = Cancellation::new();
+    let mode = WorkerMode::Check;
+    let deadline = Instant::now() + DEADLINE;
+    supervisor.begin(mode, &mut cancel, deadline).await?;
+    let connection = tokio::net::UnixStream::connect(mode.channel()).await;
+    let result = async {
+        connection.as_ref().map_err(unavailable)?;
+        loop {
+            if supervisor.state(mode).await?.active == "active" {
+                if supervisor.fence.empty(mode)? {
+                    return Err(WorkerSupervisorError::Stale);
+                }
+                break Ok(());
+            }
+            if Instant::now() >= deadline {
+                break Err(WorkerSupervisorError::Timeout);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    .await;
+    let cleanup = supervisor.recover(&mut cancel).await;
+    drop(connection);
+    result?;
+    cleanup?;
+    assert!(supervisor.fence.empty(mode)?);
+    Ok(())
+}
 
 #[test]
 fn cgroup_events_requires_a_single_zero_populated_field() {
@@ -628,19 +766,19 @@ fn missing_cgroup_is_empty_but_symlink_and_wrong_type_are_unknown() {
     std::fs::create_dir(&path).unwrap();
     let parent = File::open(&path).unwrap();
     assert!(
-        open_worker_group(&parent, WorkerMode::Run)
+        open_worker_directory(&parent, WorkerMode::Run.service())
             .unwrap()
             .is_none()
     );
     std::fs::write(path.join(WorkerMode::Run.service()), b"").unwrap();
-    assert!(open_worker_group(&parent, WorkerMode::Run).is_err());
+    assert!(open_worker_directory(&parent, WorkerMode::Run.service()).is_err());
     std::fs::remove_file(path.join(WorkerMode::Run.service())).unwrap();
     std::os::unix::fs::symlink(&path, path.join(WorkerMode::Run.service())).unwrap();
-    assert!(open_worker_group(&parent, WorkerMode::Run).is_err());
+    assert!(open_worker_directory(&parent, WorkerMode::Run.service()).is_err());
     std::fs::remove_file(path.join(WorkerMode::Run.service())).unwrap();
     std::fs::create_dir(path.join(WorkerMode::Run.service())).unwrap();
     assert!(
-        open_worker_group(&parent, WorkerMode::Run)
+        open_worker_directory(&parent, WorkerMode::Run.service())
             .unwrap()
             .is_some()
     );
