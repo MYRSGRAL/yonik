@@ -13,6 +13,7 @@
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
 | Arch Linux ARM, QEMU, AArch64, ядро 7.3.5 | Установленные GNU helper и worker, systemd 262.2, nftables 1.1.7. Штатная ссылка `/etc/resolv.conf` на upstream-файл systemd-resolved. Отдельные прогоны с глобальным DNS и FallbackDNS | NSS и прямые DNS-запросы по TCP/UDP на порт 53, HTTPS, DoH, Stop и Unlock. Ссылка `/etc/resolv.conf` и содержимое файла совпали до и после. В сценарии с глобальным DNS systemd-resolved при Stop пересоздал свой файл в `/run` |
 | Arch Linux ARM, QEMU, AArch64, systemd 262.2 | Установленный helper, uplink-файл, строгий DoT. Отдельные прогоны с глобальным DNS и FallbackDNS | Оба движка обслужили NSS, реальные и синтетические ответы при прямом подключении по TCP/UDP на порт 53, HTTPS, DoH и восстановление после Stop. Для реальных DNS-запросов стенд подтвердил TLS 1.3. Ссылка и содержимое `/etc/resolv.conf` совпали до и после |
+| Arch Linux ARM, QEMU, AArch64, systemd 262.2 | Установленный helper, строгий DoT в режиме uplink, тестовый CA доступен systemd-resolved, порт 53 работает по TCP и UDP | На обоих движках helper отказал прямым запросам реального DNS при недоверенном сертификате. Обычный сервер на порту 53 не получил этих запросов. NSS через systemd-resolved по TLS 1.3, Fake DNS и HTTPS продолжили работать. Ссылка и содержимое `/etc/resolv.conf` совпали до и после |
 | Arch Linux ARM, QEMU, AArch64, systemd 262.2 | Установленный helper, uplink-файл, строгий DoT для глобального DNS и отдельного линка с `DefaultRoute=no` и `~private.test` | Оба движка получили через NSS ответы приватного TLS-сервера. Адрес сервера отсутствовал в uplink-файле, прямые запросы Fake DNS к его порту 53 по TCP и UDP остались без синтетического ответа. Глобальный DNS и Fake DNS работали через опубликованный адрес. Ссылка и содержимое `/etc/resolv.conf` совпали до и после |
 | Arch Linux ARM, QEMU, AArch64, systemd 262.2 | Установленный helper, uplink-файл, глобальный DNS и opportunistic DoT, тестовый сервер обслуживает только обычный DNS | После сброса обнаруженных возможностей сервера NSS и релей прямых запросов получили ответы с переходом на обычный DNS. Fake DNS, HTTPS, DoH и восстановление прошли на обоих движках. Ссылка и содержимое `/etc/resolv.conf` совпали до и после |
 | Arch Linux ARM, QEMU, AArch64, systemd 262.2 и nftables 1.1.7 | Установленные ELF helper и worker, uplink-файл с обычным FallbackDNS, счётчики на обоих внешних интерфейсах | Оба движка прошли сетевой цикл. На внешних интерфейсах прошли TCP к VLESS и обычный DNS по TCP и UDP, пакетов с Fake-IP не зафиксировано. После остановки helper карантин IPv4 и IPv6 сохранился и истёк в ядре. Ссылка и содержимое `/etc/resolv.conf` совпали до и после |
@@ -811,6 +812,10 @@ IPv4-сценарий с теми же проверками прошёл пов�
   запросы клиентов к опубликованному адресу на порту 53 проходят через
   TLS-релей. Доменная привязка DNS сохраняется по снимку
   systemd-resolved, в том числе `DefaultRoute` исходных интерфейсов.
+  С `YONIK_CHECK_UNTRUSTED_UPLINK_DOT` стенд подставил исходный набор
+  корней только в mount namespace helper. Системный резолвер использовал
+  тестовый CA. Для обоих движков проверены отказ прямых запросов реального
+  DNS к недоверенному DoT и отсутствие перехода на работающий порт 53.
   Отдельный стенд проверяет это с `YONIK_CHECK_UPLINK_SPLIT_PEER`.
   Глобальный сервер в uplink-файле отвечает на `real.test`; сервер
   линка с `~private.test` и `DefaultRoute=no` возвращает свой адрес на

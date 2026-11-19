@@ -2260,6 +2260,11 @@ async fn installed_fake_dns(
         .ok()
         .map(|peer| peer.parse::<std::net::SocketAddr>())
         .transpose()?;
+    let untrusted_uplink_dot = std::env::var_os("YONIK_CHECK_UNTRUSTED_UPLINK_DOT").is_some();
+    require(
+        !untrusted_uplink_dot || plain_dns_peer.is_some(),
+        "Проверка доверия DoT требует опубликованный DNS-адрес",
+    )?;
     let uplink_split_peer = std::env::var("YONIK_CHECK_UPLINK_SPLIT_PEER")
         .ok()
         .map(|peer| peer.parse::<std::net::SocketAddr>())
@@ -2352,21 +2357,35 @@ async fn installed_fake_dns(
             "NSS вернул неверные семейства",
         )?;
         if let Some(peer) = plain_dns_peer {
+            if untrusted_uplink_dot {
+                check_fallback_dns_in_vm("real.test").await?;
+            }
             for tcp in [false, true] {
-                require(
-                    ask_fixture_dns(peer, "real.test", 1, tcp).await?
-                        == "192.0.2.99".parse::<std::net::IpAddr>()?,
-                    "Реальный DNS не ответил на настроенном порту",
-                )?;
+                let real = ask_fixture_dns(peer, "real.test", 1, tcp).await;
+                if untrusted_uplink_dot {
+                    require(
+                        real.is_err(),
+                        "Релей принял недоверенный DoT или открыл DNS",
+                    )?;
+                } else {
+                    require(
+                        real? == std::net::Ipv4Addr::new(192, 0, 2, 99),
+                        "Реальный DNS не ответил на настроенном порту",
+                    )?;
+                }
                 require(
                     ask_fixture_dns(peer, "example.test", 1, tcp).await? == v4,
                     "Синтетический DNS не ответил на настроенном порту",
                 )?;
             }
-            eprintln!(
-                "{engine:?}: реальный DNS и Fake DNS подтверждены по TCP и UDP на порту {}",
-                peer.port()
-            );
+            if untrusted_uplink_dot {
+                eprintln!("{engine:?}: строгий DoT отклонил недоверенный сертификат по TCP и UDP");
+            } else {
+                eprintln!(
+                    "{engine:?}: реальный DNS и Fake DNS подтверждены по TCP и UDP на порту {}",
+                    peer.port()
+                );
+            }
         }
         if let Some(peer) = uplink_split_peer {
             let name = match engine {
