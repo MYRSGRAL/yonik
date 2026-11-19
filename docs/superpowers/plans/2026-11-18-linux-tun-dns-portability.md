@@ -656,6 +656,13 @@ IPv4-сценарий с теми же проверками прошёл пов�
   под SELinux Enforcing прошли Prepare, Apply, Stop и восстановление на
   Xray и sing-box с неизменным `/etc/resolv.conf`.
   [Семантика cgroup.events и cgroup.kill](https://docs.kernel.org/admin-guide/cgroup-v2.html#core-interface-files)
+  В Debian VM стенд автономного запуска без настройки юнитов помещает
+  процессы в разные cgroup до `exec`. После принудительной остановки
+  контроллера стенд заново открывает cgroup, отклоняет bind mount другой
+  группы и по очереди завершает каждую группу с проверкой пустоты.
+  Для приёмки OpenRC/runit ещё нужны запуск установленного worker,
+  отдельные права Check и Run и проверка личности процесса до передачи
+  FD с конфигурацией.
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
   `Unavailable` до запуска ядра. Политики Fedora 45.23 и 45.24 отклонили

@@ -112,6 +112,39 @@ impl WorkerCgroups {
     }
 }
 
+// Проверка будущего launcher. Systemd продолжает владеть StopUnit и не
+// получает права записи в cgroup из этого API.
+#[cfg(test)]
+impl WorkerCgroups {
+    pub(super) fn join_current(&self, name: &str) -> Result<()> {
+        self.write_worker_control(name, "cgroup.procs", b"0")
+    }
+
+    pub(super) fn kill_group(&self, name: &str) -> Result<()> {
+        self.write_worker_control(name, "cgroup.kill", b"1")
+    }
+
+    fn write_worker_control(&self, name: &str, attribute: &str, value: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let group = directory_in_mount(&self.parent, name, self.mount_id)?
+            .ok_or(WorkerSupervisorError::Unavailable)?;
+        trusted(&group, true)?;
+        let flags = (FILE_FLAGS - OFlags::RDONLY) | OFlags::WRONLY;
+        let mut control =
+            File::from(openat(&group, attribute, flags, Mode::empty()).map_err(unavailable)?);
+        verify_mount(&control, self.mount_id)?;
+        trusted(&control, false)?;
+        let present = directory_in_mount(&self.parent, name, self.mount_id)?;
+        let parent = directory_in_mount(&self.mount, &self.parent_name, self.mount_id)?;
+        if !same_directory(Some(&group), present.as_ref())?
+            || !same_directory(Some(&self.parent), parent.as_ref())?
+        {
+            return Err(WorkerSupervisorError::Stale);
+        }
+        control.write_all(value).map_err(unavailable)
+    }
+}
+
 pub(super) fn open_worker_directory(parent: &File, name: &str) -> Result<Option<File>> {
     if name.is_empty()
         || matches!(name, "." | "..")

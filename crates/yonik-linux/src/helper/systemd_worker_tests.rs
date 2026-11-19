@@ -19,6 +19,128 @@ fn require_cgroup_fixture_vm() {
     assert_eq!(rustix::process::getuid().as_raw(), 0);
 }
 
+const PORTABLE_FIXTURE_PREFIX: &str = "yonik-worker-proof-";
+const PORTABLE_FIXTURE_ROLE: &str = "YONIK_WORKER_PROOF_ROLE";
+const PORTABLE_FIXTURE_ROOT: &str = "YONIK_WORKER_PROOF_ROOT";
+const PORTABLE_FIXTURE_CHILD: &str = "helper::systemd_worker::tests::portable_worker_fixture_child";
+
+#[test]
+#[ignore = "Внутренний subprocess disposable QEMU VM"]
+fn portable_worker_fixture_child() {
+    use std::{os::unix::process::CommandExt, process::Command};
+    require_cgroup_fixture_vm();
+    let root = std::env::var(PORTABLE_FIXTURE_ROOT).unwrap();
+    let parent = root.strip_prefix(PORTABLE_FIXTURE_PREFIX).unwrap();
+    assert!(parent.parse::<u32>().is_ok_and(|pid| pid > 1));
+    match std::env::var(PORTABLE_FIXTURE_ROLE).unwrap().as_str() {
+        "controller" => {
+            let mut children = [
+                spawn_portable_fixture(&root, "check"),
+                spawn_portable_fixture(&root, "run"),
+            ];
+            std::thread::sleep(Duration::from_secs(30));
+            for child in &mut children {
+                let _ = child.kill();
+                child.wait().unwrap();
+            }
+        }
+        role @ ("check" | "run") => {
+            WorkerCgroups::open(&root)
+                .unwrap()
+                .join_current(role)
+                .unwrap();
+            panic!(
+                "Не удалось выполнить fixture: {}",
+                Command::new("/usr/bin/sleep").arg("30").exec()
+            );
+        }
+        _ => panic!("Неизвестная роль fixture"),
+    }
+}
+
+fn spawn_portable_fixture(root: &str, role: &str) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", PORTABLE_FIXTURE_CHILD])
+        .env(PORTABLE_FIXTURE_ROOT, root)
+        .env(PORTABLE_FIXTURE_ROLE, role)
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "Только disposable QEMU VM, отдельные cgroup Check и Run"]
+fn standalone_worker_placement_and_recovery_after_controller_exit() {
+    use std::time::Instant as StdInstant;
+    require_cgroup_fixture_vm();
+    let root = format!("{PORTABLE_FIXTURE_PREFIX}{}", std::process::id());
+    let path = std::path::Path::new("/sys/fs/cgroup").join(&root);
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(
+        WorkerCgroups::open(&root).unwrap().join_current("check"),
+        Err(WorkerSupervisorError::Unavailable)
+    );
+    let check = path.join("check");
+    let run = path.join("run");
+    std::fs::create_dir(&check).unwrap();
+    std::fs::create_dir(&run).unwrap();
+    let mut controller = spawn_portable_fixture(&root, "controller");
+    let sleep = std::fs::canonicalize("/usr/bin/sleep").unwrap();
+    let launched = || {
+        [&check, &run].into_iter().all(|group| {
+            std::fs::read_to_string(group.join("cgroup.procs"))
+                .ok()
+                .and_then(|pids| pids.trim().parse::<u32>().ok())
+                .is_some_and(|pid| {
+                    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|image| image == sleep)
+                })
+        })
+    };
+    let deadline = StdInstant::now() + Duration::from_secs(5);
+    while !launched() && StdInstant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let both_launched = launched();
+    controller.kill().unwrap();
+    controller.wait().unwrap();
+
+    let recovery = WorkerCgroups::open(&root).unwrap();
+    let occupied = !recovery.empty("check").unwrap() && !recovery.empty("run").unwrap();
+    assert!(
+        std::process::Command::new("/usr/bin/mount")
+            .arg("--bind")
+            .arg(&run)
+            .arg(&check)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let substituted = recovery.kill_group("check");
+    assert!(
+        std::process::Command::new("/usr/bin/umount")
+            .arg(&check)
+            .status()
+            .unwrap()
+            .success()
+    );
+    recovery.kill_group("check").unwrap();
+    let deadline = StdInstant::now() + Duration::from_secs(2);
+    while !recovery.empty("check").unwrap() && StdInstant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let isolated = recovery.empty("check").unwrap() && !recovery.empty("run").unwrap();
+    recovery.kill_group("run").unwrap();
+    let deadline = StdInstant::now() + Duration::from_secs(2);
+    while !recovery.empty("run").unwrap() && StdInstant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(recovery.empty("run").unwrap());
+    std::fs::remove_dir(check).unwrap();
+    std::fs::remove_dir(run).unwrap();
+    std::fs::remove_dir(path).unwrap();
+    assert_eq!(substituted, Err(WorkerSupervisorError::Untrusted));
+    assert!(both_launched && occupied && isolated);
+}
+
 #[test]
 #[ignore = "Только disposable QEMU VM с доступной для записи cgroup v2"]
 fn worker_cgroup_recovery_observes_nested_process() {
