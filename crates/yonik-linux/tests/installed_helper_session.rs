@@ -2304,6 +2304,7 @@ async fn installed_fake_dns(
         .map(|peer| peer.parse::<std::net::SocketAddr>())
         .transpose()?;
     let untrusted_uplink_dot = std::env::var_os("YONIK_CHECK_UNTRUSTED_UPLINK_DOT").is_some();
+    let check_unissued = std::env::var_os("YONIK_CHECK_UNISSUED_FAKE_IP").is_some();
     require(
         !untrusted_uplink_dot || plain_dns_peer.is_some(),
         "Проверка доверия DoT требует опубликованный DNS-адрес",
@@ -2448,6 +2449,19 @@ async fn installed_fake_dns(
             eprintln!("{engine:?}: приватный DoT ответил через NSS, прямой DNS закрыт");
         }
         check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+        if check_unissued {
+            // Стенд запрашивает несколько имён, а аренды выделяются с начала пулов.
+            let unissued = [
+                "198.19.255.254:40000".parse()?,
+                "[fd79:6f69:6b00:5c01::1ffe]:40000".parse()?,
+            ];
+            check_tun_routes(&unissued)?;
+            tokio::try_join!(
+                check_fake_flow_blocked(unissued[0]),
+                check_fake_flow_blocked(unissued[1]),
+            )?;
+            eprintln!("{engine:?}: невыданные Fake-IP заблокированы по TCP/UDP IPv4/IPv6");
+        }
         if let Some(witness) = &policy_witness {
             for database in ["ahostsv4", "ahostsv6"] {
                 let blocked = getent_fake_dns(database, "blocked.example.test").await?;
