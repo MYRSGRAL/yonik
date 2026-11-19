@@ -30,6 +30,7 @@ const MAX_ROUTE_DOMAINS: usize = 256;
 const MAX_DOMAIN_LENGTH: usize = 253;
 const MAX_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_PORT: u16 = 53;
+const DOT_PORT: u16 = 853;
 type ManagerDnsServerEx = (i32, i32, Vec<u8>, u16, String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -43,7 +44,7 @@ pub struct Resolve1Endpoint {
     /// `Global` соответствует D-Bus ifindex=0; `Link` сохраняет исходный ifindex.
     pub scope: Resolve1Scope,
     pub address: IpAddr,
-    /// Порт 53 подразумевается, если resolved не указал порт явно.
+    /// При отсутствии явного порта используется 53 для DNS или 853 для TLS.
     pub port: u16,
     pub port_inferred: bool,
 }
@@ -77,8 +78,41 @@ pub struct Resolve1Snapshot {
 pub(crate) struct Resolve1TunSnapshot {
     pub(crate) config: Resolve1Snapshot,
     pub(crate) fallback_only: bool,
+    pub(crate) global_transport: Option<Resolve1Transport>,
     /// По одному элементу на config.endpoints, включая глобальные DNS с %ifindex.
-    pub(crate) route_links: Vec<Option<u32>>,
+    pub(crate) sockets: Vec<Resolve1Socket>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Resolve1Transport {
+    Plain,
+    StrictTls,
+    OpportunisticTls,
+}
+
+impl Resolve1Transport {
+    fn parse(value: &str) -> Result<Self, ResolverError> {
+        match value {
+            "no" => Ok(Self::Plain),
+            "yes" => Ok(Self::StrictTls),
+            "opportunistic" => Ok(Self::OpportunisticTls),
+            _ => Err(ResolverError::Unsupported),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Resolve1Socket {
+    pub(crate) route_link: Option<u32>,
+    pub(crate) transport: Resolve1Transport,
+    // Учитываем изменение SNI при сверке, даже если IP и порт совпадают.
+    server_name: Option<String>,
+}
+
+impl std::fmt::Debug for Resolve1Socket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Resolve1Socket(<скрыто>)")
+    }
 }
 impl std::fmt::Debug for Resolve1Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -150,11 +184,14 @@ async fn read_connection(
         SnapshotScope::Tun { .. } => decode(Vec::new(), domains)?,
     };
     let mut fallback_only = false;
-    let mut route_links = Vec::new();
+    let mut global_transport = None;
+    let mut sockets = Vec::new();
     if let SnapshotScope::Tun { own_link } = scope {
         let rows = property::<Vec<ManagerDnsServerEx>>(&proxy, "DNSEx").await?;
-        (snapshot.endpoints, route_links) =
-            read_tun_endpoints(connection, &proxy, &owner_name, rows, own_link).await?;
+        let transport = Resolve1Transport::parse(&property::<String>(&proxy, "DNSOverTLS").await?)?;
+        global_transport = Some(transport);
+        (snapshot.endpoints, sockets) =
+            read_tun_endpoints(connection, &owner_name, rows, own_link, transport).await?;
         if let Some(index) = own_link {
             let scope = Resolve1Scope::Link(index);
             snapshot.domains.retain(|domain| domain.scope != scope);
@@ -163,20 +200,20 @@ async fn read_connection(
             let fallback = property::<Vec<ManagerDnsServerEx>>(&proxy, "FallbackDNSEx").await?;
             if !fallback.is_empty() {
                 fallback_only = snapshot.endpoints.is_empty();
-                let fallback_count = fallback.len();
-                if fallback_count > MAX_ENTRIES {
+                if fallback.len() > MAX_ENTRIES {
                     return Err(ResolverError::Limit);
                 }
-                let plain = if property::<String>(&proxy, "DNSOverTLS").await? == "no" {
-                    decode_dns_ex(fallback.into_iter().filter(|row| row.0 == 0).collect())?
-                } else {
-                    Vec::new()
-                };
-                if fallback_only && plain.len() != fallback_count {
-                    return Err(ResolverError::Unsupported);
+                for row in fallback {
+                    if row.0 != 0 {
+                        if fallback_only {
+                            return Err(ResolverError::Unsupported);
+                        }
+                        continue;
+                    }
+                    let mut endpoint = decode_ex_endpoint(&row)?;
+                    sockets.push(tun_socket(&mut endpoint, None, transport, row.4));
+                    snapshot.endpoints.push(endpoint);
                 }
-                route_links.resize(route_links.len() + plain.len(), None);
-                snapshot.endpoints.extend(plain);
             }
         }
     }
@@ -186,7 +223,8 @@ async fn read_connection(
     Ok(Resolve1TunSnapshot {
         config: snapshot,
         fallback_only,
-        route_links,
+        global_transport,
+        sockets,
     })
 }
 
@@ -216,18 +254,17 @@ async fn has_default_dns(
 
 async fn read_tun_endpoints(
     connection: &Connection,
-    manager: &Proxy<'_>,
     owner: &str,
     rows: Vec<ManagerDnsServerEx>,
     own_link: Option<u32>,
-) -> Result<(Vec<Resolve1Endpoint>, Vec<Option<u32>>), ResolverError> {
+    global_transport: Resolve1Transport,
+) -> Result<(Vec<Resolve1Endpoint>, Vec<Resolve1Socket>), ResolverError> {
     if rows.len() > MAX_ENTRIES {
         return Err(ResolverError::Limit);
     }
     let mut interfaces = HashMap::new();
-    let mut manager_mode = None;
     let mut endpoints = Vec::with_capacity(rows.len());
-    let mut route_links = Vec::with_capacity(rows.len());
+    let mut sockets = Vec::with_capacity(rows.len());
     for row in rows {
         let mut endpoint = decode_ex_endpoint(&row)?;
         let physical_link = match endpoint.scope {
@@ -237,71 +274,66 @@ async fn read_tun_endpoints(
         if physical_link.is_some() && physical_link == own_link {
             continue;
         }
-        if endpoint.port != DNS_PORT {
-            // Manager.DNSEx сообщает исходящий ifindex даже для записи DNS=…%link.
-            // Только точное совпадение с Link.DNSEx наследует режим TLS линка.
-            let mut link_mode = None;
-            if let Some(index) = physical_link {
-                if let std::collections::hash_map::Entry::Vacant(slot) = interfaces.entry(index) {
-                    let path = get_link_path(connection, owner, index).await?;
-                    let proxy = Proxy::new(connection, owner, path.as_str(), PROPERTIES)
-                        .await
-                        .map_err(bus_error)?;
-                    let entries =
-                        property_for::<Vec<LinkDnsServerEx>>(&proxy, LINK, "DNSEx").await?;
-                    if entries.len() > MAX_ENTRIES {
-                        return Err(ResolverError::Limit);
-                    }
-                    let mode = property_for::<String>(&proxy, LINK, "DNSOverTLS").await?;
-                    slot.insert((entries, mode));
+        // Manager.DNSEx сообщает ifindex даже для глобальной записи DNS=…%link.
+        // Только сервер из Link.DNSEx использует транспорт этого линка.
+        let (_, family, bytes, port, name) = row;
+        let mut transport = global_transport;
+        let key = (family, bytes, port, name);
+        if let Some(index) = physical_link {
+            if let std::collections::hash_map::Entry::Vacant(slot) = interfaces.entry(index) {
+                let path = get_link_path(connection, owner, index).await?;
+                let proxy = Proxy::new(connection, owner, path.as_str(), PROPERTIES)
+                    .await
+                    .map_err(bus_error)?;
+                let entries = property_for::<Vec<LinkDnsServerEx>>(&proxy, LINK, "DNSEx").await?;
+                if entries.len() > MAX_ENTRIES {
+                    return Err(ResolverError::Limit);
                 }
-                let (entries, mode) = interfaces.get_mut(&index).ok_or(ResolverError::Malformed)?;
-                if let Some(position) = entries.iter().position(|(family, bytes, port, name)| {
-                    *family == row.1 && *bytes == row.2 && *port == row.3 && *name == row.4
-                }) {
-                    entries.swap_remove(position);
-                    link_mode = Some(mode.as_str());
-                }
+                let mode = property_for::<String>(&proxy, LINK, "DNSOverTLS").await?;
+                slot.insert((
+                    entries.into_iter().collect::<HashSet<_>>(),
+                    Resolve1Transport::parse(&mode)?,
+                ));
             }
-            let mode = if let Some(mode) = link_mode {
-                mode
+            let (entries, link_transport) =
+                interfaces.get_mut(&index).ok_or(ResolverError::Malformed)?;
+            if entries.remove(&key) {
+                transport = *link_transport;
             } else {
                 endpoint.scope = Resolve1Scope::Global;
-                if manager_mode.is_none() {
-                    manager_mode = Some(property::<String>(manager, "DNSOverTLS").await?);
-                }
-                manager_mode.as_deref().ok_or(ResolverError::Malformed)?
-            };
-            if mode != "no" {
-                return Err(ResolverError::Unsupported);
             }
         }
+        sockets.push(tun_socket(&mut endpoint, physical_link, transport, key.3));
         endpoints.push(endpoint);
-        route_links.push(physical_link);
     }
-    // Чтения неатомарны: остаточная custom-запись на линке означает, что
+    // Чтения неатомарны: остаточная запись на линке означает, что
     // список Manager и список Link не описывают одну и ту же конфигурацию.
-    if interfaces.values().any(|(entries, _)| {
-        entries
-            .iter()
-            .any(|(_, _, port, _)| !matches!(*port, 0 | DNS_PORT))
-    }) {
+    if interfaces.values().any(|(entries, _)| !entries.is_empty()) {
         return Err(ResolverError::NetworkChanged);
     }
-    Ok((endpoints, route_links))
+    Ok((endpoints, sockets))
 }
 
-fn decode_dns_ex(rows: Vec<ManagerDnsServerEx>) -> Result<Vec<Resolve1Endpoint>, ResolverError> {
-    if rows.len() > MAX_ENTRIES {
-        return Err(ResolverError::Limit);
+fn tun_socket(
+    endpoint: &mut Resolve1Endpoint,
+    route_link: Option<u32>,
+    transport: Resolve1Transport,
+    name: String,
+) -> Resolve1Socket {
+    let tls = transport != Resolve1Transport::Plain;
+    if tls && endpoint.port_inferred {
+        endpoint.port = DOT_PORT;
     }
-    rows.iter().map(decode_ex_endpoint).collect()
+    Resolve1Socket {
+        route_link,
+        transport,
+        server_name: (tls && !name.is_empty()).then_some(name),
+    }
 }
 
 fn decode_ex_endpoint(row: &ManagerDnsServerEx) -> Result<Resolve1Endpoint, ResolverError> {
     let (index, family, bytes, port, name) = row;
-    // Имя TLS сохраняет resolved. В открытом DNS оно не участвует
-    // в сопоставлении сокета, поэтому достаточно проверить размер.
+    // TLS-соединение открывает resolved. Имя нужно только для сверки снимков.
     if name.len() > MAX_DOMAIN_LENGTH + 1 || name.as_bytes().contains(&0) {
         return Err(ResolverError::Malformed);
     }
@@ -1333,10 +1365,17 @@ mod tests {
             .unwrap();
         assert_eq!(updated.config.endpoints, snapshot.config.endpoints[..1]);
         uses_tls.store(true, std::sync::atomic::Ordering::Relaxed);
+        let link_tls = read_connection(&client, SnapshotScope::Tun { own_link: Some(13) })
+            .await
+            .unwrap();
+        assert_eq!(link_tls.config.endpoints[0].scope, Resolve1Scope::Link(7));
+        assert_eq!(link_tls.config.endpoints[0].port, 1053);
+        assert_eq!(link_tls.sockets[0].transport, Resolve1Transport::StrictTls);
         assert_eq!(
-            read_connection(&client, SnapshotScope::Tun { own_link: Some(13) }).await,
-            Err(ResolverError::Unsupported)
+            link_tls.sockets[0].server_name.as_deref(),
+            Some("dns.example.")
         );
+        assert_eq!(link_tls.global_transport, Some(Resolve1Transport::Plain));
         // Тот же ifindex может относиться к глобальной записи DNS=…%link.
         no_link_dns.store(true, std::sync::atomic::Ordering::Relaxed);
         let pinned_global = read_connection(&client, SnapshotScope::Tun { own_link: Some(13) })
@@ -1346,14 +1385,37 @@ mod tests {
             pinned_global.config.endpoints[0].scope,
             Resolve1Scope::Global
         );
-        assert_eq!(pinned_global.route_links, [Some(7)]);
+        assert_eq!(pinned_global.sockets[0].route_link, Some(7));
+        assert_eq!(pinned_global.sockets[0].transport, Resolve1Transport::Plain);
         uses_tls.store(false, std::sync::atomic::Ordering::Relaxed);
         global_tls.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            read_connection(&client, SnapshotScope::Tun { own_link: Some(13) }).await,
-            Err(ResolverError::Unsupported)
-        );
+        let global = read_connection(&client, SnapshotScope::Tun { own_link: Some(13) })
+            .await
+            .unwrap();
+        assert_eq!(global.sockets[0].transport, Resolve1Transport::StrictTls);
+        assert_eq!(global.global_transport, Some(Resolve1Transport::StrictTls));
         server.close().await.unwrap();
+    }
+
+    #[test]
+    fn транспорт_resolved_задаёт_только_неявный_порт() {
+        for (transport, default_port) in [
+            (Resolve1Transport::Plain, 53),
+            (Resolve1Transport::StrictTls, 853),
+            (Resolve1Transport::OpportunisticTls, 853),
+        ] {
+            for (port, expected) in [(0, default_port), (53, 53), (1853, 1853)] {
+                let row = (0, 2, vec![192, 0, 2, 53], port, "resolver.test".into());
+                let mut endpoint = decode_ex_endpoint(&row).unwrap();
+                let socket = tun_socket(&mut endpoint, None, transport, row.4);
+                assert_eq!(endpoint.port, expected);
+                assert_eq!(endpoint.port_inferred, port == 0);
+                assert_eq!(
+                    socket.server_name.as_deref(),
+                    (transport != Resolve1Transport::Plain).then_some("resolver.test")
+                );
+            }
+        }
     }
 
     #[tokio::test]

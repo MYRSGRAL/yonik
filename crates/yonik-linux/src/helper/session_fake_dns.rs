@@ -17,8 +17,9 @@ use crate::{
         plain_relay::{PlainDnsRelay, TCP_IDLE},
         plain_resolver_path,
         resolve1::{
-            Resolve1Domain, Resolve1Prepared, Resolve1Scope, Resolve1TunSnapshot, apply_link_dns,
-            prepare_fallback_link_dns, prepare_link_dns, read_resolve1_tun_snapshot,
+            Resolve1Domain, Resolve1Prepared, Resolve1Scope, Resolve1Transport,
+            Resolve1TunSnapshot, apply_link_dns, prepare_fallback_link_dns, prepare_link_dns,
+            read_resolve1_tun_snapshot,
         },
     },
 };
@@ -267,7 +268,7 @@ fn resolved_peers(
     topology: &LinuxTopology,
 ) -> Vec<(SocketAddr, ResolverBinding)> {
     let mut scopes = BTreeMap::<_, BTreeSet<_>>::new();
-    for (endpoint, &route_link) in snapshot.config.endpoints.iter().zip(&snapshot.route_links) {
+    for (endpoint, socket) in snapshot.config.endpoints.iter().zip(&snapshot.sockets) {
         let scope_link = match endpoint.scope {
             Resolve1Scope::Global => None,
             Resolve1Scope::Link(index) => Some(index),
@@ -277,7 +278,7 @@ fn resolved_peers(
             .or_default()
             .insert(ResolverBinding {
                 scope_link,
-                route_link,
+                route_link: socket.route_link,
             });
     }
     scopes
@@ -400,11 +401,17 @@ impl PreparedFakeDns {
                 .map_err(|_| ServiceError::Unavailable)?;
         let resolved = if matches!(source, ResolverSource::Resolved(_)) {
             config = config.reject_unbound_system_dns();
-            Some(Arc::new(
-                read_resolve1_tun_snapshot(cancel, LIMIT, None)
-                    .await
-                    .map_err(|_| ServiceError::Unavailable)?,
-            ))
+            let snapshot = read_resolve1_tun_snapshot(cancel, LIMIT, None)
+                .await
+                .map_err(|_| ServiceError::Unavailable)?;
+            if snapshot
+                .sockets
+                .iter()
+                .any(|socket| socket.transport != Resolve1Transport::Plain)
+            {
+                return Err(ServiceError::Unsupported);
+            }
+            Some(Arc::new(snapshot))
         } else {
             None
         };
