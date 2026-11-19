@@ -3035,10 +3035,10 @@ struct ResolverFileState {
 
 #[cfg(feature = "test-support")]
 fn resolver_file_state() -> Result<ResolverFileState> {
-    fn identity(metadata: &fs::Metadata) -> [u64; 5] {
+    fn identity(metadata: &fs::Metadata, track_inode: bool) -> [u64; 5] {
         [
             metadata.dev(),
-            metadata.ino(),
+            if track_inode { metadata.ino() } else { 0 },
             u64::from(metadata.mode()),
             u64::from(metadata.uid()),
             u64::from(metadata.gid()),
@@ -3051,10 +3051,14 @@ fn resolver_file_state() -> Result<ResolverFileState> {
         .is_symlink()
         .then(|| fs::read_link(path))
         .transpose()?;
+    // После снятия DNS с TUN systemd-resolved может атомарно заменить свой
+    // uplink-файл. Сравниваем саму ссылку, содержимое и права файла.
+    let track_target_inode =
+        yonik_linux::inspect_host_resolv_conf() != yonik_linux::ResolvConfLayout::ResolvedUplink;
     Ok(ResolverFileState {
         link,
-        entry: identity(&entry),
-        target: identity(&fs::metadata(path)?),
+        entry: identity(&entry, true),
+        target: identity(&fs::metadata(path)?, track_target_inode),
         contents: fs::read(path)?,
     })
 }

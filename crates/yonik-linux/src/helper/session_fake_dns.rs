@@ -64,16 +64,18 @@ const DNS_PROBE: &[u8] =
 #[derive(Clone, PartialEq, Eq)]
 enum ResolverSource {
     Resolved(Option<PlainResolverSnapshot>),
+    ResolvedUplink,
     Literal(PlainResolverSnapshot, &'static str),
 }
 
 impl ResolverSource {
     fn watch_file(&self) -> Result<Option<ResolverFileWatch>, ServiceError> {
-        let Self::Literal(_, source) = *self else {
-            return Ok(None);
-        };
         let host_entry = Path::new(SYSTEM_RESOLV_CONF);
-        let source = Path::new(source);
+        let source = match *self {
+            Self::Literal(_, source) => Path::new(source),
+            Self::ResolvedUplink => host_entry,
+            Self::Resolved(_) => return Ok(None),
+        };
         let paths = [host_entry, source];
         ResolverFileWatch::new(if source == host_entry {
             &paths[..1]
@@ -98,6 +100,7 @@ async fn resolver_source() -> Result<ResolverSource, ServiceError> {
         ResolvConfLayout::ResolvedStub | ResolvConfLayout::ResolvedStaticStub => {
             Ok(ResolverSource::Resolved(None))
         }
+        ResolvConfLayout::ResolvedUplink => Ok(ResolverSource::ResolvedUplink),
         layout @ (ResolvConfLayout::RegularFile
         | ResolvConfLayout::NetworkManager
         | ResolvConfLayout::Resolvconf) => {
@@ -502,11 +505,25 @@ impl PreparedFakeDns {
             SystemFakeDnsBridge::new(marker, pools, dns_port, lookup_port, reinject_port)
                 .and_then(|config| config.with_isolated_loopback(loopback))
                 .map_err(|_| ServiceError::Unavailable)?;
-        let resolved = if matches!(source, ResolverSource::Resolved(_)) {
+        let resolved = if matches!(
+            source,
+            ResolverSource::Resolved(_) | ResolverSource::ResolvedUplink
+        ) {
             config = config.reject_unbound_system_dns();
             let snapshot = read_resolve1_tun_snapshot(cancel, LIMIT, None)
                 .await
                 .map_err(|_| ServiceError::Unavailable)?;
+            // Клиенты uplink-файла обращаются к опубликованным адресам по
+            // обычному DNS. Для DoT такой клиент должен иметь отдельный
+            // релей с проверенной TLS-политикой.
+            if matches!(source, ResolverSource::ResolvedUplink)
+                && snapshot
+                    .sockets
+                    .iter()
+                    .any(|socket| socket.transport != Resolve1Transport::Plain)
+            {
+                return Err(ServiceError::Unsupported);
+            }
             Some(Arc::new(snapshot))
         } else {
             None

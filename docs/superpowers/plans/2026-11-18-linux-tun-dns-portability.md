@@ -11,6 +11,7 @@
 | Система | Путь проверки | Результат для Xray и sing-box |
 | --- | --- | --- |
 | Arch Linux, ядро 7.2.11 | Установленные helper и worker, клиент desktop backend | Системный TUN, Fake DNS, HTTPS, Stop и Unlock |
+| Arch Linux ARM, QEMU, AArch64, ядро 7.3.5 | Установленные GNU helper и worker, systemd 262.2, nftables 1.1.7. Штатная ссылка `/etc/resolv.conf` на upstream-файл systemd-resolved. Отдельные прогоны с глобальным DNS и FallbackDNS | NSS и прямые DNS-запросы по TCP/UDP на порт 53, HTTPS, DoH, Stop и Unlock. Ссылка `/etc/resolv.conf` и содержимое файла совпали до и после. В сценарии с глобальным DNS systemd-resolved при Stop пересоздал свой файл в `/run` |
 | Debian 13.7 | Установленный helper с systemd-resolved и отдельный стенд DNS по адресу | NSS и DNS TCP/UDP, Fake DNS A/AAAA, HTTPS, DoH, восстановление и карантин Fake-IP. Отдельно проверены смена маршрута, переподключение DHCPv4, отзыв DNS-зоны и HTTP/3 в Firefox с системным DNS и строгим DoH |
 | Debian 13.7, QEMU, x86-64 | Установленный стендовый helper с автономным worker, отдельным mount namespace, seccomp и системным D-Bus | Восстановление после прежнего worker, Prepare, Apply, Stop, Unlock, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS по Fake-IP и DoH через TUN. При остановке службы с активной сессией TUN удаляется, cgroup пустеют, карантин Fake-IP сохраняется |
 | Debian 13.7, QEMU, AArch64, systemd 257 и nftables 1.1.3 | Установленные GNU helper и worker без `test-support`, systemd-resolved с FallbackDNS, явная политика Proxy. Xray 26.10.31 и закреплённый адаптер sing-box 1.14.4 | Fake A/AAAA, TCP/UDP по IPv4 и IPv6, HTTPS с проверкой имени, DoH, Stop, Unlock, блокировка старых Fake-IP и восстановление DNS. На Xray также проверено восстановление карантина после удаления таблицы nftables. Содержимое и метаданные `/etc/resolv.conf` совпали до и после |
@@ -33,7 +34,9 @@
 | Fedora Cloud 45 с GNOME Shell 51.1 и Wayland, SELinux Enforcing | Тот же RPM, обычный UID в активной сессии, системный D-Bus и штатный диалог polkit | TUN и Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop и удаление после пользовательской сессии |
 
 В этих прогонах содержимое и метаданные `/etc/resolv.conf` совпали до и
-после. В матрице проверена политика Proxy для всех адресов. Отдельный прогон
+после. В режиме uplink systemd-resolved может заменить inode собственного
+файла в `/run`, сохраняя ссылку и содержимое. В матрице проверена политика
+Proxy для всех адресов. Отдельный прогон
 в Debian 13.7 подтвердил доменные Proxy и Block для восстановленных имён и
 CIDR Proxy, Block и Direct для буквальных IPv4/IPv6 на обоих движках.
 Остальные варианты перечислены ниже.
@@ -781,7 +784,14 @@ IPv4-сценарий с теми же проверками прошёл пов�
   системе. Установка и `rpm -V` прошли, байты ELF в RPM совпали
   с проверенной GNU-сборкой. В режиме SELinux Enforcing проверены
   полный сетевой цикл, восстановление DNS и карантин с обоими
-  движками. Пакет Arch на AArch64 требует отдельного прогона.
+  движками. На Arch Linux ARM установленный helper с обоими движками
+  проверен при штатной ссылке `/etc/resolv.conf` на
+  `/run/systemd/resolve/resolv.conf`. Helper использует проверенную
+  конфигурацию systemd-resolved, прямые запросы к её адресам обрабатывает
+  существующий DNS-релей. Установку проводили в QEMU по раскладке
+  системных файлов из дерева пакетирования. Полный Arch-пакет с Qt для
+  AArch64 и DoT в режиме upstream-файла требуют отдельных проверок.
+  [Режимы resolv.conf в systemd-resolved](https://www.freedesktop.org/software/systemd/man/261/systemd-resolved.html)
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
   `Unavailable` до запуска ядра. Политики Fedora 45.23 и 45.24 отклонили
