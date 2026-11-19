@@ -2,7 +2,7 @@
 
 use super::read::{
     NetlinkReader, NetworkAttribute, NetworkNamespace, NetworkReadError, ReadOperation, attributes,
-    ip_value, u32_value,
+    ip_value, retry_snapshot, u32_value,
 };
 use crate::Cancellation;
 use std::{fmt, net::IpAddr, num::NonZeroU32, time::Duration};
@@ -230,6 +230,17 @@ pub(crate) async fn lookup_route_captured(
         return Err(NetworkReadError::Timeout);
     }
     Ok((route, capture))
+}
+
+pub(crate) async fn reread_changed_route(
+    query: RouteQuery,
+    cancel: &mut Cancellation,
+    timeout: Duration,
+) -> Result<(KernelRoute, super::equivalence::RouteCapture), NetworkReadError> {
+    retry_snapshot(cancel, timeout, async |cancel, remaining| {
+        lookup_route_captured(query.clone(), cancel, remaining).await
+    })
+    .await
 }
 
 fn family(address: IpAddr) -> u8 {

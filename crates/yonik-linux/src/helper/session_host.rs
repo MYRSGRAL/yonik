@@ -21,7 +21,7 @@ use crate::{
     },
     network::{
         RouteCapture, TopologyCapture, lookup_route_captured, read_topology_captured,
-        same_captured_kernel_route, same_captured_topology,
+        reread_changed_route, same_captured_kernel_route, same_captured_topology,
     },
     read_topology,
     worker::WorkerPayload,
@@ -457,9 +457,17 @@ impl SessionArtifact {
         let mut transports = Vec::with_capacity(self.routes.len());
         let mut dns = Vec::new();
         for captured in &self.routes {
-            let (route, stamp) = lookup_route_captured(self.query(captured), cancel, DEADLINE)
+            // При подъёме собственного TUN уведомление carrier может прервать
+            // GETROUTE. Свежий ответ всё равно сравнивается с маршрутом Prepare.
+            let (route, stamp) = reread_changed_route(self.query(captured), cancel, DEADLINE)
                 .await
-                .map_err(unavailable)?;
+                .map_err(|error| {
+                    let _ = diagnostic_value::<(), _>(
+                        "profile_route_lookup_dns_protocol_error",
+                        Err((captured.dns, captured.protocol, error)),
+                    );
+                    unavailable(error)
+                })?;
             let index = checked_route(&route, self.owner, self.plan.routing_table())?;
             if own_index == Some(index)
                 || !same_captured_kernel_route(
@@ -1996,9 +2004,14 @@ impl Backend {
             same_captured_topology(&baseline, baseline_capture, &current, current_capture);
         let uid_matches = worker_uid == self::worker_uid()?;
         if !context_matches || !stamp_matches || !topology_matches || !uid_matches {
-            #[cfg(test)]
-            eprintln!(
-                "Актуальность Prepare: context={context_matches}, stamp={stamp_matches}, topology={topology_matches}, worker_uid={uid_matches}"
+            let _ = diagnostic_value::<(), _>(
+                "profile_prepare_freshness_context_stamp_topology_uid",
+                Err((
+                    context_matches,
+                    stamp_matches,
+                    topology_matches,
+                    uid_matches,
+                )),
             );
             return Err(stale());
         }

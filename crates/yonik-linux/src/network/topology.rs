@@ -5,6 +5,7 @@ mod tests;
 
 use super::read::{
     self, NetlinkReader, NetworkAttribute, NetworkNamespace, NetworkReadError, ReadOperation,
+    retry_snapshot,
 };
 use crate::Cancellation;
 use std::{
@@ -284,33 +285,6 @@ pub(crate) async fn reread_changed_topology(
     timeout: Duration,
 ) -> Result<(LinuxTopology, TopologyCapture), NetworkReadError> {
     retry_snapshot(cancel, timeout, read_topology_captured).await
-}
-
-async fn retry_snapshot<T>(
-    cancel: &mut Cancellation,
-    timeout: Duration,
-    mut read: impl AsyncFnMut(&mut Cancellation, Duration) -> Result<T, NetworkReadError>,
-) -> Result<T, NetworkReadError> {
-    const RETRIES: usize = 2;
-    if timeout.is_zero() || timeout > Duration::from_secs(5) {
-        return Err(NetworkReadError::Limit);
-    }
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut retries = 0;
-    loop {
-        cancel.check().map_err(|_| NetworkReadError::Cancelled)?;
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(NetworkReadError::Timeout);
-        }
-        match read(cancel, remaining).await {
-            Err(NetworkReadError::Changed | NetworkReadError::Interrupted) if retries < RETRIES => {
-                retries += 1;
-                tokio::task::yield_now().await;
-            }
-            result => return result,
-        }
-    }
 }
 
 type Error = NetworkReadError;

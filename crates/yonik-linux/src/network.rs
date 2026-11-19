@@ -11,7 +11,7 @@ pub(crate) use equivalence::{
 mod lookup;
 mod nft_cgroup;
 pub(crate) use equivalence::RouteCapture;
-pub(crate) use lookup::lookup_route_captured;
+pub(crate) use lookup::{lookup_route_captured, reread_changed_route};
 mod read;
 mod route;
 mod topology;
