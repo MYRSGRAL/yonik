@@ -80,6 +80,7 @@ pub struct SystemProtectionHost {
     _monitor: NetworkMonitor,
     runtime: tokio::runtime::Handle,
     _safety: Option<session_host::SafetyTask>,
+    _dhcp_sleep: Option<super::dhcp_sleep::DhcpSleepTask>,
 }
 const PROFILE_ADMISSION_BOUND: Duration = Duration::from_secs(2);
 
@@ -100,6 +101,7 @@ struct Backend {
     registry: Option<super::TrustedRegistry>,
     fake_dns: FakeDnsState,
     fake_dns_reap: Option<session_host::SafetyTask>,
+    dhcp_sleep: Arc<super::dhcp_sleep::DhcpSleep>,
     exited: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     isolated: bool,
@@ -182,6 +184,9 @@ impl SystemProtectionHost {
         let seed = u64::from_le_bytes(random).max(1);
         let exited = Arc::new(tokio::sync::Notify::new());
         let backend_exited = Arc::clone(&exited);
+        let dhcp_sleep = Arc::new(super::dhcp_sleep::DhcpSleep::default());
+        let sleep_watch = (!isolated)
+            .then(|| super::dhcp_sleep::watch(Arc::clone(&dhcp_sleep), Arc::clone(&exited)));
         let backend = tokio::task::spawn_blocking(move || {
             let (journal, fake_dns) = open_startup_state(&path)?;
             let _fixture_only = isolated;
@@ -202,6 +207,7 @@ impl SystemProtectionHost {
                 registry: None,
                 fake_dns,
                 fake_dns_reap: None,
+                dhcp_sleep,
                 exited: backend_exited,
                 #[cfg(test)]
                 isolated,
@@ -228,6 +234,7 @@ impl SystemProtectionHost {
             _monitor: monitor,
             runtime,
             _safety: Some(safety),
+            _dhcp_sleep: sleep_watch,
         })
     }
     async fn job(&self, operation: Operation, cancel: Cancellation) -> Result<Reply, ServiceError> {

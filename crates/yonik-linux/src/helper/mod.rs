@@ -5,6 +5,7 @@
 //! Prepare/Apply нужна новая проверка непосредственно перед эффектами.
 
 pub mod dhcp_networkd;
+pub(crate) mod dhcp_sleep;
 pub mod fence;
 mod kernel_evidence;
 pub(crate) mod native_bootstrap;

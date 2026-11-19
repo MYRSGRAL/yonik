@@ -335,12 +335,14 @@ fn actor_fixture() -> super::super::SystemProtectionHost {
             registry: None,
             fake_dns: super::session_fake_dns::FakeDnsState::new(None),
             fake_dns_reap: None,
+            dhcp_sleep: Default::default(),
             exited: std::sync::Arc::new(tokio::sync::Notify::new()),
             isolated: true,
         })),
         _monitor: monitor,
         runtime: tokio::runtime::Handle::current(),
         _safety: None,
+        _dhcp_sleep: None,
     }
 }
 
@@ -622,6 +624,7 @@ async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_wor
         registry: None,
         fake_dns: super::session_fake_dns::FakeDnsState::new(None),
         fake_dns_reap: None,
+        dhcp_sleep: Default::default(),
         exited: std::sync::Arc::new(tokio::sync::Notify::new()),
         isolated: true,
     };

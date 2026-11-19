@@ -127,7 +127,7 @@ async fn owned_test_child(
     let permit = Arc::clone(&gate).acquire_owned().await.unwrap();
     let global = PROCESS_LIMIT.acquire().await.unwrap();
     (
-        own_child(child, Vec::new(), permit, global, deadline).unwrap(),
+        own_child(child, Vec::new(), permit, global, None, deadline).unwrap(),
         pid,
         gate,
     )

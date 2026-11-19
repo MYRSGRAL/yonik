@@ -196,6 +196,9 @@ impl Backend {
     }
 
     async fn refresh_dhcp(&self) {
+        let Some(sleep_ticket) = self.dhcp_sleep.ticket() else {
+            return;
+        };
         let snapshot = self.watch.current();
         if !snapshot.coverage.routes || snapshot.exhausted {
             return;
@@ -215,8 +218,14 @@ impl Backend {
         if let Ok(mut nft) = self.executor(journal.ownership()) {
             let _refresh = diagnostic_result(
                 "dhcp_refresh",
-                nft.refresh_dhcp_renewals(journal, revision, &mut leases, &mut cancel)
-                    .await,
+                nft.refresh_dhcp_renewals(
+                    journal,
+                    revision,
+                    &mut leases,
+                    &mut cancel,
+                    Some(&sleep_ticket),
+                )
+                .await,
             );
         }
     }

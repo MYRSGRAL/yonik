@@ -888,7 +888,7 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         if dhcp {
             check_dhcp_fixture_dns("10.203.2.1", &mut token).await?;
         }
-        let drain = start_fake_dns_in_vm(
+        let mut drain = start_fake_dns_in_vm(
             &connection,
             &server,
             engine,
@@ -941,6 +941,57 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             "Сессия изменила /etc/resolv.conf до вмешательства стенда",
         )?;
         if change == FakeDnsNetworkChange::DhcpRenewal {
+            if std::env::var_os("YONIK_DHCP_SLEEP_FIXTURE").is_some() {
+                fixture_suspend_and_check_dhcp().await?;
+                let state = state_after_route_events(&connection).await?;
+                let mut current = (old_v4, old_v6);
+                if state["state"] != "tunnel_starting" {
+                    require(
+                        if kill_switch {
+                            matches!(
+                                state["state"].as_str(),
+                                Some("recovery_required" | "verified_rules")
+                            )
+                        } else {
+                            state["state"] == "no_managed_policy"
+                        },
+                        "Возобновление нарушило выбранную политику kill switch",
+                    )?;
+                    require(
+                        tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+                        "Вывод прежнего worker открыт после S3",
+                    )?;
+                    if kill_switch {
+                        call(&connection, "Unlock", empty.clone()).await?;
+                    }
+                    check_only_fake_is_filtered(old_v4, old_v6).await?;
+                    drain = start_fake_dns_in_vm(
+                        &connection,
+                        &server,
+                        engine,
+                        kill_switch,
+                        Some(&policy),
+                        &token,
+                    )
+                    .await?;
+                    current = (
+                        getent_fake_dns("ahostsv4", "example.test").await?,
+                        getent_fake_dns("ahostsv6", "example.test").await?,
+                    );
+                    require(
+                        current.0 != old_v4 && current.1 != old_v6,
+                        "После S3 повторно выданы старые Fake-IP",
+                    )?;
+                    eprintln!(
+                        "{engine:?}: установлена новая сессия, прежние Fake-IP заблокированы"
+                    );
+                }
+                check_running_dhcp_renewal(&dhcp_links).await?;
+                renew_dhcp_links(&connection, &dhcp_links, None).await?;
+                check_tun_traffic_to([(current.0, 40000).into(), (current.1, 40000).into()])
+                    .await?;
+                eprintln!("{engine:?}: DHCP и Fake A/AAAA проверены после S3");
+            }
             check_running_dhcp_renewal(&dhcp_links).await?;
             call(&connection, "Stop", empty.clone()).await?;
             require(
@@ -1108,6 +1159,44 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         );
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn fixture_suspend_and_check_dhcp() -> Result {
+    let pre = std::path::Path::new("/run/yonik-dhcp-sleep-pre");
+    let post = std::path::Path::new("/run/yonik-dhcp-sleep-post");
+    for marker in [pre, post] {
+        match fs::remove_file(marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    require(
+        Command::new("/usr/bin/busctl")
+            .args([
+                "call",
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "Suspend",
+                "b",
+                "false",
+            ])
+            .status()?
+            .success(),
+        "logind отклонил запрос на сон",
+    )?;
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while !post.exists() {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await?;
+    require(
+        fs::read_to_string(pre)?.trim() == "empty",
+        "Перед S3 сохранялось действующее DHCP-разрешение",
+    )
 }
 
 #[cfg(feature = "test-support")]

@@ -4,6 +4,7 @@ use super::{
     Journal, JournalError, NftFamily, Ownership, Reconciled, RecordState, Resource, Scope,
 };
 use super::{executable::NetworkTool, firewall::PublicBlockPolicy};
+use crate::helper::dhcp_sleep::DhcpSleepTicket;
 use rustix::fs;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -239,7 +240,7 @@ impl NftExecutor {
         } else {
             serde_json::to_vec(&request).map_err(|_| NftError::Invalid)?
         };
-        self.run_batch(bytes, text_input, check_only).await
+        self.run_batch(bytes, text_input, check_only, None).await
     }
 
     async fn run_batch(
@@ -247,6 +248,7 @@ impl NftExecutor {
         bytes: Vec<u8>,
         text_input: bool,
         check_only: bool,
+        dhcp_sleep: Option<&DhcpSleepTicket>,
     ) -> Result<Vec<u8>, NftError> {
         if bytes.len() > MAX_OUTPUT {
             return Err(NftError::Invalid);
@@ -260,6 +262,14 @@ impl NftExecutor {
             .map_err(|_| NftError::Timeout)?
             .map_err(|_| NftError::Io)?;
         self.check_namespace()?;
+        let dhcp_write = dhcp_sleep
+            .map(|ticket| ticket.begin().ok_or(NftError::Evidence))
+            .transpose()?;
+        let deadline = if dhcp_write.is_some() {
+            block::DHCP_NFT_BUDGET
+        } else {
+            DEADLINE
+        };
         let mut command = Command::new(format!("/proc/self/fd/{}", self.executable.as_raw_fd()));
         command.arg("-n");
         if !text_input {
@@ -278,7 +288,7 @@ impl NftExecutor {
             .kill_on_drop(true)
             .spawn()
             .map_err(|_| NftError::Io)?;
-        own_child(child, bytes, gate, global, DEADLINE)?
+        own_child(child, bytes, gate, global, dhcp_write, deadline)?
             .wait()
             .await
     }
@@ -403,6 +413,7 @@ fn own_child(
     bytes: Vec<u8>,
     gate: OwnedSemaphorePermit,
     global: SemaphorePermit<'static>,
+    dhcp_write: Option<OwnedSemaphorePermit>,
     deadline: Duration,
 ) -> Result<Running, NftError> {
     let mut input = child.stdin.take().ok_or(NftError::Io)?;
@@ -413,7 +424,7 @@ fn own_child(
     // Задача сохраняет владение Child после отмены вызывающего future,
     // убивает и wait/reap-ит его; kill_on_drop страхует shutdown runtime.
     tokio::spawn(async move {
-        let (_gate, _global) = (gate, global);
+        let (_gate, _global, _dhcp_write) = (gate, global, dhcp_write);
         let work = async {
             let write = async {
                 input.write_all(&bytes).await.map_err(|_| NftError::Io)?;

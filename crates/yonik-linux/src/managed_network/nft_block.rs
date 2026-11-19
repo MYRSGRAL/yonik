@@ -12,7 +12,7 @@ use std::{
 };
 
 const DHCP_ELEMENT_TIMEOUT: Duration = Duration::from_millis(650);
-const DHCP_NFT_BUDGET: Duration = Duration::from_millis(300);
+pub(super) const DHCP_NFT_BUDGET: Duration = Duration::from_millis(300);
 
 pub(super) fn block_table(
     owner: Ownership,
@@ -320,7 +320,7 @@ impl NftExecutor {
             return Err(NftError::Invalid);
         }
         match self
-            .refresh_dhcp_renewals(journal, revision, std::slice::from_mut(lease), cancel)
+            .refresh_dhcp_renewals(journal, revision, std::slice::from_mut(lease), cancel, None)
             .await?
         {
             1 => Ok(()),
@@ -336,6 +336,7 @@ impl NftExecutor {
         revision: u64,
         leases: &mut [DhcpNetworkdLease],
         cancel: &mut crate::Cancellation,
+        dhcp_sleep: Option<&DhcpSleepTicket>,
     ) -> Result<usize, NftError> {
         let (table, policy) = self.stable_dhcp_policy(journal, revision)?;
         if leases.len() > MAX_DHCP_RENEWALS {
@@ -377,9 +378,12 @@ impl NftExecutor {
             }
             let batch =
                 text::dhcp_renewal(&table.name, &keys, DHCP_ELEMENT_TIMEOUT.as_millis() as u64)?;
-            tokio::time::timeout(DHCP_NFT_BUDGET, self.run_batch(batch, true, false))
-                .await
-                .map_err(|_| NftError::Timeout)??;
+            tokio::time::timeout(
+                DHCP_NFT_BUDGET,
+                self.run_batch(batch, true, false, dhcp_sleep),
+            )
+            .await
+            .map_err(|_| NftError::Timeout)??;
             cancel.check().map_err(|_| NftError::Evidence)?;
             let stale: Vec<_> = selected
                 .iter()
@@ -393,7 +397,7 @@ impl NftExecutor {
                 .collect();
             if !stale.is_empty() {
                 let delete = text::delete_dhcp_renewals(&table.name, &stale)?;
-                tokio::time::timeout(DHCP_NFT_BUDGET, self.run_batch(delete, true, false))
+                tokio::time::timeout(DHCP_NFT_BUDGET, self.run_batch(delete, true, false, None))
                     .await
                     .map_err(|_| NftError::Timeout)??;
                 cancel.check().map_err(|_| NftError::Evidence)?;
@@ -443,6 +447,7 @@ impl NftExecutor {
             text::dhcp_renewal(&table.name, &[], DHCP_ELEMENT_TIMEOUT.as_millis() as u64)?,
             true,
             false,
+            None,
         )
         .await?;
         Ok(())
