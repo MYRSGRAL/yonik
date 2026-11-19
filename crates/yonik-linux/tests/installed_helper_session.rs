@@ -73,6 +73,7 @@ fn helper_pid() -> Result<u32> {
 async fn kill_helper_and_wait_for_recovery(
     connection: &zbus::Connection,
     original_pid: u32,
+    expected_state: &str,
 ) -> Result {
     require(
         Command::new("/usr/bin/systemctl")
@@ -92,8 +93,8 @@ async fn kill_helper_and_wait_for_recovery(
         if helper_pid().is_ok_and(|pid| pid != original_pid) {
             if let Ok(state) = call(connection, "State", json!({"version":1})).await {
                 return require(
-                    state["state"] == "recovery_required",
-                    "Журнал не восстановлен",
+                    state["state"] == expected_state,
+                    "Состояние после восстановления не соответствует политике kill switch",
                 );
             }
         }
@@ -328,28 +329,50 @@ async fn check_tun_traffic_to(servers: [std::net::SocketAddr; 2]) -> Result {
 #[tokio::test]
 #[ignore = "выделенная Debian VM с тестовой сборкой установленного helper"]
 async fn production_helper_resolved_fake_dns() -> Result {
-    installed_fake_dns(None, false, None, None).await
+    installed_fake_dns(None, None, None, None).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM с контролируемым DNS за veth"]
 async fn production_helper_literal_fake_dns() -> Result {
-    installed_fake_dns(Some("10.203.1.2:53".parse()?), false, None, None).await
+    installed_fake_dns(Some("10.203.1.2:53".parse()?), None, None, None).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM для SIGKILL и истечения Fake-IP"]
 async fn production_helper_fake_dns_survives_sigkill() -> Result {
-    installed_fake_dns(None, true, None, None).await
+    installed_fake_dns(None, Some(Engine::Xray), None, None).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM с обычным Prepare и политикой Proxy"]
 async fn production_helper_scoped_fake_dns_policy() -> Result {
-    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+    let policy = scoped_fake_dns_proxy_policy()?;
+    installed_fake_dns(None, None, Some(&policy), None).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная VM, штатный Prepare Xray и SIGKILL установленного helper"]
+async fn production_helper_xray_fake_dns_recovers() -> Result {
+    let policy = scoped_fake_dns_proxy_policy()?;
+    installed_fake_dns(None, Some(Engine::Xray), Some(&policy), None).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная VM, штатный Prepare sing-box и SIGKILL установленного helper"]
+async fn production_helper_sing_box_fake_dns_recovers() -> Result {
+    let policy = scoped_fake_dns_proxy_policy()?;
+    installed_fake_dns(None, Some(Engine::SingBox), Some(&policy), None).await
+}
+
+#[cfg(feature = "test-support")]
+fn scoped_fake_dns_proxy_policy() -> Result<yonik_engine::policy_wire::SystemPolicy> {
+    Ok(yonik_engine::policy_wire::SystemPolicy::parse(
         &json!({
             "version":1, "default_action":"proxy", "preset_rules":[],
             "lan":[], "private_networks":[], "private_domains":[],
@@ -360,8 +383,7 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
             }]
         })
         .to_string(),
-    )?;
-    installed_fake_dns(None, false, Some(&policy), None).await
+    )?)
 }
 
 #[cfg(feature = "test-support")]
@@ -1940,7 +1962,13 @@ async fn installed_fake_dns_with_domain_policy(
         })
         .to_string(),
     )?;
-    installed_fake_dns(None, crash, Some(&policy), Some(witness)).await
+    installed_fake_dns(
+        None,
+        crash.then_some(Engine::Xray),
+        Some(&policy),
+        Some(witness),
+    )
+    .await
 }
 
 #[cfg(feature = "test-support")]
@@ -1954,7 +1982,7 @@ enum FakeDnsPolicyWitness {
 #[cfg(feature = "test-support")]
 async fn installed_fake_dns(
     literal: Option<std::net::SocketAddr>,
-    crash: bool,
+    crash_engine: Option<Engine>,
     policy: Option<&yonik_engine::policy_wire::SystemPolicy>,
     policy_witness: Option<FakeDnsPolicyWitness>,
 ) -> Result {
@@ -1972,7 +2000,11 @@ async fn installed_fake_dns(
     if std::env::var_os("YONIK_EXPECT_CLEAN_FAKE_DNS_START").is_none() {
         tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
     }
-    for engine in [Engine::Xray, Engine::SingBox] {
+    for engine in [Engine::Xray, Engine::SingBox]
+        .into_iter()
+        .filter(|engine| crash_engine.is_none_or(|selected| *engine == selected))
+    {
+        let crash = crash_engine.is_some();
         let kill_switch = engine == Engine::Xray;
         require(
             state_after_route_events(&connection).await?["state"] == "no_managed_policy",
@@ -2036,7 +2068,15 @@ async fn installed_fake_dns(
             check_https_through_tun(&certificate, literal.map(|_| v4)).await?;
         }
         if crash {
-            kill_helper_and_wait_for_recovery(&connection, helper_pid()?).await?;
+            let expected_state = if kill_switch {
+                "recovery_required"
+            } else {
+                "no_managed_policy"
+            };
+            kill_helper_and_wait_for_recovery(&connection, helper_pid()?, expected_state).await?;
+            if !kill_switch {
+                check_only_fake_is_filtered(v4, v6).await?;
+            }
             if matches!(policy_witness, Some(FakeDnsPolicyWitness::LiteralDirect)) {
                 require(
                     literal_direct_rule_marks()?.is_empty(),
@@ -2092,9 +2132,6 @@ async fn installed_fake_dns(
         eprintln!(
             "{engine:?} установленный helper, системный DNS, TCP/UDP IPv4/IPv6 и восстановление подтверждены"
         );
-        if crash {
-            break;
-        }
     }
     Ok(())
 }
@@ -2416,7 +2453,7 @@ async fn wait_for_quarantine_expiry() -> Result {
     let nft = nft_test_binary();
     require(
         quarantine_table_name(nft)?.is_some(),
-        "После SIGKILL и Unlock таблица Fake-IP должна действовать",
+        "После аварийного восстановления таблица Fake-IP должна действовать",
     )?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
     loop {
@@ -2775,7 +2812,7 @@ async fn lifecycle(engine: Option<Engine>, with_output: bool) -> Result {
             "Worker не работает перед SIGKILL",
         )?;
     }
-    kill_helper_and_wait_for_recovery(&connection, original_pid).await?;
+    kill_helper_and_wait_for_recovery(&connection, original_pid, "recovery_required").await?;
     require(
         call(&connection, "Stop", empty.clone()).await?["state"] == "recovery_required",
         "Stop после recovery",
