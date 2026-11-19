@@ -426,7 +426,7 @@ impl WorkerMode {
     }
 }
 
-fn installed_worker_credentials() -> Result<WorkerCredentials> {
+pub(super) fn installed_worker_credentials() -> Result<WorkerCredentials> {
     let etc = child(&root()?, "etc")?;
     let passwd =
         File::from(openat(&etc, "passwd", FILE_FLAGS, Mode::empty()).map_err(unavailable)?);

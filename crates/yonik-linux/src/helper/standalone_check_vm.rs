@@ -3,6 +3,10 @@
 use super::{WorkerCgroups, WorkerMode, WorkerPayload, WorkerStatus, require_cgroup_fixture_vm};
 use crate::helper::{
     TrustedRegistry,
+    standalone_launcher::{
+        STANDALONE_PARENT, STANDALONE_RUNTIME, WORKER_IMAGE, group, socket_name,
+    },
+    standalone_worker_argument,
     worker_identity::{WorkerCredentials, WorkerProcess},
 };
 use crate::worker::WorkerAck;
@@ -14,9 +18,8 @@ use std::{
     os::{
         fd::OwnedFd,
         unix::{
-            fs::{DirBuilderExt, MetadataExt},
+            fs::{DirBuilderExt, MetadataExt, PermissionsExt},
             net::{UnixListener, UnixStream},
-            process::CommandExt,
         },
     },
     path::{Path, PathBuf},
@@ -24,71 +27,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-const PREFIX: &str = "yonik-standalone-worker-";
-const ROOT_ENV: &str = "YONIK_STANDALONE_WORKER_FIXTURE";
-const MODE_ENV: &str = "YONIK_STANDALONE_WORKER_MODE";
-const CHILD: &str = "helper::systemd_worker::tests::standalone_check_vm::exec_worker_child";
-const IMAGE: &str = "/usr/lib/yonik/yonik-worker";
+const HELPER_IMAGE: &str = "/usr/lib/yonik/yonik-helper";
 const LIMIT: Duration = Duration::from_secs(8);
-
-fn group(mode: WorkerMode) -> &'static str {
-    match mode {
-        WorkerMode::Check => "check",
-        WorkerMode::Run => "run",
-    }
-}
 
 fn require_private_network() {
     assert_ne!(
         inode("/proc/self/ns/net").unwrap(),
         inode("/proc/1/ns/net").unwrap()
     );
-}
-
-#[test]
-#[ignore = "Внутренний subprocess одноразовой QEMU VM"]
-fn exec_worker_child() {
-    require_cgroup_fixture_vm();
-    let root = std::env::var(ROOT_ENV).unwrap();
-    assert!(
-        root.strip_prefix(PREFIX)
-            .and_then(|s| s.parse::<u32>().ok())
-            .is_some_and(|pid| pid > 1)
-    );
-    let (mode, capabilities, argument, mut command) =
-        match std::env::var(MODE_ENV).unwrap().as_str() {
-            "check" => {
-                let mut command = Command::new("/usr/bin/unshare");
-                command.args(["--net", "--", "/usr/bin/setpriv"]);
-                (WorkerMode::Check, "-all", "--check", command)
-            }
-            "run" => {
-                require_private_network();
-                (
-                    WorkerMode::Run,
-                    "-all,+net_admin",
-                    "--run",
-                    Command::new("/usr/bin/setpriv"),
-                )
-            }
-            _ => panic!("Неизвестная роль worker"),
-        };
-    WorkerCgroups::open(&root)
-        .unwrap()
-        .join_current(group(mode))
-        .unwrap();
-    let error = command
-        .args([
-            "--reuid=yonik-worker",
-            "--regid=yonik-worker",
-            "--clear-groups",
-        ])
-        .arg(format!("--inh-caps={capabilities}"))
-        .arg(format!("--ambient-caps={capabilities}"))
-        .arg(format!("--bounding-set={capabilities}"))
-        .args(["--no-new-privs", "--", IMAGE, argument])
-        .exec();
-    panic!("Не удалось запустить worker: {error}");
 }
 
 struct Fixture {
@@ -99,27 +45,49 @@ struct Fixture {
 }
 impl Fixture {
     fn start(mode: WorkerMode) -> Self {
-        let root = format!("{PREFIX}{}", std::process::id());
+        let root = STANDALONE_PARENT.to_owned();
         let cgroup = Path::new("/sys/fs/cgroup").join(&root);
-        let socket_dir = Path::new("/run").join(&root);
+        let socket_dir = PathBuf::from(STANDALONE_RUNTIME);
+        fs::create_dir(&cgroup).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&socket_dir)
+            .unwrap();
         let mut fixture = Self {
             root,
             socket_dir,
             mode,
             child: None,
         };
-        fs::create_dir(&cgroup).unwrap();
         fs::create_dir(cgroup.join(group(mode))).unwrap();
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&fixture.socket_dir)
-            .unwrap();
         let listener = UnixListener::bind(fixture.socket()).unwrap();
+        fs::set_permissions(fixture.socket(), fs::Permissions::from_mode(0o600)).unwrap();
+        require_denied(
+            Command::new(HELPER_IMAGE)
+                .arg(standalone_worker_argument(mode))
+                .stdin(Stdio::null()),
+        );
+        listener.set_nonblocking(true).unwrap();
+        require_denied(
+            Command::new(HELPER_IMAGE)
+                .arg(standalone_worker_argument(mode))
+                .stdin(Stdio::from(OwnedFd::from(listener.try_clone().unwrap()))),
+        );
+        listener.set_nonblocking(false).unwrap();
+        require_denied(
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "exec 3</dev/null; exec \"$@\"",
+                    "sh",
+                    HELPER_IMAGE,
+                    standalone_worker_argument(mode),
+                ])
+                .stdin(Stdio::from(OwnedFd::from(listener.try_clone().unwrap()))),
+        );
         fixture.child = Some(
-            Command::new(std::env::current_exe().unwrap())
-                .args(["--ignored", "--exact", CHILD])
-                .env(ROOT_ENV, &fixture.root)
-                .env(MODE_ENV, group(mode))
+            Command::new(HELPER_IMAGE)
+                .arg(standalone_worker_argument(mode))
                 .stdin(Stdio::from(OwnedFd::from(listener)))
                 .spawn()
                 .unwrap(),
@@ -128,7 +96,7 @@ impl Fixture {
     }
 
     fn socket(&self) -> PathBuf {
-        self.socket_dir.join("worker.sock")
+        self.socket_dir.join(socket_name(self.mode))
     }
 
     fn await_image(&mut self, image: (u64, u64)) -> WorkerProcess {
@@ -204,6 +172,23 @@ impl Drop for Fixture {
     }
 }
 
+fn require_denied(command: &mut Command) {
+    let mut child = command.stderr(Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + LIMIT;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(1));
+            return;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("Launcher не отклонил вход до запуска worker");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn inode(path: impl AsRef<Path>) -> io::Result<(u64, u64)> {
     let metadata = fs::metadata(path)?;
     Ok((metadata.dev(), metadata.ino()))
@@ -271,7 +256,7 @@ fn installed_standalone_check_on_both_engines() {
         uid: installed_id("-u"),
         gid: installed_id("-g"),
     };
-    let image = inode(IMAGE).unwrap();
+    let image = inode(WORKER_IMAGE).unwrap();
     let wrong_image = inode("/usr/bin/sleep").unwrap();
     let registry = TrustedRegistry::system().unwrap();
     let server = yonik_import::import_bytes(b"socks5://127.0.0.1:10999".to_vec())
@@ -376,7 +361,7 @@ fn installed_standalone_run_passes_tcp_through_tun_on_both_engines() {
         uid: installed_id("-u"),
         gid: installed_id("-g"),
     };
-    let image = inode(IMAGE).unwrap();
+    let image = inode(WORKER_IMAGE).unwrap();
     let registry = TrustedRegistry::system().unwrap();
     let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
     let name = tun.interface_name();

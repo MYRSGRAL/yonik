@@ -4,15 +4,33 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     use yonik_linux::{
         Cancellation,
-        helper::{SystemSessionHost, fence::verify_worker_fence, run_system_service},
+        helper::{
+            SystemSessionHost, fence::verify_worker_fence, launch_standalone_worker,
+            run_system_service, standalone_worker_argument,
+        },
+        worker::WorkerMode,
     };
     let mut args = std::env::args_os().skip(1);
     if let Some(argument) = args.next() {
-        return if argument == "--check-worker-fence" && args.next().is_none() {
+        if args.next().is_some() {
+            return ExitCode::from(64);
+        }
+        return if argument == "--check-worker-fence" {
             if verify_worker_fence().is_ok() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
+            }
+        } else if let Some(mode) = [WorkerMode::Check, WorkerMode::Run]
+            .into_iter()
+            .find(|&mode| argument == standalone_worker_argument(mode))
+        {
+            match launch_standalone_worker(mode) {
+                Ok(never) => match never {},
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
             }
         } else {
             ExitCode::from(64)

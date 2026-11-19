@@ -677,9 +677,16 @@ IPv4-сценарий с теми же проверками прошёл пов�
   PID в ACK. Run сохраняет исходный InvocationID до подтверждения.
   Этот код передачи использует и автономный стенд. В Debian и Fedora
   RPM с SELinux Enforcing штатные TUN и Fake DNS прошли с Xray и sing-box
-  при неизменном `/etc/resolv.conf`. Для приёмки OpenRC/runit остаются
-  подключение launcher к helper, проверка полного sandbox и прогоны
-  системного TUN и Fake DNS в обеих init-средах.
+  при неизменном `/etc/resolv.conf`. Установленный `yonik-helper` получил
+  отдельные root-входы для автономных Check и Run. Launcher принимает
+  заранее открытый блокирующий Unix listener в защищённом runtime,
+  отклоняет лишние наследуемые FD, входит в нужную cgroup до `exec` и
+  назначает права по роли. Debian VM подтвердила отказы для неверного
+  stdin, неблокирующего listener и FD 3 без CLOEXEC, затем проверила
+  Check и TCP через TUN на обоих установленных движках. Для приёмки
+  OpenRC/runit остаются выбор этого launcher в сетевой сессии helper,
+  управление временем жизни сокета и cgroup, полный sandbox и
+  приёмочные прогоны TUN и Fake DNS в обеих init-средах.
   На Fedora Cloud 45 (ядро 7.2.11, nftables 1.1.6, SELinux enforcing)
   установленный helper загрузился. Системный Prepare вернул
   `Unavailable` до запуска ядра. Политики Fedora 45.23 и 45.24 отклонили

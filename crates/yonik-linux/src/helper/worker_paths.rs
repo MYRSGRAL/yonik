@@ -112,14 +112,12 @@ impl WorkerCgroups {
     }
 }
 
-// Проверка будущего launcher. Systemd продолжает владеть StopUnit и не
-// получает права записи в cgroup из этого API.
-#[cfg(test)]
 impl WorkerCgroups {
     pub(super) fn join_current(&self, name: &str) -> Result<()> {
         self.write_worker_control(name, "cgroup.procs", b"0")
     }
 
+    #[cfg(test)]
     pub(super) fn kill_group(&self, name: &str) -> Result<()> {
         self.write_worker_control(name, "cgroup.kill", b"1")
     }
