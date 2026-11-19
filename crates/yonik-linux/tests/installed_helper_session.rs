@@ -2073,6 +2073,10 @@ async fn installed_fake_dns(
         tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
     }
     let fallback_dns = std::env::var("YONIK_CHECK_FALLBACK_DNS");
+    let strict_dot = std::env::var("YONIK_CHECK_STRICT_DOT")
+        .ok()
+        .map(|peer| peer.parse::<std::net::SocketAddr>())
+        .transpose()?;
     let fallback_search = std::env::var_os("YONIK_CHECK_FALLBACK_SEARCH").is_some();
     let plain_dns_peer = std::env::var("YONIK_CHECK_PLAIN_DNS_PEER")
         .ok()
@@ -2109,6 +2113,13 @@ async fn installed_fake_dns(
             check_fallback_dns_in_vm("real.test").await?;
             check_fallback_dns_local_names_in_vm().await?;
             eprintln!("{engine:?}: NSS получил реальный ответ от FallbackDNS");
+        }
+        if let Some(peer) = strict_dot {
+            check_fallback_dns_in_vm("real.test").await?;
+            check_strict_dot_outsider(peer).await?;
+            eprintln!(
+                "{engine:?}: NSS получил ответ по строгому DoT, сокет с тем же UID вне cgroup заблокирован"
+            );
         }
         if fallback_search {
             check_fallback_search_in_vm("printer-active", true).await?;
@@ -2236,6 +2247,10 @@ async fn installed_fake_dns(
             check_fallback_dns_in_vm("restored.test").await?;
             eprintln!("{engine:?}: NSS получил ответ от FallbackDNS после остановки");
         }
+        if strict_dot.is_some() {
+            check_fallback_dns_in_vm("restored.test").await?;
+            eprintln!("{engine:?}: исходный DoT работает после остановки");
+        }
         if fallback_search {
             check_fallback_search_in_vm("printer-restored", true).await?;
             eprintln!("{engine:?}: исходный поисковый домен работает после Stop");
@@ -2284,6 +2299,63 @@ async fn check_fallback_dns_in_vm(domain: &str) -> Result {
     require(
         getent_fake_dns("ahostsv4", domain).await? == std::net::Ipv4Addr::new(192, 0, 2, 99),
         "NSS не получил реальный ответ от резервного DNS",
+    )
+}
+
+#[cfg(feature = "test-support")]
+async fn check_strict_dot_outsider(peer: std::net::SocketAddr) -> Result {
+    let process = Command::new("systemctl")
+        .args([
+            "show",
+            "--property=MainPID",
+            "--value",
+            "systemd-resolved.service",
+        ])
+        .output()?;
+    require(
+        process.status.success(),
+        "Не удалось определить PID резолвера",
+    )?;
+    let pid = std::str::from_utf8(&process.stdout)?
+        .trim()
+        .parse::<u32>()?;
+    require(pid > 1, "Некорректный PID резолвера")?;
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+    let credential = |key| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|line| line.split_ascii_whitespace().nth(1))
+            .and_then(|value| value.parse::<std::num::NonZeroU32>().ok())
+            .ok_or_else(|| io::Error::other("Некорректные credentials резолвера"))
+    };
+    let uid = credential("Uid:")?.to_string();
+    let gid = credential("Gid:")?.to_string();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("setpriv")
+            .args([
+                "--reuid",
+                &uid,
+                "--regid",
+                &gid,
+                "--clear-groups",
+                "timeout",
+                "2",
+                "openssl",
+                "s_client",
+                "-brief",
+                "-connect",
+                &peer.to_string(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    require(
+        result.status.code() == Some(124),
+        "Соединение с UID резолвера вне его cgroup не заблокировано",
     )
 }
 

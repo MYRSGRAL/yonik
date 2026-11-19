@@ -19,7 +19,7 @@ use crate::{
     Cancellation, KernelRoute, LinuxLink, LinuxTopology, NetworkStamp, RouteKind, RouteQuery,
     managed_network::{
         PublicPolicyPhase, QuarantineIntent, Resource, Scope,
-        firewall::{BoundDirect, MAX_BOUND_DIRECT, PrivateRoute},
+        firewall::{BoundDirect, MAX_BOUND_DIRECT, PrivateRoute, ResolverTls},
         tun::TunExecutor,
     },
     network::{
@@ -40,7 +40,7 @@ use std::{
     io::Read,
     mem::size_of,
     net::{IpAddr, TcpListener},
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroU32},
     os::unix::fs::MetadataExt,
     sync::{Arc, Mutex},
     time::Duration,
@@ -383,6 +383,73 @@ pub(super) struct SessionArtifact {
     memory: ByteLease,
     native_owner_stamp: Option<native_owner::NativeArtifactStamp>,
     fake_dns: Option<Arc<PreparedFakeDns>>,
+    resolver_tls: Option<ResolvedTlsEgress>,
+}
+
+struct ResolvedTlsEgress {
+    policy: ResolverTls,
+    routes: Vec<(KernelRoute, RouteCapture)>,
+}
+
+impl ResolvedTlsEgress {
+    async fn prepare(
+        fake_dns: &PreparedFakeDns,
+        plan: SessionNetworkPlan,
+        baseline: &LinuxTopology,
+        owner: Ownership,
+        cancel: &mut Cancellation,
+    ) -> Result<(SessionNetworkPlan, Option<Self>), ServiceError> {
+        let peers = fake_dns.tls_peers();
+        if peers.is_empty() {
+            return Ok((plan, None));
+        }
+        let daemon = fake_dns.tls_daemon().ok_or(ServiceError::Unavailable)?;
+        let mut routes = Vec::with_capacity(peers.len());
+        let mut rules = Vec::with_capacity(peers.len());
+        let mut endpoints = Vec::with_capacity(peers.len());
+        for &(peer, route_link) in peers {
+            let query = RouteQuery::new(peer.ip(), daemon.uid)
+                .with_interfaces(None, route_link.and_then(NonZeroU32::new))
+                .with_transport(crate::TransportProtocol::Tcp, None, Some(peer.port()));
+            let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
+                .await
+                .map_err(unavailable)?;
+            let index = checked_route(&route, owner, plan.routing_table())?;
+            if route_link.is_some_and(|expected| expected != index)
+                || !session_fake_dns::usable_resolver_link(baseline, index)
+            {
+                return Err(ServiceError::Unsupported);
+            }
+            let link = baseline
+                .links
+                .iter()
+                .find(|link| link.index == index)
+                .ok_or(ServiceError::Unsupported)?;
+            let name = String::from_utf8(link.name.clone()).map_err(unavailable)?;
+            let table = route.table.ok_or(ServiceError::Unsupported)?;
+            endpoints.push((peer, index, name));
+            rules.push((peer, table));
+            routes.push((route, capture));
+        }
+        let policy = ResolverTls::new(daemon.uid, daemon.group.1, owner.namespace(), endpoints)
+            .map_err(unavailable)?;
+        let plan = plan
+            .with_resolver_routes(baseline, daemon.uid, &rules)
+            .map_err(unavailable)?;
+        Ok((plan, Some(Self { policy, routes })))
+    }
+
+    async fn verify(&self, cancel: &mut Cancellation) -> Result<(), ServiceError> {
+        for (expected, capture) in &self.routes {
+            let (route, timing) = reread_changed_route(expected.query.clone(), cancel, DEADLINE)
+                .await
+                .map_err(unavailable)?;
+            if !same_captured_kernel_route(expected, &route, Some((*capture, timing))) {
+                return Err(stale());
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Clone)]
 struct ProfileRoute {
@@ -456,6 +523,14 @@ impl SessionArtifact {
                 .ok_or_else(stale)?
                 .revalidate(profile, cancel)
                 .map_err(unavailable)?;
+        }
+        if let Some(resolver_tls) = &self.resolver_tls {
+            self.fake_dns
+                .as_ref()
+                .ok_or_else(stale)?
+                .verify_tls(own_index)
+                .await?;
+            resolver_tls.verify(cancel).await?;
         }
         let mut transports = Vec::with_capacity(self.routes.len());
         let mut dns = Vec::new();
@@ -1585,6 +1660,7 @@ impl Backend {
             memory,
             native_owner_stamp: Some(self.native_owner.reserve()?),
             fake_dns: None,
+            resolver_tls: None,
         };
         artifact.revalidate_routes(cancel, None).await?;
         let mut nonce = [0; 32];
@@ -1839,6 +1915,11 @@ impl Backend {
             )),
             None => None,
         };
+        let (plan, resolver_tls) = if let Some(fake_dns) = &fake_dns {
+            ResolvedTlsEgress::prepare(fake_dns, plan, &baseline, owner, cancel).await?
+        } else {
+            (plan, None)
+        };
         let port = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .map_err(unavailable)?
             .local_addr()
@@ -2077,6 +2158,7 @@ impl Backend {
             peer: request.peer,
             memory,
             fake_dns,
+            resolver_tls,
         };
         Ok(GuardArtifact {
             bytes,
@@ -2239,6 +2321,11 @@ impl Backend {
                 .with_isolated_loopback(fake_dns.loopback, artifact.worker_uid)
                 .and_then(|policy| policy.with_bound_direct(fake_dns.direct_egress.clone()))
                 .and_then(|policy| policy.with_dhcp_renewal_anchor(true))
+                .and_then(|policy| {
+                    policy.with_resolver_tls(
+                        artifact.resolver_tls.as_ref().map(|tls| tls.policy.clone()),
+                    )
+                })
                 .map_err(unavailable)?;
             if self.profile_owner.is_some() {
                 if let Some((indices, bound)) =

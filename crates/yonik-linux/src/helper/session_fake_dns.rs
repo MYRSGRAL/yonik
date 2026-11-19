@@ -2,6 +2,8 @@
 use super::{
     ServiceError, SessionNetworkPlan,
     protection_host::{ARPHRD_ETHER, IFF_UP},
+    session_network::MAX_RESOLVER_RULES,
+    systemd_network_service::Daemon,
 };
 use crate::{
     Cancellation, NetworkReadError, RouteQuery, TransportProtocol,
@@ -242,6 +244,7 @@ pub(super) struct PreparedFakeDns {
     listeners: Mutex<Option<FakeDnsBridgeListeners>>,
     source: ResolverSource,
     resolved: Option<Arc<Resolve1TunSnapshot>>,
+    tls_peers: Vec<(SocketAddr, Option<u32>)>,
     plain: Vec<(PlainDnsRelay, ResolverBinding)>,
 }
 
@@ -269,6 +272,9 @@ fn resolved_peers(
 ) -> Vec<(SocketAddr, ResolverBinding)> {
     let mut scopes = BTreeMap::<_, BTreeSet<_>>::new();
     for (endpoint, socket) in snapshot.config.endpoints.iter().zip(&snapshot.sockets) {
+        if socket.transport != Resolve1Transport::Plain {
+            continue;
+        }
         let scope_link = match endpoint.scope {
             Resolve1Scope::Global => None,
             Resolve1Scope::Link(index) => Some(index),
@@ -334,6 +340,51 @@ async fn verify_resolved_baseline(
         return Err(ServiceError::Unavailable);
     }
     Ok(())
+}
+
+fn strict_tls_peers(
+    snapshot: &Resolve1TunSnapshot,
+) -> Result<Vec<(SocketAddr, Option<u32>)>, ServiceError> {
+    use Resolve1Transport::{OpportunisticTls, Plain, StrictTls};
+    if snapshot
+        .sockets
+        .iter()
+        .any(|socket| socket.transport == OpportunisticTls)
+    {
+        return Err(ServiceError::Unsupported);
+    }
+    if !snapshot
+        .sockets
+        .iter()
+        .any(|socket| socket.transport == StrictTls)
+    {
+        return Ok(Vec::new());
+    }
+    // На старых resolved проверка сертификата зависит от глобального режима.
+    // FallbackDNS теряет свою область при появлении DNS на новом линке.
+    if snapshot.fallback_only
+        || snapshot.global_transport != Some(StrictTls)
+        || snapshot.daemon.is_none()
+    {
+        return Err(ServiceError::Unsupported);
+    }
+    let mut plain = BTreeSet::new();
+    let mut tls = BTreeMap::new();
+    for (endpoint, socket) in snapshot.config.endpoints.iter().zip(&snapshot.sockets) {
+        let peer = SocketAddr::new(endpoint.address, endpoint.port);
+        if socket.transport == Plain {
+            plain.insert(peer);
+        } else if tls
+            .insert(peer, socket.route_link)
+            .is_some_and(|previous| previous != socket.route_link)
+        {
+            return Err(ServiceError::Unsupported);
+        }
+    }
+    if tls.len() > MAX_RESOLVER_RULES || tls.keys().any(|peer| plain.contains(peer)) {
+        return Err(ServiceError::Unsupported);
+    }
+    Ok(tls.into_iter().collect())
 }
 
 fn permits_resolver_name(domains: &[Resolve1Domain], name: &str, link: Option<u32>) -> bool {
@@ -404,17 +455,15 @@ impl PreparedFakeDns {
             let snapshot = read_resolve1_tun_snapshot(cancel, LIMIT, None)
                 .await
                 .map_err(|_| ServiceError::Unavailable)?;
-            if snapshot
-                .sockets
-                .iter()
-                .any(|socket| socket.transport != Resolve1Transport::Plain)
-            {
-                return Err(ServiceError::Unsupported);
-            }
             Some(Arc::new(snapshot))
         } else {
             None
         };
+        let tls_peers = resolved
+            .as_deref()
+            .map(strict_tls_peers)
+            .transpose()?
+            .unwrap_or_default();
         let mut upstreams = match (&source, &resolved) {
             (ResolverSource::Literal(snapshot, _), _) => snapshot
                 .nameservers()
@@ -433,12 +482,18 @@ impl PreparedFakeDns {
             return Err(ServiceError::Unsupported);
         }
         if resolved.as_ref().is_some_and(|snapshot| {
-            snapshot.config.endpoints.iter().any(|endpoint| {
-                endpoint.port != DNS_PORT
-                    && !upstreams.iter().any(|(peer, _)| {
-                        peer.ip() == endpoint.address && peer.port() == endpoint.port
-                    })
-            })
+            snapshot
+                .config
+                .endpoints
+                .iter()
+                .zip(&snapshot.sockets)
+                .any(|(endpoint, socket)| {
+                    socket.transport == Resolve1Transport::Plain
+                        && endpoint.port != DNS_PORT
+                        && !upstreams.iter().any(|(peer, _)| {
+                            peer.ip() == endpoint.address && peer.port() == endpoint.port
+                        })
+                })
         }) {
             // Обычная блокировка DNS на порту 53 не защищает такой сервер.
             return Err(ServiceError::Unsupported);
@@ -484,6 +539,7 @@ impl PreparedFakeDns {
             listeners: Mutex::new(Some(listeners)),
             source,
             resolved,
+            tls_peers,
             plain,
         })
     }
@@ -506,6 +562,28 @@ impl PreparedFakeDns {
 
     pub fn uses_resolve1(&self) -> bool {
         self.resolved.is_some()
+    }
+
+    pub fn tls_daemon(&self) -> Option<&Daemon> {
+        self.resolved.as_ref()?.daemon.as_ref()
+    }
+
+    pub fn tls_peers(&self) -> &[(SocketAddr, Option<u32>)] {
+        &self.tls_peers
+    }
+
+    pub async fn verify_tls(&self, own_link: Option<u32>) -> Result<(), ServiceError> {
+        if self.tls_peers.is_empty() {
+            return Ok(());
+        }
+        if resolver_source().await? != self.source {
+            return Err(ServiceError::Unavailable);
+        }
+        verify_resolved_baseline(
+            self.resolved.as_deref().ok_or(ServiceError::Unavailable)?,
+            own_link,
+        )
+        .await
     }
 
     pub fn suffixes(&self) -> &[String] {

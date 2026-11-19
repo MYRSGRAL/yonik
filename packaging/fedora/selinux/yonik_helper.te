@@ -8,6 +8,7 @@ gen_require(`
     type ifconfig_t;
     type ephemeral_port_t, sysctl_net_t;
     type systemd_logind_t, systemd_networkd_t, systemd_networkd_unit_file_t;
+    type systemd_resolved_t, systemd_resolved_unit_file_t;
 ')
 
 type yonik_helper_t;
@@ -61,6 +62,10 @@ allow systemd_networkd_t yonik_helper_t:dbus send_msg;
 allow yonik_helper_t systemd_networkd_unit_file_t:service status;
 allow yonik_helper_t systemd_networkd_t:dir search;
 allow yonik_helper_t systemd_networkd_t:file { open read };
+# Привязка DoT сверяет статус юнита и читает cgroup и stat процесса resolved.
+allow yonik_helper_t systemd_resolved_unit_file_t:service status;
+allow yonik_helper_t systemd_resolved_t:dir search;
+allow yonik_helper_t systemd_resolved_t:file { open read };
 allow yonik_helper_t self:netlink_tcpdiag_socket { create getattr ioctl setopt write read nlmsg_read };
 # SIOCGSKNS и fstatfs подтверждают сетевое пространство сокета.
 allowxperm yonik_helper_t self:netlink_tcpdiag_socket ioctl 0x894c;

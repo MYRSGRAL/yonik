@@ -30,7 +30,7 @@ pub(super) const FIRST_THROW_ROUTE: u64 = RULES + 2;
 const MAX_THROW_ROUTES: usize = 64;
 pub(super) const LAST_THROW_ROUTE: u64 = FIRST_THROW_ROUTE + MAX_THROW_ROUTES as u64 - 1;
 pub(super) const FIRST_RESOLVER_RULE: u64 = LAST_THROW_ROUTE + 1;
-const MAX_RESOLVER_RULES: usize = 16;
+pub(super) const MAX_RESOLVER_RULES: usize = 16;
 pub(super) const LAST_RESOLVER_RULE: u64 = FIRST_RESOLVER_RULE + MAX_RESOLVER_RULES as u64 - 1;
 const ALLOCATION_ATTEMPTS: usize = 8;
 

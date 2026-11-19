@@ -80,6 +80,9 @@ fn правило_dot_проверяет_cgroup_и_защищает_физиче
         .unwrap();
     socket["match"]["right"] = json!(2501);
     assert_eq!(check(&observed, &table, &active), Err(NftError::Evidence));
+    let mut fake_pool = wire.clone();
+    fake_pool["resolver_tls"]["endpoints"][0]["peer"] = json!("198.19.224.1:1853");
+    assert!(serde_json::from_value::<PublicBlockPolicy>(fake_pool).is_err());
     wire["resolver_tls"]["endpoints"][0]["ifindex"] = json!(8);
     assert!(serde_json::from_value::<PublicBlockPolicy>(wire).is_err());
 }

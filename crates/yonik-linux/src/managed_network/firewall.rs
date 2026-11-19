@@ -377,6 +377,32 @@ pub(crate) struct ResolverTls {
     endpoints: Vec<ResolverTlsEndpoint>,
 }
 
+impl ResolverTls {
+    pub(crate) fn new(
+        uid: u32,
+        cgroup_id: NonZeroU64,
+        (namespace_device, namespace_inode): (u64, u64),
+        endpoints: impl IntoIterator<Item = (SocketAddr, u32, String)>,
+    ) -> Result<Self, PolicyError> {
+        Ok(Self {
+            uid: interface(uid)?,
+            cgroup_id,
+            namespace_device,
+            namespace_inode: NonZeroU64::new(namespace_inode).ok_or(PolicyError::Interface)?,
+            endpoints: endpoints
+                .into_iter()
+                .map(|(peer, ifindex, ifname)| {
+                    Ok(ResolverTlsEndpoint {
+                        peer,
+                        ifindex: interface(ifindex)?,
+                        ifname: InterfaceName::try_from(ifname)?,
+                    })
+                })
+                .collect::<Result<_, PolicyError>>()?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResolverTlsEndpoint {
@@ -771,7 +797,6 @@ impl PublicBlockPolicy {
         .then_some(rule.ifindex)
     }
 
-    /// Отпечаток канонических правил не зависит от имени принадлежащей helper таблицы.
     pub(crate) fn with_resolver_tls(
         mut self,
         mut tls: Option<ResolverTls>,
@@ -818,6 +843,9 @@ impl PublicBlockPolicy {
                         .private_routes
                         .iter()
                         .any(|route| route.prefix.contains(address))
+                    || super::FAKE_POOLS.iter().any(|&(network, length)| {
+                        IpPrefix::new(network, length).is_ok_and(|pool| pool.contains(address))
+                    })
                 {
                     return Err(PolicyError::PrivateTransport);
                 }
@@ -839,6 +867,7 @@ impl PublicBlockPolicy {
         })
     }
 
+    /// Отпечаток канонических правил не зависит от имени таблицы helper.
     pub fn digest(&self) -> [u8; 32] {
         // Value сериализуется однозначно; здесь не бывает пользовательских map/чисел float.
         let mut hash = Sha256::new();
