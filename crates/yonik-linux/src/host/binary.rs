@@ -50,7 +50,7 @@ impl FromStr for Sha256 {
 /// после копирования больше не читается; ни пути, ни содержимое не попадают в Debug.
 pub struct BinarySnapshot {
     producer: Option<crate::helper::ImageContract>,
-    pub(crate) file: File,
+    file: File,
     pub(crate) engine: Engine,
     image: Arc<SharedImage>,
 }
@@ -190,6 +190,10 @@ impl BinarySnapshot {
 
     pub(crate) fn trusted_hash(&self) -> [u8; 32] {
         self.image.expected.0
+    }
+
+    pub(crate) fn file(&self) -> &File {
+        &self.file
     }
 
     pub(crate) fn weak_image(&self) -> Weak<SharedImage> {
