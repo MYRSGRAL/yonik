@@ -2060,24 +2060,38 @@ impl Backend {
             .check_public_policy(&block)
             .await
             .map_err(unavailable)?;
+        let mut watch = self.watch.clone();
+        cancel.check().map_err(|_| ServiceError::Cancelled)?;
+        if !watch.is_open() {
+            return Err(ServiceError::Unavailable);
+        }
+        if !self.snapshot()?.is_current(stamp) {
+            return Err(stale());
+        }
         self.worker_uncertain = true;
-        let result = self
-            .supervisor()
-            .await?
-            .check(Arc::clone(&payload), cancel)
-            .await;
-        let result = diagnostic_result("check_profile_worker", result);
-        if result.is_err() {
+        let result = watch
+            .run_while_current(
+                stamp,
+                self.supervisor().await?.check(Arc::clone(&payload), cancel),
+            )
+            .await
+            .map(|result| diagnostic_result("check_profile_worker", result));
+        if !matches!(result, Some(Ok(()))) {
             // Отмена check тоже обязана остановить activation и подтвердить cgroup.
             let (_keep, mut cleanup) = fresh_cancel();
             if self.supervisor().await?.recover(&mut cleanup).await.is_ok() {
                 self.worker_uncertain = false;
             }
-            return Err(if cancel.check().is_err() {
-                ServiceError::Cancelled
-            } else {
-                ServiceError::Unsupported
-            });
+            cancel.check().map_err(|_| ServiceError::Cancelled)?;
+            if result.is_none() {
+                self.snapshot()?;
+                return Err(if self.worker_uncertain || !watch.is_open() {
+                    ServiceError::Unavailable
+                } else {
+                    stale()
+                });
+            }
+            return Err(ServiceError::Unsupported);
         }
         self.worker_uncertain = false;
         let context_matches = self.context(uid)? == context;

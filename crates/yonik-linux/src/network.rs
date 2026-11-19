@@ -81,6 +81,35 @@ impl NetworkWatch {
     pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         self.0.changed().await
     }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.0.has_changed().is_ok()
+    }
+
+    /// Прерывает ожидание при смене поколения или закрытии наблюдателя.
+    /// Вызывающий отвечает за восстановление после отмены операции.
+    pub(crate) async fn run_while_current<T>(
+        &mut self,
+        stamp: NetworkStamp,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
+        tokio::pin!(operation);
+        while self.current().is_current(stamp) {
+            tokio::select! {
+                biased;
+                changed = self.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                output = &mut operation => {
+                    return (self.current().is_current(stamp) && self.is_open())
+                        .then_some(output);
+                }
+            }
+        }
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +334,48 @@ mod tests {
             publisher.changed(NetworkSource::Resolver);
         }
         assert_eq!(rx.borrow().stamp.generation, before.generation + 10_000);
+    }
+
+    #[tokio::test]
+    async fn prepare_check_stops_when_network_generation_changes() {
+        let (publisher, receiver) = publisher();
+        publisher.ready(NetworkSource::Routes);
+        let mut watch = NetworkWatch(receiver);
+        let stamp = watch.current().stamp;
+        let entered = std::cell::Cell::new(false);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let (result, ()) = tokio::join!(
+                biased;
+                watch.run_while_current(stamp, async {
+                    entered.set(true);
+                    std::future::pending::<u8>().await
+                }),
+                async {
+                    assert!(entered.get());
+                    publisher.changed(NetworkSource::Resolver);
+                },
+            );
+            result
+        })
+        .await
+        .expect("смена поколения должна прервать ожидание Check");
+        assert_eq!(result, None);
+        assert_eq!(
+            watch
+                .run_while_current(stamp, async {
+                    panic!("устаревший Check не запускается")
+                })
+                .await,
+            None::<()>,
+        );
+        let current = watch.current().stamp;
+        assert_eq!(
+            watch.run_while_current(current, async { 42 }).await,
+            Some(42)
+        );
+        drop(publisher);
+        assert_eq!(watch.run_while_current(current, async { 42 }).await, None);
     }
 
     #[test]

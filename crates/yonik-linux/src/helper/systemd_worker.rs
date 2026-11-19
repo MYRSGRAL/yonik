@@ -1402,6 +1402,17 @@ impl SystemWorkerSupervisor {
         for mode in [WorkerMode::Check, WorkerMode::Run] {
             bounded(cancel, deadline, self.unit_job("StopUnit", mode.socket())).await?;
         }
+        // При отмене Check отправитель ждёт ACK от уже активного сервиса.
+        // Останавливаем этот Check до ожидания его передачи.
+        let stop_check_first = self.pending == Some(WorkerMode::Check) && self.transfer.is_some();
+        if stop_check_first {
+            bounded(
+                cancel,
+                deadline,
+                self.unit_job("StopUnit", WorkerMode::Check.service()),
+            )
+            .await?;
+        }
         if let Some(handle) = self.native_admission.as_mut() {
             let result = bounded(cancel, deadline, async {
                 handle.await.map_err(unavailable)
@@ -1428,15 +1439,13 @@ impl SystemWorkerSupervisor {
             .await?;
             self.native_transfer = None;
         }
-        if let Some(handle) = self.transfer.as_mut() {
-            bounded(cancel, deadline, async {
-                let _result = handle.await.map_err(unavailable)?;
-                Ok(())
-            })
-            .await?;
-            self.transfer = None;
+        if self.transfer.is_some() {
+            let _result = wait_owned(&mut self.transfer, cancel, deadline).await?;
         }
         for mode in [WorkerMode::Check, WorkerMode::Run] {
+            if mode == WorkerMode::Check && stop_check_first {
+                continue;
+            }
             if mode == WorkerMode::Run {
                 if let Some(ticket) = self.current.as_ref() {
                     let state = bounded(cancel, deadline, self.state(mode)).await?;
