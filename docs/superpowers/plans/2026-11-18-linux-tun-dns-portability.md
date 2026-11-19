@@ -1053,6 +1053,8 @@ IPv4-сценарий с теми же проверками прошёл пов�
   допуска при смене сокета, маршрута или остановке helper.
   [WireGuard UDP в Linux](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireguard/socket.c#L342-L412) · [Netfilter BPF](https://github.com/torvalds/linux/blob/v6.12/net/netfilter/nf_bpf_link.c) · [Часы ядра Linux](https://docs.kernel.org/core-api/timekeeping.html)
 
+  Сам снимок UDP-маршрута теперь проверяет срок и по `CLOCK_BOOTTIME`. Монотонная граница сохраняется для тайм-аутов Netlink. Синтетический регрессионный тест подтвердил отзыв при истечении срока во время сна. На Debian 6.12.117 и Ubuntu 6.8.0-147 повторена проверка реального маршрута, смены RPDB и endpoint и отзыва снимка. Этот код пока используется для проверки снимка и не устанавливает допуск пакетов WireGuard.
+
   Сетевой план уже умеет журналировать собственные
   IPv4/IPv6 `throw` и сверять их с опорными маршрутами своей таблицы. На тех
   же ядрах отдельный тест исполнил реальный RTNETLINK и путь восстановления

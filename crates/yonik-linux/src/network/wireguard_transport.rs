@@ -7,6 +7,7 @@ use super::{
     same_captured_topology,
 };
 use crate::Cancellation;
+use rustix::time::{ClockId, clock_gettime};
 use std::{
     collections::BTreeSet,
     net::{IpAddr, SocketAddr, SocketAddrV6},
@@ -21,6 +22,28 @@ const IFF_UP: u32 = 1;
 const IFF_LOOPBACK: u32 = 8;
 const ARPHRD_ETHER: u16 = 1;
 const IFA_UNUSABLE: u32 = 0x08 | 0x40; // IFA_F_DADFAILED, IFA_F_TENTATIVE.
+
+#[derive(Clone, Copy)]
+struct TransportDeadline {
+    monotonic: Instant,
+    boottime: Duration,
+}
+
+impl TransportDeadline {
+    fn start() -> Result<Self, Error> {
+        let started = boottime()?;
+        Ok(Self {
+            monotonic: Instant::now() + VALIDITY,
+            boottime: started.checked_add(VALIDITY).ok_or(Error::Limit)?,
+        })
+    }
+
+    fn remaining_at(&self, monotonic: Instant, boottime: Duration) -> Duration {
+        self.monotonic
+            .saturating_duration_since(monotonic)
+            .min(self.boottime.saturating_sub(boottime))
+    }
+}
 
 /// Результат RTM_GETROUTE для UDP-адресов, портов и метки. Он описывает
 /// выходной L3-интерфейс, включая виртуальный Ethernet, и не проверяет L2-путь.
@@ -70,7 +93,7 @@ pub struct WireGuardUdpRouteSnapshot {
     device: WireGuardDevice,
     link: LinuxLink,
     paths: Vec<WireGuardUdpPath>,
-    expires_at: Instant,
+    expires_at: TransportDeadline,
     cancellation: Cancellation,
     revoked: bool,
 }
@@ -80,7 +103,7 @@ impl WireGuardUdpRouteSnapshot {
     /// namespace UDP-сокета или запомненный source peer. Перед выдачей допуска
     /// nft требуется отдельно подтвердить фактический выход UDP WireGuard.
     pub async fn capture(ifindex: u32, cancel: &mut Cancellation) -> Result<Self, Error> {
-        let expires_at = Instant::now() + VALIDITY;
+        let expires_at = TransportDeadline::start()?;
         remaining(expires_at, cancel)?;
         let mut fence = NetlinkReader::open()?;
         let (topology, timing) =
@@ -130,7 +153,7 @@ impl WireGuardUdpRouteSnapshot {
         {
             return Err(Error::Changed);
         }
-        fence.finish(cancel, expires_at)?;
+        fence.finish(cancel, expires_at.monotonic)?;
         remaining(expires_at, cancel)?;
         Ok(Self {
             device,
@@ -154,7 +177,7 @@ impl WireGuardUdpRouteSnapshot {
         self.revoked = true;
         let mut current = Self::capture(self.device.ifindex, cancel).await?;
         self.cancellation.check().map_err(|_| Error::Cancelled)?;
-        if Instant::now() >= previous_expiry
+        if remaining(previous_expiry, cancel).is_err()
             || self.device != current.device
             || !same_link(&self.link, &current.link)
             || self.paths.len() != current.paths.len()
@@ -171,10 +194,11 @@ impl WireGuardUdpRouteSnapshot {
         Ok(())
     }
 
-    /// Возвращает пути и абсолютный срок применения снимка.
+    /// Возвращает пути живого снимка и монотонную верхнюю границу срока.
+    /// После сна предел может наступить раньше этой границы.
     pub fn paths(&self) -> Option<(Instant, &[WireGuardUdpPath])> {
-        (!self.revoked && self.cancellation.check().is_ok() && Instant::now() < self.expires_at)
-            .then_some((self.expires_at, &self.paths))
+        (!self.revoked && remaining(self.expires_at, &self.cancellation).is_ok())
+            .then_some((self.expires_at.monotonic, &self.paths))
     }
 }
 
@@ -183,7 +207,7 @@ async fn check_endpoint(
     endpoint: SocketAddr,
     port: u16,
     fwmark: NonZeroU32,
-    deadline: Instant,
+    deadline: TransportDeadline,
     cancel: &mut Cancellation,
 ) -> Result<WireGuardUdpPath, Error> {
     if !unicast_address(endpoint.ip()) || endpoint.port() == 0 {
@@ -294,12 +318,50 @@ fn unicast_address(ip: IpAddr) -> bool {
         && !matches!(ip, IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some())
 }
 
-fn remaining(deadline: Instant, cancel: &Cancellation) -> Result<Duration, Error> {
+fn boottime() -> Result<Duration, Error> {
+    let time = clock_gettime(ClockId::Boottime);
+    let seconds = u64::try_from(time.tv_sec).map_err(|_| Error::Unavailable)?;
+    let nanos = u32::try_from(time.tv_nsec).map_err(|_| Error::Unavailable)?;
+    if nanos >= 1_000_000_000 {
+        return Err(Error::Unavailable);
+    }
+    Ok(Duration::new(seconds, nanos))
+}
+
+fn remaining(deadline: TransportDeadline, cancel: &Cancellation) -> Result<Duration, Error> {
     cancel.check().map_err(|_| Error::Cancelled)?;
-    let duration = deadline.saturating_duration_since(Instant::now());
+    let duration = deadline.remaining_at(Instant::now(), boottime()?);
     if duration.is_zero() {
         Err(Error::Timeout)
     } else {
         Ok(duration)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suspend_expires_the_snapshot_without_advancing_monotonic_time() {
+        let monotonic = Instant::now();
+        let boot = Duration::from_secs(10);
+        let deadline = TransportDeadline {
+            monotonic: monotonic + VALIDITY,
+            boottime: boot + VALIDITY,
+        };
+        let short = Duration::from_millis(20);
+        assert_eq!(
+            deadline.remaining_at(monotonic + short, boot + short),
+            VALIDITY - short,
+        );
+        assert_eq!(
+            deadline.remaining_at(monotonic + short, boot + VALIDITY),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            deadline.remaining_at(monotonic + VALIDITY, boot + short),
+            Duration::ZERO,
+        );
     }
 }
