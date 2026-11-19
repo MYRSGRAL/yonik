@@ -113,6 +113,12 @@ pub(crate) struct Resolve1Socket {
     server_name: Option<String>,
 }
 
+impl Resolve1Socket {
+    pub(crate) fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
+    }
+}
+
 impl std::fmt::Debug for Resolve1Socket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Resolve1Socket(<скрыто>)")

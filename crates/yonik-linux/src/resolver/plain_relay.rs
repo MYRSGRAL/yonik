@@ -1,7 +1,8 @@
 //! Передача реального DNS прежнему resolver через заранее проверенный маршрут.
 use super::{
     ResolverError,
-    forward::{forward_tcp, forward_udp},
+    dot::DotPeer,
+    forward::{forward_framed, forward_tcp, forward_udp},
 };
 use crate::{Cancellation, managed_network::FAKE_POOLS};
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -30,6 +31,7 @@ pub(crate) struct PlainDnsRelay {
     udp: UdpSocket,
     peer: SocketAddr,
     mark: NonZeroU32,
+    dot: Option<DotPeer>,
 }
 
 impl PlainDnsRelay {
@@ -48,11 +50,26 @@ impl PlainDnsRelay {
             udp,
             peer,
             mark,
+            dot: None,
         })
     }
 
     pub fn peer(&self) -> SocketAddr {
         self.peer
+    }
+
+    pub fn with_dot(mut self, dot: DotPeer) -> Self {
+        self.dot = Some(dot);
+        self
+    }
+
+    pub fn upstream_protocols(&self) -> &'static [crate::TransportProtocol] {
+        use crate::TransportProtocol::{Tcp, Udp};
+        if self.dot.is_some() {
+            &[Tcp]
+        } else {
+            &[Tcp, Udp]
+        }
     }
 
     pub fn port(&self) -> io::Result<NonZeroU16> {
@@ -170,7 +187,7 @@ impl PlainDnsRelay {
     ) -> Result<Vec<u8>, ResolverError> {
         let endpoint = self.peer;
         let transport = async {
-            if tcp {
+            if tcp || self.dot.is_some() {
                 let socket = if endpoint.is_ipv4() {
                     TcpSocket::new_v4()
                 } else {
@@ -183,7 +200,14 @@ impl PlainDnsRelay {
                     .await
                     .map_err(|_| ResolverError::Timeout)?
                     .map_err(|_| ResolverError::Unavailable)?;
-                forward_tcp(&mut stream, endpoint, query, LIMIT, &mut cancel).await
+                if let Some(dot) = &self.dot {
+                    forward_framed(query, LIMIT, &mut cancel, async |outbound| {
+                        dot.exchange(&mut stream, outbound).await
+                    })
+                    .await
+                } else {
+                    forward_tcp(&mut stream, endpoint, query, LIMIT, &mut cancel).await
+                }
             } else {
                 let bind = if endpoint.is_ipv4() {
                     IpAddr::from(Ipv4Addr::UNSPECIFIED)

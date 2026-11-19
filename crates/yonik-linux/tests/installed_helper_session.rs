@@ -2074,6 +2074,7 @@ async fn installed_fake_dns(
     }
     let fallback_dns = std::env::var("YONIK_CHECK_FALLBACK_DNS");
     let opportunistic_dot = std::env::var_os("YONIK_CHECK_OPPORTUNISTIC_DOT").is_some();
+    let invalid_fallback_dot = std::env::var_os("YONIK_CHECK_INVALID_FALLBACK_DOT").is_some();
     let strict_dot = std::env::var("YONIK_CHECK_STRICT_DOT")
         .ok()
         .map(|peer| peer.parse::<std::net::SocketAddr>())
@@ -2133,6 +2134,13 @@ async fn installed_fake_dns(
             eprintln!(
                 "{engine:?}: NSS получил ответ по строгому DoT, сокет с тем же UID вне cgroup заблокирован"
             );
+        }
+        if invalid_fallback_dot {
+            require(
+                getent_fake_dns("ahostsv4", "real.test").await.is_err(),
+                "Релей принял недоверенное имя сертификата FallbackDNS",
+            )?;
+            eprintln!("{engine:?}: релей отклонил неверное имя сертификата FallbackDNS");
         }
         if fallback_search {
             check_fallback_search_in_vm("printer-active", true).await?;

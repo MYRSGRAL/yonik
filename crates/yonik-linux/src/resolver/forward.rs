@@ -166,6 +166,27 @@ pub async fn forward_tcp(
     if peer != trusted_peer {
         return Err(ResolverError::Untrusted);
     }
+    forward_framed(query, timeout_budget, cancel, async |outbound| {
+        let frame_len = u16::try_from(outbound.len()).map_err(|_| ResolverError::Limit)?;
+        stream.write_u16(frame_len).await.map_err(map_io)?;
+        stream.write_all(outbound).await.map_err(map_io)?;
+        let response_len = usize::from(stream.read_u16().await.map_err(map_io)?);
+        if !(HEADER_LEN..=MAX_DNS_PACKET).contains(&response_len) {
+            return Err(ResolverError::Limit);
+        }
+        let mut response = vec![0; response_len];
+        stream.read_exact(&mut response).await.map_err(map_io)?;
+        Ok(response)
+    })
+    .await
+}
+
+pub(super) async fn forward_framed(
+    query: &[u8],
+    timeout_budget: Duration,
+    cancel: &mut Cancellation,
+    exchange: impl AsyncFnOnce(&[u8]) -> Result<Vec<u8>, ResolverError>,
+) -> Result<ForwardResponse, ResolverError> {
     if timeout_budget.is_zero() || timeout_budget > Duration::from_secs(10) {
         return Err(ResolverError::Limit);
     }
@@ -173,17 +194,8 @@ pub async fn forward_tcp(
     let outbound_id = random_id(original.id)?;
     let mut outbound = query.to_vec();
     outbound[..2].copy_from_slice(&outbound_id.to_be_bytes());
-    let frame_len = u16::try_from(outbound.len()).map_err(|_| ResolverError::Limit)?;
-
     run_cancellable(cancel, timeout_budget, async {
-        stream.write_u16(frame_len).await.map_err(map_io)?;
-        stream.write_all(&outbound).await.map_err(map_io)?;
-        let response_len = usize::from(stream.read_u16().await.map_err(map_io)?);
-        if !(HEADER_LEN..=MAX_DNS_PACKET).contains(&response_len) {
-            return Err(ResolverError::Limit);
-        }
-        let mut response = vec![0; response_len];
-        stream.read_exact(&mut response).await.map_err(map_io)?;
+        let mut response = exchange(&outbound).await?;
         let returned = verify_response(&response, outbound_id, &original)?;
         response[..2].copy_from_slice(&original.id.to_be_bytes());
         Ok(ForwardResponse {

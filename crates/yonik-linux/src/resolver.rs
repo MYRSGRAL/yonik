@@ -3,6 +3,7 @@
 //! Снимок описывает daemon; наблюдения и peer credentials не дают права Apply.
 
 mod config;
+pub(crate) mod dot;
 pub mod fake_service;
 pub(crate) mod file_watch;
 pub mod forward;

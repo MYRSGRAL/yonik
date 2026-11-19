@@ -2028,30 +2028,28 @@ impl Backend {
             capture: route_capture,
         }];
         if let Some(fake_dns) = &fake_dns {
-            for (peer, expected_link) in fake_dns.plain_peers() {
-                for protocol in [crate::TransportProtocol::Tcp, crate::TransportProtocol::Udp] {
-                    let query = RouteQuery::new(peer.ip(), 0)
-                        .with_mark(plan.socket_mark())
-                        .with_transport(protocol, None, Some(peer.port()));
-                    let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
-                        .await
-                        .map_err(unavailable)?;
-                    let index = checked_route(&route, owner, plan.routing_table())?;
-                    if expected_link.is_some_and(|expected| expected != index)
-                        || fake_dns.uses_resolve1()
-                            && !session_fake_dns::usable_resolver_link(&baseline, index)
-                    {
-                        return Err(ServiceError::Unsupported);
-                    }
-                    routes.push(ProfileRoute {
-                        dns: true,
-                        endpoint: peer.ip(),
-                        port: peer.port(),
-                        protocol,
-                        route,
-                        capture,
-                    });
+            for (peer, protocol, expected_link) in fake_dns.relay_routes() {
+                let query = RouteQuery::new(peer.ip(), 0)
+                    .with_mark(plan.socket_mark())
+                    .with_transport(protocol, None, Some(peer.port()));
+                let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
+                    .await
+                    .map_err(unavailable)?;
+                let index = checked_route(&route, owner, plan.routing_table())?;
+                if expected_link.is_some_and(|expected| expected != index)
+                    || fake_dns.uses_resolve1()
+                        && !session_fake_dns::usable_resolver_link(&baseline, index)
+                {
+                    return Err(ServiceError::Unsupported);
                 }
+                routes.push(ProfileRoute {
+                    dns: true,
+                    endpoint: peer.ip(),
+                    port: peer.port(),
+                    protocol,
+                    route,
+                    capture,
+                });
             }
         }
         let block = compile_protection(&baseline, false)?;
