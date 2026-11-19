@@ -22,6 +22,8 @@ use tokio::{
 mod config;
 #[path = "tun_custody.rs"]
 mod custody;
+#[path = "tun_resolver_rule.rs"]
+mod resolver_rule;
 #[path = "tun_rule.rs"]
 mod rule;
 #[path = "tun_topology.rs"]
@@ -37,6 +39,7 @@ mod tests;
 #[path = "tun_write.rs"]
 mod write;
 pub use config::{TunAddress, TunRoute};
+pub use resolver_rule::ResolverRouteRule;
 pub use rule::TunRule;
 
 const DEADLINE: Duration = Duration::from_secs(5);

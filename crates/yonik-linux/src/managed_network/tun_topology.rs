@@ -1,7 +1,7 @@
 //! Чистая проекция внешней топологии: исключает только доказанные эффекты сессии.
 use super::{
     Journal, RecordState, Resource, Scope, TunAddress, TunError, TunRule, alias, config, observed,
-    rule,
+    resolver_rule, rule,
 };
 use crate::{LinuxRoute, LinuxTopology};
 use std::collections::{BTreeMap, BTreeSet};
@@ -160,6 +160,7 @@ fn project(
     let mut addresses = BTreeMap::new();
     let mut routes = BTreeMap::new();
     let mut rules = BTreeMap::new();
+    let mut resolver_rules = BTreeMap::new();
     let mut tables = BTreeSet::new();
     for record in journal
         .records()
@@ -209,6 +210,23 @@ fn project(
                         (if *ipv6 { 10 } else { 2 }, *priority),
                         TunRule::new(*priority, *table, *mark, *ipv6)?,
                     )
+                    .is_some()
+                {
+                    return Err(TunError::Evidence);
+                }
+            }
+            Resource::ResolverRule {
+                tun_id: parent,
+                ifindex,
+                priority,
+                ipv6,
+                digest,
+            } if *parent == tun_id
+                && *ifindex == index
+                && record.state() == RecordState::Confirmed =>
+            {
+                if resolver_rules
+                    .insert((if *ipv6 { 10 } else { 2 }, *priority), digest)
                     .is_some()
                 {
                     return Err(TunError::Evidence);
@@ -285,6 +303,13 @@ fn project(
             if !rule::rule_matches(&value, *expected) || !consumed_rules.insert(key) {
                 return Err(TunError::Foreign);
             }
+        } else if let Some(digest) = resolver_rules.get(&key) {
+            if tables.contains(&value.table)
+                || !resolver_rule::matches_digest(&value, digest)
+                || !consumed_rules.insert(key)
+            {
+                return Err(TunError::Foreign);
+            }
         } else {
             if tables.contains(&value.table) {
                 return Err(TunError::Foreign);
@@ -292,7 +317,7 @@ fn project(
             remaining_rules.push(value);
         }
     }
-    if consumed_rules.len() != rules.len() {
+    if consumed_rules.len() != rules.len() + resolver_rules.len() {
         return Err(TunError::Evidence);
     }
     topology.rules = remaining_rules;

@@ -95,7 +95,7 @@ fn observe_rule(topology: &LinuxTopology, expected: TunRule) -> Result<bool, Tun
     }
     Ok(true)
 }
-fn parent(
+pub(super) fn parent(
     executor: &TunExecutor,
     journal: &Journal,
     tun_id: u64,

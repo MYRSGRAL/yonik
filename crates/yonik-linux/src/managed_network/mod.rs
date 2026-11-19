@@ -135,6 +135,14 @@ pub enum Resource {
         mark: u32,
         ipv6: bool,
     },
+    /// Физический маршрут исходного резолвера. В журнале хранится отпечаток селекторов.
+    ResolverRule {
+        tun_id: u64,
+        ifindex: u32,
+        priority: u32,
+        ipv6: bool,
+        digest: [u8; 32],
+    },
     Rule {
         priority: u32,
         table: u32,
@@ -156,6 +164,7 @@ impl Resource {
         match *self {
             Self::Address { tun_id, .. }
             | Self::TunRule { tun_id, .. }
+            | Self::ResolverRule { tun_id, .. }
             | Self::ThrowRoute { tun_id, .. } => Some(tun_id),
             _ => None,
         }
@@ -248,6 +257,18 @@ impl Resource {
                     && (1..32766).contains(priority)
                     && (256..u32::MAX).contains(table)
                     && (1..=i32::MAX as u32).contains(mark)
+            }
+            Self::ResolverRule {
+                tun_id,
+                ifindex,
+                priority,
+                digest,
+                ..
+            } => {
+                *tun_id != 0
+                    && (1..=i32::MAX as u32).contains(ifindex)
+                    && (1..32766).contains(priority)
+                    && *digest != [0; 32]
             }
             Self::Rule {
                 priority,

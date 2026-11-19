@@ -1,6 +1,6 @@
 //! Закрытый RTNETLINK write transport: ACK не заменяет последующую сверку.
 use super::config::{TunAddress, TunRoute};
-use super::{OperationLease, TunError, TunRule};
+use super::{OperationLease, ResolverRouteRule, TunError, TunRule};
 use rustix::net::{
     self, AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType, netlink::SocketAddrNetlink,
 };
@@ -13,6 +13,10 @@ const HEADER: usize = 16;
 pub(super) enum Action {
     Rule {
         rule: TunRule,
+        add: bool,
+    },
+    ResolverRule {
+        rule: ResolverRouteRule,
         add: bool,
     },
     SetAlias {
@@ -59,8 +63,8 @@ impl Action {
             Self::Address { add: false, .. } => 21,
             Self::Route { add: true, .. } => 24,
             Self::Route { add: false, .. } => 25,
-            Self::Rule { add: true, .. } => 32,
-            Self::Rule { add: false, .. } => 33,
+            Self::Rule { add: true, .. } | Self::ResolverRule { add: true, .. } => 32,
+            Self::Rule { add: false, .. } | Self::ResolverRule { add: false, .. } => 33,
         }
     }
     fn flags(&self) -> u16 {
@@ -69,6 +73,7 @@ impl Action {
             Self::Address { add: true, .. }
                 | Self::Route { add: true, .. }
                 | Self::Rule { add: true, .. }
+                | Self::ResolverRule { add: true, .. }
         ) {
             0x605
         } else {
@@ -82,7 +87,7 @@ impl Action {
             | Self::Delete { index }
             | Self::Address { index, .. }
             | Self::Route { index, .. } => *index,
-            Self::Rule { .. } => 1,
+            Self::Rule { .. } | Self::ResolverRule { .. } => 1,
         };
         if index == 0 || index > i32::MAX as u32 {
             return Err(TunError::Invalid);
@@ -96,6 +101,38 @@ impl Action {
                 attribute(&mut value, 15, &rule.table().to_ne_bytes());
                 attribute(&mut value, 16, &u32::MAX.to_ne_bytes());
                 attribute(&mut value, 21, &[253]);
+                value
+            }
+            Self::ResolverRule { rule, .. } => {
+                if rule.mark() == 0 {
+                    return Err(TunError::Invalid);
+                }
+                let endpoint = rule.endpoint();
+                let address = address_bytes(endpoint.ip());
+                let (family, prefix) = if endpoint.is_ipv4() {
+                    (2, 32)
+                } else {
+                    (10, 128)
+                };
+                let mut value = vec![family, prefix, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+                let uid = rule.uid().to_ne_bytes();
+                let mut uid_range = [0; 8];
+                uid_range[..4].copy_from_slice(&uid);
+                uid_range[4..].copy_from_slice(&uid);
+                let port = endpoint.port().to_ne_bytes();
+                let mut port_range = [0; 4];
+                port_range[..2].copy_from_slice(&port);
+                port_range[2..].copy_from_slice(&port);
+                attribute(&mut value, 1, &address); // FRA_DST.
+                attribute(&mut value, 6, &rule.priority().to_ne_bytes()); // FRA_PRIORITY.
+                // Нулевая маска сохраняет метку владения в правиле, не ограничивая трафик.
+                attribute(&mut value, 10, &rule.mark().to_ne_bytes()); // FRA_FWMARK.
+                attribute(&mut value, 15, &rule.table().to_ne_bytes()); // FRA_TABLE.
+                attribute(&mut value, 16, &0_u32.to_ne_bytes()); // FRA_FWMASK.
+                attribute(&mut value, 20, &uid_range); // FRA_UID_RANGE.
+                attribute(&mut value, 21, &[253]); // FRA_PROTOCOL.
+                attribute(&mut value, 22, &[6]); // FRA_IP_PROTO: TCP.
+                attribute(&mut value, 24, &port_range); // FRA_DPORT_RANGE.
                 value
             }
             Self::Address { address, .. } => {
@@ -437,6 +474,63 @@ mod tests {
             }
             attribute(&mut expected, 21, &[253]);
             assert_eq!(&add[16..], expected);
+        }
+    }
+    #[test]
+    fn resolver_rule_wire_image_matches_only_exact_tcp_endpoint_and_uid() {
+        let ipv4 = [192, 0, 2, 53];
+        let ipv6 = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+        ];
+        for (endpoint, family, prefix, destination) in [
+            ("192.0.2.53:853", 2, 32, ipv4.as_slice()),
+            ("[2001:db8::53]:853", 10, 128, ipv6.as_slice()),
+        ] {
+            let owner = crate::managed_network::Ownership::new(1000, 7, 9, 1, 2).unwrap();
+            let rule = ResolverRouteRule::new(10000, 1001, 1000, endpoint.parse().unwrap())
+                .unwrap()
+                .with_owner(owner, 2);
+            let add = Action::ResolverRule { rule, add: true }
+                .request(3, 5)
+                .unwrap();
+            let delete = Action::ResolverRule { rule, add: false }
+                .request(3, 5)
+                .unwrap();
+            assert_eq!(value_u32(&add[..4]), Ok(add.len() as u32));
+            assert_eq!(value_u16(&add[4..6]), Ok(32));
+            assert_eq!(value_u16(&add[6..8]), Ok(0x605));
+            assert_eq!(value_u16(&delete[4..6]), Ok(33));
+            assert_eq!(value_u16(&delete[6..8]), Ok(5));
+            assert_eq!(&add[8..], &delete[8..]);
+            assert_eq!(
+                &add[16..28],
+                &[family, prefix, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+            );
+            let mut attributes = &add[28..];
+            for (kind, payload) in [
+                (1, destination),
+                (6, &10000_u32.to_ne_bytes()),
+                (10, &rule.mark().to_ne_bytes()),
+                (15, &1001_u32.to_ne_bytes()),
+                (16, &0_u32.to_ne_bytes()),
+                (20, &1000_u32.to_ne_bytes().repeat(2)),
+                (21, &[253]),
+                (22, &[6]),
+                (24, &853_u16.to_ne_bytes().repeat(2)),
+            ] {
+                let length = payload.len() + 4;
+                let aligned_length = (length + 3) & !3;
+                assert_eq!(value_u16(&attributes[..2]), Ok(length as u16));
+                assert_eq!(value_u16(&attributes[2..4]), Ok(kind));
+                assert_eq!(&attributes[4..length], payload);
+                assert!(
+                    attributes[length..aligned_length]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                );
+                attributes = &attributes[aligned_length..];
+            }
+            assert!(attributes.is_empty());
         }
     }
     #[test]
