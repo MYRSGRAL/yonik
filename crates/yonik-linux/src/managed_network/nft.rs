@@ -132,6 +132,8 @@ fn request(action: Action<'_>) -> Value {
 
 #[path = "nft_quarantine.rs"]
 mod quarantine;
+#[path = "nft_text.rs"]
+mod text;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -225,7 +227,18 @@ impl NftExecutor {
     }
     async fn run(&mut self, action: Action<'_>) -> Result<Vec<u8>, NftError> {
         let check_only = matches!(&action, Action::CheckBlock(..));
-        let bytes = serde_json::to_vec(&request(action)).map_err(|_| NftError::Invalid)?;
+        let text_input = match &action {
+            Action::InstallBlock(_, policy)
+            | Action::CheckBlock(_, policy)
+            | Action::ReplaceBlock(_, _, _, policy) => policy.dhcp_rule_identity().is_some(),
+            _ => false,
+        };
+        let request = request(action);
+        let bytes = if text_input {
+            text::render(request["nftables"].as_array().ok_or(NftError::Invalid)?)?
+        } else {
+            serde_json::to_vec(&request).map_err(|_| NftError::Invalid)?
+        };
         if bytes.len() > MAX_OUTPUT {
             return Err(NftError::Invalid);
         }
@@ -239,7 +252,10 @@ impl NftExecutor {
             .map_err(|_| NftError::Io)?;
         self.check_namespace()?;
         let mut command = Command::new(format!("/proc/self/fd/{}", self.executable.as_raw_fd()));
-        command.args(["-j", "-n"]);
+        command.arg("-n");
+        if !text_input {
+            command.arg("-j");
+        }
         if check_only {
             command.arg("-c");
         }

@@ -563,6 +563,137 @@ async fn dhcp_cgroup_socket_rule_has_exact_kernel_identity() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая VM с DHCPv4 и nftables"]
+async fn dhcp_rule_is_verified_through_durable_public_policy() -> Result {
+    use std::{io::Write, os::unix::fs::DirBuilderExt, process::Stdio};
+    use yonik_linux::{
+        helper::dhcp_networkd::DhcpNetworkdLease,
+        managed_network::{
+            Journal, Ownership,
+            firewall::PublicBlockPolicy,
+            nft::{NftExecutor, PublicPolicyRecovery},
+        },
+    };
+
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    let before = resolver_file_state()?;
+    let (_owner, mut cancel) = yonik_linux::Cancellation::new();
+    let index = fs::read_to_string("/sys/class/net/yonik-dhcp/ifindex")?
+        .trim()
+        .parse::<std::num::NonZeroU32>()?;
+    let lo = fs::read_to_string("/sys/class/net/lo/ifindex")?
+        .trim()
+        .parse()?;
+    check_dhcp_fixture_dns("10.203.2.1", &mut cancel).await?;
+    let lease = DhcpNetworkdLease::capture(index, &mut cancel).await?;
+    let path = lease
+        .path()
+        .ok_or_else(|| io::Error::other("Нет снимка DHCP"))?;
+    let owner = Ownership::new(1000, 1, 1, path.namespace.device, path.namespace.inode)?;
+    let journal_dir = std::path::Path::new("/run/yonik-dhcp-rule-test");
+    fs::DirBuilder::new().mode(0o700).create(journal_dir)?;
+    let mut journal = Journal::open(journal_dir, owner)?;
+    let mut nft = NftExecutor::open(owner)?;
+    let base = PublicBlockPolicy::new(lo, Some(index.get() + 100), vec![], vec![], vec![], vec![])?;
+    let policy = base.clone().with_dhcp_renewal_rule(&lease)?;
+    let initial_revision = nft
+        .apply_durable_public_policy(&mut journal, 1, 5, base)
+        .await?;
+    let revision = nft
+        .apply_durable_public_policy(&mut journal, 1, 5, policy)
+        .await?;
+    require(
+        revision > initial_revision,
+        "Правило DHCP не заменило предыдущую политику",
+    )?;
+    drop(journal);
+    let mut journal =
+        Journal::open_existing(journal_dir)?.ok_or_else(|| io::Error::other("Не открыт журнал"))?;
+    require(
+        nft.recover_public_policy(&mut journal).await?
+            == PublicPolicyRecovery::DesiredRules { revision },
+        "Правило DHCP не принято после повторного открытия журнала",
+    )?;
+    require(
+        Command::new("/usr/bin/systemctl")
+            .args(["start", "yonik-dhcp-fixture-renew.service"])
+            .status()?
+            .success(),
+        "Стенд не запросил продление DHCP",
+    )?;
+
+    let table = "yonik_0000000000000005";
+    let chain = "dhcp_renewal";
+    let output = Command::new(nft_test_binary())
+        .args(["-a", "list", "chain", "inet", table, chain])
+        .output()?;
+    require(output.status.success(), "Не прочитана цепочка DHCP")?;
+    let text = std::str::from_utf8(&output.stdout)?;
+    let (expression, handle) = text
+        .lines()
+        .find_map(|line| {
+            let (expr, handle) = line.split_once("# handle ")?;
+            expr.contains("socket cgroupv2 level 2")
+                .then_some((expr.trim(), handle.trim()))
+        })
+        .ok_or_else(|| io::Error::other("Нет правила DHCP с cgroup"))?;
+    let handle = handle.parse::<u64>()?;
+    let replace = |expression: &str| -> Result {
+        let mut child = Command::new(nft_test_binary())
+            .args(["-f", "-"])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        let mut input = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("Не открыт stdin nft"))?;
+        writeln!(
+            input,
+            "replace rule inet {table} {chain} handle {handle} {expression}"
+        )?;
+        drop(input);
+        require(child.wait()?.success(), "Не заменено тестовое правило DHCP")
+    };
+    replace(&expression.replacen("socket cgroupv2 level 2", "socket cgroupv2 level 1", 1))?;
+    require(
+        nft.recover_public_policy(&mut journal).await.is_err(),
+        "Принят другой уровень cgroup, скрытый в JSON",
+    )?;
+    replace(expression)?;
+    require(
+        nft.recover_public_policy(&mut journal).await?
+            == PublicPolicyRecovery::DesiredRules { revision },
+        "Точное правило не принято после восстановления",
+    )?;
+    require(
+        Command::new("/usr/bin/systemctl")
+            .args(["stop", "systemd-networkd.service"])
+            .status()?
+            .success(),
+        "Не остановлен DHCP-клиент стенда",
+    )?;
+    require(
+        nft.recover_public_policy(&mut journal).await?
+            == PublicPolicyRecovery::DesiredRules { revision },
+        "Сверка правила не прошла после выхода DHCP-клиента",
+    )?;
+    require(
+        nft.unlock_durable_public_policy(&mut journal, 1)
+            .await?
+            .is_some(),
+        "Unlock не снял правило DHCP",
+    )?;
+    require(
+        resolver_file_state()? == before,
+        "Изменился /etc/resolv.conf",
+    )?;
+    eprintln!("Нормальная сверка правил приняла точную cgroup и отклонила изменение уровня");
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная VM с DHCP-клиентом systemd-networkd и двумя ответами DNS"]
 async fn dhcp_networkd_lease_is_bound_to_kernel_socket_and_revoked_after_renewal() -> Result {
     use yonik_linux::{NetworkReadError, helper::dhcp_networkd::DhcpNetworkdLease};

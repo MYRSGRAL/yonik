@@ -30,6 +30,7 @@ fn check(value: &Value, table: &Table, policy: &PublicBlockPolicy) -> Result<(),
             Err(NftError::Evidence)
         }
     })
+    .map(|_| ())
 }
 
 #[test]
@@ -85,6 +86,28 @@ fn dhcp_anchor_is_inert_and_rejects_unexpected_kernel_contents() {
     );
     wire["tun_ifindex"] = Value::Null;
     assert!(serde_json::from_value::<PublicBlockPolicy>(wire).is_err());
+}
+
+#[test]
+fn dhcp_rule_keeps_cgroup_inode_in_durable_identity() {
+    let mut policy = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![])
+            .expect("Активная политика"),
+    )
+    .expect("Запись политики");
+    policy["dhcp_renewal_anchor"] = json!(true);
+    policy["dhcp_renewal_rule"] = json!({
+        "ifindex": 7, "ifname": "test-dhcp", "address": "192.0.2.10", "server": "192.0.2.1",
+        "uid": 999, "cgroup_id": 2500, "dscp": 32, "mark": 0,
+        "namespace_device":3,"namespace_inode":11
+    });
+    let first = serde_json::from_value::<PublicBlockPolicy>(policy.clone()).expect("Политика DHCP");
+    policy["dhcp_renewal_rule"]["cgroup_id"] = json!(2501);
+    let second =
+        serde_json::from_value::<PublicBlockPolicy>(policy.clone()).expect("Другая cgroup");
+    assert_ne!(first.digest(), second.digest());
+    policy["dhcp_renewal_rule"]["ifname"] = json!("bad*");
+    assert!(serde_json::from_value::<PublicBlockPolicy>(policy).is_err());
 }
 
 #[test]
