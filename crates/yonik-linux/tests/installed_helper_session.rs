@@ -1168,7 +1168,8 @@ async fn installed_fake_dns_after_network_change_in_vm(
             tokio::time::timeout(Duration::from_secs(10), drain.drained()).await?,
             "Сетевой наблюдатель не остановил worker",
         )?;
-        let state = state_after_route_events(&connection).await?;
+        let state =
+            state_after_route_events_with_timeout(&connection, Duration::from_secs(10)).await?;
         require(
             if kill_switch {
                 matches!(
@@ -2668,7 +2669,8 @@ async fn start_fake_dns_in_vm(
     let mut client =
         SystemClient::on_connection(connection.clone(), deadline, token.clone()).await?;
     let domains = ["example.test".to_owned()];
-    let retry_until = tokio::time::Instant::now() + Duration::from_secs(3);
+    let busy_window = Duration::from_secs(3);
+    let mut retry_until = deadline.min(tokio::time::Instant::now() + busy_window);
     let mut retried_stale = false;
     let prepared = loop {
         let result = if let Some(policy) = policy {
@@ -2701,6 +2703,7 @@ async fn start_fake_dns_in_vm(
             Err(ClientError::Busy) if now < retry_until => retry_until,
             Err(ClientError::Stale) if policy.is_some() && !retried_stale && now < deadline => {
                 retried_stale = true;
+                retry_until = deadline.min(now + busy_window);
                 eprintln!("{engine:?} Fake DNS: повтор Prepare после изменения сети");
                 deadline
             }
@@ -2862,9 +2865,19 @@ fn connected_direct_fixture() -> Result<[std::net::SocketAddr; 2]> {
 
 #[cfg(feature = "test-support")]
 async fn state_after_route_events(connection: &zbus::Connection) -> Result<Value> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    state_after_route_events_with_timeout(connection, Duration::from_secs(3)).await
+}
+
+#[cfg(feature = "test-support")]
+async fn state_after_route_events_with_timeout(
+    connection: &zbus::Connection,
+    timeout: Duration,
+) -> Result<Value> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let result = call(connection, "State", json!({"version":1})).await;
+        let result =
+            tokio::time::timeout_at(deadline, call(connection, "State", json!({"version":1})))
+                .await?;
         if !matches!(
             result.as_ref().err().and_then(|error| error.downcast_ref::<zbus::Error>()),
             Some(zbus::Error::MethodError(_, Some(body), _))
@@ -2873,7 +2886,10 @@ async fn state_after_route_events(connection: &zbus::Connection) -> Result<Value
         {
             return result;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(50)),
+        )
+        .await;
     }
 }
 

@@ -171,7 +171,8 @@ impl SystemSession {
         // После Unlock собственные сетевые события могут ещё обрабатываться.
         // Prepare не выдаёт дескриптор при Busy или Stale. После Stale один
         // раз запрашиваем новый снимок сети в пределах общего дедлайна.
-        let retry_until = deadline.min(Instant::now() + std::time::Duration::from_secs(3));
+        let busy_window = std::time::Duration::from_secs(3);
+        let mut retry_until = deadline.min(Instant::now() + busy_window);
         let mut retried_stale = false;
         let prepared = loop {
             let result = self
@@ -191,6 +192,7 @@ impl SystemSession {
                 Err(ClientError::Busy) if now < retry_until => retry_until,
                 Err(ClientError::Stale) if !retried_stale && now < deadline => {
                     retried_stale = true;
+                    retry_until = deadline.min(now + busy_window);
                     deadline
                 }
                 _ => break result?,
