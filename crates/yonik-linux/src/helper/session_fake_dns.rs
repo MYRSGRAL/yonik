@@ -266,6 +266,7 @@ type ResolverPeer = (SocketAddr, TransportProtocol, Option<u32>);
 struct ResolverBinding {
     scope_link: Option<u32>,
     route_link: Option<u32>,
+    split_only: bool,
 }
 
 impl ResolverBinding {
@@ -276,7 +277,16 @@ impl ResolverBinding {
                 Resolve1Scope::Link(index) => Some(index),
             },
             route_link: socket.route_link,
+            split_only: !socket.default_route,
         }
+    }
+
+    fn permits_synthetic(self, source: &ResolverSource, name: &str) -> bool {
+        // Встроенная проверка по зарезервированному имени подтверждает путь
+        // релея, даже когда uplink-файл не публикует его DNS-адрес.
+        !self.split_only
+            || !matches!(source, ResolverSource::ResolvedUplink)
+            || name == SYSTEM_FAKE_DNS_PROBE_NAME
     }
 }
 
@@ -860,18 +870,25 @@ impl PreparedFakeDns {
             let approved = |query: &FakeDnsQuestion| {
                 task_horizon.can_issue() && for_task.approves(query.name().as_str())
             };
-            let synthesize = |packet: &[u8], link| {
+            let synthesize = |packet: &[u8], binding: ResolverBinding| {
                 let name = forward_query_name(packet)?;
                 if !for_task.approves(&name) {
                     if for_task.resolved.as_ref().is_some_and(|snapshot| {
                         // В fallback-only ни один внешний link не имеет DNS.
                         // Его домены не участвуют в выборе области у resolved.
                         !snapshot.fallback_only
-                            && !permits_resolver_name(&snapshot.config.domains, &name, link)
+                            && !permits_resolver_name(
+                                &snapshot.config.domains,
+                                &name,
+                                binding.scope_link,
+                            )
                     }) {
                         return Err(ResolverError::Untrusted);
                     }
                     return Ok(None);
+                }
+                if !binding.permits_synthetic(&for_task.source, &name) {
+                    return Err(ResolverError::Untrusted);
                 }
                 // DNSSEC или неподдержанный тип для synthetic suffix никогда
                 // не пересылается установленному реальному резолверу.
@@ -893,10 +910,7 @@ impl PreparedFakeDns {
                     async move {
                         entry
                             .relay
-                            .serve(
-                                &|packet| synthesize(packet, entry.binding.scope_link),
-                                cancel,
-                            )
+                            .serve(&|packet| synthesize(packet, entry.binding), cancel)
                             .await
                     }
                 })
@@ -1114,5 +1128,18 @@ mod tests {
         assert!(!permits_resolver_name(&domains, "more.real.test", Some(2)));
         assert!(permits_resolver_name(&domains, "more.real.test", Some(3)));
         assert!(permits_resolver_name(&domains, "notreal.test", None));
+    }
+
+    #[test]
+    fn неопубликованный_uplink_dns_не_выдаёт_fake_ip_для_сайта() {
+        let uplink = ResolverSource::ResolvedUplink;
+        let split = ResolverBinding {
+            scope_link: Some(2),
+            route_link: Some(2),
+            split_only: true,
+        };
+        assert!(!split.permits_synthetic(&uplink, "example.test"));
+        assert!(split.permits_synthetic(&uplink, SYSTEM_FAKE_DNS_PROBE_NAME));
+        assert!(ResolverBinding::default().permits_synthetic(&uplink, "example.test"));
     }
 }
