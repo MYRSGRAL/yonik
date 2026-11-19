@@ -8,6 +8,7 @@ pub(crate) use equivalence::{
     same_captured_kernel_route, same_captured_topology, same_external_topology,
 };
 mod lookup;
+mod nft_cgroup;
 pub(crate) use equivalence::RouteCapture;
 pub(crate) use lookup::lookup_route_captured;
 mod read;
@@ -18,6 +19,7 @@ mod wireguard_transport;
 pub use lookup::{
     KernelRoute, LookupIncomplete, RouteKind, RouteQuery, TransportProtocol, lookup_route,
 };
+pub use nft_cgroup::{NftSocketCgroupMatch, read_nft_socket_cgroup_matches};
 pub use read::{NetworkAttribute, NetworkNamespace, NetworkReadError};
 pub use topology::{
     IpPrefix, LinuxAddress, LinuxLink, LinuxNexthop, LinuxRoute, LinuxRule, LinuxTopology,

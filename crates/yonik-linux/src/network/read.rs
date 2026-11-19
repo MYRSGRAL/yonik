@@ -76,6 +76,14 @@ pub(super) enum ReadOperation {
     RouteGet,
     WireGuardFamily,
     WireGuardDevice(u16),
+    NftRules,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetlinkProtocol {
+    Route,
+    Generic,
+    Netfilter,
 }
 
 impl ReadOperation {
@@ -88,20 +96,25 @@ impl ReadOperation {
             Self::Nexthops => 106,
             Self::WireGuardFamily => 16, // GENL_ID_CTRL.
             Self::WireGuardDevice(family) => family,
+            Self::NftRules => (10 << 8) | 7, // NFNL_SUBSYS_NFTABLES, NFT_MSG_GETRULE.
         }
     }
     fn dump(self) -> bool {
         !matches!(self, Self::RouteGet | Self::WireGuardFamily)
     }
     fn response_kind(self) -> u16 {
-        if self.generic() {
-            self.kind()
-        } else {
-            self.kind() - 2
+        match self.protocol() {
+            NetlinkProtocol::Route => self.kind() - 2,
+            NetlinkProtocol::Generic => self.kind(),
+            NetlinkProtocol::Netfilter => self.kind() - 1, // NFT_MSG_NEWRULE.
         }
     }
-    fn generic(self) -> bool {
-        matches!(self, Self::WireGuardFamily | Self::WireGuardDevice(_))
+    fn protocol(self) -> NetlinkProtocol {
+        match self {
+            Self::WireGuardFamily | Self::WireGuardDevice(_) => NetlinkProtocol::Generic,
+            Self::NftRules => NetlinkProtocol::Netfilter,
+            _ => NetlinkProtocol::Route,
+        }
     }
 }
 
@@ -204,7 +217,7 @@ impl<T> Exchange<T> {
                 return Err(NetworkReadError::Interrupted);
             }
             if groups != 0
-                || (!self.operation.generic()
+                || (self.operation.protocol() == NetlinkProtocol::Route
                     && sequence == 0
                     && matches!(
                         kind,
@@ -286,17 +299,20 @@ pub(super) struct NetlinkReader {
     namespace: NetworkNamespace,
     port: u32,
     sequence: u32,
-    generic: bool,
+    protocol: NetlinkProtocol,
     budget: Budget,
 }
 impl NetlinkReader {
     pub fn open() -> Result<Self, NetworkReadError> {
-        Self::open_socket(false)
+        Self::open_socket(NetlinkProtocol::Route)
     }
     pub fn open_generic() -> Result<Self, NetworkReadError> {
-        Self::open_socket(true)
+        Self::open_socket(NetlinkProtocol::Generic)
     }
-    fn open_socket(generic: bool) -> Result<Self, NetworkReadError> {
+    pub fn open_netfilter() -> Result<Self, NetworkReadError> {
+        Self::open_socket(NetlinkProtocol::Netfilter)
+    }
+    fn open_socket(protocol: NetlinkProtocol) -> Result<Self, NetworkReadError> {
         tokio::runtime::Handle::try_current().map_err(|_| NetworkReadError::Unavailable)?;
         // Нет await между идентификацией namespace и созданием его socket.
         let ns = std::fs::metadata("/proc/thread-self/ns/net")
@@ -305,10 +321,18 @@ impl NetlinkReader {
             AddressFamily::NETLINK,
             SocketType::RAW,
             SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-            generic.then_some(net::netlink::GENERIC),
+            match protocol {
+                NetlinkProtocol::Route => None,
+                NetlinkProtocol::Generic => Some(net::netlink::GENERIC),
+                NetlinkProtocol::Netfilter => Some(net::netlink::NETFILTER),
+            },
         )
         .map_err(io_error)?;
-        let groups = if generic { 0 } else { super::route::GROUPS };
+        let groups = if protocol == NetlinkProtocol::Route {
+            super::route::GROUPS
+        } else {
+            0
+        };
         net::bind(&socket, &SocketAddrNetlink::new(0, groups)).map_err(io_error)?;
         let address = net::getsockname(&socket).map_err(io_error)?;
         let port = SocketAddrNetlink::try_from(address)
@@ -327,7 +351,7 @@ impl NetlinkReader {
             },
             port,
             sequence: u32::from_ne_bytes(sequence).max(1),
-            generic,
+            protocol,
             budget: Budget::default(),
         })
     }
@@ -356,7 +380,7 @@ impl NetlinkReader {
         cancel: &mut Cancellation,
         deadline: Instant,
     ) -> Result<Vec<Message>, NetworkReadError> {
-        if operation.generic() {
+        if operation.protocol() == NetlinkProtocol::Generic {
             return Err(NetworkReadError::Unsupported);
         }
         self.request_decoded(operation, payload, cancel, deadline, copy_message)
@@ -370,7 +394,7 @@ impl NetlinkReader {
         deadline: Instant,
         decode: fn(&[u8]) -> Result<T, NetworkReadError>,
     ) -> Result<Vec<T>, NetworkReadError> {
-        if operation.generic() != self.generic {
+        if operation.protocol() != self.protocol {
             return Err(NetworkReadError::Unsupported);
         }
         cancel.check().map_err(|_| NetworkReadError::Cancelled)?;

@@ -534,6 +534,34 @@ async fn production_helper_fake_dns_after_dhcp_reconnect() -> Result {
 }
 
 #[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная VM с правилом DHCP cgroupv2 в таблице стенда"]
+async fn dhcp_cgroup_socket_rule_has_exact_kernel_identity() -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    let group = fs::metadata("/sys/fs/cgroup/system.slice/systemd-networkd.service")?;
+    let namespace = fs::metadata("/proc/thread-self/ns/net")?;
+    let (_owner, mut cancel) = yonik_linux::Cancellation::new();
+    let (observed, matches) = yonik_linux::read_nft_socket_cgroup_matches(
+        "yonik_dhcp_gate",
+        "output",
+        &mut cancel,
+        Duration::from_secs(3),
+    )
+    .await?;
+    require(
+        observed.device == namespace.dev() && observed.inode == namespace.ino(),
+        "Правило прочитано в другом сетевом пространстве имён",
+    )?;
+    require(
+        matches.len() == 1 && matches[0].level == 2 && matches[0].cgroup_id.get() == group.ino(),
+        "Ядро вернуло другой уровень или inode cgroup",
+    )?;
+    eprintln!("Правило DHCP совпало с cgroup сокета по данным ядра");
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FakeDnsNetworkChange {
     PeerRoute,
