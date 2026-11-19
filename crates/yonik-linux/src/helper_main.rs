@@ -5,8 +5,9 @@ fn main() -> ExitCode {
     use yonik_linux::{
         Cancellation,
         helper::{
-            SystemSessionHost, fence::verify_worker_fence, launch_standalone_worker,
-            run_system_service, standalone_worker_argument,
+            SystemSessionHost, fence::verify_worker_fence, launch_standalone_sandbox,
+            launch_standalone_worker, run_system_service, standalone_sandbox_argument,
+            standalone_worker_argument,
         },
         worker::WorkerMode,
     };
@@ -24,11 +25,20 @@ fn main() -> ExitCode {
             } else {
                 ExitCode::FAILURE
             };
-        } else if let Some(mode) = [WorkerMode::Check, WorkerMode::Run]
-            .into_iter()
-            .find(|&mode| argument == standalone_worker_argument(mode))
+        } else if let Some(result) =
+            [WorkerMode::Check, WorkerMode::Run]
+                .into_iter()
+                .find_map(|mode| {
+                    if argument == standalone_worker_argument(mode) {
+                        Some(launch_standalone_worker(mode))
+                    } else if argument == standalone_sandbox_argument(mode) {
+                        Some(launch_standalone_sandbox(mode))
+                    } else {
+                        None
+                    }
+                })
         {
-            return match launch_standalone_worker(mode) {
+            return match result {
                 Ok(never) => match never {},
                 Err(error) => {
                     eprintln!("{error}");

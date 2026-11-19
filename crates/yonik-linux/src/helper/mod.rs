@@ -18,10 +18,14 @@ mod session_fake_dns;
 mod session_network;
 mod session_supervisor;
 mod standalone_launcher;
+mod standalone_mounts;
 #[cfg(feature = "test-support")]
 mod standalone_supervisor;
 pub use session_network::SessionNetworkPlan;
-pub use standalone_launcher::{launch_standalone_worker, standalone_worker_argument};
+pub use standalone_launcher::{
+    launch_standalone_sandbox, launch_standalone_worker, standalone_sandbox_argument,
+    standalone_worker_argument,
+};
 pub(crate) mod run_authorization;
 pub(crate) mod systemd_network_service;
 mod systemd_worker;

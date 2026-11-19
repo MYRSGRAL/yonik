@@ -6,7 +6,7 @@ use crate::helper::{
     standalone_launcher::{
         CONTROLLER_PID, STANDALONE_PARENT, STANDALONE_RUNTIME, WORKER_IMAGE, group, socket_name,
     },
-    standalone_worker_argument,
+    standalone_sandbox_argument, standalone_worker_argument,
     worker_identity::{WorkerCredentials, WorkerProcess},
 };
 use crate::worker::WorkerAck;
@@ -18,7 +18,7 @@ use std::{
     os::{
         fd::OwnedFd,
         unix::{
-            fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+            fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
             net::{UnixListener, UnixStream},
         },
     },
@@ -77,6 +77,12 @@ impl Fixture {
                 .stdin(Stdio::from(OwnedFd::from(listener.try_clone().unwrap()))),
         );
         listener.set_nonblocking(false).unwrap();
+        require_denied(
+            Command::new(HELPER_IMAGE)
+                .arg(standalone_sandbox_argument(mode))
+                .env(CONTROLLER_PID, &controller)
+                .stdin(Stdio::from(OwnedFd::from(listener.try_clone().unwrap()))),
+        );
         require_denied(
             Command::new("/bin/sh")
                 .args([
@@ -199,6 +205,56 @@ fn inode(path: impl AsRef<Path>) -> io::Result<(u64, u64)> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
+fn verify_filesystem(pid: u32, mode: WorkerMode) {
+    let process = PathBuf::from(format!("/proc/{pid}"));
+    assert_ne!(
+        inode(process.join("ns/mnt")).unwrap(),
+        inode("/proc/self/ns/mnt").unwrap(),
+        "worker должен иметь отдельный mount namespace"
+    );
+    let root = process.join("root");
+    let mounts = fs::read_to_string(process.join("mountinfo")).unwrap();
+    for path in ["/", "/proc", "/sys", "/sys/fs/cgroup"] {
+        assert!(
+            mounts.lines().any(|line| {
+                let mut fields = line.split_ascii_whitespace().skip(4);
+                fields.next() == Some(path)
+                    && fields.next().is_some_and(|options| {
+                        ["ro", "nodev", "nosuid"]
+                            .into_iter()
+                            .all(|flag| options.split(',').any(|value| value == flag))
+                    })
+            }),
+            "{path} должен быть доступен только для чтения с nodev,nosuid"
+        );
+    }
+    for path in ["home", "root", "tmp", "var/tmp"] {
+        assert!(
+            fs::read_dir(root.join(path)).unwrap().next().is_none(),
+            "{path}"
+        );
+    }
+    for path in ["dev/null", "dev/urandom"] {
+        assert!(
+            fs::metadata(root.join(path))
+                .unwrap()
+                .file_type()
+                .is_char_device(),
+            "{path}"
+        );
+    }
+    assert!(!root.join("dev/tty").exists());
+    let tun = fs::metadata(root.join("dev/net/tun"));
+    match mode {
+        WorkerMode::Check => assert_eq!(tun.unwrap_err().kind(), io::ErrorKind::NotFound),
+        WorkerMode::Run => {
+            let tun = tun.unwrap();
+            assert!(tun.file_type().is_char_device());
+            assert_eq!(tun.rdev(), rustix::fs::makedev(10, 200));
+        }
+    }
+}
+
 fn field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     text.lines()
         .find_map(|line| line.strip_prefix(name))
@@ -273,6 +329,7 @@ fn installed_standalone_check_on_both_engines() {
         let mut fixture = Fixture::start(WorkerMode::Check);
         let process = fixture.await_image(image);
         fixture.verify(&process, image, credentials).unwrap();
+        verify_filesystem(process.pid, WorkerMode::Check);
         assert_eq!(
             fixture
                 .verify(&process, wrong_image, credentials)
@@ -398,6 +455,7 @@ fn installed_standalone_run_passes_tcp_through_tun_on_both_engines() {
         let mut fixture = Fixture::start(WorkerMode::Run);
         let process = fixture.await_image(image);
         fixture.verify(&process, image, credentials).unwrap();
+        verify_filesystem(process.pid, WorkerMode::Run);
         assert_eq!(
             verify_worker(
                 WorkerMode::Check,

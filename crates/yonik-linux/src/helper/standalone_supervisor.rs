@@ -3,8 +3,8 @@
 use super::{
     WorkerLiveness, WorkerSupervisorError as Error, WorkerTicket,
     standalone_launcher::{
-        CONTROLLER_PID, STANDALONE_PARENT, STANDALONE_RUNTIME, WORKER_IMAGE, group, socket_name,
-        verify_executable,
+        CONTROLLER_PID, HELPER_IMAGE, STANDALONE_PARENT, STANDALONE_RUNTIME, WORKER_IMAGE, group,
+        socket_name, verify_executable,
     },
     standalone_worker_argument,
     systemd_worker::{installed_worker_credentials, wait_owned},
@@ -41,7 +41,6 @@ use tokio::{
 };
 
 type Result<T> = std::result::Result<T, Error>;
-const HELPER: &str = "/usr/lib/yonik/yonik-helper";
 const LIMIT: Duration = Duration::from_secs(15);
 const ROLES: [WorkerMode; 2] = [WorkerMode::Check, WorkerMode::Run];
 
@@ -164,7 +163,8 @@ impl StandaloneSupervisor {
         }
         self.verify_runtime()?;
         let credentials = installed_worker_credentials()?;
-        let namespace = inode("/proc/self/ns/net")?;
+        let controller_netns = inode("/proc/self/ns/net")?;
+        let controller_mountns = inode("/proc/self/ns/mnt")?;
         let image = inode(WORKER_IMAGE)?;
         let mut invocation = [0; 16];
         getrandom::getrandom(&mut invocation).map_err(unavailable)?;
@@ -172,7 +172,7 @@ impl StandaloneSupervisor {
         self.clean = false;
         let listener = UnixListener::bind(&socket).map_err(unavailable)?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).map_err(unavailable)?;
-        let child = Command::new(HELPER)
+        let child = Command::new(HELPER_IMAGE)
             .arg(standalone_worker_argument(mode))
             .env_clear()
             .env(CONTROLLER_PID, std::process::id().to_string())
@@ -197,7 +197,7 @@ impl StandaloneSupervisor {
         loop {
             self.verify_runtime()?;
             if inode(&format!("/proc/{pid}/exe")).ok() == Some(image) {
-                verify_setup(pid, mode, namespace)?;
+                verify_setup(pid, mode, controller_netns, controller_mountns)?;
                 break;
             }
             if self
@@ -375,7 +375,12 @@ fn inode(path: &str) -> Result<(u64, u64)> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
-fn verify_setup(pid: u32, mode: WorkerMode, controller_netns: (u64, u64)) -> Result<()> {
+fn verify_setup(
+    pid: u32,
+    mode: WorkerMode,
+    controller_netns: (u64, u64),
+    controller_mountns: (u64, u64),
+) -> Result<()> {
     let process = format!("/proc/{pid}");
     let info = fs::read_to_string(format!("{process}/status")).map_err(unavailable)?;
     let field = |key: &str| {
@@ -393,6 +398,7 @@ fn verify_setup(pid: u32, mode: WorkerMode, controller_netns: (u64, u64)) -> Res
                 field(key).and_then(|value| u64::from_str_radix(value, 16).ok()) != Some(allowed)
             })
         || (inode(&format!("{process}/ns/net"))? == controller_netns) == check
+        || inode(&format!("{process}/ns/mnt"))? == controller_mountns
     {
         return Err(Error::Untrusted);
     }
