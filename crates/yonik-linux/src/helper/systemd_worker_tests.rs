@@ -1218,6 +1218,35 @@ pub(super) fn binding_test_payload() -> Arc<WorkerPayload> {
 }
 
 #[test]
+fn ordinary_check_cannot_ack_after_its_supervisor_deadline() {
+    use std::io::{Read, Write};
+
+    let payload = binding_test_payload();
+    let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let receiver = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        server.read_to_end(&mut bytes).unwrap();
+        if !bytes.is_empty() {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = server.write_all(b"YNKA\x00\x00\x00\x2a\x01");
+        }
+    });
+    let result = send_ordinary_payload(
+        &payload,
+        &client,
+        WorkerMode::Check,
+        None,
+        Instant::now() + Duration::from_millis(50),
+    );
+    drop(client);
+    receiver.join().unwrap();
+    assert_eq!(result, Err(WorkerSupervisorError::Protocol));
+}
+
+#[test]
 fn actual_payload_transfer_rejects_late_ack_after_revocation() {
     use std::io::{Read, Write};
     let payload = binding_test_payload();

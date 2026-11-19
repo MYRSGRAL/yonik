@@ -1312,9 +1312,7 @@ impl SystemWorkerSupervisor {
                 let (ticket, process, credentials) =
                     ordinary.ok_or(WorkerSupervisorError::Protocol)?;
                 let ack = process.transfer(credentials, mode.cgroup(), || {
-                    payload
-                        .send_output(&stream, mode, output)
-                        .map_err(|_| WorkerSupervisorError::Protocol)
+                    send_ordinary_payload(&payload, &stream, mode, output, deadline)
                 })?;
                 Ok((ack, ticket, None))
             }
@@ -1908,6 +1906,27 @@ fn validate_socket(p: &Properties, mode: WorkerMode) -> Result<()> {
     }
     Ok(())
 }
+fn send_ordinary_payload(
+    payload: &WorkerPayload,
+    stream: &std::os::unix::net::UnixStream,
+    mode: WorkerMode,
+    output: Option<crate::output_transport::ValidatedWriters>,
+    deadline: Instant,
+) -> Result<WorkerAck> {
+    // ACK проверки отправляется только после проверки конфигурации ядра.
+    // Для неё используем остаток общего срока Check, включая старт сервиса.
+    let ack = match mode {
+        WorkerMode::Check => payload.send_output_before(stream, mode, output, deadline.into_std()),
+        WorkerMode::Run => payload.send_output(stream, mode, output),
+    }
+    .map_err(|_| WorkerSupervisorError::Protocol)?;
+    // Относительный тайм-аут сокета может округлить остаток срока вверх.
+    if mode == WorkerMode::Check && Instant::now() >= deadline {
+        return Err(WorkerSupervisorError::Timeout);
+    }
+    Ok(ack)
+}
+
 async fn bounded<T>(
     cancel: &mut Cancellation,
     deadline: Instant,
