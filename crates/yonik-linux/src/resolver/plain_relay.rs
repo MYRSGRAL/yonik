@@ -33,8 +33,12 @@ pub(crate) struct PlainDnsRelay {
 }
 
 impl PlainDnsRelay {
-    pub async fn bind(address: Ipv4Addr, peer: IpAddr, mark: NonZeroU32) -> io::Result<Self> {
-        if !address.is_loopback() || peer.is_loopback() || peer.is_unspecified() {
+    pub async fn bind(address: Ipv4Addr, peer: SocketAddr, mark: NonZeroU32) -> io::Result<Self> {
+        if !address.is_loopback()
+            || peer.ip().is_loopback()
+            || peer.ip().is_unspecified()
+            || peer.port() == 0
+        {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let tcp = TcpListener::bind(SocketAddrV4::new(address, 0)).await?;
@@ -42,7 +46,7 @@ impl PlainDnsRelay {
         Ok(Self {
             tcp,
             udp,
-            peer: SocketAddr::new(peer, 53),
+            peer,
             mark,
         })
     }

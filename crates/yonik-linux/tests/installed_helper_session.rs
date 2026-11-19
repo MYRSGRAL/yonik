@@ -2074,6 +2074,10 @@ async fn installed_fake_dns(
     }
     let fallback_dns = std::env::var("YONIK_CHECK_FALLBACK_DNS");
     let fallback_search = std::env::var_os("YONIK_CHECK_FALLBACK_SEARCH").is_some();
+    let plain_dns_peer = std::env::var("YONIK_CHECK_PLAIN_DNS_PEER")
+        .ok()
+        .map(|peer| peer.parse::<std::net::SocketAddr>())
+        .transpose()?;
     let fallback_engine = match fallback_dns.as_deref() {
         Ok("xray") => Some(Engine::Xray),
         Ok("sing-box") => Some(Engine::SingBox),
@@ -2133,6 +2137,23 @@ async fn installed_fake_dns(
             v4.is_ipv4() && v6.is_ipv6(),
             "NSS вернул неверные семейства",
         )?;
+        if let Some(peer) = plain_dns_peer {
+            for tcp in [false, true] {
+                require(
+                    ask_fixture_dns(peer, "real.test", 1, tcp).await?
+                        == "192.0.2.99".parse::<std::net::IpAddr>()?,
+                    "Реальный DNS не ответил на настроенном порту",
+                )?;
+                require(
+                    ask_fixture_dns(peer, "example.test", 1, tcp).await? == v4,
+                    "Синтетический DNS не ответил на настроенном порту",
+                )?;
+            }
+            eprintln!(
+                "{engine:?}: реальный DNS и Fake DNS подтверждены по TCP и UDP на порту {}",
+                peer.port()
+            );
+        }
         check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
         if let Some(witness) = &policy_witness {
             for database in ["ahostsv4", "ahostsv6"] {

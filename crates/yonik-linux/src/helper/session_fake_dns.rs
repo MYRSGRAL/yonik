@@ -17,16 +17,15 @@ use crate::{
         plain_relay::{PlainDnsRelay, TCP_IDLE},
         plain_resolver_path,
         resolve1::{
-            Resolve1Domain, Resolve1Prepared, Resolve1Scope, Resolve1Snapshot, Resolve1TunSnapshot,
-            apply_link_dns, prepare_fallback_link_dns, prepare_link_dns,
-            read_resolve1_tun_snapshot,
+            Resolve1Domain, Resolve1Prepared, Resolve1Scope, Resolve1TunSnapshot, apply_link_dns,
+            prepare_fallback_link_dns, prepare_link_dns, read_resolve1_tun_snapshot,
         },
     },
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
     num::{NonZeroU16, NonZeroU32},
     path::Path,
     sync::{Arc, Mutex},
@@ -47,6 +46,7 @@ use yonik_engine::{
 
 pub(super) use crate::managed_network::FAKE_POOLS as POOLS;
 const LIMIT: Duration = Duration::from_secs(3);
+const DNS_PORT: u16 = 53;
 const DNS_PROBE_RETRY: Duration = Duration::from_millis(200);
 pub(super) const HOLD_MS: u32 = 90_000;
 const REFRESH_BEFORE: Duration = Duration::from_secs(60);
@@ -241,7 +241,13 @@ pub(super) struct PreparedFakeDns {
     listeners: Mutex<Option<FakeDnsBridgeListeners>>,
     source: ResolverSource,
     resolved: Option<Arc<Resolve1TunSnapshot>>,
-    plain: Vec<(PlainDnsRelay, Option<u32>)>,
+    plain: Vec<(PlainDnsRelay, ResolverBinding)>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct ResolverBinding {
+    scope_link: Option<u32>,
+    route_link: Option<u32>,
 }
 
 pub(super) fn usable_resolver_link(topology: &LinuxTopology, index: u32) -> bool {
@@ -257,42 +263,50 @@ pub(super) fn usable_resolver_link(topology: &LinuxTopology, index: u32) -> bool
 }
 
 fn resolved_peers(
-    snapshot: &Resolve1Snapshot,
+    snapshot: &Resolve1TunSnapshot,
     topology: &LinuxTopology,
-) -> Vec<(IpAddr, Option<u32>)> {
+) -> Vec<(SocketAddr, ResolverBinding)> {
     let mut scopes = BTreeMap::<_, BTreeSet<_>>::new();
-    for endpoint in &snapshot.endpoints {
-        let index = match endpoint.scope {
+    for (endpoint, &route_link) in snapshot.config.endpoints.iter().zip(&snapshot.route_links) {
+        let scope_link = match endpoint.scope {
             Resolve1Scope::Global => None,
             Resolve1Scope::Link(index) => Some(index),
         };
-        scopes.entry(endpoint.address).or_default().insert(index);
+        scopes
+            .entry(SocketAddr::new(endpoint.address, endpoint.port))
+            .or_default()
+            .insert(ResolverBinding {
+                scope_link,
+                route_link,
+            });
     }
     scopes
         .into_iter()
-        .filter_map(|(address, scopes)| {
-            let scope = *scopes.first()?;
+        .filter_map(|(peer, scopes)| {
+            let binding = *scopes.first()?;
+            let address = peer.ip();
             (scopes.len() == 1
                 && !address.is_loopback()
                 && !address.is_unspecified()
                 && !address.is_multicast()
                 && !matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local())
-                && scope.is_none_or(|index| usable_resolver_link(topology, index)))
-            .then_some((address, scope))
+                && binding
+                    .route_link
+                    .is_none_or(|index| usable_resolver_link(topology, index)))
+            .then_some((peer, binding))
         })
         .collect()
 }
 
 async fn fallback_peer_reachable(
-    address: IpAddr,
+    peer: SocketAddr,
     mark: u32,
     cancel: &mut Cancellation,
 ) -> Result<bool, ServiceError> {
     for protocol in [TransportProtocol::Tcp, TransportProtocol::Udp] {
-        let query =
-            RouteQuery::new(address, 0)
-                .with_mark(mark)
-                .with_transport(protocol, None, Some(53));
+        let query = RouteQuery::new(peer.ip(), 0)
+            .with_mark(mark)
+            .with_transport(protocol, None, Some(peer.port()));
         match reread_changed_route(query, cancel, LIMIT).await {
             Ok(_) => {}
             Err(NetworkReadError::Kernel(errno))
@@ -398,12 +412,28 @@ impl PreparedFakeDns {
             (ResolverSource::Literal(snapshot, _), _) => snapshot
                 .nameservers()
                 .iter()
-                .map(|&address| (address, None))
+                .map(|&address| {
+                    (
+                        SocketAddr::new(address, DNS_PORT),
+                        ResolverBinding::default(),
+                    )
+                })
                 .collect(),
-            (_, Some(snapshot)) => resolved_peers(&snapshot.config, topology),
+            (_, Some(snapshot)) => resolved_peers(snapshot, topology),
             _ => return Err(ServiceError::Unavailable),
         };
         if upstreams.len() > SystemFakeDnsBridge::MAX_PLAIN_DNS_PEERS {
+            return Err(ServiceError::Unsupported);
+        }
+        if resolved.as_ref().is_some_and(|snapshot| {
+            snapshot.config.endpoints.iter().any(|endpoint| {
+                endpoint.port != DNS_PORT
+                    && !upstreams.iter().any(|(peer, _)| {
+                        peer.ip() == endpoint.address && peer.port() == endpoint.port
+                    })
+            })
+        }) {
+            // Обычная блокировка DNS на порту 53 не защищает такой сервер.
             return Err(ServiceError::Unsupported);
         }
         if let Some(snapshot) = resolved.as_ref().filter(|snapshot| snapshot.fallback_only) {
@@ -415,8 +445,9 @@ impl PreparedFakeDns {
             // по-прежнему закрывают Prepare. Отбор пропускает только адреса,
             // для которых ядро подтвердило недостижимость сети.
             for endpoint in &snapshot.config.endpoints {
-                if fallback_peer_reachable(endpoint.address, plan.socket_mark(), cancel).await? {
-                    upstreams.push((endpoint.address, None));
+                let peer = SocketAddr::new(endpoint.address, endpoint.port);
+                if fallback_peer_reachable(peer, plan.socket_mark(), cancel).await? {
+                    upstreams.push((peer, ResolverBinding::default()));
                 }
             }
             if upstreams.is_empty() {
@@ -426,15 +457,15 @@ impl PreparedFakeDns {
         let mark = NonZeroU32::new(plan.socket_mark()).ok_or(ServiceError::Unavailable)?;
         let mut plain = Vec::with_capacity(upstreams.len());
         let mut peers = Vec::with_capacity(upstreams.len());
-        for (peer, link) in upstreams {
+        for (peer, binding) in upstreams {
             let relay = PlainDnsRelay::bind(loopback, peer, mark)
                 .await
                 .map_err(|_| ServiceError::Unavailable)?;
             peers.push((peer, relay.port().map_err(|_| ServiceError::Unavailable)?));
-            plain.push((relay, link));
+            plain.push((relay, binding));
         }
         config = config
-            .with_plain_dns_peers(peers)
+            .with_plain_dns_endpoints(peers)
             .map_err(|_| ServiceError::Unsupported)?;
         drop(temporary);
         Ok(Self {
@@ -460,8 +491,10 @@ impl PreparedFakeDns {
             })
     }
 
-    pub fn plain_peers(&self) -> impl Iterator<Item = (std::net::SocketAddr, Option<u32>)> + '_ {
-        self.plain.iter().map(|(relay, link)| (relay.peer(), *link))
+    pub fn plain_peers(&self) -> impl Iterator<Item = (SocketAddr, Option<u32>)> + '_ {
+        self.plain
+            .iter()
+            .map(|(relay, binding)| (relay.peer(), binding.route_link))
     }
 
     pub fn uses_resolve1(&self) -> bool {
@@ -495,10 +528,7 @@ impl PreparedFakeDns {
             Some(snapshot) if snapshot.fallback_only => {
                 // Сохраняем порядок резервных серверов из resolved. Каждый адрес
                 // уже имеет отдельный релей и проверенный физический маршрут.
-                let servers = self
-                    .plain_peers()
-                    .map(|(peer, _)| peer.ip())
-                    .collect::<Vec<_>>();
+                let servers = self.plain_peers().map(|(peer, _)| peer).collect::<Vec<_>>();
                 Some(
                     prepare_fallback_link_dns(
                         ifindex,
@@ -565,11 +595,11 @@ impl PreparedFakeDns {
             let mut real: FuturesUnordered<_> = for_task
                 .plain
                 .iter()
-                .map(|(relay, link)| {
+                .map(|(relay, binding)| {
                     let cancel = cancel.clone();
                     async move {
                         relay
-                            .serve(&|packet| synthesize(packet, *link), cancel)
+                            .serve(&|packet| synthesize(packet, binding.scope_link), cancel)
                             .await
                     }
                 })
@@ -624,9 +654,9 @@ impl PreparedFakeDns {
             horizon,
             source,
         };
-        verify_dns_path(marker, &leases, epoch, "marker").await?;
+        verify_dns_path(SocketAddr::new(marker, DNS_PORT), &leases, epoch, "marker").await?;
         for (peer, _) in self.plain_peers() {
-            verify_dns_path(peer.ip(), &leases, epoch, "plain").await?;
+            verify_dns_path(peer, &leases, epoch, "plain").await?;
         }
         if let Some(resolved) = &active.resolved {
             apply_link_dns(resolved, LIMIT)
@@ -641,7 +671,7 @@ impl PreparedFakeDns {
 }
 
 async fn verify_dns_path(
-    address: IpAddr,
+    address: SocketAddr,
     leases: &FakeDnsLeases,
     epoch: DnsEpoch,
     _stage: &str,
@@ -657,7 +687,7 @@ async fn verify_dns_path(
 }
 
 async fn probe_through_tun(
-    marker: IpAddr,
+    marker: SocketAddr,
     leases: &FakeDnsLeases,
     epoch: DnsEpoch,
 ) -> Result<(), ServiceError> {
@@ -668,7 +698,7 @@ async fn probe_through_tun(
         IpAddr::from(Ipv6Addr::UNSPECIFIED)
     };
     let socket = UdpSocket::bind((bind, 0)).await.map_err(unavailable)?;
-    socket.connect((marker, 53)).await.map_err(unavailable)?;
+    socket.connect(marker).await.map_err(unavailable)?;
     let mut answer = [0; 128];
     let length = loop {
         socket.send(DNS_PROBE).await.map_err(unavailable)?;
