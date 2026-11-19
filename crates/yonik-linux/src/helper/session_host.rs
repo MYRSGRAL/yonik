@@ -1992,29 +1992,6 @@ impl Backend {
                 .map_err(|_| ServiceError::Unsupported)?
         };
         let config = config.with_local_runtime_logging();
-        if self.registry.is_none() {
-            self.registry = Some(TrustedRegistry::system().map_err(unavailable)?);
-        }
-        let binary = self
-            .registry
-            .as_ref()
-            .ok_or(ServiceError::Unavailable)?
-            .snapshot(request.engine)
-            .map_err(unavailable)?;
-        let payload = Arc::new(if let Some(bundle) = &bundle {
-            if binary.trusted_hash() != bundle.native_pin {
-                return Err(ServiceError::Unsupported);
-            }
-            WorkerPayload::new_bundle(
-                binary,
-                config,
-                Arc::clone(&bundle.resources),
-                bundle.resource_session,
-            )
-            .map_err(unavailable)?
-        } else {
-            WorkerPayload::new(binary, config).map_err(unavailable)?
-        });
         let query = RouteQuery::new(endpoint, worker_uid)
             .with_mark(plan.socket_mark())
             .with_transport(protocol, None, Some(server.endpoint().port()));
@@ -2068,6 +2045,32 @@ impl Backend {
         if !self.snapshot()?.is_current(stamp) {
             return Err(stale());
         }
+        // Создание снимка читает весь ELF. До него отсеиваем изменения,
+        // обнаруженные, пока шли асинхронные проверки сети.
+        if self.registry.is_none() {
+            self.registry = Some(TrustedRegistry::system().map_err(unavailable)?);
+        }
+        let binary = self
+            .registry
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .snapshot(request.engine)
+            .map_err(unavailable)?;
+        let payload = Arc::new(if let Some(bundle) = &bundle {
+            if binary.trusted_hash() != bundle.native_pin {
+                return Err(ServiceError::Unsupported);
+            }
+            WorkerPayload::new_bundle(
+                binary,
+                config,
+                Arc::clone(&bundle.resources),
+                bundle.resource_session,
+            )
+            .map_err(unavailable)?
+        } else {
+            WorkerPayload::new(binary, config).map_err(unavailable)?
+        });
+        cancel.check().map_err(|_| ServiceError::Cancelled)?;
         self.worker_uncertain = true;
         let result = watch
             .run_while_current(
