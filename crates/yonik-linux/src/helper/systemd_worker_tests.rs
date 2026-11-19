@@ -1,6 +1,9 @@
 use super::*;
 use crate::helper::worker_paths::{empty_events, open_worker_directory};
 
+#[path = "standalone_check_vm.rs"]
+mod standalone_check_vm;
+
 fn require_cgroup_fixture_vm() {
     assert_eq!(
         std::env::var("YONIK_PRODUCTION_HELPER_VM").as_deref(),
