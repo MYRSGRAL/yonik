@@ -207,6 +207,16 @@ fn inode(path: impl AsRef<Path>) -> io::Result<(u64, u64)> {
 
 fn verify_filesystem(pid: u32, mode: WorkerMode) {
     let process = PathBuf::from(format!("/proc/{pid}"));
+    let controller = fs::read_to_string("/proc/thread-self/status").unwrap();
+    let status = fs::read_to_string(process.join("status")).unwrap();
+    let filters =
+        |status: &str| -> u32 { field(status, "Seccomp_filters:").unwrap().parse().unwrap() };
+    assert_eq!(field(&status, "Seccomp:"), Some("2"));
+    assert_eq!(
+        filters(&status),
+        filters(&controller) + 1,
+        "launcher должен установить собственный фильтр seccomp"
+    );
     assert_ne!(
         inode(process.join("ns/mnt")).unwrap(),
         inode("/proc/self/ns/mnt").unwrap(),
@@ -253,6 +263,63 @@ fn verify_filesystem(pid: u32, mode: WorkerMode) {
             assert_eq!(tun.rdev(), rustix::fs::makedev(10, 200));
         }
     }
+}
+
+#[test]
+#[ignore = "Только одноразовая QEMU VM с setpriv и Python"]
+fn standalone_filter_denies_restricted_syscalls() {
+    require_cgroup_fixture_vm();
+    let path = std::env::temp_dir().join(format!("yonik-seccomp-{}", std::process::id()));
+    crate::helper::standalone_seccomp::write_filter(&path).unwrap();
+    let probe = r#"
+import ctypes
+import errno
+import mmap
+import os
+import socket
+import tempfile
+import threading
+
+def denied(call):
+    try:
+        call()
+    except PermissionError as error:
+        assert error.errno == errno.EPERM
+    else:
+        raise AssertionError("seccomp разрешил запрещённый системный вызов")
+
+libc = ctypes.CDLL(None, use_errno=True)
+assert libc.unshare(0) == -1 and ctypes.get_errno() == errno.EPERM
+denied(lambda: socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM))
+denied(lambda: mmap.mmap(-1, mmap.PAGESIZE, prot=mmap.PROT_WRITE | mmap.PROT_EXEC))
+with mmap.mmap(-1, mmap.PAGESIZE, prot=mmap.PROT_READ | mmap.PROT_WRITE) as region:
+    address = ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(region)))
+    result = libc.mprotect(address, ctypes.c_size_t(mmap.PAGESIZE), mmap.PROT_EXEC)
+    assert result == -1 and ctypes.get_errno() == errno.EPERM
+with tempfile.TemporaryFile() as file:
+    os.fchmod(file.fileno(), 0o600)
+    denied(lambda: os.fchmod(file.fileno(), 0o4600))
+with socket.socket(socket.AF_UNIX), socket.socket(socket.AF_INET), \
+     socket.socket(socket.AF_INET6), socket.socket(socket.AF_NETLINK, socket.SOCK_RAW):
+    pass
+thread = threading.Thread(target=lambda: None)
+thread.start()
+thread.join()
+"#;
+    let output = Command::new("/usr/bin/setpriv")
+        .arg("--no-new-privs")
+        .arg("--seccomp-filter")
+        .arg(&path)
+        .args(["--", "/usr/bin/python3", "-I", "-c", probe])
+        .output();
+    fs::remove_file(path).unwrap();
+    let output = output.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!("Seccomp ограничил namespace, сокеты, исполняемую память и смену режима файла");
 }
 
 fn field<'a>(text: &'a str, name: &str) -> Option<&'a str> {

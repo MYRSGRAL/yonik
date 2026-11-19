@@ -6,6 +6,7 @@ use super::{
         CONTROLLER_PID, HELPER_IMAGE, STANDALONE_PARENT, STANDALONE_RUNTIME, WORKER_IMAGE, group,
         socket_name, verify_executable,
     },
+    standalone_seccomp::filter_count,
     standalone_worker_argument,
     systemd_worker::{installed_worker_credentials, wait_owned},
     worker_identity::{WorkerCredentials, WorkerProcess},
@@ -165,6 +166,8 @@ impl StandaloneSupervisor {
         let credentials = installed_worker_credentials()?;
         let controller_netns = inode("/proc/self/ns/net")?;
         let controller_mountns = inode("/proc/self/ns/mnt")?;
+        let controller_filters =
+            filter_count(&fs::read_to_string("/proc/thread-self/status").map_err(unavailable)?)?;
         let image = inode(WORKER_IMAGE)?;
         let mut invocation = [0; 16];
         getrandom::getrandom(&mut invocation).map_err(unavailable)?;
@@ -197,7 +200,13 @@ impl StandaloneSupervisor {
         loop {
             self.verify_runtime()?;
             if inode(&format!("/proc/{pid}/exe")).ok() == Some(image) {
-                verify_setup(pid, mode, controller_netns, controller_mountns)?;
+                verify_setup(
+                    pid,
+                    mode,
+                    controller_netns,
+                    controller_mountns,
+                    controller_filters,
+                )?;
                 break;
             }
             if self
@@ -380,6 +389,7 @@ fn verify_setup(
     mode: WorkerMode,
     controller_netns: (u64, u64),
     controller_mountns: (u64, u64),
+    controller_filters: u32,
 ) -> Result<()> {
     let process = format!("/proc/{pid}");
     let info = fs::read_to_string(format!("{process}/status")).map_err(unavailable)?;
@@ -399,6 +409,7 @@ fn verify_setup(
             })
         || (inode(&format!("{process}/ns/net"))? == controller_netns) == check
         || inode(&format!("{process}/ns/mnt"))? == controller_mountns
+        || controller_filters.checked_add(1) != Some(filter_count(&info)?)
     {
         return Err(Error::Untrusted);
     }

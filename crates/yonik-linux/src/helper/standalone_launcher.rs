@@ -1,7 +1,7 @@
 //! Одноразовый вход для выделенного процесса, запускаемого helper.
 
 use super::{
-    WorkerSupervisorError, standalone_mounts,
+    WorkerSupervisorError, standalone_mounts, standalone_seccomp,
     systemd_worker::installed_worker_credentials,
     worker_paths::{FILE_FLAGS, WorkerCgroups, child, read_bounded, root, trusted},
 };
@@ -9,11 +9,12 @@ use crate::worker::WorkerMode;
 use rustix::{
     fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, fcntl_getfl, flock, openat, statat},
     net::{SocketAddrUnix, SocketType, getsockname, sockopt},
-    process::{geteuid, getppid, umask},
+    process::{Resource, Rlimit, geteuid, getppid, setrlimit, umask},
 };
 use std::{
     fs::{self, File},
     os::unix::{fs::MetadataExt, process::CommandExt},
+    path::Path,
     process::Command,
 };
 
@@ -124,6 +125,18 @@ pub fn launch_standalone_sandbox(mode: WorkerMode) -> Result<std::convert::Infal
     verify_inherited_descriptors()?;
     let credentials = installed_worker_credentials()?;
     standalone_mounts::setup(mode)?;
+    let filter = Path::new("/dev/.yonik-worker-seccomp");
+    standalone_seccomp::write_filter(filter)?;
+    for resource in [Resource::Core, Resource::Rtprio] {
+        setrlimit(
+            resource,
+            Rlimit {
+                current: Some(0),
+                maximum: Some(0),
+            },
+        )
+        .map_err(unavailable)?;
+    }
 
     let (capabilities, argument) = match mode {
         WorkerMode::Check => ("-all", "--check"),
@@ -137,6 +150,8 @@ pub fn launch_standalone_sandbox(mode: WorkerMode) -> Result<std::convert::Infal
         .arg(format!("--inh-caps={capabilities}"))
         .arg(format!("--ambient-caps={capabilities}"))
         .arg(format!("--bounding-set={capabilities}"))
+        .arg("--seccomp-filter")
+        .arg(filter)
         .args(["--no-new-privs", "--", WORKER_IMAGE, argument])
         .exec();
     Err(unavailable(error))
