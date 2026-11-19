@@ -535,6 +535,13 @@ async fn production_helper_fake_dns_after_dhcp_reconnect() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "выделенная VM с одним проверяемым DHCPv4-лизингом systemd-networkd"]
+async fn production_helper_fake_dns_dhcp_renewal() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::DhcpRenewal).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная VM с правилом DHCP cgroupv2 в таблице стенда"]
 async fn dhcp_cgroup_socket_rule_has_exact_kernel_identity() -> Result {
     guard()?;
@@ -847,6 +854,7 @@ enum FakeDnsNetworkChange {
     WireGuard,
     Resolvconf,
     DhcpReconnect,
+    DhcpRenewal,
 }
 
 #[cfg(feature = "test-support")]
@@ -868,8 +876,12 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
     }
     let (_owner, mut token) = yonik_linux::Cancellation::new();
+    let dhcp = matches!(
+        change,
+        FakeDnsNetworkChange::DhcpReconnect | FakeDnsNetworkChange::DhcpRenewal
+    );
     for (engine, kill_switch) in [(Engine::Xray, true), (Engine::SingBox, false)] {
-        if change == FakeDnsNetworkChange::DhcpReconnect {
+        if dhcp {
             check_dhcp_fixture_dns("10.203.2.1", &mut token).await?;
         }
         let drain = start_fake_dns_in_vm(
@@ -881,8 +893,39 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             &token,
         )
         .await?;
-        if change == FakeDnsNetworkChange::DhcpReconnect {
-            check_empty_dhcp_renewal_anchor(true)?;
+        if dhcp {
+            require(
+                dhcp_renewal_set()?.is_some(),
+                "Нет набора DHCP в активной политике",
+            )?;
+        }
+        if change == FakeDnsNetworkChange::DhcpRenewal {
+            check_running_dhcp_renewal().await?;
+            let index = fs::read_to_string("/sys/class/net/yonik-dhcp/ifindex")?;
+            let index: i32 = index.trim().parse()?;
+            let networkd = zbus::Proxy::new(
+                &connection,
+                "org.freedesktop.network1",
+                "/org/freedesktop/network1",
+                "org.freedesktop.network1.Manager",
+            )
+            .await?;
+            let before = dhcp_lease_timestamp(&networkd, index).await?;
+            require(
+                Command::new("/usr/bin/networkctl")
+                    .args(["renew", "yonik-dhcp"])
+                    .status()?
+                    .success(),
+                "Стенд не запросил продление DHCP",
+            )?;
+            tokio::time::timeout(Duration::from_secs(6), async {
+                while dhcp_lease_timestamp(&networkd, index).await? <= before {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })
+            .await??;
+            eprintln!("{engine:?}: DHCP продлён при работающей TUN-сессии");
         }
         let before_query = tokio::time::Instant::now();
         let old_v4 = getent_fake_dns("ahostsv4", "example.test").await?;
@@ -892,6 +935,24 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             resolver_file_state()? == resolver_before,
             "Сессия изменила /etc/resolv.conf до вмешательства стенда",
         )?;
+        if change == FakeDnsNetworkChange::DhcpRenewal {
+            check_running_dhcp_renewal().await?;
+            call(&connection, "Stop", empty.clone()).await?;
+            require(
+                tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+                "Worker не остановлен после продления DHCP",
+            )?;
+            require(dhcp_renewal_set()?.is_none(), "Набор DHCP пережил Stop")?;
+            if kill_switch {
+                call(&connection, "Unlock", empty.clone()).await?;
+            }
+            require(
+                resolver_file_state()? == resolver_before,
+                "Продление DHCP и Stop изменили /etc/resolv.conf",
+            )?;
+            eprintln!("{engine:?}: Fake DNS и TUN продолжили работать после продления DHCP");
+            continue;
+        }
         match change {
             FakeDnsNetworkChange::PeerRoute => change_fixture_peer_route("add")?,
             FakeDnsNetworkChange::ResolverLink => revoke_fixture_link_dns(&mut token).await?,
@@ -908,6 +969,7 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
                 eprintln!("{engine:?}: resolvconf опубликовал новый DNS-сервер");
             }
             FakeDnsNetworkChange::DhcpReconnect => control_dhcp_fixture("disconnect")?,
+            FakeDnsNetworkChange::DhcpRenewal => unreachable!("Сценарий продления завершён"),
         }
         // До закрытия вывода не обращаемся к helper по D-Bus. Только его
         // наблюдатель сетевых событий может остановить этот worker.
@@ -941,8 +1003,8 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
         if kill_switch {
             call(&connection, "Unlock", empty.clone()).await?;
         }
-        if change == FakeDnsNetworkChange::DhcpReconnect {
-            check_empty_dhcp_renewal_anchor(false)?;
+        if dhcp {
+            require(dhcp_renewal_set()?.is_none(), "Набор DHCP пережил Unlock")?;
             control_dhcp_fixture("10.203.2.2")?;
             check_dhcp_fixture_dns("10.203.2.2", &mut token).await?;
             let answer = Command::new("/usr/bin/resolvectl")
@@ -972,8 +1034,11 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             &token,
         )
         .await?;
-        if change == FakeDnsNetworkChange::DhcpReconnect {
-            check_empty_dhcp_renewal_anchor(true)?;
+        if dhcp {
+            require(
+                dhcp_renewal_set()?.is_some(),
+                "Нет набора DHCP после переподключения",
+            )?;
         }
         let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
         let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
@@ -1024,8 +1089,11 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
             switch_fixture_resolver("10.203.1.2")?;
             resolver_before = resolver_file_state()?;
         }
-        if change == FakeDnsNetworkChange::DhcpReconnect {
-            check_empty_dhcp_renewal_anchor(false)?;
+        if dhcp {
+            require(
+                dhcp_renewal_set()?.is_none(),
+                "Набор DHCP пережил Stop и Unlock",
+            )?;
             control_dhcp_fixture("disconnect")?;
             control_dhcp_fixture("10.203.2.1")?;
             check_dhcp_fixture_dns("10.203.2.1", &mut token).await?;
@@ -1038,7 +1106,7 @@ async fn installed_fake_dns_after_network_change(change: FakeDnsNetworkChange) -
 }
 
 #[cfg(feature = "test-support")]
-fn check_empty_dhcp_renewal_anchor(expected: bool) -> Result {
+fn dhcp_renewal_set() -> Result<Option<Value>> {
     let output = Command::new(nft_test_binary())
         .args(["-j", "list", "ruleset"])
         .output()?;
@@ -1051,28 +1119,42 @@ fn check_empty_dhcp_renewal_anchor(expected: bool) -> Result {
         .iter()
         .filter_map(|item| item.get("set"))
         .filter(|set| set["family"] == "inet" && set["name"] == "dhcp_renewal_leases");
-    let Some(set) = sets.next() else {
-        return require(!expected, "Активная политика не содержит набора DHCP");
-    };
-    require(
-        expected
-            && sets.next().is_none()
-            && set["flags"] == json!(["timeout"])
-            && set
-                .get("elem")
-                .is_none_or(|elem| elem.as_array().is_some_and(Vec::is_empty)),
-        "Набор DHCP дублируется, содержит элементы или пережил снятие политики",
-    )?;
-    require(
-        items.iter().any(|entry| {
-            entry["chain"]["table"] == set["table"] && entry["chain"]["name"] == "dhcp_renewal"
-        }) && !items.iter().any(|entry| {
-            entry["rule"]["table"] == set["table"] && entry["rule"]["chain"] == "dhcp_renewal"
-        }),
-        "Цепочка DHCP отсутствует или содержит правила до разрешения",
-    )?;
-    eprintln!("Установленный helper создал пустую цепочку DHCP и набор с таймером");
-    Ok(())
+    let set = sets.next().cloned();
+    require(sets.next().is_none(), "Набор DHCP дублируется")?;
+    Ok(set)
+}
+
+#[cfg(feature = "test-support")]
+async fn check_running_dhcp_renewal() -> Result {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(set) = dhcp_renewal_set()? {
+                require(set["flags"] == json!(["timeout"]), "Нет таймера DHCP")?;
+                if let Some([element]) = set["elem"].as_array().map(Vec::as_slice) {
+                    require(
+                        element.pointer("/elem/val/concat/0") == Some(&json!("10.203.2.10"))
+                            && element.pointer("/elem/val/concat/1") == Some(&json!("10.203.2.1"))
+                            && element.pointer("/elem/timeout") == Some(&json!(0))
+                            && element.pointer("/elem/expires") == Some(&json!(0)),
+                        "Активный DHCP-элемент содержит другой лизинг или таймер",
+                    )?;
+                    return Ok::<_, Box<dyn std::error::Error>>(());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("Установленный helper не обновляет допуск DHCP"))?
+}
+
+#[cfg(feature = "test-support")]
+async fn dhcp_lease_timestamp(networkd: &zbus::Proxy<'_>, index: i32) -> Result<u64> {
+    let description: String = networkd.call("DescribeLink", &(index,)).await?;
+    serde_json::from_str::<Value>(&description)?
+        .pointer("/DHCPv4Client/Lease/LeaseTimestampUSec")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| io::Error::other("networkd не вернул время DHCP-лизинга").into())
 }
 
 #[cfg(feature = "test-support")]

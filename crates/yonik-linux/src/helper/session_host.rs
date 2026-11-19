@@ -28,6 +28,8 @@ use crate::{
 };
 #[path = "native_owner.rs"]
 pub(in crate::helper) mod native_owner;
+#[path = "session_dhcp.rs"]
+mod session_dhcp;
 use sha2::Digest;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -501,8 +503,9 @@ pub(super) struct ActiveSession {
     ticket: WorkerTicket,
     index: u32,
     link: LinuxLink,
-    _exit_watch: SafetyTask,
+    exit_watch: SafetyTask,
     fake_dns: Option<ActiveFakeDns>,
+    dhcp_refresh: Option<session_dhcp::DhcpRefresh>,
 }
 
 /// Sideband использует тот же serial backend и durable journal. Отдельного
@@ -2207,13 +2210,26 @@ impl Backend {
         )
         .and_then(|policy| policy.with_link_control(controls))
         .map_err(unavailable)?;
+        let mut dhcp_interface = None;
         if let Some(fake_dns) = &artifact.fake_dns {
             policy = policy
                 .with_isolated_loopback(fake_dns.loopback, artifact.worker_uid)
                 .and_then(|policy| policy.with_bound_direct(fake_dns.direct_egress.clone()))
                 .and_then(|policy| policy.with_dhcp_renewal_anchor(true))
                 .map_err(unavailable)?;
+            if self.profile_owner.is_some() {
+                if let Some((index, acquired, bound)) =
+                    session_dhcp::select_policy(&artifact.baseline, &policy, cancel).await
+                {
+                    let mut executor = self.executor(owner)?;
+                    if session_dhcp::check_policy(&mut executor, &bound).await {
+                        policy = bound;
+                        dhcp_interface = Some((index, acquired));
+                    }
+                }
+            }
         }
+        cancel.check().map_err(|_| ServiceError::Cancelled)?;
         let policy_fingerprint = policy.digest();
         self.policy(owner, policy).await?;
         artifact
@@ -2250,12 +2266,13 @@ impl Backend {
             watch_worker_exit(ticket.pid(), Arc::clone(&self.exited)),
         )?;
         let active = ActiveSession {
-            _exit_watch: exit_watch,
+            exit_watch,
             artifact,
             ticket,
             index,
             link,
             fake_dns: None,
+            dhcp_refresh: None,
         };
         // Сохраняем ticket до verification: даже ошибка снимка не теряет worker.
         self.active = Some(active);
@@ -2309,6 +2326,20 @@ impl Backend {
                 .ok_or(ServiceError::Unavailable)?
                 .fake_dns = Some(active_dns);
         }
+        if let Some((backend, runtime)) = &self.profile_owner {
+            if let Some((index, acquired)) = dhcp_interface {
+                self.active
+                    .as_mut()
+                    .ok_or(ServiceError::Unavailable)?
+                    .dhcp_refresh = Some(session_dhcp::spawn_refresh(
+                    backend.clone(),
+                    runtime,
+                    self.epoch,
+                    index,
+                    acquired,
+                ));
+            }
+        }
         if self
             .active
             .as_ref()
@@ -2359,15 +2390,16 @@ impl Backend {
             diagnostic_link("raw", link, current_link);
             return diagnostic_result("same_link_contract", Err(stale()));
         }
+        let dhcp = self.verified_dhcp_address(cancel).await;
         diagnostic_result(
             "external_verification",
             artifact.plan.verify_external_captured(
-                &artifact.baseline,
-                artifact.baseline_capture,
+                (&artifact.baseline, artifact.baseline_capture),
                 current,
                 current_capture,
                 self.journal.as_ref().ok_or(ServiceError::Unavailable)?,
                 index,
+                dhcp,
             ),
         )
         .map_err(unavailable)?;
@@ -2522,6 +2554,7 @@ impl Backend {
         if let Some(active) = &mut self.active {
             active.fake_dns = None;
         }
+        self.revoke_session_dhcp().await;
         let keep_block = !public_unlock_pending(self.journal.as_ref())
             && keep_after_stop(
                 unlock,

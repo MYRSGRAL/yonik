@@ -7,7 +7,10 @@ use super::{
 use crate::{
     Cancellation, KernelRoute, NetworkNamespace, NetworkReadError as Error, RouteKind, RouteQuery,
     TransportProtocol,
-    attribution::broker::kernel::{Listener, listener_census},
+    attribution::broker::{
+        Unavailable as SocketReadError,
+        kernel::{Listener, listener_census},
+    },
     network::{
         RouteCapture, lookup_route_captured, read_topology_captured, same_captured_kernel_route,
         same_captured_topology,
@@ -67,6 +70,7 @@ struct Lease {
     acquired: u64,
     t1: u64,
     t2: u64,
+    address_lifetimes: Option<[u64; 2]>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +92,10 @@ struct AddressDescription {
     config_source: String,
     config_state: String,
     config_provider: Option<Vec<u8>>,
+    #[serde(rename = "PreferredLifetimeUSec")]
+    preferred: Option<u64>,
+    #[serde(rename = "ValidLifetimeUSec")]
+    valid: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -137,6 +145,13 @@ fn parse_lease(json: &str, index: u32, now: u64) -> Result<Lease, Error> {
     }
     let address_bytes = ipv4(address.address)?;
     let server = ipv4(address.config_provider.ok_or(Error::Unsupported)?)?;
+    let address_lifetimes = address
+        .preferred
+        .zip(address.valid)
+        .and_then(|(preferred, valid)| {
+            (lease.t2 <= preferred && preferred <= valid && valid < u64::MAX)
+                .then_some([preferred, valid])
+        });
     if address_bytes == server {
         return Err(Error::Unsupported);
     }
@@ -149,6 +164,7 @@ fn parse_lease(json: &str, index: u32, now: u64) -> Result<Lease, Error> {
         acquired: lease.acquired,
         t1: lease.t1,
         t2: lease.t2,
+        address_lifetimes,
     })
 }
 
@@ -213,6 +229,8 @@ impl DhcpNetworkdLease {
             interface: self.lease.index,
             ifname: &self.lease.name,
             address: self.lease.address,
+            prefix_len: self.lease.prefix,
+            acquired: self.lease.acquired,
             server: self.lease.server,
             uid: self.daemon.uid,
             cgroup_id: self.daemon.group.1,
@@ -228,6 +246,15 @@ impl DhcpNetworkdLease {
         Some(Duration::from_micros(
             path.expires_boottime_micros.checked_sub(boottime().ok()?)?,
         ))
+    }
+
+    pub(crate) fn address_expiries(&self) -> Option<[Instant; 2]> {
+        let [preferred, valid] = self.lease.address_lifetimes?;
+        let now = boottime().ok()?;
+        let sample = Instant::now();
+        let expiry =
+            |value: u64| sample.checked_add(Duration::from_micros(value.checked_sub(now)?));
+        Some([expiry(preferred)?, expiry(valid)?])
     }
 
     /// Ошибка чтения, изменения лизинга или завершение проверки через Drop
@@ -267,6 +294,8 @@ pub struct DhcpRenewalPath<'a> {
     pub interface: u32,
     pub ifname: &'a str,
     pub address: Ipv4Addr,
+    pub prefix_len: u8,
+    pub(crate) acquired: u64,
     pub server: Ipv4Addr,
     pub uid: u32,
     pub cgroup_id: NonZeroU64,
@@ -377,14 +406,23 @@ async fn sample_socket(
     let (fds, pending, bytes) = &*CAPTURE_BUDGET;
     let credits = CaptureCredits::reserve_shared(fds, pending, bytes).map_err(unavailable)?;
     tokio::task::spawn_blocking(move || {
-        let rows = listener_census(
-            17,
-            CLIENT_PORT,
-            (namespace.device, namespace.inode),
-            deadline.into_std(),
-            &AtomicBool::new(false),
-            &credits,
-        )
+        let cancelled = AtomicBool::new(false);
+        let read = || {
+            listener_census(
+                17,
+                CLIENT_PORT,
+                (namespace.device, namespace.inode),
+                deadline.into_std(),
+                &cancelled,
+                &credits,
+            )
+        };
+        let rows = match read() {
+            // Первый запрос может истечь при загрузке обработчика SOCK_DIAG.
+            // Повтор с новым сокетом сохраняет общий deadline снимка.
+            Err(SocketReadError::Timeout) if Instant::now() < deadline => read(),
+            result => result,
+        }
         .map_err(unavailable)?;
         let mut matches = rows.iter().filter(|socket| {
             socket.family == 2
@@ -507,7 +545,7 @@ async fn property<T: TryFrom<zbus::zvariant::OwnedValue>>(
         return Err(Error::Limit);
     }
     let value: zbus::zvariant::OwnedValue = reply.body().deserialize().map_err(unavailable)?;
-    T::try_from(value).map_err(unavailable)
+    T::try_from(value).map_err(|_| Error::Malformed)
 }
 
 async fn describe(
@@ -590,7 +628,11 @@ fn remaining(deadline: Instant) -> Result<Duration, Error> {
     }
 }
 
-fn unavailable<T>(_: T) -> Error {
+fn unavailable<T: std::fmt::Debug>(_error: T) -> Error {
+    #[cfg(any(test, feature = "test-support"))]
+    if std::env::var_os("YONIK_SESSION_DIAGNOSTICS").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        eprintln!("session diagnostic dhcp_capture: {_error:?}");
+    }
     Error::Unavailable
 }
 

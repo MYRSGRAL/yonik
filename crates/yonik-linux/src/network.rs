@@ -5,7 +5,8 @@ mod equivalence;
 #[cfg(test)]
 pub(crate) use equivalence::diagnostic_class_matches;
 pub(crate) use equivalence::{
-    same_captured_kernel_route, same_captured_topology, same_external_topology,
+    RenewedDhcpAddress, same_captured_kernel_route, same_captured_topology, same_external_topology,
+    same_session_topology,
 };
 mod lookup;
 mod nft_cgroup;

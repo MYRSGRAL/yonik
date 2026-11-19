@@ -425,13 +425,15 @@ impl SessionNetworkPlan {
     }
     pub(crate) fn verify_external_captured(
         &self,
-        baseline: &LinuxTopology,
-        baseline_capture: crate::network::TopologyCapture,
+        baseline: (&LinuxTopology, crate::network::TopologyCapture),
         current: LinuxTopology,
         current_capture: crate::network::TopologyCapture,
         journal: &Journal,
         index: u32,
+        dhcp: Option<crate::network::RenewedDhcpAddress>,
     ) -> Result<(), TunError> {
+        #[cfg(test)]
+        let (baseline, baseline_capture) = baseline;
         let records = self.check_records(journal, index, Some(self.configured_count() + 2));
         #[cfg(test)]
         let records = records.inspect_err(|&error| {
@@ -472,11 +474,14 @@ impl SessionNetworkPlan {
                     return Err(error);
                 }
             };
-        if !crate::network::same_captured_topology(
-            baseline,
-            baseline_capture,
-            &projected,
-            current_capture,
+        #[cfg(test)]
+        let baseline_pair = (baseline, baseline_capture);
+        #[cfg(not(test))]
+        let baseline_pair = baseline;
+        if !crate::network::same_session_topology(
+            baseline_pair,
+            (&projected, current_capture),
+            dhcp,
         ) {
             #[cfg(test)]
             diagnostics::failure(

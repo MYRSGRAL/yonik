@@ -619,6 +619,10 @@ impl PublicBlockPolicy {
         })
     }
 
+    pub(crate) fn dhcp_renewal_ifindex(&self) -> Option<NonZeroU32> {
+        self.dhcp_renewal_rule.as_ref().map(|rule| rule.ifindex)
+    }
+
     /// Отпечаток канонических правил не зависит от имени принадлежащей helper таблицы.
     pub fn digest(&self) -> [u8; 32] {
         // Value сериализуется однозначно; здесь не бывает пользовательских map/чисел float.
