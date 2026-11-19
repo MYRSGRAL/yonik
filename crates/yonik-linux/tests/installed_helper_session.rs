@@ -2072,9 +2072,17 @@ async fn installed_fake_dns(
     if std::env::var_os("YONIK_EXPECT_CLEAN_FAKE_DNS_START").is_none() {
         tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
     }
+    let fallback_dns = std::env::var("YONIK_CHECK_FALLBACK_DNS");
+    let fallback_engine = match fallback_dns.as_deref() {
+        Ok("xray") => Some(Engine::Xray),
+        Ok("sing-box") => Some(Engine::SingBox),
+        Ok("1") | Err(std::env::VarError::NotPresent) => None,
+        _ => return Err(io::Error::other("Неизвестный движок стенда FallbackDNS").into()),
+    };
     for engine in [Engine::Xray, Engine::SingBox]
         .into_iter()
         .filter(|engine| crash_engine.is_none_or(|selected| *engine == selected))
+        .filter(|engine| fallback_engine.is_none_or(|selected| *engine == selected))
     {
         let crash = crash_engine.is_some();
         let kill_switch = engine == Engine::Xray;
@@ -2089,6 +2097,11 @@ async fn installed_fake_dns(
             resolver_file_state()? == resolver_before,
             "Запуск изменил /etc/resolv.conf",
         )?;
+        if fallback_dns.is_ok() {
+            check_fallback_dns_in_vm("real.test").await?;
+            check_fallback_dns_local_names_in_vm().await?;
+            eprintln!("{engine:?}: NSS получил реальный ответ от FallbackDNS");
+        }
         let (v4, v6) = if let Some(peer) = literal {
             let v4 = ask_fixture_dns(peer, "example.test", 1, false).await?;
             let v6 = ask_fixture_dns(peer, "example.test", 28, true).await?;
@@ -2188,6 +2201,10 @@ async fn installed_fake_dns(
         if kill_switch {
             call(&connection, "Unlock", empty.clone()).await?;
         }
+        if fallback_dns.is_ok() {
+            check_fallback_dns_in_vm("restored.test").await?;
+            eprintln!("{engine:?}: NSS получил ответ от FallbackDNS после остановки");
+        }
         if matches!(policy_witness, Some(FakeDnsPolicyWitness::LiteralDirect)) {
             check_tun_traffic_to(connected_direct_fixture()?).await?;
         }
@@ -2204,6 +2221,33 @@ async fn installed_fake_dns(
         eprintln!(
             "{engine:?} установленный helper, системный DNS, TCP/UDP IPv4/IPv6 и восстановление подтверждены"
         );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn check_fallback_dns_in_vm(domain: &str) -> Result {
+    require(
+        getent_fake_dns("ahostsv4", domain).await? == std::net::Ipv4Addr::new(192, 0, 2, 99),
+        "NSS не получил реальный ответ от резервного DNS",
+    )
+}
+
+#[cfg(feature = "test-support")]
+async fn check_fallback_dns_local_names_in_vm() -> Result {
+    for name in ["yonik-private-witness.local", "169.254.99.98"] {
+        let output = tokio::time::timeout(
+            Duration::from_secs(6),
+            tokio::process::Command::new("/usr/bin/resolvectl")
+                .args(["--protocol=dns", "query", name])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await??;
+        require(
+            !output.status.success(),
+            "Локальное имя разрешилось по unicast DNS",
+        )?;
     }
     Ok(())
 }

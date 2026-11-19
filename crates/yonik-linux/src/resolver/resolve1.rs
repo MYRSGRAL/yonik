@@ -29,6 +29,7 @@ const MAX_ENTRIES: usize = 4096;
 const MAX_ROUTE_DOMAINS: usize = 256;
 const MAX_DOMAIN_LENGTH: usize = 253;
 const MAX_TIMEOUT: Duration = Duration::from_secs(5);
+type ManagerDnsServerEx = (i32, i32, Vec<u8>, u16, String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resolve1Scope {
@@ -70,6 +71,12 @@ pub struct Resolve1Snapshot {
     pub endpoints: Vec<Resolve1Endpoint>,
     pub domains: Vec<Resolve1Domain>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Resolve1TunSnapshot {
+    pub(crate) config: Resolve1Snapshot,
+    pub(crate) fallback_only: bool,
+}
 impl std::fmt::Debug for Resolve1Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Resolve1Snapshot")
@@ -85,6 +92,30 @@ pub async fn read_resolve1_snapshot(
     cancel: &mut Cancellation,
     timeout: Duration,
 ) -> Result<Resolve1Snapshot, ResolverError> {
+    Ok(read_snapshot(cancel, timeout, SnapshotScope::Configured)
+        .await?
+        .config)
+}
+
+pub(crate) async fn read_resolve1_tun_snapshot(
+    cancel: &mut Cancellation,
+    timeout: Duration,
+    own_link: Option<u32>,
+) -> Result<Resolve1TunSnapshot, ResolverError> {
+    read_snapshot(cancel, timeout, SnapshotScope::Tun { own_link }).await
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotScope {
+    Configured,
+    Tun { own_link: Option<u32> },
+}
+
+async fn read_snapshot(
+    cancel: &mut Cancellation,
+    timeout: Duration,
+    scope: SnapshotScope,
+) -> Result<Resolve1TunSnapshot, ResolverError> {
     if timeout.is_zero() || timeout > MAX_TIMEOUT {
         return Err(ResolverError::Limit);
     }
@@ -92,30 +123,100 @@ pub async fn read_resolve1_snapshot(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ResolverError::Cancelled),
-            result = read_inner() => result,
+            result = async {
+                let connection = Connection::system().await.map_err(bus_error)?;
+                read_connection(&connection, scope).await
+            } => result,
         }
     })
     .await
     .map_err(|_| ResolverError::Timeout)?
 }
 
-async fn read_inner() -> Result<Resolve1Snapshot, ResolverError> {
-    let connection = Connection::system().await.map_err(bus_error)?;
-    read_connection(&connection).await
-}
-
-async fn read_connection(connection: &Connection) -> Result<Resolve1Snapshot, ResolverError> {
+async fn read_connection(
+    connection: &Connection,
+    scope: SnapshotScope,
+) -> Result<Resolve1TunSnapshot, ResolverError> {
     let owner_name = owner(connection).await?;
     let proxy = Proxy::new(connection, owner_name.as_str(), PATH, PROPERTIES)
         .await
         .map_err(bus_error)?;
     let dns = property::<Vec<(i32, i32, Vec<u8>)>>(&proxy, "DNS").await?;
     let domains = property::<Vec<(i32, String, bool)>>(&proxy, "Domains").await?;
-    let snapshot = decode(dns, domains)?;
+    let mut snapshot = decode(dns, domains)?;
+    let mut fallback_only = false;
+    if let SnapshotScope::Tun { own_link } = scope {
+        if let Some(index) = own_link {
+            let scope = Resolve1Scope::Link(index);
+            snapshot
+                .endpoints
+                .retain(|endpoint| endpoint.scope != scope);
+            snapshot.domains.retain(|domain| domain.scope != scope);
+        }
+        if !has_default_dns(connection, &owner_name, &snapshot).await? {
+            let fallback = property::<Vec<ManagerDnsServerEx>>(&proxy, "FallbackDNSEx").await?;
+            if !fallback.is_empty() {
+                fallback_only = snapshot.endpoints.is_empty();
+                let fallback_count = fallback.len();
+                let plain = if property::<String>(&proxy, "DNSOverTLS").await? == "no" {
+                    decode_plain_fallback(fallback)?
+                } else {
+                    Vec::new()
+                };
+                if fallback_only && plain.len() != fallback_count {
+                    return Err(ResolverError::Unsupported);
+                }
+                snapshot.endpoints.extend(plain);
+            }
+        }
+    }
     if owner(connection).await? != owner_name {
         return Err(ResolverError::NetworkChanged);
     }
-    Ok(snapshot)
+    Ok(Resolve1TunSnapshot {
+        config: snapshot,
+        fallback_only,
+    })
+}
+
+async fn has_default_dns(
+    connection: &Connection,
+    owner: &str,
+    snapshot: &Resolve1Snapshot,
+) -> Result<bool, ResolverError> {
+    let mut links = HashSet::new();
+    for endpoint in &snapshot.endpoints {
+        let Resolve1Scope::Link(index) = endpoint.scope else {
+            return Ok(true);
+        };
+        links.insert(index);
+    }
+    for index in links {
+        let path = get_link_path(connection, owner, index).await?;
+        let proxy = Proxy::new(connection, owner, path.as_str(), PROPERTIES)
+            .await
+            .map_err(bus_error)?;
+        if property_for::<bool>(&proxy, LINK, "DefaultRoute").await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn decode_plain_fallback(
+    rows: Vec<ManagerDnsServerEx>,
+) -> Result<Vec<Resolve1Endpoint>, ResolverError> {
+    if rows.len() > MAX_ENTRIES {
+        return Err(ResolverError::Limit);
+    }
+    let plain = rows
+        .into_iter()
+        .filter_map(|(index, family, address, port, name)| {
+            (index == 0 && matches!(port, 0 | 53) && name.is_empty())
+                .then_some((index, family, address))
+        })
+        .collect();
+    Ok(decode(plain, Vec::new())?.endpoints)
 }
 
 async fn owner(connection: &Connection) -> Result<String, ResolverError> {
@@ -228,14 +329,41 @@ pub async fn prepare_link_dns(
     route_domains: &[String],
     timeout: Duration,
 ) -> Result<Resolve1Prepared, ResolverError> {
+    prepare_dns_on_owned_link(ifindex, &[marker], route_domains, false, timeout).await
+}
+
+/// В режиме FallbackDNS переносим выбор сервера на собственный TUN, иначе
+/// старый resolved перестаёт обслуживать обычные имена при появлении DNS линка.
+pub(crate) async fn prepare_fallback_link_dns(
+    ifindex: u32,
+    servers: &[IpAddr],
+    route_domains: &[String],
+    timeout: Duration,
+) -> Result<Resolve1Prepared, ResolverError> {
+    // ~. имеет приоритет над обычными исключениями .local и link-local PTR.
+    prepare_dns_on_owned_link(ifindex, servers, route_domains, true, timeout).await
+}
+
+async fn prepare_dns_on_owned_link(
+    ifindex: u32,
+    servers: &[IpAddr],
+    route_domains: &[String],
+    default_route: bool,
+    timeout: Duration,
+) -> Result<Resolve1Prepared, ResolverError> {
     validate_link_request(ifindex, route_domains)?;
-    validate_marker(marker)?;
+    if servers.is_empty() || servers.len() > MAX_ENTRIES {
+        return Err(ResolverError::Limit);
+    }
+    for &server in servers {
+        validate_marker(server)?;
+    }
     if timeout.is_zero() || timeout > MAX_TIMEOUT {
         return Err(ResolverError::Limit);
     }
     tokio::time::timeout(timeout, async {
         let connection = Connection::system().await.map_err(bus_error)?;
-        prepare_on_connection(connection, ifindex, marker, route_domains).await
+        prepare_on_connection(connection, ifindex, servers, route_domains, default_route).await
     })
     .await
     .map_err(|_| ResolverError::Timeout)?
@@ -276,7 +404,8 @@ pub struct Resolve1Prepared {
     owner: String,
     ifindex: i32,
     link_path: OwnedObjectPath,
-    marker: IpAddr,
+    dns: Vec<(i32, Vec<u8>)>,
+    default_route: bool,
     route_domains: Vec<String>,
 }
 
@@ -288,10 +417,15 @@ impl Resolve1Prepared {
         if path != self.link_path {
             return Err(ResolverError::NetworkChanged);
         }
-        let (family, bytes) = encode_address(self.marker);
         let expected = Resolve1LinkConfig {
-            dns: vec![(family, bytes.clone())],
-            dns_ex: vec![(family, bytes, 0, String::new())],
+            dns: self.dns.clone(),
+            dns_ex: self
+                .dns
+                .iter()
+                .cloned()
+                .map(|(family, bytes)| (family, bytes, 0, String::new()))
+                .collect(),
+            default_route: self.default_route,
             domains: self
                 .route_domains
                 .iter()
@@ -316,7 +450,7 @@ impl std::fmt::Debug for Resolve1Prepared {
         f.debug_struct("Resolve1Prepared")
             .field("ifindex", &self.ifindex)
             .field("route_domain_count", &self.route_domains.len())
-            .field("dns_marker", &"<скрыто>")
+            .field("dns_count", &self.dns.len())
             .finish()
     }
 }
@@ -331,11 +465,11 @@ pub struct Resolve1ApplyError {
 async fn prepare_on_connection(
     connection: Connection,
     ifindex: u32,
-    marker: IpAddr,
+    servers: &[IpAddr],
     route_domains: &[String],
+    default_route: bool,
 ) -> Result<Resolve1Prepared, ResolverError> {
     validate_link_request(ifindex, route_domains)?;
-    validate_marker(marker)?;
     let owner = owner(&connection).await?;
     let link_path = get_link_path(&connection, &owner, ifindex).await?;
     let state = read_link_config(&connection, &owner, &link_path).await?;
@@ -354,7 +488,8 @@ async fn prepare_on_connection(
         owner,
         ifindex: i32::try_from(ifindex).map_err(|_| ResolverError::Limit)?,
         link_path,
-        marker,
+        dns: servers.iter().copied().map(encode_address).collect(),
+        default_route,
         route_domains: route_domains.to_vec(),
     })
 }
@@ -383,8 +518,6 @@ async fn apply_prepared(
     let manager = Proxy::new(connection, prepared.owner.as_str(), PATH, MANAGER)
         .await
         .map_err(bus_error)?;
-    let (family, bytes) = encode_address(prepared.marker);
-    let expected_dns = vec![(family, bytes)];
     let expected_domains = prepared
         .route_domains
         .iter()
@@ -393,6 +526,13 @@ async fn apply_prepared(
         .collect::<Vec<_>>();
     // Routing is installed first, before this interface receives DNS queries.
     *mutation_started = true;
+    let _: () = manager
+        .call(
+            "SetLinkDefaultRoute",
+            &(prepared.ifindex, prepared.default_route),
+        )
+        .await
+        .map_err(bus_error)?;
     let _: () = manager
         .call(
             "SetLinkDomains",
@@ -405,6 +545,7 @@ async fn apply_prepared(
     let after_domains = read_link_config(connection, &prepared.owner, &link_path).await?;
     if !after_domains.dns.is_empty()
         || !after_domains.dns_ex.is_empty()
+        || after_domains.default_route != prepared.default_route
         || after_domains.domains != expected_domains
     {
         return Err(ResolverError::NetworkChanged);
@@ -418,7 +559,7 @@ async fn apply_prepared(
 
     // Mutation outcomes may be ambiguous at timeout/disconnect; never retry.
     let _: () = manager
-        .call("SetLinkDNS", &(prepared.ifindex, expected_dns))
+        .call("SetLinkDNS", &(prepared.ifindex, &prepared.dns))
         .await
         .map_err(bus_error)?;
 
@@ -438,6 +579,7 @@ type LinkDnsServerEx = (i32, Vec<u8>, u16, String);
 struct Resolve1LinkConfig {
     dns: Vec<(i32, Vec<u8>)>,
     dns_ex: Vec<LinkDnsServerEx>,
+    default_route: bool,
     domains: Vec<(String, bool)>,
 }
 
@@ -471,6 +613,7 @@ async fn read_link_config(
         .map_err(bus_error)?;
     let dns = property_for::<Vec<(i32, Vec<u8>)>>(&proxy, LINK, "DNS").await?;
     let dns_ex = property_for::<Vec<LinkDnsServerEx>>(&proxy, LINK, "DNSEx").await?;
+    let default_route = property_for::<bool>(&proxy, LINK, "DefaultRoute").await?;
     let domains = property_for::<Vec<(String, bool)>>(&proxy, LINK, "Domains").await?;
     if dns.len() > MAX_ENTRIES || dns_ex.len() > MAX_ENTRIES || domains.len() > MAX_ENTRIES {
         return Err(ResolverError::Limit);
@@ -496,6 +639,7 @@ async fn read_link_config(
     Ok(Resolve1LinkConfig {
         dns,
         dns_ex,
+        default_route,
         domains,
     })
 }
@@ -670,6 +814,10 @@ mod tests {
     }
     #[zbus::interface(name = "org.freedesktop.resolve1.Manager")]
     impl ManagerFixture {
+        fn get_link(&self, index: i32) -> OwnedObjectPath {
+            OwnedObjectPath::try_from(link_object_path(index)).unwrap()
+        }
+
         #[zbus(property, name = "DNS")]
         fn dns(&self) -> Vec<(i32, i32, Vec<u8>)> {
             self.dns.clone()
@@ -677,6 +825,30 @@ mod tests {
         #[zbus(property, name = "Domains")]
         fn domains(&self) -> Vec<(i32, String, bool)> {
             self.domains.clone()
+        }
+        #[zbus(property, name = "FallbackDNSEx")]
+        fn fallback_dns_ex(&self) -> Vec<ManagerDnsServerEx> {
+            vec![
+                (0, 2, vec![192, 0, 2, 11], 0, String::new()),
+                (0, 2, vec![192, 0, 2, 12], 53, String::new()),
+                (0, 2, vec![192, 0, 2, 13], 853, String::new()),
+                (0, 2, vec![192, 0, 2, 14], 0, "tls.test".into()),
+            ]
+        }
+        #[zbus(property, name = "DNSOverTLS")]
+        fn dns_over_tls(&self) -> &str {
+            "no"
+        }
+    }
+
+    #[derive(Default)]
+    struct DefaultDnsRoute(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    #[zbus::interface(name = "org.freedesktop.resolve1.Link")]
+    impl DefaultDnsRoute {
+        #[zbus(property, name = "DefaultRoute")]
+        fn default_route(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -687,6 +859,7 @@ mod tests {
     struct MutationState {
         dns: Vec<(i32, Vec<u8>)>,
         dns_ex: Vec<LinkDnsServerEx>,
+        default_route: bool,
         domains: Vec<(String, bool)>,
         foreign_domains: Vec<(i32, String, bool)>,
         set_dns_calls: usize,
@@ -742,6 +915,14 @@ mod tests {
                 .collect();
             Ok(())
         }
+
+        #[zbus(name = "SetLinkDefaultRoute")]
+        fn set_link_default_route(&self, ifindex: i32, default_route: bool) {
+            assert_eq!(ifindex, TEST_IFINDEX);
+            let mut state = self.0.lock().unwrap();
+            state.events.push("default_route");
+            state.default_route = default_route;
+        }
         #[zbus(name = "SetLinkDomains")]
         fn set_link_domains(
             &self,
@@ -766,6 +947,10 @@ mod tests {
     struct MutationLink(std::sync::Arc<std::sync::Mutex<MutationState>>);
     #[zbus::interface(name = "org.freedesktop.resolve1.Link")]
     impl MutationLink {
+        #[zbus(property, name = "DefaultRoute")]
+        fn default_route(&self) -> bool {
+            self.0.lock().unwrap().default_route
+        }
         #[zbus(property, name = "DNS")]
         fn dns(&self) -> Vec<(i32, Vec<u8>)> {
             self.0.lock().unwrap().dns.clone()
@@ -835,9 +1020,10 @@ mod tests {
         property::<Vec<(i32, String, bool)>>(&properties, "Domains")
             .await
             .expect("Domains property shape");
-        let snapshot = read_connection(&client)
+        let snapshot = read_connection(&client, SnapshotScope::Configured)
             .await
-            .unwrap_or_else(|error| panic!("fixture read failed: {error:?}"));
+            .unwrap_or_else(|error| panic!("fixture read failed: {error:?}"))
+            .config;
         assert_eq!(snapshot.endpoints.len(), 2);
         assert_eq!(
             snapshot
@@ -855,6 +1041,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn туннельный_dns_не_скрывает_резервные_серверы() {
+        let bus = PrivateBus::new();
+        let route = DefaultDnsRoute::default();
+        let is_default = std::sync::Arc::clone(&route.0);
+        let server = zbus::connection::Builder::address(bus.1.as_str())
+            .unwrap()
+            .name(SERVICE)
+            .unwrap()
+            .serve_at(
+                PATH,
+                ManagerFixture {
+                    dns: vec![(13, 2, vec![198, 18, 0, 2]), (7, 2, vec![192, 0, 2, 7])],
+                    domains: vec![(13, "fake.test".into(), true)],
+                },
+            )
+            .unwrap()
+            .serve_at(link_object_path(7), route)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let client = bus.connect().await;
+        let snapshot = read_connection(&client, SnapshotScope::Tun { own_link: Some(13) })
+            .await
+            .unwrap();
+        let addresses: Vec<_> = snapshot
+            .config
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.address)
+            .collect();
+        assert_eq!(
+            addresses,
+            [
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12)),
+            ]
+        );
+        assert!(snapshot.config.domains.is_empty());
+        assert!(!snapshot.fallback_only);
+        is_default.store(true, std::sync::atomic::Ordering::Relaxed);
+        let updated = read_connection(&client, SnapshotScope::Tun { own_link: Some(13) })
+            .await
+            .unwrap();
+        assert_eq!(updated.config.endpoints, snapshot.config.endpoints[..1]);
+        server.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn публикует_резервные_серверы_на_tun_в_исходном_порядке() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MutationState::default()));
+        let (_bus, server, client) = mutation_fixture(state.clone()).await;
+        let servers = [
+            "192.0.2.11".parse().unwrap(),
+            "2001:db8::12".parse().unwrap(),
+            "192.0.2.10".parse().unwrap(),
+        ];
+        let prepared = prepare_on_connection(
+            client,
+            TEST_IFINDEX as u32,
+            &servers,
+            &["fake.test".into()],
+            true,
+        )
+        .await
+        .unwrap();
+        apply_link_dns(&prepared, Duration::from_secs(1))
+            .await
+            .unwrap();
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.dns, servers.map(encode_address));
+            assert_eq!(state.domains, [("fake.test".into(), true)]);
+            assert!(state.default_route);
+        }
+        server.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn applies_exact_wire_values_and_readback_per_link() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(MutationState::default()));
         let (_bus, server, client) = mutation_fixture(state.clone()).await;
@@ -862,8 +1128,9 @@ mod tests {
         let prepared = prepare_on_connection(
             client,
             TEST_IFINDEX as u32,
-            "198.18.0.1".parse().unwrap(),
+            &["198.18.0.1".parse().unwrap()],
             &domains,
+            false,
         )
         .await
         .unwrap();
@@ -884,7 +1151,7 @@ mod tests {
             );
             assert_eq!(state.set_dns_calls, 1);
             assert_eq!(state.set_domains_calls, 1);
-            assert_eq!(state.events, vec!["domains", "dns"]);
+            assert_eq!(state.events, vec!["default_route", "domains", "dns"]);
         }
         server.close().await.unwrap();
     }
@@ -899,8 +1166,9 @@ mod tests {
         let result = prepare_on_connection(
             client,
             TEST_IFINDEX as u32,
-            "198.18.0.1".parse().unwrap(),
+            &["198.18.0.1".parse().unwrap()],
             &[],
+            false,
         )
         .await;
         assert_eq!(result.err(), Some(ResolverError::Untrusted));
@@ -923,8 +1191,9 @@ mod tests {
         let result = prepare_on_connection(
             client,
             TEST_IFINDEX as u32,
-            "198.18.0.1".parse().unwrap(),
+            &["198.18.0.1".parse().unwrap()],
             &["corp.example".into()],
+            false,
         )
         .await;
         assert_eq!(result.err(), Some(ResolverError::Untrusted));
@@ -943,8 +1212,9 @@ mod tests {
         let result = prepare_on_connection(
             client,
             TEST_IFINDEX as u32,
-            "198.18.0.1".parse().unwrap(),
+            &["198.18.0.1".parse().unwrap()],
             &["corp.example".into()],
+            false,
         )
         .await;
         assert_eq!(result.err(), Some(ResolverError::Untrusted));
@@ -961,8 +1231,9 @@ mod tests {
         let prepared = prepare_on_connection(
             client,
             TEST_IFINDEX as u32,
-            "198.18.0.1".parse().unwrap(),
+            &["198.18.0.1".parse().unwrap()],
             &["corp.example".into()],
+            false,
         )
         .await
         .unwrap();
@@ -975,7 +1246,7 @@ mod tests {
             let state = state.lock().unwrap();
             assert_eq!(state.set_domains_calls, 1);
             assert_eq!(state.set_dns_calls, 0);
-            assert_eq!(state.events, vec!["domains"]);
+            assert_eq!(state.events, vec!["default_route", "domains"]);
         }
         server.close().await.unwrap();
     }
@@ -990,8 +1261,9 @@ mod tests {
         let prepared = prepare_on_connection(
             client,
             TEST_IFINDEX as u32,
-            "198.18.0.1".parse().unwrap(),
+            &["198.18.0.1".parse().unwrap()],
             &["corp.example".into()],
+            false,
         )
         .await
         .unwrap();
@@ -1018,8 +1290,9 @@ mod tests {
         let prepared = prepare_on_connection(
             client,
             TEST_IFINDEX as u32,
-            "198.18.0.1".parse().unwrap(),
+            &["198.18.0.1".parse().unwrap()],
             &["corp.example".into()],
+            false,
         )
         .await
         .unwrap();
@@ -1034,7 +1307,7 @@ mod tests {
             assert_eq!(state.domains, vec![("corp.example".into(), true)]);
             assert_eq!(state.set_dns_calls, 1);
             assert_eq!(state.set_domains_calls, 1);
-            assert_eq!(state.events, vec!["domains", "dns"]);
+            assert_eq!(state.events, vec!["default_route", "domains", "dns"]);
         }
         server.close().await.unwrap();
     }

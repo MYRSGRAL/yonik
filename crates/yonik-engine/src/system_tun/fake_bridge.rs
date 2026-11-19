@@ -51,7 +51,7 @@ struct PlainDnsPeer {
 }
 
 impl SystemFakeDnsBridge {
-    pub const MAX_PLAIN_DNS_PEERS: usize = 3;
+    pub const MAX_PLAIN_DNS_PEERS: usize = 16;
 
     pub fn new(
         dns_address: IpAddr,
@@ -842,13 +842,26 @@ mod tests {
                 Err(CompileError::ListenerConflict)
             ));
         }
+        assert!(
+            empty_bridge()
+                .with_plain_dns_peers(vec![
+                    ("1.1.1.1".parse().unwrap(), port(12557)),
+                    ("8.8.8.8".parse().unwrap(), port(12558)),
+                    ("9.9.9.9".parse().unwrap(), port(12559)),
+                    ("208.67.222.222".parse().unwrap(), port(12560)),
+                ])
+                .is_ok()
+        );
+        let too_many = (1..=SystemFakeDnsBridge::MAX_PLAIN_DNS_PEERS as u8 + 1)
+            .map(|index| {
+                (
+                    Ipv4Addr::new(192, 0, 2, index).into(),
+                    port(12600 + u16::from(index)),
+                )
+            })
+            .collect();
         assert!(matches!(
-            empty_bridge().with_plain_dns_peers(vec![
-                ("1.1.1.1".parse().unwrap(), port(12557)),
-                ("8.8.8.8".parse().unwrap(), port(12558)),
-                ("9.9.9.9".parse().unwrap(), port(12559)),
-                ("208.67.222.222".parse().unwrap(), port(12560)),
-            ]),
+            empty_bridge().with_plain_dns_peers(too_many),
             Err(CompileError::InvalidParameter)
         ));
     }

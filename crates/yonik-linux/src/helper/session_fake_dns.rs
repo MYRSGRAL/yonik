@@ -17,8 +17,9 @@ use crate::{
         plain_relay::{PlainDnsRelay, TCP_IDLE},
         plain_resolver_path,
         resolve1::{
-            Resolve1Domain, Resolve1Prepared, Resolve1Scope, Resolve1Snapshot, apply_link_dns,
-            prepare_link_dns, read_resolve1_snapshot,
+            Resolve1Domain, Resolve1Prepared, Resolve1Scope, Resolve1Snapshot, Resolve1TunSnapshot,
+            apply_link_dns, prepare_fallback_link_dns, prepare_link_dns,
+            read_resolve1_tun_snapshot,
         },
     },
 };
@@ -239,7 +240,7 @@ pub(super) struct PreparedFakeDns {
     suffixes: Vec<String>,
     listeners: Mutex<Option<FakeDnsBridgeListeners>>,
     source: ResolverSource,
-    resolved: Option<Arc<Resolve1Snapshot>>,
+    resolved: Option<Arc<Resolve1TunSnapshot>>,
     plain: Vec<(PlainDnsRelay, Option<u32>)>,
 }
 
@@ -283,18 +284,13 @@ fn resolved_peers(
 }
 
 async fn verify_resolved_baseline(
-    expected: &Resolve1Snapshot,
+    expected: &Resolve1TunSnapshot,
     own_link: Option<u32>,
 ) -> Result<(), ServiceError> {
     let (_owner, mut cancel) = Cancellation::new();
-    let mut current = read_resolve1_snapshot(&mut cancel, LIMIT)
+    let current = read_resolve1_tun_snapshot(&mut cancel, LIMIT, own_link)
         .await
         .map_err(|_| ServiceError::Unavailable)?;
-    if let Some(index) = own_link {
-        let scope = Resolve1Scope::Link(index);
-        current.endpoints.retain(|endpoint| endpoint.scope != scope);
-        current.domains.retain(|domain| domain.scope != scope);
-    }
     if &current != expected {
         return Err(ServiceError::Unavailable);
     }
@@ -367,7 +363,7 @@ impl PreparedFakeDns {
         let resolved = if matches!(source, ResolverSource::Resolved(_)) {
             config = config.reject_unbound_system_dns();
             Some(Arc::new(
-                read_resolve1_snapshot(cancel, LIMIT)
+                read_resolve1_tun_snapshot(cancel, LIMIT, None)
                     .await
                     .map_err(|_| ServiceError::Unavailable)?,
             ))
@@ -380,10 +376,22 @@ impl PreparedFakeDns {
                 .iter()
                 .map(|&address| (address, None))
                 .collect(),
-            (_, Some(snapshot)) => resolved_peers(snapshot, topology),
+            (_, Some(snapshot)) => resolved_peers(&snapshot.config, topology),
             _ => return Err(ServiceError::Unavailable),
         };
         if upstreams.len() > SystemFakeDnsBridge::MAX_PLAIN_DNS_PEERS {
+            return Err(ServiceError::Unsupported);
+        }
+        if resolved.as_ref().is_some_and(|snapshot| {
+            snapshot.fallback_only
+                && (upstreams.len() != snapshot.config.endpoints.len()
+                    || snapshot
+                        .config
+                        .domains
+                        .iter()
+                        .any(|domain| domain.scope == Resolve1Scope::Global))
+        }) {
+            // При переносе fallback на линк resolved меняет набор search domains.
             return Err(ServiceError::Unsupported);
         }
         let mark = NonZeroU32::new(plan.socket_mark()).ok_or(ServiceError::Unavailable)?;
@@ -454,13 +462,28 @@ impl PreparedFakeDns {
         if let Some(expected) = &self.resolved {
             verify_resolved_baseline(expected, None).await?;
         }
-        let resolved = match &self.source {
-            ResolverSource::Resolved(_) => Some(
+        let resolved = match &self.resolved {
+            Some(snapshot) if snapshot.fallback_only => {
+                // Сохраняем порядок резервных серверов из resolved. Каждый адрес
+                // уже имеет отдельный релей и проверенный физический маршрут.
+                let servers = snapshot
+                    .config
+                    .endpoints
+                    .iter()
+                    .map(|server| server.address)
+                    .collect::<Vec<_>>();
+                Some(
+                    prepare_fallback_link_dns(ifindex, &servers, &self.suffixes, LIMIT)
+                        .await
+                        .map_err(|_| ServiceError::Unsupported)?,
+                )
+            }
+            Some(_) => Some(
                 prepare_link_dns(ifindex, self.marker, &self.suffixes, LIMIT)
                     .await
                     .map_err(|_| ServiceError::Unsupported)?,
             ),
-            ResolverSource::Literal(..) => None,
+            None => None,
         };
         leases
             .advance_epoch(epoch)
@@ -485,7 +508,7 @@ impl PreparedFakeDns {
                 let name = forward_query_name(packet)?;
                 if !for_task.approves(&name) {
                     if for_task.resolved.as_ref().is_some_and(|snapshot| {
-                        !permits_resolver_name(&snapshot.domains, &name, link)
+                        !permits_resolver_name(&snapshot.config.domains, &name, link)
                     }) {
                         return Err(ResolverError::Untrusted);
                     }
@@ -641,7 +664,7 @@ pub(super) struct ActiveFakeDns {
     _stop: tokio::sync::watch::Sender<bool>,
     task: JoinHandle<std::io::Result<()>>,
     resolved: Option<Resolve1Prepared>,
-    original_resolved: Option<Arc<Resolve1Snapshot>>,
+    original_resolved: Option<Arc<Resolve1TunSnapshot>>,
     ifindex: u32,
     source: ResolverSource,
     pub horizon: PublicationHorizon,
