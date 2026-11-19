@@ -377,6 +377,7 @@ impl Drop for PrivateBus {
 #[derive(Default)]
 struct FakeState {
     jobs: Vec<(String, String)>,
+    loaded_units: Vec<String>,
     populated: bool,
     pid: u32,
     invocation: Vec<u8>,
@@ -408,6 +409,7 @@ impl FakeManager {
         {
             return Err(zbus::fdo::Error::InvalidArgs("Неизвестный unit".into()));
         }
+        self.0.lock().unwrap().loaded_units.push(name.to_owned());
         Ok(OwnedObjectPath::try_from(format!("/test/{}", name.replace(['.', '-'], "_"))).unwrap())
     }
     async fn start_unit(
@@ -606,6 +608,17 @@ impl Fixture {
         }
     }
 }
+#[tokio::test]
+async fn worker_state_reads_unit_and_service_from_one_path_lookup() {
+    let fixture = Fixture::new().await;
+    let mode = WorkerMode::Run;
+    let state = fixture.supervisor.state(mode).await.unwrap();
+    assert_eq!(state.active, "inactive");
+    assert_eq!(state.pid, 0);
+    assert_eq!(state.invocation, vec![7; 16]);
+    assert_eq!(fixture.state.lock().unwrap().loaded_units, [mode.service()]);
+}
+
 #[tokio::test]
 async fn cleanup_stops_both_sockets_before_services_and_confirms_empty() {
     let mut fixture = Fixture::new().await;

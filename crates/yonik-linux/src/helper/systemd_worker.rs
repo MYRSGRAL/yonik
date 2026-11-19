@@ -1563,6 +1563,9 @@ impl SystemWorkerSupervisor {
     }
     async fn properties(&self, unit: &str, interface: &str) -> Result<Properties> {
         let path = self.path(unit).await?;
+        self.properties_at(&path, interface).await
+    }
+    async fn properties_at(&self, path: &OwnedObjectPath, interface: &str) -> Result<Properties> {
         let proxy = zbus::Proxy::new(
             &self.connection,
             self.owner.as_str(),
@@ -1577,8 +1580,9 @@ impl SystemWorkerSupervisor {
             .map_err(unavailable)
     }
     async fn state(&self, mode: WorkerMode) -> Result<WorkerState> {
-        let unit = self.properties(mode.service(), UNIT_IFACE).await?;
-        let service = self.properties(mode.service(), SERVICE_IFACE).await?;
+        let path = self.path(mode.service()).await?;
+        let unit = self.properties_at(&path, UNIT_IFACE).await?;
+        let service = self.properties_at(&path, SERVICE_IFACE).await?;
         let cgroup = string(&service, "ControlGroup")?;
         if !cgroup.is_empty() && cgroup != mode.cgroup() {
             return Err(WorkerSupervisorError::Untrusted);
@@ -1611,7 +1615,8 @@ impl SystemWorkerSupervisor {
                 (mode.service(), SERVICE_IFACE),
                 (mode.socket(), SOCKET_IFACE),
             ] {
-                let unit = self.properties(name, UNIT_IFACE).await?;
+                let path = self.path(name).await?;
+                let unit = self.properties_at(&path, UNIT_IFACE).await?;
                 let drop_ins = strings(&unit, "DropInPaths")?;
                 if string(&unit, "LoadState")? != "loaded"
                     || string(&unit, "FragmentPath")? != format!("/usr/lib/systemd/system/{name}")
@@ -1628,7 +1633,7 @@ impl SystemWorkerSupervisor {
                         return Err(WorkerSupervisorError::Untrusted);
                     }
                 }
-                let properties = self.properties(name, interface).await?;
+                let properties = self.properties_at(&path, interface).await?;
                 if !drop_ins.is_empty() {
                     verify_worker_timeout_abort_mask(name)?;
                     if string(&properties, "TimeoutStopFailureMode")? != "terminate" {
