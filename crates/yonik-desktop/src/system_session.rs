@@ -162,48 +162,24 @@ impl SystemSession {
         policy: &yonik_linux::system_policy::InlinePolicy,
         suffixes: &[String],
         deadline: Instant,
-        mut cancel: Cancellation,
+        cancel: Cancellation,
     ) -> Result<(), ClientError> {
         self.fence(revision)?;
         self.prepared = None;
         yonik_engine::validate_scoped_fake_dns_policy(policy.policy().policy(), suffixes)
             .map_err(|_| ClientError::Unsupported)?;
-        // После Unlock собственные сетевые события могут ещё обрабатываться.
-        // Prepare не выдаёт дескриптор при Busy или Stale. После Stale один
-        // раз запрашиваем новый снимок сети в пределах общего дедлайна.
-        let busy_window = std::time::Duration::from_secs(3);
-        let mut retry_until = deadline.min(Instant::now() + busy_window);
-        let mut retried_stale = false;
-        let prepared = loop {
-            let result = self
-                .client
-                .prepare_fake_dns_policy_profile(
-                    server,
-                    engine,
-                    true,
-                    suffixes,
-                    policy.policy(),
-                    deadline,
-                    cancel.clone(),
-                )
-                .await;
-            let now = Instant::now();
-            let retry_deadline = match result {
-                Err(ClientError::Busy) if now < retry_until => retry_until,
-                Err(ClientError::Stale) if !retried_stale && now < deadline => {
-                    retried_stale = true;
-                    retry_until = deadline.min(now + busy_window);
-                    deadline
-                }
-                _ => break result?,
-            };
-            let retry_at = retry_deadline.min(now + std::time::Duration::from_millis(50));
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(ClientError::Cancelled),
-                () = tokio::time::sleep_until(retry_at) => {}
-            }
-        };
+        let prepared = self
+            .client
+            .prepare_fake_dns_policy_profile(
+                server,
+                engine,
+                true,
+                suffixes,
+                policy.policy(),
+                deadline,
+                cancel,
+            )
+            .await?;
         self.prepared = Some(
             PreparedOutput::bind(prepared, engine, &self.log, revision.generation)
                 .map_err(|_| ClientError::Unavailable)?,

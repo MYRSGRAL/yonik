@@ -137,6 +137,77 @@ impl Server {
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(3)
 }
+
+#[tokio::test]
+async fn fake_dns_prepare_retries_two_stale_replies() {
+    use futures_util::StreamExt;
+
+    let bus = Bus::new();
+    let server = bus.connect().await;
+    server.request_name(SERVICE_NAME).await.unwrap();
+    let mut calls = zbus::MessageStream::from(&server);
+    let reply_server = server.clone();
+    let respond = tokio::spawn(async move {
+        let mut replies = 0;
+        while let Some(Ok(message)) = calls.next().await {
+            let header = message.header();
+            if header.member().map(|member| member.as_str()) != Some("Prepare") {
+                continue;
+            }
+            let request: String = message.body().deserialize().unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["mode"], "system_profile_fake_dns");
+            replies += 1;
+            if replies == 3 {
+                let reply = serde_json::json!({"version":1,"handle":vec![42;32]}).to_string();
+                reply_server.reply(&message, &reply).await.unwrap();
+            } else {
+                let error = if replies <= 2 {
+                    "stale"
+                } else {
+                    "authorization"
+                };
+                let reply = serde_json::json!({"version":1,"error":error}).to_string();
+                reply_server
+                    .reply_error(&message, "cloud.highpriority.yonik.Network1.Error", &reply)
+                    .await
+                    .unwrap();
+                if replies == 4 {
+                    break;
+                }
+            }
+        }
+    });
+    let input = yonik_import::import_bytes(
+        b"vless://11111111-1111-1111-1111-111111111111@192.0.2.1:443".to_vec(),
+    )
+    .unwrap();
+    let intent = yonik_import::ServerIntent::from_server(&input.servers[0]).unwrap();
+    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+        r#"{"version":1,"default_action":"proxy","user_rules":[],"preset_rules":[],"lan":[],"private_networks":[],"private_domains":[]}"#,
+    )
+    .unwrap();
+    let (_keep, cancel) = Cancellation::new();
+    let mut client = SystemClient::on_connection(bus.connect().await, deadline(), cancel.clone())
+        .await
+        .unwrap();
+    for expected in [None, Some(ClientError::Denied)] {
+        let result = client
+            .prepare_fake_dns_policy_profile(
+                &intent,
+                yonik_engine::Engine::Xray,
+                false,
+                &["example.test".to_owned()],
+                &policy,
+                deadline(),
+                cancel.clone(),
+            )
+            .await;
+        assert_eq!(result.err(), expected);
+    }
+    respond.await.unwrap();
+}
+
 #[tokio::test]
 async fn real_bus_contract_errors_cancellation_and_owner_fence() {
     let bus = Bus::new();

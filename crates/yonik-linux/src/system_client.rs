@@ -1,7 +1,8 @@
 //! Клиент закрытого IPC v1. Потеря имени необратимо инвалидирует экземпляр.
 //!
 //! Отмена или deadline после отправки мутации означает неизвестный исход эффекта.
-//! Клиент никогда не повторяет RPC; controller должен явно запросить State.
+//! При неизвестном исходе controller должен явно запросить State.
+//! Prepare с политикой Fake DNS повторяется только после подтверждённого отказа.
 use crate::Cancellation;
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -524,6 +525,7 @@ impl SystemClient {
     }
 
     /// Системный Fake DNS для явно заданных суффиксов с проверяемой политикой.
+    /// После Busy или Stale запрашивает новый Prepare в ограниченном окне.
     #[allow(clippy::too_many_arguments)] // Явные границы IPC и отмены.
     pub async fn prepare_fake_dns_policy_profile(
         &mut self,
@@ -533,20 +535,45 @@ impl SystemClient {
         domains: &[String],
         policy: &yonik_engine::policy_wire::SystemPolicy,
         deadline: Instant,
-        cancel: Cancellation,
+        mut cancel: Cancellation,
     ) -> Result<Prepared, ClientError> {
-        self.prepare_profile_with_dns(
-            server,
-            engine,
-            kill_switch,
-            Some(FakeDnsProfile {
-                domains,
-                policy: Some(policy),
-            }),
-            deadline,
-            cancel,
-        )
-        .await
+        let retry_window = Duration::from_secs(3);
+        let mut retry_until = deadline.min(Instant::now() + retry_window);
+        let mut saw_stale = false;
+        loop {
+            let result = self
+                .prepare_profile_with_dns(
+                    server,
+                    engine,
+                    kill_switch,
+                    Some(FakeDnsProfile {
+                        domains,
+                        policy: Some(policy),
+                    }),
+                    deadline,
+                    cancel.clone(),
+                )
+                .await;
+            let now = Instant::now();
+            if matches!(result, Err(ClientError::Stale)) && !saw_stale {
+                // Первая проверка могла занять несколько секунд до смены сети.
+                saw_stale = true;
+                retry_until = deadline.min(now + retry_window);
+            }
+            if !matches!(result, Err(ClientError::Busy | ClientError::Stale)) || now >= retry_until
+            {
+                return result;
+            }
+            let retry_at = retry_until.min(now + Duration::from_millis(50));
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(ClientError::Cancelled),
+                () = tokio::time::sleep_until(retry_at) => {}
+            }
+            if Instant::now() >= retry_until {
+                return result;
+            }
+        }
     }
 
     async fn prepare_profile_with_dns(
