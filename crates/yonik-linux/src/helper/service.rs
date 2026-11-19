@@ -132,6 +132,9 @@ pub struct BundleDigests {
 /// Единственный владелец привилегированных эффектов; dispatcher сериализует доступ.
 pub trait ProtectionHost: Send + 'static {
     type Artifact: PreparedArtifact;
+    fn shutdown(&mut self) -> impl Future<Output = Result<(), ServiceError>> + Send {
+        async { Ok(()) }
+    }
     fn prepare_full_profile(
         &mut self,
         _uid: u32,
@@ -568,8 +571,9 @@ pub(super) async fn serve_with_broker<H: ProtectionHost>(
     peers.revoke_all();
     let _ = stop.send(true);
     while tasks.join_next().await.is_some() {}
+    let cleanup = host.lock().await.shutdown().await;
     let _ = connection.release_name(SERVICE_NAME).await;
-    result
+    result.and(cleanup)
 }
 
 fn forget_disconnected<A: PreparedArtifact>(

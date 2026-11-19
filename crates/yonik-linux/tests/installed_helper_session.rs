@@ -329,21 +329,27 @@ async fn check_tun_traffic_to(servers: [std::net::SocketAddr; 2]) -> Result {
 #[tokio::test]
 #[ignore = "выделенная Debian VM с тестовой сборкой установленного helper"]
 async fn production_helper_resolved_fake_dns() -> Result {
-    installed_fake_dns(None, None, None, None).await
+    installed_fake_dns(None, HelperLifecycle::Normal, None, None).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM с контролируемым DNS за veth"]
 async fn production_helper_literal_fake_dns() -> Result {
-    installed_fake_dns(Some("10.203.1.2:53".parse()?), None, None, None).await
+    installed_fake_dns(
+        Some("10.203.1.2:53".parse()?),
+        HelperLifecycle::Normal,
+        None,
+        None,
+    )
+    .await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "выделенная Debian VM для SIGKILL и истечения Fake-IP"]
 async fn production_helper_fake_dns_survives_sigkill() -> Result {
-    installed_fake_dns(None, Some(Engine::Xray), None, None).await
+    installed_fake_dns(None, HelperLifecycle::Crash(Engine::Xray), None, None).await
 }
 
 #[cfg(feature = "test-support")]
@@ -351,7 +357,15 @@ async fn production_helper_fake_dns_survives_sigkill() -> Result {
 #[ignore = "выделенная Debian VM с обычным Prepare и политикой Proxy"]
 async fn production_helper_scoped_fake_dns_policy() -> Result {
     let policy = scoped_fake_dns_proxy_policy()?;
-    installed_fake_dns(None, None, Some(&policy), None).await
+    installed_fake_dns(None, HelperLifecycle::Normal, Some(&policy), None).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная Debian VM с автономным helper и остановкой службы после Apply"]
+async fn production_helper_standalone_shutdown_restores_network() -> Result {
+    let policy = scoped_fake_dns_proxy_policy()?;
+    installed_fake_dns(None, HelperLifecycle::Shutdown, Some(&policy), None).await
 }
 
 #[cfg(feature = "test-support")]
@@ -359,7 +373,13 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
 #[ignore = "выделенная VM, штатный Prepare Xray и SIGKILL установленного helper"]
 async fn production_helper_xray_fake_dns_recovers() -> Result {
     let policy = scoped_fake_dns_proxy_policy()?;
-    installed_fake_dns(None, Some(Engine::Xray), Some(&policy), None).await
+    installed_fake_dns(
+        None,
+        HelperLifecycle::Crash(Engine::Xray),
+        Some(&policy),
+        None,
+    )
+    .await
 }
 
 #[cfg(feature = "test-support")]
@@ -367,7 +387,13 @@ async fn production_helper_xray_fake_dns_recovers() -> Result {
 #[ignore = "выделенная VM, штатный Prepare sing-box и SIGKILL установленного helper"]
 async fn production_helper_sing_box_fake_dns_recovers() -> Result {
     let policy = scoped_fake_dns_proxy_policy()?;
-    installed_fake_dns(None, Some(Engine::SingBox), Some(&policy), None).await
+    installed_fake_dns(
+        None,
+        HelperLifecycle::Crash(Engine::SingBox),
+        Some(&policy),
+        None,
+    )
+    .await
 }
 
 #[cfg(feature = "test-support")]
@@ -2036,7 +2062,11 @@ async fn installed_fake_dns_with_domain_policy(
     )?;
     installed_fake_dns(
         None,
-        crash.then_some(Engine::Xray),
+        if crash {
+            HelperLifecycle::Crash(Engine::Xray)
+        } else {
+            HelperLifecycle::Normal
+        },
         Some(&policy),
         Some(witness),
     )
@@ -2052,9 +2082,17 @@ enum FakeDnsPolicyWitness {
 }
 
 #[cfg(feature = "test-support")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelperLifecycle {
+    Normal,
+    Crash(Engine),
+    Shutdown,
+}
+
+#[cfg(feature = "test-support")]
 async fn installed_fake_dns(
     literal: Option<std::net::SocketAddr>,
-    crash_engine: Option<Engine>,
+    lifecycle: HelperLifecycle,
     policy: Option<&yonik_engine::policy_wire::SystemPolicy>,
     policy_witness: Option<FakeDnsPolicyWitness>,
 ) -> Result {
@@ -2092,10 +2130,12 @@ async fn installed_fake_dns(
     };
     for engine in [Engine::Xray, Engine::SingBox]
         .into_iter()
-        .filter(|engine| crash_engine.is_none_or(|selected| *engine == selected))
+        .filter(
+            |engine| !matches!(lifecycle, HelperLifecycle::Crash(selected) if *engine != selected),
+        )
         .filter(|engine| fallback_engine.is_none_or(|selected| *engine == selected))
     {
-        let crash = crash_engine.is_some();
+        let crash = matches!(lifecycle, HelperLifecycle::Crash(_));
         let kill_switch = engine == Engine::Xray;
         require(
             state_after_route_events(&connection).await?["state"] == "no_managed_policy",
@@ -2215,6 +2255,13 @@ async fn installed_fake_dns(
         if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
             check_https_through_tun(&certificate, literal.map(|_| v4)).await?;
         }
+        let restarted_at = if lifecycle == HelperLifecycle::Shutdown {
+            stop_standalone_fixture(v4, v6, kill_switch).await?;
+            eprintln!("{engine:?}: служба очистила сеть и остановила worker до перезапуска");
+            Some(tokio::time::Instant::now())
+        } else {
+            None
+        };
         if crash {
             let expected_state = if kill_switch {
                 "recovery_required"
@@ -2292,8 +2339,79 @@ async fn installed_fake_dns(
         eprintln!(
             "{engine:?} установленный helper, системный DNS, TCP/UDP IPv4/IPv6 и восстановление подтверждены"
         );
+        if let Some(restarted_at) =
+            restarted_at.filter(|_| kill_switch && fallback_engine.is_none())
+        {
+            // Новый helper выдерживает максимальный TTL перед повторной выдачей Fake-IP.
+            tokio::time::sleep_until(restarted_at + yonik_linux::fake_service::MAX_FAKE_TTL).await;
+        }
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn stop_standalone_fixture(
+    v4: std::net::IpAddr,
+    v6: std::net::IpAddr,
+    kill_switch: bool,
+) -> Result {
+    const UNIT: &str = "yonik-standalone-fixture.service";
+    let tun_links = || -> Result<Vec<Value>> {
+        let output = Command::new("/usr/sbin/ip")
+            .args(["-j", "link", "show", "type", "tun"])
+            .output()?;
+        require(output.status.success(), "Не прочитаны интерфейсы TUN")?;
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    require(tun_links()?.len() == 1, "Нет единственного TUN стенда")?;
+    let manage_fixture = |operation: &'static str| async move {
+        let status = tokio::time::timeout(
+            Duration::from_secs(40),
+            tokio::process::Command::new("/usr/bin/systemctl")
+                .args([operation, UNIT])
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await??;
+        require(
+            status.success(),
+            "Штатное управление службой завершилось ошибкой",
+        )
+    };
+    manage_fixture("stop").await?;
+    for role in ["check", "run"] {
+        let events = fs::read_to_string(format!(
+            "/sys/fs/cgroup/yonik-worker-standalone/{role}/cgroup.events"
+        ))?;
+        require(
+            events.lines().any(|line| line == "populated 0"),
+            "После остановки helper в cgroup остался worker",
+        )?;
+    }
+    require(
+        tun_links()?.is_empty(),
+        "TUN остался после остановки helper",
+    )?;
+    require(
+        quarantine_table_name(nft_test_binary())?.is_some(),
+        "Остановка службы сняла карантин Fake-IP",
+    )?;
+    if kill_switch {
+        require(
+            !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio::net::TcpStream::connect("10.203.0.2:24443"),
+                )
+                .await,
+                Ok(Ok(_))
+            ),
+            "После остановки helper отключился kill switch",
+        )?;
+    } else {
+        check_only_fake_is_filtered(v4, v6).await?;
+    }
+    manage_fixture("start").await
 }
 
 #[cfg(feature = "test-support")]

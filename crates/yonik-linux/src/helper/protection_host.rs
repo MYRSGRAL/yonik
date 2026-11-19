@@ -81,6 +81,8 @@ pub struct SystemProtectionHost {
     runtime: tokio::runtime::Handle,
     _safety: Option<session_host::SafetyTask>,
     _dhcp_sleep: Option<super::dhcp_sleep::DhcpSleepTask>,
+    #[cfg(feature = "test-support")]
+    standalone: bool,
 }
 const PROFILE_ADMISSION_BOUND: Duration = Duration::from_secs(2);
 
@@ -205,6 +207,11 @@ impl SystemProtectionHost {
         let seed = u64::from_le_bytes(random).max(1);
         let exited = Arc::new(tokio::sync::Notify::new());
         let backend_exited = Arc::clone(&exited);
+        #[cfg(feature = "test-support")]
+        let standalone = matches!(
+            &supervisor,
+            Some(super::session_supervisor::SessionSupervisor::Standalone(_))
+        );
         let dhcp_sleep = Arc::new(super::dhcp_sleep::DhcpSleep::default());
         let sleep_watch = (!isolated)
             .then(|| super::dhcp_sleep::watch(Arc::clone(&dhcp_sleep), Arc::clone(&exited)));
@@ -256,6 +263,8 @@ impl SystemProtectionHost {
             runtime,
             _safety: Some(safety),
             _dhcp_sleep: sleep_watch,
+            #[cfg(feature = "test-support")]
+            standalone,
         })
     }
     async fn job(&self, operation: Operation, cancel: Cancellation) -> Result<Reply, ServiceError> {
@@ -331,6 +340,28 @@ async fn execute_job(
     .map_err(unavailable)?
 }
 impl Backend {
+    #[cfg(feature = "test-support")]
+    async fn shutdown_standalone(&mut self, cancel: &mut Cancellation) -> Result<(), ServiceError> {
+        use super::session_supervisor::SessionSupervisor;
+        if self.has_session() {
+            let uid = self
+                .journal
+                .as_ref()
+                .ok_or(ServiceError::Unavailable)?
+                .ownership()
+                .owner_uid();
+            return match self.finish_session(uid, false).await? {
+                ProtectionState::NoManagedPolicy | ProtectionState::RecoveryRequired => Ok(()),
+                _ => Err(ServiceError::Unavailable),
+            };
+        }
+        // Публичная политика и истекающий Fake-IP карантин живут без сессии.
+        let Some(SessionSupervisor::Standalone(supervisor)) = &mut self.supervisor else {
+            return Err(ServiceError::Unavailable);
+        };
+        supervisor.recover(cancel).await.map_err(unavailable)
+    }
+
     fn snapshot(&self) -> Result<crate::NetworkSnapshot, ServiceError> {
         let snapshot = self.watch.current();
         if !snapshot.coverage.routes || snapshot.exhausted {
@@ -648,6 +679,31 @@ fn compile_protection(
 }
 impl ProtectionHost for SystemProtectionHost {
     type Artifact = GuardArtifact;
+
+    #[cfg(feature = "test-support")]
+    async fn shutdown(&mut self) -> Result<(), ServiceError> {
+        if !self.standalone {
+            return Ok(());
+        }
+        drop(self._safety.take());
+        drop(self._dhcp_sleep.take());
+        let (owner, mut cancel) = Cancellation::new();
+        let permit = wait_for_stop(
+            Arc::clone(&self.operations),
+            &mut cancel,
+            super::service::STOP_WAIT_BOUND,
+        )
+        .await?;
+        let shared = Arc::clone(&self.backend);
+        let runtime = self.runtime.clone();
+        tokio::task::spawn_blocking(move || {
+            let (_owner, _permit) = (owner, permit);
+            let mut backend = shared.lock().map_err(unavailable)?;
+            runtime.block_on(backend.shutdown_standalone(&mut cancel))
+        })
+        .await
+        .map_err(unavailable)?
+    }
     async fn prepare_full_profile(
         &mut self,
         uid: u32,
