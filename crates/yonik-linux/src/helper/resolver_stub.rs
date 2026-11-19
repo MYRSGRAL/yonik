@@ -577,6 +577,8 @@ mod observation {
                 cookie,
                 cgroup: 42,
                 v6only: false,
+                tos: None,
+                mark: None,
             }
         }
         fn fake() -> Fake {

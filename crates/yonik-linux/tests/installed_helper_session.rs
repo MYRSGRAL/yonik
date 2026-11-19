@@ -580,11 +580,16 @@ async fn dhcp_networkd_lease_is_bound_to_kernel_socket_and_revoked_after_renewal
         .path()
         .ok_or_else(|| io::Error::other("Недоступен путь DHCP"))?;
     let group = fs::metadata("/sys/fs/cgroup/system.slice/systemd-networkd.service")?;
+    let expected_tos = std::env::var("YONIK_DHCP_EXPECTED_TOS")
+        .unwrap_or_else(|_| "192".to_owned())
+        .parse::<u8>()?;
     require(
         original_path.ifname == "yonik-dhcp"
             && original_path.address == std::net::Ipv4Addr::new(10, 203, 2, 10)
             && original_path.server == std::net::Ipv4Addr::new(10, 203, 2, 1)
-            && original_path.cgroup_id.get() == group.ino(),
+            && original_path.cgroup_id.get() == group.ino()
+            && original_path.route_tos == expected_tos
+            && original_path.route_mark == 0,
         "Ядро и лизинг DHCP указывают на разные пути",
     )?;
     original.revalidate(&mut token).await?;

@@ -19,6 +19,8 @@ const MAX_PROCESSES: usize = 256;
 const MAX_TASKS: usize = 256;
 const MAX_FDS_PER_TASK: usize = 256;
 const MAX_DIAG_RECORDS: usize = 65536;
+const INET_DIAG_TOS: u16 = 5;
+const INET_DIAG_MARK: u16 = 15;
 
 fn u32n(b: &[u8]) -> Result<u32, Unavailable> {
     Ok(u32::from_ne_bytes(
@@ -42,6 +44,8 @@ pub(crate) struct Listener {
     pub cookie: u64,
     pub cgroup: u64,
     pub v6only: bool,
+    pub tos: Option<u8>,
+    pub mark: Option<u32>,
 }
 pub(crate) struct ListenerSet {
     rows: [Option<Listener>; 64],
@@ -112,6 +116,7 @@ impl ListenerDump {
         b[8..12].copy_from_slice(&self.sequence.to_ne_bytes());
         b[16] = self.family;
         b[17] = self.protocol;
+        b[18] = 1 << (INET_DIAG_TOS - 1);
         let states = if self.protocol == 6 {
             1u32 << 10
         } else {
@@ -195,6 +200,8 @@ impl ListenerDump {
                 }
                 let mut cgroup = None;
                 let mut v6only = None;
+                let mut tos = None;
+                let mut mark = None;
                 let mut at = 72;
                 while at < body.len() {
                     let h = body.get(at..at + 4).ok_or(Unavailable::Malformed)?;
@@ -205,6 +212,19 @@ impl ListenerDump {
                     }
                     let value = &body[at + 4..at + n];
                     match tag {
+                        INET_DIAG_TOS => {
+                            let [value] = value else {
+                                return Err(Unavailable::Malformed);
+                            };
+                            if tos.replace(*value).is_some() {
+                                return Err(Unavailable::Malformed);
+                            }
+                        }
+                        INET_DIAG_MARK => {
+                            if mark.replace(u32n(value)?).is_some() {
+                                return Err(Unavailable::Malformed);
+                            }
+                        }
                         21 => {
                             if value.len() != 8 || cgroup.is_some() {
                                 return Err(Unavailable::Coverage);
@@ -254,6 +274,8 @@ impl ListenerDump {
                     inode: u32n(&body[68..72])?,
                     cookie,
                     cgroup: group,
+                    tos,
+                    mark,
                     v6only: if self.family == 10 {
                         v6only.ok_or(Unavailable::Coverage)?
                     } else {
@@ -319,6 +341,56 @@ mod listener_pure_tests {
         b[8..12].copy_from_slice(&seq.to_ne_bytes());
         b
     }
+    #[test]
+    fn listener_dump_requests_ipv4_tos_extension() {
+        let mut dump = ListenerDump::new(17, 68).expect("Запрос DHCP-сокета");
+        assert_ne!(dump.request()[18] & (1 << 4), 0);
+        dump.consume(&done(1), ReturnFlags::empty(), true)
+            .expect("Завершение IPv4");
+        dump.begin_v6().expect("Начало IPv6");
+        assert_ne!(dump.request()[18] & (1 << 4), 0);
+    }
+
+    #[test]
+    fn listener_dump_preserves_tos_and_mark_and_rejects_duplicate_selectors() {
+        let add = |wire: &mut Vec<u8>, kind: u16, value: &[u8]| {
+            let length = (value.len() + 4) as u16;
+            wire.extend_from_slice(&length.to_ne_bytes());
+            wire.extend_from_slice(&kind.to_ne_bytes());
+            wire.extend_from_slice(value);
+            wire.resize((wire.len() + 3) & !3, 0);
+            let length = wire.len() as u32;
+            wire[..4].copy_from_slice(&length.to_ne_bytes());
+        };
+        let mut wire = message(2, 68, 29);
+        add(&mut wire, INET_DIAG_TOS, &[0x80]);
+        add(&mut wire, INET_DIAG_MARK, &0x1234u32.to_ne_bytes());
+        let mut dump = ListenerDump::new(17, 68).expect("Запрос DHCP-сокета");
+        dump.consume(&wire, ReturnFlags::empty(), true)
+            .expect("Сокет");
+        dump.consume(&message(2, 68, 30), ReturnFlags::empty(), true)
+            .expect("Сокет без дополнительных атрибутов");
+        let mut rows = dump.rows.iter();
+        let selected = rows.next().expect("Первый сокет");
+        assert_eq!((selected.tos, selected.mark), (Some(0x80), Some(0x1234)));
+        let plain = rows.next().expect("Второй сокет");
+        assert_eq!((plain.tos, plain.mark), (None, None));
+
+        for (kind, value) in [
+            (INET_DIAG_TOS, &[0xc0][..]),
+            (INET_DIAG_MARK, &[0, 0, 0, 0][..]),
+        ] {
+            let mut duplicate = wire.clone();
+            add(&mut duplicate, kind, value);
+            assert!(matches!(
+                ListenerDump::new(17, 68)
+                    .expect("Запрос DHCP-сокета")
+                    .consume(&duplicate, ReturnFlags::empty(), true),
+                Err(Unavailable::Malformed)
+            ));
+        }
+    }
+
     #[test]
     fn listener_pure_requires_both_complete_families_and_keeps_kernel_fields() {
         let mut dump = ListenerDump::new(17, 53).unwrap();

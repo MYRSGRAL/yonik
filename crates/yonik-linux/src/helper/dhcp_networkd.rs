@@ -45,7 +45,6 @@ const NETWORKD: &str = "org.freedesktop.network1";
 const SYSTEMD: &str = "org.freedesktop.systemd1";
 const CLIENT_PORT: u16 = 68;
 const SERVER_PORT: u16 = 67;
-const ROUTE_TOS_CS6: u8 = 0xc0;
 const DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
@@ -218,7 +217,8 @@ impl DhcpNetworkdLease {
             uid: self.daemon.uid,
             cgroup_id: self.daemon.group.1,
             namespace: self.namespace,
-            route_tos: ROUTE_TOS_CS6,
+            route_tos: self.route.0.query.tos(),
+            route_mark: self.route.0.query.mark(),
             expires_boottime_micros: self.expires.min(self.lease.t2),
         })
     }
@@ -264,8 +264,10 @@ pub struct DhcpRenewalPath<'a> {
     pub uid: u32,
     pub cgroup_id: NonZeroU64,
     pub namespace: NetworkNamespace,
-    /// RTM_GETROUTE проверен с обычным CS6. Фактический TOS сокета не считан.
+    /// Значения IP_TOS и SO_MARK прочитаны из сокета и переданы в RTM_GETROUTE.
+    /// При выдаче разрешения отдельно сверяются DSCP и метка самого пакета.
     pub route_tos: u8,
+    pub route_mark: u32,
     pub expires_boottime_micros: u64,
 }
 
@@ -317,11 +319,12 @@ async fn collect(
     {
         return Err(Error::Changed);
     }
+    let socket = sample_socket(topology.namespace, &lease, &daemon, deadline).await?;
     let query = RouteQuery::new(lease.server.into(), daemon.uid)
         .with_source(lease.address.into())?
         .with_interfaces(None, Some(index))
-        // Штатный IP_TOS DHCPv4 systemd-networkd равен CS6.
-        .with_tos(ROUTE_TOS_CS6)
+        .with_tos(socket.tos.ok_or(Error::Unsupported)?)
+        .with_mark(socket.mark.ok_or(Error::Unsupported)?)
         .with_transport(TransportProtocol::Udp, Some(CLIENT_PORT), Some(SERVER_PORT));
     let route = lookup_route_captured(query, cancel, remaining(deadline)?).await?;
     if route.0.namespace != topology.namespace
@@ -331,11 +334,11 @@ async fn collect(
     {
         return Err(Error::Unsupported);
     }
-    let socket = sample_socket(topology.namespace, &lease, &daemon, deadline).await?;
     let (after, after_timing) = read_topology_captured(cancel, remaining(deadline)?).await?;
     if !same_captured_topology(&topology, timing, &after, after_timing)
         || lease != describe(&connection, &daemon.owner, index.get()).await?
         || daemon != self::daemon(&connection, &bus).await?
+        || socket != sample_socket(topology.namespace, &lease, &daemon, deadline).await?
         || !same_pid(&pidfd, daemon.pid)?
         || boottime()? >= expires.min(lease.t2)
     {
