@@ -123,7 +123,7 @@ pub async fn handle_tcp(
     upstream: SocketAddr,
     incoming_auth: &SocksCredentials,
     upstream_auth: &SocksCredentials,
-    resolve_fake_ip: impl FnOnce(IpAddr) -> Option<DomainName>,
+    resolve_fake_ip: impl FnMut(IpAddr) -> Option<DomainName>,
     mut cancellation: Cancellation,
 ) -> Result<(), FakeFlowError> {
     validate_loopback(&incoming, upstream)?;
@@ -198,15 +198,13 @@ async fn handle_tcp_authenticated(
     request: AuthenticatedRequest,
     upstream: SocketAddr,
     upstream_auth: &SocksCredentials,
-    resolve_fake_ip: impl FnOnce(IpAddr) -> Option<DomainName>,
+    mut resolve_fake_ip: impl FnMut(IpAddr) -> Option<DomainName>,
     mut cancellation: Cancellation,
 ) -> Result<(), FakeFlowError> {
     let handshake = async {
         let target = read_tcp_target(&mut incoming, request).await?;
         let Some(domain) = resolve_fake_ip(target.ip) else {
-            incoming
-                .write_all(&[SOCKS_VERSION, 4, 0, 1, 0, 0, 0, 0, 0, 0])
-                .await?;
+            write_socks_failure(&mut incoming, 4).await?;
             return Err(FakeFlowError::UnknownFakeIp);
         };
         if domain.as_str().is_empty() || domain.as_str().len() > MAX_DOMAIN_LEN || target.port == 0
@@ -217,10 +215,22 @@ async fn handle_tcp_authenticated(
         if !core.local_addr()?.ip().is_loopback() || !core.peer_addr()?.ip().is_loopback() {
             return Err(FakeFlowError::NonLoopback);
         }
-        if let Err(error) = connect_core(&mut core, &domain, target.port, upstream_auth).await {
-            incoming
-                .write_all(&[SOCKS_VERSION, 5, 0, 1, 0, 0, 0, 0, 0, 0])
-                .await?;
+        let still_current = || resolve_fake_ip(target.ip).as_ref() == Some(&domain);
+        if let Err(error) = connect_core(
+            &mut core,
+            &domain,
+            target.port,
+            upstream_auth,
+            still_current,
+        )
+        .await
+        {
+            let reply = if matches!(error, FakeFlowError::UnknownFakeIp) {
+                4
+            } else {
+                5
+            };
+            write_socks_failure(&mut incoming, reply).await?;
             return Err(error);
         }
         incoming
@@ -229,8 +239,9 @@ async fn handle_tcp_authenticated(
         Ok::<_, FakeFlowError>(core)
     };
     let mut core = tokio::select! {
-        result = timeout(HANDSHAKE_TIMEOUT, handshake) => result.map_err(|_| FakeFlowError::Timeout)??,
+        biased;
         () = cancellation.cancelled() => return Err(FakeFlowError::Cancelled),
+        result = timeout(HANDSHAKE_TIMEOUT, handshake) => result.map_err(|_| FakeFlowError::Timeout)??,
     };
     tokio::select! {
         result = copy_bidirectional(&mut incoming, &mut core) => { result?; Ok(()) },
@@ -336,6 +347,7 @@ async fn connect_core(
     domain: &DomainName,
     port: u16,
     credentials: &SocksCredentials,
+    mut still_current: impl FnMut() -> bool,
 ) -> Result<(), FakeFlowError> {
     stream
         .write_all(&[SOCKS_VERSION, 1, METHOD_USER_PASS])
@@ -363,7 +375,20 @@ async fn connect_core(
     request.extend_from_slice(&[SOCKS_VERSION, 1, 0, 3, name.len() as u8]);
     request.extend_from_slice(name);
     request.extend_from_slice(&port.to_be_bytes());
-    stream.write_all(&request).await?;
+    let mut pending = request.as_slice();
+    while !pending.is_empty() {
+        stream.writable().await?;
+        // Аутентификация и ожидание сокета могут пережить срок выдачи адреса.
+        if !still_current() {
+            return Err(FakeFlowError::UnknownFakeIp);
+        }
+        match stream.try_write(pending) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+            Ok(written) => pending = &pending[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     read_socks_reply(stream).await
 }
 
@@ -1075,6 +1100,66 @@ mod tests {
         core.await.unwrap();
         drop(client);
         assert!(handler.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn истекший_при_аутентификации_fake_ip_не_отправляет_connect() {
+        use std::sync::{Mutex, atomic::AtomicU64};
+        use yonik_engine::fake_dns::{DnsEpoch, FakeIpFamily, FakeIpLeaseTable};
+
+        let fake_ip = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 7));
+        let epoch = DnsEpoch {
+            network: 1,
+            engine: 1,
+            resolver: 1,
+        };
+        let mut leases = FakeIpLeaseTable::new([fake_ip]).unwrap();
+        leases
+            .issue(
+                DomainName::from_str("example.org").unwrap(),
+                FakeIpFamily::V4,
+                epoch,
+                1,
+                10,
+            )
+            .unwrap();
+        let leases = Mutex::new(leases);
+        let now = Arc::new(AtomicU64::new(1));
+
+        let core_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let core_addr = core_listener.local_addr().unwrap();
+        let core_clock = Arc::clone(&now);
+        let core = tokio::spawn(async move {
+            let (mut stream, _) = core_listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 2]);
+            stream.write_all(&[5, 2]).await.unwrap();
+            let expected = b"\x01\x09core-user\x0bcore-secret";
+            let mut auth = [0; 23];
+            stream.read_exact(&mut auth).await.unwrap();
+            assert_eq!(&auth, expected);
+            core_clock.store(11, Ordering::SeqCst);
+            stream.write_all(&[1, 0]).await.unwrap();
+            let mut connect = [0; 1];
+            let length = stream.read(&mut connect).await.unwrap();
+            assert_eq!(length, 0, "Движок получил CONNECT с истёкшим Fake-IP");
+        });
+        let (mut client, handler) = start_handler(core_addr, move |address| {
+            let mut leases = leases.lock().unwrap();
+            leases
+                .lookup(address, epoch, now.load(Ordering::SeqCst))
+                .unwrap()
+                .map(|mapping| mapping.name)
+        })
+        .await;
+        let response = authenticate_and_request(&mut client, b"secret", fake_ip, 443).await;
+        core.await.unwrap();
+        assert_eq!(response, [SOCKS_VERSION, 4]);
+        assert!(matches!(
+            handler.await.unwrap(),
+            Err(FakeFlowError::UnknownFakeIp)
+        ));
     }
 
     #[tokio::test]
