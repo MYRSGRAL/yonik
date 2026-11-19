@@ -1,4 +1,4 @@
-//! Read-only привязка DHCPv4-лизинга networkd к адресу, сокету и маршруту ядра.
+//! Привязка DHCPv4-лизинга networkd к маршруту и проверяемым параметрам пакета.
 
 use super::{
     memory::ByteBudget,
@@ -50,6 +50,7 @@ const NETWORKD: &str = "org.freedesktop.network1";
 const SYSTEMD: &str = "org.freedesktop.systemd1";
 const CLIENT_PORT: u16 = 68;
 const SERVER_PORT: u16 = 67;
+const NETWORKD_DEFAULT_TOS: u8 = 48 << 2; // DSCP CS6.
 const DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
@@ -192,7 +193,7 @@ pub struct DhcpNetworkdLease {
     lease: Lease,
     daemon: Daemon,
     namespace: NetworkNamespace,
-    socket: Listener,
+    socket: Option<Listener>,
     route: (KernelRoute, RouteCapture),
     pidfd: OwnedFd,
     expires: u64,
@@ -217,7 +218,7 @@ impl DhcpNetworkdLease {
         }
     }
 
-    /// Срок, адреса и идентичность относятся к моменту проверки сокета.
+    /// Срок, адреса и идентичность относятся к моменту проверки лизинга.
     pub fn path(&self) -> Option<DhcpRenewalPath<'_>> {
         let now = boottime().ok()?;
         if self.revoked
@@ -302,8 +303,7 @@ pub struct DhcpRenewalPath<'a> {
     pub uid: u32,
     pub cgroup_id: NonZeroU64,
     pub namespace: NetworkNamespace,
-    /// Значения IP_TOS и SO_MARK прочитаны из сокета и переданы в RTM_GETROUTE.
-    /// При выдаче разрешения отдельно сверяются DSCP и метка самого пакета.
+    /// Параметры поиска маршрута проверяются по DSCP и метке пакета в nftables.
     pub route_tos: u8,
     pub route_mark: u32,
     pub expires_boottime_micros: u64,
@@ -358,11 +358,12 @@ async fn collect(
         return Err(Error::Changed);
     }
     let socket = sample_socket(topology.namespace, &lease, &daemon, deadline).await?;
+    let (tos, mark) = route_selectors(socket)?;
     let query = RouteQuery::new(lease.server.into(), daemon.uid)
         .with_source(lease.address.into())?
         .with_interfaces(None, Some(index))
-        .with_tos(socket.tos.ok_or(Error::Unsupported)?)
-        .with_mark(socket.mark.ok_or(Error::Unsupported)?)
+        .with_tos(tos)
+        .with_mark(mark)
         .with_transport(TransportProtocol::Udp, Some(CLIENT_PORT), Some(SERVER_PORT));
     let route = lookup_route_captured(query, cancel, remaining(deadline)?).await?;
     if route.0.namespace != topology.namespace
@@ -395,12 +396,22 @@ async fn collect(
     })
 }
 
+fn route_selectors(socket: Option<Listener>) -> Result<(u8, u32), Error> {
+    match socket {
+        Some(socket) => socket.tos.zip(socket.mark).ok_or(Error::Unsupported),
+        // networkd может открыть UDP-сокет вместе с отправкой первого DHCPREQUEST.
+        // До отправки проверяем маршрут для стандартного CS6 без метки. Допуск
+        // действует только для пакета с этими полями и сокетом UID/cgroup networkd.
+        None => Ok((NETWORKD_DEFAULT_TOS, 0)),
+    }
+}
+
 async fn sample_socket(
     namespace: NetworkNamespace,
     lease: &Lease,
     daemon: &Daemon,
     deadline: Instant,
-) -> Result<Listener, Error> {
+) -> Result<Option<Listener>, Error> {
     let uid = daemon.uid;
     let group = daemon.group.1.get();
     let address = lease.address.octets();
@@ -435,7 +446,7 @@ async fn sample_socket(
                 && socket.cgroup == group
                 && socket.inode != 0
         });
-        let socket = *matches.next().ok_or(Error::Unsupported)?;
+        let socket = matches.next().copied();
         if matches.next().is_some() {
             return Err(Error::Unsupported);
         }

@@ -3,10 +3,11 @@ policy_module(yonik_helper, 1.0)
 gen_require(`
     type init_t, iptables_t, var_run_t;
     type systemd_unit_file_t;
-    type fs_t;
+    type fs_t, nsfs_t;
     type initrc_t, unconfined_t;
     type ifconfig_t;
     type ephemeral_port_t, sysctl_net_t;
+    type systemd_logind_t, systemd_networkd_t, systemd_networkd_unit_file_t;
 ')
 
 type yonik_helper_t;
@@ -53,6 +54,25 @@ init_use_fds(yonik_helper_t)
 policykit_dbus_chat(yonik_helper_t)
 systemd_chat_resolved(yonik_helper_t)
 networkmanager_dbus_chat(yonik_helper_t)
+
+# Снимок DHCP сверяет D-Bus, cgroup процесса networkd и сокет UDP в ядре.
+allow yonik_helper_t systemd_networkd_t:dbus send_msg;
+allow systemd_networkd_t yonik_helper_t:dbus send_msg;
+allow yonik_helper_t systemd_networkd_unit_file_t:service status;
+allow yonik_helper_t systemd_networkd_t:dir search;
+allow yonik_helper_t systemd_networkd_t:file { open read };
+allow yonik_helper_t self:netlink_tcpdiag_socket { create getattr ioctl setopt write read nlmsg_read };
+# SIOCGSKNS и fstatfs подтверждают сетевое пространство сокета.
+allowxperm yonik_helper_t self:netlink_tcpdiag_socket ioctl 0x894c;
+allow yonik_helper_t nsfs_t:filesystem getattr;
+# Сверка числового inode cgroup читает правило через NFT_MSG_GETRULE.
+allow yonik_helper_t self:netlink_netfilter_socket { create bind getattr write read };
+
+# Перед сном logind ждёт закрытия возвращённого им дескриптора inhibitor.
+allow yonik_helper_t systemd_logind_t:dbus send_msg;
+allow systemd_logind_t yonik_helper_t:dbus send_msg;
+systemd_use_fds_logind(yonik_helper_t)
+systemd_write_inhibit_pipes(yonik_helper_t)
 
 iptables_domtrans(yonik_helper_t)
 allow yonik_helper_t iptables_t:process2 nnp_transition;

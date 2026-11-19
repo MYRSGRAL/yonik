@@ -73,9 +73,9 @@ UseNTP=no
 EOF
         ip link add "$client" type veth peer name "$server"
         ip link set "$server" netns "$peer"
-        ip -n "$peer" address add "$subnet.1/24" dev "$server"
-        ip -n "$peer" address add "$subnet.2/24" dev "$server"
-        ip -n "$peer" link set "$server" up
+        nsenter --net="/run/netns/$peer" -- ip address add "$subnet.1/24" dev "$server"
+        nsenter --net="/run/netns/$peer" -- ip address add "$subnet.2/24" dev "$server"
+        nsenter --net="/run/netns/$peer" -- ip link set "$server" up
         start_server "$subnet.1"
         systemctl start systemd-networkd.service
         networkctl reload
@@ -84,11 +84,11 @@ EOF
     disconnect)
         ip -4 route get "$subnet.1" from "$subnet.10" uid "$(id -u systemd-network)" \
             ipproto udp sport 68 dport 67 || true
-        ip -n "$peer" link set "$server" down
+        nsenter --net="/run/netns/$peer" -- ip link set "$server" down
         ;;
     "$subnet.1"|"$subnet.2")
         start_server "$1"
-        ip -n "$peer" link set "$server" up
+        nsenter --net="/run/netns/$peer" -- ip link set "$server" up
         ;;
     *) exit 2 ;;
 esac

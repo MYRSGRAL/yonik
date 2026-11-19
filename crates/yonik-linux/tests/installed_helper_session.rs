@@ -1270,13 +1270,7 @@ async fn renew_dhcp_links(
     links: &[(&str, &str, &str)],
     offline: Option<&str>,
 ) -> Result {
-    let networkd = zbus::Proxy::new(
-        connection,
-        "org.freedesktop.network1",
-        "/org/freedesktop/network1",
-        "org.freedesktop.network1.Manager",
-    )
-    .await?;
+    let networkd = networkd_fixture(connection).await?;
     let mut pending = std::collections::BTreeMap::new();
     for (name, _, _) in links {
         let index: i32 = fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))?
@@ -1332,12 +1326,25 @@ async fn dhcp_lease_timestamp(networkd: &zbus::Proxy<'_>, index: i32) -> Result<
 }
 
 #[cfg(feature = "test-support")]
+async fn networkd_fixture(connection: &zbus::Connection) -> zbus::Result<zbus::Proxy<'_>> {
+    zbus::Proxy::new(
+        connection,
+        "org.freedesktop.network1",
+        "/org/freedesktop/network1",
+        "org.freedesktop.network1.Manager",
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
 async fn check_dhcp_fixture_dns(address: &str, token: &mut yonik_linux::Cancellation) -> Result {
     let index = fs::read_to_string("/sys/class/net/yonik-dhcp/ifindex")?;
     let index: u32 = index.trim().parse()?;
-    let lease_path = format!("/run/systemd/netif/leases/{index}");
-    let expected_lease = format!("DNS={address}");
-    let address = address.parse::<std::net::IpAddr>()?;
+    let bus_index = i32::try_from(index)?;
+    let address = address.parse::<std::net::Ipv4Addr>()?;
+    let expected_dns = json!(address.octets());
+    let connection = zbus::Connection::system().await?;
+    let networkd = networkd_fixture(&connection).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1356,10 +1363,18 @@ async fn check_dhcp_fixture_dns(address: &str, token: &mut yonik_linux::Cancella
             .next()
             .is_some_and(|endpoint| endpoint.address == address)
             && endpoints.next().is_none()
-            && fs::read_to_string(&lease_path)
-                .is_ok_and(|lease| lease.lines().any(|line| line == expected_lease))
         {
-            return Ok(());
+            let description: String =
+                tokio::time::timeout_at(deadline, networkd.call("DescribeLink", &(bus_index,)))
+                    .await??;
+            let link: Value = serde_json::from_str(&description)?;
+            if link["DNS"].as_array().is_some_and(|servers| {
+                servers.iter().any(|server| {
+                    server["ConfigSource"] == "DHCPv4" && server["Address"] == expected_dns
+                })
+            }) {
+                return Ok(());
+            }
         }
         tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
     }

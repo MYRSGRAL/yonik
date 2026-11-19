@@ -17,7 +17,7 @@
 | Debian 13.7, Xfce 4.20 и X11, ядро 6.12.117 | Обычный UID в активной сессии LightDM и штатный диалог polkit. Отдельные прогоны с systemd-resolved и resolvconf 1.94 | Системный TUN, Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и карантин Fake-IP |
 | Ubuntu 24.04.5 LTS без графической сессии | Установленный helper, ядро 6.8.0-147, nftables 1.0.9 | TUN, Fake DNS, HTTPS, DoH и восстановление правил. Отдельно проверены смена маршрута, переподключение DHCPv4 и отзыв DNS-зоны |
 | Ubuntu 24.04.5 LTS, GNOME Shell 46 и Wayland, Qt 6.4.2 | Видимый Qt-клиент в активной сессии GDM, обычный UID и штатная политика polkit | TUN, Fake A/AAAA, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop, Unlock и истечение карантина после остановки helper |
-| Fedora Cloud 45, SELinux Enforcing | Установленный RPM, root-клиент на системной шине | TUN и Fake DNS, обновление при остановленном helper и удаление с истечением карантина |
+| Fedora Cloud 45, SELinux Enforcing | Установленный RPM, root-клиент на системной шине | TUN и Fake DNS, продление двух лизингов systemd-networkd 262, S3 через logind, обновление при остановленном helper и удаление с истечением карантина |
 | Fedora Cloud 45 с GNOME Shell 51.1 и Wayland, SELinux Enforcing | Тот же RPM, обычный UID в активной сессии, системный D-Bus и штатный диалог polkit | TUN и Fake DNS, IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop и удаление после пользовательской сессии |
 
 В этих прогонах содержимое и метаданные `/etc/resolv.conf` совпали до и
@@ -223,8 +223,16 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
   nftables 1.0.9
   и 1.1.3 требуют путь cgroup при текстовой установке, поэтому её смену
   между компиляцией правила и сверкой нужно обработать до выдачи допуска.
-  Доступ `NETLINK_SOCK_DIAG` из SELinux-домена helper требует отдельной
-  проверки на Fedora.
+  В Fedora Cloud 45 с systemd 262 и SELinux Enforcing проверены доступ
+  `NETLINK_SOCK_DIAG`, идентификатор пространства имён и сверка inode cgroup
+  через netfilter из домена установленного helper. В состоянии Bound
+  networkd 262 может открывать UDP-сокет только при отправке запроса. При
+  полном снимке ядра без подходящего сокета helper проверяет маршрут для
+  немаркированного пакета со стандартным DSCP CS6. nftables сверяет эти
+  поля, адреса, порты, выходной интерфейс, UID и cgroup в момент отправки.
+  Варианты `IPServiceType=CS4` и `none` с ленивым сокетом пока требуют
+  отдельной поддержки. Стенд читает DNS лизинга через D-Bus `DescribeLink`,
+  что работает и в systemd без файловой копии лизингов.
 - [ ] Устранить окно DHCP сразу после сна и проверить установленный helper
   с Xray и sing-box. В Debian 13.7 и Ubuntu 24.04.5 после ACPI S3
   `CLOCK_BOOTTIME` продвинулся на 3,2–3,7 секунды, монотонное время —
@@ -259,7 +267,12 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
   на обоих движках. Топология изменилась, поэтому helper остановил worker.
   После нового подключения тест проверил блокировку прежних Fake-IP,
   работу новых Fake A/AAAA, продление двух DHCP-лизингов и неизменность
-  `/etc/resolv.conf`.
+  `/etc/resolv.conf`. Тот же сценарий пройден в Fedora Cloud 45 с
+  SELinux Enforcing, systemd 262 и nftables 1.1.6 после установки RPM.
+  Управляющий линк Fedora был статическим, чтобы штатное отключение
+  интерфейсов NetworkManager перед сном не опередило проверку logind.
+  При работающем sing-box первый лизинг также продлился с приостановленным
+  вторым DHCP-сервером.
   [Справочник QEMU QMP](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html)
 
 ## 4. Fake DNS и проверка пакетов
