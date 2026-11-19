@@ -579,9 +579,29 @@ Debian 13.7 и Arch Linux 7.2.11 оба ядра прошли перехват �
   После выхода загрузчика TCP/UDP через настоящий WireGuard продолжили
   работать, а контрольная отправка получила `EPERM`. Содержимое и
   метаданные `/etc/resolv.conf` совпали до и после проверок.
-  Для допуска в helper ещё нужны подтверждение связи интерфейса с сокетом,
-  сверка выхода с сохранённым исходным адресом и восстановление защиты при
-  смене сокета, истечении допуска и остановке helper. [WireGuard UDP в Linux](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireguard/socket.c#L342-L412) · [Netfilter BPF](https://github.com/torvalds/linux/blob/v6.12/net/netfilter/nf_bpf_link.c)
+  На Debian 6.12.117 и Ubuntu 6.8.0-147 отдельная проба сняла cookie обоих
+  сокетов после поиска конкретного интерфейса через `WG_CMD_GET_DEVICE`.
+  Cookie совпали с SOCK_DIAG до переноса интерфейса, после переноса при том же
+  порте VXLAN в целевом namespace и после смены порта WireGuard. Подготовка
+  пробы через SOCK_DIAG заранее назначала cookie. Этот снимок годится для
+  диагностики. В `wg_get_device_start` удерживается ссылка на устройство,
+  а при одновременной смене порта отдельные поля сокетов могут попасть в
+  снимок из разных поколений. Для выдачи допуска требуется согласованный
+  снимок конкретного запроса и сверка namespace интерфейса и сокетов.
+  [Чтение устройства WireGuard](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireguard/netlink.c#L199-L309) · [Замена сокетов](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireguard/socket.c#L419-L436)
+
+  На тех же ядрах прогоны QEMU проверили шестисекундный допуск фактического
+  сокета по `CLOCK_BOOTTIME` в Netfilter BPF. До S3 прошёл контрольный
+  обмен через WireGuard, после пробуждения фильтр отбросил пакет с тем же
+  cookie по истёкшему сроку. Монотонные часы при первой проверке после
+  пробуждения ещё оставались внутри исходного окна. Debian проверен с
+  внешним UDP/IPv4, Ubuntu с UDP/IPv6. Содержимое и метаданные
+  `/etc/resolv.conf` совпали до и после. Фильтр проверял срок на пакете без
+  обновления карты после сна. Для интеграции в helper ещё нужны сверка
+  фактического выхода с сохранённым исходным адресом и безопасный отзыв
+  допуска при смене сокета, маршрута или остановке helper.
+  [WireGuard UDP в Linux](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireguard/socket.c#L342-L412) · [Netfilter BPF](https://github.com/torvalds/linux/blob/v6.12/net/netfilter/nf_bpf_link.c) · [Часы ядра Linux](https://docs.kernel.org/core-api/timekeeping.html)
+
   Сетевой план уже умеет журналировать собственные
   IPv4/IPv6 `throw` и сверять их с опорными маршрутами своей таблицы. На тех
   же ядрах отдельный тест исполнил реальный RTNETLINK и путь восстановления
