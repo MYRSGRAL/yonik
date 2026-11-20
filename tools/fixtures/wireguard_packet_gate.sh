@@ -53,7 +53,7 @@ mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
 mkdir "$pins"
 cleanup() {
     rc=$?
-    for entry in v4 v6 wg_leases wg_verdicts; do
+    for entry in v4 v6 wg_active wg_leases wg_verdicts; do
         if [[ -e "$pins/$entry" ]]; then unlink "$pins/$entry"; fi
     done
     rmdir "$pins"
@@ -64,6 +64,8 @@ systemd-run --wait --pipe --collect --unit=yonik-wg-packet-load \
     --property=NoNewPrivileges=yes --property='CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON' \
     "$gate" load /run/yonik-wg-socket.bpf.o "$pins" "$mark"
 echo YONIK_WG_PACKET_LOAD_LIMITED_CAPS
+generation=1
+"$gate" start "$pins" "$generation"
 cookie_for() {
     local cookie
     cookie=$(ss "$family_switch" -H -a -u -n -e "( sport = :$1 )" | sed -n 's/.* sk:\([0-9a-f]*\) .*/\1/p')
@@ -71,7 +73,7 @@ cookie_for() {
     printf '%s\n' "$cookie"
 }
 cookie=$(cookie_for "$port")
-lease=("$1" "$host" "$endpoint" "$port" "$port" "$ifindex" "$mark" "$cookie" -)
+lease=("$1" "$host" "$endpoint" "$port" "$port" "$ifindex" "$mark" "$cookie" - "$generation")
 echo_over_vpn() {
     python3 - <<'PYVM'
 import socket
@@ -196,7 +198,38 @@ lease[3]=24178
 lease[7]=$new_cookie
 "$gate" allow "$pins" "${lease[@]}" 15000
 check 0 republished_socket
+
+"$gate" stop "$pins" "$generation"
+check 4 stopped_generation
+# Запоздавший отправитель сохранил старый токен и обновил срок записи.
+"$gate" allow "$pins" "${lease[@]}" 60000
+check 4 stale_publication_while_stopped
+if "$gate" start "$pins" "$generation"; then
+    echo 'Остановленное поколение запустилось повторно' >&2
+    exit 1
+fi
+echo YONIK_WG_PACKET_GATE stopped_generation_reuse_rejected
+
+next_generation=$((generation + 1))
+"$gate" start "$pins" "$next_generation"
+check 2 new_generation_without_lease
+next_lease=("${lease[@]}")
+next_lease[9]=$next_generation
+"$gate" allow "$pins" "${next_lease[@]}" 15000
+check 0 new_generation_published
+"$gate" allow "$pins" "${lease[@]}" 60000
+check 0 new_generation_after_stale_publication
 "$gate" revoke "$pins" "${lease[@]}"
+check 0 new_generation_after_stale_revocation
+if "$gate" stop "$pins" "$generation"; then
+    echo 'Запоздавшая остановка отключила новое поколение' >&2
+    exit 1
+fi
+check 0 new_generation_after_stale_stop
+"$gate" stop "$pins" "$next_generation"
+check 4 stopped_new_generation
+"$gate" revoke "$pins" "${next_lease[@]}"
+
 after=$(stat -c '%i %a %u %g %F %N' /etc/resolv.conf; stat -L -c '%i %a %u %g' /etc/resolv.conf; sha256sum /etc/resolv.conf)
 test "$before" = "$after"
 echo YONIK_RESOLV_CONF_UNCHANGED

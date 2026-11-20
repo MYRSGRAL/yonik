@@ -52,6 +52,14 @@ struct {
     __type(value, __u32);
 } wg_mark SEC(".maps");
 
+// Один неизменный слот, читаемый и обновляемый под одним spin lock.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct yonik_wg_session);
+} wg_active SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 64);
@@ -72,6 +80,18 @@ static __always_inline int verdict(__u32 value)
     if (counter)
         __sync_fetch_and_add(counter, 1);
     return value == YONIK_WG_ALLOWED;
+}
+
+static __always_inline __u64 active_generation(void)
+{
+    const __u32 zero = 0;
+    struct yonik_wg_session *session = bpf_map_lookup_elem(&wg_active, &zero);
+    if (!session)
+        return 0;
+    bpf_spin_lock(&session->lock);
+    __u64 generation = session->active ? session->generation : 0;
+    bpf_spin_unlock(&session->lock);
+    return generation;
 }
 
 // Отдельный кадр стека не даёт компилятору переиспользовать место dynptr
@@ -167,6 +187,10 @@ int wireguard_gate(struct bpf_nf_ctx *ctx)
     if (!mark || !*mark || ctx->skb->mark != *mark)
         return 1;
 
+    __u64 generation = active_generation();
+    if (!generation)
+        return verdict(YONIK_WG_INACTIVE_SESSION);
+
     struct sock *socket = ctx->state->sk;
     struct net_device *out = ctx->state->out;
     if (!socket || !out)
@@ -177,6 +201,7 @@ int wireguard_gate(struct bpf_nf_ctx *ctx)
         .mark = ctx->skb->mark,
         .ifindex = out->ifindex,
         .family = ctx->state->pf,
+        .generation = generation,
     };
     if (!packet.cookie || !packet.ifindex || read_packet(ctx->skb, &packet)
         || read_next_hop(ctx->skb, out, &packet))
@@ -187,6 +212,8 @@ int wireguard_gate(struct bpf_nf_ctx *ctx)
         return verdict(YONIK_WG_MISSING_LEASE);
     if (bpf_ktime_get_boot_ns() >= *expires)
         return verdict(YONIK_WG_EXPIRED);
+    if (active_generation() != generation)
+        return verdict(YONIK_WG_INACTIVE_SESSION);
     return verdict(YONIK_WG_ALLOWED);
 }
 
