@@ -404,6 +404,11 @@ impl ResolvedTlsEgress {
         if peers.is_empty() {
             return Ok((plan, None));
         }
+        // Нативный DoT скрывает имя запроса от реле. При исчезновении
+        // маршрута приватной зоны resolved может отправить её публичному DNS.
+        if !fake_dns.private_dns_zones().is_empty() {
+            return Err(ServiceError::Unsupported);
+        }
         let daemon = fake_dns.tls_daemon().ok_or(ServiceError::Unavailable)?;
         let mut routes = Vec::with_capacity(peers.len());
         let mut rules = Vec::with_capacity(peers.len());

@@ -366,6 +366,54 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "выделенная VM с нативным DoT и известной helper приватной зоной"]
+async fn production_helper_rejects_native_dot_with_private_dns() -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let (_owner, token) = yonik_linux::Cancellation::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut client =
+        SystemClient::on_connection(connection.clone(), deadline, token.clone()).await?;
+    for engine in [Engine::Xray, Engine::SingBox] {
+        let result = client
+            .prepare_fake_dns_profile(
+                &server,
+                engine,
+                false,
+                &["example.test".to_owned()],
+                deadline,
+                token.clone(),
+            )
+            .await;
+        let state = result.as_ref().map(|_| ());
+        require(
+            matches!(
+                state,
+                Err(yonik_linux::system_client::ClientError::Unsupported)
+            ),
+            &format!("{engine:?} Prepare с приватной зоной и нативным DoT: {state:?}"),
+        )?;
+    }
+    require(
+        state_after_route_events(&connection).await?["state"] == "no_managed_policy",
+        "Отказ Prepare создал сетевую политику",
+    )?;
+    require(
+        resolver_file_state()? == resolver_before,
+        "Проверка изменила /etc/resolv.conf",
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная Debian VM с автономным helper и остановкой службы после Apply"]
 async fn production_helper_standalone_shutdown_restores_network() -> Result {
     guard()?;
