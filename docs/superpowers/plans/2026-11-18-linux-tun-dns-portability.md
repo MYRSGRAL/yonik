@@ -1285,6 +1285,18 @@ IPv4-сценарий с теми же проверками прошёл пов�
   `/etc/resolv.conf` совпали.
   [Привязка сокета к индексу в ядре Linux](https://github.com/torvalds/linux/blob/v6.12/net/core/sock.c#L1509-L1511)
 
+  Установленный helper распознаёт конкретные зоны WireGuard из снимка
+  systemd-resolved и отдаёт им приоритет над Fake DNS. Публикация TUN
+  сохраняет публичный родительский суффикс и исключает приватные зоны
+  и их потомков. Оба входа helper проверяют зону перед выдачей Fake-IP
+  или пересылкой запроса к обычному резолверу. На Debian и Ubuntu с Xray
+  и sing-box проверены публичный ответ, отказ для приватного имени при
+  прямом TCP/UDP-запросе к DNS-адресу TUN и восстановление доступа к
+  WireGuard после Stop. Состояние `/etc/resolv.conf` совпало.
+  Для полного D-06 остаются сохранение приватной зоны при новом Prepare
+  без WireGuard и нативный DoT через systemd-resolved.
+  [Маршрутизация DNS по суффиксам](https://www.freedesktop.org/software/systemd/man/latest/systemd-resolved.service.html#Protocols%20and%20Routing)
+
   Сетевой план уже умеет журналировать собственные
   IPv4/IPv6 `throw` и сверять их с опорными маршрутами своей таблицы. На тех
   же ядрах отдельный тест исполнил реальный RTNETLINK и путь восстановления

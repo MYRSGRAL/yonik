@@ -247,6 +247,7 @@ pub(super) struct PreparedFakeDns {
     pub direct_egress: Vec<BoundDirect>,
     marker: IpAddr,
     suffixes: Vec<String>,
+    private_dns_zones: BTreeSet<String>,
     listeners: Mutex<Option<FakeDnsBridgeListeners>>,
     source: ResolverSource,
     resolved: Option<Arc<Resolve1TunSnapshot>>,
@@ -575,6 +576,28 @@ fn permits_resolver_name(domains: &[Resolve1Domain], name: &str, link: Option<u3
     permitted
 }
 
+fn wireguard_dns_zones(domains: &[Resolve1Domain], wireguard: &BTreeSet<u32>) -> BTreeSet<String> {
+    domains
+        .iter()
+        .filter(|domain| matches!(domain.scope, Resolve1Scope::Link(index) if wireguard.contains(&index)))
+        .map(|domain| domain.name.trim_end_matches('.'))
+        // Маршрут ~. выбирает DNS по умолчанию и не объявляет внутреннюю зону.
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            name.parse::<DomainName>()
+                .map(|domain| domain.as_str().to_owned())
+                .unwrap_or_else(|_| name.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn name_in_dns_zone(name: &str, suffix: &str) -> bool {
+    name == suffix
+        || name
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
 impl PreparedFakeDns {
     pub async fn new(
         plan: &SessionNetworkPlan,
@@ -635,6 +658,15 @@ impl PreparedFakeDns {
         } else {
             None
         };
+        let private_dns_zones = resolved.as_ref().map_or_else(BTreeSet::new, |snapshot| {
+            let wireguard = topology
+                .links
+                .iter()
+                .filter(|link| link.kind.as_deref() == Some(b"wireguard"))
+                .map(|link| link.index)
+                .collect();
+            wireguard_dns_zones(&snapshot.config.domains, &wireguard)
+        });
         let tls_peers = resolved
             .as_deref()
             .map(native_resolver_peers)
@@ -760,6 +792,7 @@ impl PreparedFakeDns {
             direct_egress,
             marker,
             suffixes,
+            private_dns_zones,
             listeners: Mutex::new(Some(listeners)),
             source,
             resolved,
@@ -771,12 +804,19 @@ impl PreparedFakeDns {
 
     fn approves(&self, name: &str) -> bool {
         name == SYSTEM_FAKE_DNS_PROBE_NAME
-            || self.suffixes.iter().any(|suffix| {
-                name == suffix
-                    || name
-                        .strip_suffix(suffix)
-                        .is_some_and(|prefix| prefix.ends_with('.'))
-            })
+            || !self.is_private_dns_name(name)
+                && self
+                    .suffixes
+                    .iter()
+                    .any(|suffix| name_in_dns_zone(name, suffix))
+    }
+
+    fn is_private_dns_name(&self, name: &str) -> bool {
+        name != SYSTEM_FAKE_DNS_PROBE_NAME
+            && self
+                .private_dns_zones
+                .iter()
+                .any(|zone| name_in_dns_zone(name, zone))
     }
 
     fn plain_clients(&self) -> impl Iterator<Item = SocketAddr> + '_ {
@@ -841,6 +881,12 @@ impl PreparedFakeDns {
         if let Some(expected) = &self.resolved {
             verify_resolved_baseline(expected, None).await?;
         }
+        let publication_domains = self
+            .suffixes
+            .iter()
+            .filter(|name| !self.is_private_dns_name(name))
+            .cloned()
+            .collect::<Vec<_>>();
         let resolved = match &self.resolved {
             Some(snapshot) if snapshot.fallback_only => {
                 // Сохраняем порядок резервных серверов из resolved. Каждый адрес
@@ -850,7 +896,7 @@ impl PreparedFakeDns {
                     prepare_fallback_link_dns(
                         ifindex,
                         &servers,
-                        &self.suffixes,
+                        &publication_domains,
                         &snapshot.config.domains,
                         LIMIT,
                     )
@@ -859,7 +905,7 @@ impl PreparedFakeDns {
                 )
             }
             Some(_) => Some(
-                prepare_link_dns(ifindex, self.marker, &self.suffixes, LIMIT)
+                prepare_link_dns(ifindex, self.marker, &publication_domains, LIMIT)
                     .await
                     .map_err(|_| ServiceError::Unsupported)?,
             ),
@@ -886,6 +932,9 @@ impl PreparedFakeDns {
             };
             let synthesize = |packet: &[u8], binding: ResolverBinding| {
                 let name = forward_query_name(packet)?;
+                if for_task.is_private_dns_name(&name) {
+                    return Err(ResolverError::Untrusted);
+                }
                 if !for_task.approves(&name) {
                     if for_task.resolved.as_ref().is_some_and(|snapshot| {
                         // В fallback-only ни один внешний link не имеет DNS.
@@ -1143,6 +1192,35 @@ mod tests {
         assert!(!permits_resolver_name(&domains, "more.real.test", Some(2)));
         assert!(permits_resolver_name(&domains, "more.real.test", Some(3)));
         assert!(permits_resolver_name(&domains, "notreal.test", None));
+    }
+
+    #[test]
+    fn wireguard_split_zones_protect_exact_names_and_descendants() {
+        let domain = |name: &str, scope| Resolve1Domain {
+            scope,
+            name: name.to_owned(),
+            route_only: true,
+        };
+        let domains = [
+            domain(".", Resolve1Scope::Link(2)),
+            domain("Private.Test.", Resolve1Scope::Link(2)),
+            domain("private.test", Resolve1Scope::Link(3)),
+            domain("büro.test", Resolve1Scope::Link(3)),
+            domain("public.test", Resolve1Scope::Link(4)),
+        ];
+        let private = wireguard_dns_zones(&domains, &BTreeSet::from([2, 3]));
+        assert_eq!(
+            private,
+            BTreeSet::from(["private.test".to_owned(), "xn--bro-hoa.test".to_owned()])
+        );
+        let protected = |name| private.iter().any(|zone| name_in_dns_zone(name, zone));
+        assert!(protected("private.test"));
+        assert!(protected("service.private.test"));
+        assert!(protected("service.xn--bro-hoa.test"));
+        assert!(!protected("notprivate.test"));
+        assert!(!protected("private.test.example"));
+        assert!(!protected("test"));
+        assert!(!protected("public.test"));
     }
 
     #[test]

@@ -556,11 +556,54 @@ async fn installed_fake_dns_blocks_unbound_wireguard(engine: Engine) -> Result {
     check_wireguard_dns("before.wg.test").await?;
     eprintln!("{engine:?}: приватные DNS и трафик доступны до запуска Fake DNS");
 
-    let drain =
-        start_fake_dns_in_vm(&connection, &server, engine, false, Some(&policy), &token).await?;
+    let drain = start_fake_dns_in_vm_with_domains(
+        &connection,
+        &server,
+        engine,
+        false,
+        Some(&policy),
+        &token,
+        &["test".to_owned(), "wg.test".to_owned()],
+    )
+    .await?;
     let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
     let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
     check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+    let dns_configuration = Command::new("resolvectl").arg("dns").output()?;
+    require(dns_configuration.status.success(), "Не прочитан DNS TUN")?;
+    let dns_configuration = std::str::from_utf8(&dns_configuration.stdout)?;
+    let (link, marker) = dns_configuration
+        .lines()
+        .filter_map(|line| line.split_once(": "))
+        .find_map(|(link, entry)| {
+            let name = link.split_once("(tofu")?.1.strip_suffix(')')?;
+            let marker = entry.parse::<std::net::IpAddr>().ok()?;
+            Some((format!("tofu{name}"), std::net::SocketAddr::new(marker, 53)))
+        })
+        .ok_or_else(|| io::Error::other("Не найден DNS-адрес TUN"))?;
+    let published = Command::new("resolvectl")
+        .args(["domain", &link])
+        .output()?;
+    require(published.status.success(), "Не прочитаны DNS-зоны TUN")?;
+    let published = std::str::from_utf8(&published.stdout)?;
+    require(
+        published.split_whitespace().any(|word| word == "~test")
+            && !published.split_whitespace().any(|word| word == "~wg.test"),
+        "TUN опубликовал приватную зону либо потерял публичный суффикс",
+    )?;
+    for tcp in [false, true] {
+        require(
+            ask_fixture_dns(marker, "example.test", 1, tcp).await? == v4,
+            "Контрольный DNS-запрос не дошёл до Fake DNS",
+        )?;
+        require(
+            ask_fixture_dns(marker, "hidden.wg.test", 1, tcp)
+                .await
+                .is_err(),
+            "Прямой запрос получил Fake-IP для приватной зоны WireGuard",
+        )?;
+    }
+    eprintln!("{engine:?}: YONIK_PRIVATE_ZONE_PRECEDENCE");
     let dns = check_wireguard_dns("active.wg.test");
     let block4 = check_fake_flow_blocked("10.42.1.2:40000".parse()?);
     let block6 = check_fake_flow_blocked("[fd42:1::2]:40000".parse()?);
@@ -2926,10 +2969,31 @@ async fn start_fake_dns_in_vm(
     policy: Option<&yonik_engine::policy_wire::SystemPolicy>,
     token: &yonik_linux::Cancellation,
 ) -> Result<OutputDrain> {
+    start_fake_dns_in_vm_with_domains(
+        connection,
+        server,
+        engine,
+        kill_switch,
+        policy,
+        token,
+        &["example.test".to_owned()],
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
+async fn start_fake_dns_in_vm_with_domains(
+    connection: &zbus::Connection,
+    server: &yonik_import::ServerIntent,
+    engine: Engine,
+    kill_switch: bool,
+    policy: Option<&yonik_engine::policy_wire::SystemPolicy>,
+    token: &yonik_linux::Cancellation,
+    domains: &[String],
+) -> Result<OutputDrain> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut client =
         SystemClient::on_connection(connection.clone(), deadline, token.clone()).await?;
-    let domains = ["example.test".to_owned()];
     let prepared = if let Some(policy) = policy {
         let policy_resolver = std::env::var("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER")
             .ok()
@@ -2940,7 +3004,7 @@ async fn start_fake_dns_in_vm(
                 server,
                 engine,
                 kill_switch,
-                &domains,
+                domains,
                 policy,
                 policy_resolver,
                 deadline,
@@ -2955,7 +3019,7 @@ async fn start_fake_dns_in_vm(
                     server,
                     engine,
                     kill_switch,
-                    &domains,
+                    domains,
                     deadline,
                     token.clone(),
                 )
