@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use yonik_domain::{
     Action, AnswerSet, Cidr, Conditions, Decision, Destination, DestinationFlow, DnsEpoch,
     DomainName, DomainPattern, Evaluation, EvaluationContext, FakeMapping, Policy, PolicyFault,
-    PrivateDomain, PrivateNetwork, Resolution, ResolverPath, Route, Rule, VpnId,
+    PrivateDomain, PrivateNetwork, Resolution, ResolverPath, Route, Rule, RuleOrigin, VpnId,
 };
 
 fn name(value: &str) -> DomainName {
@@ -109,8 +109,16 @@ fn d01_private_cidr_precedes_user_domain_and_missing_vpn_blocks() {
         Route::Block
     );
     policy.private_networks[0].available = true;
-    assert!(
-        matches!(evaluate(&policy, &host, answer(&[ip("10.1.2.3")])), Evaluation::Decided { decision: Decision { action: Route::PrivateVpn, .. }, vpn: Some(id) } if id == vpn(1))
+    assert_eq!(
+        evaluate(&policy, &host, answer(&[ip("10.1.2.3")])),
+        Evaluation::Decided {
+            decision: Decision {
+                action: Route::PrivateVpn,
+                origin: RuleOrigin::PrivateNetwork,
+            },
+            vpn: Some(vpn(1)),
+            selected_address: Some(ip("10.1.2.3")),
+        }
     );
 }
 
@@ -126,10 +134,20 @@ fn d02_domain_wins_without_lookup_over_younger_cidr() {
     policy
         .preset_rules
         .push(rule(2, &[], &["0.0.0.0/0"], Action::Direct));
-    assert_eq!(
-        action(evaluate(&policy, &name("one.test"), Resolution::Missing)),
-        Route::Proxy
-    );
+    let addresses = [ip("192.0.2.3")];
+    for resolution in [Resolution::Missing, Resolution::Failed, answer(&addresses)] {
+        assert_eq!(
+            evaluate(&policy, &name("one.test"), resolution),
+            Evaluation::Decided {
+                decision: Decision {
+                    action: Route::Proxy,
+                    origin: RuleOrigin::User(1),
+                },
+                vpn: None,
+                selected_address: None,
+            }
+        );
+    }
 }
 
 #[test]
@@ -143,10 +161,17 @@ fn d03_any_address_uses_first_rule_independent_of_answer_order() {
         [ip("192.0.2.3"), ip("2001:db8::1")],
         [ip("2001:db8::1"), ip("192.0.2.3")],
     ] {
-        assert_eq!(
-            action(evaluate(&policy, &name("one.test"), answer(&addresses))),
-            Route::Block
-        );
+        assert!(matches!(
+            evaluate(&policy, &name("one.test"), answer(&addresses)),
+            Evaluation::Decided {
+                decision: Decision {
+                    action: Route::Block,
+                    origin: RuleOrigin::User(1),
+                },
+                selected_address: None,
+                ..
+            }
+        ));
     }
     let result = policy.evaluate_destination(
         &DestinationFlow {
@@ -159,6 +184,85 @@ fn d03_any_address_uses_first_rule_independent_of_answer_order() {
         &EvaluationContext::default(),
     );
     assert_eq!(action(result), Route::Direct);
+}
+
+#[test]
+fn d03_выбранный_ip_принадлежит_выигравшему_правилу() {
+    let mut policy = Policy::default();
+    policy.user_rules.extend([
+        rule(1, &[], &["2001:db8::/32"], Action::Proxy),
+        rule(2, &[], &["192.0.2.0/24"], Action::Direct),
+    ]);
+    let mapping = FakeMapping {
+        address: ip("198.18.0.2"),
+        name: name("one.test"),
+        epoch: DnsEpoch::default(),
+        expires_at: 1000,
+    };
+    let pools = [cidr("198.18.0.0/15")];
+    for addresses in [
+        [ip("192.0.2.3"), ip("2001:db8::2"), ip("2001:db8::1")],
+        [ip("2001:db8::1"), ip("2001:db8::2"), ip("192.0.2.3")],
+    ] {
+        assert_eq!(
+            policy.evaluate_destination(
+                &DestinationFlow {
+                    executable: None,
+                    destination: Destination::Fake {
+                        address: mapping.address,
+                        mapping: Some(&mapping),
+                        resolution: answer(&addresses),
+                    },
+                },
+                &EvaluationContext {
+                    fake_pools: &pools,
+                    ..Default::default()
+                },
+            ),
+            Evaluation::Decided {
+                decision: Decision {
+                    action: Route::Proxy,
+                    origin: RuleOrigin::User(1),
+                },
+                vpn: None,
+                selected_address: Some(ip("2001:db8::1")),
+            }
+        );
+    }
+}
+
+#[test]
+fn локальный_маршрут_выбирает_адрес_из_своей_сети() {
+    let mut policy = Policy {
+        lan: vec![cidr("2001:db8::/32")],
+        default_action: Action::Proxy,
+        ..Default::default()
+    };
+    let addresses = [ip("192.0.2.3"), ip("2001:db8::1")];
+    assert_eq!(
+        evaluate(&policy, &name("one.test"), answer(&addresses)),
+        Evaluation::Decided {
+            decision: Decision {
+                action: Route::Direct,
+                origin: RuleOrigin::Lan,
+            },
+            vpn: None,
+            selected_address: Some(addresses[1]),
+        }
+    );
+
+    policy.lan = vec![cidr("10.0.0.0/8")];
+    assert_eq!(
+        evaluate(&policy, &name("one.test"), answer(&addresses)),
+        Evaluation::Decided {
+            decision: Decision {
+                action: Route::Proxy,
+                origin: RuleOrigin::Default,
+            },
+            vpn: None,
+            selected_address: Some(addresses[0]),
+        }
+    );
 }
 
 #[test]
@@ -213,14 +317,14 @@ fn d05_failed_or_partial_required_lookup_does_not_reach_younger_domain_rule() {
         Evaluation::Rejected(PolicyFault::DnsPolicyUnresolved)
     );
     set.complete = true; // NODATA для IPv4 при успешном AAAA — полный ответ.
-    assert_eq!(
-        action(evaluate(
-            &policy,
-            &name("one.test"),
-            Resolution::Answer(set)
-        )),
-        Route::Proxy
-    );
+    assert!(matches!(
+        evaluate(&policy, &name("one.test"), Resolution::Answer(set)),
+        Evaluation::Decided {
+            decision: Decision { action: Route::Proxy, .. },
+            selected_address: Some(address),
+            ..
+        } if address == addresses[0]
+    ));
 }
 
 #[test]
@@ -369,7 +473,7 @@ fn overlapping_vpn_owners_and_private_resolver_route_are_explicit() {
     };
     set.path = ResolverPath::Vpn(vpn(1));
     assert!(
-        matches!(evaluate(&policy, &name("a.corp.test"), Resolution::Answer(set)), Evaluation::Decided { decision: Decision { action: Route::PrivateVpn, .. }, vpn: Some(id) } if id == vpn(1))
+        matches!(evaluate(&policy, &name("a.corp.test"), Resolution::Answer(set)), Evaluation::Decided { decision: Decision { action: Route::PrivateVpn, .. }, vpn: Some(id), .. } if id == vpn(1))
     );
     policy.private_networks.extend([
         PrivateNetwork {

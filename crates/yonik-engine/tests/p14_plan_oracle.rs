@@ -307,7 +307,7 @@ fn outcome(e: Evaluation) -> Value {
         Evaluation::Rejected(f) => {
             json!({"kind":"rejected","error":match f {PolicyFault::DnsPolicyUnresolved=>"dns_policy_unresolved",PolicyFault::DnsPolicyAmbiguous=>"dns_policy_ambiguous",PolicyFault::UnknownFakeMapping=>"unknown_fake_mapping",PolicyFault::WrongResolver=>"wrong_resolver",_=>panic!("unexpected fault {f:?}")}})
         }
-        Evaluation::Decided { decision, vpn } => {
+        Evaluation::Decided { decision, vpn, .. } => {
             json!({"kind":"decided","route":match decision.action {Route::Direct=>"direct",Route::Proxy=>"proxy",Route::Block=>"block",Route::PrivateVpn=>"private_vpn"},"origin":match decision.origin {RuleOrigin::User(id)=>format!("user:{id}"),RuleOrigin::Preset(id)=>format!("preset:{id}"),RuleOrigin::PrivateNetwork=>"private_network".into(),RuleOrigin::PrivateDomain=>"private_domain".into(),RuleOrigin::Lan=>"lan".into(),RuleOrigin::Default=>"default".into()},"vpn":vpn.map_or(0,VpnId::get)})
         }
     }
