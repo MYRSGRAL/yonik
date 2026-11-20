@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 from dns_fixture import (
@@ -53,6 +54,53 @@ def peer() -> None:
                 ),
                 flush=True,
             )
+
+
+def relay_peer() -> None:
+    guard_namespace()
+
+    def reply(query: bytes) -> bytes:
+        name, _, question_end = read_question(query)
+        if name.startswith("_svc."):
+            assert query[10:12] == b"\x00\x01"
+            assert query[question_end:] == b"\x00\x00\x29\x04\xd0\x00\x00\x80\x00\x00\x00"
+        return make_response(query, Reply(addresses=("10.42.1.2",)))
+
+    with ExitStack() as opened:
+        listeners = {}
+        for family, address, source in (
+            (socket.AF_INET, "10.42.1.2", "10.42.1.1"),
+            (socket.AF_INET6, "fd42:1::2", "fd42:1::1"),
+        ):
+            for protocol in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
+                listener = opened.enter_context(socket.socket(family, protocol))
+                listener.bind((address, 1053))
+                if protocol == socket.SOCK_STREAM:
+                    listener.listen(1)
+                listeners[listener] = (protocol, address, source)
+        print("READY", flush=True)
+        for _ in range(8):
+            ready, _, _ = select.select(listeners, [], [], 12)
+            if not ready:
+                return
+            listener = ready[0]
+            protocol, address, source = listeners[listener]
+            if protocol == socket.SOCK_DGRAM:
+                query, peer_address = listener.recvfrom(4096)
+                assert peer_address[0] == source
+                if read_question(query)[0] == "hold.corp.test":
+                    print("HOLD " + address, flush=True)
+                    continue
+                listener.sendto(reply(query), peer_address)
+            else:
+                stream, peer_address = listener.accept()
+                with stream, stream.makefile("rb") as framed:
+                    stream.settimeout(2)
+                    assert peer_address[0] == source
+                    length = int.from_bytes(framed.read(2))
+                    response = reply(framed.read(length))
+                    stream.sendall(len(response).to_bytes(2) + response)
+            print(f"{protocol.name} {address}", flush=True)
 
 
 def configure(config: dict, engine: str) -> dict:
@@ -233,11 +281,13 @@ def run(baseline: Path) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["peer", "run"])
+    parser.add_argument("action", choices=["peer", "relay-peer", "run"])
     parser.add_argument("--baseline", type=Path)
     args = parser.parse_args()
     if args.action == "peer":
         peer()
+    elif args.action == "relay-peer":
+        relay_peer()
     else:
         if args.baseline is None:
             parser.error("Нужен --baseline")

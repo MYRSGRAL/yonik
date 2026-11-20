@@ -1,7 +1,8 @@
 use super::{BindingError, BindingRequest, IpPrefix, PrivateBindings, PrivateDnsCompileError};
 use crate::{
     Cancellation,
-    network::{NetworkMonitor, read_topology},
+    network::{NetworkMonitor, TransportProtocol, read_topology},
+    resolver::ResolverError,
 };
 use std::{
     num::NonZeroU16,
@@ -13,6 +14,191 @@ use yonik_engine::{
         DnsEpoch, DnsPolicy, DomainPattern, Policy, PrivateDnsRoute, PrivateDomain, VpnId,
     },
 };
+
+#[tokio::test]
+#[ignore = "Private WireGuard namespace + private bus runner"]
+async fn private_dns_exchange_uses_confirmed_interface_and_scope() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    assert!(
+        std::process::Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tools/private_bindings_fixture.py"
+            ))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bus = zbus::Connection::system().await.unwrap();
+    bus.request_name("org.freedesktop.resolve1").await.unwrap();
+    bus.request_name("org.freedesktop.NetworkManager")
+        .await
+        .unwrap();
+    let monitor = NetworkMonitor::start().unwrap();
+    let mut watch = monitor.watch();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !watch.current().fully_observed() {
+            watch.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let (_keep, mut cancel) = Cancellation::new();
+    let topology = read_topology(&mut cancel, Duration::from_secs(3))
+        .await
+        .unwrap();
+    let vpn = topology
+        .links
+        .iter()
+        .find(|link| link.name == b"vpn")
+        .unwrap()
+        .index;
+    let requests = [("10.42.1.0", 24), ("fd42:1::", 64)]
+        .into_iter()
+        .map(|(prefix, length)| BindingRequest {
+            prefix: IpPrefix::new(prefix.parse().unwrap(), length).unwrap(),
+            ifindex: vpn,
+            table: 254,
+            wireguard: true,
+        })
+        .collect();
+    let binding = PrivateBindings::capture(&watch, &mut cancel, requests)
+        .await
+        .unwrap();
+    let mut peer = tokio::process::Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            "yonik-peer",
+            "python3",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tools/private_dns_fixture.py"
+            ),
+            "relay-peer",
+        ])
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut witnessed = BufReader::new(peer.stdout.take().unwrap()).lines();
+    let mut next = async || {
+        tokio::time::timeout(Duration::from_secs(3), witnessed.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(next().await, "READY");
+    let zone = PrivateDomain {
+        domain: DomainPattern::Suffix("corp.test".parse().unwrap()),
+        vpn: VpnId::new(7).unwrap(),
+        available: true,
+    };
+    let epoch = DnsEpoch {
+        network: 1,
+        engine: 2,
+        resolver: 3,
+    };
+    let query = b"\x12\x34\x01\0\0\x01\0\0\0\0\0\0\x04corp\x04test\0\0\x01\0\x01";
+    let service = b"\x12\x34\x01\0\0\x01\0\0\0\0\0\x01\x04_svc\x04corp\x04test\0\0\x01\0\x01\
+        \0\0\x29\x04\xd0\0\0\x80\0\0\x05\xfd\xe9\0\x01x";
+    let dotted_label = b"\x12\x34\x01\0\0\x01\0\0\0\0\0\0\x09corp.test\0\0\x01\0\x01";
+    let mut foreign_record = query.to_vec();
+    foreign_record[11] = 1;
+    foreign_record
+        .extend_from_slice(b"\x04open\x04test\0\0\x01\0\x01\0\0\0\x3c\0\x04\xc0\0\x02\x01");
+    for (endpoint, address) in [
+        ("10.42.1.2:1053", "10.42.1.2"),
+        ("[fd42:1::2]:1053", "fd42:1::2"),
+    ] {
+        let route = PrivateDnsRoute::new(&zone, endpoint.parse().unwrap(), "vpn").unwrap();
+        let mut resolver = binding
+            .verify_private_resolver(
+                route,
+                Instant::now() + Duration::from_secs(10),
+                epoch,
+                0,
+                0x5100_0001,
+                &watch,
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        let mut unrelated = *query;
+        unrelated[13..17].copy_from_slice(b"open");
+        assert!(matches!(
+            resolver
+                .exchange(
+                    &unrelated,
+                    TransportProtocol::Udp,
+                    epoch,
+                    &watch,
+                    &mut cancel
+                )
+                .await,
+            Err(ResolverError::Untrusted)
+        ));
+        for rejected in [dotted_label.as_slice(), foreign_record.as_slice()] {
+            assert!(matches!(
+                resolver
+                    .exchange(rejected, TransportProtocol::Udp, epoch, &watch, &mut cancel)
+                    .await,
+                Err(ResolverError::Unsupported)
+            ));
+        }
+        for (transport, expected) in [
+            (TransportProtocol::Udp, "SOCK_DGRAM"),
+            (TransportProtocol::Tcp, "SOCK_STREAM"),
+        ] {
+            let response = resolver
+                .exchange(service, transport, epoch, &watch, &mut cancel)
+                .await
+                .unwrap();
+            assert_eq!(&response.packet()[..2], &[0x12, 0x34]);
+            assert!(response.packet().ends_with(&[10, 42, 1, 2]));
+            assert_eq!(next().await, format!("{expected} {address}"));
+            eprintln!("YONIK_PRIVATE_DNS_WIREGUARD {expected} {address}");
+        }
+    }
+    let route = PrivateDnsRoute::new(&zone, "10.42.1.2:1053".parse().unwrap(), "vpn").unwrap();
+    let mut resolver = binding
+        .verify_private_resolver(
+            route,
+            Instant::now() + Duration::from_secs(10),
+            epoch,
+            0,
+            0,
+            &watch,
+            &mut cancel,
+        )
+        .await
+        .unwrap();
+    let hold = b"\x12\x34\x01\0\0\x01\0\0\0\0\0\0\x04hold\x04corp\x04test\0\0\x01\0\x01";
+    let (interrupted, ()) = tokio::join!(
+        resolver.exchange(hold, TransportProtocol::Udp, epoch, &watch, &mut cancel),
+        async {
+            assert_eq!(next().await, "HOLD 10.42.1.2");
+            assert!(monitor.shutdown().await);
+        },
+    );
+    assert!(matches!(interrupted, Err(ResolverError::Untrusted)));
+    eprintln!("YONIK_PRIVATE_DNS_WIREGUARD_REVOKED_IN_FLIGHT");
+    assert!(matches!(
+        resolver
+            .exchange(query, TransportProtocol::Tcp, epoch, &watch, &mut cancel)
+            .await,
+        Err(ResolverError::Untrusted)
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), next())
+            .await
+            .is_err()
+    );
+    peer.kill().await.unwrap();
+}
 
 #[tokio::test]
 #[ignore = "Private namespace + private bus runner"]

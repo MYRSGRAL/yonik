@@ -29,7 +29,7 @@ impl PrivateDnsRoute {
             || resolver.ip().is_unspecified()
             || resolver.ip().is_multicast()
             || resolver.ip().is_loopback()
-            || matches!(resolver, SocketAddr::V6(v) if v.scope_id() != 0 || v.flowinfo() != 0)
+            || matches!(resolver, SocketAddr::V6(v) if v.scope_id() != 0 || v.flowinfo() != 0 || v.ip().to_ipv4_mapped().is_some())
         {
             return Err(PolicyCompileError::InvalidPolicy);
         }
@@ -101,7 +101,13 @@ mod tests {
         ] {
             assert!(PrivateDnsRoute::new(&zone, resolver, invalid).is_err());
         }
-        for invalid in ["0.0.0.0:53", "127.0.0.1:53", "224.0.0.1:53", "10.42.1.2:0"] {
+        for invalid in [
+            "0.0.0.0:53",
+            "127.0.0.1:53",
+            "224.0.0.1:53",
+            "10.42.1.2:0",
+            "[::ffff:10.42.1.2]:53",
+        ] {
             assert!(PrivateDnsRoute::new(&zone, invalid.parse().unwrap(), "vpn").is_err());
         }
     }

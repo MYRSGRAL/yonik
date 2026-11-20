@@ -3,6 +3,7 @@
 //! Модуль не выбирает upstream, не создаёт сокеты и не меняет route mark.
 
 use std::{
+    borrow::Cow,
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
@@ -138,6 +139,42 @@ struct ParsedMessage {
 
 pub(crate) fn forward_query_name(packet: &[u8]) -> Result<String, ResolverError> {
     let question = parse_message(packet, false)?.question;
+    query_name(&question)
+}
+
+/// Оставляет только вопрос и заголовок опционального EDNS v0.
+pub(crate) fn private_forward_query(
+    packet: &[u8],
+) -> Result<(String, Cow<'_, [u8]>), ResolverError> {
+    let (question, mut offset) = parse_question(packet, false)?;
+    let name = query_name(&question)?;
+    let query = match section_counts(packet)? {
+        [0, 0, 0] => Cow::Borrowed(packet),
+        [0, 0, 1] => {
+            if packet.get(offset) != Some(&0) {
+                return Err(ResolverError::Unsupported);
+            }
+            let opt = read_record(packet, &mut offset)?;
+            if opt.kind != 41 || opt.class < 512 || opt.ttl & !0x8000 != 0 {
+                return Err(ResolverError::Unsupported);
+            }
+            if opt.data.is_empty() {
+                Cow::Borrowed(packet)
+            } else {
+                let mut normalized = packet[..opt.data.start].to_vec();
+                normalized[opt.data.start - 2..].fill(0);
+                Cow::Owned(normalized)
+            }
+        }
+        _ => return Err(ResolverError::Unsupported),
+    };
+    if offset != packet.len() {
+        return Err(ResolverError::Malformed);
+    }
+    Ok((name, query))
+}
+
+fn query_name(question: &Question) -> Result<String, ResolverError> {
     if question.opcode != 0 || question.truncated || question.name.len() == 1 {
         return Err(ResolverError::Unsupported);
     }
@@ -516,7 +553,7 @@ fn map_io(error: std::io::Error) -> ResolverError {
     }
 }
 
-pub(super) fn is_reserved_fake(address: IpAddr) -> bool {
+pub(crate) fn is_reserved_fake(address: IpAddr) -> bool {
     let address = address.to_canonical();
     FAKE_POOLS
         .iter()

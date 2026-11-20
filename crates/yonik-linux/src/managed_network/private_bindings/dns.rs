@@ -5,21 +5,33 @@ use crate::{
     network::{
         NetworkWatch, RouteKind, RouteQuery, TransportProtocol, lookup_route, read_topology,
     },
-    resolver::forward::boottime_now,
+    resolver::{
+        ResolverError,
+        forward::{
+            ForwardResponse, boottime_now, forward_tcp, forward_udp, is_reserved_fake,
+            private_forward_query,
+        },
+    },
 };
 use std::{
-    num::NonZeroU16,
+    future::{Future, poll_fn},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::{NonZeroU16, NonZeroU32},
+    os::{fd::AsFd, unix::fs::MetadataExt},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     time::{Duration, Instant},
 };
+use tokio::net::{TcpSocket, UdpSocket};
 use yonik_engine::{
     CompiledConfig, Engine, PolicyCompileError, PolicyMode,
-    private_dns::{DnsEpoch, DnsPolicy, Policy, PrivateDnsRoute},
+    private_dns::{DnsEpoch, DnsPolicy, DomainPattern, Policy, PrivateDnsRoute},
 };
 use yonik_import::ParsedServer;
+use yonik_nsfs::socket_namespace::bind_unconnected_private_dns_socket;
 
 const MAX_LEASE: Duration = Duration::from_secs(30);
 const MAX_READ: Duration = Duration::from_secs(3);
@@ -136,6 +148,120 @@ impl PrivateBindings {
     }
 }
 impl VerifiedPrivateResolver {
+    /// Отправляет запрос из подтверждённой зоны одним транспортом.
+    /// Закрытие watcher или истечение срока исключает выдачу ответа.
+    pub async fn exchange(
+        &mut self,
+        query: &[u8],
+        transport: TransportProtocol,
+        epoch: DnsEpoch,
+        watch: &NetworkWatch,
+        cancel: &mut Cancellation,
+    ) -> Result<ForwardResponse, ResolverError> {
+        let (name, query) = private_forward_query(query)?;
+        let zone = self.route.zone();
+        let expected = zone.name().as_str();
+        // Wire-имена сервисов могут содержать подчёркивания.
+        let in_zone = name == expected
+            || matches!(zone, DomainPattern::Suffix(_))
+                && name
+                    .strip_suffix(expected)
+                    .is_some_and(|prefix| prefix.ends_with('.'));
+        if !in_zone || self.uid != rustix::process::geteuid().as_raw() {
+            return Err(ResolverError::Untrusted);
+        }
+        self.revalidate(epoch, watch, cancel)
+            .await
+            .map_err(|_| ResolverError::Untrusted)?;
+        let remaining = |cancel: &Cancellation| {
+            self.remaining(epoch, watch, cancel)
+                .map_err(|_| ResolverError::Untrusted)
+        };
+        let budget = remaining(cancel)?;
+        let mut stop = cancel.clone();
+        let proof_cancel = cancel.clone();
+        let transfer = async {
+            // Проверяем namespace в том же потоке, который создаёт сокет.
+            let namespace = std::fs::metadata("/proc/thread-self/ns/net")
+                .map_err(|_| ResolverError::Untrusted)?;
+            if namespace.dev() != self.topology.namespace.device
+                || namespace.ino() != self.topology.namespace.inode
+            {
+                return Err(ResolverError::Untrusted);
+            }
+            let peer = self.route.resolver();
+            let response = match transport {
+                TransportProtocol::Udp => {
+                    let local = if peer.is_ipv4() {
+                        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+                    } else {
+                        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+                    };
+                    let socket =
+                        std::net::UdpSocket::bind(local).map_err(|_| ResolverError::Unavailable)?;
+                    socket
+                        .set_nonblocking(true)
+                        .map_err(|_| ResolverError::Unavailable)?;
+                    self.prepare_socket(&socket)?;
+                    let socket =
+                        UdpSocket::from_std(socket).map_err(|_| ResolverError::Unavailable)?;
+                    remaining(cancel)?;
+                    socket
+                        .connect(peer)
+                        .await
+                        .map_err(|_| ResolverError::Unavailable)?;
+                    forward_udp(&socket, peer, &query, remaining(cancel)?, cancel).await?
+                }
+                TransportProtocol::Tcp => {
+                    let socket = if peer.is_ipv4() {
+                        TcpSocket::new_v4()
+                    } else {
+                        TcpSocket::new_v6()
+                    }
+                    .map_err(|_| ResolverError::Unavailable)?;
+                    self.prepare_socket(&socket)?;
+                    remaining(cancel)?;
+                    let mut stream = socket
+                        .connect(peer)
+                        .await
+                        .map_err(|_| ResolverError::Unavailable)?;
+                    forward_tcp(&mut stream, peer, &query, remaining(cancel)?, cancel).await?
+                }
+            };
+            response.reject_addresses(is_reserved_fake)?;
+            Ok(response)
+        };
+        tokio::pin!(transfer);
+        // После ожидания готовности сокета и пробуждения сверяем исходный BOOTTIME.
+        let guarded = poll_fn(|cx| {
+            if let Err(error) = remaining(&proof_cancel) {
+                return Poll::Ready(Err(error));
+            }
+            transfer.as_mut().poll(cx)
+        });
+        let mut changes = watch.clone();
+        let response = tokio::select! {
+            biased;
+            () = stop.cancelled() => Err(ResolverError::Cancelled),
+            result = changes.run_while_current(self.stamp, tokio::time::timeout(budget, guarded)) => {
+                result.ok_or(ResolverError::Untrusted)?.map_err(|_| ResolverError::Timeout)?
+            }
+        }?;
+        remaining(&proof_cancel)?;
+        Ok(response)
+    }
+
+    fn prepare_socket(&self, socket: &impl AsFd) -> Result<(), ResolverError> {
+        let stat = rustix::fs::fstat(socket).map_err(|_| ResolverError::Untrusted)?;
+        // Ядро назначает UID при создании сокета по FSUID вызывающего потока.
+        if stat.st_uid != self.uid {
+            return Err(ResolverError::Untrusted);
+        }
+        let index = NonZeroU32::new(self.index).ok_or(ResolverError::Untrusted)?;
+        bind_unconnected_private_dns_socket(socket, index, self.mark)
+            .map_err(|_| ResolverError::Untrusted)
+    }
+
     /// Проверяет BOTH transport contexts без принудительного oif, иначе lookup
     /// мог бы скрыть конфликт RPDB. UID/mark закреплены на весь срок lease.
     pub async fn revalidate(

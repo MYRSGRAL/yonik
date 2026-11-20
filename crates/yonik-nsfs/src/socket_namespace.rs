@@ -56,12 +56,29 @@ pub fn profile_socket_mark(socket: impl AsFd) -> io::Result<u32> {
 /// Устанавливает и перечитывает SO_MARK нового IP-сокета до connect.
 pub fn mark_unconnected_dns_socket(socket: impl AsFd, mark: NonZeroU32) -> io::Result<()> {
     let fd = socket.as_fd();
-    match rustix::net::getpeername(fd) {
-        Ok(None) | Err(rustix::io::Errno::NOTCONN) => {}
-        Ok(Some(_)) => return Err(io::ErrorKind::AlreadyExists.into()),
-        Err(error) => return Err(error.into()),
-    }
+    ensure_unconnected(fd)?;
     udp_raw::mark_dns(fd, mark)
+}
+
+/// Привязывает новый DNS-сокет к подтверждённому индексу интерфейса.
+/// Существующая привязка и метка не могут быть заменены.
+/// При ошибке вызывающий закрывает сокет.
+pub fn bind_unconnected_private_dns_socket(
+    socket: impl AsFd,
+    ifindex: NonZeroU32,
+    mark: u32,
+) -> io::Result<()> {
+    let fd = socket.as_fd();
+    ensure_unconnected(fd)?;
+    udp_raw::bind_private_dns(fd, ifindex, mark)
+}
+
+fn ensure_unconnected(fd: BorrowedFd<'_>) -> io::Result<()> {
+    match rustix::net::getpeername(fd) {
+        Ok(None) | Err(rustix::io::Errno::NOTCONN) => Ok(()),
+        Ok(Some(_)) => Err(io::ErrorKind::AlreadyExists.into()),
+        Err(error) => Err(error.into()),
+    }
 }
 /// Consuming close ровно двух retained handles. Даже EINTR не повторяется:
 /// numeric FD после close больше не принадлежит caller. Ошибка означает Unknown.
@@ -201,7 +218,7 @@ mod udp_raw {
         }
         Ok(())
     }
-    pub(super) fn mark_dns(fd: BorrowedFd<'_>, value: NonZeroU32) -> io::Result<()> {
+    fn validate_dns_socket(fd: BorrowedFd<'_>) -> io::Result<()> {
         let domain = option(fd, libc::SOL_SOCKET, libc::SO_DOMAIN)?;
         let socket_type = option(fd, libc::SOL_SOCKET, libc::SO_TYPE)?;
         let protocol = option(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL)?;
@@ -213,15 +230,51 @@ mod udp_raw {
         {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        Ok(())
+    }
+    pub(super) fn mark_dns(fd: BorrowedFd<'_>, value: NonZeroU32) -> io::Result<()> {
+        validate_dns_socket(fd)?;
+        set_dns_mark(fd, value.get())
+    }
+    fn set_dns_mark(fd: BorrowedFd<'_>, value: u32) -> io::Result<()> {
         let current = mark(fd)?;
-        if current != 0 && current != value.get() {
+        if current != 0 && current != value {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        set(fd, libc::SOL_SOCKET, libc::SO_MARK, value.get() as i32)?;
-        if mark(fd)? != value.get() {
+        if value == 0 {
+            return Ok(());
+        }
+        set(fd, libc::SOL_SOCKET, libc::SO_MARK, value as i32)?;
+        if mark(fd)? != value {
             return Err(io::ErrorKind::InvalidData.into());
         }
         Ok(())
+    }
+    pub(super) fn bind_private_dns(
+        fd: BorrowedFd<'_>,
+        ifindex: NonZeroU32,
+        value: u32,
+    ) -> io::Result<()> {
+        // Linux UAPI asm-generic/socket.h и отдельный UAPI SPARC.
+        #[cfg(not(any(target_arch = "sparc", target_arch = "sparc64")))]
+        const SO_BINDTOIFINDEX: i32 = 62;
+        #[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+        const SO_BINDTOIFINDEX: i32 = 0x0041;
+        validate_dns_socket(fd)?;
+        let index = i32::try_from(ifindex.get()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let current_mark = mark(fd)?;
+        if current_mark != 0 && current_mark != value {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        match option(fd, libc::SOL_SOCKET, SO_BINDTOIFINDEX)? {
+            0 => set(fd, libc::SOL_SOCKET, SO_BINDTOIFINDEX, index)?,
+            current if current == index => {}
+            _ => return Err(io::ErrorKind::InvalidInput.into()),
+        }
+        if option(fd, libc::SOL_SOCKET, SO_BINDTOIFINDEX)? != index {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        set_dns_mark(fd, value)
     }
     fn socket(fd: BorrowedFd<'_>) -> io::Result<()> {
         if option(fd, libc::SOL_SOCKET, libc::SO_TYPE)? != libc::SOCK_DGRAM
