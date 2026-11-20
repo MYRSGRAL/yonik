@@ -1846,15 +1846,20 @@ impl Backend {
         if self.has_session() || self.worker_uncertain {
             return Err(ServiceError::Busy);
         }
-        let attribution_required = request
-            .policy
+        let policy = request.policy.map(Arc::new);
+        let attribution_required = policy
             .as_ref()
             .is_some_and(|policy| policy.requires_attribution());
+        let resolved_cidrs = request.fake_dns_domains.is_some()
+            && request.fake_dns_policy_resolver.is_some()
+            && policy.as_ref().is_some_and(|policy| {
+                yonik_engine::SystemFakeDnsBridge::supports_resolved_cidr_policy(policy.policy())
+            });
         if let Some(suffixes) = &request.fake_dns_domains {
             if attribution_required || bundle.is_some() {
                 return Err(ServiceError::Unsupported);
             }
-            if let Some(policy) = &request.policy {
+            if let Some(policy) = policy.as_ref().filter(|_| !resolved_cidrs) {
                 yonik_engine::validate_scoped_fake_dns_policy(policy.policy(), suffixes)
                     .map_err(|_| ServiceError::Unsupported)?;
             }
@@ -1907,7 +1912,7 @@ impl Backend {
             SessionNetworkPlan::reserve_for_engine(owner, &baseline, request.engine)
         }
         .map_err(unavailable)?;
-        let direct_egress = match (fake_dns_requested, &request.policy) {
+        let direct_egress = match (fake_dns_requested, &policy) {
             (true, Some(policy)) => {
                 bound_fake_literal_direct(policy, &baseline, worker_uid, plan.socket_mark())?
             }
@@ -1921,6 +1926,7 @@ impl Backend {
                     domains,
                     direct_egress,
                     request.fake_dns_policy_resolver,
+                    policy.as_ref().filter(|_| resolved_cidrs).cloned(),
                     cancel,
                 )
                 .await?,
@@ -1939,7 +1945,7 @@ impl Backend {
             .port();
         let port = NonZeroU16::new(port).ok_or(ServiceError::Unavailable)?;
         let tun = plan.compiler_tun().map_err(unavailable)?;
-        let config = if let Some(policy) = request.policy.as_ref() {
+        let config = if let Some(policy) = policy.as_ref() {
             let probe =
                 TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(unavailable)?;
             let probe_port = NonZeroU16::new(probe.local_addr().map_err(unavailable)?.port())

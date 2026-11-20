@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rustix::time::{ClockId, clock_gettime};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
@@ -30,6 +31,16 @@ const UDP_RECEIVE_LEN: usize = MAX_DNS_PACKET + 1;
 const MAX_LABELS: usize = 127;
 const MAX_POINTER_HOPS: usize = 32;
 
+pub(crate) fn boottime_now() -> Option<Duration> {
+    let now = clock_gettime(ClockId::Boottime);
+    let seconds = u64::try_from(now.tv_sec).ok()?;
+    let nanoseconds = u32::try_from(now.tv_nsec).ok()?;
+    if nanoseconds >= 1_000_000_000 {
+        return None;
+    }
+    Some(Duration::new(seconds, nanoseconds))
+}
+
 /// Ответ DNS. При `truncated()` вызывающая сторона может повторить исходный запрос
 /// по TCP к тому же доверенному узлу.
 #[derive(Clone, PartialEq, Eq)]
@@ -38,6 +49,7 @@ pub struct ForwardResponse {
     truncated: bool,
     question: Question,
     received_at: Instant,
+    received_boottime: Duration,
     peer: ForwardPeer,
 }
 
@@ -180,6 +192,7 @@ pub async fn forward_udp(
         let mut buffer = vec![0; UDP_RECEIVE_LEN];
         let received = socket.recv(&mut buffer).await.map_err(map_io)?;
         let received_at = Instant::now();
+        let received_boottime = boottime_now().ok_or(ResolverError::Unavailable)?;
         if received > MAX_DNS_PACKET {
             return Err(ResolverError::Limit);
         }
@@ -191,6 +204,7 @@ pub async fn forward_udp(
             truncated: returned.truncated,
             question: original,
             received_at,
+            received_boottime,
             peer: ForwardPeer::Plain(trusted_peer),
         })
     })
@@ -260,6 +274,7 @@ pub(super) async fn forward_framed(
     run_cancellable(cancel, timeout_budget, async {
         let mut response = exchange(&outbound).await?;
         let received_at = Instant::now();
+        let received_boottime = boottime_now().ok_or(ResolverError::Unavailable)?;
         let returned = verify_response(&response, outbound_id, &original)?;
         response[..2].copy_from_slice(&original.id.to_be_bytes());
         Ok(ForwardResponse {
@@ -267,6 +282,7 @@ pub(super) async fn forward_framed(
             truncated: returned.truncated,
             question: original,
             received_at,
+            received_boottime,
             peer,
         })
     })
@@ -655,6 +671,7 @@ mod tests {
                 truncated: false,
                 question: original,
                 received_at: Instant::now(),
+                received_boottime: boottime_now().expect("boottime clock is available"),
                 peer: ForwardPeer::Plain((Ipv4Addr::LOCALHOST, 53).into()),
             };
             assert_eq!(

@@ -10,7 +10,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZeroU16,
 };
-use yonik_domain::{Action, Cidr, DomainPattern, Policy};
+use yonik_domain::{Action, Cidr, DomainPattern, Policy, Rule};
 use yonik_import::ParsedServer;
 
 const LINK_SCOPED_DESTINATIONS: [&str; 5] = [
@@ -21,12 +21,17 @@ const LINK_SCOPED_DESTINATIONS: [&str; 5] = [
     "ff00::/8",
 ];
 const DNS_PORT: u16 = 53;
+// IP-only конфигурация не резолвит домены для сопоставления с CIDR.
+const LITERAL_DESTINATIONS: [&str; 2] = ["0.0.0.0/0", "::/0"];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ScopedFakePolicy {
+enum ScopedFakePolicy<'a> {
     ProxyOnly,
     Names,
     NamesAndLiteral,
+    ResolvedCidr {
+        policy: &'a Policy,
+        direct_auth: &'a ProbeCredentials,
+    },
 }
 
 /// Только маршрутизация между принадлежащими сессии локальными службами.
@@ -44,6 +49,7 @@ pub struct SystemFakeDnsBridge {
     lookup_auth: ProbeCredentials,
     reinject_auth: ProbeCredentials,
     policy_resolver: Option<(SocketAddr, ProbeCredentials)>,
+    resolved_direct_auth: Option<ProbeCredentials>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +61,7 @@ struct PlainDnsPeer {
 impl SystemFakeDnsBridge {
     pub const MAX_PLAIN_DNS_PEERS: usize = 16;
     pub const POLICY_RESOLVER_USERNAME: &str = "yonik-policy-resolver";
+    pub const RESOLVED_DIRECT_USERNAME: &str = "yonik-resolved-direct";
 
     pub fn new(
         dns_address: IpAddr,
@@ -92,6 +99,7 @@ impl SystemFakeDnsBridge {
             lookup_auth,
             reinject_auth,
             policy_resolver: None,
+            resolved_direct_auth: None,
         })
     }
 
@@ -125,6 +133,33 @@ impl SystemFakeDnsBridge {
         self.policy_resolver
             .as_ref()
             .map(|(endpoint, auth)| (*endpoint, auth))
+    }
+
+    /// Разрешает host передавать предварительно классифицированные буквальные IP.
+    pub fn with_resolved_cidr_policy(mut self) -> Result<Self, CompileError> {
+        if self.policy_resolver.is_none() {
+            return Err(CompileError::InvalidParameter);
+        }
+        let auth = ProbeCredentials::random().map_err(|_| CompileError::InvalidParameter)?;
+        self.resolved_direct_auth = Some(auth);
+        Ok(self)
+    }
+
+    /// Пароль для отдельной учётной записи с именем RESOLVED_DIRECT_USERNAME.
+    pub fn resolved_direct_auth(&self) -> Option<&ProbeCredentials> {
+        self.resolved_direct_auth.as_ref()
+    }
+
+    /// Принимает только публичный профиль с непустой политикой по CIDR.
+    pub fn supports_resolved_cidr_policy(policy: &Policy) -> bool {
+        if !supports_public_fake_dns_policy(policy) {
+            return false;
+        }
+        let mut rules = enabled_rules(policy).peekable();
+        rules.peek().is_some()
+            && rules.all(|rule| {
+                !rule.conditions.destinations.is_empty() && rule.conditions.domains.is_empty()
+            })
     }
 
     pub fn reinject_endpoint(&self) -> SocketAddrV4 {
@@ -312,7 +347,7 @@ fn attach_fake_dns(
     mut config: CompiledConfig,
     tun: &SystemTun,
     bridge: &SystemFakeDnsBridge,
-    mode: ScopedFakePolicy,
+    mode: ScopedFakePolicy<'_>,
 ) -> Result<CompiledConfig, CompileError> {
     let engine = config.engine;
     let pools: Vec<_> = bridge.pools.iter().map(ToString::to_string).collect();
@@ -331,6 +366,17 @@ fn attach_fake_dns(
     let reinject_port = bridge.reinject_port.get();
     let (lookup, reinject) = (&bridge.lookup_auth, &bridge.reinject_auth);
     let policy_username = SystemFakeDnsBridge::POLICY_RESOLVER_USERNAME;
+    let direct_username = SystemFakeDnsBridge::RESOLVED_DIRECT_USERNAME;
+    // Host уже применил порядок user/preset к всему DNS-ответу. Здесь
+    // независимо ограничиваем адреса, разрешённые для учётной записи Direct.
+    let direct_cidrs: Vec<_> = match mode {
+        ScopedFakePolicy::ResolvedCidr { policy, .. } => enabled_rules(policy)
+            .filter(|rule| rule.action == Action::Direct)
+            .flat_map(|rule| &rule.conditions.destinations)
+            .map(ToString::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
 
     let (inbound, dns, socks) = match engine {
         Engine::Xray => {
@@ -372,11 +418,21 @@ fn attach_fake_dns(
                 json!({"type":"field", "inboundTag":["system-tun"], "ip":LINK_SCOPED_DESTINATIONS,
                     "outboundTag":"fake-dns-reject"}),
             ]);
-            if mode == ScopedFakePolicy::ProxyOnly {
-                rules.push(json!({"type":"field", "inboundTag":["fake-ip-reinject"], "outboundTag":"proxy"}));
-            } else if mode == ScopedFakePolicy::NamesAndLiteral {
-                rules.push(json!({"type":"field", "inboundTag":["fake-ip-reinject"],
-                    "domain":[format!("full:{SYSTEM_FAKE_DNS_PROBE_NAME}")], "outboundTag":"fake-dns-reject"}));
+            match mode {
+                ScopedFakePolicy::ProxyOnly => rules.push(json!({"type":"field", "inboundTag":["fake-ip-reinject"], "outboundTag":"proxy"})),
+                ScopedFakePolicy::NamesAndLiteral => rules.push(json!({"type":"field", "inboundTag":["fake-ip-reinject"],
+                    "domain":[format!("full:{SYSTEM_FAKE_DNS_PROBE_NAME}")], "outboundTag":"fake-dns-reject"})),
+                ScopedFakePolicy::ResolvedCidr { direct_auth, .. } => {
+                    accounts.push(json!({"user":direct_username,"pass":direct_auth.password()}));
+                    rules.push(json!({"type":"field","inboundTag":["fake-ip-reinject"],"user":[reinject.username()],
+                        "ip":LITERAL_DESTINATIONS,"outboundTag":"proxy"}));
+                    if !direct_cidrs.is_empty() {
+                        rules.push(json!({"type":"field","inboundTag":["fake-ip-reinject"],"user":[direct_username],
+                            "ip":direct_cidrs,"outboundTag":"direct"}));
+                    }
+                    rules.push(json!({"type":"field","inboundTag":["fake-ip-reinject"],"outboundTag":"fake-dns-reject"}));
+                }
+                ScopedFakePolicy::Names => {}
             }
             if config.value.get("routing").is_none() {
                 config.value["routing"] = json!({"domainStrategy":"AsIs"});
@@ -442,13 +498,30 @@ fn attach_fake_dns(
                 json!({"inbound":["system-tun"],"ip_cidr":pools,"action":"route","outbound":"fake-ip-lookup"}),
                 json!({"inbound":["system-tun"],"ip_cidr":LINK_SCOPED_DESTINATIONS,"action":"reject"}),
             ]);
-            if mode == ScopedFakePolicy::ProxyOnly {
-                rules.push(
+            match mode {
+                ScopedFakePolicy::ProxyOnly => rules.push(
                     json!({"inbound":["fake-ip-reinject"],"action":"route","outbound":"proxy"}),
-                );
-            } else if mode == ScopedFakePolicy::NamesAndLiteral {
-                rules.push(json!({"inbound":["fake-ip-reinject"],
-                    "domain":[SYSTEM_FAKE_DNS_PROBE_NAME], "action":"reject"}));
+                ),
+                ScopedFakePolicy::NamesAndLiteral => rules
+                    .push(json!({"inbound":["fake-ip-reinject"],
+                    "domain":[SYSTEM_FAKE_DNS_PROBE_NAME], "action":"reject"})),
+                ScopedFakePolicy::ResolvedCidr { direct_auth, .. } => {
+                    users.push(
+                        json!({"username":direct_username,"password":direct_auth.password()}),
+                    );
+                    rules.push(
+                        json!({"inbound":["fake-ip-reinject"],"auth_user":[reinject.username()],
+                        "ip_cidr":LITERAL_DESTINATIONS,"action":"route","outbound":"proxy"}),
+                    );
+                    if !direct_cidrs.is_empty() {
+                        rules.push(
+                            json!({"inbound":["fake-ip-reinject"],"auth_user":[direct_username],
+                            "ip_cidr":direct_cidrs,"action":"route","outbound":"direct"}),
+                        );
+                    }
+                    rules.push(json!({"inbound":["fake-ip-reinject"],"action":"reject"}));
+                }
+                ScopedFakePolicy::Names => {}
             }
             prepend_rules(&mut config.value["route"]["rules"], rules)?;
             (
@@ -510,27 +583,39 @@ pub fn validate_scoped_fake_dns_policy(
     scoped_fake_dns_policy_mode(policy, suffixes).map(|_| ())
 }
 
-fn scoped_fake_dns_policy_mode(
-    policy: &Policy,
-    suffixes: &[String],
-) -> Result<ScopedFakePolicy, PolicyCompileError> {
-    let rules = || {
-        policy
-            .user_rules
-            .iter()
-            .chain(&policy.preset_rules)
-            .filter(|rule| rule.enabled)
-    };
-    if policy.default_action != Action::Proxy
-        || !policy.private_networks.is_empty()
-        || !policy.private_domains.is_empty()
-        || !policy.lan.is_empty()
-        || rules().any(|rule| {
-            !rule.conditions.executables.is_empty()
-                || !rule.conditions.platform_sources.is_empty()
-                || rule.conditions.transport.constrained()
+fn enabled_rules(policy: &Policy) -> impl Iterator<Item = &Rule> {
+    policy
+        .user_rules
+        .iter()
+        .chain(&policy.preset_rules)
+        .filter(|rule| rule.enabled)
+}
+
+fn supports_public_fake_dns_policy(policy: &Policy) -> bool {
+    policy.default_action == Action::Proxy
+        && policy.private_networks.is_empty()
+        && policy.private_domains.is_empty()
+        && policy.lan.is_empty()
+        && enabled_rules(policy).all(|rule| {
+            rule.conditions.executables.is_empty()
+                && rule.conditions.platform_sources.is_empty()
+                && !rule.conditions.transport.constrained()
+                && (rule.action != Action::Direct
+                    || (!rule.conditions.destinations.is_empty()
+                        && rule
+                            .conditions
+                            .destinations
+                            .iter()
+                            .all(|cidr| cidr.prefix_len() != 0)))
         })
-    {
+}
+
+fn scoped_fake_dns_policy_mode<'a>(
+    policy: &'a Policy,
+    suffixes: &[String],
+) -> Result<ScopedFakePolicy<'a>, PolicyCompileError> {
+    let rules = || enabled_rules(policy);
+    if !supports_public_fake_dns_policy(policy) {
         return Err(PolicyCompileError::InvalidPolicy);
     }
     if rules().all(|rule| rule.action == Action::Proxy && rule.conditions.domains.is_empty()) {
@@ -545,13 +630,6 @@ fn scoped_fake_dns_policy_mode(
         .map_err(|_| PolicyCompileError::InvalidPolicy)?;
     if rules().any(|rule| {
         (!rule.conditions.destinations.is_empty() && !rule.conditions.domains.is_empty())
-            || (rule.action == Action::Direct
-                && (rule.conditions.destinations.is_empty()
-                    || rule
-                        .conditions
-                        .destinations
-                        .iter()
-                        .any(|cidr| cidr.prefix_len() == 0)))
             || (rule.action == Action::Block
                 && rule.conditions.domains.is_empty()
                 && rule.conditions.destinations.is_empty())
@@ -599,7 +677,15 @@ pub fn compile_system_fake_dns_policy(
     bridge: &SystemFakeDnsBridge,
     suffixes: &[String],
 ) -> Result<CompiledConfig, PolicyCompileError> {
-    let mode = scoped_fake_dns_policy_mode(policy, suffixes)?;
+    let mode = match bridge.resolved_direct_auth() {
+        Some(direct_auth) if SystemFakeDnsBridge::supports_resolved_cidr_policy(policy) => {
+            ScopedFakePolicy::ResolvedCidr {
+                policy,
+                direct_auth,
+            }
+        }
+        _ => scoped_fake_dns_policy_mode(policy, suffixes)?,
+    };
     if [bridge.dns_port, bridge.lookup_port, bridge.reinject_port].contains(&probe_port)
         || bridge
             .plain_dns_peers
@@ -611,7 +697,7 @@ pub fn compile_system_fake_dns_policy(
 
     validate_bridge(server, port, tun, bridge).map_err(crate::PolicyCompileError::Server)?;
     let config = match mode {
-        ScopedFakePolicy::ProxyOnly => {
+        ScopedFakePolicy::ProxyOnly | ScopedFakePolicy::ResolvedCidr { .. } => {
             crate::routing::compile_tun_policy(server, engine, port, probe_port, policy)
         }
         ScopedFakePolicy::Names => crate::routing::compile_policy(
@@ -666,6 +752,233 @@ mod tests {
             port(12555),
         )
         .unwrap()
+    }
+
+    fn cidr_rule(id: u64, action: Action, destination: &str) -> yonik_domain::Rule {
+        yonik_domain::Rule {
+            id,
+            enabled: true,
+            action,
+            conditions: yonik_domain::Conditions {
+                destinations: vec![destination.parse().unwrap()],
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn resolved_cidr_mode_requires_nonempty_public_cidr_only_policy_and_resolver() {
+        let supports = SystemFakeDnsBridge::supports_resolved_cidr_policy;
+        let mut policy = Policy::default();
+        assert!(!supports(&policy));
+        policy
+            .user_rules
+            .push(cidr_rule(1, Action::Direct, "8.8.8.0/24"));
+        assert!(supports(&policy));
+        policy
+            .preset_rules
+            .push(cidr_rule(2, Action::Block, "::/0"));
+        assert!(supports(&policy));
+        policy.preset_rules[0].action = Action::Direct;
+        assert!(!supports(&policy));
+        policy.preset_rules[0].action = Action::Block;
+        policy.preset_rules[0].conditions.domains =
+            vec![DomainPattern::Exact("example.test".parse().unwrap())];
+        assert!(!supports(&policy));
+        policy.preset_rules[0].conditions.domains.clear();
+        policy.preset_rules[0].conditions.destinations.clear();
+        assert!(!supports(&policy));
+        policy.preset_rules[0].enabled = false;
+        assert!(supports(&policy));
+        policy.user_rules[0]
+            .conditions
+            .executables
+            .push("/bin/browser".into());
+        assert!(!supports(&policy));
+        policy.user_rules[0].conditions.executables.clear();
+        policy.user_rules[0].conditions.platform_sources =
+            vec![yonik_domain::PlatformSource::AndroidPackage {
+                package: yonik_domain::AndroidPackageId::parse("example.browser").unwrap(),
+            }];
+        assert!(!supports(&policy));
+        policy.user_rules[0].conditions.platform_sources.clear();
+        policy.user_rules[0].conditions.transport =
+            yonik_domain::TransportConditions::parse(Some(&["tcp"]), None).unwrap();
+        assert!(!supports(&policy));
+        policy.user_rules[0].conditions.transport = Default::default();
+        policy.lan.push("192.168.0.0/16".parse().unwrap());
+        assert!(!supports(&policy));
+        policy.lan.clear();
+        policy.default_action = Action::Direct;
+        assert!(!supports(&policy));
+
+        assert!(empty_bridge().resolved_direct_auth().is_none());
+        assert!(matches!(
+            empty_bridge().with_resolved_cidr_policy(),
+            Err(CompileError::InvalidParameter)
+        ));
+    }
+
+    #[test]
+    fn resolved_cidr_reinject_routes_only_authorized_literal_destinations() {
+        let imported = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+        )
+        .unwrap();
+        let server = &imported.servers[0];
+        let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        let bridge = empty_bridge()
+            .with_policy_resolver("192.0.2.53:1053".parse().unwrap())
+            .unwrap();
+        let direct_policy = Policy {
+            user_rules: vec![
+                cidr_rule(1, Action::Block, "8.8.8.8/32"),
+                cidr_rule(2, Action::Direct, "8.8.8.0/24"),
+                cidr_rule(3, Action::Proxy, "1.1.1.0/24"),
+            ],
+            preset_rules: vec![cidr_rule(4, Action::Direct, "2606:4700::/32")],
+            ..Default::default()
+        };
+        let compile_for = |engine, policy: &Policy, bridge: &SystemFakeDnsBridge| {
+            compile_system_fake_dns_policy(
+                server,
+                engine,
+                port(12556),
+                port(12552),
+                policy,
+                &tun,
+                bridge,
+                &["example.test".into()],
+            )
+        };
+        assert!(matches!(
+            compile_for(Engine::Xray, &direct_policy, &bridge),
+            Err(PolicyCompileError::InvalidPolicy)
+        ));
+        let bridge = bridge.with_resolved_cidr_policy().unwrap();
+        let direct_user = SystemFakeDnsBridge::RESOLVED_DIRECT_USERNAME;
+        let proxy_user = bridge.reinject_auth().username();
+        let (resolver, resolver_auth) = bridge.policy_resolver().unwrap();
+        let resolver_user = SystemFakeDnsBridge::POLICY_RESOLVER_USERNAME;
+        let direct_auth = bridge.resolved_direct_auth().unwrap();
+        assert_ne!(direct_user, proxy_user);
+        assert_ne!(direct_user, resolver_user);
+        assert!(direct_auth.password() != bridge.reinject_auth().password());
+        assert!(direct_auth.password() != resolver_auth.password());
+        assert!(direct_auth.password() != bridge.lookup_auth().password());
+
+        let block_policy = Policy {
+            user_rules: vec![cidr_rule(1, Action::Block, "0.0.0.0/0")],
+            ..Default::default()
+        };
+        for engine in [Engine::Xray, Engine::SingBox] {
+            let (
+                routing,
+                ingress,
+                cidrs,
+                users_path,
+                user_key,
+                password_key,
+                allow_dns,
+                reject_dns,
+                allow_proxy,
+                allow_direct,
+                reject_reinject,
+            ) = match engine {
+                Engine::Xray => (
+                    "routing",
+                    "inboundTag",
+                    "ip",
+                    "/settings/accounts",
+                    "user",
+                    "pass",
+                    json!({"type":"field","inboundTag":["fake-ip-reinject"],"user":[resolver_user],
+                        "ip":["192.0.2.53/32"],"port":resolver.port().to_string(),"network":"tcp","outboundTag":"proxy"}),
+                    json!({"type":"field","inboundTag":["fake-ip-reinject"],"user":[resolver_user],"outboundTag":"fake-dns-reject"}),
+                    json!({"type":"field","inboundTag":["fake-ip-reinject"],"user":[proxy_user],
+                        "ip":["0.0.0.0/0","::/0"],"outboundTag":"proxy"}),
+                    json!({"type":"field","inboundTag":["fake-ip-reinject"],"user":[direct_user],
+                        "ip":["8.8.8.0/24","2606:4700::/32"],"outboundTag":"direct"}),
+                    json!({"type":"field","inboundTag":["fake-ip-reinject"],"outboundTag":"fake-dns-reject"}),
+                ),
+                Engine::SingBox => (
+                    "route",
+                    "inbound",
+                    "ip_cidr",
+                    "/users",
+                    "username",
+                    "password",
+                    json!({"inbound":["fake-ip-reinject"],"auth_user":[resolver_user],
+                        "ip_cidr":["192.0.2.53/32"],"port":[resolver.port()],"network":["tcp"],"action":"route","outbound":"proxy"}),
+                    json!({"inbound":["fake-ip-reinject"],"auth_user":[resolver_user],"action":"reject"}),
+                    json!({"inbound":["fake-ip-reinject"],"auth_user":[proxy_user],
+                        "ip_cidr":["0.0.0.0/0","::/0"],"action":"route","outbound":"proxy"}),
+                    json!({"inbound":["fake-ip-reinject"],"auth_user":[direct_user],
+                        "ip_cidr":["8.8.8.0/24","2606:4700::/32"],"action":"route","outbound":"direct"}),
+                    json!({"inbound":["fake-ip-reinject"],"action":"reject"}),
+                ),
+            };
+            for (policy, has_direct) in [(&direct_policy, true), (&block_policy, false)] {
+                let compiled = compile_for(engine, policy, &bridge).unwrap().value;
+                let rules = compiled[routing]["rules"].as_array().unwrap();
+                let reinject_rules: Vec<_> = rules
+                    .iter()
+                    .filter(|rule| rule[ingress] == json!(["fake-ip-reinject"]))
+                    .cloned()
+                    .collect();
+                let mut expected = vec![allow_dns.clone(), reject_dns.clone(), allow_proxy.clone()];
+                if has_direct {
+                    expected.push(allow_direct.clone());
+                }
+                expected.push(reject_reinject.clone());
+                assert_eq!(reinject_rules, expected);
+                assert_eq!(&rules[..2], &expected[..2]);
+                let reject_index = rules
+                    .iter()
+                    .position(|rule| rule == &reject_reinject)
+                    .unwrap();
+                let literal_index = rules
+                    .iter()
+                    .position(|rule| {
+                        rule[cidrs]
+                            == json!([policy.user_rules[0].conditions.destinations[0].to_string()])
+                    })
+                    .unwrap();
+                assert!(reject_index < literal_index);
+                let baseline = crate::routing::compile_tun_policy(
+                    server,
+                    engine,
+                    port(12556),
+                    port(12552),
+                    policy,
+                )
+                .unwrap();
+                assert_eq!(
+                    &rules[reject_index + 1..],
+                    baseline.value[routing]["rules"].as_array().unwrap()
+                );
+
+                let users = compiled["inbounds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|inbound| inbound["tag"] == "fake-ip-reinject")
+                    .unwrap()
+                    .pointer(users_path)
+                    .unwrap()
+                    .as_array()
+                    .unwrap();
+                assert_eq!(users.len(), 3);
+                for (user, (name, password)) in users.iter().zip([
+                    (proxy_user, bridge.reinject_auth().password()),
+                    (resolver_user, resolver_auth.password()),
+                    (direct_user, direct_auth.password()),
+                ]) {
+                    assert_eq!(user[user_key], name);
+                    assert!(user[password_key] == password);
+                }
+            }
+        }
     }
 
     #[test]

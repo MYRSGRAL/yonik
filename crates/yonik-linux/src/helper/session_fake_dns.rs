@@ -250,6 +250,7 @@ pub(super) struct PreparedFakeDns {
     listeners: Mutex<Option<FakeDnsBridgeListeners>>,
     source: ResolverSource,
     resolved: Option<Arc<Resolve1TunSnapshot>>,
+    cidr_policy: Option<Arc<yonik_engine::policy_wire::SystemPolicy>>,
     tls_peers: Vec<ResolverPeer>,
     plain: Vec<SessionResolverRelay>,
 }
@@ -581,6 +582,7 @@ impl PreparedFakeDns {
         suffixes: Vec<String>,
         direct_egress: Vec<BoundDirect>,
         policy_resolver: Option<SocketAddr>,
+        cidr_policy: Option<Arc<yonik_engine::policy_wire::SystemPolicy>>,
         cancel: &mut Cancellation,
     ) -> Result<Self, ServiceError> {
         let source = resolver_source().await?;
@@ -615,6 +617,11 @@ impl PreparedFakeDns {
             config = config
                 .with_policy_resolver(upstream)
                 .map_err(|_| ServiceError::InvalidRequest)?;
+        }
+        if cidr_policy.is_some() {
+            config = config
+                .with_resolved_cidr_policy()
+                .map_err(|_| ServiceError::Unavailable)?;
         }
         let resolved = if matches!(
             source,
@@ -756,6 +763,7 @@ impl PreparedFakeDns {
             listeners: Mutex::new(Some(listeners)),
             source,
             resolved,
+            cidr_policy,
             tls_peers,
             plain,
         })
@@ -921,12 +929,13 @@ impl PreparedFakeDns {
                     }
                 })
                 .collect();
-            let serving = listeners.serve(
+            let serving = listeners.serve_with_policy(
                 &for_task.config,
                 &isolation,
                 &task_leases,
                 epoch,
                 &approved,
+                for_task.cidr_policy.as_ref().map(|policy| policy.policy()),
                 cancel,
             );
             tokio::pin!(serving);

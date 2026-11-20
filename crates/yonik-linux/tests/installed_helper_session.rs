@@ -2181,6 +2181,7 @@ async fn installed_fake_dns_with_domain_policy(
         FakeDnsPolicyWitness::Domains => None,
         FakeDnsPolicyWitness::LiteralBlock | FakeDnsPolicyWitness::LiteralDirect => Some("block"),
         FakeDnsPolicyWitness::LiteralProxy => Some("proxy"),
+        FakeDnsPolicyWitness::ResolvedCidrs => unreachable!("У проверок CIDR свой профиль"),
     };
     if let Some(action) = literal_action {
         preset_rules.push(json!({"id":3,"enabled":true,"action":action,
@@ -2220,6 +2221,45 @@ enum FakeDnsPolicyWitness {
     LiteralBlock,
     LiteralProxy,
     LiteralDirect,
+    ResolvedCidrs,
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая Debian VM с VLESS peer и DNS для проверки CIDR"]
+async fn production_helper_resolved_fake_dns_cidrs() -> Result {
+    require(
+        std::env::var("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER").is_ok(),
+        "Стенду нужен DNS политики",
+    )?;
+    let rules: Vec<_> = [
+        ("proxy", ["2001:db8:746f::2/128", "203.0.113.47/32"]),
+        ("block", ["203.0.113.46/32", "2001:db8:746f::48/128"]),
+        ("direct", ["192.0.2.201/32", "2001:db8:7471::2/128"]),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (action, cidrs))| {
+        json!({
+            "id": index + 1, "enabled": true, "action": action, "ip_cidr": cidrs,
+            "domain": [], "domain_suffix": [], "executable_paths": []
+        })
+    })
+    .collect();
+    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+        &json!({
+            "version": 1, "default_action": "proxy", "lan": [], "private_networks": [],
+            "private_domains": [], "user_rules": rules, "preset_rules": []
+        })
+        .to_string(),
+    )?;
+    installed_fake_dns(
+        None,
+        HelperLifecycle::Normal,
+        Some(&policy),
+        Some(FakeDnsPolicyWitness::ResolvedCidrs),
+    )
+    .await
 }
 
 #[cfg(feature = "test-support")]
@@ -2503,14 +2543,26 @@ async fn installed_fake_dns(
             eprintln!("{engine:?}: невыданные Fake-IP заблокированы по TCP/UDP IPv4/IPv6");
         }
         if let Some(witness) = &policy_witness {
-            for database in ["ahostsv4", "ahostsv6"] {
-                let blocked = getent_fake_dns(database, "blocked.example.test").await?;
-                check_fake_flow_blocked((blocked, 40000).into()).await?;
+            let mut blocked_names = vec!["blocked.example.test"];
+            if matches!(witness, FakeDnsPolicyWitness::ResolvedCidrs) {
+                blocked_names.push("failed.example.test");
             }
-            eprintln!(
-                "{engine:?} Fake DNS: точный Proxy опередил Block, поддомен заблокирован по TCP и UDP"
-            );
+            for name in blocked_names {
+                for database in ["ahostsv4", "ahostsv6"] {
+                    let blocked = getent_fake_dns(database, name).await?;
+                    check_fake_flow_blocked((blocked, 40000).into()).await?;
+                }
+            }
             match witness {
+                FakeDnsPolicyWitness::ResolvedCidrs => {
+                    let direct_v4 = getent_fake_dns("ahostsv4", "direct.example.test").await?;
+                    let direct_v6 = getent_fake_dns("ahostsv6", "direct.example.test").await?;
+                    check_tun_traffic_to([(direct_v4, 40000).into(), (direct_v6, 40000).into()])
+                        .await?;
+                    eprintln!(
+                        "{engine:?}: полученные по DNS адреса проверены по CIDR на TCP и UDP"
+                    );
+                }
                 FakeDnsPolicyWitness::Domains => {}
                 FakeDnsPolicyWitness::LiteralBlock => {
                     check_literal_cidr_traffic(false).await?;
@@ -2526,6 +2578,9 @@ async fn installed_fake_dns(
                     eprintln!("{engine:?} CIDR Direct подтверждён по TCP/UDP IPv4/IPv6");
                 }
             }
+            eprintln!(
+                "{engine:?} Fake DNS: разрешённые и заблокированные запросы проверены по TCP и UDP"
+            );
         }
         if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
             check_https_through_tun(&certificate, literal.map(|_| v4)).await?;

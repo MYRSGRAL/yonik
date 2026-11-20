@@ -1,4 +1,4 @@
-//! Безопасный TCP bridge Fake-IP → доменное имя → локальный SOCKS ядра.
+//! Передача TCP и UDP к Fake-IP через локальный SOCKS ядра.
 
 use std::{
     collections::HashMap,
@@ -16,8 +16,10 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
-use crate::Cancellation;
+use crate::{Cancellation, fake_service::CidrFlowPolicy, forward::boottime_now};
 use yonik_engine::fake_dns::{DomainName, FakeMapping};
+
+mod resolved_udp;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKS_VERSION: u8 = 5;
@@ -84,6 +86,7 @@ pub enum FakeFlowError {
     Cancelled,
     Timeout,
     UnknownFakeIp,
+    PolicyDenied,
     Protocol,
     UpstreamRejected,
     UdpPeerRejected,
@@ -99,6 +102,7 @@ impl std::fmt::Display for FakeFlowError {
             Self::Cancelled => "SOCKS bridge отменён",
             Self::Timeout => "Превышен timeout SOCKS handshake",
             Self::UnknownFakeIp => "Fake-IP не найден в активном реестре",
+            Self::PolicyDenied => "Политика Fake DNS отклонила назначение",
             Self::Protocol => "Некорректный SOCKS протокол",
             Self::UpstreamRejected => "Локальное ядро отклонило SOCKS соединение",
             Self::UdpPeerRejected => "UDP пакет пришёл не от клиента этой SOCKS ассоциации",
@@ -141,6 +145,7 @@ pub async fn handle_tcp(
         upstream,
         upstream_auth,
         resolve_fake_ip,
+        None,
         cancellation,
     )
     .await
@@ -150,12 +155,36 @@ pub async fn handle_tcp(
 /// аутентифицированный CONNECT или UDP ASSOCIATE. Lookup возвращает исходную
 /// аренду целиком для проверки её срока и поколения перед записью в сокет.
 pub async fn handle_flow(
+    incoming: TcpStream,
+    upstream: SocketAddr,
+    incoming_auth: &SocksCredentials,
+    upstream_auth: &SocksCredentials,
+    worker_isolation: Option<&WorkerOnlyLoopbackIsolation>,
+    resolve_fake_ip: impl Fn(IpAddr) -> Option<FakeMapping> + Send + Sync,
+    cancellation: Cancellation,
+) -> Result<(), FakeFlowError> {
+    handle_flow_with_policy(
+        incoming,
+        upstream,
+        incoming_auth,
+        upstream_auth,
+        worker_isolation,
+        resolve_fake_ip,
+        None,
+        cancellation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_flow_with_policy(
     mut incoming: TcpStream,
     upstream: SocketAddr,
     incoming_auth: &SocksCredentials,
     upstream_auth: &SocksCredentials,
     worker_isolation: Option<&WorkerOnlyLoopbackIsolation>,
     resolve_fake_ip: impl Fn(IpAddr) -> Option<FakeMapping> + Send + Sync,
+    policy: Option<&CidrFlowPolicy<'_>>,
     mut cancellation: Cancellation,
 ) -> Result<(), FakeFlowError> {
     validate_loopback(&incoming, upstream)?;
@@ -171,6 +200,7 @@ pub async fn handle_flow(
                 upstream,
                 upstream_auth,
                 resolve_fake_ip,
+                policy,
                 cancellation,
             )
             .await
@@ -183,6 +213,7 @@ pub async fn handle_flow(
                 upstream_auth,
                 worker_isolation,
                 resolve_fake_ip,
+                policy,
                 cancellation,
             )
             .await
@@ -200,8 +231,10 @@ async fn handle_tcp_authenticated(
     upstream: SocketAddr,
     upstream_auth: &SocksCredentials,
     mut resolve_fake_ip: impl FnMut(IpAddr) -> Option<FakeMapping>,
+    policy: Option<&CidrFlowPolicy<'_>>,
     mut cancellation: Cancellation,
 ) -> Result<(), FakeFlowError> {
+    let selection_cancel = cancellation.clone();
     let handshake = async {
         let target = read_tcp_target(&mut incoming, request).await?;
         let Some(mapping) =
@@ -216,19 +249,32 @@ async fn handle_tcp_authenticated(
         {
             return Err(FakeFlowError::Protocol);
         }
+        let chosen = match choose_target(policy, &mapping, selection_cancel).await {
+            Ok(target) => target,
+            Err(error) => {
+                write_socks_failure(&mut incoming, 2).await?;
+                return Err(error);
+            }
+        };
         let mut core = TcpStream::connect(upstream).await?;
         if !core.local_addr()?.ip().is_loopback() || !core.peer_addr()?.ip().is_loopback() {
             return Err(FakeFlowError::NonLoopback);
         }
-        let still_current = || resolve_fake_ip(target.ip).as_ref() == Some(&mapping);
-        if let Err(error) = connect_core(
-            &mut core,
-            CoreTcpTarget::Name(&mapping.name, target.port),
-            upstream_auth,
-            still_current,
-        )
-        .await
-        {
+        let still_current =
+            || chosen.current() && resolve_fake_ip(target.ip).as_ref() == Some(&mapping);
+        let (destination, credentials) = match chosen {
+            FlowTarget::Name => (
+                CoreTcpTarget::Name(&mapping.name, target.port),
+                upstream_auth,
+            ),
+            FlowTarget::Literal {
+                address, direct, ..
+            } => (
+                CoreTcpTarget::Literal(SocketAddr::new(address, target.port)),
+                upstream_credentials(upstream_auth, policy, direct)?,
+            ),
+        };
+        if let Err(error) = connect_core(&mut core, destination, credentials, still_current).await {
             let reply = if matches!(error, FakeFlowError::UnknownFakeIp) {
                 4
             } else {
@@ -251,6 +297,51 @@ async fn handle_tcp_authenticated(
         result = copy_bidirectional(&mut incoming, &mut core) => { result?; Ok(()) },
         () = cancellation.cancelled() => Err(FakeFlowError::Cancelled),
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FlowTarget {
+    Name,
+    Literal {
+        address: IpAddr,
+        direct: bool,
+        valid_until: Duration,
+    },
+}
+
+impl FlowTarget {
+    fn current(self) -> bool {
+        match self {
+            Self::Name => true,
+            Self::Literal { valid_until, .. } => {
+                boottime_now().is_some_and(|now| now < valid_until)
+            }
+        }
+    }
+}
+
+async fn choose_target(
+    policy: Option<&CidrFlowPolicy<'_>>,
+    mapping: &FakeMapping,
+    cancel: Cancellation,
+) -> Result<FlowTarget, FakeFlowError> {
+    match policy {
+        None => Ok(FlowTarget::Name),
+        Some(policy) => policy.select(mapping, cancel).await,
+    }
+}
+
+fn upstream_credentials<'a>(
+    proxy: &'a SocksCredentials,
+    policy: Option<&'a CidrFlowPolicy<'_>>,
+    direct: bool,
+) -> Result<&'a SocksCredentials, FakeFlowError> {
+    if direct {
+        return policy
+            .map(|policy| &policy.direct_auth)
+            .ok_or(FakeFlowError::PolicyDenied);
+    }
+    Ok(proxy)
 }
 
 struct Target {
@@ -565,11 +656,13 @@ pub async fn handle_udp_associate(
         upstream_auth,
         worker_isolation,
         resolve_fake_ip,
+        None,
         cancellation,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_udp_associate_authenticated(
     mut incoming_control: TcpStream,
     authenticated_request: AuthenticatedRequest,
@@ -577,6 +670,7 @@ async fn handle_udp_associate_authenticated(
     upstream_auth: &SocksCredentials,
     worker_isolation: Option<&WorkerOnlyLoopbackIsolation>,
     resolve_fake_ip: impl Fn(IpAddr) -> Option<FakeMapping> + Send + Sync,
+    policy: Option<&CidrFlowPolicy<'_>>,
     mut cancellation: Cancellation,
 ) -> Result<(), FakeFlowError> {
     if !incoming_control.peer_addr()?.ip().is_loopback()
@@ -609,6 +703,20 @@ async fn handle_udp_associate_authenticated(
         result = timeout(HANDSHAKE_TIMEOUT, setup) => result.map_err(|_| FakeFlowError::Timeout)??,
         () = cancellation.cancelled() => return Err(FakeFlowError::Cancelled),
     };
+
+    if let Some(policy) = policy {
+        return resolved_udp::handle(
+            incoming_control,
+            client_relay,
+            request,
+            upstream,
+            upstream_auth,
+            &resolve_fake_ip,
+            policy,
+            cancellation,
+        )
+        .await;
+    }
 
     let mut expected_client = request.exact_client;
     let mut upstream_assoc: Option<UpstreamUdpAssociation> = None;

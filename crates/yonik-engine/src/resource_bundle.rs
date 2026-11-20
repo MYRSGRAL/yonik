@@ -6,7 +6,7 @@ use std::{
     net::IpAddr,
 };
 pub use yonik_domain::{
-    Action, AnswerSet, Conditions, Destination, DestinationFlow, DomainName, DomainPattern,
+    Action, AnswerSet, Cidr, Conditions, Destination, DestinationFlow, DomainName, DomainPattern,
     Evaluation, EvaluationContext, Policy, Resolution, ResolverPath, ResourceConditions,
     ResourceRule, Route, Rule,
 };

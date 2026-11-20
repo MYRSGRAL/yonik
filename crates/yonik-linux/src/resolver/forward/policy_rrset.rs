@@ -7,8 +7,8 @@ use std::{
 };
 
 use super::{
-    ForwardResponse, ResolverError, ResourceRecord, decode_name, parse_question, read_record,
-    read_u16, read_u32, section_counts,
+    ForwardResponse, ResolverError, ResourceRecord, boottime_now, decode_name, parse_question,
+    read_record, read_u16, read_u32, section_counts,
 };
 
 const MAX_ADDRESSES: usize = 64;
@@ -18,6 +18,7 @@ const MAX_TTL: u32 = i32::MAX as u32;
 pub struct PolicyRrset {
     addresses: Vec<IpAddr>,
     valid_until: Instant,
+    boot_valid_until: Duration,
     terminal: Vec<u8>,
 }
 
@@ -28,6 +29,10 @@ impl PolicyRrset {
 
     pub fn valid_until(&self) -> Instant {
         self.valid_until
+    }
+
+    pub fn boot_valid_until(&self) -> Duration {
+        self.boot_valid_until
     }
 }
 
@@ -68,7 +73,10 @@ impl ForwardResponse {
             return Err(ResolverError::Limit);
         }
         v4.valid_until = v4.valid_until.min(v6.valid_until);
-        if v4.valid_until <= Instant::now() {
+        v4.boot_valid_until = v4.boot_valid_until.min(v6.boot_valid_until);
+        if v4.valid_until <= Instant::now()
+            || v4.boot_valid_until <= boottime_now().ok_or(ResolverError::Unavailable)?
+        {
             return Err(ResolverError::Unavailable);
         }
         v4.addresses.extend(v6.addresses);
@@ -161,9 +169,16 @@ impl ForwardResponse {
             .checked_add(Duration::from_secs(u64::from(ttl.min(terminal_ttl))))
             .filter(|&until| until > Instant::now())
             .ok_or(ResolverError::Unavailable)?;
+        let now_boottime = boottime_now().ok_or(ResolverError::Unavailable)?;
+        let boot_valid_until = self
+            .received_boottime
+            .checked_add(Duration::from_secs(u64::from(ttl.min(terminal_ttl))))
+            .filter(|&until| until > now_boottime)
+            .ok_or(ResolverError::Unavailable)?;
         Ok(PolicyRrset {
             addresses: addresses.into_iter().collect(),
             valid_until,
+            boot_valid_until,
             terminal,
         })
     }
@@ -401,6 +416,60 @@ mod tests {
         );
         reply.received_at -= Duration::from_secs(5);
         assert_eq!(reply.policy_rrset(), Err(ResolverError::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn срок_dns_истекает_во_время_suspended_системы() {
+        let mut response = exchange(
+            1,
+            0x8180,
+            &[record(HOST_POINTER, 1, 5, &[192, 0, 2, 2])],
+            &[],
+            &[],
+        )
+        .await;
+        response.received_boottime -= Duration::from_secs(6);
+        assert_eq!(
+            response.policy_rrset(),
+            Err(ResolverError::Unavailable),
+            "ответ с истёкшим сроком должен отклоняться по часам, учитывающим suspend"
+        );
+    }
+
+    #[tokio::test]
+    async fn истечение_одной_семьи_отвергает_всю_пару() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut a = exchange_from(
+            &server,
+            1,
+            0x8180,
+            &[record(HOST_POINTER, 1, 5, &[192, 0, 2, 2])],
+            &[],
+            &[],
+        )
+        .await;
+        let aaaa = exchange_from(
+            &server,
+            28,
+            0x8180,
+            &[record(
+                HOST_POINTER,
+                28,
+                30,
+                &"2001:db8::42"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            )],
+            &[],
+            &[],
+        )
+        .await;
+        a.received_boottime -= Duration::from_secs(6);
+        assert_eq!(
+            a.policy_address_pair(&aaaa),
+            Err(ResolverError::Unavailable)
+        );
     }
 
     #[tokio::test]

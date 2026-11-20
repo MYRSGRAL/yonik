@@ -18,16 +18,96 @@ use yonik_engine::SystemFakeDnsBridge;
 use yonik_engine::fake_dns::{
     DnsEpoch, FakeDnsQuestion, FakeIpLeaseTable, FakeMapping, MAX_DNS_PACKET, answer_approved,
 };
+use yonik_engine::resource_bundle::{
+    AnswerSet, Cidr, Destination, DestinationFlow, Evaluation, EvaluationContext, Policy,
+    Resolution, ResolverPath, Route,
+};
 
 use crate::{
     Cancellation,
-    fake_flow::{SocksCredentials, WorkerOnlyLoopbackIsolation, handle_flow},
+    fake_flow::{
+        FakeFlowError, FlowTarget, SocksCredentials, WorkerOnlyLoopbackIsolation,
+        handle_flow_with_policy,
+    },
+    forward::{PolicyProxyResolver, boottime_now},
 };
+use std::sync::Arc;
 
 const MAX_TCP_CONNECTIONS: usize = 64;
 const MAX_FLOWS: usize = 128;
+const MAX_RESOLVED_UDP_FLOWS: usize = 128;
 const TCP_IDLE: Duration = Duration::from_secs(5);
 pub const MAX_FAKE_TTL: Duration = Duration::from_secs(30);
+const POLICY_DNS_BUDGET: Duration = Duration::from_secs(3);
+
+pub(crate) struct CidrFlowPolicy<'a> {
+    policy: &'a Policy,
+    resolver: Arc<PolicyProxyResolver>,
+    leases: &'a FakeDnsLeases,
+    pools: Vec<Cidr>,
+    pub(crate) direct_auth: SocksCredentials,
+    pub(crate) udp_slots: tokio::sync::Semaphore,
+}
+
+impl CidrFlowPolicy<'_> {
+    pub(crate) async fn select(
+        &self,
+        mapping: &FakeMapping,
+        mut cancel: Cancellation,
+    ) -> Result<FlowTarget, FakeFlowError> {
+        let evaluate = |resolution| {
+            self.policy.evaluate_destination(
+                &DestinationFlow {
+                    executable: None,
+                    destination: Destination::Fake {
+                        address: mapping.address,
+                        mapping: Some(mapping),
+                        resolution,
+                    },
+                },
+                &EvaluationContext {
+                    now: self.leases.tick(),
+                    epoch: mapping.epoch,
+                    fake_pools: &self.pools,
+                },
+            )
+        };
+        if evaluate(Resolution::Missing) != Evaluation::NeedResolution(ResolverPath::Policy) {
+            return Err(FakeFlowError::PolicyDenied);
+        }
+        let answer = self
+            .resolver
+            .lookup(&mapping.name, POLICY_DNS_BUDGET, &mut cancel)
+            .await
+            .map_err(|_| FakeFlowError::PolicyDenied)?;
+        if self.leases.lookup(mapping.address, mapping.epoch).as_ref() != Some(mapping) {
+            return Err(FakeFlowError::UnknownFakeIp);
+        }
+        let valid_until = answer.boot_valid_until();
+        let expires_at =
+            u64::try_from(valid_until.as_nanos()).map_err(|_| FakeFlowError::PolicyDenied)?;
+        match evaluate(Resolution::Answer(AnswerSet {
+            addresses: answer.addresses(),
+            complete: true,
+            expires_at,
+            epoch: mapping.epoch,
+            path: ResolverPath::Policy,
+        })) {
+            Evaluation::Decided {
+                decision,
+                selected_address: Some(address),
+                ..
+            } if matches!(decision.action, Route::Proxy | Route::Direct) => {
+                Ok(FlowTarget::Literal {
+                    address,
+                    direct: decision.action == Route::Direct,
+                    valid_until,
+                })
+            }
+            _ => Err(FakeFlowError::PolicyDenied),
+        }
+    }
+}
 
 /// Единый реестр для DNS-сокета и восстановления имени в обратном тракте.
 /// Один экземпляр используется всеми сменяющимися сессиями helper.
@@ -107,7 +187,10 @@ impl FakeDnsLeases {
     }
 
     fn tick(&self) -> u64 {
-        u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        // BOOTTIME учитывает сон хоста. При недоступных часах аренды истекают.
+        boottime_now()
+            .and_then(|now| u64::try_from(now.as_nanos()).ok())
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -148,6 +231,21 @@ impl FakeDnsBridgeListeners {
         approved: &(impl Fn(&FakeDnsQuestion) -> bool + Sync),
         cancel: Cancellation,
     ) -> io::Result<()> {
+        self.serve_with_policy(bridge, isolation, leases, epoch, approved, None, cancel)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn serve_with_policy(
+        self,
+        bridge: &SystemFakeDnsBridge,
+        isolation: &WorkerOnlyLoopbackIsolation,
+        leases: &FakeDnsLeases,
+        epoch: DnsEpoch,
+        approved: &(impl Fn(&FakeDnsQuestion) -> bool + Sync),
+        policy: Option<&Policy>,
+        cancel: Cancellation,
+    ) -> io::Result<()> {
         let expected = bridge.helper_endpoints().map(SocketAddr::V4);
         if [self.dns.address()?, self.lookup.local_addr()?] != expected {
             return Err(io::Error::new(
@@ -161,6 +259,45 @@ impl FakeDnsBridgeListeners {
             .map_err(io::Error::other)?;
         let upstream_auth =
             SocksCredentials::new(sent.username(), sent.password()).map_err(io::Error::other)?;
+        let policy = policy
+            .map(|policy| -> io::Result<_> {
+                let (endpoint, account) = bridge
+                    .policy_resolver()
+                    .ok_or(io::ErrorKind::InvalidInput)?;
+                let direct = bridge
+                    .resolved_direct_auth()
+                    .ok_or(io::ErrorKind::InvalidInput)?;
+                let auth = SocksCredentials::new(
+                    SystemFakeDnsBridge::POLICY_RESOLVER_USERNAME,
+                    account.password(),
+                )
+                .map_err(io::Error::other)?;
+                let resolver =
+                    PolicyProxyResolver::new(bridge.reinject_endpoint().into(), endpoint, auth)
+                        .map_err(io::Error::other)?;
+                let pools = crate::managed_network::FAKE_POOLS
+                    .iter()
+                    .map(|(address, prefix)| {
+                        format!("{address}/{prefix}")
+                            .parse()
+                            .map_err(io::Error::other)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                let direct_auth = SocksCredentials::new(
+                    SystemFakeDnsBridge::RESOLVED_DIRECT_USERNAME,
+                    direct.password(),
+                )
+                .map_err(io::Error::other)?;
+                Ok(CidrFlowPolicy {
+                    policy,
+                    resolver,
+                    leases,
+                    pools,
+                    direct_auth,
+                    udp_slots: tokio::sync::Semaphore::new(MAX_RESOLVED_UDP_FLOWS),
+                })
+            })
+            .transpose()?;
         let dns = self.dns.serve(leases, epoch, approved, cancel.clone());
         let lookup = async {
             let mut flows = FuturesUnordered::new();
@@ -169,13 +306,14 @@ impl FakeDnsBridgeListeners {
                     _ = flows.next(), if !flows.is_empty() => {}
                     accepted = self.lookup.accept(), if flows.len() < MAX_FLOWS => {
                         let (stream, _) = accepted?;
-                        flows.push(handle_flow(
+                        flows.push(handle_flow_with_policy(
                             stream,
                             bridge.reinject_endpoint().into(),
                             &incoming_auth,
                             &upstream_auth,
                             Some(isolation),
                             |address| leases.lookup(address, epoch),
+                            policy.as_ref(),
                             cancel.clone(),
                         ));
                     }
