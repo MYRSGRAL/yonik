@@ -353,5 +353,35 @@ async fn verified_dns_lease_actual_route_epochs_and_unsupported_native_hooks() {
         )
         .await;
     assert!(matches!(rejected, Err(BindingError::MissingPath)));
+    assert!(
+        std::process::Command::new("ip")
+            .args(["rule", "del", "priority", "100"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    tokio::time::timeout(Duration::from_secs(3), watch.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let binding = PrivateBindings::capture(&watch, &mut cancel, request())
+        .await
+        .unwrap();
+    let mut token = binding
+        .verify_private_resolver(
+            route(),
+            Instant::now() + Duration::from_secs(10),
+            epoch,
+            0,
+            0,
+            &watch,
+            &mut cancel,
+        )
+        .await
+        .unwrap();
     assert!(monitor.shutdown().await);
+    assert_eq!(
+        token.revalidate(epoch, &watch, &mut cancel).await,
+        Err(BindingError::Stale)
+    );
 }
