@@ -22,7 +22,7 @@ use crate::forward::boottime_now;
 use super::{
     Cancellation, CidrFlowPolicy, FakeDestination, FakeFlowError, FlowTarget, HANDSHAKE_TIMEOUT,
     MAX_UDP_DESTINATIONS, MAX_UDP_PACKET_LEN, SocksCredentials, UDP_IDLE_TIMEOUT,
-    UdpAssociationRequest, connect_core_udp, encode_fake_ip, parse_client_udp,
+    UdpAssociationRequest, connect_core_udp, encode_fake_ip, parse_client_udp, parse_upstream_udp,
 };
 
 const QUEUED_PACKETS: usize = 4;
@@ -171,13 +171,7 @@ where
                 return Ok(());
             }
             let target = self.policy.select(&lease, cancellation.clone()).await?;
-            let FlowTarget::Literal {
-                address, direct, ..
-            } = target
-            else {
-                return Err(FakeFlowError::PolicyDenied);
-            };
-            let credentials = if direct {
+            let credentials = if matches!(target, FlowTarget::Literal { direct: true, .. }) {
                 self.direct_auth
             } else {
                 self.proxy_auth
@@ -195,10 +189,9 @@ where
                 return Ok(());
             };
             loop {
-                if payload.len() + if address.is_ipv4() { 10 } else { 22 } <= MAX_UDP_PACKET_LEN {
-                    wire.clear();
-                    encode_fake_ip(&mut wire, address);
-                    wire.extend_from_slice(&destination.port.to_be_bytes());
+                wire.clear();
+                encode_upstream(&mut wire, target, &lease, destination.port);
+                if wire.len() + payload.len() <= MAX_UDP_PACKET_LEN {
                     wire.extend_from_slice(&payload);
                     if !self
                         .send(&association.relay, &lease, target, || {
@@ -224,19 +217,16 @@ where
                         }
                         () = sleep_until(idle) => return Ok(()),
                         len = association.relay.recv(&mut reply) => {
-                            let Some((replied, port, message)) = parse_client_udp(&reply[..len?]) else {
+                            let Some(message) = upstream_payload(&reply[..len?], target, &lease, destination.port) else {
                                 continue;
                             };
-                            if replied.address.to_canonical() != address.to_canonical() || port != destination.port {
-                                continue;
-                            }
                             let header = if destination.address.is_ipv4() { 10 } else { 22 };
                             if header + message.len() > MAX_UDP_PACKET_LEN {
                                 continue;
                             }
                             wire.clear();
                             encode_fake_ip(&mut wire, destination.address);
-                            wire.extend_from_slice(&port.to_be_bytes());
+                            wire.extend_from_slice(&destination.port.to_be_bytes());
                             wire.extend_from_slice(message);
                             if self.send(self.relay, &lease, target, || {
                                 self.relay.try_send_to(&wire, source)
@@ -286,6 +276,37 @@ where
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error.into()),
             }
+        }
+    }
+}
+
+fn encode_upstream(wire: &mut Vec<u8>, target: FlowTarget, lease: &FakeMapping, port: u16) {
+    match target {
+        FlowTarget::Literal { address, .. } => encode_fake_ip(wire, address),
+        FlowTarget::Name => {
+            let name = lease.name.as_str().as_bytes();
+            wire.extend_from_slice(&[0, 0, 0, 3, name.len() as u8]);
+            wire.extend_from_slice(name);
+        }
+    }
+    wire.extend_from_slice(&port.to_be_bytes());
+}
+
+fn upstream_payload<'a>(
+    packet: &'a [u8],
+    target: FlowTarget,
+    lease: &FakeMapping,
+    port: u16,
+) -> Option<&'a [u8]> {
+    match target {
+        FlowTarget::Literal { address, .. } => {
+            let (source, source_port, payload) = parse_client_udp(packet)?;
+            (source.address.to_canonical() == address.to_canonical() && source_port == port)
+                .then_some(payload)
+        }
+        FlowTarget::Name => {
+            let (name, source_port, payload) = parse_upstream_udp(packet)?;
+            (name == lease.name.as_str() && source_port == port).then_some(payload)
         }
     }
 }

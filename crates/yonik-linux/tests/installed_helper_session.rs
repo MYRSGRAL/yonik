@@ -2181,7 +2181,9 @@ async fn installed_fake_dns_with_domain_policy(
         FakeDnsPolicyWitness::Domains => None,
         FakeDnsPolicyWitness::LiteralBlock | FakeDnsPolicyWitness::LiteralDirect => Some("block"),
         FakeDnsPolicyWitness::LiteralProxy => Some("proxy"),
-        FakeDnsPolicyWitness::ResolvedCidrs => unreachable!("У проверок CIDR свой профиль"),
+        FakeDnsPolicyWitness::ResolvedCidrs | FakeDnsPolicyWitness::ResolvedMixed => {
+            unreachable!("У проверок DNS политики свой профиль")
+        }
     };
     if let Some(action) = literal_action {
         preset_rules.push(json!({"id":3,"enabled":true,"action":action,
@@ -2222,17 +2224,30 @@ enum FakeDnsPolicyWitness {
     LiteralProxy,
     LiteralDirect,
     ResolvedCidrs,
+    ResolvedMixed,
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "одноразовая Debian VM с VLESS peer и DNS для проверки CIDR"]
 async fn production_helper_resolved_fake_dns_cidrs() -> Result {
+    installed_resolved_fake_dns_policy(false).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая Debian VM с VLESS peer и DNS для смешанных правил"]
+async fn production_helper_resolved_fake_dns_mixed() -> Result {
+    installed_resolved_fake_dns_policy(true).await
+}
+
+#[cfg(feature = "test-support")]
+async fn installed_resolved_fake_dns_policy(mixed: bool) -> Result {
     require(
         std::env::var("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER").is_ok(),
         "Стенду нужен DNS политики",
     )?;
-    let rules: Vec<_> = [
+    let mut rules: Vec<_> = [
         ("proxy", ["2001:db8:746f::2/128", "203.0.113.47/32"]),
         ("block", ["203.0.113.46/32", "2001:db8:746f::48/128"]),
         ("direct", ["192.0.2.201/32", "2001:db8:7471::2/128"]),
@@ -2246,6 +2261,20 @@ async fn production_helper_resolved_fake_dns_cidrs() -> Result {
         })
     })
     .collect();
+    if mixed {
+        rules.splice(0..0, [
+            json!({"id": 4, "enabled": true, "action": "proxy", "domain": ["early.example.test"],
+                "domain_suffix": [], "ip_cidr": [], "executable_paths": []}),
+            json!({"id": 5, "enabled": true, "action": "block", "domain": ["combined.example.test"],
+                "domain_suffix": [], "ip_cidr": ["203.0.113.50/32"], "executable_paths": []}),
+            json!({"id": 7, "enabled": true, "action": "direct",
+                "domain": ["mixed-direct.example.test"], "domain_suffix": [],
+                "ip_cidr": ["192.0.2.202/32"], "executable_paths": []}),
+        ]);
+        rules.push(json!({"id": 6, "enabled": true, "action": "proxy",
+            "domain": ["blocked.example.test", "failed.example.test"],
+            "domain_suffix": [], "ip_cidr": [], "executable_paths": []}));
+    }
     let policy = yonik_engine::policy_wire::SystemPolicy::parse(
         &json!({
             "version": 1, "default_action": "proxy", "lan": [], "private_networks": [],
@@ -2257,7 +2286,11 @@ async fn production_helper_resolved_fake_dns_cidrs() -> Result {
         None,
         HelperLifecycle::Normal,
         Some(&policy),
-        Some(FakeDnsPolicyWitness::ResolvedCidrs),
+        Some(if mixed {
+            FakeDnsPolicyWitness::ResolvedMixed
+        } else {
+            FakeDnsPolicyWitness::ResolvedCidrs
+        }),
     )
     .await
 }
@@ -2544,8 +2577,14 @@ async fn installed_fake_dns(
         }
         if let Some(witness) = &policy_witness {
             let mut blocked_names = vec!["blocked.example.test"];
-            if matches!(witness, FakeDnsPolicyWitness::ResolvedCidrs) {
+            if matches!(
+                witness,
+                FakeDnsPolicyWitness::ResolvedCidrs | FakeDnsPolicyWitness::ResolvedMixed
+            ) {
                 blocked_names.push("failed.example.test");
+            }
+            if matches!(witness, FakeDnsPolicyWitness::ResolvedMixed) {
+                blocked_names.push("combined.example.test");
             }
             for name in blocked_names {
                 for database in ["ahostsv4", "ahostsv6"] {
@@ -2554,7 +2593,7 @@ async fn installed_fake_dns(
                 }
             }
             match witness {
-                FakeDnsPolicyWitness::ResolvedCidrs => {
+                FakeDnsPolicyWitness::ResolvedCidrs | FakeDnsPolicyWitness::ResolvedMixed => {
                     let direct_v4 = getent_fake_dns("ahostsv4", "direct.example.test").await?;
                     let direct_v6 = getent_fake_dns("ahostsv6", "direct.example.test").await?;
                     check_tun_traffic_to([(direct_v4, 40000).into(), (direct_v6, 40000).into()])
@@ -2562,6 +2601,36 @@ async fn installed_fake_dns(
                     eprintln!(
                         "{engine:?}: полученные по DNS адреса проверены по CIDR на TCP и UDP"
                     );
+                    if matches!(witness, FakeDnsPolicyWitness::ResolvedMixed) {
+                        let early_v4 = getent_fake_dns("ahostsv4", "early.example.test").await?;
+                        let early_v6 = getent_fake_dns("ahostsv6", "early.example.test").await?;
+                        check_tun_traffic_to([(early_v4, 40000).into(), (early_v6, 40000).into()])
+                            .await?;
+                        let nodata_v4 = getent_fake_dns("ahostsv4", "nodata.example.test").await?;
+                        let nodata_v6 = getent_fake_dns("ahostsv6", "nodata.example.test").await?;
+                        check_tun_traffic_to([
+                            (nodata_v4, 40000).into(),
+                            (nodata_v6, 40000).into(),
+                        ])
+                        .await?;
+                        check_tun_traffic_to([
+                            "203.0.113.50:40000".parse()?,
+                            "[2001:db8:746f::2]:40000".parse()?,
+                        ])
+                        .await?;
+                        let mixed_v4 =
+                            getent_fake_dns("ahostsv4", "mixed-direct.example.test").await?;
+                        let mixed_v6 =
+                            getent_fake_dns("ahostsv6", "mixed-direct.example.test").await?;
+                        check_tun_traffic_to([(mixed_v4, 40000).into(), (mixed_v6, 40000).into()])
+                            .await?;
+                        let literal = "192.0.2.202:40000".parse()?;
+                        check_tun_routes(&[literal])?;
+                        check_fake_flow_blocked(literal).await?;
+                        eprintln!(
+                            "{engine:?}: смешанные правила проверены по Fake-IP и буквальному IP"
+                        );
+                    }
                 }
                 FakeDnsPolicyWitness::Domains => {}
                 FakeDnsPolicyWitness::LiteralBlock => {

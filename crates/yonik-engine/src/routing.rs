@@ -7,6 +7,9 @@ use yonik_import::ParsedServer;
 use crate::resource_bundle::{BoundCompileError, Checkpoint};
 use crate::{CompileError, CompiledConfig, Engine, compile};
 
+pub(crate) const INVALID_WIRE_NAME: &str =
+    r"[^A-Za-z0-9.\-]|^\.|\.$|\.\.|(^|\.)-|-(\.|$)|(^|\.)[A-Za-z0-9\-]{64,}(\.|$)|.{254,}";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyMode {
     Names,
@@ -181,6 +184,38 @@ pub(crate) fn compile_tun_policy(
         PolicyMode::IpOnly,
         true,
     )
+}
+
+/// Именные правила применяет helper с лизингом Fake-IP. На входе
+/// буквальных пакетов доступны только правила без условия по имени.
+pub(crate) fn compile_tun_resolved_fake_policy(
+    server: &ParsedServer,
+    engine: Engine,
+    port: NonZeroU16,
+    probe_port: NonZeroU16,
+    policy: &Policy,
+) -> Result<CompiledConfig, PolicyCompileError> {
+    if port == probe_port {
+        return Err(PolicyCompileError::ProbePort);
+    }
+    validate_policy_inputs(policy, true)?;
+    let checkpoint = Checkpoint::new(&|| true);
+    emit_policy(
+        server,
+        engine,
+        port,
+        probe_port,
+        policy,
+        PolicyMode::IpOnly,
+        true,
+        None,
+        false,
+        &checkpoint,
+    )
+    .map_err(|error| match error {
+        BoundCompileError::Policy(error) => error,
+        BoundCompileError::Cancelled => PolicyCompileError::InvalidPolicy,
+    })
 }
 
 /// Вызывающая сторона проверяет, что восстановленное имя получает решение до CIDR.
@@ -448,12 +483,10 @@ fn emit_policy(
     }];
     // Native matchers не выполняют IDNA и удаление root-dot. Не даём
     // некорректному wire имени обойти правило и попасть в default.
-    const INVALID_NAME: &str =
-        r"[^A-Za-z0-9.\-]|^\.|\.$|\.\.|(^|\.)-|-(\.|$)|(^|\.)[A-Za-z0-9\-]{64,}(\.|$)|.{254,}";
     let guard = if mode == PolicyMode::IpOnly {
         "."
     } else {
-        INVALID_NAME
+        INVALID_WIRE_NAME
     };
     rules.push(route_rule(
         engine,
@@ -497,7 +530,9 @@ fn emit_policy(
                 .iter()
                 .map(|r| (r, yonik_domain::ResourceRule::Preset(r.id))),
         )
-        .filter(|(rule, _)| rule.enabled)
+        .filter(|(rule, _)| {
+            rule.enabled && (mode != PolicyMode::IpOnly || rule.conditions.domains.is_empty())
+        })
     {
         checkpoint.check()?;
         let domains = (!rule.conditions.domains.is_empty())

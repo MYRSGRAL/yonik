@@ -16,7 +16,8 @@ use tokio::{
 };
 use yonik_engine::SystemFakeDnsBridge;
 use yonik_engine::fake_dns::{
-    DnsEpoch, FakeDnsQuestion, FakeIpLeaseTable, FakeMapping, MAX_DNS_PACKET, answer_approved,
+    DnsEpoch, FakeDnsQuestion, FakeIpLeaseTable, FakeMapping, MAX_DNS_PACKET,
+    SYSTEM_FAKE_DNS_PROBE_NAME, answer_approved,
 };
 use yonik_engine::resource_bundle::{
     AnswerSet, Cidr, Destination, DestinationFlow, Evaluation, EvaluationContext, Policy,
@@ -55,6 +56,9 @@ impl CidrFlowPolicy<'_> {
         mapping: &FakeMapping,
         mut cancel: Cancellation,
     ) -> Result<FlowTarget, FakeFlowError> {
+        if mapping.name.as_str() == SYSTEM_FAKE_DNS_PROBE_NAME {
+            return Err(FakeFlowError::PolicyDenied);
+        }
         let evaluate = |resolution| {
             self.policy.evaluate_destination(
                 &DestinationFlow {
@@ -72,8 +76,16 @@ impl CidrFlowPolicy<'_> {
                 },
             )
         };
-        if evaluate(Resolution::Missing) != Evaluation::NeedResolution(ResolverPath::Policy) {
-            return Err(FakeFlowError::PolicyDenied);
+        match evaluate(Resolution::Missing) {
+            Evaluation::Decided {
+                decision,
+                selected_address: None,
+                ..
+            } if decision.action == Route::Proxy => {
+                return Ok(FlowTarget::Name);
+            }
+            Evaluation::NeedResolution(ResolverPath::Policy) => {}
+            _ => return Err(FakeFlowError::PolicyDenied),
         }
         let answer = self
             .resolver
@@ -445,6 +457,55 @@ mod tests {
             engine,
             resolver: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn старшее_доменное_proxy_правило_не_запрашивает_dns_политики() {
+        use serde_json::json;
+        use yonik_engine::policy_wire::SystemPolicy;
+
+        let (mut leases, address) = leases();
+        leases.ready_after = Duration::ZERO;
+        let epoch = make_epoch(1);
+        leases.advance_epoch(epoch).unwrap();
+        leases.answer(QUERY, epoch, approve).unwrap();
+        let mapping = leases.lookup(address, epoch).unwrap();
+        let policy = SystemPolicy::parse(
+            &json!({
+                "version": 1, "default_action": "proxy", "lan": [], "private_networks": [],
+                "private_domains": [],
+                "user_rules": [{"id": 1, "enabled": true, "action": "proxy",
+                    "domain": ["example.test"], "domain_suffix": [], "ip_cidr": [], "executable_paths": []}],
+                "preset_rules": [{"id": 2, "enabled": true, "action": "direct",
+                    "domain": [], "domain_suffix": [], "ip_cidr": ["192.0.2.0/24"], "executable_paths": []}]
+            })
+            .to_string(),
+        ).unwrap();
+        let socks = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let auth = || SocksCredentials::new("test-user", "test-pass").unwrap();
+        let flow_policy = CidrFlowPolicy {
+            policy: policy.policy(),
+            resolver: PolicyProxyResolver::new(
+                socks.local_addr().unwrap(),
+                "192.0.2.53:5353".parse().unwrap(),
+                auth(),
+            )
+            .unwrap(),
+            leases: &leases,
+            pools: vec!["198.18.4.0/24".parse().unwrap()],
+            direct_auth: auth(),
+            udp_slots: tokio::sync::Semaphore::new(1),
+        };
+        let (_owner, cancel) = Cancellation::new();
+        assert!(matches!(
+            flow_policy.select(&mapping, cancel).await,
+            Ok(FlowTarget::Name)
+        ));
+        assert!(
+            timeout(Duration::from_millis(20), socks.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
