@@ -1919,8 +1919,15 @@ impl Backend {
             _ => Vec::new(),
         };
         let fake_dns = match request.fake_dns_domains {
-            Some(domains) => Some(Arc::new(
-                PreparedFakeDns::new(
+            Some(domains) => {
+                let saved = self
+                    .journal
+                    .as_ref()
+                    .map(|journal| journal.saved_private_dns_zones(uid))
+                    .transpose()
+                    .map_err(unavailable)?
+                    .unwrap_or_default();
+                let prepared = PreparedFakeDns::new(
                     &plan,
                     &baseline,
                     domains,
@@ -1929,8 +1936,9 @@ impl Backend {
                     policy.as_ref().filter(|_| resolved_cidrs).cloned(),
                     cancel,
                 )
-                .await?,
-            )),
+                .await?;
+                Some(Arc::new(prepared.with_saved_private_dns_zones(saved)))
+            }
             None => None,
         };
         let (plan, resolver_tls) = if let Some(fake_dns) = &fake_dns {
@@ -2246,6 +2254,13 @@ impl Backend {
         }
         let owner = self.ensure_owner(uid)?;
         self.invalidate()?;
+        if let Some(fake_dns) = &artifact.fake_dns {
+            self.journal
+                .as_mut()
+                .ok_or(ServiceError::Unavailable)?
+                .store_private_dns_zones(owner, fake_dns.private_dns_zones())
+                .map_err(unavailable)?;
+        }
         self.journal
             .as_mut()
             .ok_or(ServiceError::Unavailable)?

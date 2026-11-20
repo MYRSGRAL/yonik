@@ -598,7 +598,23 @@ fn name_in_dns_zone(name: &str, suffix: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
+fn contains_private_dns_zone(zones: &BTreeSet<String>, name: &str) -> bool {
+    zones.contains(name)
+        || name
+            .match_indices('.')
+            .any(|(index, _)| zones.contains(&name[index + 1..]))
+}
+
 impl PreparedFakeDns {
+    pub fn with_saved_private_dns_zones(mut self, zones: BTreeSet<String>) -> Self {
+        self.private_dns_zones.extend(zones);
+        self
+    }
+
+    pub fn private_dns_zones(&self) -> &BTreeSet<String> {
+        &self.private_dns_zones
+    }
+
     pub async fn new(
         plan: &SessionNetworkPlan,
         topology: &LinuxTopology,
@@ -813,10 +829,7 @@ impl PreparedFakeDns {
 
     fn is_private_dns_name(&self, name: &str) -> bool {
         name != SYSTEM_FAKE_DNS_PROBE_NAME
-            && self
-                .private_dns_zones
-                .iter()
-                .any(|zone| name_in_dns_zone(name, zone))
+            && contains_private_dns_zone(&self.private_dns_zones, name)
     }
 
     fn plain_clients(&self) -> impl Iterator<Item = SocketAddr> + '_ {
@@ -1213,7 +1226,7 @@ mod tests {
             private,
             BTreeSet::from(["private.test".to_owned(), "xn--bro-hoa.test".to_owned()])
         );
-        let protected = |name| private.iter().any(|zone| name_in_dns_zone(name, zone));
+        let protected = |name| contains_private_dns_zone(&private, name);
         assert!(protected("private.test"));
         assert!(protected("service.private.test"));
         assert!(protected("service.xn--bro-hoa.test"));

@@ -12,6 +12,7 @@ pub mod firewall;
 pub mod nft;
 mod policy_state;
 pub mod private_bindings;
+mod private_dns_state;
 mod quarantine_state;
 mod session_state;
 mod storage;

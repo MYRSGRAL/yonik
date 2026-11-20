@@ -569,28 +569,7 @@ async fn installed_fake_dns_blocks_unbound_wireguard(engine: Engine) -> Result {
     let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
     let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
     check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
-    let dns_configuration = Command::new("resolvectl").arg("dns").output()?;
-    require(dns_configuration.status.success(), "Не прочитан DNS TUN")?;
-    let dns_configuration = std::str::from_utf8(&dns_configuration.stdout)?;
-    let (link, marker) = dns_configuration
-        .lines()
-        .filter_map(|line| line.split_once(": "))
-        .find_map(|(link, entry)| {
-            let name = link.split_once("(tofu")?.1.strip_suffix(')')?;
-            let marker = entry.parse::<std::net::IpAddr>().ok()?;
-            Some((format!("tofu{name}"), std::net::SocketAddr::new(marker, 53)))
-        })
-        .ok_or_else(|| io::Error::other("Не найден DNS-адрес TUN"))?;
-    let published = Command::new("resolvectl")
-        .args(["domain", &link])
-        .output()?;
-    require(published.status.success(), "Не прочитаны DNS-зоны TUN")?;
-    let published = std::str::from_utf8(&published.stdout)?;
-    require(
-        published.split_whitespace().any(|word| word == "~test")
-            && !published.split_whitespace().any(|word| word == "~wg.test"),
-        "TUN опубликовал приватную зону либо потерял публичный суффикс",
-    )?;
+    let marker = private_zone_test_marker()?;
     for tcp in [false, true] {
         require(
             ask_fixture_dns(marker, "example.test", 1, tcp).await? == v4,
@@ -618,6 +597,51 @@ async fn installed_fake_dns_blocks_unbound_wireguard(engine: Engine) -> Result {
     check_only_fake_is_filtered(v4, v6).await?;
     control_fixture_wireguard("stop-dns")?;
     control_fixture_wireguard("disconnect")?;
+    require(
+        Command::new("systemctl")
+            .args(["restart", "yonik-helper.service"])
+            .status()?
+            .success(),
+        "Не перезапущен helper",
+    )?;
+    let drain = start_fake_dns_in_vm_with_domains(
+        &connection,
+        &server,
+        engine,
+        false,
+        Some(&policy),
+        &token,
+        &["test".to_owned(), "wg.test".to_owned()],
+    )
+    .await?;
+    let marker = private_zone_test_marker()?;
+    let public = tokio::time::timeout(Duration::from_secs(40), async {
+        loop {
+            if let Ok(address) = getent_fake_dns("ahostsv4", "example.test").await {
+                break address;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await?;
+    for tcp in [false, true] {
+        require(
+            ask_fixture_dns(marker, "example.test", 1, tcp).await? == public,
+            "Fake DNS публичной зоны не восстановился после перезапуска",
+        )?;
+        require(
+            ask_fixture_dns(marker, "missing.wg.test", 1, tcp)
+                .await
+                .is_err(),
+            "Отсутствующий WireGuard потерял сохранённую приватную зону",
+        )?;
+    }
+    eprintln!("{engine:?}: YONIK_PRIVATE_ZONE_RESTART_WITHOUT_WIREGUARD");
+    call(&connection, "Stop", json!({"version":1})).await?;
+    require(
+        tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+        "Не остановлен worker повторной сессии",
+    )?;
     require(
         resolver_file_state()? == resolver_before,
         "Проверка изменила /etc/resolv.conf",
@@ -648,6 +672,32 @@ async fn installed_fake_dns_blocks_unbound_wireguard(engine: Engine) -> Result {
     )?;
     eprintln!("{engine:?}: VLESS не получил приватный трафик. WireGuard восстановился после Stop");
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn private_zone_test_marker() -> Result<std::net::SocketAddr> {
+    let output = Command::new("resolvectl").arg("dns").output()?;
+    require(output.status.success(), "Не прочитан DNS TUN")?;
+    let (link, marker) = std::str::from_utf8(&output.stdout)?
+        .lines()
+        .filter_map(|line| line.split_once(": "))
+        .find_map(|(link, entry)| {
+            let name = link.split_once("(tofu")?.1.strip_suffix(')')?;
+            let marker = entry.parse::<std::net::IpAddr>().ok()?;
+            Some((format!("tofu{name}"), std::net::SocketAddr::new(marker, 53)))
+        })
+        .ok_or_else(|| io::Error::other("Не найден DNS-адрес TUN"))?;
+    let output = Command::new("resolvectl")
+        .args(["domain", &link])
+        .output()?;
+    require(output.status.success(), "Не прочитаны DNS-зоны TUN")?;
+    let published = std::str::from_utf8(&output.stdout)?;
+    require(
+        published.split_whitespace().any(|word| word == "~test")
+            && !published.split_whitespace().any(|word| word == "~wg.test"),
+        "TUN опубликовал приватную зону либо потерял публичный суффикс",
+    )?;
+    Ok(marker)
 }
 
 #[cfg(feature = "test-support")]
@@ -2991,30 +3041,30 @@ async fn start_fake_dns_in_vm_with_domains(
     token: &yonik_linux::Cancellation,
     domains: &[String],
 ) -> Result<OutputDrain> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let retry_until = deadline - Duration::from_secs(8);
     let mut client =
         SystemClient::on_connection(connection.clone(), deadline, token.clone()).await?;
-    let prepared = if let Some(policy) = policy {
-        let policy_resolver = std::env::var("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER")
-            .ok()
-            .map(|address| address.parse::<std::net::SocketAddr>())
-            .transpose()?;
-        client
-            .prepare_fake_dns_policy_profile_with_resolver(
-                server,
-                engine,
-                kill_switch,
-                domains,
-                policy,
-                policy_resolver,
-                deadline,
-                token.clone(),
-            )
-            .await
-    } else {
-        let retry_until = deadline.min(tokio::time::Instant::now() + Duration::from_secs(3));
-        loop {
-            let result = client
+    let policy_resolver = policy
+        .and_then(|_| std::env::var("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER").ok())
+        .map(|address| address.parse::<std::net::SocketAddr>())
+        .transpose()?;
+    let prepared = loop {
+        let result = if let Some(policy) = policy {
+            client
+                .prepare_fake_dns_policy_profile_with_resolver(
+                    server,
+                    engine,
+                    kill_switch,
+                    domains,
+                    policy,
+                    policy_resolver,
+                    deadline,
+                    token.clone(),
+                )
+                .await
+        } else {
+            client
                 .prepare_fake_dns_profile(
                     server,
                     engine,
@@ -3023,15 +3073,16 @@ async fn start_fake_dns_in_vm_with_domains(
                     deadline,
                     token.clone(),
                 )
-                .await;
-            let now = tokio::time::Instant::now();
-            if !matches!(result, Err(yonik_linux::system_client::ClientError::Busy))
-                || now >= retry_until
-            {
-                break result;
-            }
-            tokio::time::sleep_until(retry_until.min(now + Duration::from_millis(50))).await;
+                .await
+        };
+        let now = tokio::time::Instant::now();
+        if !matches!(result, Err(yonik_linux::system_client::ClientError::Busy))
+            || now >= retry_until
+        {
+            break result;
         }
+        // После restart helper выдерживает MAX_FAKE_TTL предыдущей сессии.
+        tokio::time::sleep_until(retry_until.min(now + Duration::from_millis(250))).await;
     }
     .map_err(|error| io::Error::other(format!("{engine:?} Fake DNS Prepare: {error:?}")))?;
     let output = PreparedOutput::bind(
