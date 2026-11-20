@@ -5,7 +5,8 @@
 use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -16,7 +17,10 @@ use tokio::{
 
 use crate::Cancellation;
 
-use super::ResolverError;
+use super::{ResolverError, dot::DotPeer};
+
+mod policy_rrset;
+pub use policy_rrset::PolicyRrset;
 
 const HEADER_LEN: usize = 12;
 const MAX_DNS_PACKET: usize = 4096;
@@ -24,14 +28,36 @@ const UDP_RECEIVE_LEN: usize = MAX_DNS_PACKET + 1;
 const MAX_LABELS: usize = 127;
 const MAX_POINTER_HOPS: usize = 32;
 
-/// Ответ UDP. При `truncated` вызывающая сторона может повторить исходный запрос
+/// Ответ DNS. При `truncated()` вызывающая сторона может повторить исходный запрос
 /// по TCP к тому же доверенному узлу.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ForwardResponse {
-    pub packet: Vec<u8>,
-    pub truncated: bool,
+    packet: Vec<u8>,
+    truncated: bool,
     question: Question,
+    received_at: Instant,
+    peer: ForwardPeer,
 }
+
+#[derive(Clone)]
+pub(super) enum ForwardPeer {
+    Plain(SocketAddr),
+    Tls(SocketAddr, Arc<DotPeer>),
+}
+
+impl PartialEq for ForwardPeer {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Plain(left), Self::Plain(right)) => left == right,
+            (Self::Tls(left, left_policy), Self::Tls(right, right_policy)) => {
+                left == right && Arc::ptr_eq(left_policy, right_policy)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ForwardPeer {}
 
 impl std::fmt::Debug for ForwardResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -43,6 +69,18 @@ impl std::fmt::Debug for ForwardResponse {
 }
 
 impl ForwardResponse {
+    pub fn packet(&self) -> &[u8] {
+        &self.packet
+    }
+
+    pub fn into_packet(self) -> Vec<u8> {
+        self.packet
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
     /// Отклоняет ответ, если любая IN A/AAAA запись содержит зарезервированный адрес.
     pub fn reject_addresses(
         &self,
@@ -137,6 +175,7 @@ pub async fn forward_udp(
         }
         let mut buffer = vec![0; UDP_RECEIVE_LEN];
         let received = socket.recv(&mut buffer).await.map_err(map_io)?;
+        let received_at = Instant::now();
         if received > MAX_DNS_PACKET {
             return Err(ResolverError::Limit);
         }
@@ -147,6 +186,8 @@ pub async fn forward_udp(
             packet: response,
             truncated: returned.truncated,
             question: original,
+            received_at,
+            peer: ForwardPeer::Plain(trusted_peer),
         })
     })
     .await
@@ -166,18 +207,24 @@ pub async fn forward_tcp(
     if peer != trusted_peer {
         return Err(ResolverError::Untrusted);
     }
-    forward_framed(query, timeout_budget, cancel, async |outbound| {
-        let frame_len = u16::try_from(outbound.len()).map_err(|_| ResolverError::Limit)?;
-        stream.write_u16(frame_len).await.map_err(map_io)?;
-        stream.write_all(outbound).await.map_err(map_io)?;
-        let response_len = usize::from(stream.read_u16().await.map_err(map_io)?);
-        if !(HEADER_LEN..=MAX_DNS_PACKET).contains(&response_len) {
-            return Err(ResolverError::Limit);
-        }
-        let mut response = vec![0; response_len];
-        stream.read_exact(&mut response).await.map_err(map_io)?;
-        Ok(response)
-    })
+    forward_framed(
+        query,
+        timeout_budget,
+        cancel,
+        ForwardPeer::Plain(trusted_peer),
+        async |outbound| {
+            let frame_len = u16::try_from(outbound.len()).map_err(|_| ResolverError::Limit)?;
+            stream.write_u16(frame_len).await.map_err(map_io)?;
+            stream.write_all(outbound).await.map_err(map_io)?;
+            let response_len = usize::from(stream.read_u16().await.map_err(map_io)?);
+            if !(HEADER_LEN..=MAX_DNS_PACKET).contains(&response_len) {
+                return Err(ResolverError::Limit);
+            }
+            let mut response = vec![0; response_len];
+            stream.read_exact(&mut response).await.map_err(map_io)?;
+            Ok(response)
+        },
+    )
     .await
 }
 
@@ -185,6 +232,7 @@ pub(super) async fn forward_framed(
     query: &[u8],
     timeout_budget: Duration,
     cancel: &mut Cancellation,
+    peer: ForwardPeer,
     exchange: impl AsyncFnOnce(&[u8]) -> Result<Vec<u8>, ResolverError>,
 ) -> Result<ForwardResponse, ResolverError> {
     if timeout_budget.is_zero() || timeout_budget > Duration::from_secs(10) {
@@ -196,12 +244,15 @@ pub(super) async fn forward_framed(
     outbound[..2].copy_from_slice(&outbound_id.to_be_bytes());
     run_cancellable(cancel, timeout_budget, async {
         let mut response = exchange(&outbound).await?;
+        let received_at = Instant::now();
         let returned = verify_response(&response, outbound_id, &original)?;
         response[..2].copy_from_slice(&original.id.to_be_bytes());
         Ok(ForwardResponse {
             packet: response,
             truncated: returned.truncated,
             question: original,
+            received_at,
+            peer,
         })
     })
     .await
@@ -253,6 +304,26 @@ fn random_id(original: u16) -> Result<u16, ResolverError> {
 }
 
 fn parse_message(packet: &[u8], response: bool) -> Result<ParsedMessage, ResolverError> {
+    let (question, mut offset) = parse_question(packet, response)?;
+    let mut addresses = Vec::new();
+    for count in section_counts(packet)? {
+        for _ in 0..count {
+            let record = read_record(packet, &mut offset)?;
+            if let Some(address) = record.address(packet)? {
+                addresses.push(address);
+            }
+        }
+    }
+    if offset != packet.len() {
+        return Err(ResolverError::Malformed);
+    }
+    Ok(ParsedMessage {
+        question,
+        addresses,
+    })
+}
+
+fn parse_question(packet: &[u8], response: bool) -> Result<(Question, usize), ResolverError> {
     if !(HEADER_LEN..=MAX_DNS_PACKET).contains(&packet.len()) {
         return Err(ResolverError::Limit);
     }
@@ -265,60 +336,14 @@ fn parse_message(packet: &[u8], response: bool) -> Result<ParsedMessage, Resolve
     if qd != 1 {
         return Err(ResolverError::Unsupported);
     }
-    let counts = [
-        read_u16(packet, 6)?,
-        read_u16(packet, 8)?,
-        read_u16(packet, 10)?,
-    ];
-    let mut offset = HEADER_LEN;
-    let (name, question_end) = decode_name(packet, offset, false)?;
-    offset = question_end;
+    let (name, offset) = decode_name(packet, HEADER_LEN, false)?;
     let qtype = read_u16(packet, offset)?;
     let qclass = read_u16(packet, offset + 2)?;
     if qclass != 1 {
         return Err(ResolverError::Unsupported);
     }
-    offset += 4;
-    let mut addresses = Vec::new();
-    for count in counts {
-        for _ in 0..count {
-            let (_, end_name) = decode_name(packet, offset, true)?;
-            offset = end_name;
-            let fixed_end = offset.checked_add(10).ok_or(ResolverError::Malformed)?;
-            if fixed_end > packet.len() {
-                return Err(ResolverError::Malformed);
-            }
-            let record_type = read_u16(packet, offset)?;
-            let record_class = read_u16(packet, offset + 2)?;
-            let rdata_len = usize::from(read_u16(packet, offset + 8)?);
-            let rdata_start = fixed_end;
-            if record_class == 1 && record_type == 1 {
-                let bytes = packet
-                    .get(rdata_start..rdata_start + rdata_len)
-                    .filter(|bytes| bytes.len() == 4)
-                    .ok_or(ResolverError::Malformed)?;
-                addresses.push(IpAddr::V4(Ipv4Addr::from([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                ])));
-            } else if record_class == 1 && record_type == 28 {
-                let bytes = packet
-                    .get(rdata_start..rdata_start + rdata_len)
-                    .filter(|bytes| bytes.len() == 16)
-                    .ok_or(ResolverError::Malformed)?;
-                let octets: [u8; 16] = bytes.try_into().map_err(|_| ResolverError::Malformed)?;
-                addresses.push(IpAddr::V6(Ipv6Addr::from(octets)));
-            }
-            offset = fixed_end
-                .checked_add(rdata_len)
-                .filter(|end| *end <= packet.len())
-                .ok_or(ResolverError::Malformed)?;
-        }
-    }
-    if offset != packet.len() {
-        return Err(ResolverError::Malformed);
-    }
-    Ok(ParsedMessage {
-        question: Question {
+    Ok((
+        Question {
             id: read_u16(packet, 0)?,
             opcode: ((flags >> 11) & 0x0f) as u8,
             name,
@@ -326,7 +351,57 @@ fn parse_message(packet: &[u8], response: bool) -> Result<ParsedMessage, Resolve
             qclass,
             truncated: flags & 0x0200 != 0,
         },
-        addresses,
+        offset + 4,
+    ))
+}
+
+fn section_counts(packet: &[u8]) -> Result<[u16; 3], ResolverError> {
+    Ok([
+        read_u16(packet, 6)?,
+        read_u16(packet, 8)?,
+        read_u16(packet, 10)?,
+    ])
+}
+
+struct ResourceRecord {
+    owner: Vec<u8>,
+    kind: u16,
+    class: u16,
+    ttl: u32,
+    data: std::ops::Range<usize>,
+}
+
+impl ResourceRecord {
+    fn address(&self, packet: &[u8]) -> Result<Option<IpAddr>, ResolverError> {
+        let bytes = &packet[self.data.clone()];
+        match (self.class, self.kind) {
+            (1, 1) => {
+                let octets: [u8; 4] = bytes.try_into().map_err(|_| ResolverError::Malformed)?;
+                Ok(Some(Ipv4Addr::from(octets).into()))
+            }
+            (1, 28) => {
+                let octets: [u8; 16] = bytes.try_into().map_err(|_| ResolverError::Malformed)?;
+                Ok(Some(Ipv6Addr::from(octets).into()))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn read_record(packet: &[u8], offset: &mut usize) -> Result<ResourceRecord, ResolverError> {
+    let (owner, header) = decode_name(packet, *offset, true)?;
+    let start = header + 10;
+    let end = start + usize::from(read_u16(packet, header + 8)?);
+    if end > packet.len() {
+        return Err(ResolverError::Malformed);
+    }
+    *offset = end;
+    Ok(ResourceRecord {
+        owner,
+        kind: read_u16(packet, header)?,
+        class: read_u16(packet, header + 2)?,
+        ttl: read_u32(packet, header + 4)?,
+        data: start..end,
     })
 }
 
@@ -388,6 +463,16 @@ fn read_u16(packet: &[u8], offset: usize) -> Result<u16, ResolverError> {
         .get(offset..offset + 2)
         .ok_or(ResolverError::Malformed)?;
     Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(packet: &[u8], offset: usize) -> Result<u32, ResolverError> {
+    let mut value = [0; 4];
+    value.copy_from_slice(
+        packet
+            .get(offset..offset + 4)
+            .ok_or(ResolverError::Malformed)?,
+    );
+    Ok(u32::from_be_bytes(value))
 }
 
 fn map_io(error: std::io::Error) -> ResolverError {
@@ -484,11 +569,11 @@ mod tests {
         let response = forward_udp(&client, peer, QUERY, Duration::from_secs(1), &mut cancel)
             .await
             .expect("forward");
-        assert!(response.truncated);
-        assert_eq!(&response.packet[..2], &QUERY[..2]);
-        assert!(response.packet[2] & 0x02 != 0);
+        assert!(response.truncated());
+        assert_eq!(&response.packet()[..2], &QUERY[..2]);
+        assert!(response.packet()[2] & 0x02 != 0);
         assert!(
-            response.packet[20..]
+            response.packet()[20..]
                 .windows(4)
                 .any(|window| window == [0, 0, 0x80, 0])
         );
@@ -539,6 +624,8 @@ mod tests {
                 packet,
                 truncated: false,
                 question: original,
+                received_at: Instant::now(),
+                peer: ForwardPeer::Plain((Ipv4Addr::LOCALHOST, 53).into()),
             };
             assert_eq!(
                 response.reject_addresses(|address| address == reserved),
@@ -622,8 +709,8 @@ mod tests {
         )
         .await
         .expect("forward");
-        assert!(!response.truncated);
-        assert_eq!(&response.packet[..2], &QUERY[..2]);
+        assert!(!response.truncated());
+        assert_eq!(&response.packet()[..2], &QUERY[..2]);
         server.await.expect("server");
     }
 

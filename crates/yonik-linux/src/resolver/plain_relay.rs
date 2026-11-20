@@ -10,6 +10,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
     num::{NonZeroU16, NonZeroU32},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -32,7 +33,7 @@ pub(crate) struct PlainDnsRelay {
     udp: UdpSocket,
     peer: SocketAddr,
     mark: NonZeroU32,
-    dot: Option<DotPeer>,
+    dot: Option<Arc<DotPeer>>,
     plain: Option<SocketAddr>,
 }
 
@@ -75,7 +76,7 @@ impl PlainDnsRelay {
     }
 
     pub fn with_dot(mut self, dot: DotPeer, plain: Option<SocketAddr>) -> Self {
-        self.dot = Some(dot);
+        self.dot = Some(Arc::new(dot));
         self.plain = plain;
         self
     }
@@ -214,9 +215,13 @@ impl PlainDnsRelay {
                 .and_then(std::convert::identity);
                 match negotiated {
                     Ok((mut stream, tls)) => {
-                        return forward_framed(query, LIMIT, &mut cancel, async |outbound| {
-                            dot.exchange(&mut stream, tls, outbound).await
-                        })
+                        return forward_framed(
+                            query,
+                            LIMIT,
+                            &mut cancel,
+                            super::forward::ForwardPeer::Tls(self.peer, Arc::clone(dot)),
+                            async |outbound| dot.exchange(&mut stream, tls, outbound).await,
+                        )
                         .await;
                     }
                     Err(
@@ -254,7 +259,7 @@ impl PlainDnsRelay {
             .await
             .map_err(|_| ResolverError::Timeout)??;
         response.reject_addresses(is_reserved_fake)?;
-        Ok(response.packet)
+        Ok(response.into_packet())
     }
 
     async fn connect_tcp(&self, endpoint: SocketAddr) -> Result<TcpStream, ResolverError> {
