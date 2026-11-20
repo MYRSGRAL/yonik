@@ -275,6 +275,13 @@ fn verify_rules(
             .and_then(NonZeroU64::new)
             .ok_or(NftError::Evidence)?;
         if kind == "set" {
+            // nftables 1.1.7 выводит число элементов, включая истёкшие до сборки мусора.
+            if data_object
+                .remove("count")
+                .is_some_and(|count| !count.is_u64())
+            {
+                return Err(NftError::Evidence);
+            }
             if let Some(elements) = data_object.remove("elem") {
                 verify_dhcp_element(elements, policy, &resolve)?;
             }

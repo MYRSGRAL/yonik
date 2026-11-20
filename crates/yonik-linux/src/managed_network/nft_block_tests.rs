@@ -368,25 +368,26 @@ fn dhcp_rule_only_accepts_the_exact_short_lived_element() {
     let policy = serde_json::from_value::<PublicBlockPolicy>(wire).expect("Политика DHCP");
     let table = block_table(owner(), 2, 5, &policy);
     let mut live = listing(&table, &policy);
-    let set = live["nftables"]
-        .as_array_mut()
+    let set_index = live["nftables"]
+        .as_array()
         .expect("Список nftables")
-        .iter_mut()
-        .find_map(|object| object.get_mut("set"))
+        .iter()
+        .position(|object| object.get("set").is_some())
         .expect("Набор DHCP");
     let value = json!({"concat":["192.0.2.10","192.0.2.1",7,"test-dhcp"]});
     let allowed = json!({"elem":{"val":value,"timeout":0,"expires":0}});
-    set["elem"] = json!([allowed]);
+    live["nftables"][set_index]["set"]["elem"] = json!([allowed]);
     let read = |listing: &Value| check(listing, &table, &policy);
     assert_eq!(read(&live), Ok(()));
+    let mut counted = live.clone();
+    counted["nftables"][set_index]["set"]["count"] = json!("2");
+    assert_eq!(read(&counted), Err(NftError::Evidence));
+    counted["nftables"][set_index]["set"]["count"] = json!(2);
+    assert_eq!(read(&counted), Ok(()));
+
     let with_elements = |elements: Value| {
-        let mut modified = live.clone();
-        modified["nftables"]
-            .as_array_mut()
-            .expect("Список nftables")
-            .iter_mut()
-            .find_map(|object| object.get_mut("set"))
-            .expect("Набор DHCP")["elem"] = elements;
+        let mut modified = counted.clone();
+        modified["nftables"][set_index]["set"]["elem"] = elements;
         modified
     };
     for index in ["7", "test-dhcp"] {
