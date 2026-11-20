@@ -62,15 +62,21 @@ gate_command() {
 pins=/sys/fs/bpf/yonik-wg-packet-gate
 mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
 mkdir "$pins"
-cleanup() {
-    rc=$?
-    for entry in v4 v6 wg_active wg_leases wg_verdicts; do
+clear_gate() {
+    for entry in post4 post6 v4 v6 wg_active wg_leases wg_verdicts; do
         if [[ -e "$pins/$entry" ]]; then unlink "$pins/$entry"; fi
     done
+}
+cleanup() {
+    rc=$?
+    if [[ "${2:-}" = nft-order ]]; then
+        nft delete table inet yonik_order_matrix || true
+    fi
+    clear_gate
     rmdir "$pins"
     echo "YONIK_WIREGUARD_PROOF_EXIT=$rc"
 }
-trap cleanup EXIT
+trap 'cleanup "$@"' EXIT
 systemd-run --wait --pipe --collect --unit=yonik-wg-packet-load \
     --property=NoNewPrivileges=yes --property='CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON' \
     "$gate_exec" load /run/yonik-wg-socket.bpf.o "$pins" "$mark"
@@ -144,6 +150,110 @@ snapshot_id() {
     [[ "$id" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
     printf '%s\n' "$id"
 }
+if [[ "${2:-}" = nft-order ]]; then
+    nft_family=ip
+    packet_header='ip version 4 ip hdrlength 5 ip frag-off & 0x3fff == 0 ip protocol udp'
+    if [[ "$1" = 6 ]]; then
+        nft_family=ip6
+        packet_header='ip6 version 6 ip6 nexthdr udp'
+    fi
+    rewrite_mark=24178
+    nft -f - <<NFT
+add table inet yonik_order_matrix
+add chain inet yonik_order_matrix foreign_pre { type filter hook output priority -50; policy accept; }
+add chain inet yonik_order_matrix managed { type filter hook output priority 0; policy accept; }
+add chain inet yonik_order_matrix foreign_post { type filter hook output priority 50; policy accept; }
+add rule inet yonik_order_matrix managed $packet_header $nft_family saddr $host $nft_family daddr $endpoint udp sport $port udp dport $port meta oifname "yonik-outer" meta mark $mark accept
+add rule inet yonik_order_matrix managed $nft_family daddr $endpoint udp dport $port drop
+NFT
+    load_late_gate() {
+        local mode=$1
+        shift
+        systemd-run --wait --pipe --collect --unit="yonik-wg-$mode" \
+            --property=NoNewPrivileges=yes --property='CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON' \
+            "$gate_exec" "$mode" /run/yonik-wg-socket.bpf.o "$pins" "$@"
+        "$gate" start "$pins" "$generation"
+    }
+    rewrite_late_mark() {
+        nft add rule inet yonik_order_matrix foreign_post "$nft_family" daddr "$endpoint" udp dport "$port" meta mark set "$rewrite_mark"
+    }
+    "$wg" set yonik-wg fwmark "$rewrite_mark"
+    nft add rule inet yonik_order_matrix foreign_pre "$nft_family" daddr "$endpoint" udp dport "$port" meta mark set "$mark"
+    probe 1 early_mark_only_control
+    test "$(count 0)" = 0
+    test "$(count 2)" = 0
+    echo YONIK_WG_ORDER_EARLY_MARK_ONLY_CONTROL
+    clear_gate
+
+    load_late_gate load-late "$mark"
+    check 2 late_after_nft_sets_mark
+    rewrite_late_mark
+    probe 1 late_mark_only_control
+    echo YONIK_WG_ORDER_LATE_MARK_ONLY_CONTROL
+    clear_gate
+
+    # Проверяем отбор по конечной точке отдельно от отбора по cookie.
+    other_cookie=fffffffffffffffe
+    test "$cookie" != "$other_cookie"
+    load_late_gate load-guarded "$1" "$endpoint" "$port" "$port" "$other_cookie"
+    check 2 endpoint_selected_after_mark_rewrite
+    clear_gate
+
+    # Эта цепочка OUTPUT работает уже после максимально позднего BPF OUTPUT.
+    nft flush chain inet yonik_order_matrix foreign_post
+    nft delete chain inet yonik_order_matrix foreign_post
+    nft add chain inet yonik_order_matrix foreign_post '{ type filter hook output priority 2147483647; policy accept; }'
+    rewrite_late_mark
+    # Переписанный поток не совпадёт и с портом, указанным в списке.
+    load_late_gate load-guarded "$1" "$endpoint" "$port" 24179 "$cookie"
+    check 2 cookie_selected_after_mark_rewrite
+    "$gate" replace "$pins" "$generation" "${lease[@]:0:9}" 15000
+    before_allowed=$(count 0)
+    check 2 postrouting_rejects_rewrite_after_output_lease
+    test "$(count 0)" -gt "$before_allowed"
+    nft flush chain inet yonik_order_matrix foreign_post
+    check 0 guarded_current_lease
+    # Сторонний сокет с такой же меткой вне перечня остаётся доступен.
+    python3 - "$mark" <<'PY'
+import socket
+import sys
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+    receiver.bind(("127.0.0.1", 0))
+    receiver.settimeout(1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, int(sys.argv[1]))
+        sender.sendto(b"yonik-unrelated", receiver.getsockname())
+    assert receiver.recv(32) == b"yonik-unrelated"
+PY
+    echo YONIK_WG_ORDER_UNRELATED_SOCKET_UNCHANGED
+
+    # Проверяем тот же интерфейс с другим реальным следующим узлом.
+    "$wg" set yonik-wg fwmark "$mark"
+    ip "$family_switch" rule add pref 300 fwmark "$mark" table 219
+    ip "$family_switch" route replace "$cidr" via "$gateway_a" dev yonik-outer onlink src "$host" table 219
+    guarded_lease=("${lease[@]:0:9}")
+    guarded_lease[8]=$gateway_a
+    "$gate" replace "$pins" "$generation" "${guarded_lease[@]}" 15000
+    check 0 guarded_first_gateway
+    ip "$family_switch" route replace "$cidr" via "$gateway_b" dev yonik-outer onlink src "$host" table 219
+    ip "$family_switch" route get "$endpoint" from "$host" mark "$mark" |
+        grep -F "via $gateway_b dev yonik-outer table 219"
+    check 2 guarded_gateway_changed
+    ip "$family_switch" rule del pref 300
+    ip "$family_switch" route del "$cidr" table 219
+
+    "$gate" replace "$pins" "$generation" "${lease[@]:0:9}" 500
+    sleep 1
+    check 3 guarded_expired_lease
+    "$gate" stop "$pins" "$generation"
+    rewrite_late_mark
+    check 4 guarded_stop_after_mark_rewrite
+    test "$before" = "$(stat -c '%i %a %u %g %F %N' /etc/resolv.conf; stat -L -c '%i %a %u %g' /etc/resolv.conf; sha256sum /etc/resolv.conf)"
+    echo YONIK_WG_ORDER_RESOLVCONF_OK
+    exit 0
+fi
+
 binary_lease() {
     python3 - "$@" <<'PYVM'
 import ipaddress

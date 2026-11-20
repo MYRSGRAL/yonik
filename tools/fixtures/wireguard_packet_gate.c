@@ -5,7 +5,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,8 +48,43 @@ static int open_map(const char *dir, const char *name)
     return fd;
 }
 
-static int load(const char *file, const char *dir, __u32 mark)
+#define SELECTOR_FIELDS 5
+
+static int freeze_selectors(struct bpf_object *object, int fields, char **entries)
 {
+    int endpoints = bpf_object__find_map_fd_by_name(object, "wg_endpoints");
+    int sockets = bpf_object__find_map_fd_by_name(object, "wg_sockets");
+    if (endpoints < 0 || sockets < 0)
+        return 1;
+    const __u32 present = 1;
+    for (int i = 0; i < fields; i += SELECTOR_FIELDS) {
+        struct yonik_wg_endpoint endpoint = {
+            .family = !strcmp(entries[i], "4") ? AF_INET : !strcmp(entries[i], "6") ? AF_INET6 : 0,
+            .source_port = htons(integer(entries[i + 2], 10, UINT16_MAX)),
+            .destination_port = htons(integer(entries[i + 3], 10, UINT16_MAX)),
+        };
+        __u64 cookie = integer(entries[i + 4], 16, UINT64_MAX);
+        if (!endpoint.family || inet_pton(endpoint.family, entries[i + 1], endpoint.destination) != 1)
+            return 2;
+        if (bpf_map_update_elem(endpoints, &endpoint, &present, BPF_ANY)
+            || bpf_map_update_elem(sockets, &cookie, &present, BPF_ANY))
+            return 1;
+    }
+    return bpf_map_freeze(endpoints) || bpf_map_freeze(sockets);
+}
+
+static int load(int argc, char **argv)
+{
+    const int guarded = !strcmp(argv[1], "load-guarded");
+    const int late = guarded || !strcmp(argv[1], "load-late");
+    const int fields = argc - 4;
+    if ((guarded && (fields < SELECTOR_FIELDS || fields % SELECTOR_FIELDS
+                    || fields / SELECTOR_FIELDS > YONIK_WG_MAX_LEASES))
+        || (!guarded && argc != 5))
+        return 2;
+    const char *file = argv[2];
+    const char *dir = argv[3];
+    const __u32 mark = guarded ? 0 : integer(argv[4], 10, UINT32_MAX);
     struct bpf_object *object = bpf_object__open_file(file, NULL);
     if (!object || bpf_object__load(object))
         return 1;
@@ -56,13 +93,17 @@ static int load(const char *file, const char *dir, __u32 mark)
     int fd = bpf_object__find_map_fd_by_name(object, "wg_mark");
     if (!program || fd < 0 || bpf_map_update_elem(fd, &zero, &mark, BPF_ANY))
         return 1;
+    int result = freeze_selectors(object, guarded ? fields : 0, argv + 4);
+    if (result)
+        return result;
 
-    const char *names[] = {"wg_leases", "wg_verdicts", "wg_active", "v4", "v6"};
+    const char *names[] = {"wg_leases", "wg_verdicts", "wg_active", "v4", "v6", "post4", "post6"};
     char path[256];
-    struct bpf_link *links[2] = {};
+    struct bpf_link *links[4] = {};
     const unsigned int families[] = { NFPROTO_IPV4, NFPROTO_IPV6 };
     const int map_count = 3;
-    const int pin_count = sizeof(names) / sizeof(names[0]);
+    const int link_count = guarded ? 4 : 2;
+    const int pin_count = map_count + link_count;
     int installed = 0;
     for (; installed < pin_count; installed++) {
         pin_name(path, dir, names[installed]);
@@ -72,16 +113,19 @@ static int load(const char *file, const char *dir, __u32 mark)
                 break;
         } else {
             int link = installed - map_count;
+            // POST_ROUTING проверяет уже итог OUTPUT до штатного SNAT.
+            int postrouting = link >= 2;
             struct bpf_netfilter_opts opts = {
-                .sz = sizeof(opts), .pf = families[link],
-                .hooknum = NF_INET_LOCAL_OUT, .priority = -150,
+                .sz = sizeof(opts), .pf = families[link % 2],
+                .hooknum = postrouting ? NF_INET_POST_ROUTING : NF_INET_LOCAL_OUT,
+                .priority = postrouting ? NF_IP_PRI_NAT_SRC - 1 : late ? INT_MAX - 1 : -150,
             };
             links[link] = bpf_program__attach_netfilter(program, &opts);
             if (!links[link] || bpf_link__pin(links[link], path))
                 break;
         }
     }
-    int result = installed != pin_count;
+    result = installed != pin_count;
     if (result) {
         perror("Закрепление BPF");
         for (int i = installed - 1; i >= 0; i--) {
@@ -89,8 +133,8 @@ static int load(const char *file, const char *dir, __u32 mark)
             unlink(path);
         }
     }
-    bpf_link__destroy(links[1]);
-    bpf_link__destroy(links[0]);
+    for (int i = link_count - 1; i >= 0; i--)
+        bpf_link__destroy(links[i]);
     bpf_object__close(object);
     return result;
 }
@@ -402,8 +446,9 @@ static int change_lease(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-    if (argc == 5 && !strcmp(argv[1], "load"))
-        return load(argv[2], argv[3], integer(argv[4], 10, UINT32_MAX));
+    if (argc > 1 && (!strcmp(argv[1], "load") || !strcmp(argv[1], "load-late")
+                     || !strcmp(argv[1], "load-guarded")))
+        return load(argc, argv);
     if (argc == 4 && (!strcmp(argv[1], "start") || !strcmp(argv[1], "stop")))
         return change_session(argv[2], integer(argv[3], 10, UINT64_MAX), !strcmp(argv[1], "start"));
     if (argc > 1 && !strcmp(argv[1], "replace"))

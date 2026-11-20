@@ -19,6 +19,13 @@ struct yonik_wg_packet {
     __u64 generation;
 };
 
+struct yonik_wg_endpoint {
+    __u32 family;
+    __u8 destination[16];
+    __be16 source_port;
+    __be16 destination_port;
+};
+
 struct yonik_wg_session {
     struct bpf_spin_lock lock;
     __u32 reserved;

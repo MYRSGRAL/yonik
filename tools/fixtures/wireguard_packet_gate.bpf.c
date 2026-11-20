@@ -52,6 +52,24 @@ struct {
     __type(value, __u32);
 } wg_mark SEC(".maps");
 
+// В режиме совместной работы с nft кандидаты остаются под контролем
+// после смены метки и после отзыва разрешений до удаления правила nft.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, YONIK_WG_MAX_LEASES);
+    __uint(map_flags, BPF_F_RDONLY_PROG);
+    __type(key, struct yonik_wg_endpoint);
+    __type(value, __u32);
+} wg_endpoints SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, YONIK_WG_MAX_LEASES);
+    __uint(map_flags, BPF_F_RDONLY_PROG);
+    __type(key, __u64);
+    __type(value, __u32);
+} wg_sockets SEC(".maps");
+
 // Один неизменный слот, читаемый и обновляемый под одним spin lock.
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -192,27 +210,38 @@ int wireguard_gate(struct bpf_nf_ctx *ctx)
 {
     const __u32 zero = 0;
     const __u32 *mark = bpf_map_lookup_elem(&wg_mark, &zero);
-    if (!mark || !*mark || ctx->skb->mark != *mark)
+    struct sk_buff *skb = ctx->skb;
+    const struct nf_hook_state *state = ctx->state;
+    struct sock *socket = state->sk;
+    const __u32 packet_mark = skb->mark;
+    struct yonik_wg_packet packet = {
+        .cookie = socket ? socket->__sk_common.skc_cookie.counter : 0,
+        .mark = packet_mark,
+        .family = state->pf,
+    };
+    if (mark && *mark && packet_mark != *mark)
+        return 1;
+    const int selected = (mark && *mark) || bpf_map_lookup_elem(&wg_sockets, &packet.cookie);
+    if (read_packet(skb, &packet))
+        return selected ? verdict(YONIK_WG_UNSUPPORTED_PACKET) : 1;
+    struct yonik_wg_endpoint endpoint = {
+        .family = packet.family,
+        .source_port = packet.source_port,
+        .destination_port = packet.destination_port,
+    };
+    __builtin_memcpy(endpoint.destination, packet.destination, sizeof(endpoint.destination));
+    if (!selected && !bpf_map_lookup_elem(&wg_endpoints, &endpoint))
         return 1;
 
     __u64 generation = active_generation();
     if (!generation)
         return verdict(YONIK_WG_INACTIVE_SESSION);
-
-    struct sock *socket = ctx->state->sk;
-    struct net_device *out = ctx->state->out;
-    if (!socket || !out)
+    struct net_device *out = state->out;
+    if (!out || !packet.cookie)
         return verdict(YONIK_WG_UNSUPPORTED_PACKET);
-
-    struct yonik_wg_packet packet = {
-        .cookie = socket->__sk_common.skc_cookie.counter,
-        .mark = ctx->skb->mark,
-        .ifindex = out->ifindex,
-        .family = ctx->state->pf,
-        .generation = generation,
-    };
-    if (!packet.cookie || !packet.ifindex || read_packet(ctx->skb, &packet)
-        || read_next_hop(ctx->skb, out, &packet))
+    packet.ifindex = out->ifindex;
+    packet.generation = generation;
+    if (!packet.ifindex || read_next_hop(skb, out, &packet))
         return verdict(YONIK_WG_UNSUPPORTED_PACKET);
 
     // Каждый проход использует один опубликованный, замороженный снимок.
