@@ -1190,6 +1190,23 @@ IPv4-сценарий с теми же проверками прошёл пов�
   допуска при смене сокета, маршрута или остановке helper.
   [WireGuard UDP в Linux](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireguard/socket.c#L342-L412) · [Netfilter BPF](https://github.com/torvalds/linux/blob/v6.12/net/netfilter/nf_bpf_link.c) · [Часы ядра Linux](https://docs.kernel.org/core-api/timekeeping.html)
 
+  [Стенд фильтра WireGuard](../../../tools/fixtures/wireguard_packet_gate.sh)
+  на том же Debian с UDP/IPv4 и Ubuntu с UDP/IPv6 объединил проверку
+  cookie сокета, обоих IP и UDP-портов, метки, выходного ifindex и срока
+  `CLOCK_BOOTTIME` в хук `LOCAL_OUT`. Стенд загрузил его из службы с
+  `NoNewPrivileges=yes` и только `CAP_NET_ADMIN`, `CAP_BPF` и
+  `CAP_PERFMON`. После выхода загрузчика прошли приватные TCP/UDP и
+  системное разрешение внутреннего имени через WireGuard. Удаление
+  допуска заблокировало трафик и DNS. Смена маршрута на другой интерфейс
+  и замена UDP-сокета отвергли прежний допуск. После публикации нового
+  допуска связь восстановилась. Срок истёк в ядре без участия
+  загрузчика. `/etc/resolv.conf` сохранил содержимое и метаданные.
+  Хук проверял пакеты с выделенной меткой до возможной последующей
+  трансляции. Интеграции в helper ещё нужны основной запрет обхода при
+  смене метки, согласованная публикация и отзыв с учётом поколения
+  сессии, проверка смены шлюза на том же интерфейсе и пакетная политика
+  службы. [Тесты интерфейса Netfilter BPF в Linux](https://github.com/torvalds/linux/blob/master/tools/testing/selftests/bpf/progs/verifier_netfilter_ctx.c)
+
   Сам снимок UDP-маршрута теперь проверяет срок и по `CLOCK_BOOTTIME`. Монотонная граница сохраняется для тайм-аутов Netlink. Синтетический регрессионный тест подтвердил отзыв при истечении срока во время сна. На Debian 6.12.117 и Ubuntu 6.8.0-147 повторена проверка реального маршрута, смены RPDB и endpoint и отзыва снимка. Этот код пока используется для проверки снимка и не устанавливает допуск пакетов WireGuard.
 
   Сетевой план уже умеет журналировать собственные
