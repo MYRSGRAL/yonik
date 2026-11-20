@@ -1924,12 +1924,11 @@ impl Backend {
         let fake_dns = match request.fake_dns_domains {
             Some(domains) => {
                 let saved = self
-                    .journal
+                    .private_dns_zones
                     .as_ref()
-                    .map(|journal| journal.saved_private_dns_zones(uid))
-                    .transpose()
                     .map_err(unavailable)?
-                    .unwrap_or_default();
+                    .saved_zones(uid)
+                    .map_err(unavailable)?;
                 let prepared = PreparedFakeDns::new(
                     &plan,
                     &baseline,
@@ -2261,10 +2260,10 @@ impl Backend {
         let owner = self.ensure_owner(uid)?;
         self.invalidate()?;
         if let Some(fake_dns) = &artifact.fake_dns {
-            self.journal
+            self.private_dns_zones
                 .as_mut()
-                .ok_or(ServiceError::Unavailable)?
-                .store_private_dns_zones(owner, fake_dns.private_dns_zones())
+                .map_err(unavailable)?
+                .store_zones(owner.owner_uid(), fake_dns.private_dns_zones())
                 .map_err(unavailable)?;
         }
         self.journal

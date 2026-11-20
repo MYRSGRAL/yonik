@@ -1,7 +1,7 @@
 policy_module(yonik_helper, 1.0)
 
 gen_require(`
-    type init_t, iptables_t, var_run_t;
+    type init_t, iptables_t, var_t, var_lib_t, var_run_t;
     type systemd_unit_file_t;
     type fs_t, nsfs_t;
     type initrc_t, unconfined_t;
@@ -24,6 +24,18 @@ manage_dirs_pattern(yonik_helper_t, yonik_helper_run_t, yonik_helper_run_t)
 manage_files_pattern(yonik_helper_t, yonik_helper_run_t, yonik_helper_run_t)
 allow init_t yonik_helper_run_t:dir manage_dir_perms;
 type_transition init_t var_run_t:dir yonik_helper_run_t "yonik";
+
+type yonik_helper_state_t;
+files_type(yonik_helper_state_t)
+
+manage_dirs_pattern(yonik_helper_t, yonik_helper_state_t, yonik_helper_state_t)
+manage_files_pattern(yonik_helper_t, yonik_helper_state_t, yonik_helper_state_t)
+allow init_t yonik_helper_state_t:dir manage_dir_perms;
+type_transition init_t var_lib_t:dir yonik_helper_state_t "yonik";
+
+# Хранилище открывается по дескрипторам каталогов и подтверждает имя через fsync родителя.
+files_search_var_lib(yonik_helper_t)
+allow yonik_helper_t { var_t var_lib_t }:dir { getattr open read };
 
 allow yonik_helper_t self:capability net_admin;
 allow yonik_helper_t self:netlink_route_socket { create_netlink_socket_perms nlmsg_read };

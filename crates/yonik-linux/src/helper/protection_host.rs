@@ -4,7 +4,7 @@ use super::service::{ProtectionHost, ProtectionState, ServiceError};
 use super::session_fake_dns::FakeDnsState;
 use super::{PreparedArtifact, PreparedContext, PreparedError};
 use crate::managed_network::{
-    Journal, Ownership,
+    Journal, JournalError, Ownership, PrivateDnsJournal,
     firewall::{IpPrefix, LanException, PublicBlockPolicy},
     nft::{NftExecutor, PublicPolicyRecovery},
 };
@@ -24,6 +24,7 @@ pub(super) mod session_host;
 use session_host::{ActiveSession, HelperTunCustody, SessionArtifact};
 
 const STATE_PATH: &str = "/run/yonik/network";
+const PRIVATE_DNS_STATE_PATH: &str = "/var/lib/yonik";
 const MAX_PLAN_BYTES: usize = 64 * 1024;
 const RT_SCOPE_LINK: u8 = 253;
 const RT_TABLE_MAIN: u32 = 254;
@@ -89,6 +90,7 @@ struct Backend {
     profile_owner: Option<(std::sync::Weak<Mutex<Backend>>, tokio::runtime::Handle)>,
     path: PathBuf,
     journal: Option<Journal>,
+    private_dns_zones: Result<PrivateDnsJournal, JournalError>,
     watch: NetworkWatch,
     seed: u64,
     epoch: u64,
@@ -223,11 +225,20 @@ impl SystemProtectionHost {
             .then(|| super::dhcp_sleep::watch(Arc::clone(&dhcp_sleep), Arc::clone(&exited)));
         let backend = tokio::task::spawn_blocking(move || {
             let (journal, fake_dns) = open_startup_state(&path)?;
+            let private_dns_path = if isolated {
+                path.join("private-dns")
+            } else {
+                PathBuf::from(PRIVATE_DNS_STATE_PATH)
+            };
+            // Повреждение DNS-состояния блокирует Fake DNS. Stop и
+            // восстановление ресурсов по сетевому журналу остаются доступны.
+            let private_dns_zones = PrivateDnsJournal::open(&private_dns_path, journal.as_ref());
             let _fixture_only = isolated;
             Ok::<_, ServiceError>(Backend {
                 profile_owner: None,
                 path,
                 journal,
+                private_dns_zones,
                 watch,
                 seed,
                 epoch: 1,

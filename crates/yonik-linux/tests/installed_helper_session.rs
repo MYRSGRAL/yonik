@@ -652,6 +652,59 @@ async fn production_helper_sing_box_fake_dns_blocks_unbound_wireguard() -> Resul
 }
 
 #[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная VM после перезагрузки с ранее обнаруженной зоной WireGuard"]
+async fn production_helper_protects_private_dns_after_reboot() -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let policy = scoped_fake_dns_proxy_policy()?;
+    let (_owner, token) = yonik_linux::Cancellation::new();
+    for engine in [Engine::Xray, Engine::SingBox] {
+        let drain = start_fake_dns_in_vm_with_domains(
+            &connection,
+            &server,
+            engine,
+            false,
+            Some(&policy),
+            &token,
+            &["test".to_owned(), "wg.test".to_owned()],
+        )
+        .await?;
+        let marker = private_zone_test_marker()?;
+        for tcp in [false, true] {
+            let public = ask_fixture_dns(marker, "example.test", 1, tcp).await?;
+            require(
+                matches!(public, std::net::IpAddr::V4(v4) if matches!(v4.octets(), [198, 19, 224..=255, _])),
+                "Публичное имя не получило Fake-IP",
+            )?;
+            require(
+                ask_fixture_dns(marker, "rebooted.wg.test", 1, tcp)
+                    .await
+                    .is_err(),
+                "Приватное имя получило ответ Fake DNS после перезагрузки",
+            )?;
+        }
+        call(&connection, "Stop", json!({"version":1})).await?;
+        require(
+            tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+            "Не остановлен worker",
+        )?;
+        eprintln!("{engine:?}: YONIK_PRIVATE_DNS_AFTER_REBOOT");
+    }
+    require(
+        resolver_file_state()? == resolver_before,
+        "Проверка изменила /etc/resolv.conf",
+    )
+}
+
+#[cfg(feature = "test-support")]
 async fn installed_fake_dns_blocks_unbound_wireguard(engine: Engine) -> Result {
     guard()?;
     let _lock = vm_lock::acquire()?;

@@ -61,7 +61,7 @@ semodule -X %{yonik_policy_priority} -i %{yonik_policy_dir}/yonik_helper.pp
 restorecon -F %{yonik_libdir}/yonik-helper %{yonik_libdir}/yonik-worker \
     %{_unitdir}/yonik-worker{,-check}.{service,socket}
 restorecon -RF %{_unitdir}/yonik-worker{,-check}.service.d
-for directory in /run/yonik /run/yonik-worker; do
+for directory in /run/yonik /run/yonik-worker /var/lib/yonik; do
     if [ -d "$directory" ]; then
         restorecon -RF "$directory"
     fi
@@ -93,7 +93,8 @@ fi
 set -eu
 if [ "$1" -eq 0 ]; then
     semodule -X %{yonik_policy_priority} -r yonik_helper
-    for directory in /run/yonik /run/yonik-worker; do
+    # Данные StateDirectory сохраняются. Возвращаем штатную метку после удаления политики.
+    for directory in /run/yonik /run/yonik-worker /var/lib/yonik; do
         if [ -d "$directory" ]; then
             restorecon -RF "$directory"
         fi

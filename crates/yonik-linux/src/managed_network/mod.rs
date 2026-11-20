@@ -18,6 +18,7 @@ mod session_state;
 mod storage;
 pub mod tun;
 pub use policy_state::{PublicPolicyPhase, PublicPolicyRecord};
+pub(crate) use private_dns_state::PrivateDnsJournal;
 pub(crate) use quarantine_state::{FAKE_POOLS, QuarantineIntent, QuarantineTun};
 pub use session_state::SessionRecoveryRecord;
 
