@@ -1,6 +1,6 @@
 //! Ограниченный versioned D-Bus transport: идентичность берётся только у daemon.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,7 @@ pub struct SystemProfileRequest {
     pub kill_switch: bool,
     pub policy: Option<yonik_engine::policy_wire::SystemPolicy>,
     pub(super) fake_dns_domains: Option<Vec<String>>,
+    pub(super) fake_dns_policy_resolver: Option<SocketAddr>,
     pub(crate) peer: Option<Arc<crate::attribution::PeerProcess>>,
 }
 impl std::fmt::Debug for SystemProfileRequest {
@@ -271,6 +272,8 @@ struct FakeDnsProfilePrepareRequest<'a> {
     #[serde(borrow)]
     server: &'a serde_json::value::RawValue,
     fake_dns_domains: Vec<String>,
+    #[serde(default)]
+    fake_dns_policy_resolver: Option<SocketAddr>,
     #[serde(default, borrow)]
     policy: Option<&'a serde_json::value::RawValue>,
 }
@@ -394,7 +397,9 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                     Ok(Request::Prepare(dto.allow_lan))
                 }
                 "system_profile" | "system_profile_policy" | "system_profile_fake_dns" => {
-                    let (dto, policy, fake_dns_domains) = if route.mode == "system_profile_policy" {
+                    let (dto, policy, fake_dns_domains, fake_dns_policy_resolver) = if route.mode
+                        == "system_profile_policy"
+                    {
                         if !yonik_engine::policy_wire::bounded_depth(json, 6)
                             || !json.trim_start().starts_with('{')
                         {
@@ -415,6 +420,7 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                             },
                             Some(policy),
                             None,
+                            None,
                         )
                     } else if route.mode == "system_profile_fake_dns" {
                         let dto: FakeDnsProfilePrepareRequest<'_> =
@@ -422,6 +428,14 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                         if dto.policy.is_none() && !cfg!(feature = "test-support") {
                             return Err(ServiceError::Unsupported);
                         }
+                        if dto.policy.is_none() && dto.fake_dns_policy_resolver.is_some() {
+                            return Err(ServiceError::InvalidRequest);
+                        }
+                        let policy_resolver = dto
+                            .fake_dns_policy_resolver
+                            .map(crate::forward::PolicyProxyResolver::validate_upstream)
+                            .transpose()
+                            .map_err(|_| ServiceError::InvalidRequest)?;
                         let domains =
                             super::session_fake_dns::canonical_suffixes(&dto.fake_dns_domains)?;
                         let policy = dto
@@ -441,11 +455,12 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                             },
                             policy,
                             Some(domains),
+                            policy_resolver,
                         )
                     } else {
                         let dto: ProfilePrepareRequest<'_> =
                             serde_json::from_str(json).map_err(|_| ServiceError::InvalidRequest)?;
-                        (dto, None, None)
+                        (dto, None, None, None)
                     };
                     let dto: ProfilePrepareRequest<'_> = dto;
                     if dto.version != 1 || dto.mode != route.mode {
@@ -467,6 +482,7 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                         kill_switch: dto.kill_switch,
                         policy,
                         fake_dns_domains,
+                        fake_dns_policy_resolver,
                         peer: None,
                     })))
                 }

@@ -636,6 +636,7 @@ async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_wor
     let request = crate::helper::service::SystemProfileRequest {
         policy: None,
         fake_dns_domains: None,
+        fake_dns_policy_resolver: None,
         peer: None,
         server: yonik_import::ServerIntent::from_server(&report.servers[0]).unwrap(),
         engine: yonik_engine::Engine::Xray,
@@ -1187,6 +1188,7 @@ async fn app_policy_denied_before_backend_resources() {
         kill_switch: false,
         policy: Some(policy),
         fake_dns_domains: None,
+        fake_dns_policy_resolver: None,
         peer: None,
     };
     let (_keep, mut cancel) = crate::Cancellation::new();

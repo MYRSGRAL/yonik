@@ -2807,13 +2807,18 @@ async fn start_fake_dns_in_vm(
         SystemClient::on_connection(connection.clone(), deadline, token.clone()).await?;
     let domains = ["example.test".to_owned()];
     let prepared = if let Some(policy) = policy {
+        let policy_resolver = std::env::var("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER")
+            .ok()
+            .map(|address| address.parse::<std::net::SocketAddr>())
+            .transpose()?;
         client
-            .prepare_fake_dns_policy_profile(
+            .prepare_fake_dns_policy_profile_with_resolver(
                 server,
                 engine,
                 kill_switch,
                 &domains,
                 policy,
+                policy_resolver,
                 deadline,
                 token.clone(),
             )

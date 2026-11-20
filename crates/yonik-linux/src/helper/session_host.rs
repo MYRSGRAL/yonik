@@ -1799,6 +1799,7 @@ impl Backend {
             server: intent.server,
             policy: Some(intent.policy),
             fake_dns_domains: None,
+            fake_dns_policy_resolver: None,
             engine: intent.engine,
             kill_switch: intent.requirements.kill_switch,
             peer: request.peer,
@@ -1914,7 +1915,15 @@ impl Backend {
         };
         let fake_dns = match request.fake_dns_domains {
             Some(domains) => Some(Arc::new(
-                PreparedFakeDns::new(&plan, &baseline, domains, direct_egress, cancel).await?,
+                PreparedFakeDns::new(
+                    &plan,
+                    &baseline,
+                    domains,
+                    direct_egress,
+                    request.fake_dns_policy_resolver,
+                    cancel,
+                )
+                .await?,
             )),
             None => None,
         };

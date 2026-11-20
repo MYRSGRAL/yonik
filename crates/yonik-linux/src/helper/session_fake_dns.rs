@@ -580,6 +580,7 @@ impl PreparedFakeDns {
         topology: &LinuxTopology,
         suffixes: Vec<String>,
         direct_egress: Vec<BoundDirect>,
+        policy_resolver: Option<SocketAddr>,
         cancel: &mut Cancellation,
     ) -> Result<Self, ServiceError> {
         let source = resolver_source().await?;
@@ -610,6 +611,11 @@ impl PreparedFakeDns {
             SystemFakeDnsBridge::new(marker, pools, dns_port, lookup_port, reinject_port)
                 .and_then(|config| config.with_isolated_loopback(loopback))
                 .map_err(|_| ServiceError::Unavailable)?;
+        if let Some(upstream) = policy_resolver {
+            config = config
+                .with_policy_resolver(upstream)
+                .map_err(|_| ServiceError::InvalidRequest)?;
+        }
         let resolved = if matches!(
             source,
             ResolverSource::Resolved(_) | ResolverSource::ResolvedUplink

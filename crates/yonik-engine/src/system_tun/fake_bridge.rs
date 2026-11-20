@@ -43,6 +43,7 @@ pub struct SystemFakeDnsBridge {
     reject_unbound_dns: bool,
     lookup_auth: ProbeCredentials,
     reinject_auth: ProbeCredentials,
+    policy_resolver: Option<(SocketAddr, ProbeCredentials)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,7 @@ struct PlainDnsPeer {
 
 impl SystemFakeDnsBridge {
     pub const MAX_PLAIN_DNS_PEERS: usize = 16;
+    pub const POLICY_RESOLVER_USERNAME: &str = "yonik-policy-resolver";
 
     pub fn new(
         dns_address: IpAddr,
@@ -89,6 +91,7 @@ impl SystemFakeDnsBridge {
             reject_unbound_dns: false,
             lookup_auth,
             reinject_auth,
+            policy_resolver: None,
         })
     }
 
@@ -98,6 +101,30 @@ impl SystemFakeDnsBridge {
 
     pub fn reinject_auth(&self) -> &ProbeCredentials {
         &self.reinject_auth
+    }
+
+    /// Отдельная SOCKS-учётная запись для TCP-соединения с одним DNS-сервером.
+    pub fn with_policy_resolver(mut self, endpoint: SocketAddr) -> Result<Self, CompileError> {
+        let ip = endpoint.ip();
+        if endpoint.port() == 0
+            || matches!(endpoint, SocketAddr::V6(address)
+                if address.scope_id() != 0 || address.flowinfo() != 0 || address.ip().to_ipv4().is_some())
+            || !valid_plain_dns_peer(ip)
+            || ip == self.dns_address
+            || self.pools.iter().any(|pool| pool.contains(ip))
+        {
+            return Err(CompileError::InvalidParameter);
+        }
+        let auth = ProbeCredentials::random().map_err(|_| CompileError::InvalidParameter)?;
+        self.policy_resolver = Some((endpoint, auth));
+        Ok(self)
+    }
+
+    /// Пароль берётся из credentials, имя фиксировано в POLICY_RESOLVER_USERNAME.
+    pub fn policy_resolver(&self) -> Option<(SocketAddr, &ProbeCredentials)> {
+        self.policy_resolver
+            .as_ref()
+            .map(|(endpoint, auth)| (*endpoint, auth))
     }
 
     pub fn reinject_endpoint(&self) -> SocketAddrV4 {
@@ -253,6 +280,13 @@ fn validate_bridge(
             .plain_dns_peers
             .iter()
             .any(|peer| same_ip_address(peer.endpoint.ip(), remote))
+        || bridge.policy_resolver().is_some_and(|(endpoint, _)| {
+            same_ip_address(endpoint.ip(), remote)
+                || tun
+                    .addresses
+                    .iter()
+                    .any(|address| same_ip_address(endpoint.ip(), address.address))
+        })
         || tun.addresses.iter().any(|address| {
             address.address == bridge.dns_address
                 || bridge
@@ -296,10 +330,22 @@ fn attach_fake_dns(
     let lookup_port = bridge.lookup_port.get();
     let reinject_port = bridge.reinject_port.get();
     let (lookup, reinject) = (&bridge.lookup_auth, &bridge.reinject_auth);
+    let policy_username = SystemFakeDnsBridge::POLICY_RESOLVER_USERNAME;
 
     let (inbound, dns, socks) = match engine {
         Engine::Xray => {
-            let mut rules = Vec::with_capacity(bridge.plain_dns_peers.len() + 6);
+            let mut rules = Vec::with_capacity(bridge.plain_dns_peers.len() + 8);
+            let mut accounts = vec![json!({"user":reinject.username(),"pass":reinject.password()})];
+            if let Some((endpoint, auth)) = bridge.policy_resolver() {
+                accounts.push(json!({"user":policy_username,"pass":auth.password()}));
+                rules.extend([
+                    json!({"type":"field","inboundTag":["fake-ip-reinject"],"user":[policy_username],
+                        "ip":[ip_prefix(endpoint.ip())],"port":endpoint.port().to_string(),
+                        "network":"tcp","outboundTag":"proxy"}),
+                    json!({"type":"field","inboundTag":["fake-ip-reinject"],"user":[policy_username],
+                        "outboundTag":"fake-dns-reject"}),
+                ]);
+            }
             for (index, peer) in bridge.plain_dns_peers.iter().enumerate() {
                 rules.push(json!({
                     "type":"field",
@@ -343,7 +389,7 @@ fn attach_fake_dns(
             (
                 json!({"tag":"fake-ip-reinject","protocol":"socks","listen":local,"port":reinject_port,
                     "settings":{"auth":"password","udp":true,"ip":local,
-                    "accounts":[{"user":reinject.username(),"pass":reinject.password()}]}}),
+                    "accounts":accounts}}),
                 json!({"tag":"fake-dns-stub","protocol":"freedom","settings":{
                     "redirect":format!("{local}:{dns_port}"),
                     "finalRules":[{"action":"allow","ip":[format!("{local}/32")],"port":dns_port.to_string()}]
@@ -355,7 +401,19 @@ fn attach_fake_dns(
             )
         }
         Engine::SingBox => {
-            let mut rules = Vec::with_capacity(bridge.plain_dns_peers.len() + 6);
+            let mut rules = Vec::with_capacity(bridge.plain_dns_peers.len() + 8);
+            let mut users =
+                vec![json!({"username":reinject.username(),"password":reinject.password()})];
+            if let Some((endpoint, auth)) = bridge.policy_resolver() {
+                users.push(json!({"username":policy_username,"password":auth.password()}));
+                rules.extend([
+                    json!({"inbound":["fake-ip-reinject"],"auth_user":[policy_username],
+                        "ip_cidr":[ip_prefix(endpoint.ip())],"port":[endpoint.port()],"network":["tcp"],
+                        "action":"route","outbound":"proxy"}),
+                    json!({"inbound":["fake-ip-reinject"],"auth_user":[policy_username],
+                        "action":"reject"}),
+                ]);
+            }
             for peer in &bridge.plain_dns_peers {
                 rules.push(json!({
                     "inbound":["system-tun"],
@@ -395,7 +453,7 @@ fn attach_fake_dns(
             prepend_rules(&mut config.value["route"]["rules"], rules)?;
             (
                 json!({"type":"socks","tag":"fake-ip-reinject","listen":local,"listen_port":reinject_port,
-                    "users":[{"username":reinject.username(),"password":reinject.password()}]}),
+                    "users":users}),
                 json!({"type":"direct","tag":"fake-dns-stub"}),
                 json!({"type":"socks","tag":"fake-ip-lookup","server":local,"server_port":lookup_port,
                     "version":"5","username":lookup.username(),"password":lookup.password()}),
@@ -608,6 +666,162 @@ mod tests {
             port(12555),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn policy_resolver_routes_only_exact_tcp_destination_before_legacy_rules() {
+        let imported = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+        )
+        .unwrap();
+        let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        let legacy = empty_bridge().reject_unbound_system_dns();
+        assert!(legacy.policy_resolver().is_none());
+        for (server, prefix) in [
+            ("192.0.2.53:1053", "192.0.2.53/32"),
+            ("[2001:db8::53]:1053", "2001:db8::53/128"),
+        ] {
+            let endpoint = server.parse().unwrap();
+            let bridge = empty_bridge()
+                .reject_unbound_system_dns()
+                .with_policy_resolver(endpoint)
+                .unwrap();
+            let (stored_endpoint, auth) = bridge.policy_resolver().unwrap();
+            assert_eq!(stored_endpoint, endpoint);
+            assert!(auth.password() != bridge.reinject_auth().password());
+            assert!(auth.password() != bridge.lookup_auth().password());
+            let username = SystemFakeDnsBridge::POLICY_RESOLVER_USERNAME;
+            let policy = Policy::default();
+            for engine in [Engine::Xray, Engine::SingBox] {
+                let config_for = |bridge| {
+                    compile_system_fake_dns_policy(
+                        &imported.servers[0],
+                        engine,
+                        port(12556),
+                        port(12552),
+                        &policy,
+                        &tun,
+                        bridge,
+                        &[],
+                    )
+                    .unwrap()
+                    .value
+                };
+                let (config, legacy_config) = (config_for(&bridge), config_for(&legacy));
+                let (rules_path, users_path, username_key, password_key, allow, reject) =
+                    match engine {
+                        Engine::Xray => (
+                            "/routing/rules",
+                            "/settings/accounts",
+                            "user",
+                            "pass",
+                            json!({"type":"field","inboundTag":["fake-ip-reinject"],"user":[username],
+                            "ip":[prefix],"port":"1053","network":"tcp","outboundTag":"proxy"}),
+                            json!({"type":"field","inboundTag":["fake-ip-reinject"],"user":[username],
+                            "outboundTag":"fake-dns-reject"}),
+                        ),
+                        Engine::SingBox => (
+                            "/route/rules",
+                            "/users",
+                            "username",
+                            "password",
+                            json!({"inbound":["fake-ip-reinject"],"auth_user":[username],
+                            "ip_cidr":[prefix],"port":[1053],"network":["tcp"],
+                            "action":"route","outbound":"proxy"}),
+                            json!({"inbound":["fake-ip-reinject"],"auth_user":[username],
+                            "action":"reject"}),
+                        ),
+                    };
+                let rules = config.pointer(rules_path).unwrap().as_array().unwrap();
+                let legacy_rules = legacy_config
+                    .pointer(rules_path)
+                    .unwrap()
+                    .as_array()
+                    .unwrap();
+                assert_eq!(rules[0], allow);
+                assert_eq!(rules[1], reject);
+                assert_eq!(&rules[2..], legacy_rules.as_slice());
+
+                for (compiled, expected_count, reinject_auth) in [
+                    (&config, 2, bridge.reinject_auth()),
+                    (&legacy_config, 1, legacy.reinject_auth()),
+                ] {
+                    let users = compiled["inbounds"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|inbound| inbound["tag"] == "fake-ip-reinject")
+                        .unwrap()
+                        .pointer(users_path)
+                        .unwrap()
+                        .as_array()
+                        .unwrap();
+                    assert_eq!(users.len(), expected_count);
+                    assert_eq!(users[0][username_key], reinject_auth.username());
+                    assert!(users[0][password_key] == reinject_auth.password());
+                    if let Some(account) = users.get(1) {
+                        assert_eq!(account[username_key], username);
+                        assert!(account[password_key] == auth.password());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn policy_resolver_rejects_unusable_and_reserved_destinations() {
+        for invalid in [
+            "192.0.2.53:0",
+            "0.0.0.0:53",
+            "127.0.1.2:53",
+            "169.254.1.2:53",
+            "224.0.0.1:53",
+            "255.255.255.255:53",
+            "[::]:53",
+            "[::1]:53",
+            "[::192.0.2.53]:53",
+            "[::ffff:192.0.2.53]:53",
+            "[fe80::53]:53",
+            "[ff02::53]:53",
+            "[2001:db8::53%3]:53",
+            "198.18.0.2:53",
+            "198.18.4.1:53",
+            "[fd10::53]:53",
+        ] {
+            assert!(matches!(
+                empty_bridge().with_policy_resolver(invalid.parse().unwrap()),
+                Err(CompileError::InvalidParameter)
+            ));
+        }
+    }
+
+    #[test]
+    fn policy_resolver_rejects_proxy_and_system_tun_addresses_even_on_other_ports() {
+        let imported = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+        )
+        .unwrap();
+        let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        for endpoint in ["10.203.0.2:53", "198.18.0.1:53"] {
+            let bridge = empty_bridge()
+                .with_policy_resolver(endpoint.parse().unwrap())
+                .unwrap();
+            for engine in [Engine::Xray, Engine::SingBox] {
+                assert!(matches!(
+                    compile_system_fake_dns_policy(
+                        &imported.servers[0],
+                        engine,
+                        port(12556),
+                        port(12552),
+                        &Policy::default(),
+                        &tun,
+                        &bridge,
+                        &[],
+                    ),
+                    Err(PolicyCompileError::Server(CompileError::InvalidParameter))
+                ));
+            }
+        }
     }
 
     #[test]

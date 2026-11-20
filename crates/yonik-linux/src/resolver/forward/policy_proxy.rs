@@ -31,14 +31,12 @@ impl PolicyProxyResolver {
         upstream: SocketAddr,
         credentials: SocksCredentials,
     ) -> Result<Arc<Self>, ResolverError> {
-        if [proxy, upstream].into_iter().any(|address| {
-            address.port() == 0 || matches!(address, SocketAddr::V6(value) if value.scope_id() != 0)
-        }) {
+        if !valid_socket_address(proxy) {
             return Err(ResolverError::Untrusted);
         }
         let proxy = SocketAddr::new(proxy.ip().to_canonical(), proxy.port());
-        let upstream = SocketAddr::new(upstream.ip().to_canonical(), upstream.port());
-        if !proxy.ip().is_loopback() || !valid_upstream(upstream.ip()) {
+        let upstream = Self::validate_upstream(upstream)?;
+        if !proxy.ip().is_loopback() {
             return Err(ResolverError::Untrusted);
         }
         Ok(Arc::new(Self {
@@ -46,6 +44,14 @@ impl PolicyProxyResolver {
             upstream,
             credentials,
         }))
+    }
+
+    pub(crate) fn validate_upstream(upstream: SocketAddr) -> Result<SocketAddr, ResolverError> {
+        let address = upstream.ip().to_canonical();
+        if !valid_socket_address(upstream) || !valid_upstream(address) {
+            return Err(ResolverError::Untrusted);
+        }
+        Ok(SocketAddr::new(address, upstream.port()))
     }
 
     pub async fn lookup(
@@ -93,6 +99,11 @@ impl PolicyProxyResolver {
         response.reject_addresses(is_reserved_fake)?;
         Ok(response)
     }
+}
+
+fn valid_socket_address(address: SocketAddr) -> bool {
+    address.port() != 0
+        && !matches!(address, SocketAddr::V6(value) if value.scope_id() != 0 || value.flowinfo() != 0)
 }
 
 fn valid_upstream(address: IpAddr) -> bool {

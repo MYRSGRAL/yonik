@@ -641,6 +641,7 @@ fn fake_dns_keeps_the_supplied_inline_policy_and_suffixes() {
         panic!("Допустимая политика Fake DNS должна пройти декодирование");
     };
     assert!(request.policy.is_some());
+    assert!(request.fake_dns_policy_resolver.is_none());
     assert_eq!(
         request.fake_dns_domains,
         Some(vec!["example.test".to_owned()])
@@ -651,6 +652,41 @@ fn fake_dns_keeps_the_supplied_inline_policy_and_suffixes() {
         parse(&prepare_message(&frame.to_string())),
         Err(ServiceError::InvalidRequest)
     ));
+}
+
+#[test]
+fn prepare_fake_dns_проверяет_явный_policy_resolver() {
+    let mut frame: serde_json::Value = serde_json::from_str(&profile_frame()).unwrap();
+    frame["mode"] = serde_json::json!("system_profile_fake_dns");
+    frame["fake_dns_domains"] = serde_json::json!(["example.test"]);
+    frame["policy"] = serde_json::json!({"version":1,"default_action":"proxy","user_rules":[],"preset_rules":[],"lan":[],"private_networks":[],"private_domains":[]});
+    for (input, expected) in [
+        ("192.0.2.53:5353", "192.0.2.53:5353"),
+        ("[::ffff:192.0.2.53]:5353", "192.0.2.53:5353"),
+        ("[2001:db8::53]:5353", "[2001:db8::53]:5353"),
+    ] {
+        frame["fake_dns_policy_resolver"] = serde_json::json!(input);
+        let Ok(Request::PrepareProfile(request)) = parse(&prepare_message(&frame.to_string()))
+        else {
+            panic!("Допустимый адрес DNS должен пройти декодирование");
+        };
+        assert_eq!(
+            request.fake_dns_policy_resolver,
+            Some(expected.parse().unwrap())
+        );
+    }
+    for endpoint in [
+        "resolver.test:53",
+        "127.0.0.1:53",
+        "192.0.2.53:0",
+        "198.19.224.2:53",
+    ] {
+        frame["fake_dns_policy_resolver"] = serde_json::json!(endpoint);
+        assert!(matches!(
+            parse(&prepare_message(&frame.to_string())),
+            Err(ServiceError::InvalidRequest)
+        ));
+    }
 }
 
 #[cfg(not(feature = "test-support"))]
