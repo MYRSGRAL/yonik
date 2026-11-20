@@ -359,6 +359,17 @@ impl NetlinkReader {
     pub fn namespace(&self) -> NetworkNamespace {
         self.namespace
     }
+    pub(super) fn request_identity(&self) -> (u32, u32) {
+        (self.port, self.sequence)
+    }
+
+    pub(super) fn next_request_identity(&self) -> Result<(u32, u32), NetworkReadError> {
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(NetworkReadError::Limit)?;
+        Ok((self.port, sequence))
+    }
     /// Последний drain после разбора DTO. Не превращает результат в lease ОС.
     pub fn finish(
         &mut self,
@@ -420,10 +431,7 @@ impl NetlinkReader {
         cancel: &Cancellation,
         decode: fn(&[u8]) -> Result<T, NetworkReadError>,
     ) -> Result<Vec<T>, NetworkReadError> {
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or(NetworkReadError::Limit)?;
+        self.sequence = self.next_request_identity()?.1;
         let mut exchange = Exchange::decoded(operation, self.sequence, self.port, decode);
         // WireGuard GET может вернуть private/preshared keys в том же сообщении.
         let mut buffer = Zeroizing::new(vec![0; DATAGRAM_LIMIT]);

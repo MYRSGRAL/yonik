@@ -239,6 +239,27 @@ static int install_snapshot(int outer, int inner)
     return bpf_map_update_elem(outer, &zero, &inner, BPF_ANY) != 0;
 }
 
+static int publish_snapshot(const char *dir, __u64 generation, __u64 revision,
+                            int inner, __u64 earliest_expiry)
+{
+    // Сеанс мог завершиться за время сборки и заморозки карты.
+    int lock = lock_gate(dir);
+    int session_fd = open_map(dir, "wg_active");
+    struct yonik_wg_session session;
+    int result = require_revision(session_fd, generation, revision, &session);
+    if (!result && inner >= 0 && earliest_expiry <= boottime())
+        result = 3;
+    if (!result) {
+        int outer = open_map(dir, "wg_leases");
+        result = reserve_revision(session_fd, &session)
+            || (inner < 0 ? remove_snapshot(outer) : install_snapshot(outer, inner));
+        close(outer);
+    }
+    close(session_fd);
+    close(lock);
+    return result;
+}
+
 static int replace_snapshot(int argc, char **argv)
 {
     const int fields_per_lease = 10;
@@ -264,21 +285,53 @@ static int replace_snapshot(int argc, char **argv)
             return 1;
     }
 
-    // Сеанс мог завершиться за время сборки и заморозки карты.
-    int lock = lock_gate(dir);
-    int session_fd = open_map(dir, "wg_active");
-    struct yonik_wg_session session;
-    int result = require_revision(session_fd, generation, revision, &session);
-    if (!result) {
-        int outer = open_map(dir, "wg_leases");
-        result = reserve_revision(session_fd, &session)
-            || (inner < 0 ? remove_snapshot(outer) : install_snapshot(outer, inner));
-        close(outer);
-    }
+    int result = publish_snapshot(dir, generation, revision, inner, UINT64_MAX);
     if (inner >= 0)
         close(inner);
-    close(session_fd);
-    close(lock);
+    return result;
+}
+
+static int replace_snapshot_binary(const char *dir, __u64 generation, __u64 revision)
+{
+    struct {
+        struct yonik_wg_packet packet;
+        __u64 expires;
+    } record;
+    _Static_assert(sizeof(record) == 88, "Размер записи допуска");
+    const __u64 max_validity_ns = 2000000000; // Срок снимка маршрута в Rust.
+    __u64 earliest_expiry = UINT64_MAX;
+    int inner = -1;
+    int result = 2;
+    size_t count = 0;
+    size_t size;
+    while ((size = fread(&record, 1, sizeof(record), stdin)) != 0) {
+        const struct yonik_wg_packet *packet = &record.packet;
+        const __u64 now = boottime();
+        if (size != sizeof(record) || count == YONIK_WG_MAX_LEASES
+            || packet->generation != generation || !packet->cookie || !packet->mark
+            || !packet->ifindex || !packet->source_port || !packet->destination_port
+            || (packet->family != AF_INET && packet->family != AF_INET6)
+            || record.expires <= now || record.expires - now > max_validity_ns)
+            goto done;
+        if (count++ == 0)
+            inner = create_snapshot();
+        if (inner < 0 || bpf_map_update_elem(inner, packet, &record.expires, BPF_NOEXIST)) {
+            result = 1;
+            goto done;
+        }
+        if (record.expires < earliest_expiry)
+            earliest_expiry = record.expires;
+    }
+    if (ferror(stdin))
+        goto done;
+    if (inner >= 0 && bpf_map_freeze(inner)) {
+        result = 1;
+        goto done;
+    }
+    result = publish_snapshot(dir, generation, revision, inner, earliest_expiry);
+done:
+    if (inner >= 0)
+        close(inner);
     return result;
 }
 
@@ -355,6 +408,9 @@ int main(int argc, char **argv)
         return change_session(argv[2], integer(argv[3], 10, UINT64_MAX), !strcmp(argv[1], "start"));
     if (argc > 1 && !strcmp(argv[1], "replace"))
         return replace_snapshot(argc, argv);
+    if (argc == 5 && !strcmp(argv[1], "replace-binary"))
+        return replace_snapshot_binary(argv[2], integer(argv[3], 10, UINT64_MAX),
+                                       integer(argv[4], 10, UINT64_MAX));
     if (argc == 3 && !strcmp(argv[1], "revision")) {
         int lock = lock_gate(argv[2]);
         int fd = open_map(argv[2], "wg_active");

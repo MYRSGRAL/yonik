@@ -27,8 +27,11 @@ pub use topology::{
     NexthopMember, RouteNexthop, read_topology,
 };
 pub(crate) use topology::{TopologyCapture, read_topology_captured, reread_changed_topology};
-pub use wireguard::{WireGuardDevice, WireGuardPeer, read_wireguard_device};
-pub use wireguard_transport::{WireGuardUdpPath, WireGuardUdpRouteSnapshot};
+pub use wireguard::{
+    WireGuardDevice, WireGuardPeer, WireGuardReadReceipt, WireGuardSocketObservation,
+    WireGuardSocketObserver, read_wireguard_device, read_wireguard_device_observed,
+};
+pub use wireguard_transport::{WireGuardPacketLease, WireGuardUdpPath, WireGuardUdpRouteSnapshot};
 
 use std::fmt;
 use tokio::sync::watch;

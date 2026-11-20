@@ -51,8 +51,10 @@ pub use network::{
     IpPrefix, KernelRoute, LinuxAddress, LinuxLink, LinuxNexthop, LinuxRoute, LinuxRule,
     LinuxTopology, LookupIncomplete, NetworkAttribute, NetworkNamespace, NetworkReadError,
     NexthopMember, NftSocketCgroupMatch, RouteKind, RouteNexthop, RouteQuery, TransportProtocol,
-    WireGuardDevice, WireGuardPeer, WireGuardUdpPath, WireGuardUdpRouteSnapshot, lookup_route,
-    read_nft_socket_cgroup_matches, read_topology, read_wireguard_device,
+    WireGuardDevice, WireGuardPacketLease, WireGuardPeer, WireGuardReadReceipt,
+    WireGuardSocketObservation, WireGuardSocketObserver, WireGuardUdpPath,
+    WireGuardUdpRouteSnapshot, lookup_route, read_nft_socket_cgroup_matches, read_topology,
+    read_wireguard_device, read_wireguard_device_observed,
 };
 #[cfg(target_os = "linux")]
 mod resolver;

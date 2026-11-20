@@ -144,6 +144,39 @@ snapshot_id() {
     [[ "$id" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
     printf '%s\n' "$id"
 }
+binary_lease() {
+    python3 - "$@" <<'PYVM'
+import ipaddress
+import socket
+import struct
+import sys
+import time
+
+family, source, endpoint, sport, dport, index, mark, cookie, _, generation = sys.argv[1:11]
+deadline_delta = int(sys.argv[11])
+family = socket.AF_INET if family == "4" else socket.AF_INET6
+source = ipaddress.ip_address(source).packed
+endpoint = ipaddress.ip_address(endpoint).packed
+key = struct.pack("=QII16s16s", int(cookie, 16), int(mark), int(index), source, endpoint)
+key += struct.pack("!HH", int(sport), int(dport))
+expiry = time.clock_gettime_ns(time.CLOCK_BOOTTIME) + deadline_delta
+key += struct.pack("=I16sQQ", family, endpoint, int(generation), expiry)
+sys.stdout.buffer.write(key)
+PYVM
+}
+revision=$("$gate" revision "$pins")
+binary_lease "${lease[@]}" -1000000000 | expect_status 2 "$gate" replace-binary "$pins" "$generation" "$revision"
+binary_lease "${lease[@]}" 3000000000 | expect_status 2 "$gate" replace-binary "$pins" "$generation" "$revision"
+printf '%s' short | expect_status 2 "$gate" replace-binary "$pins" "$generation" "$revision"
+{ binary_lease "${lease[@]}" 500000000; sleep 1; } |
+    expect_status 3 "$gate" replace-binary "$pins" "$generation" "$revision"
+test "$("$gate" revision "$pins")" = "$revision"
+binary_lease "${lease[@]}" 1800000000 | "$gate" replace-binary "$pins" "$generation" "$revision"
+check 0 binary_snapshot_current
+binary_lease "${lease[@]}" 1800000000 | expect_status 3 "$gate" replace-binary "$pins" "$generation" "$revision"
+sleep 2
+check 3 binary_snapshot_absolute_deadline
+
 "$gate" allow "$pins" "${lease[@]}" 15000
 check 0 after_loader_exit
 timeout 4 getent ahostsv4 active.wg.test | grep -q '^10\.42\.1\.2 '

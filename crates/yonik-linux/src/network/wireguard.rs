@@ -37,6 +37,47 @@ pub struct WireGuardPeer {
     pub allowed_ips: Vec<IpPrefix>,
 }
 
+/// Реквизиты завершённого WG_CMD_GET_DEVICE, включая число частей снимка.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WireGuardReadReceipt {
+    pub port_id: u32,
+    pub sequence: u32,
+    pub ifindex: u32,
+    pub namespace: NetworkNamespace,
+    pub listen_port: u16,
+    pub parts: usize,
+}
+
+/// Подтверждение происхождения пары UDP-сокетов конкретного снимка WireGuard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WireGuardSocketObservation {
+    pub port_id: u32,
+    pub sequence: u32,
+    pub ifindex: u32,
+    /// Inode сетевого пространства интерфейса из ядра.
+    pub device_namespace: u64,
+    /// Общий inode пространства creating_net и пространств обоих сокетов.
+    pub socket_namespace: u64,
+    pub ipv4_cookie: u64,
+    pub ipv6_cookie: u64,
+    pub listen_port: u16,
+    pub generation: u32,
+    pub parts: usize,
+}
+
+/// Источник синхронного подтверждения для завершённого netlink-запроса.
+pub trait WireGuardSocketObserver: Send {
+    /// Начинает наблюдение нового запроса и сбрасывает предыдущий результат.
+    fn prepare(&mut self, port_id: u32, sequence: u32) -> Result<(), Error>;
+
+    /// Возвращает результат без ожидания новых событий. При потере частей,
+    /// несогласованном поколении или расхождении пространств сокетов выдаёт ошибку.
+    fn observe(
+        &mut self,
+        receipt: WireGuardReadReceipt,
+    ) -> Result<WireGuardSocketObservation, Error>;
+}
+
 impl fmt::Debug for WireGuardDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("WireGuardDevice(<скрыто>)")
@@ -56,6 +97,29 @@ pub async fn read_wireguard_device(
     cancel: &mut Cancellation,
     timeout: Duration,
 ) -> Result<WireGuardDevice, Error> {
+    let (snapshot, _) = read_wireguard_device_inner(ifindex, cancel, timeout, None).await?;
+    Ok(snapshot)
+}
+
+/// Читает снимок и принимает только подтверждение, связанное со всеми
+/// частями того же запроса. Использует единый срок для чтения и наблюдения.
+pub async fn read_wireguard_device_observed(
+    ifindex: u32,
+    cancel: &mut Cancellation,
+    timeout: Duration,
+    observer: &mut dyn WireGuardSocketObserver,
+) -> Result<(WireGuardDevice, WireGuardSocketObservation), Error> {
+    let (snapshot, observation) =
+        read_wireguard_device_inner(ifindex, cancel, timeout, Some(observer)).await?;
+    Ok((snapshot, observation.ok_or(Error::Unavailable)?))
+}
+
+async fn read_wireguard_device_inner(
+    ifindex: u32,
+    cancel: &mut Cancellation,
+    timeout: Duration,
+    mut observer: Option<&mut dyn WireGuardSocketObserver>,
+) -> Result<(WireGuardDevice, Option<WireGuardSocketObservation>), Error> {
     if timeout.is_zero() || timeout > MAX_WAIT || !(1..=i32::MAX as u32).contains(&ifindex) {
         return Err(Error::Limit);
     }
@@ -72,6 +136,12 @@ pub async fn read_wireguard_device(
         )
         .await?;
     let family = family.pop().ok_or(Error::Malformed)?;
+    if let Some(observer) = observer.as_mut() {
+        check_read_deadline(cancel, deadline)?;
+        let (port_id, sequence) = reader.next_request_identity()?;
+        observer.prepare(port_id, sequence)?;
+        check_read_deadline(cancel, deadline)?;
+    }
     let parts = reader
         .request_decoded(
             ReadOperation::WireGuardDevice(family),
@@ -81,12 +151,73 @@ pub async fn read_wireguard_device(
             device_part,
         )
         .await?;
+    let part_count = parts.len();
     let snapshot = assemble(reader.namespace(), ifindex, parts)?;
+    check_read_deadline(cancel, deadline)?;
+    let observation = if let Some(observer) = observer {
+        let (port_id, sequence) = reader.request_identity();
+        let receipt = WireGuardReadReceipt {
+            port_id,
+            sequence,
+            ifindex,
+            namespace: snapshot.namespace,
+            listen_port: snapshot.listen_port,
+            parts: part_count,
+        };
+        // Пока наблюдение не завершилось, reader удерживает port_id этого запроса.
+        Some(observe_socket(observer, receipt, cancel, deadline)?)
+    } else {
+        None
+    };
+    Ok((snapshot, observation))
+}
+
+fn check_read_deadline(cancel: &Cancellation, deadline: Instant) -> Result<(), Error> {
     cancel.check().map_err(|_| Error::Cancelled)?;
     if Instant::now() >= deadline {
         return Err(Error::Timeout);
     }
-    Ok(snapshot)
+    Ok(())
+}
+
+fn observe_socket(
+    observer: &mut dyn WireGuardSocketObserver,
+    receipt: WireGuardReadReceipt,
+    cancel: &Cancellation,
+    deadline: Instant,
+) -> Result<WireGuardSocketObservation, Error> {
+    check_read_deadline(cancel, deadline)?;
+    if receipt.listen_port == 0 {
+        return Err(Error::Unavailable);
+    }
+    let observation = observer.observe(receipt);
+    check_read_deadline(cancel, deadline)?;
+    let observation = observation?;
+    check_socket_observation(receipt, observation)?;
+    Ok(observation)
+}
+
+fn check_socket_observation(
+    receipt: WireGuardReadReceipt,
+    observation: WireGuardSocketObservation,
+) -> Result<(), Error> {
+    if observation.port_id != receipt.port_id
+        || observation.sequence != receipt.sequence
+        || observation.ifindex != receipt.ifindex
+        || observation.device_namespace != receipt.namespace.inode
+        || observation.listen_port != receipt.listen_port
+        || observation.parts != receipt.parts
+    {
+        return Err(Error::Changed);
+    }
+    if observation.socket_namespace == 0
+        || observation.ipv4_cookie == 0
+        || observation.ipv6_cookie == 0
+        || observation.ipv4_cookie == observation.ipv6_cookie
+    {
+        return Err(Error::Unavailable);
+    }
+    Ok(())
 }
 
 fn request(command: u8, version: u8, kind: u16, value: &[u8]) -> Vec<u8> {
@@ -347,6 +478,132 @@ fn append_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receipt() -> WireGuardReadReceipt {
+        WireGuardReadReceipt {
+            port_id: 42,
+            sequence: 17,
+            ifindex: 7,
+            namespace: NetworkNamespace {
+                device: 1,
+                inode: 2,
+            },
+            listen_port: 24177,
+            parts: 3,
+        }
+    }
+
+    fn observation() -> WireGuardSocketObservation {
+        WireGuardSocketObservation {
+            port_id: 42,
+            sequence: 17,
+            ifindex: 7,
+            device_namespace: 2,
+            socket_namespace: 3,
+            ipv4_cookie: 11,
+            ipv6_cookie: 12,
+            listen_port: 24177,
+            generation: 5,
+            parts: 3,
+        }
+    }
+
+    #[test]
+    fn socket_observation_must_match_every_part_of_the_request() {
+        let receipt = receipt();
+        let observation = observation();
+        assert_eq!(check_socket_observation(receipt, observation), Ok(()));
+        let changes: [fn(&mut WireGuardSocketObservation); 6] = [
+            |value| value.port_id += 1,
+            |value| value.sequence += 1,
+            |value| value.ifindex += 1,
+            |value| value.device_namespace += 1,
+            |value| value.listen_port += 1,
+            |value| value.parts -= 1,
+        ];
+        for change in changes {
+            let mut different = observation;
+            change(&mut different);
+            assert_eq!(
+                check_socket_observation(receipt, different),
+                Err(Error::Changed)
+            );
+        }
+    }
+
+    #[test]
+    fn socket_observation_requires_two_distinct_cookies_and_a_namespace() {
+        let changes: [fn(&mut WireGuardSocketObservation); 4] = [
+            |value| value.socket_namespace = 0,
+            |value| value.ipv4_cookie = 0,
+            |value| value.ipv6_cookie = 0,
+            |value| value.ipv6_cookie = value.ipv4_cookie,
+        ];
+        for change in changes {
+            let mut invalid = observation();
+            change(&mut invalid);
+            assert_eq!(
+                check_socket_observation(receipt(), invalid),
+                Err(Error::Unavailable)
+            );
+        }
+    }
+
+    struct TestObserver<F>(F);
+
+    impl<F> WireGuardSocketObserver for TestObserver<F>
+    where
+        F: FnMut(WireGuardReadReceipt) -> Result<WireGuardSocketObservation, Error> + Send,
+    {
+        fn prepare(&mut self, _port_id: u32, _sequence: u32) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn observe(
+            &mut self,
+            receipt: WireGuardReadReceipt,
+        ) -> Result<WireGuardSocketObservation, Error> {
+            (self.0)(receipt)
+        }
+    }
+
+    #[test]
+    fn observer_honors_cancellation_during_observation() {
+        let (sender, cancel) = Cancellation::new();
+        let mut observer = TestObserver(move |actual| {
+            assert_eq!(actual, receipt());
+            sender.send(true).unwrap();
+            Ok(observation())
+        });
+        assert_eq!(
+            observe_socket(&mut observer, receipt(), &cancel, Instant::now() + MAX_WAIT),
+            Err(Error::Cancelled)
+        );
+    }
+
+    #[test]
+    fn expired_deadline_prevents_observation() {
+        let (_sender, cancel) = Cancellation::new();
+        let mut observer = TestObserver(|_actual| panic!("Истёк срок наблюдения"));
+        assert_eq!(
+            observe_socket(&mut observer, receipt(), &cancel, Instant::now()),
+            Err(Error::Timeout)
+        );
+    }
+
+    #[test]
+    fn unbound_device_cannot_prove_socket_origin() {
+        let (_sender, cancel) = Cancellation::new();
+        let mut observer = TestObserver(|_actual| panic!("Сокеты устройства не открыты"));
+        let receipt = WireGuardReadReceipt {
+            listen_port: 0,
+            ..receipt()
+        };
+        assert_eq!(
+            observe_socket(&mut observer, receipt, &cancel, Instant::now() + MAX_WAIT),
+            Err(Error::Unavailable)
+        );
+    }
 
     #[tokio::test]
     async fn refuses_cancelled_read_before_opening_netlink() {
