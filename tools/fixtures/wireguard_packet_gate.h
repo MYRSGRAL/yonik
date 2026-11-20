@@ -3,6 +3,9 @@
 
 #include <linux/bpf.h>
 
+#define YONIK_WG_MAX_LEASES 64
+#define YONIK_WG_LEASE_FLAGS BPF_F_RDONLY_PROG
+
 struct yonik_wg_packet {
     __u64 cookie;
     __u32 mark;
@@ -21,6 +24,7 @@ struct yonik_wg_session {
     __u32 reserved;
     __u64 generation;
     __u64 active;
+    __u64 revision;
 };
 
 enum yonik_wg_verdict {

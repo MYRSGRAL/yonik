@@ -60,11 +60,19 @@ struct {
     __type(value, struct yonik_wg_session);
 } wg_active SEC(".maps");
 
-struct {
+struct lease_map {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 64);
+    __uint(max_entries, YONIK_WG_MAX_LEASES);
+    __uint(map_flags, YONIK_WG_LEASE_FLAGS);
     __type(key, struct yonik_wg_packet);
     __type(value, __u64);
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __array(values, struct lease_map);
 } wg_leases SEC(".maps");
 
 struct {
@@ -207,7 +215,11 @@ int wireguard_gate(struct bpf_nf_ctx *ctx)
         || read_next_hop(ctx->skb, out, &packet))
         return verdict(YONIK_WG_UNSUPPORTED_PACKET);
 
-    const __u64 *expires = bpf_map_lookup_elem(&wg_leases, &packet);
+    // Каждый проход использует один опубликованный, замороженный снимок.
+    void *snapshot = bpf_map_lookup_elem(&wg_leases, &zero);
+    if (!snapshot)
+        return verdict(YONIK_WG_MISSING_LEASE);
+    const __u64 *expires = bpf_map_lookup_elem(snapshot, &packet);
     if (!expires)
         return verdict(YONIK_WG_MISSING_LEASE);
     if (bpf_ktime_get_boot_ns() >= *expires)

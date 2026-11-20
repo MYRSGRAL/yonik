@@ -47,7 +47,18 @@ mark=24177
 port=24177
 family_switch="-$1"
 ifindex=$(cat /sys/class/net/yonik-outer/ifindex)
-gate=/opt/yonik-gate/wg-observe
+gate_exec=/opt/yonik-gate/wg-observe
+gate=gate_command
+gate_command() {
+    case "$1" in
+        allow|revoke)
+            "$gate_exec" "${@:1:12}" "$("$gate_exec" revision "$2")" "${@:13}" ;;
+        replace)
+            "$gate_exec" "${@:1:3}" "$("$gate_exec" revision "$2")" "${@:4}" ;;
+        *)
+            "$gate_exec" "$@" ;;
+    esac
+}
 pins=/sys/fs/bpf/yonik-wg-packet-gate
 mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
 mkdir "$pins"
@@ -62,7 +73,7 @@ cleanup() {
 trap cleanup EXIT
 systemd-run --wait --pipe --collect --unit=yonik-wg-packet-load \
     --property=NoNewPrivileges=yes --property='CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON' \
-    "$gate" load /run/yonik-wg-socket.bpf.o "$pins" "$mark"
+    "$gate_exec" load /run/yonik-wg-socket.bpf.o "$pins" "$mark"
 echo YONIK_WG_PACKET_LOAD_LIMITED_CAPS
 generation=1
 "$gate" start "$pins" "$generation"
@@ -117,6 +128,21 @@ check() {
     after_counter=$(count "$expected")
     test "$after_counter" -gt "$before_counter"
     echo "YONIK_WG_PACKET_GATE $label verdict=$expected count=$before_counter/$after_counter"
+}
+expect_status() {
+    local expected_status=$1 status=0
+    shift
+    "$@" || status=$?
+    if [[ "$status" != "$expected_status" ]]; then
+        printf 'Ожидался код %s, получен %s\n' "$expected_status" "$status" >&2
+        exit 1
+    fi
+}
+snapshot_id() {
+    local id
+    id=$("$gate" snapshot "$pins") || return
+    [[ "$id" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    printf '%s\n' "$id"
 }
 "$gate" allow "$pins" "${lease[@]}" 15000
 check 0 after_loader_exit
@@ -200,35 +226,82 @@ lease[7]=$new_cookie
 check 0 republished_socket
 
 "$gate" stop "$pins" "$generation"
+test "$(snapshot_id)" = 0
 check 4 stopped_generation
-# Запоздавший отправитель сохранил старый токен и обновил срок записи.
-"$gate" allow "$pins" "${lease[@]}" 60000
+# Запоздавший отправитель пытается продлить допуск для прежнего поколения.
+expect_status 3 "$gate" allow "$pins" "${lease[@]}" 60000
+expect_status 3 "$gate" replace "$pins" "$generation" "${lease[@]:0:9}" 60000
+test "$(snapshot_id)" = 0
 check 4 stale_publication_while_stopped
-if "$gate" start "$pins" "$generation"; then
-    echo 'Остановленное поколение запустилось повторно' >&2
-    exit 1
-fi
+expect_status 3 "$gate" start "$pins" "$generation"
 echo YONIK_WG_PACKET_GATE stopped_generation_reuse_rejected
 
 next_generation=$((generation + 1))
 "$gate" start "$pins" "$next_generation"
+test "$(snapshot_id)" = 0
 check 2 new_generation_without_lease
 next_lease=("${lease[@]}")
 next_lease[9]=$next_generation
-"$gate" allow "$pins" "${next_lease[@]}" 15000
+wrong_route=("${next_lease[@]:0:9}")
+wrong_route[3]=24179
+"$gate" replace "$pins" "$next_generation" \
+    "${next_lease[@]:0:9}" 15000 "${wrong_route[@]}" 15000
+current_snapshot=$(snapshot_id)
+test "$current_snapshot" != 0
 check 0 new_generation_published
-"$gate" allow "$pins" "${lease[@]}" 60000
-check 0 new_generation_after_stale_publication
-"$gate" revoke "$pins" "${lease[@]}"
-check 0 new_generation_after_stale_revocation
-if "$gate" stop "$pins" "$generation"; then
-    echo 'Запоздавшая остановка отключила новое поколение' >&2
+
+# Разный срок не делает вторую запись с тем же ключом допустимой.
+if "$gate" replace "$pins" "$next_generation" \
+    "${next_lease[@]:0:9}" 15000 "${next_lease[@]:0:9}" 60000; then
+    echo 'Снимок с дублирующимся ключом принят' >&2
     exit 1
 fi
+test "$(snapshot_id)" = "$current_snapshot"
+check 0 snapshot_after_rejected_duplicate
+
+"$gate" replace "$pins" "$next_generation"
+empty_snapshot=$(snapshot_id)
+test "$empty_snapshot" != "$current_snapshot"
+check 2 empty_snapshot
+
+# При накоплении строк в одной карте этот цикл превысил бы 64 записи.
+current_snapshot=$empty_snapshot
+for ((iteration = 0; iteration < 70; iteration++)); do
+    wrong_route[3]=$((24200 + iteration))
+    "$gate" replace "$pins" "$next_generation" \
+        "${next_lease[@]:0:9}" 15000 "${wrong_route[@]}" 15000
+    replacement=$(snapshot_id)
+    test "$replacement" != 0
+    test "$replacement" != "$current_snapshot"
+    current_snapshot=$replacement
+done
+check 0 snapshot_after_70_replacements
+
+saved_revision=$("$gate_exec" revision "$pins")
+"$gate" revoke "$pins" "${next_lease[@]}"
+current_snapshot=$(snapshot_id)
+expect_status 3 "$gate_exec" replace "$pins" "$next_generation" "$saved_revision" \
+    "${next_lease[@]:0:9}" 60000
+expect_status 3 "$gate_exec" allow "$pins" "${next_lease[@]}" "$saved_revision" 60000
+test "$(snapshot_id)" = "$current_snapshot"
+check 2 stale_revision_after_revoke
+"$gate" replace "$pins" "$next_generation" "${next_lease[@]:0:9}" 15000
+current_snapshot=$(snapshot_id)
+check 0 restored_with_current_revision
+
+expect_status 3 "$gate" allow "$pins" "${lease[@]}" 60000
+expect_status 3 "$gate" replace "$pins" "$generation" "${lease[@]:0:9}" 60000
+test "$(snapshot_id)" = "$current_snapshot"
+check 0 new_generation_after_stale_publication
+expect_status 3 "$gate" revoke "$pins" "${lease[@]}"
+test "$(snapshot_id)" = "$current_snapshot"
+check 0 new_generation_after_stale_revocation
+expect_status 3 "$gate" stop "$pins" "$generation"
+test "$(snapshot_id)" = "$current_snapshot"
 check 0 new_generation_after_stale_stop
 "$gate" stop "$pins" "$next_generation"
+test "$(snapshot_id)" = 0
 check 4 stopped_new_generation
-"$gate" revoke "$pins" "${next_lease[@]}"
 
 after=$(stat -c '%i %a %u %g %F %N' /etc/resolv.conf; stat -L -c '%i %a %u %g' /etc/resolv.conf; sha256sum /etc/resolv.conf)
 test "$before" = "$after"
