@@ -2,7 +2,7 @@
 
 use super::{MAX_OUTPUT, NftError};
 use crate::managed_network::firewall::{
-    DHCP_CGROUP_PATH as DHCP_CGROUP, DHCP_RENEWAL_CHAIN as DHCP_CHAIN,
+    CT_DIRECTION_REPLY, DHCP_CGROUP_PATH as DHCP_CGROUP, DHCP_RENEWAL_CHAIN as DHCP_CHAIN,
     DHCP_RENEWAL_SET as DHCP_SET, DhcpRenewalKey, MAX_DHCP_RENEWALS,
 };
 use serde_json::Value;
@@ -361,6 +361,11 @@ fn render_match(
         "meta skuid" | "meta mark" => {
             write_fmt(write!(script, "{}", number(right, 0, u32::MAX.into())?))
         }
+        "ct direction" => {
+            require(right.as_u64() == Some(CT_DIRECTION_REPLY.into()))?;
+            script.push_str("reply");
+            Ok(())
+        }
         "meta nfproto" => keyword(script, right, &["ipv4", "ipv6"]),
         "meta l4proto" => keyword(script, right, &["tcp", "udp", "ipv6-icmp"]),
         "meta oifname" => {
@@ -393,6 +398,11 @@ fn selector(value: &Value) -> Result<&'static str> {
                 "mark" => Ok("meta mark"),
                 _ => Err(NftError::Invalid),
             }
+        }
+        "ct" => {
+            let [key] = exact(data, ["key"])?;
+            require(text(key)? == "direction")?;
+            Ok("ct direction")
         }
         "payload" => {
             let [protocol, field] = exact(data, ["protocol", "field"])?;
@@ -533,6 +543,23 @@ mod tests {
     use serde_json::{Value, json};
 
     const TABLE: &str = "yonik_0000000000000001";
+
+    #[test]
+    fn разрешает_только_обратное_направление_conntrack() {
+        let mut selector = json!({
+            "op": "==",
+            "left": {"ct": {"key": "direction"}},
+            "right": super::CT_DIRECTION_REPLY
+        });
+        let mut rendered = String::new();
+        super::render_match(&mut rendered, &selector, None).unwrap();
+        assert_eq!(rendered, "ct direction reply");
+        selector["right"] = json!(0);
+        assert_eq!(
+            super::render_match(&mut String::new(), &selector, None),
+            Err(NftError::Invalid)
+        );
+    }
 
     #[test]
     fn deletion_targets_only_the_stale_dhcp_key() {

@@ -13,6 +13,7 @@ const MAX_EXCEPTIONS: usize = 128;
 pub(crate) const MAX_BOUND_DIRECT: usize = MAX_EXCEPTIONS / 2;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+pub(super) const CT_DIRECTION_REPLY: u8 = 1;
 const OUTPUT_CHAIN: &str = "output";
 pub(super) const DHCP_RENEWAL_CHAIN: &str = "dhcp_renewal";
 pub(super) const DHCP_RENEWAL_SET: &str = "dhcp_renewal_leases";
@@ -370,6 +371,38 @@ pub struct PublicBlockPolicy {
     dhcp_renewal_rules: Option<Box<DhcpRules>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resolver_tls: Option<Box<ResolverTls>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolver_relay: Option<Box<ResolverRelay>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResolverRelay {
+    uid: NonZeroU32,
+    peers: Vec<SocketAddr>,
+}
+
+impl ResolverRelay {
+    pub(crate) fn new(uid: u32, mut peers: Vec<SocketAddr>) -> Result<Self, PolicyError> {
+        if peers.is_empty() || peers.len() > MAX_RESOLVER_TLS_ENDPOINTS {
+            return Err(PolicyError::Limit);
+        }
+        if uid == u32::MAX || peers.iter().any(|peer| {
+            peer.port() == 0
+                || peer.ip().is_loopback()
+                || peer.ip().is_unspecified()
+                || peer.ip().is_multicast()
+                || matches!(peer, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.flowinfo() != 0)
+        }) {
+            return Err(PolicyError::Interface);
+        }
+        peers.sort_unstable();
+        peers.dedup();
+        Ok(Self {
+            uid: interface(uid)?,
+            peers,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,6 +523,10 @@ impl PublicBlockPolicy {
                 .resolver_tls
                 .as_ref()
                 .map_or(0, |tls| tls.endpoints.len() * 2)
+            + self
+                .resolver_relay
+                .as_ref()
+                .map_or(0, |relay| relay.peers.len() * 2 + 2)
             + usize::from(self.dhcp_renewal_anchor)
             + self
                 .dhcp_rules()
@@ -562,7 +599,8 @@ impl PublicBlockPolicy {
         .with_bound_direct(self.bound_direct.clone())?
         .with_dhcp_renewal_anchor(self.dhcp_renewal_anchor)?
         .with_dhcp_rule_config(self.dhcp_rules().to_vec())?
-        .with_resolver_tls(self.resolver_tls.as_deref().cloned())
+        .with_resolver_tls(self.resolver_tls.as_deref().cloned())?
+        .with_resolver_relay(self.resolver_relay.as_deref().cloned())
     }
     pub fn new(
         loopback_ifindex: u32,
@@ -620,6 +658,7 @@ impl PublicBlockPolicy {
             dhcp_renewal_anchor: false,
             dhcp_renewal_rules: None,
             resolver_tls: None,
+            resolver_relay: None,
         })
     }
 
@@ -814,6 +853,9 @@ impl PublicBlockPolicy {
         mut tls: Option<ResolverTls>,
     ) -> Result<Self, PolicyError> {
         if let Some(tls) = &mut tls {
+            if self.resolver_relay.is_some() {
+                return Err(PolicyError::Interface);
+            }
             if tls.endpoints.is_empty() || tls.endpoints.len() > MAX_RESOLVER_TLS_ENDPOINTS {
                 return Err(PolicyError::Limit);
             }
@@ -864,6 +906,22 @@ impl PublicBlockPolicy {
             }
         }
         self.resolver_tls = tls.map(Box::new);
+        if self.exception_count() > MAX_EXCEPTIONS {
+            return Err(PolicyError::Limit);
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn with_resolver_relay(
+        mut self,
+        relay: Option<ResolverRelay>,
+    ) -> Result<Self, PolicyError> {
+        if relay.is_some() && (self.tun_ifindex.is_none() || self.resolver_tls.is_some()) {
+            return Err(PolicyError::Interface);
+        }
+        self.resolver_relay = relay
+            .map(|relay| ResolverRelay::new(relay.uid.get(), relay.peers).map(Box::new))
+            .transpose()?;
         if self.exception_count() > MAX_EXCEPTIONS {
             return Err(PolicyError::Limit);
         }
@@ -949,6 +1007,37 @@ impl PublicBlockPolicy {
                     ],
                 ));
             }
+        }
+        if let (Some(relay), Some(tun)) = (&self.resolver_relay, self.tun_ifindex) {
+            let uid = meta("skuid", json!(relay.uid));
+            commands.push(rule(
+                table_name,
+                vec![
+                    uid.clone(),
+                    meta("oif", json!(self.loopback_ifindex)),
+                    compare(json!({"ct":{"key":"direction"}}), json!(CT_DIRECTION_REPLY)),
+                    json!({"accept":null}),
+                ],
+            ));
+            for peer in &relay.peers {
+                for protocol in ["tcp", "udp"] {
+                    commands.push(rule(
+                        table_name,
+                        vec![
+                            uid.clone(),
+                            meta("oif", json!(tun)),
+                            destination(peer.ip(), json!(peer.ip().to_string())),
+                            meta("l4proto", json!(protocol)),
+                            compare(
+                                json!({"payload":{"protocol":protocol,"field":"dport"}}),
+                                json!(peer.port()),
+                            ),
+                            json!({"accept":null}),
+                        ],
+                    ));
+                }
+            }
+            commands.push(rule(table_name, vec![uid, json!({"drop":null})]));
         }
         commands.push(rule(
             table_name,
@@ -1200,6 +1289,8 @@ struct PublicBlockPolicyDto {
     dhcp_renewal_rule: Option<DhcpRulesDto>,
     #[serde(default)]
     resolver_tls: Option<ResolverTls>,
+    #[serde(default)]
+    resolver_relay: Option<ResolverRelay>,
 }
 impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
     type Error = PolicyError;
@@ -1221,7 +1312,8 @@ impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
             Some(DhcpRulesDto::Single(rule)) => vec![rule],
             Some(DhcpRulesDto::Multiple(rules)) => rules,
         })?
-        .with_resolver_tls(value.resolver_tls)
+        .with_resolver_tls(value.resolver_tls)?
+        .with_resolver_relay(value.resolver_relay)
     }
 }
 

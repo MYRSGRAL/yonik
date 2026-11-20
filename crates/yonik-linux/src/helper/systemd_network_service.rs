@@ -57,6 +57,7 @@ impl NetworkService {
 pub(crate) struct Daemon {
     pub(crate) owner: OwnedUniqueName,
     pub(crate) uid: u32,
+    pub(crate) dynamic_uid: bool,
     pub(crate) pid: u32,
     invocation: [u8; 16],
     pub(crate) group: (u64, NonZeroU64),
@@ -181,11 +182,19 @@ pub(super) async fn daemon(
     {
         return Err(Error::Changed);
     }
-    if matches!(service, NetworkService::Resolved)
+    let resolved = matches!(service, NetworkService::Resolved);
+    if resolved
         && property::<bool>(&properties, "org.freedesktop.systemd1.Service", "Delegate").await?
     {
         return Err(Error::Unsupported);
     }
+    let dynamic_uid = resolved
+        && property::<bool>(
+            &properties,
+            "org.freedesktop.systemd1.Service",
+            "DynamicUser",
+        )
+        .await?;
     let cgroup = open("/sys/fs/cgroup", DIRECTORY, Mode::empty()).map_err(unavailable)?;
     let slice = openat(&cgroup, "system.slice", DIRECTORY, Mode::empty()).map_err(unavailable)?;
     let unit =
@@ -205,6 +214,7 @@ pub(super) async fn daemon(
     Ok(Daemon {
         owner,
         uid,
+        dynamic_uid,
         pid,
         invocation,
         group,

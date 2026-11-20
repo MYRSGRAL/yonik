@@ -9,7 +9,10 @@ use crate::{
     Cancellation, NetworkReadError, RouteQuery, TransportProtocol,
     fake_flow::WorkerOnlyLoopbackIsolation,
     fake_service::{FakeDnsBridgeListeners, FakeDnsLeases, MAX_FAKE_TTL},
-    managed_network::{Journal, firewall::BoundDirect},
+    managed_network::{
+        Journal,
+        firewall::{BoundDirect, ResolverRelay},
+    },
     network::{LinuxTopology, reread_changed_route},
     resolver::{
         PlainResolverSnapshot, ResolvConfLayout, ResolverError, SYSTEM_RESOLV_CONF,
@@ -253,7 +256,13 @@ pub(super) struct PreparedFakeDns {
     resolved: Option<Arc<Resolve1TunSnapshot>>,
     cidr_policy: Option<Arc<yonik_engine::policy_wire::SystemPolicy>>,
     tls_peers: Vec<ResolverPeer>,
+    pub resolver_relay: Option<ResolverRelay>,
     plain: Vec<SessionResolverRelay>,
+}
+
+pub(super) struct RequestedDnsZones {
+    pub fake_suffixes: Vec<String>,
+    pub saved_private: BTreeSet<String>,
 }
 
 struct SessionResolverRelay {
@@ -371,6 +380,48 @@ fn fallback_tls(snapshot: &Resolve1TunSnapshot) -> Option<Resolve1Transport> {
             .iter()
             .all(|socket| socket.transport == mode))
     .then_some(mode)
+}
+
+fn can_mediate_global_dot(
+    snapshot: &Resolve1TunSnapshot,
+    wireguard: &BTreeSet<u32>,
+    private: &BTreeSet<String>,
+) -> bool {
+    use Resolve1Transport::{Plain, StrictTls};
+    !private.is_empty()
+        && !snapshot.fallback_only
+        && snapshot
+            .daemon
+            .as_ref()
+            .is_some_and(|daemon| !daemon.dynamic_uid)
+        && snapshot.global_transport == Some(StrictTls)
+        && snapshot
+            .config
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.scope == Resolve1Scope::Global)
+        && snapshot
+            .config
+            .endpoints
+            .iter()
+            .zip(&snapshot.sockets)
+            .all(|(endpoint, socket)| match endpoint.scope {
+                Resolve1Scope::Global => socket.transport == StrictTls && endpoint.port != DNS_PORT,
+                Resolve1Scope::Link(index) => {
+                    wireguard.contains(&index)
+                        && !socket.default_route
+                        && socket.transport == Plain
+                        && endpoint.port == DNS_PORT
+                }
+            })
+        && snapshot.config.domains.iter().all(|domain| {
+            domain.scope != Resolve1Scope::Global
+                || domain.name == "."
+                || domain
+                    .name
+                    .parse::<DomainName>()
+                    .is_ok_and(|name| !contains_private_dns_zone(private, name.as_str()))
+        })
 }
 
 fn plaintext_peer(endpoint: &Resolve1Endpoint) -> SocketAddr {
@@ -606,11 +657,6 @@ fn contains_private_dns_zone(zones: &BTreeSet<String>, name: &str) -> bool {
 }
 
 impl PreparedFakeDns {
-    pub fn with_saved_private_dns_zones(mut self, zones: BTreeSet<String>) -> Self {
-        self.private_dns_zones.extend(zones);
-        self
-    }
-
     pub fn private_dns_zones(&self) -> &BTreeSet<String> {
         &self.private_dns_zones
     }
@@ -618,7 +664,7 @@ impl PreparedFakeDns {
     pub async fn new(
         plan: &SessionNetworkPlan,
         topology: &LinuxTopology,
-        suffixes: Vec<String>,
+        zones: RequestedDnsZones,
         direct_egress: Vec<BoundDirect>,
         policy_resolver: Option<SocketAddr>,
         cidr_policy: Option<Arc<yonik_engine::policy_wire::SystemPolicy>>,
@@ -674,17 +720,22 @@ impl PreparedFakeDns {
         } else {
             None
         };
-        let private_dns_zones = resolved.as_ref().map_or_else(BTreeSet::new, |snapshot| {
-            let wireguard = topology
-                .links
-                .iter()
-                .filter(|link| link.kind.as_deref() == Some(b"wireguard"))
-                .map(|link| link.index)
-                .collect();
-            wireguard_dns_zones(&snapshot.config.domains, &wireguard)
+        let mut private_dns_zones = zones.saved_private;
+        let wireguard = topology
+            .links
+            .iter()
+            .filter(|link| link.kind.as_deref() == Some(b"wireguard"))
+            .map(|link| link.index)
+            .collect();
+        if let Some(snapshot) = &resolved {
+            private_dns_zones.extend(wireguard_dns_zones(&snapshot.config.domains, &wireguard));
+        }
+        let mediated_global_dns = resolved.as_ref().is_some_and(|snapshot| {
+            can_mediate_global_dot(snapshot, &wireguard, &private_dns_zones)
         });
         let tls_peers = resolved
             .as_deref()
+            .filter(|_| !mediated_global_dns)
             .map(native_resolver_peers)
             .transpose()?
             .unwrap_or_default();
@@ -723,9 +774,22 @@ impl PreparedFakeDns {
             return Err(ServiceError::Unsupported);
         }
         let fallback_mode = resolved.as_deref().and_then(fallback_tls);
-        if let Some(snapshot) = resolved.as_ref().filter(|snapshot| snapshot.fallback_only) {
-            let dot = fallback_mode.is_some();
-            if (dot && snapshot.config.endpoints.len() > SystemFakeDnsBridge::MAX_PLAIN_DNS_PEERS)
+        let relay_mode =
+            fallback_mode.or(mediated_global_dns.then_some(Resolve1Transport::StrictTls));
+        if let Some(snapshot) = resolved
+            .as_ref()
+            .filter(|snapshot| snapshot.fallback_only || mediated_global_dns)
+        {
+            let dot = relay_mode.is_some();
+            let endpoints = snapshot
+                .config
+                .endpoints
+                .iter()
+                .zip(&snapshot.sockets)
+                .filter(|(endpoint, _)| {
+                    !mediated_global_dns || endpoint.scope == Resolve1Scope::Global
+                });
+            if (dot && endpoints.clone().count() > SystemFakeDnsBridge::MAX_PLAIN_DNS_PEERS)
                 || (!dot && upstreams.len() != snapshot.config.endpoints.len())
             {
                 return Err(ServiceError::Unsupported);
@@ -734,19 +798,24 @@ impl PreparedFakeDns {
             // Сохраняем исходный порядок. Неполные снимки и потеря событий
             // по-прежнему закрывают Prepare. Отбор пропускает только адреса,
             // для которых ядро подтвердило недостижимость сети.
-            for endpoint in &snapshot.config.endpoints {
+            for (endpoint, socket) in endpoints {
                 let peer = SocketAddr::new(endpoint.address, endpoint.port);
-                let plain = (fallback_mode != Some(Resolve1Transport::StrictTls))
+                let plain = (relay_mode != Some(Resolve1Transport::StrictTls))
                     .then(|| plaintext_peer(endpoint));
                 if fallback_peer_reachable(peer, plan.socket_mark(), dot, plain, cancel).await? {
-                    upstreams.push((peer, ResolverBinding::default()));
+                    let binding = if mediated_global_dns {
+                        ResolverBinding::resolved(endpoint, socket)
+                    } else {
+                        ResolverBinding::default()
+                    };
+                    upstreams.push((peer, binding));
                 }
             }
             if upstreams.is_empty() {
                 return Err(ServiceError::Unsupported);
             }
         }
-        let dot_policy = if let Some(mode) = fallback_mode {
+        let dot_policy = if let Some(mode) = relay_mode {
             Some(resolver_dot_policy(mode).await?)
         } else {
             None
@@ -760,6 +829,17 @@ impl PreparedFakeDns {
         if dot_policy.is_some() && client_endpoints.len() != upstreams.len() {
             return Err(ServiceError::Unsupported);
         }
+        if mediated_global_dns {
+            let snapshot = resolved.as_ref().ok_or(ServiceError::Unavailable)?;
+            client_endpoints.extend(
+                snapshot
+                    .config
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.scope == Resolve1Scope::Global)
+                    .map(|endpoint| SocketAddr::new(endpoint.address, endpoint.port)),
+            );
+        }
         for (peer, binding) in upstreams {
             let mut client = peer;
             let relay = if let (Some(policy), Some(snapshot)) = (&dot_policy, &resolved) {
@@ -770,7 +850,11 @@ impl PreparedFakeDns {
                     .zip(&snapshot.sockets)
                     .find(|(endpoint, _)| SocketAddr::new(endpoint.address, endpoint.port) == peer)
                     .ok_or(ServiceError::Unavailable)?;
-                client = fallback_dot_client(peer, &mut client_endpoints)?;
+                client = if mediated_global_dns {
+                    local_dns_client(peer, &mut client_endpoints)?
+                } else {
+                    fallback_dot_client(peer, &mut client_endpoints)?
+                };
                 tls_relay(loopback, mark, endpoint, socket, policy).await?
             } else {
                 PlainDnsRelay::bind(loopback, peer, mark)
@@ -784,7 +868,9 @@ impl PreparedFakeDns {
             });
         }
         if let Some(snapshot) = resolved.as_deref().filter(|snapshot| {
-            matches!(source, ResolverSource::ResolvedUplink) && !snapshot.fallback_only
+            matches!(source, ResolverSource::ResolvedUplink)
+                && !snapshot.fallback_only
+                && !mediated_global_dns
         }) {
             let remaining = SystemFakeDnsBridge::MAX_PLAIN_DNS_PEERS - plain.len();
             plain.extend(uplink_tls_relays(snapshot, loopback, mark, remaining).await?);
@@ -801,19 +887,32 @@ impl PreparedFakeDns {
         config = config
             .with_plain_dns_endpoints(peers)
             .map_err(|_| ServiceError::Unsupported)?;
+        let resolver_relay = if mediated_global_dns {
+            let daemon = resolved
+                .as_ref()
+                .and_then(|snapshot| snapshot.daemon.as_ref())
+                .ok_or(ServiceError::Unavailable)?;
+            Some(
+                ResolverRelay::new(daemon.uid, plain.iter().map(|entry| entry.client).collect())
+                    .map_err(|_| ServiceError::Unsupported)?,
+            )
+        } else {
+            None
+        };
         drop(temporary);
         Ok(Self {
             config,
             loopback,
             direct_egress,
             marker,
-            suffixes,
+            suffixes: zones.fake_suffixes,
             private_dns_zones,
             listeners: Mutex::new(Some(listeners)),
             source,
             resolved,
             cidr_policy,
             tls_peers,
+            resolver_relay,
             plain,
         })
     }
@@ -858,7 +957,7 @@ impl PreparedFakeDns {
     }
 
     pub async fn verify_tls(&self, own_link: Option<u32>) -> Result<(), ServiceError> {
-        if self.tls_peers.is_empty() {
+        if self.tls_peers.is_empty() && self.resolver_relay.is_none() {
             return Ok(());
         }
         if resolver_source().await? != self.source {
@@ -901,10 +1000,26 @@ impl PreparedFakeDns {
             .cloned()
             .collect::<Vec<_>>();
         let resolved = match &self.resolved {
-            Some(snapshot) if snapshot.fallback_only => {
-                // Сохраняем порядок резервных серверов из resolved. Каждый адрес
-                // уже имеет отдельный релей и проверенный физический маршрут.
+            Some(snapshot) if snapshot.fallback_only || self.resolver_relay.is_some() => {
+                // Порядок серверов сохраняется. Каждый адрес уже имеет
+                // отдельное реле и проверенный физический маршрут.
                 let servers = self.plain_clients().collect::<Vec<_>>();
+                let publication_domains = if self.resolver_relay.is_some() {
+                    publication_domains
+                        .into_iter()
+                        // Для имён без более точной зоны resolved выбирает
+                        // TUN и не держит параллельную попытку native DoT.
+                        .chain(std::iter::once(".".to_owned()))
+                        .filter(|name| {
+                            !snapshot.config.domains.iter().any(|domain| {
+                                domain.scope == Resolve1Scope::Global
+                                    && domain.name.eq_ignore_ascii_case(name)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    publication_domains
+                };
                 Some(
                     prepare_fallback_link_dns(
                         ifindex,
@@ -1067,6 +1182,13 @@ fn fallback_dot_client(
     }
     // resolved нормализует 853 в порт по умолчанию. На локальном TUN
     // отключён TLS, поэтому его порт по умолчанию здесь равен 53.
+    local_dns_client(peer, allocated)
+}
+
+fn local_dns_client(
+    peer: SocketAddr,
+    allocated: &mut BTreeSet<SocketAddr>,
+) -> Result<SocketAddr, ServiceError> {
     std::iter::once(DNS_PORT)
         .chain(FIRST_DYNAMIC_PORT..=u16::MAX)
         .map(|port| SocketAddr::new(peer.ip(), port))

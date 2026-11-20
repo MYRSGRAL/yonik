@@ -366,7 +366,7 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-#[ignore = "выделенная VM с нативным DoT и известной helper приватной зоной"]
+#[ignore = "выделенная VM с нативным DoT на внешнем линке и известной приватной зоной"]
 async fn production_helper_rejects_native_dot_with_private_dns() -> Result {
     guard()?;
     let _lock = vm_lock::acquire()?;
@@ -405,6 +405,79 @@ async fn production_helper_rejects_native_dot_with_private_dns() -> Result {
         state_after_route_events(&connection).await?["state"] == "no_managed_policy",
         "Отказ Prepare создал сетевую политику",
     )?;
+    require(
+        resolver_file_state()? == resolver_before,
+        "Проверка изменила /etc/resolv.conf",
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "выделенная VM с глобальным DoT и известной приватной зоной wg.test"]
+async fn production_helper_relays_global_dot_with_private_dns() -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let policy = scoped_fake_dns_proxy_policy()?;
+    let (_owner, token) = yonik_linux::Cancellation::new();
+    let peer = std::env::var("YONIK_CHECK_STRICT_DOT")?.parse()?;
+    let alternate = std::env::var("YONIK_CHECK_ALTERNATE_DOT")?.parse()?;
+    check_fallback_dns_in_vm("real.test").await?;
+    for (engine, private) in [
+        (Engine::Xray, "xray-denied.wg.test"),
+        (Engine::SingBox, "sing-box-denied.wg.test"),
+    ] {
+        let drain = start_fake_dns_in_vm_with_domains(
+            &connection,
+            &server,
+            engine,
+            false,
+            Some(&policy),
+            &token,
+            &["example.test".to_owned()],
+        )
+        .await?;
+        check_fallback_dns_in_vm("real.test").await?;
+        check_fallback_dns_in_vm("public.dot.test").await?;
+        check_strict_dot_outsider(peer).await?;
+        check_strict_dot_outsider(alternate).await?;
+        let address = getent_fake_dns("ahostsv4", "example.test").await?;
+        require(
+            matches!(address, std::net::IpAddr::V4(v4) if matches!(v4.octets(), [198, 19, 224..=255, _])),
+            "Публичная зона не получила Fake-IP",
+        )?;
+        require(
+            getent_fake_dns("ahostsv4", private).await.is_err(),
+            "Системный резолвер получил ответ для приватного имени",
+        )?;
+        call(&connection, "Stop", json!({"version":1})).await?;
+        require(
+            tokio::time::timeout(Duration::from_secs(3), drain.drained())
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!("{engine:?} вывод после Stop: {error}"))
+                })?,
+            "Не остановлен worker",
+        )?;
+        check_fallback_dns_in_vm("real.test")
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("{engine:?} повторный DoT после Stop: {error}"))
+            })?;
+        check_fallback_dns_in_vm("restored.test")
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("{engine:?} новый DoT после Stop: {error}"))
+            })?;
+        eprintln!("{engine:?}: YONIK_GLOBAL_DOT_PRIVATE_ZONE_RELAY");
+    }
     require(
         resolver_file_state()? == resolver_before,
         "Проверка изменила /etc/resolv.conf",

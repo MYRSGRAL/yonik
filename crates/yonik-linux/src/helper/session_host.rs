@@ -530,12 +530,10 @@ impl SessionArtifact {
                 .revalidate(profile, cancel)
                 .map_err(unavailable)?;
         }
+        if let Some(fake_dns) = &self.fake_dns {
+            fake_dns.verify_tls(own_index).await?;
+        }
         if let Some(resolver_tls) = &self.resolver_tls {
-            self.fake_dns
-                .as_ref()
-                .ok_or_else(stale)?
-                .verify_tls(own_index)
-                .await?;
             resolver_tls.verify(cancel).await?;
         }
         let mut transports = Vec::with_capacity(self.routes.len());
@@ -1935,14 +1933,17 @@ impl Backend {
                 let prepared = PreparedFakeDns::new(
                     &plan,
                     &baseline,
-                    domains,
+                    session_fake_dns::RequestedDnsZones {
+                        fake_suffixes: domains,
+                        saved_private: saved,
+                    },
                     direct_egress,
                     request.fake_dns_policy_resolver,
                     policy.as_ref().filter(|_| resolved_cidrs).cloned(),
                     cancel,
                 )
                 .await?;
-                Some(Arc::new(prepared.with_saved_private_dns_zones(saved)))
+                Some(Arc::new(prepared))
             }
             None => None,
         };
@@ -2379,6 +2380,7 @@ impl Backend {
                         artifact.resolver_tls.as_ref().map(|tls| tls.policy.clone()),
                     )
                 })
+                .and_then(|policy| policy.with_resolver_relay(fake_dns.resolver_relay.clone()))
                 .map_err(unavailable)?;
             if self.profile_owner.is_some() {
                 if let Some((indices, bound)) =
