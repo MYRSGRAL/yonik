@@ -14,7 +14,7 @@
 
 #include "wireguard_packet_gate.h"
 
-_Static_assert(sizeof(struct yonik_wg_packet) == 56, "Размер ключа карты");
+_Static_assert(sizeof(struct yonik_wg_packet) == 72, "Размер ключа карты");
 
 static uint64_t integer(const char *text, unsigned int radix, uint64_t limit)
 {
@@ -93,7 +93,7 @@ static int load(const char *file, const char *dir, __u32 mark)
 static int change_lease(int argc, char **argv)
 {
     bool remove = !strcmp(argv[1], "revoke");
-    if (argc != (remove ? 11 : 12))
+    if (argc != (remove ? 12 : 13))
         return 2;
     struct yonik_wg_packet packet = {
         .cookie = integer(argv[10], 16, UINT64_MAX),
@@ -111,6 +111,10 @@ static int change_lease(int argc, char **argv)
     if (inet_pton(packet.family, argv[4], packet.source) != 1
         || inet_pton(packet.family, argv[5], packet.destination) != 1)
         return 2;
+    if (!strcmp(argv[11], "-"))
+        memcpy(packet.next_hop, packet.destination, sizeof(packet.next_hop));
+    else if (inet_pton(packet.family, argv[11], packet.next_hop) != 1)
+        return 2;
 
     int fd = open_map(argv[2], "wg_leases");
     if (remove)
@@ -119,7 +123,7 @@ static int change_lease(int argc, char **argv)
     if (clock_gettime(CLOCK_BOOTTIME, &now))
         return 1;
     __u64 expires = (__u64)now.tv_sec * 1000000000 + now.tv_nsec;
-    expires += integer(argv[11], 10, 60000) * 1000000;
+    expires += integer(argv[12], 10, 60000) * 1000000;
     return bpf_map_update_elem(fd, &packet, &expires, BPF_ANY) != 0;
 }
 

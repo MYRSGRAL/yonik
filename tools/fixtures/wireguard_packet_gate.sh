@@ -27,9 +27,17 @@ python3 "$fixture" connect
 python3 "$fixture" split-dns
 
 case "$1" in
-    4) endpoint=10.203.0.2; host=10.203.0.1; family=ip; cidr="$endpoint/32" ;;
+    4)
+        endpoint=10.203.0.2; host=10.203.0.1; cidr="$endpoint/32"
+        gateway_a=10.203.0.4; gateway_b=10.203.0.5; gateway_prefix=32
+        ip -n yonik-peer -4 address add "$gateway_a/$gateway_prefix" dev yonik-inner
+        ip -n yonik-peer -4 address add "$gateway_b/$gateway_prefix" dev yonik-inner
+        ;;
     6)
-        endpoint=2001:db8:7470::2; host=2001:db8:7470::1; family=ip6; cidr="$endpoint/128"
+        endpoint=2001:db8:7470::2; host=2001:db8:7470::1; cidr="$endpoint/128"
+        gateway_a=2001:db8:7470::4; gateway_b=2001:db8:7470::5; gateway_prefix=128
+        ip -n yonik-peer -6 address add "$gateway_a/$gateway_prefix" dev yonik-inner nodad
+        ip -n yonik-peer -6 address add "$gateway_b/$gateway_prefix" dev yonik-inner nodad
         "$wg" set yonik-wg peer "$("$wg" show yonik-wg peers)" endpoint "[$endpoint]:24177"
         ip netns exec yonik-peer "$wg" set yonik-wg peer "$(ip netns exec yonik-peer "$wg" show yonik-wg peers)" endpoint "[$host]:24177"
         ;;
@@ -63,7 +71,7 @@ cookie_for() {
     printf '%s\n' "$cookie"
 }
 cookie=$(cookie_for "$port")
-lease=("$1" "$host" "$endpoint" "$port" "$port" "$ifindex" "$mark" "$cookie")
+lease=("$1" "$host" "$endpoint" "$port" "$port" "$ifindex" "$mark" "$cookie" -)
 echo_over_vpn() {
     python3 - <<'PYVM'
 import socket
@@ -149,6 +157,36 @@ ip "$family_switch" rule del pref 300
 ip link del yonik-wrong
 "$gate" allow "$pins" "${lease[@]}" 15000
 check 0 restored_output_route
+"$gate" revoke "$pins" "${lease[@]}"
+# Оба шлюза отвечают на одном интерфейсе, адреса и порты пакета сохраняются.
+select_gateway() {
+    ip "$family_switch" route replace "$cidr" via "$1" dev yonik-outer onlink src "$host" table 219
+}
+check_gateway_route() {
+    ip "$family_switch" route get "$endpoint" from "$host" mark "$mark" \
+        | grep -F "via $1 dev yonik-outer table 219"
+}
+select_gateway "$gateway_a"
+ip "$family_switch" rule add pref 300 fwmark "$mark" table 219
+check_gateway_route "$gateway_a"
+via_gateway=("${lease[@]}")
+via_gateway[8]=$gateway_a
+"$gate" allow "$pins" "${via_gateway[@]}" 15000
+check 0 via_first_gateway
+select_gateway "$gateway_b"
+check_gateway_route "$gateway_b"
+check 2 changed_gateway_same_interface
+"$gate" revoke "$pins" "${via_gateway[@]}"
+via_gateway[8]=$gateway_b
+"$gate" allow "$pins" "${via_gateway[@]}" 15000
+check 0 via_republished_gateway
+"$gate" revoke "$pins" "${via_gateway[@]}"
+ip "$family_switch" rule del pref 300
+ip "$family_switch" route del "$cidr" table 219
+ip -n yonik-peer "$family_switch" address del "$gateway_a/$gateway_prefix" dev yonik-inner
+ip -n yonik-peer "$family_switch" address del "$gateway_b/$gateway_prefix" dev yonik-inner
+"$gate" allow "$pins" "${lease[@]}" 15000
+check 0 restored_direct_gateway
 "$wg" set yonik-wg listen-port 24178
 new_cookie=$(cookie_for 24178)
 test "$cookie" != "$new_cookie"

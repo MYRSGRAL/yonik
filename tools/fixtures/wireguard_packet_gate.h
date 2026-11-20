@@ -12,6 +12,7 @@ struct yonik_wg_packet {
     __be16 source_port;
     __be16 destination_port;
     __u32 family;
+    __u8 next_hop[16];
 };
 
 enum yonik_wg_verdict {
