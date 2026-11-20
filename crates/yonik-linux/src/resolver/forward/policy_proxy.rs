@@ -46,7 +46,8 @@ impl PolicyProxyResolver {
         }))
     }
 
-    pub(crate) fn validate_upstream(upstream: SocketAddr) -> Result<SocketAddr, ResolverError> {
+    /// Проверяет и нормализует адрес без сетевых запросов.
+    pub fn validate_upstream(upstream: SocketAddr) -> Result<SocketAddr, ResolverError> {
         let address = upstream.ip().to_canonical();
         if !valid_socket_address(upstream) || !valid_upstream(address) {
             return Err(ResolverError::Untrusted);
@@ -113,7 +114,7 @@ fn valid_upstream(address: IpAddr) -> bool {
         && !is_reserved_fake(address)
         && match address {
             IpAddr::V4(value) => !value.is_link_local() && (1..240).contains(&value.octets()[0]),
-            IpAddr::V6(value) => !value.is_unicast_link_local(),
+            IpAddr::V6(value) => !value.is_unicast_link_local() && value.to_ipv4().is_none(),
         }
 }
 

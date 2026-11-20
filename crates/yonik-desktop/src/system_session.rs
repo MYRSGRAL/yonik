@@ -1,4 +1,6 @@
 //! Сериализуемый host для системного IPC; профиль не сохраняется в снимках.
+use std::net::SocketAddr;
+
 use tokio::time::Instant;
 use yonik_engine::Engine;
 use yonik_import::ServerIntent;
@@ -12,6 +14,25 @@ pub(crate) fn ensure_engine_available(engine: Engine) -> Result<(), ClientError>
         Engine::Xray => Ok(()),
         Engine::SingBox => Err(ClientError::Unsupported),
     }
+}
+
+pub(crate) fn validate_fake_dns_policy(
+    policy: &yonik_engine::resource_bundle::Policy,
+    suffixes: &[String],
+    policy_resolver: Option<SocketAddr>,
+) -> Result<(), ClientError> {
+    if policy_resolver.is_some()
+        && yonik_engine::SystemFakeDnsBridge::supports_resolved_cidr_policy(policy)
+    {
+        return Ok(());
+    }
+    yonik_engine::validate_scoped_fake_dns_policy(policy, suffixes)
+        .map_err(|_| ClientError::Unsupported)
+}
+
+pub(crate) struct FakeDnsOptions {
+    pub(crate) suffixes: Vec<String>,
+    pub(crate) policy_resolver: Option<SocketAddr>,
 }
 
 /// Ревизии выдаёт GUI host при каждом изменении выбора или источника.
@@ -160,22 +181,26 @@ impl SystemSession {
         server: &ServerIntent,
         engine: Engine,
         policy: &yonik_linux::system_policy::InlinePolicy,
-        suffixes: &[String],
+        options: &FakeDnsOptions,
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<(), ClientError> {
         self.fence(revision)?;
         self.prepared = None;
-        yonik_engine::validate_scoped_fake_dns_policy(policy.policy().policy(), suffixes)
-            .map_err(|_| ClientError::Unsupported)?;
+        validate_fake_dns_policy(
+            policy.policy().policy(),
+            &options.suffixes,
+            options.policy_resolver,
+        )?;
         let prepared = self
             .client
-            .prepare_fake_dns_policy_profile(
+            .prepare_fake_dns_policy_profile_with_resolver(
                 server,
                 engine,
                 true,
-                suffixes,
+                &options.suffixes,
                 policy.policy(),
+                options.policy_resolver,
                 deadline,
                 cancel,
             )

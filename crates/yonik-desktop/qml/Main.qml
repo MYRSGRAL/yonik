@@ -1438,12 +1438,12 @@ ApplicationWindow {
                     visible: window.state.connection_mode === "system" && window.state.selected_kind !== "xray"
                     SmallLabel {
                         Layout.fillWidth: true
-                        text: window.tr("Разделяйте суффиксы запятыми. Пустое поле отключает Fake DNS. Для восстановленных имён доступны доменные правила Proxy и Block.", "Separate suffixes with commas. Leave the field empty to turn Fake DNS off. Proxy and Block domain rules can match recovered names.")
+                        text: window.tr("Разделяйте суффиксы запятыми. Пустое поле отключает Fake DNS.", "Separate suffixes with commas. Leave the field empty to turn Fake DNS off.")
                     }
                     SmallLabel {
                         visible: (window.state.system_fake_dns || []).length > 0 && !window.systemFakeDnsEnabled
                         Layout.fillWidth: true
-                        text: window.tr("Выберите «Прокси» по умолчанию. До первого CIDR покройте все суффиксы Fake DNS правилами Proxy или Block. Для Direct укажите CIDR с ненулевым префиксом. Правила по приложениям недоступны.", "Select Proxy as the default. Cover all Fake DNS suffixes with Proxy or Block rules before the first CIDR rule. For Direct, use CIDRs with a nonzero prefix length. Per-app rules are unavailable.")
+                        text: window.tr("Выберите «Прокси» по умолчанию. Если CIDR-правилам нужны реальные адреса, укажите DNS политики. Для Direct нужен CIDR с ненулевым префиксом. Правила по приложениям недоступны.", "Select Proxy as the default. Set a policy DNS server if CIDR rules need real addresses. Direct requires a CIDR with a nonzero prefix length. Per-app rules are unavailable.")
                     }
                     RowLayout {
                         Layout.fillWidth: true
@@ -1460,6 +1460,28 @@ ApplicationWindow {
                             objectName: "saveSystemFakeDns"
                             text: window.tr("Сохранить", "Save")
                             onClicked: window.send({command: "set_system_fake_dns", suffixes: systemFakeDns.text})
+                        }
+                    }
+                    SmallLabel {
+                        Layout.fillWidth: true
+                        text: window.tr("DNS политики Fake DNS. Укажите IP и порт DNS-over-TCP. Запросы идут через выбранный прокси. Пустое поле отключает это разрешение.", "Fake DNS policy resolver. Enter a DNS-over-TCP IP and port. Queries use the selected proxy. Leave empty to disable policy lookups.")
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: window.editable && !window.state.can_stop && !window.state.system_busy && !window.state.system_recovery_pending
+                        TextField {
+                            id: systemFakeDnsResolver
+                            objectName: "systemFakeDnsResolver"
+                            Layout.fillWidth: true
+                            maximumLength: 128
+                            placeholderText: "IP:port / [IPv6]:port"
+                            text: window.state.system_fake_dns_policy_resolver || ""
+                            Accessible.name: window.tr("Адрес DNS политики Fake DNS", "Fake DNS policy resolver address")
+                        }
+                        ActionButton {
+                            objectName: "saveSystemFakeDnsResolver"
+                            text: window.tr("Сохранить DNS", "Save DNS")
+                            onClicked: window.send({command: "set_system_fake_dns_resolver", upstream: systemFakeDnsResolver.text})
                         }
                     }
                 }

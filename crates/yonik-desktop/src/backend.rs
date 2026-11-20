@@ -19,7 +19,7 @@ pub use backend_startup::StartupPhase;
 #[path = "maintenance_job.rs"]
 mod maintenance_job;
 use crate::preferences::{Preferences, SaveError, SaveOutcome, Store};
-use crate::system_session::{ProfileRevision, SystemSession};
+use crate::system_session::{FakeDnsOptions, ProfileRevision, SystemSession};
 use batch_diagnostics::{BatchEvent, BatchPoll, BatchRunning, BatchState};
 use desktop_schedule::DesktopSchedule;
 #[path = "source_failure.rs"]
@@ -490,6 +490,9 @@ enum Command {
     },
     SetSystemFakeDns {
         suffixes: String,
+    },
+    SetSystemFakeDnsResolver {
+        upstream: String,
     },
     CheckTcp,
     CheckBatch,
@@ -1046,7 +1049,9 @@ fn validate(command: &Command) -> Result<()> {
         Command::SourcePage { offset } => *offset <= 40_000,
         Command::ReviewPage { offset } => *offset <= 160_000,
         Command::SetProbeTarget { url, .. } => text(url, 2048),
-        Command::SetProxyFetchDns { upstream } => text(upstream, 128),
+        Command::SetProxyFetchDns { upstream } | Command::SetSystemFakeDnsResolver { upstream } => {
+            text(upstream, 128)
+        }
         Command::SetSystemFakeDns { suffixes } => text(suffixes, 1024),
         Command::SelectSource { id }
         | Command::Favorite { id, .. }
@@ -1397,6 +1402,7 @@ struct Snapshot {
     active_engine: Option<EngineChoice>,
     proxy_fetch_dns: Option<SocketAddr>,
     system_fake_dns: Vec<String>,
+    system_fake_dns_policy_resolver: Option<SocketAddr>,
     probe_custom: bool,
     probe_persistent: bool,
     probe_expected_status: u16,
@@ -1424,8 +1430,12 @@ impl Snapshot {
             .routing
             .policy()
             .map_err(|_| DesktopError("fake_dns_policy"))?;
-        yonik_engine::validate_scoped_fake_dns_policy(&policy, &self.system_fake_dns)
-            .map_err(|_| DesktopError("fake_dns_policy"))
+        crate::system_session::validate_fake_dns_policy(
+            &policy,
+            &self.system_fake_dns,
+            self.system_fake_dns_policy_resolver,
+        )
+        .map_err(|_| DesktopError("fake_dns_policy"))
     }
 
     fn ensure_connection_engine(&self, engine: EngineChoice) -> Result<()> {
@@ -1509,6 +1519,7 @@ impl Snapshot {
             active_engine: None,
             proxy_fetch_dns: None,
             system_fake_dns: Vec::new(),
+            system_fake_dns_policy_resolver: None,
             probe_custom: false,
             probe_persistent: true,
             probe_expected_status: 204,
@@ -2179,6 +2190,8 @@ impl Actor {
                     self.preferences.subscription_interval_seconds;
                 self.state.subscription_background = self.preferences.subscription_background;
                 self.state.proxy_fetch_dns = self.preferences.proxy_fetch_dns;
+                self.state.system_fake_dns_policy_resolver =
+                    self.preferences.system_fake_dns_policy_resolver;
                 self.state
                     .system_fake_dns
                     .clone_from(&self.preferences.system_fake_dns);
@@ -3273,6 +3286,29 @@ impl Actor {
                 preferences.system_fake_dns.clone_from(&suffixes);
                 self.save_preferences(preferences)?;
                 self.state.system_fake_dns = suffixes;
+                Ok(())
+            }
+            Command::SetSystemFakeDnsResolver { upstream } => {
+                if self.state.can_stop
+                    || self.state.system_busy
+                    || self.state.system_recovery_pending
+                {
+                    return Err(DesktopError("busy"));
+                }
+                let upstream = upstream.trim();
+                let address = (!upstream.is_empty())
+                    .then(|| {
+                        let address = upstream
+                            .parse::<SocketAddr>()
+                            .map_err(|_| DesktopError("invalid_input"))?;
+                        yonik_linux::forward::PolicyProxyResolver::validate_upstream(address)
+                            .map_err(|_| DesktopError("invalid_input"))
+                    })
+                    .transpose()?;
+                let mut preferences = self.preferences.clone();
+                preferences.system_fake_dns_policy_resolver = address;
+                self.save_preferences(preferences)?;
+                self.state.system_fake_dns_policy_resolver = address;
                 Ok(())
             }
             Command::SetLanguage { language } => {
@@ -4797,6 +4833,7 @@ async fn run(
     state.subscription_interval_seconds = preferences.subscription_interval_seconds;
     state.subscription_background = preferences.subscription_background;
     state.proxy_fetch_dns = preferences.proxy_fetch_dns;
+    state.system_fake_dns_policy_resolver = preferences.system_fake_dns_policy_resolver;
     state
         .system_fake_dns
         .clone_from(&preferences.system_fake_dns);
@@ -6046,7 +6083,11 @@ async fn run(
                                     } else {
                                         Vec::new()
                                     };
-                                    system_flight = Some(Flight::start(system_session.take(), Operation::PolicyConnect(Box::new(server), actor.state.engine.engine(), Box::new(policy), routing_revision, suffixes), system_revision(&actor), envelope.generation, actor.event_log.clone()));
+                                    let fake_dns = FakeDnsOptions {
+                                        suffixes,
+                                        policy_resolver: actor.state.system_fake_dns_policy_resolver,
+                                    };
+                                    system_flight = Some(Flight::start(system_session.take(), Operation::PolicyConnect(Box::new(server), actor.state.engine.engine(), Box::new(policy), routing_revision, fake_dns), system_revision(&actor), envelope.generation, actor.event_log.clone()));
                                     if let Some(flight) = &mut system_flight { flight.request_id = request_id; flight.source_generation = actor.state.source_generation; }
                                     actor.state.system_tun_available = false;
                                     actor.state.routing_ack = None;
@@ -7451,7 +7492,7 @@ pub(crate) enum Operation {
         Engine,
         Box<yonik_linux::system_policy::InlinePolicy>,
         i64,
-        Vec<String>,
+        FakeDnsOptions,
     ),
     Stop,
     Unlock,
@@ -7487,7 +7528,7 @@ impl Flight {
         // Helper проверяет исходную сеть, отличает свой TUN от внешних
         // изменений и повторно сверяет маршруты перед выдачей Fake-IP.
         let cancel_on_network_change = connecting
-            && !matches!(&operation, Operation::PolicyConnect(_, _, _, _, suffixes) if !suffixes.is_empty());
+            && !matches!(&operation, Operation::PolicyConnect(_, _, _, _, options) if !options.suffixes.is_empty());
         let routing_revision = match &operation {
             Operation::PolicyConnect(_, _, _, revision, _) => Some(*revision),
             _ => None,
@@ -7526,8 +7567,8 @@ impl Flight {
                         Err(error) => Err(error),
                     }
                 }
-                Operation::PolicyConnect(server, engine, policy, _, suffixes) => {
-                    let prepared = if suffixes.is_empty() {
+                Operation::PolicyConnect(server, engine, policy, _, options) => {
+                    let prepared = if options.suffixes.is_empty() {
                         session
                             .prepare_policy(
                                 revision,
@@ -7545,7 +7586,7 @@ impl Flight {
                                 &server,
                                 engine,
                                 &policy,
-                                &suffixes,
+                                &options,
                                 deadline,
                                 cancellation.clone(),
                             )

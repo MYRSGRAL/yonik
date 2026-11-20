@@ -36,6 +36,8 @@ pub(crate) struct Preferences {
     pub proxy_fetch_dns: Option<std::net::SocketAddr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_fake_dns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_fake_dns_policy_resolver: Option<std::net::SocketAddr>,
     #[serde(default = "default_interval")]
     pub subscription_interval_seconds: u32,
     #[serde(default)]
@@ -57,6 +59,7 @@ impl Default for Preferences {
             language: "ru".into(),
             proxy_fetch_dns: None,
             system_fake_dns: Vec::new(),
+            system_fake_dns_policy_resolver: None,
             subscription_interval_seconds: default_interval(),
             subscription_background: false,
         }
@@ -333,6 +336,9 @@ fn valid(p: &Preferences) -> bool {
         && p.subscription_interval_seconds >= default_interval()
         && p.proxy_fetch_dns.is_none_or(valid_proxy_fetch_dns)
         && valid_system_fake_dns(&p.system_fake_dns)
+        && p.system_fake_dns_policy_resolver.is_none_or(|address| {
+            yonik_linux::forward::PolicyProxyResolver::validate_upstream(address).is_ok()
+        })
         && matches!(p.engine.as_str(), "xray" | "sing-box")
         && matches!(p.language.as_str(), "ru" | "en")
         && p.probe_url.len() <= 2048

@@ -18,6 +18,12 @@ system DNS manager controls the file. Firefox using system DNS can receive a
 Fake-IP. Firefox using its own DoH receives an address from its chosen provider
 and sends HTTPS through the system TUN.
 
+When CIDR rules need real addresses for Fake DNS names, enter a
+**Fake DNS policy resolver** under **Settings → Connection** and select
+**Save DNS**. Use `IP:port` or `[IPv6]:port` for a DNS-over-TCP server
+reachable through the selected proxy. Clear the field to disable policy DNS
+lookups. Stop the connection before changing the address.
+
 The build and installation commands below cover base revision
 `48ce74304a3fb7263ccc7e2c06d96394113a687d` and local SOCKS5 on
 Arch/CachyOS x86-64. Full P25 acceptance still covers open work on licensing,

@@ -115,8 +115,104 @@ fn system_fake_dns_is_saved_and_enables_sing_box_only_in_system_mode() {
 }
 
 #[test]
+fn system_fake_dns_policy_resolver_is_validated_saved_and_cleared() {
+    let directory = Directory::new();
+    let mut app = Harness::new(directory.config());
+    let state = app.wait(|state| state["ready"] == true);
+    assert_eq!(
+        state.get("system_fake_dns_policy_resolver"),
+        Some(&Value::Null)
+    );
+
+    app.send(json!({"command":"set_connection_mode","mode":"system"}));
+    app.wait(|state| state["connection_mode"] == "system");
+    app.send(json!({"command":"set_system_fake_dns","suffixes":"example.test"}));
+    app.wait(|state| state["system_fake_dns"] == json!(["example.test"]));
+    let state = add_fake_dns_rule(
+        &mut app,
+        0,
+        "block",
+        &["example.test"],
+        &["203.0.113.46/32"],
+    );
+    assert_eq!(state["system_fake_dns_enabled"], false);
+
+    let address = "[2001:db8::53]:5353";
+    app.send(json!({"command":"set_system_fake_dns_resolver","upstream":address}));
+    let state = app.wait(|state| state["system_fake_dns_policy_resolver"] == address);
+    assert_eq!(state["system_fake_dns_enabled"], true);
+    for rejected in [
+        "192.0.2.53",
+        "192.0.2.53:0",
+        "127.0.0.1:5353",
+        "198.19.224.2:5353",
+        "[::c000:235]:5353",
+    ] {
+        app.send(json!({"command":"set_system_fake_dns_resolver","upstream":rejected}));
+        let state = app.wait(|state| state["error"] == "invalid_input");
+        assert_eq!(state["system_fake_dns_policy_resolver"], address);
+        assert_eq!(state["system_fake_dns_enabled"], true);
+    }
+    app.close();
+
+    let mut app = Harness::new(directory.config());
+    let state = app.wait(|state| state["ready"] == true);
+    assert_eq!(state["system_fake_dns_policy_resolver"], address);
+    app.send(json!({"command":"set_connection_mode","mode":"system"}));
+    let state = app.wait(|state| state["connection_mode"] == "system");
+    assert_eq!(state["system_fake_dns_enabled"], true);
+    app.send(json!({"command":"set_system_fake_dns_resolver","upstream":""}));
+    let state =
+        app.wait(|state| state.get("system_fake_dns_policy_resolver") == Some(&Value::Null));
+    assert_eq!(state["system_fake_dns_enabled"], false);
+    app.close();
+
+    let mut app = Harness::new(directory.config());
+    let state = app.wait(|state| state["ready"] == true);
+    assert_eq!(
+        state.get("system_fake_dns_policy_resolver"),
+        Some(&Value::Null)
+    );
+    app.close();
+}
+
+fn add_fake_dns_rule(
+    app: &mut Harness,
+    revision: u64,
+    action: &str,
+    domains: &[&str],
+    destinations: &[&str],
+) -> Value {
+    let id = revision + 1;
+    app.send(json!({
+        "command":"edit_routing","expected_revision":revision,"request_id":id,
+        "create":true,"confirm_broad":false,"rule":{"id":id,"enabled":true,
+        "executables":[],"domains":domains,"destinations":destinations,"action":action},
+    }));
+    let state = app.wait(|state| state["routing_ack"]["request_id"] == id);
+    assert!(
+        state["routing_ack"]["error"].is_null(),
+        "{}",
+        state["routing_ack"]
+    );
+    state
+}
+
+#[test]
 #[ignore = "одноразовая QEMU VM со штатным helper, peer и тестовым TLS"]
 fn desktop_uses_installed_helper_for_system_fake_dns() {
+    desktop_fake_dns_through_helper(None);
+}
+
+#[test]
+#[ignore = "одноразовая QEMU VM со штатным helper, peer и DNS политики"]
+fn desktop_uses_installed_helper_for_mixed_fake_dns_policy() {
+    let resolver = std::env::var("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER")
+        .expect("адрес DNS политики тестового peer");
+    desktop_fake_dns_through_helper(Some(&resolver));
+}
+
+fn desktop_fake_dns_through_helper(policy_resolver: Option<&str>) {
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
 
@@ -192,6 +288,22 @@ fn desktop_uses_installed_helper_for_system_fake_dns() {
     app.wait(|value| value["connection_mode"] == "system");
     app.send(json!({"command":"set_system_fake_dns","suffixes":"example.test"}));
     app.wait(|value| value["system_fake_dns_enabled"] == true);
+    if let Some(resolver) = policy_resolver {
+        add_fake_dns_rule(&mut app, 0, "proxy", &["early.example.test"], &[]);
+        add_fake_dns_rule(
+            &mut app,
+            1,
+            "block",
+            &["combined.example.test"],
+            &["203.0.113.50/32"],
+        );
+        add_fake_dns_rule(&mut app, 2, "proxy", &[], &["2001:db8:746f::2/128"]);
+        add_fake_dns_rule(&mut app, 3, "block", &[], &["203.0.113.46/32"]);
+        add_fake_dns_rule(&mut app, 4, "proxy", &["example.test"], &[]);
+        app.send(json!({"command":"set_system_fake_dns_resolver","upstream":resolver}));
+        let state = app.wait(|value| value["system_fake_dns_policy_resolver"] == resolver);
+        assert_eq!(state["system_fake_dns_enabled"], true);
+    }
 
     for engine in ["xray", "sing-box"] {
         app.send(json!({"command":"set_engine","engine":engine}));
@@ -224,6 +336,13 @@ fn desktop_uses_installed_helper_for_system_fake_dns() {
             String::from_utf8_lossy(&response.stderr)
         );
         assert_eq!(response.stdout, b"YONIK_TLS_FIXTURE");
+        if let Some(resolver) = policy_resolver {
+            check_desktop_mixed_fake_dns();
+            app.send(json!({"command":"set_system_fake_dns_resolver","upstream":""}));
+            let state = app.wait(|value| value["error"] == "busy");
+            assert_eq!(state["system_fake_dns_policy_resolver"], resolver);
+            eprintln!("DesktopHost → смешанная DNS-политика установленного helper: {engine}");
+        }
         app.send(json!({"command":"stop"}));
         app.wait(|value| value["can_unlock"] == true && value["can_stop"] == false);
         app.send(json!({"command":"system_unlock"}));
@@ -231,6 +350,52 @@ fn desktop_uses_installed_helper_for_system_fake_dns() {
         eprintln!("DesktopHost → установленный helper → HTTPS через Fake-IP: {engine}");
     }
     app.close();
+}
+
+fn check_desktop_mixed_fake_dns() {
+    use std::net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket};
+
+    let resolve = |name: &str| {
+        (name, 40000_u16)
+            .to_socket_addrs()
+            .expect("системный Fake DNS")
+            .find(|address| {
+                matches!(address.ip(), IpAddr::V4(ip) if ip.octets()[..2] == [198, 19] && ip.octets()[2] >= 224)
+            })
+            .expect("синтетический IPv4 тестового домена")
+    };
+    let timeout = Duration::from_secs(2);
+    let allowed = resolve("early.example.test");
+    let payload = [47u8; 32];
+    let expected = [b"yonik-tun:".as_slice(), &payload].concat();
+    let mut tcp = TcpStream::connect_timeout(&allowed, timeout).expect("разрешённый TCP");
+    tcp.set_read_timeout(Some(timeout)).unwrap();
+    tcp.set_write_timeout(Some(timeout)).unwrap();
+    tcp.write_all(&payload).expect("отправка TCP");
+    let mut response = [0u8; 42];
+    tcp.read_exact(&mut response).expect("ответ TCP");
+    assert_eq!(response.as_slice(), expected);
+
+    let udp = UdpSocket::bind("0.0.0.0:0").expect("клиент UDP");
+    udp.set_read_timeout(Some(timeout)).unwrap();
+    udp.connect(allowed).expect("разрешённый UDP");
+    udp.send(&payload).expect("отправка UDP");
+    let mut response = [0u8; 43];
+    let len = udp.recv(&mut response).expect("ответ UDP");
+    assert_eq!(&response[..len], expected);
+
+    let blocked = resolve("combined.example.test");
+    if let Ok(mut tcp) = TcpStream::connect_timeout(&blocked, timeout) {
+        tcp.set_read_timeout(Some(timeout)).unwrap();
+        tcp.set_write_timeout(Some(timeout)).unwrap();
+        if tcp.write_all(&payload).is_ok() {
+            let mut response = [0u8; 42];
+            assert!(
+                tcp.read_exact(&mut response).is_err(),
+                "смешанный Block пропустил TCP"
+            );
+        }
+    }
 }
 
 #[test]
