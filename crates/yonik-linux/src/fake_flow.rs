@@ -17,7 +17,7 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use crate::Cancellation;
-use yonik_engine::fake_dns::DomainName;
+use yonik_engine::fake_dns::{DomainName, FakeMapping};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKS_VERSION: u8 = 5;
@@ -123,7 +123,7 @@ pub async fn handle_tcp(
     upstream: SocketAddr,
     incoming_auth: &SocksCredentials,
     upstream_auth: &SocksCredentials,
-    resolve_fake_ip: impl FnMut(IpAddr) -> Option<DomainName>,
+    resolve_fake_ip: impl FnMut(IpAddr) -> Option<FakeMapping>,
     mut cancellation: Cancellation,
 ) -> Result<(), FakeFlowError> {
     validate_loopback(&incoming, upstream)?;
@@ -147,14 +147,15 @@ pub async fn handle_tcp(
 }
 
 /// Единый entry point SOCKS listener: один раз выбирает USERPASS и dispatch-ит
-/// аутентифицированный CONNECT или UDP ASSOCIATE.
+/// аутентифицированный CONNECT или UDP ASSOCIATE. Lookup возвращает исходную
+/// аренду целиком для проверки её срока и поколения перед записью в сокет.
 pub async fn handle_flow(
     mut incoming: TcpStream,
     upstream: SocketAddr,
     incoming_auth: &SocksCredentials,
     upstream_auth: &SocksCredentials,
     worker_isolation: Option<&WorkerOnlyLoopbackIsolation>,
-    resolve_fake_ip: impl Fn(IpAddr) -> Option<DomainName> + Send + Sync,
+    resolve_fake_ip: impl Fn(IpAddr) -> Option<FakeMapping> + Send + Sync,
     mut cancellation: Cancellation,
 ) -> Result<(), FakeFlowError> {
     validate_loopback(&incoming, upstream)?;
@@ -198,16 +199,20 @@ async fn handle_tcp_authenticated(
     request: AuthenticatedRequest,
     upstream: SocketAddr,
     upstream_auth: &SocksCredentials,
-    mut resolve_fake_ip: impl FnMut(IpAddr) -> Option<DomainName>,
+    mut resolve_fake_ip: impl FnMut(IpAddr) -> Option<FakeMapping>,
     mut cancellation: Cancellation,
 ) -> Result<(), FakeFlowError> {
     let handshake = async {
         let target = read_tcp_target(&mut incoming, request).await?;
-        let Some(domain) = resolve_fake_ip(target.ip) else {
+        let Some(mapping) =
+            resolve_fake_ip(target.ip).filter(|mapping| mapping.address == target.ip)
+        else {
             write_socks_failure(&mut incoming, 4).await?;
             return Err(FakeFlowError::UnknownFakeIp);
         };
-        if domain.as_str().is_empty() || domain.as_str().len() > MAX_DOMAIN_LEN || target.port == 0
+        if mapping.name.as_str().is_empty()
+            || mapping.name.as_str().len() > MAX_DOMAIN_LEN
+            || target.port == 0
         {
             return Err(FakeFlowError::Protocol);
         }
@@ -215,10 +220,10 @@ async fn handle_tcp_authenticated(
         if !core.local_addr()?.ip().is_loopback() || !core.peer_addr()?.ip().is_loopback() {
             return Err(FakeFlowError::NonLoopback);
         }
-        let still_current = || resolve_fake_ip(target.ip).as_ref() == Some(&domain);
+        let still_current = || resolve_fake_ip(target.ip).as_ref() == Some(&mapping);
         if let Err(error) = connect_core(
             &mut core,
-            &domain,
+            &mapping.name,
             target.port,
             upstream_auth,
             still_current,
@@ -498,7 +503,7 @@ pub async fn handle_udp_associate(
     incoming_auth: &SocksCredentials,
     upstream_auth: &SocksCredentials,
     worker_isolation: Option<&WorkerOnlyLoopbackIsolation>,
-    resolve_fake_ip: impl Fn(IpAddr) -> Option<DomainName> + Send + Sync,
+    resolve_fake_ip: impl Fn(IpAddr) -> Option<FakeMapping> + Send + Sync,
     mut cancellation: Cancellation,
 ) -> Result<(), FakeFlowError> {
     if !incoming_control.peer_addr()?.ip().is_loopback()
@@ -534,7 +539,7 @@ async fn handle_udp_associate_authenticated(
     upstream: SocketAddr,
     upstream_auth: &SocksCredentials,
     worker_isolation: Option<&WorkerOnlyLoopbackIsolation>,
-    resolve_fake_ip: impl Fn(IpAddr) -> Option<DomainName> + Send + Sync,
+    resolve_fake_ip: impl Fn(IpAddr) -> Option<FakeMapping> + Send + Sync,
     mut cancellation: Cancellation,
 ) -> Result<(), FakeFlowError> {
     if !incoming_control.peer_addr()?.ip().is_loopback()
@@ -570,7 +575,7 @@ async fn handle_udp_associate_authenticated(
 
     let mut expected_client = request.exact_client;
     let mut upstream_assoc: Option<UpstreamUdpAssociation> = None;
-    let mut by_fake = HashMap::<FakeDestination, String>::new();
+    let mut by_fake = HashMap::<FakeDestination, FakeMapping>::new();
     let mut by_domain = HashMap::<(String, u16), FakeDestination>::new();
     let mut idle_deadline = Instant::now() + UDP_IDLE_TIMEOUT;
     let mut client_buffer = [0u8; MAX_UDP_PACKET_LEN + 1];
@@ -619,33 +624,36 @@ async fn handle_udp_associate_authenticated(
                 let Some((fake, port, payload)) = parse_client_udp(&client_buffer[..len]) else {
                     continue;
                 };
-                let Some(resolved_domain) = resolve_fake_ip(fake.address) else {
+                let Some(mapping) =
+                    resolve_fake_ip(fake.address).filter(|mapping| mapping.address == fake.address)
+                else {
                     continue;
                 };
-                if resolved_domain.as_str().is_empty()
-                    || resolved_domain.as_str().len() > MAX_DOMAIN_LEN
+                if mapping.name.as_str().is_empty() || mapping.name.as_str().len() > MAX_DOMAIN_LEN
                 {
                     continue;
                 }
-                let domain = resolved_domain.as_str();
-                if let Some(previous) = by_fake.get(&fake) {
-                    if previous != domain {
-                        return Err(FakeFlowError::UnknownFakeIp);
+                let within_limit = by_fake.len() < MAX_UDP_DESTINATIONS;
+                let mapping = match by_fake.entry(fake) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        if entry.get() != &mapping {
+                            return Err(FakeFlowError::UnknownFakeIp);
+                        }
+                        entry.into_mut()
                     }
-                } else {
-                    let reverse_key = (domain.to_owned(), port);
-                    if by_domain
-                        .get(&reverse_key)
-                        .is_some_and(|other| *other != fake)
-                    {
-                        continue;
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let reverse_key = (mapping.name.as_str().to_owned(), port);
+                        if by_domain.contains_key(&reverse_key) {
+                            continue;
+                        }
+                        if !within_limit {
+                            return Err(FakeFlowError::UdpMappingLimit);
+                        }
+                        by_domain.insert(reverse_key, fake);
+                        entry.insert(mapping)
                     }
-                    if by_fake.len() >= MAX_UDP_DESTINATIONS {
-                        return Err(FakeFlowError::UdpMappingLimit);
-                    }
-                    by_domain.insert(reverse_key, fake);
-                    by_fake.insert(fake, domain.to_owned());
-                }
+                };
+                let domain = mapping.name.as_str();
                 if expected_client.is_none() {
                     expected_client = Some(source);
                 }
@@ -661,12 +669,6 @@ async fn handle_udp_associate_authenticated(
                         () = cancellation.cancelled() => return Err(FakeFlowError::Cancelled),
                     };
                     upstream_assoc = Some(association);
-                    let Some(current_domain) = resolve_fake_ip(fake.address) else {
-                        continue;
-                    };
-                    if current_domain.as_str() != domain {
-                        return Err(FakeFlowError::UnknownFakeIp);
-                    }
                 }
                 if 7 + domain.len() + payload.len() > MAX_UDP_PACKET_LEN {
                     continue;
@@ -679,8 +681,13 @@ async fn handle_udp_associate_authenticated(
                 let Some(association) = upstream_assoc.as_mut() else {
                     return Err(FakeFlowError::UpstreamRejected);
                 };
-                association.relay.send(&encoded).await?;
-                idle_deadline = Instant::now() + UDP_IDLE_TIMEOUT;
+                if send_udp_for_mapping(&association.relay, mapping, &resolve_fake_ip, || {
+                    association.relay.try_send(&encoded)
+                })
+                .await?
+                {
+                    idle_deadline = Instant::now() + UDP_IDLE_TIMEOUT;
+                }
             }
             UdpEvent::Upstream(len) => {
                 let Some((domain, port, payload)) = parse_upstream_udp(&upstream_buffer[..len])
@@ -691,12 +698,7 @@ async fn handle_udp_associate_authenticated(
                 let Some(fake) = by_domain.get(&key).copied() else {
                     continue;
                 };
-                let Some(current_domain) = resolve_fake_ip(fake.address) else {
-                    continue;
-                };
-                if current_domain.as_str() != key.0 {
-                    return Err(FakeFlowError::UnknownFakeIp);
-                }
+                let mapping = by_fake.get(&fake).ok_or(FakeFlowError::UnknownFakeIp)?;
                 let Some(source) = expected_client else {
                     continue;
                 };
@@ -708,9 +710,36 @@ async fn handle_udp_associate_authenticated(
                 encode_fake_ip(&mut encoded, fake.address);
                 encoded.extend_from_slice(&fake.port.to_be_bytes());
                 encoded.extend_from_slice(payload);
-                client_relay.send_to(&encoded, source).await?;
-                idle_deadline = Instant::now() + UDP_IDLE_TIMEOUT;
+                if send_udp_for_mapping(&client_relay, mapping, &resolve_fake_ip, || {
+                    client_relay.try_send_to(&encoded, source)
+                })
+                .await?
+                {
+                    idle_deadline = Instant::now() + UDP_IDLE_TIMEOUT;
+                }
             }
+        }
+    }
+}
+
+async fn send_udp_for_mapping(
+    socket: &UdpSocket,
+    mapping: &FakeMapping,
+    resolve_fake_ip: impl Fn(IpAddr) -> Option<FakeMapping>,
+    send: impl Fn() -> io::Result<usize>,
+) -> Result<bool, FakeFlowError> {
+    loop {
+        socket.writable().await?;
+        // Срок аренды проверяем после ожидания, перед каждой попыткой записи.
+        match resolve_fake_ip(mapping.address) {
+            None => return Ok(false),
+            Some(current) if &current != mapping => return Err(FakeFlowError::UnknownFakeIp),
+            Some(_) => {}
+        }
+        match send() {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -963,14 +992,24 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    use yonik_engine::fake_dns::DnsEpoch;
 
     fn credentials() -> SocksCredentials {
         SocksCredentials::new(b"user", b"secret").unwrap_or_else(|_| unreachable!())
     }
 
+    fn mapping(address: IpAddr, name: &str, expires_at: u64) -> Option<FakeMapping> {
+        Some(FakeMapping {
+            address,
+            name: DomainName::from_str(name).ok()?,
+            epoch: DnsEpoch::default(),
+            expires_at,
+        })
+    }
+
     async fn start_handler(
         upstream: SocketAddr,
-        resolver: impl Fn(IpAddr) -> Option<DomainName> + Send + Sync + 'static,
+        resolver: impl Fn(IpAddr) -> Option<FakeMapping> + Send + Sync + 'static,
     ) -> (
         TcpStream,
         tokio::task::JoinHandle<Result<(), FakeFlowError>>,
@@ -1079,7 +1118,7 @@ mod tests {
         });
         let (mut client, handler) = start_handler(core_addr, |ip| {
             (ip == IpAddr::V4(Ipv4Addr::new(198, 18, 0, 7)))
-                .then(|| DomainName::from_str("example.org").ok())
+                .then(|| mapping(ip, "example.org", 10))
                 .flatten()
         })
         .await;
@@ -1104,8 +1143,19 @@ mod tests {
 
     #[tokio::test]
     async fn истекший_при_аутентификации_fake_ip_не_отправляет_connect() {
+        проверить_истечение_при_аутентификации(false).await;
+    }
+
+    #[tokio::test]
+    async fn повторная_выдача_того_же_fake_ip_не_оживляет_connect() {
+        проверить_истечение_при_аутентификации(true).await;
+    }
+
+    async fn проверить_истечение_при_аутентификации(
+        перевыдать: bool,
+    ) {
         use std::sync::{Mutex, atomic::AtomicU64};
-        use yonik_engine::fake_dns::{DnsEpoch, FakeIpFamily, FakeIpLeaseTable};
+        use yonik_engine::fake_dns::{FakeIpFamily, FakeIpLeaseTable};
 
         let fake_ip = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 7));
         let epoch = DnsEpoch {
@@ -1147,10 +1197,21 @@ mod tests {
         });
         let (mut client, handler) = start_handler(core_addr, move |address| {
             let mut leases = leases.lock().unwrap();
-            leases
-                .lookup(address, epoch, now.load(Ordering::SeqCst))
-                .unwrap()
-                .map(|mapping| mapping.name)
+            let tick = now.load(Ordering::SeqCst);
+            if перевыдать && tick == 11 {
+                let grant = leases
+                    .issue(
+                        DomainName::from_str("example.org").unwrap(),
+                        FakeIpFamily::V4,
+                        epoch,
+                        tick,
+                        10,
+                    )
+                    .unwrap();
+                assert_eq!(grant.address, address);
+                assert_eq!(grant.expires_at, 21);
+            }
+            leases.lookup(address, epoch, tick).unwrap()
         })
         .await;
         let response = authenticate_and_request(&mut client, b"secret", fake_ip, 443).await;
@@ -1191,7 +1252,7 @@ mod tests {
         let core_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let core_addr = core_listener.local_addr().unwrap();
         let (mut client, handler) =
-            start_handler(core_addr, |_| DomainName::from_str("example.org").ok()).await;
+            start_handler(core_addr, |ip| mapping(ip, "example.org", 10)).await;
         assert_eq!(
             authenticate_and_request(&mut client, b"wrong", IpAddr::V4(Ipv4Addr::LOCALHOST), 443)
                 .await,
@@ -1275,10 +1336,28 @@ mod tests {
 
     #[tokio::test]
     async fn udp_relay_maps_domain_rejects_injection_and_tracks_controls() {
+        проверить_udp_после_смены_аренды("replacement.example", false).await;
+    }
+
+    #[tokio::test]
+    async fn повторная_выдача_fake_ip_не_оживляет_udp_ассоциацию() {
+        проверить_udp_после_смены_аренды("example.org", false).await;
+    }
+
+    #[tokio::test]
+    async fn повторная_выдача_fake_ip_отбрасывает_запоздалый_udp_ответ() {
+        проверить_udp_после_смены_аренды("example.org", true).await;
+    }
+
+    async fn проверить_udp_после_смены_аренды(
+        имя: &'static str,
+        поздний_ответ: bool,
+    ) {
         let upstream_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let upstream_udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let upstream_relay_addr = upstream_udp.local_addr().unwrap();
+        let (ответить, ждать_ответа) = tokio::sync::oneshot::channel();
         let upstream = tokio::spawn(async move {
             let (mut control, _) = upstream_listener.accept().await.unwrap();
             let mut greeting = [0; 3];
@@ -1348,14 +1427,26 @@ mod tests {
                 response
             };
             upstream_udp.send_to(&valid, client).await.unwrap();
+            if поздний_ответ {
+                ждать_ответа.await.unwrap();
+                upstream_udp.send_to(&valid, client).await.unwrap();
+            }
             let mut unexpected = [0; MAX_UDP_PACKET_LEN + 1];
             let mut eof = [0; 1];
-            tokio::select! {
-                packet = upstream_udp.recv_from(&mut unexpected) => {
-                    panic!("upstream получил пакет после смены Fake-IP mapping: {packet:?}");
-                }
-                read = control.read(&mut eof) => assert_eq!(read.unwrap(), 0),
-            }
+            let length = timeout(Duration::from_secs(2), control.read(&mut eof))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(length, 0);
+            assert!(
+                timeout(
+                    Duration::from_millis(30),
+                    upstream_udp.recv_from(&mut unexpected)
+                )
+                .await
+                .is_err(),
+                "Движок получил UDP-пакет после смены аренды Fake-IP"
+            );
         });
 
         let bridge_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -1384,9 +1475,9 @@ mod tests {
                     }
                     resolver_calls_inner.fetch_add(1, Ordering::SeqCst);
                     match resolver_mode.load(Ordering::SeqCst) {
-                        0 => DomainName::from_str("example.org").ok(),
+                        0 => mapping(ip, "example.org", 10),
                         1 => None,
-                        _ => DomainName::from_str("replacement.example").ok(),
+                        _ => mapping(ip, имя, 20),
                     }
                 },
                 cancellation,
@@ -1458,13 +1549,17 @@ mod tests {
             .is_err()
         );
         mapping_mode.store(2, Ordering::SeqCst);
-        client_udp
-            .send_to(
-                &socks_udp_packet(fake_ip, 5353, 0, b"replaced-mapping"),
-                relay,
-            )
-            .await
-            .unwrap();
+        if поздний_ответ {
+            ответить.send(()).unwrap();
+        } else {
+            client_udp
+                .send_to(
+                    &socks_udp_packet(fake_ip, 5353, 0, b"replaced-mapping"),
+                    relay,
+                )
+                .await
+                .unwrap();
+        }
         tokio::time::timeout(Duration::from_secs(2), async {
             while resolver_calls.load(Ordering::SeqCst) < 5 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1472,6 +1567,14 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                client_udp.recv_from(&mut response)
+            )
+            .await
+            .is_err()
+        );
         attacker
             .send_to(
                 &socks_udp_packet(
@@ -1518,7 +1621,7 @@ mod tests {
                 &incoming_auth,
                 &upstream_auth,
                 None,
-                |_| DomainName::from_str("example.org").ok(),
+                |ip| mapping(ip, "example.org", 10),
                 cancellation,
             )
             .await

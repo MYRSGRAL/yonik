@@ -46,7 +46,7 @@ pub enum Resolution<'a> {
     Failed,
     Answer(AnswerSet<'a>),
 }
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FakeMapping {
     pub address: IpAddr,
     pub name: DomainName,

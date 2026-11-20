@@ -175,7 +175,7 @@ impl FakeDnsBridgeListeners {
                             &incoming_auth,
                             &upstream_auth,
                             Some(isolation),
-                            |address| leases.lookup(address, epoch).map(|mapping| mapping.name),
+                            |address| leases.lookup(address, epoch),
                             cancel.clone(),
                         ));
                     }
