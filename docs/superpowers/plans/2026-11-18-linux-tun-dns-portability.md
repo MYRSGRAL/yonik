@@ -1077,6 +1077,14 @@ IPv4-сценарий с теми же проверками прошёл пов�
   Отдельный прогон под systemd с `CAP_NET_ADMIN` и
   `NoNewPrivileges=yes` получил `EPERM` при пробной загрузке BPF на обоих
   ядрах. Установленный helper работает с этими ограничениями.
+  На Debian 6.12.117 и Fedora 45 с ядром 7.2.11, оба x86-64, отдельная
+  лабораторная служба systemd с `NoNewPrivileges=yes` подключила пробу
+  через `kprobe.multi` с `CAP_BPF` и `CAP_PERFMON`. Для чтения WireGuard
+  через Netlink добавили `CAP_NET_ADMIN`. Номер и порт запроса, ifindex
+  и cookie сокетов IPv4 и IPv6 совпали в однофрагментном ответе.
+  В гостевой Fedora SELinux был в режиме Enforcing. Прогон не проверял
+  домен установленного helper, многофрагментные ответы и ARM64 этим
+  способом. Содержимое `/etc/resolv.conf` совпало до и после.
   Для рабочего допуска ещё требуются загрузчик в рамках пакетной политики,
   проверка фактического UDP-выхода и отзыв разрешения в ядре.
   [Блокировки чтения WireGuard](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireguard/netlink.c#L195-L275)
