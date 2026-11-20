@@ -32,6 +32,18 @@ impl PolicyRrset {
 }
 
 impl ForwardResponse {
+    pub(super) fn verify_policy_status(&self) -> Result<(), ResolverError> {
+        let flags = read_u16(&self.packet, 2)?;
+        if self.truncated
+            || self.question.opcode != 0
+            || !matches!(self.question.qtype, 1 | 28)
+            || flags & 0x024f != 0
+        {
+            return Err(ResolverError::Untrusted);
+        }
+        Ok(())
+    }
+
     /// Объединяет ответы A и AAAA на одно имя от одного узла.
     /// UDP и TCP к одному узлу считаются одним путём обычного DNS.
     /// Вызывающая сторона сохраняет связь с текущим снимком резолвера.
@@ -66,15 +78,10 @@ impl ForwardResponse {
     /// Возвращает только адреса конечного владельца из секции Answer.
     /// Пустой набор означает NODATA с SOA зоны конечного имени.
     pub fn policy_rrset(&self) -> Result<PolicyRrset, ResolverError> {
+        self.verify_policy_status()?;
         let packet = &self.packet;
         let (question, mut offset) = parse_question(packet, true)?;
-        let flags = read_u16(packet, 2)?;
-        if question != self.question
-            || self.truncated
-            || question.opcode != 0
-            || !matches!(question.qtype, 1 | 28)
-            || flags & 0x024f != 0
-        {
+        if question != self.question {
             return Err(ResolverError::Untrusted);
         }
 

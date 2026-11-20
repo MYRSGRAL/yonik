@@ -2,9 +2,9 @@
 use super::{
     ResolverError,
     dot::DotPeer,
-    forward::{forward_framed, forward_tcp, forward_udp},
+    forward::{forward_framed, forward_tcp, forward_udp, is_reserved_fake},
 };
-use crate::{Cancellation, TransportProtocol, managed_network::FAKE_POOLS};
+use crate::{Cancellation, TransportProtocol};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
     io,
@@ -276,21 +276,6 @@ impl PlainDnsRelay {
             .await
             .map_err(|_| ResolverError::Unavailable)
     }
-}
-
-fn is_reserved_fake(address: IpAddr) -> bool {
-    let address = address.to_canonical();
-    FAKE_POOLS
-        .iter()
-        .any(|(network, length)| match (*network, address) {
-            (IpAddr::V4(base), IpAddr::V4(address)) => {
-                u32::from(address) & (u32::MAX << (32 - length)) == u32::from(base)
-            }
-            (IpAddr::V6(base), IpAddr::V6(address)) => {
-                u128::from(address) & (u128::MAX << (128 - length)) == u128::from(base)
-            }
-            _ => false,
-        })
 }
 
 #[cfg(test)]

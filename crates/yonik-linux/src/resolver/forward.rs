@@ -15,11 +15,13 @@ use tokio::{
     time::timeout,
 };
 
-use crate::Cancellation;
+use crate::{Cancellation, managed_network::FAKE_POOLS};
 
 use super::{ResolverError, dot::DotPeer};
 
+mod policy_proxy;
 mod policy_rrset;
+pub use policy_proxy::PolicyProxyResolver;
 pub use policy_rrset::PolicyRrset;
 
 const HEADER_LEN: usize = 12;
@@ -43,6 +45,7 @@ pub struct ForwardResponse {
 pub(super) enum ForwardPeer {
     Plain(SocketAddr),
     Tls(SocketAddr, Arc<DotPeer>),
+    Proxy(Arc<PolicyProxyResolver>),
 }
 
 impl PartialEq for ForwardPeer {
@@ -52,6 +55,7 @@ impl PartialEq for ForwardPeer {
             (Self::Tls(left, left_policy), Self::Tls(right, right_policy)) => {
                 left == right && Arc::ptr_eq(left_policy, right_policy)
             }
+            (Self::Proxy(left), Self::Proxy(right)) => Arc::ptr_eq(left, right),
             _ => false,
         }
     }
@@ -207,24 +211,35 @@ pub async fn forward_tcp(
     if peer != trusted_peer {
         return Err(ResolverError::Untrusted);
     }
-    forward_framed(
+    forward_tcp_for_peer(
+        stream,
         query,
         timeout_budget,
         cancel,
-        ForwardPeer::Plain(trusted_peer),
-        async |outbound| {
-            let frame_len = u16::try_from(outbound.len()).map_err(|_| ResolverError::Limit)?;
-            stream.write_u16(frame_len).await.map_err(map_io)?;
-            stream.write_all(outbound).await.map_err(map_io)?;
-            let response_len = usize::from(stream.read_u16().await.map_err(map_io)?);
-            if !(HEADER_LEN..=MAX_DNS_PACKET).contains(&response_len) {
-                return Err(ResolverError::Limit);
-            }
-            let mut response = vec![0; response_len];
-            stream.read_exact(&mut response).await.map_err(map_io)?;
-            Ok(response)
-        },
+        ForwardPeer::Plain(peer),
     )
+    .await
+}
+
+async fn forward_tcp_for_peer(
+    stream: &mut TcpStream,
+    query: &[u8],
+    budget: Duration,
+    cancel: &mut Cancellation,
+    peer: ForwardPeer,
+) -> Result<ForwardResponse, ResolverError> {
+    forward_framed(query, budget, cancel, peer, async |outbound| {
+        let frame_len = u16::try_from(outbound.len()).map_err(|_| ResolverError::Limit)?;
+        stream.write_u16(frame_len).await.map_err(map_io)?;
+        stream.write_all(outbound).await.map_err(map_io)?;
+        let response_len = usize::from(stream.read_u16().await.map_err(map_io)?);
+        if !(HEADER_LEN..=MAX_DNS_PACKET).contains(&response_len) {
+            return Err(ResolverError::Limit);
+        }
+        let mut response = vec![0; response_len];
+        stream.read_exact(&mut response).await.map_err(map_io)?;
+        Ok(response)
+    })
     .await
 }
 
@@ -483,6 +498,21 @@ fn map_io(error: std::io::Error) -> ResolverError {
         | std::io::ErrorKind::UnexpectedEof => ResolverError::Closed,
         _ => ResolverError::Unavailable,
     }
+}
+
+pub(super) fn is_reserved_fake(address: IpAddr) -> bool {
+    let address = address.to_canonical();
+    FAKE_POOLS
+        .iter()
+        .any(|(network, length)| match (*network, address) {
+            (IpAddr::V4(base), IpAddr::V4(address)) => {
+                u32::from(address) & (u32::MAX << (32 - length)) == u32::from(base)
+            }
+            (IpAddr::V6(base), IpAddr::V6(address)) => {
+                u128::from(address) & (u128::MAX << (128 - length)) == u128::from(base)
+            }
+            _ => false,
+        })
 }
 
 #[cfg(test)]

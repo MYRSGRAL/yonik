@@ -223,8 +223,7 @@ async fn handle_tcp_authenticated(
         let still_current = || resolve_fake_ip(target.ip).as_ref() == Some(&mapping);
         if let Err(error) = connect_core(
             &mut core,
-            &mapping.name,
-            target.port,
+            CoreTcpTarget::Name(&mapping.name, target.port),
             upstream_auth,
             still_current,
         )
@@ -347,10 +346,36 @@ async fn read_tcp_target(
     Ok(Target { ip, port })
 }
 
+enum CoreTcpTarget<'a> {
+    Name(&'a DomainName, u16),
+    Literal(SocketAddr),
+}
+
+pub(crate) async fn connect_core_literal(
+    upstream: SocketAddr,
+    target: SocketAddr,
+    credentials: &SocksCredentials,
+) -> Result<TcpStream, FakeFlowError> {
+    if !upstream.ip().is_loopback() || upstream.port() == 0 || target.port() == 0 {
+        return Err(FakeFlowError::InvalidConfiguration);
+    }
+    let mut stream = TcpStream::connect(upstream).await?;
+    if stream.peer_addr()? != upstream || !stream.local_addr()?.ip().is_loopback() {
+        return Err(FakeFlowError::NonLoopback);
+    }
+    connect_core(
+        &mut stream,
+        CoreTcpTarget::Literal(target),
+        credentials,
+        || true,
+    )
+    .await?;
+    Ok(stream)
+}
+
 async fn connect_core(
     stream: &mut TcpStream,
-    domain: &DomainName,
-    port: u16,
+    target: CoreTcpTarget<'_>,
     credentials: &SocksCredentials,
     mut still_current: impl FnMut() -> bool,
 ) -> Result<(), FakeFlowError> {
@@ -375,11 +400,23 @@ async fn connect_core(
     if auth_reply != [AUTH_VERSION, 0] {
         return Err(FakeFlowError::UpstreamRejected);
     }
-    let name = domain.as_str().as_bytes();
-    let mut request = Vec::with_capacity(7 + name.len());
-    request.extend_from_slice(&[SOCKS_VERSION, 1, 0, 3, name.len() as u8]);
-    request.extend_from_slice(name);
-    request.extend_from_slice(&port.to_be_bytes());
+    let request = match target {
+        CoreTcpTarget::Name(domain, port) => {
+            let name = domain.as_str().as_bytes();
+            let mut request = Vec::with_capacity(7 + name.len());
+            request.extend_from_slice(&[SOCKS_VERSION, 1, 0, 3, name.len() as u8]);
+            request.extend_from_slice(name);
+            request.extend_from_slice(&port.to_be_bytes());
+            request
+        }
+        CoreTcpTarget::Literal(address) => {
+            let mut request = Vec::with_capacity(if address.is_ipv4() { 10 } else { 22 });
+            request.extend_from_slice(&[SOCKS_VERSION, 1, 0]);
+            encode_ip(&mut request, address.ip());
+            request.extend_from_slice(&address.port().to_be_bytes());
+            request
+        }
+    };
     let mut pending = request.as_slice();
     while !pending.is_empty() {
         stream.writable().await?;
