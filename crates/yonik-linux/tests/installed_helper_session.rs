@@ -1020,6 +1020,56 @@ async fn production_helper_ip_only_policy_uses_the_literal_address() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая VM с эхо-серверами за шлюзом и в connected-сети"]
+async fn production_helper_ip_only_direct_is_bound_to_the_gateway() -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+        &json!({"version":1,"default_action":"proxy","lan":[],"private_networks":[],"private_domains":[],
+            "user_rules":[{"id":1,"enabled":true,"action":"direct","ip_cidr":["192.0.2.192/27","2001:db8:7471::/64"],
+                "domain":[],"domain_suffix":[],"executable_paths":[]}],"preset_rules":[]})
+        .to_string(),
+    )?;
+    let (_owner, cancel) = yonik_linux::Cancellation::new();
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(25);
+    let mut client = SystemClient::on_connection(
+        zbus::Connection::system().await?,
+        deadline(),
+        cancel.clone(),
+    )
+    .await?;
+    check_tun_traffic_to(connected_direct_fixture()?).await?;
+    for engine in [Engine::Xray, Engine::SingBox] {
+        let prepared = client
+            .prepare_profile_policy(&server, engine, false, &policy, deadline(), cancel.clone())
+            .await?;
+        require(
+            client.apply(prepared, deadline(), cancel.clone()).await? == State::TunnelStarting,
+            "Direct не запустил TUN",
+        )?;
+        check_literal_direct_traffic().await?;
+        require(
+            client.stop(deadline(), cancel.clone()).await? == State::NoManagedPolicy,
+            "Stop не очистил Direct",
+        )?;
+        check_tun_traffic_to(connected_direct_fixture()?).await?;
+        require(
+            resolver_file_state()? == resolver_before,
+            "Изменился resolv.conf",
+        )?;
+        eprintln!("{engine:?}: Direct через шлюз и блокировка доступа без шлюза прошли");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная Debian VM с отдельным физическим echo и блокировкой этих адресов на прокси"]
 async fn production_helper_scoped_fake_dns_literal_direct() -> Result {
     installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralDirect, false).await

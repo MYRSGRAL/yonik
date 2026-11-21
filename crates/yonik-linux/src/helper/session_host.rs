@@ -388,6 +388,7 @@ pub(super) struct SessionArtifact {
     peer: Option<Arc<crate::attribution::PeerProcess>>,
     memory: ByteLease,
     native_owner_stamp: Option<native_owner::NativeArtifactStamp>,
+    direct_egress: Vec<BoundDirect>,
     fake_dns: Option<Arc<PreparedFakeDns>>,
     resolver_tls: Option<ResolvedTlsEgress>,
     bootstrap: Option<BootstrapAddress>,
@@ -1211,7 +1212,7 @@ fn checked_route(route: &KernelRoute, owner: Ownership, table: u32) -> Result<u3
         .ok_or(ServiceError::Unsupported)
 }
 
-fn bound_fake_literal_direct(
+fn bound_literal_direct(
     policy: &yonik_engine::policy_wire::SystemPolicy,
     baseline: &LinuxTopology,
     worker_uid: u32,
@@ -1680,6 +1681,7 @@ impl Backend {
             peer: Some(peer),
             memory,
             native_owner_stamp: Some(self.native_owner.reserve()?),
+            direct_egress: Vec::new(),
             fake_dns: None,
             resolver_tls: None,
             bootstrap: None,
@@ -1938,9 +1940,9 @@ impl Backend {
             SessionNetworkPlan::reserve_for_engine(owner, &baseline, request.engine)
         }
         .map_err(unavailable)?;
-        let direct_egress = match (fake_dns_requested, &policy) {
-            (true, Some(policy)) => {
-                bound_fake_literal_direct(policy, &baseline, worker_uid, plan.socket_mark())?
+        let direct_egress = match &policy {
+            Some(policy) if fake_dns_requested || (!attribution_required && bundle.is_none()) => {
+                bound_literal_direct(policy, &baseline, worker_uid, plan.socket_mark())?
             }
             _ => Vec::new(),
         };
@@ -1959,7 +1961,6 @@ impl Backend {
                         fake_suffixes: domains,
                         saved_private: saved,
                     },
-                    direct_egress,
                     request.fake_dns_policy_resolver,
                     policy.as_ref().filter(|_| resolved_cidrs).cloned(),
                     cancel,
@@ -2300,6 +2301,7 @@ impl Backend {
             attribution_required,
             peer: request.peer,
             memory,
+            direct_egress,
             fake_dns,
             resolver_tls,
             bootstrap,
@@ -2470,12 +2472,12 @@ impl Backend {
             dns,
         )
         .and_then(|policy| policy.with_link_control(controls))
+        .and_then(|policy| policy.with_bound_direct(artifact.direct_egress.clone()))
         .map_err(unavailable)?;
         let mut dhcp_interface = None;
         if let Some(fake_dns) = &artifact.fake_dns {
             policy = policy
                 .with_isolated_loopback(fake_dns.loopback, artifact.worker_uid)
-                .and_then(|policy| policy.with_bound_direct(fake_dns.direct_egress.clone()))
                 .and_then(|policy| policy.with_dhcp_renewal_anchor(true))
                 .and_then(|policy| {
                     policy.with_resolver_tls(

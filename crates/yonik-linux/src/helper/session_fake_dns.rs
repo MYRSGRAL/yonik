@@ -13,7 +13,7 @@ use crate::{
     },
     managed_network::{
         Journal,
-        firewall::{BoundDirect, IpPrefix, ResolverRelay},
+        firewall::{IpPrefix, ResolverRelay},
     },
     network::{LinuxTopology, reread_changed_route},
     resolver::{
@@ -249,7 +249,6 @@ fn make_leases(started_at: Instant, reuse_delay: Duration) -> Result<FakeDnsLeas
 pub(super) struct PreparedFakeDns {
     pub config: SystemFakeDnsBridge,
     pub loopback: Ipv4Addr,
-    pub direct_egress: Vec<BoundDirect>,
     pub protected_prefixes: WireGuardPrefixes,
     marker: IpAddr,
     suffixes: Vec<String>,
@@ -734,7 +733,6 @@ impl PreparedFakeDns {
         plan: &SessionNetworkPlan,
         topology: &LinuxTopology,
         zones: RequestedDnsZones,
-        direct_egress: Vec<BoundDirect>,
         policy_resolver: Option<SocketAddr>,
         cidr_policy: Option<Arc<yonik_engine::policy_wire::SystemPolicy>>,
         cancel: &mut Cancellation,
@@ -972,7 +970,6 @@ impl PreparedFakeDns {
         Ok(Self {
             config,
             loopback,
-            direct_egress,
             marker,
             suffixes: zones.fake_suffixes,
             private_dns_zones,
