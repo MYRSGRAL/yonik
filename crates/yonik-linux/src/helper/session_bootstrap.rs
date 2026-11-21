@@ -15,7 +15,7 @@ use crate::{
             ForwardResponse, PolicyRrset, boottime_now, dns_question, forward_tcp, forward_udp,
             is_reserved_fake,
         },
-        inspect_host_resolv_conf, read_system_resolv_conf,
+        inspect_host_resolv_conf, read_managed_resolv_conf, read_system_resolv_conf,
         resolve1::{Resolve1TunSnapshot, read_bootstrap_resolve1_snapshot},
     },
 };
@@ -39,7 +39,7 @@ pub(super) struct BootstrapAddress {
 
 #[derive(PartialEq, Eq)]
 enum ResolverSource {
-    Plain(PlainResolverSnapshot),
+    Plain(ResolvConfLayout, PlainResolverSnapshot),
     Resolved(ResolvConfLayout, Box<Resolve1TunSnapshot>),
 }
 
@@ -76,7 +76,7 @@ impl BootstrapAddress {
             result = tokio::time::timeout(DEADLINE, async {
                 let source = diagnostic_result("bootstrap_source", read_source(cancel).await)?;
                 let (answers, routes) = match &source {
-                    ResolverSource::Plain(plain) => {
+                    ResolverSource::Plain(_, plain) => {
                         let &address = plain.nameservers().first().ok_or(ServiceError::Unsupported)?;
                         if !valid_proxy_ip(address) || is_reserved_fake(address) {
                             return Err(ServiceError::Unsupported);
@@ -147,17 +147,22 @@ fn permits_name(name: &DomainName, private: &BTreeSet<String>) -> bool {
 async fn read_source(cancel: &mut Cancellation) -> Result<ResolverSource, ServiceError> {
     let (layout, plain) = tokio::task::spawn_blocking(|| {
         let layout = inspect_host_resolv_conf();
-        let plain = (layout == ResolvConfLayout::RegularFile)
-            .then(read_system_resolv_conf)
-            .transpose()
-            .map_err(resolver_error)?;
+        let plain = match layout {
+            ResolvConfLayout::RegularFile => Some(read_system_resolv_conf()),
+            ResolvConfLayout::NetworkManager | ResolvConfLayout::Resolvconf => {
+                Some(read_managed_resolv_conf(layout))
+            }
+            _ => None,
+        }
+        .transpose()
+        .map_err(resolver_error)?;
         Ok::<_, ServiceError>((layout, plain))
     })
     .await
     .map_err(unavailable)??;
     if let Some(plain) = plain {
         if !plain.is_resolved_stub() {
-            return Ok(ResolverSource::Plain(plain));
+            return Ok(ResolverSource::Plain(layout, plain));
         }
     } else if !matches!(
         layout,
