@@ -390,6 +390,7 @@ async fn production_helper_named_proxy_checks_cname_ttl_at_apply() -> Result {
     let usable = profile("edge-bootstrap.test")?;
     let domains = ["example.test".to_owned()];
     let policy = scoped_fake_dns_proxy_policy()?;
+    let mut previous_fake = None;
     for engine in [Engine::Xray, Engine::SingBox] {
         let prepared = client
             .prepare_fake_dns_policy_profile(
@@ -420,7 +421,21 @@ async fn production_helper_named_proxy_checks_cname_ttl_at_apply() -> Result {
                 .await?;
         let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
         let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+        eprintln!("{engine:?}: NSS вернул {v4} и {v6}");
+        if let Some((old_v4, old_v6)) = previous_fake {
+            require(
+                v4 != old_v4 && v6 != old_v6,
+                "NSS вернул Fake-IP предыдущего движка",
+            )?;
+            let (blocked_v4, blocked_v6) = tokio::join!(
+                check_fake_flow_blocked((old_v4, 40000).into()),
+                check_fake_flow_blocked((old_v6, 40000).into()),
+            );
+            blocked_v4?;
+            blocked_v6?;
+        }
         check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+        previous_fake = Some((v4, v6));
         require(
             client.stop(deadline(), cancel.clone()).await? == State::NoManagedPolicy,
             "Stop не очистил состояние",

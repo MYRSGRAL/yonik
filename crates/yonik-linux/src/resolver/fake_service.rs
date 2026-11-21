@@ -22,7 +22,7 @@ use tokio::{
 use yonik_engine::SystemFakeDnsBridge;
 use yonik_engine::fake_dns::{
     DnsEpoch, FakeDnsQuestion, FakeIpLeaseTable, FakeMapping, MAX_DNS_PACKET,
-    SYSTEM_FAKE_DNS_PROBE_NAME, answer_approved,
+    SYSTEM_FAKE_DNS_PROBE_NAME, answer_approved_with_ttl_limit,
 };
 use yonik_engine::resource_bundle::{
     AnswerSet, Cidr, Destination, DestinationFlow, Evaluation, EvaluationContext, Policy,
@@ -311,15 +311,25 @@ impl FakeDnsLeases {
     }
 
     pub(crate) fn synthesize(&self, question: &FakeDnsQuestion, epoch: DnsEpoch) -> Vec<u8> {
+        self.synthesize_with_ttl_limit(question, epoch, u32::MAX)
+    }
+
+    pub(crate) fn synthesize_with_ttl_limit(
+        &self,
+        question: &FakeDnsQuestion,
+        epoch: DnsEpoch,
+        max_answer_ttl_seconds: u32,
+    ) -> Vec<u8> {
         if !self.quarantine_remaining().is_zero() {
             return question.unavailable();
         }
         let answer = self.table.lock().ok().and_then(|mut table| {
-            answer_approved(
+            answer_approved_with_ttl_limit(
                 question,
                 &mut table,
                 epoch,
                 MAX_FAKE_TTL.as_secs() as u32,
+                max_answer_ttl_seconds,
                 || self.tick(),
             )
             .ok()

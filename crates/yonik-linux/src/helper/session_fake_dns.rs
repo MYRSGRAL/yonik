@@ -1128,6 +1128,13 @@ impl PreparedFakeDns {
             let approved = |query: &FakeDnsQuestion| {
                 task_horizon.can_issue() && for_task.approves(query.name().as_str())
             };
+            // При файловой схеме nss-resolve тоже может обращаться к этому
+            // релею. Его кэш живёт дольше TUN, поэтому Fake-IP выдаём без кэширования.
+            let max_answer_ttl_seconds = if matches!(for_task.source, ResolverSource::Literal(..)) {
+                0
+            } else {
+                u32::MAX
+            };
             let synthesize = |packet: &[u8], binding: ResolverBinding| {
                 let name = forward_query_name(packet)?;
                 if for_task.is_private_dns_name(&name) {
@@ -1158,7 +1165,7 @@ impl PreparedFakeDns {
                 Ok(Some(if !query.is_supported() {
                     query.refused()
                 } else if task_horizon.can_issue() {
-                    task_leases.synthesize(&query, epoch)
+                    task_leases.synthesize_with_ttl_limit(&query, epoch, max_answer_ttl_seconds)
                 } else {
                     query.unavailable()
                 }))

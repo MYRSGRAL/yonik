@@ -207,6 +207,18 @@ pub fn answer_approved(
     leases: &mut FakeIpLeaseTable,
     epoch: DnsEpoch,
     ttl_seconds: u32,
+    now_ns: impl FnMut() -> u64,
+) -> Result<Vec<u8>, FakeDnsError> {
+    answer_approved_with_ttl_limit(question, leases, epoch, ttl_seconds, u32::MAX, now_ns)
+}
+
+/// Ограничивает TTL в DNS-ответе, сохраняя полный срок аренды Fake-IP.
+pub fn answer_approved_with_ttl_limit(
+    question: &FakeDnsQuestion,
+    leases: &mut FakeIpLeaseTable,
+    epoch: DnsEpoch,
+    lease_ttl_seconds: u32,
+    max_answer_ttl_seconds: u32,
     mut now_ns: impl FnMut() -> u64,
 ) -> Result<Vec<u8>, FakeDnsError> {
     let family = match question.kind {
@@ -215,7 +227,7 @@ pub fn answer_approved(
         QuestionKind::Unsupported(_) => return Err(FakeDnsError::Unsupported),
     };
     let request_ns = now_ns();
-    let ttl_ns = u64::from(ttl_seconds)
+    let ttl_ns = u64::from(lease_ttl_seconds)
         .checked_mul(1_000_000_000)
         .ok_or(FakeDnsError::Malformed)?;
     let grant = match leases.issue(question.name.clone(), family, epoch, request_ns, ttl_ns) {
@@ -232,8 +244,8 @@ pub fn answer_approved(
         .checked_sub(publish_ns)
         .filter(|remaining| *remaining > 0)
         .ok_or(FakeDnsError::LeaseExpired)?;
-    let ttl =
-        u32::try_from((remaining / 1_000_000_000).min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+    let ttl = u32::try_from((remaining / 1_000_000_000).min(u64::from(max_answer_ttl_seconds)))
+        .unwrap_or(max_answer_ttl_seconds);
     let address = grant.address;
     let mut response = question.base_response(0);
     response.extend_from_slice(&[0xc0, 0x0c]);
@@ -409,6 +421,24 @@ mod tests {
         assert_eq!(
             &response[response.len() - 11..],
             &[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn zero_answer_ttl_preserves_the_lease() {
+        let mut table = leases();
+        let question = FakeDnsQuestion::parse(&query(TYPE_A, &["a", "example"])).expect("question");
+        let response = answer_approved_with_ttl_limit(&question, &mut table, epoch(), 30, 0, || 0)
+            .expect("answer");
+        assert_eq!(read_u32(&response, response.len() - 10), Ok(0));
+        let address = "198.18.0.1".parse().expect("address");
+        assert_eq!(
+            table
+                .lookup(address, epoch(), 1_000_000_000)
+                .expect("lookup")
+                .expect("lease")
+                .expires_at,
+            30_000_000_000
         );
     }
 
