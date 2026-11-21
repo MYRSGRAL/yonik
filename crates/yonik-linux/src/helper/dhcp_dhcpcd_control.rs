@@ -1,7 +1,10 @@
 use std::{
-    io,
+    fs, io,
     net::Ipv4Addr,
-    os::fd::OwnedFd,
+    os::{
+        fd::OwnedFd,
+        unix::fs::{FileTypeExt, MetadataExt},
+    },
     str::{FromStr, from_utf8},
 };
 
@@ -19,6 +22,13 @@ const MAX_INTERFACE_NAME: usize = 15;
 const MAX_RECORD_BYTES: usize = 16_384;
 const MAX_LEASE_SECONDS: u32 = 365 * 24 * 60 * 60;
 static CONTROL: Mutex<()> = Mutex::const_new(());
+const PRIVATE_SOCKET: &str = "/run/dhcpcd/sock";
+
+#[derive(Clone, Copy)]
+enum ReplyFormat {
+    Legacy,
+    StatusPrefixed,
+}
 
 #[derive(Debug)]
 pub(super) struct ControlLease {
@@ -82,17 +92,44 @@ async fn read_candidates(ifname: &str) -> Result<ControlLease, Error> {
     let dual_stack = format!("/run/dhcpcd/{ifname}.unpriv.sock");
     let mut lease = None;
     for path in ["/run/dhcpcd/unpriv.sock", &ipv4, &dual_stack] {
-        let Some(candidate) = read_candidate(path, ifname).await? else {
+        let Some(candidate) = read_candidate(path, ifname, ReplyFormat::Legacy).await? else {
             continue;
         };
         if lease.replace(candidate).is_some() {
             return Err(Error::Changed);
         }
     }
-    lease.ok_or(Error::Unavailable)
+    if let Some(lease) = lease {
+        return Ok(lease);
+    }
+    if !private_socket_is_trusted()? {
+        return Err(Error::Unavailable);
+    }
+    read_candidate(PRIVATE_SOCKET, ifname, ReplyFormat::StatusPrefixed)
+        .await?
+        .ok_or(Error::Unavailable)
 }
 
-async fn read_candidate(path: &str, ifname: &str) -> Result<Option<ControlLease>, Error> {
+fn private_socket_is_trusted() -> Result<bool, Error> {
+    let metadata = |path| fs::symlink_metadata(path).map_err(|_| Error::Unavailable);
+    for parent in ["/run", "/run/dhcpcd"] {
+        let dir = metadata(parent)?;
+        if !dir.is_dir() || dir.uid() != 0 || dir.mode() & 0o022 != 0 {
+            return Ok(false);
+        }
+    }
+    let socket = metadata(PRIVATE_SOCKET)?;
+    Ok(socket.file_type().is_socket()
+        && socket.uid() == 0
+        && socket.gid() == 0
+        && socket.mode() & 0o777 == 0o600)
+}
+
+async fn read_candidate(
+    path: &str,
+    ifname: &str,
+    format: ReplyFormat,
+) -> Result<Option<ControlLease>, Error> {
     let mut stream = match UnixStream::connect(path).await {
         Ok(stream) => stream,
         Err(error)
@@ -128,7 +165,7 @@ async fn read_candidate(path: &str, ifname: &str) -> Result<Option<ControlLease>
     if sent != request.len() {
         return Err(Error::Truncated);
     }
-    let reply = read_reply(&mut stream, ifname).await?;
+    let reply = read_formatted_reply(&mut stream, ifname, format).await?;
     stream.shutdown().await.map_err(read_error)?;
     // Дожидаемся обработки EOF на стороне службы до запроса следующего клиента.
     if stream.read(&mut [0]).await.map_err(read_error)? != 0 {
@@ -142,6 +179,22 @@ async fn read_candidate(path: &str, ifname: &str) -> Result<Option<ControlLease>
         prefix: lease.prefix,
         duration: lease.duration,
     }))
+}
+
+async fn read_formatted_reply(
+    mut stream: impl AsyncRead + Unpin,
+    ifname: &str,
+    format: ReplyFormat,
+) -> Result<Option<LeaseData>, Error> {
+    if matches!(format, ReplyFormat::StatusPrefixed) {
+        // Новый управляющий протокол начинает ответ с native C int errno.
+        let mut status = [0; size_of::<i32>()];
+        stream.read_exact(&mut status).await.map_err(read_error)?;
+        if i32::from_ne_bytes(status) != 0 {
+            return Err(Error::Unavailable);
+        }
+    }
+    read_reply(stream, ifname).await
 }
 
 async fn read_reply(
@@ -345,6 +398,30 @@ mod tests {
         let (result, write) = tokio::join!(read_reply(reader, "eth0"), writer.write_all(&response));
         assert_eq!(result, Ok(Some(expected())));
         assert!(write.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reads_errno_before_the_modern_lease_frames() {
+        let response = [
+            0_i32.to_ne_bytes().as_slice(),
+            &1_usize.to_ne_bytes(),
+            &RECORD.len().to_ne_bytes(),
+            RECORD,
+        ]
+        .concat();
+        assert_eq!(
+            read_formatted_reply(response.as_slice(), "eth0", ReplyFormat::StatusPrefixed).await,
+            Ok(Some(expected()))
+        );
+        for (response, error) in [
+            (b"".as_slice(), Error::Truncated),
+            (1_i32.to_ne_bytes().as_slice(), Error::Unavailable),
+        ] {
+            assert_eq!(
+                read_formatted_reply(response, "eth0", ReplyFormat::StatusPrefixed).await,
+                Err(error)
+            );
+        }
     }
 
     #[tokio::test]
