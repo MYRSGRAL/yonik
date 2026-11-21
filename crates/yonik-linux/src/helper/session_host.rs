@@ -1210,56 +1210,6 @@ fn checked_route(route: &KernelRoute, owner: Ownership, table: u32) -> Result<u3
         .ok_or(ServiceError::Unsupported)
 }
 
-fn fake_wireguard_guards(baseline: &LinuxTopology) -> Result<Vec<PrivateRoute>, ServiceError> {
-    let wireguard: BTreeSet<_> = baseline
-        .links
-        .iter()
-        .filter(|link| link.kind.as_deref() == Some(b"wireguard"))
-        .map(|link| link.index)
-        .collect();
-    if wireguard.is_empty() {
-        return Ok(Vec::new());
-    }
-    let is_wireguard = |index: u32| wireguard.contains(&index);
-    let nexthops: BTreeSet<_> = baseline
-        .nexthops
-        .iter()
-        .filter(|hop| hop.output_interface.is_some_and(is_wireguard))
-        .map(|hop| hop.id)
-        .collect();
-    let groups: BTreeSet<_> = baseline
-        .nexthops
-        .iter()
-        .filter(|hop| hop.group.iter().any(|member| nexthops.contains(&member.id)))
-        .map(|hop| hop.id)
-        .collect();
-    // Перехват default через TUN не должен отправлять явные сети WireGuard в
-    // прокси. До появления подтверждённого маршрута применяем только drop.
-    baseline
-        .routes
-        .iter()
-        .filter(|route| {
-            route.destination.length > 0
-                && RouteKind::from(route.kind) == RouteKind::Unicast
-                && (route.output_interface.is_some_and(is_wireguard)
-                    || route
-                        .multipath
-                        .iter()
-                        .any(|hop| is_wireguard(hop.output_interface))
-                    || route
-                        .nexthop_id
-                        .is_some_and(|id| nexthops.contains(&id) || groups.contains(&id)))
-        })
-        .map(|route| (route.destination.address, route.destination.length))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|(address, length)| {
-            let prefix = IpPrefix::new(address, length).map_err(unavailable)?;
-            PrivateRoute::new(prefix, None).map_err(unavailable)
-        })
-        .collect()
-}
-
 fn bound_fake_literal_direct(
     policy: &yonik_engine::policy_wire::SystemPolicy,
     baseline: &LinuxTopology,
@@ -2376,11 +2326,13 @@ impl Backend {
         output: Option<crate::output_transport::ValidatedWriters>,
         cancel: &mut Cancellation,
     ) -> Result<ProtectionState, ServiceError> {
-        let private_routes = if artifact.fake_dns.is_some() {
-            fake_wireguard_guards(&artifact.baseline)?
-        } else {
-            Vec::new()
-        };
+        let private_routes = artifact
+            .fake_dns
+            .iter()
+            .flat_map(|dns| dns.protected_prefixes.iter().copied())
+            .map(|prefix| PrivateRoute::new(prefix, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(unavailable)?;
         self.policy(owner, compile_protection(&artifact.baseline, false)?)
             .await?;
         cancel.check().map_err(|_| ServiceError::Cancelled)?;

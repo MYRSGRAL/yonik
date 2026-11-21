@@ -87,12 +87,20 @@ pub enum FakeFlowError {
     Timeout,
     UnknownFakeIp,
     PolicyDenied,
+    DnsPolicyAmbiguous,
     DnsPolicyUnresolved,
     Protocol,
     UpstreamRejected,
     UdpPeerRejected,
     UdpMappingLimit,
     Io(io::Error),
+}
+
+impl FakeFlowError {
+    pub(crate) const DNS_POLICY_AMBIGUOUS: &str =
+        "DNS_POLICY_AMBIGUOUS: ответ DNS политики содержит публичные и защищённые адреса";
+    pub(crate) const DNS_POLICY_UNRESOLVED: &str =
+        "DNS_POLICY_UNRESOLVED: обязательное DNS-разрешение не подтверждено";
 }
 
 impl std::fmt::Display for FakeFlowError {
@@ -104,9 +112,8 @@ impl std::fmt::Display for FakeFlowError {
             Self::Timeout => "Превышен timeout SOCKS handshake",
             Self::UnknownFakeIp => "Fake-IP не найден в активном реестре",
             Self::PolicyDenied => "Политика Fake DNS отклонила назначение",
-            Self::DnsPolicyUnresolved => {
-                "DNS_POLICY_UNRESOLVED: обязательное DNS-разрешение не подтверждено"
-            }
+            Self::DnsPolicyAmbiguous => Self::DNS_POLICY_AMBIGUOUS,
+            Self::DnsPolicyUnresolved => Self::DNS_POLICY_UNRESOLVED,
             Self::Protocol => "Некорректный SOCKS протокол",
             Self::UpstreamRejected => "Локальное ядро отклонило SOCKS соединение",
             Self::UdpPeerRejected => "UDP пакет пришёл не от клиента этой SOCKS ассоциации",

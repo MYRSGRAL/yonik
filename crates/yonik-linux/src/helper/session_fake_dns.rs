@@ -6,12 +6,12 @@ use super::{
     systemd_network_service::Daemon,
 };
 use crate::{
-    Cancellation, NetworkReadError, RouteQuery, TransportProtocol,
+    Cancellation, NetworkReadError, RouteKind, RouteQuery, TransportProtocol,
     fake_flow::WorkerOnlyLoopbackIsolation,
     fake_service::{FakeDnsBridgeListeners, FakeDnsLeases, MAX_FAKE_TTL},
     managed_network::{
         Journal,
-        firewall::{BoundDirect, ResolverRelay},
+        firewall::{BoundDirect, IpPrefix, ResolverRelay},
     },
     network::{LinuxTopology, reread_changed_route},
     resolver::{
@@ -248,6 +248,7 @@ pub(super) struct PreparedFakeDns {
     pub config: SystemFakeDnsBridge,
     pub loopback: Ipv4Addr,
     pub direct_egress: Vec<BoundDirect>,
+    pub protected_prefixes: Vec<IpPrefix>,
     marker: IpAddr,
     suffixes: Vec<String>,
     private_dns_zones: BTreeSet<String>,
@@ -656,6 +657,54 @@ fn contains_private_dns_zone(zones: &BTreeSet<String>, name: &str) -> bool {
             .any(|(index, _)| zones.contains(&name[index + 1..]))
 }
 
+fn fake_wireguard_prefixes(baseline: &LinuxTopology) -> Result<Vec<IpPrefix>, ServiceError> {
+    let wireguard: BTreeSet<_> = baseline
+        .links
+        .iter()
+        .filter(|link| link.kind.as_deref() == Some(b"wireguard"))
+        .map(|link| link.index)
+        .collect();
+    if wireguard.is_empty() {
+        return Ok(Vec::new());
+    }
+    let is_wireguard = |index: u32| wireguard.contains(&index);
+    let nexthops: BTreeSet<_> = baseline
+        .nexthops
+        .iter()
+        .filter(|hop| hop.output_interface.is_some_and(is_wireguard))
+        .map(|hop| hop.id)
+        .collect();
+    let groups: BTreeSet<_> = baseline
+        .nexthops
+        .iter()
+        .filter(|hop| hop.group.iter().any(|member| nexthops.contains(&member.id)))
+        .map(|hop| hop.id)
+        .collect();
+    // Те же защищённые префиксы проверяют nftables и ответы DNS политики.
+    baseline
+        .routes
+        .iter()
+        .filter(|route| {
+            route.destination.length > 0
+                && RouteKind::from(route.kind) == RouteKind::Unicast
+                && (route.output_interface.is_some_and(is_wireguard)
+                    || route
+                        .multipath
+                        .iter()
+                        .any(|hop| is_wireguard(hop.output_interface))
+                    || route
+                        .nexthop_id
+                        .is_some_and(|id| nexthops.contains(&id) || groups.contains(&id)))
+        })
+        .map(|route| (route.destination.address, route.destination.length))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|(address, length)| {
+            IpPrefix::new(address, length).map_err(|_| ServiceError::Unavailable)
+        })
+        .collect()
+}
+
 impl PreparedFakeDns {
     pub fn private_dns_zones(&self) -> &BTreeSet<String> {
         &self.private_dns_zones
@@ -911,6 +960,7 @@ impl PreparedFakeDns {
             source,
             resolved,
             cidr_policy,
+            protected_prefixes: fake_wireguard_prefixes(topology)?,
             tls_peers,
             resolver_relay,
             plain,
@@ -1112,7 +1162,10 @@ impl PreparedFakeDns {
                 &task_leases,
                 epoch,
                 &approved,
-                for_task.cidr_policy.as_ref().map(|policy| policy.policy()),
+                for_task
+                    .cidr_policy
+                    .as_ref()
+                    .map(|policy| (policy.policy(), for_task.protected_prefixes.as_slice())),
                 cancel,
             );
             tokio::pin!(serving);

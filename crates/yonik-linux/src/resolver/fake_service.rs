@@ -35,6 +35,7 @@ use crate::{
         handle_flow_with_policy,
     },
     forward::{PolicyProxyResolver, boottime_now},
+    managed_network::firewall::IpPrefix,
     resolver::ResolverError,
 };
 use std::sync::Arc;
@@ -46,27 +47,52 @@ const TCP_IDLE: Duration = Duration::from_secs(5);
 pub const MAX_FAKE_TTL: Duration = Duration::from_secs(30);
 const POLICY_DNS_BUDGET: Duration = Duration::from_secs(3);
 
-fn report_dns_policy_unresolved() {
-    static REPORTER: OnceLock<Option<SyncSender<()>>> = OnceLock::new();
+fn report_dns_policy_error(message: &'static str) {
+    static REPORTER: OnceLock<Option<SyncSender<&'static str>>> = OnceLock::new();
     // stderr может задержаться в сборщике журнала. Один поток пишет,
     // а DNS и TUN продолжают работать даже при заполненной очереди.
     if let Some(sender) = REPORTER.get_or_init(|| {
-        let (sender, receiver) = sync_channel(1);
+        let (sender, receiver) = sync_channel(2);
         std::thread::Builder::new()
             .name("yonik-dns-log".into())
             .spawn(move || {
-                for () in receiver {
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "{}",
-                        FakeFlowError::DnsPolicyUnresolved
-                    );
+                for message in receiver {
+                    let _ = writeln!(io::stderr().lock(), "{message}");
                 }
             })
             .ok()
             .map(|_| sender)
     }) {
-        let _ = sender.try_send(());
+        let _ = sender.try_send(message);
+    }
+}
+
+fn check_private_policy_answer(
+    addresses: &[IpAddr],
+    protected_prefixes: &[IpPrefix],
+) -> Result<(), FakeFlowError> {
+    if protected_prefixes.is_empty() {
+        return Ok(());
+    }
+    let mut public = false;
+    let mut private = false;
+    for address in addresses {
+        if protected_prefixes
+            .iter()
+            .any(|prefix| prefix.contains(address.to_canonical()))
+        {
+            private = true;
+        } else {
+            public = true;
+        }
+        if public && private {
+            return Err(FakeFlowError::DnsPolicyAmbiguous);
+        }
+    }
+    if private {
+        Err(FakeFlowError::PolicyDenied)
+    } else {
+        Ok(())
     }
 }
 
@@ -75,18 +101,31 @@ pub(crate) struct CidrFlowPolicy<'a> {
     resolver: Arc<PolicyProxyResolver>,
     leases: &'a FakeDnsLeases,
     pools: Vec<Cidr>,
+    protected_prefixes: &'a [IpPrefix],
     reported_unresolved: AtomicBool,
+    reported_ambiguous: AtomicBool,
     pub(crate) direct_auth: SocksCredentials,
     pub(crate) udp_slots: tokio::sync::Semaphore,
 }
 
 impl CidrFlowPolicy<'_> {
-    fn dns_policy_unresolved(&self) -> FakeFlowError {
+    fn dns_policy_error(&self, error: FakeFlowError) -> FakeFlowError {
+        let (reported, message) = match error {
+            FakeFlowError::DnsPolicyUnresolved => (
+                &self.reported_unresolved,
+                FakeFlowError::DNS_POLICY_UNRESOLVED,
+            ),
+            FakeFlowError::DnsPolicyAmbiguous => (
+                &self.reported_ambiguous,
+                FakeFlowError::DNS_POLICY_AMBIGUOUS,
+            ),
+            _ => return error,
+        };
         // Один безопасный диагноз за сессию, даже при потоке UDP-отказов.
-        if !self.reported_unresolved.swap(true, Ordering::Relaxed) {
-            report_dns_policy_unresolved();
+        if !reported.swap(true, Ordering::Relaxed) {
+            report_dns_policy_error(message);
         }
-        FakeFlowError::DnsPolicyUnresolved
+        error
     }
 
     pub(crate) async fn select(
@@ -114,29 +153,52 @@ impl CidrFlowPolicy<'_> {
                 },
             )
         };
-        match evaluate(Resolution::Missing) {
+        let guarded_proxy = match evaluate(Resolution::Missing) {
             Evaluation::Decided {
                 decision,
                 selected_address: None,
                 ..
             } if decision.action == Route::Proxy => {
-                return Ok(FlowTarget::Name);
+                if self.protected_prefixes.is_empty() {
+                    return Ok(FlowTarget::Name);
+                }
+                // Передача имени движку позволила бы заново разрешить его
+                // за пределами проверки защищённых префиксов.
+                true
             }
-            Evaluation::NeedResolution(ResolverPath::Policy) => {}
+            Evaluation::NeedResolution(ResolverPath::Policy) => false,
             _ => return Err(FakeFlowError::PolicyDenied),
-        }
+        };
         let answer = self
             .resolver
             .lookup(&mapping.name, POLICY_DNS_BUDGET, &mut cancel)
             .await
             .map_err(|error| match error {
                 ResolverError::Cancelled => FakeFlowError::Cancelled,
-                _ => self.dns_policy_unresolved(),
+                _ => self.dns_policy_error(FakeFlowError::DnsPolicyUnresolved),
             })?;
         if self.leases.lookup(mapping.address, mapping.epoch).as_ref() != Some(mapping) {
             return Err(FakeFlowError::UnknownFakeIp);
         }
         let valid_until = answer.boot_valid_until();
+        if boottime_now().is_none_or(|now| now >= valid_until) {
+            return Err(self.dns_policy_error(FakeFlowError::DnsPolicyUnresolved));
+        }
+        check_private_policy_answer(answer.addresses(), self.protected_prefixes)
+            .map_err(|error| self.dns_policy_error(error))?;
+        if guarded_proxy {
+            let address = answer
+                .addresses()
+                .iter()
+                .map(|address| address.to_canonical())
+                .min()
+                .ok_or_else(|| self.dns_policy_error(FakeFlowError::DnsPolicyUnresolved))?;
+            return Ok(FlowTarget::Literal {
+                address,
+                direct: false,
+                valid_until,
+            });
+        }
         let expires_at =
             u64::try_from(valid_until.as_nanos()).map_err(|_| FakeFlowError::PolicyDenied)?;
         match evaluate(Resolution::Answer(AnswerSet {
@@ -159,7 +221,7 @@ impl CidrFlowPolicy<'_> {
             }
             Evaluation::NeedResolution(ResolverPath::Policy)
             | Evaluation::Rejected(PolicyFault::DnsPolicyUnresolved) => {
-                Err(self.dns_policy_unresolved())
+                Err(self.dns_policy_error(FakeFlowError::DnsPolicyUnresolved))
             }
             _ => Err(FakeFlowError::PolicyDenied),
         }
@@ -300,7 +362,7 @@ impl FakeDnsBridgeListeners {
         leases: &FakeDnsLeases,
         epoch: DnsEpoch,
         approved: &(impl Fn(&FakeDnsQuestion) -> bool + Sync),
-        policy: Option<&Policy>,
+        policy: Option<(&Policy, &[IpPrefix])>,
         cancel: Cancellation,
     ) -> io::Result<()> {
         let expected = bridge.helper_endpoints().map(SocketAddr::V4);
@@ -317,7 +379,7 @@ impl FakeDnsBridgeListeners {
         let upstream_auth =
             SocksCredentials::new(sent.username(), sent.password()).map_err(io::Error::other)?;
         let policy = policy
-            .map(|policy| -> io::Result<_> {
+            .map(|(policy, protected_prefixes)| -> io::Result<_> {
                 let (endpoint, account) = bridge
                     .policy_resolver()
                     .ok_or(io::ErrorKind::InvalidInput)?;
@@ -350,7 +412,9 @@ impl FakeDnsBridgeListeners {
                     resolver,
                     leases,
                     pools,
+                    protected_prefixes,
                     reported_unresolved: AtomicBool::new(false),
+                    reported_ambiguous: AtomicBool::new(false),
                     direct_auth,
                     udp_slots: tokio::sync::Semaphore::new(MAX_RESOLVED_UDP_FLOWS),
                 })
@@ -505,6 +569,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ответ_политики_не_выбирает_адрес_из_защищённой_сети() {
+        let prefixes = [
+            IpPrefix::new("10.80.0.0".parse().unwrap(), 16).unwrap(),
+            IpPrefix::new("fd80:1::".parse().unwrap(), 48).unwrap(),
+        ];
+        let public = "203.0.113.45".parse().unwrap();
+        let private_v4 = "10.80.4.1".parse().unwrap();
+        let private_v6 = "fd80:1::3".parse().unwrap();
+        let mapped = "::ffff:10.80.4.1".parse().unwrap();
+
+        assert!(check_private_policy_answer(&[public], &prefixes).is_ok());
+        assert!(check_private_policy_answer(&[public, private_v6], &[]).is_ok());
+        for private in [private_v4, private_v6, mapped] {
+            assert!(matches!(
+                check_private_policy_answer(&[private], &prefixes),
+                Err(FakeFlowError::PolicyDenied)
+            ));
+            for addresses in [[private, public], [public, private]] {
+                assert!(matches!(
+                    check_private_policy_answer(&addresses, &prefixes),
+                    Err(FakeFlowError::DnsPolicyAmbiguous)
+                ));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn старшее_доменное_proxy_правило_не_запрашивает_dns_политики() {
         use serde_json::json;
@@ -539,7 +630,9 @@ mod tests {
             .unwrap(),
             leases: &leases,
             pools: vec!["198.18.4.0/24".parse().unwrap()],
+            protected_prefixes: &[],
             reported_unresolved: AtomicBool::new(false),
+            reported_ambiguous: AtomicBool::new(false),
             direct_auth: auth(),
             udp_slots: tokio::sync::Semaphore::new(1),
         };
