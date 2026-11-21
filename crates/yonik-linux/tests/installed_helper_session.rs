@@ -964,6 +964,62 @@ async fn production_helper_scoped_fake_dns_literal_cidr_control() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая VM с установленным helper и эхо-сервером за VLESS"]
+async fn production_helper_ip_only_policy_uses_the_literal_address() -> Result {
+    use yonik_engine::policy_wire::SystemPolicy;
+
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let rule = |id: u64, action: &str, cidrs: [&str; 2]| {
+        json!({"id":id,"enabled":true,"action":action,"ip_cidr":cidrs,
+            "domain":[],"domain_suffix":[],"executable_paths":[]})
+    };
+    let policy = |first, second| {
+        SystemPolicy::parse(
+            &json!({"version":1,"default_action":"proxy","lan":[],"private_networks":[],
+                "private_domains":[],"user_rules":[rule(1,first,["198.18.0.2/32","2001:db8:746f::2/128"])],
+                "preset_rules":[rule(2,second,["198.18.0.0/30","2001:db8:746f::/126"])]})
+            .to_string(),
+        )
+    };
+    let proxy = policy("proxy", "block")?;
+    let block = policy("block", "proxy")?;
+    let connection = zbus::Connection::system().await?;
+    let (_owner, cancel) = yonik_linux::Cancellation::new();
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(25);
+    let mut client = SystemClient::on_connection(connection, deadline(), cancel.clone()).await?;
+    for engine in [Engine::Xray, Engine::SingBox] {
+        for (policy, permits_proxy) in [(&proxy, true), (&block, false)] {
+            let prepared = client
+                .prepare_profile_policy(&server, engine, false, policy, deadline(), cancel.clone())
+                .await?;
+            require(
+                client.apply(prepared, deadline(), cancel.clone()).await? == State::TunnelStarting,
+                "Профиль с буквальными IP не запустил TUN",
+            )?;
+            check_literal_cidr_traffic(permits_proxy).await?;
+            require(
+                client.stop(deadline(), cancel.clone()).await? == State::NoManagedPolicy,
+                "Stop не снял профиль с буквальными IP",
+            )?;
+            eprintln!("{engine:?}: Proxy={permits_proxy}, IPv4/IPv6 TCP/UDP");
+        }
+        require(
+            resolver_file_state()? == resolver_before,
+            "Изменился resolv.conf",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная Debian VM с отдельным физическим echo и блокировкой этих адресов на прокси"]
 async fn production_helper_scoped_fake_dns_literal_direct() -> Result {
     installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralDirect, false).await
