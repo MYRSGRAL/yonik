@@ -157,7 +157,11 @@ Clippy для всех целей `yonik-linux` прошли на Rust 1.85.1 и
   PAM-сессии для обоих пользователей. После трёх отмен сессии невыбранного
   пользователя PAM временно заблокировал его, и агент отклонил следующий
   Unlock. Повторный прогон изменил только состав `wheel` в одноразовой VM.
-  [Код агента lxqt-policykit 2.5.0](https://github.com/lxqt/lxqt-policykit/blob/2.5.0/src/policykitagent.cpp#L99-L110)
+  В журнале Arch с polkit 128 `pam_unix` сообщил `conversation failed`
+  для невыбранной учётной записи. Такое превращение отмены диалога в
+  неудачную попытку PAM отдельно подтверждено в проекте polkit.
+  [Код агента lxqt-policykit 2.5.0](https://github.com/lxqt/lxqt-policykit/blob/2.5.0/src/policykitagent.cpp#L99-L110),
+  [polkit #713](https://github.com/polkit-org/polkit/issues/713).
 
 В Arch и Debian 13 установленные helper и worker прошли сценарий
 `Prepare → ApplyOutputV1` для Xray и sing-box. Контрольный трафик TCP и UDP
