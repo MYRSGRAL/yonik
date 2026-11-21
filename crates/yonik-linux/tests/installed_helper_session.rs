@@ -2528,6 +2528,89 @@ async fn production_helper_resolved_fake_dns_mixed() -> Result {
 }
 
 #[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая VM с установленными helper, worker и тестовым VLESS peer"]
+async fn production_helper_rejects_private_cidrs_in_fake_dns_profile() -> Result {
+    use yonik_engine::policy_wire::SystemPolicy;
+    use yonik_linux::system_client::ClientError;
+
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let public = json!({
+        "version": 1, "default_action": "proxy", "lan": [], "private_domains": [],
+        "private_networks": [],
+        "preset_rules": [{"id": 2, "enabled": true, "action": "block",
+            "domain": [], "domain_suffix": [], "ip_cidr": ["203.0.113.46/32"],
+            "executable_paths": []}],
+        "user_rules": [{"id": 1, "enabled": true, "action": "proxy",
+            "domain": ["example.test"], "domain_suffix": [], "ip_cidr": [],
+            "executable_paths": []}]
+    });
+    let domains = ["example.test".to_owned()];
+    let policy_resolver = Some("192.0.2.53:5353".parse()?);
+    for engine in [Engine::Xray, Engine::SingBox] {
+        for networks in [
+            json!([{"cidr": "10.42.0.0/16", "vpn": 1, "available": false}]),
+            json!([
+                {"cidr": "10.42.0.0/16", "vpn": 1, "available": true},
+                {"cidr": "172.20.0.0/16", "vpn": 2, "available": true}
+            ]),
+            json!([]),
+        ] {
+            let control = networks.as_array().is_some_and(Vec::is_empty);
+            let mut request = public.clone();
+            request["private_networks"] = networks;
+            let policy = SystemPolicy::parse(&request.to_string())?;
+            let (_owner, cancel) = yonik_linux::Cancellation::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut client =
+                SystemClient::on_connection(connection.clone(), deadline, cancel.clone()).await?;
+            let result = client
+                .prepare_fake_dns_policy_profile_with_resolver(
+                    &server,
+                    engine,
+                    false,
+                    &domains,
+                    &policy,
+                    policy_resolver,
+                    deadline,
+                    cancel,
+                )
+                .await;
+            if control {
+                result.map_err(|error| {
+                    io::Error::other(format!(
+                        "{engine:?}: контрольный публичный Prepare: {error}"
+                    ))
+                })?;
+            } else {
+                require(
+                    matches!(result, Err(ClientError::Unsupported)),
+                    &format!("{engine:?}: профиль Fake DNS с приватными CIDR должен быть отклонён"),
+                )?;
+            }
+            require(
+                call(&connection, "State", json!({"version": 1})).await?["state"]
+                    == "no_managed_policy",
+                "Prepare изменил состояние активной сетевой политики",
+            )?;
+        }
+        eprintln!("{engine:?}: приватные профили отклонены, публичный Prepare прошёл");
+    }
+    require(
+        resolver_file_state()? == resolver_before,
+        "Prepare изменил /etc/resolv.conf",
+    )
+}
+
+#[cfg(feature = "test-support")]
 async fn installed_resolved_fake_dns_policy(mixed: bool) -> Result {
     require(
         std::env::var("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER").is_ok(),
