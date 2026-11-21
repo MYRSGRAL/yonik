@@ -1247,6 +1247,26 @@ fn ordinary_check_cannot_ack_after_its_supervisor_deadline() {
 }
 
 #[test]
+fn ordinary_run_respects_its_supervisor_deadline() {
+    use std::io::{Read, Write};
+
+    let payload = binding_test_payload();
+    let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let receiver = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        server.read_to_end(&mut bytes).unwrap();
+        if !bytes.is_empty() {
+            server.write_all(b"YNKA\x00\x00\x00\x2a\x02").unwrap();
+        }
+        bytes
+    });
+    let result = send_ordinary_payload(&payload, &client, WorkerMode::Run, None, Instant::now());
+    drop(client);
+    assert!(result.is_err());
+    assert!(receiver.join().unwrap().is_empty());
+}
+
+#[test]
 fn actual_payload_transfer_rejects_late_ack_after_revocation() {
     use std::io::{Read, Write};
     let payload = binding_test_payload();

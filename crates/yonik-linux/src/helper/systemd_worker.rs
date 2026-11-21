@@ -39,7 +39,8 @@ const UNIT_IFACE: &str = "org.freedesktop.systemd1.Unit";
 const SERVICE_IFACE: &str = "org.freedesktop.systemd1.Service";
 const SOCKET_IFACE: &str = "org.freedesktop.systemd1.Socket";
 const DEADLINE: Duration = Duration::from_secs(8);
-const CHECK_DEADLINE: Duration = Duration::from_secs(15);
+// При активации worker сначала копирует и проверяет образ до 128 МиБ.
+const ACTIVATION_DEADLINE: Duration = Duration::from_secs(15);
 static OWNED: AtomicBool = AtomicBool::new(false);
 type Properties = HashMap<String, OwnedValue>;
 type TransferResult = Result<(WorkerAck, WorkerTicket, Option<InvocationBinding>)>;
@@ -754,7 +755,7 @@ impl SystemWorkerSupervisor {
         payload: Arc<WorkerPayload>,
         cancel: &mut Cancellation,
     ) -> Result<()> {
-        let deadline = Instant::now() + CHECK_DEADLINE;
+        let deadline = Instant::now() + ACTIVATION_DEADLINE;
         self.begin(WorkerMode::Check, cancel, deadline).await?;
         let ack = self
             .send(payload, WorkerMode::Check, cancel, deadline)
@@ -1097,7 +1098,7 @@ impl SystemWorkerSupervisor {
     ) -> Result<(WorkerTicket, Option<AuthorizedLease>)> {
         // Guard живёт в future, а не в blocking task: drop отзывает поздний ACK.
         let revocation = authorization.as_ref().map(RunAuthorization::guard);
-        let deadline = Instant::now() + DEADLINE;
+        let deadline = Instant::now() + ACTIVATION_DEADLINE;
         self.begin(WorkerMode::Run, cancel, deadline).await?;
         let (ack, ticket, binding) = self
             .send_inner(
@@ -1913,15 +1914,13 @@ fn send_ordinary_payload(
     output: Option<crate::output_transport::ValidatedWriters>,
     deadline: Instant,
 ) -> Result<WorkerAck> {
-    // ACK проверки отправляется только после проверки конфигурации ядра.
-    // Для неё используем остаток общего срока Check, включая старт сервиса.
-    let ack = match mode {
-        WorkerMode::Check => payload.send_output_before(stream, mode, output, deadline.into_std()),
-        WorkerMode::Run => payload.send_output(stream, mode, output),
-    }
-    .map_err(|_| WorkerSupervisorError::Protocol)?;
+    // До ACK worker проверяет и копирует образ ядра. Используем остаток
+    // общего срока оркестратора, включая время активации службы.
+    let ack = payload
+        .send_output_before(stream, mode, output, deadline.into_std())
+        .map_err(|_| WorkerSupervisorError::Protocol)?;
     // Относительный тайм-аут сокета может округлить остаток срока вверх.
-    if mode == WorkerMode::Check && Instant::now() >= deadline {
+    if Instant::now() >= deadline {
         return Err(WorkerSupervisorError::Timeout);
     }
     Ok(ack)
