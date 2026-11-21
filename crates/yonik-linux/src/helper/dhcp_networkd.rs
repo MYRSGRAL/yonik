@@ -1,5 +1,6 @@
 //! Привязка системного DHCPv4-лизинга к маршруту и параметрам сокета.
 
+pub(crate) use super::systemd_network_service::dhcpcd_instance_cgroup;
 use super::{
     dhcp_dhcpcd_control::{ControlLease, read_lease as read_dhcpcd},
     memory::ByteBudget,
@@ -282,6 +283,7 @@ impl DhcpNetworkdLease {
             },
             network_manager: self.source == DhcpSource::Bus(NetworkService::NetworkManager),
             dhcpcd: self.source == DhcpSource::Dhcpcd,
+            dhcpcd_instance: self.daemon.dhcpcd_instance,
             server: self.lease.server,
             uid: self.daemon.uid,
             cgroup_id: self.daemon.group.1,
@@ -360,6 +362,7 @@ pub struct DhcpRenewalPath<'a> {
     pub(crate) acquired: u64,
     pub(crate) network_manager: bool,
     pub(crate) dhcpcd: bool,
+    pub(crate) dhcpcd_instance: bool,
     pub server: Ipv4Addr,
     pub uid: u32,
     pub cgroup_id: NonZeroU64,
@@ -636,7 +639,7 @@ async fn collect_dhcpcd(
     }
     let name = std::str::from_utf8(&link.name).map_err(|_| Error::Unsupported)?;
     let state = read_dhcpcd(name, deadline).await?;
-    let daemon = dhcpcd_daemon(&connection, &bus, state.peer_pid).await?;
+    let daemon = dhcpcd_daemon(&connection, &bus, state.peer_pid, name).await?;
     let mut candidates = topology.addresses.iter().filter(|address| {
         address.index == index.get()
             && address.family == 2
@@ -678,7 +681,7 @@ async fn collect_dhcpcd(
     let (after, after_timing) = read_topology_captured(cancel, remaining(deadline)?).await?;
     if !same_captured_topology(&topology, timing, &after, after_timing)
         || !same_dhcpcd_lease(&state, &after_state)?
-        || daemon != dhcpcd_daemon(&connection, &bus, state.peer_pid).await?
+        || daemon != dhcpcd_daemon(&connection, &bus, state.peer_pid, name).await?
         || socket
             != dhcpcd_socket(
                 topology.namespace,

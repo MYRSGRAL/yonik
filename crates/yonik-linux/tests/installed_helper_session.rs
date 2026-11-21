@@ -399,7 +399,7 @@ fn dhcpcd_fixture_journal(unit: &str) -> Result<String> {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-#[ignore = "одноразовая Debian VM с пакетным dhcpcd.service и свежим лизингом dhcpcd-probe"]
+#[ignore = "одноразовая Debian или Arch VM с пакетным dhcpcd и свежим лизингом dhcpcd-probe"]
 async fn production_helper_fake_dns_during_dhcpcd_renewal() -> Result {
     const LEASE: (&str, &str, &str) = ("dhcpcd-probe", "10.234.16.10", "10.234.16.1");
     const RENEWING: &str = "dhcpcd-probe: renewing lease of 10.234.16.10";
@@ -414,12 +414,17 @@ async fn production_helper_fake_dns_during_dhcpcd_renewal() -> Result {
         "sing-box" => Engine::SingBox,
         _ => return Err(io::Error::other("Для стенда dhcpcd нужен xray или sing-box").into()),
     };
+    let dhcpcd_unit = if std::env::var_os("YONIK_DHCPCD_INSTANCE").is_some() {
+        r"dhcpcd@dhcpcd\x2dprobe.service"
+    } else {
+        "dhcpcd.service"
+    };
     require(
         Command::new("/usr/bin/systemctl")
-            .args(["is-active", "--quiet", "dhcpcd.service"])
+            .args(["is-active", "--quiet", dhcpcd_unit])
             .status()?
             .success(),
-        "Пакетный dhcpcd.service не запущен",
+        "Пакетная служба dhcpcd не запущена",
     )?;
     let ack_count = || -> Result<usize> {
         Ok(dhcpcd_fixture_journal("yonik-dhcpcd-server")?
@@ -428,7 +433,7 @@ async fn production_helper_fake_dns_during_dhcpcd_renewal() -> Result {
             .count())
     };
     require(
-        ack_count()? == 1 && !dhcpcd_fixture_journal("dhcpcd.service")?.contains(RENEWING),
+        ack_count()? == 1 && !dhcpcd_fixture_journal(dhcpcd_unit)?.contains(RENEWING),
         "Стенд должен начать с первого DHCPACK до продления T1",
     )?;
 
@@ -471,7 +476,7 @@ async fn production_helper_fake_dns_during_dhcpcd_renewal() -> Result {
         tokio::time::timeout(Duration::from_secs(32), async {
             loop {
                 let acks = ack_count()?;
-                let journal = dhcpcd_fixture_journal("dhcpcd.service")?;
+                let journal = dhcpcd_fixture_journal(dhcpcd_unit)?;
                 require(
                     acks <= 2 && !journal.contains(REBINDING),
                     "Стенд перешёл к перепривязке или получил лишний DHCPACK",

@@ -7,6 +7,7 @@ use rustix::{
     process::{Pid, PidfdFlags, pidfd_open},
 };
 use std::{
+    fmt::Write,
     fs::File,
     io::Read,
     num::NonZeroU64,
@@ -19,10 +20,12 @@ use zbus::{
     Connection,
     fdo::DBusProxy,
     names::{BusName, OwnedUniqueName},
+    zvariant::OwnedObjectPath,
 };
 
 const MAX_REPLY: usize = 64 * 1024;
 const SYSTEMD: &str = "org.freedesktop.systemd1";
+const DHCPCD_INSTANCE_SLICE: &str = "system.slice/system-dhcpcd.slice";
 const DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
@@ -36,25 +39,22 @@ pub(super) enum NetworkService {
 }
 
 impl NetworkService {
-    fn identity(self) -> (&'static str, &'static str, &'static str, &'static str) {
+    fn identity(self) -> (&'static str, &'static str, &'static str) {
         match self {
             Self::Networkd => (
                 "org.freedesktop.network1",
                 "/org/freedesktop/systemd1/unit/systemd_2dnetworkd_2eservice",
                 "/system.slice/systemd-networkd.service",
-                "systemd-networkd.service",
             ),
             Self::NetworkManager => (
                 "org.freedesktop.NetworkManager",
                 "/org/freedesktop/systemd1/unit/NetworkManager_2eservice",
                 "/system.slice/NetworkManager.service",
-                "NetworkManager.service",
             ),
             Self::Resolved => (
                 "org.freedesktop.resolve1",
                 "/org/freedesktop/systemd1/unit/systemd_2dresolved_2eservice",
                 "/system.slice/systemd-resolved.service",
-                "systemd-resolved.service",
             ),
         }
     }
@@ -68,6 +68,7 @@ pub(crate) struct Daemon {
     pub(crate) pid: u32,
     invocation: [u8; 16],
     pub(crate) group: (u64, NonZeroU64),
+    pub(crate) dhcpcd_instance: bool,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -127,7 +128,7 @@ pub(super) async fn daemon(
     bus: &DBusProxy<'_>,
     service: NetworkService,
 ) -> Result<Daemon, Error> {
-    let (bus_name, object, group_path, unit_name) = service.identity();
+    let (bus_name, object, group_path) = service.identity();
     let name = |value| BusName::try_from(value).map_err(unavailable);
     let systemd = systemd_owner(bus).await?;
     let owner = bus
@@ -192,23 +193,82 @@ pub(super) async fn daemon(
         dynamic_uid,
         pid,
         invocation,
-        group: unit_group(unit_name)?,
+        group: open_unit_group(group_path.trim_start_matches('/'))?,
+        dhcpcd_instance: false,
     })
+}
+
+fn dhcpcd_instance_unit(ifname: &str) -> Option<String> {
+    if ifname.is_empty()
+        || ifname.len() > 15
+        || ifname.starts_with('-')
+        || matches!(ifname, "." | "..")
+    {
+        return None;
+    }
+    let mut unit = String::from("dhcpcd@");
+    for (index, byte) in ifname.bytes().enumerate() {
+        if byte == b'-' || (index == 0 && byte == b'.') {
+            write!(&mut unit, "\\x{byte:02x}").ok()?;
+        } else if byte.is_ascii_alphanumeric() || b"._".contains(&byte) {
+            unit.push(char::from(byte));
+        } else {
+            return None;
+        }
+    }
+    unit.push_str(".service");
+    Some(unit)
+}
+
+pub(crate) fn dhcpcd_instance_cgroup(ifname: &str) -> Option<String> {
+    let unit = dhcpcd_instance_unit(ifname)?;
+    Some(format!("{DHCPCD_INSTANCE_SLICE}/{unit}"))
 }
 
 pub(super) async fn dhcpcd_daemon(
     connection: &Connection,
     bus: &DBusProxy<'_>,
     peer_pid: u32,
+    ifname: &str,
 ) -> Result<Daemon, Error> {
     const UNIT: &str = "org.freedesktop.systemd1.Unit";
     const SERVICE: &str = "org.freedesktop.systemd1.Service";
     const GROUP: &str = "/system.slice/dhcpcd.service";
+    if peer_pid <= 1 {
+        return Err(Error::Changed);
+    }
+    let peer_group = read_proc(&format!("/proc/{peer_pid}/cgroup"))?;
     let owner = systemd_owner(bus).await?;
+    let mut instance = None;
+    let object = if peer_group == format!("0::{GROUP}\n") {
+        OwnedObjectPath::try_from("/org/freedesktop/systemd1/unit/dhcpcd_2eservice")
+            .map_err(unavailable)?
+    } else {
+        let unit = dhcpcd_instance_unit(ifname).ok_or(Error::Unsupported)?;
+        let group = format!("{DHCPCD_INSTANCE_SLICE}/{unit}");
+        if peer_group != format!("0::/{group}\n") {
+            return Err(Error::Changed);
+        }
+        let manager = zbus::Proxy::new(
+            connection,
+            owner.as_str(),
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        )
+        .await
+        .map_err(unavailable)?;
+        let object: OwnedObjectPath = manager
+            .call("GetUnitByPID", &(peer_pid,))
+            .await
+            .map_err(unavailable)?;
+        instance = Some((unit, format!("/{group}")));
+        object
+    };
+    let group = instance.as_ref().map_or(GROUP, |(_, group)| group);
     let properties = zbus::Proxy::new(
         connection,
         owner.as_str(),
-        "/org/freedesktop/systemd1/unit/dhcpcd_2eservice",
+        object.as_str(),
         "org.freedesktop.DBus.Properties",
     )
     .await
@@ -216,18 +276,21 @@ pub(super) async fn dhcpcd_daemon(
     let invocation: Vec<u8> = property(&properties, UNIT, "InvocationID").await?;
     let invocation: [u8; 16] = invocation.try_into().map_err(|_| Error::Malformed)?;
     let main_pid: u32 = property(&properties, SERVICE, "MainPID").await?;
-    let expected = format!("0::{GROUP}\n");
     // При privsep управляющий сокет обслуживает отдельный процесс unit.
     if invocation == [0; 16]
-        || peer_pid <= 1
         || main_pid <= 1
         || property::<String>(&properties, UNIT, "ActiveState").await? != "active"
-        || property::<String>(&properties, SERVICE, "ControlGroup").await? != GROUP
+        || property::<String>(&properties, SERVICE, "ControlGroup").await? != group
         || property::<bool>(&properties, SERVICE, "Delegate").await?
-        || read_proc(&format!("/proc/{main_pid}/cgroup"))? != expected
-        || read_proc(&format!("/proc/{peer_pid}/cgroup"))? != expected
+        || read_proc(&format!("/proc/{main_pid}/cgroup"))? != peer_group
+        || read_proc(&format!("/proc/{peer_pid}/cgroup"))? != peer_group
     {
         return Err(Error::Changed);
+    }
+    if let Some((unit, _)) = &instance {
+        if property::<String>(&properties, UNIT, "Id").await? != *unit {
+            return Err(Error::Changed);
+        }
     }
     Ok(Daemon {
         owner,
@@ -235,8 +298,32 @@ pub(super) async fn dhcpcd_daemon(
         dynamic_uid: false,
         pid: peer_pid,
         invocation,
-        group: unit_group("dhcpcd.service")?,
+        group: open_unit_group(group.trim_start_matches('/'))?,
+        dhcpcd_instance: instance.is_some(),
     })
+}
+
+fn open_unit_group(path: &str) -> Result<(u64, NonZeroU64), Error> {
+    let mut group = open("/sys/fs/cgroup", DIRECTORY, Mode::empty()).map_err(unavailable)?;
+    for component in path.split('/') {
+        if component.is_empty() || matches!(component, "." | "..") {
+            return Err(Error::Changed);
+        }
+        group = openat(&group, component, DIRECTORY, Mode::empty()).map_err(unavailable)?;
+    }
+    let unit = File::from(group);
+    let metadata = unit.metadata().map_err(unavailable)?;
+    if usize::BITS != 64
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || rustix::fs::fstatfs(&unit).map_err(unavailable)?.f_type as u64 != 0x6367_7270
+    {
+        return Err(Error::Unsupported);
+    }
+    Ok((
+        metadata.dev(),
+        NonZeroU64::new(metadata.ino()).ok_or(Error::Unsupported)?,
+    ))
 }
 
 async fn systemd_owner(bus: &DBusProxy<'_>) -> Result<OwnedUniqueName, Error> {
@@ -259,25 +346,6 @@ async fn systemd_owner(bus: &DBusProxy<'_>) -> Result<OwnedUniqueName, Error> {
         return Err(Error::Unsupported);
     }
     Ok(owner)
-}
-
-fn unit_group(unit_name: &str) -> Result<(u64, NonZeroU64), Error> {
-    let cgroup = open("/sys/fs/cgroup", DIRECTORY, Mode::empty()).map_err(unavailable)?;
-    let slice = openat(&cgroup, "system.slice", DIRECTORY, Mode::empty()).map_err(unavailable)?;
-    let unit =
-        File::from(openat(&slice, unit_name, DIRECTORY, Mode::empty()).map_err(unavailable)?);
-    let metadata = unit.metadata().map_err(unavailable)?;
-    if usize::BITS != 64
-        || metadata.uid() != 0
-        || metadata.mode() & 0o022 != 0
-        || rustix::fs::fstatfs(&unit).map_err(unavailable)?.f_type as u64 != 0x6367_7270
-    {
-        return Err(Error::Unsupported);
-    }
-    Ok((
-        metadata.dev(),
-        NonZeroU64::new(metadata.ino()).ok_or(Error::Unsupported)?,
-    ))
 }
 
 pub(super) async fn property<T: TryFrom<zbus::zvariant::OwnedValue>>(

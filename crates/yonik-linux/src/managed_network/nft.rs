@@ -12,6 +12,7 @@ use rustix::fs;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fmt,
     fs::File,
     os::{fd::AsRawFd, unix::fs::MetadataExt},
@@ -65,6 +66,30 @@ impl From<JournalError> for NftError {
     fn from(error: JournalError) -> Self {
         Self::Journal(error)
     }
+}
+
+fn open_pinned_cgroup(path: &str, expected_inode: u64) -> Result<File, NftError> {
+    let flags =
+        fs::OFlags::PATH | fs::OFlags::DIRECTORY | fs::OFlags::NOFOLLOW | fs::OFlags::CLOEXEC;
+    let mut directory =
+        fs::open("/sys/fs/cgroup", flags, fs::Mode::empty()).map_err(|_| NftError::Evidence)?;
+    for component in path.split('/') {
+        if component.is_empty() || matches!(component, "." | "..") {
+            return Err(NftError::Evidence);
+        }
+        directory = fs::openat(&directory, component, flags, fs::Mode::empty())
+            .map_err(|_| NftError::Evidence)?;
+    }
+    let file = File::from(directory);
+    let metadata = file.metadata().map_err(|_| NftError::Evidence)?;
+    if metadata.ino() != expected_inode
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || fs::fstatfs(&file).map_err(|_| NftError::Evidence)?.f_type as u64 != 0x6367_7270
+    {
+        return Err(NftError::Evidence);
+    }
+    Ok(file)
 }
 
 struct Table {
@@ -245,45 +270,41 @@ impl NftExecutor {
             _ => None,
         };
         let resolver = policy.and_then(PublicBlockPolicy::resolver_tls_identity);
-        let pinned_cgroup = if let Some((namespace, id)) = resolver {
+        let mut pinned_cgroups = Vec::new();
+        let mut resolver_pin = None;
+        if let Some((namespace, id)) = resolver {
             if namespace != self.owner.namespace() {
                 return Err(NftError::Namespace);
             }
-            let file = File::from(
-                fs::open(
-                    format!("/sys/fs/cgroup/{RESOLVED_CGROUP_PATH}"),
-                    fs::OFlags::PATH
-                        | fs::OFlags::DIRECTORY
-                        | fs::OFlags::NOFOLLOW
-                        | fs::OFlags::CLOEXEC,
-                    fs::Mode::empty(),
-                )
-                .map_err(|_| NftError::Evidence)?,
-            );
-            if file.metadata().map_err(|_| NftError::Evidence)?.ino() != id.get()
-                || fs::fstatfs(&file).map_err(|_| NftError::Evidence)?.f_type as u64 != 0x6367_7270
-            {
-                return Err(NftError::Evidence);
+            let file = open_pinned_cgroup(RESOLVED_CGROUP_PATH, id.get())?;
+            resolver_pin = Some((id.get(), file.as_raw_fd()));
+            pinned_cgroups.push(file);
+        }
+        let mut instances = BTreeMap::new();
+        if let Some(policy) = policy {
+            for (path, id) in policy.dhcp_instance_cgroups() {
+                if instances.contains_key(&path) || instances.len() >= 16 {
+                    return Err(NftError::Evidence);
+                }
+                let file = open_pinned_cgroup(&path, id.get())?;
+                let descriptor = file.as_raw_fd();
+                instances.insert(path, (id.get(), descriptor));
+                pinned_cgroups.push(file);
             }
-            Some(file)
-        } else {
-            None
-        };
-        let text_input = pinned_cgroup.is_some()
+        }
+        let text_input = !pinned_cgroups.is_empty()
             || policy.is_some_and(|policy| policy.dhcp_rule_identity().is_some());
         let request = request(action);
         let bytes = if text_input {
-            let anchor = resolver
-                .zip(pinned_cgroup.as_ref())
-                .map(|((_, id), file)| (id.get(), file.as_raw_fd()));
-            text::render(
+            text::render_with_instances(
                 request["nftables"].as_array().ok_or(NftError::Invalid)?,
-                anchor,
+                resolver_pin,
+                &instances,
             )?
         } else {
             serde_json::to_vec(&request).map_err(|_| NftError::Invalid)?
         };
-        self.run_batch(bytes, text_input, check_only, None, pinned_cgroup)
+        self.run_batch(bytes, text_input, check_only, None, Some(pinned_cgroups))
             .await
     }
 
@@ -293,7 +314,7 @@ impl NftExecutor {
         text_input: bool,
         check_only: bool,
         dhcp_sleep: Option<&DhcpSleepTicket>,
-        pinned_cgroup: Option<File>,
+        pinned_cgroups: Option<Vec<File>>,
     ) -> Result<Vec<u8>, NftError> {
         if bytes.len() > MAX_OUTPUT {
             return Err(NftError::Invalid);
@@ -316,12 +337,14 @@ impl NftExecutor {
             DEADLINE
         };
         let mut command = Command::new(format!("/proc/self/fd/{}", self.executable.as_raw_fd()));
-        if let Some(directory) = pinned_cgroup {
-            yonik_nsfs::nft_cgroup_fd::install_nft_cgroup_fd(
-                command.as_std_mut(),
-                directory.into(),
-            )
-            .map_err(|_| NftError::Io)?;
+        if let Some(directories) = pinned_cgroups {
+            for directory in directories {
+                yonik_nsfs::nft_cgroup_fd::install_nft_cgroup_fd(
+                    command.as_std_mut(),
+                    directory.into(),
+                )
+                .map_err(|_| NftError::Io)?;
+            }
         }
         command.arg("-n");
         if !text_input {

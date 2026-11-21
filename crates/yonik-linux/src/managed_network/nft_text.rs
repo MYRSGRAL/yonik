@@ -20,6 +20,7 @@ const DHCP_KEY_FIELDS: [&str; 4] = ["ip saddr", "ip daddr", "meta oif", "meta oi
 
 type Result<T> = std::result::Result<T, NftError>;
 type ResolverCgroup = (u64, std::os::fd::RawFd);
+type InstanceCgroups = std::collections::BTreeMap<String, (u64, std::os::fd::RawFd)>;
 
 pub(super) fn dhcp_renewal(
     table: &str,
@@ -61,13 +62,22 @@ fn dhcp_element_key(key: &DhcpRenewalKey) -> Result<String> {
     ))
 }
 
+#[cfg(test)]
 pub(super) fn render(commands: &[Value], resolver: Option<ResolverCgroup>) -> Result<Vec<u8>> {
+    render_with_instances(commands, resolver, &InstanceCgroups::new())
+}
+
+pub(super) fn render_with_instances(
+    commands: &[Value],
+    resolver: Option<ResolverCgroup>,
+    instances: &InstanceCgroups,
+) -> Result<Vec<u8>> {
     if commands.is_empty() || commands.len() > MAX_COMMANDS {
         return Err(NftError::Invalid);
     }
     let mut script = String::new();
     for command in commands {
-        render_command(&mut script, command, resolver)?;
+        render_command(&mut script, command, resolver, instances)?;
         if script.len() > MAX_OUTPUT {
             return Err(NftError::Invalid);
         }
@@ -79,6 +89,7 @@ fn render_command(
     script: &mut String,
     command: &Value,
     resolver: Option<ResolverCgroup>,
+    instances: &InstanceCgroups,
 ) -> Result<()> {
     let (action, body) = single(command)?;
     let (kind, fields) = single(body)?;
@@ -153,7 +164,7 @@ fn render_command(
                 "add set inet {table} {DHCP_SET} {{ type ipv4_addr . ipv4_addr . iface_index . ifname; flags timeout; size 16; }}"
             ))
         }
-        ("add", "rule") => render_rule(script, fields, resolver),
+        ("add", "rule") => render_rule(script, fields, resolver, instances),
         _ => Err(NftError::Invalid),
     }
 }
@@ -162,6 +173,7 @@ fn render_rule(
     script: &mut String,
     fields: &Value,
     resolver: Option<ResolverCgroup>,
+    instances: &InstanceCgroups,
 ) -> Result<()> {
     let [family, table, chain, expr] = exact(fields, ["family", "table", "chain", "expr"])?;
     let chain = text(chain)?;
@@ -177,7 +189,7 @@ fn render_rule(
     require(expr.len() <= MAX_EXPRESSIONS)?;
     if chain == DHCPCD_ROUTE_CHAIN {
         write_fmt(write!(script, "add rule inet {table} {chain}"))?;
-        return render_dhcpcd_route(script, expr);
+        return render_dhcpcd_route(script, expr, instances);
     }
     let (last, matches) = expr.split_last().ok_or(NftError::Invalid)?;
     let (action, value) = single(last)?;
@@ -194,6 +206,7 @@ fn render_rule(
     if chain == DHCP_CHAIN {
         require(verdict == "accept")?;
         require_dhcp_selectors(matches)?;
+        validate_dhcp_instance_socket(matches, instances)?;
     } else if chain == DHCPCD_EGRESS_CHAIN {
         let (header, extra) = matches.split_at_checked(6).ok_or(NftError::Invalid)?;
         require_renewal_matches(
@@ -240,7 +253,7 @@ fn render_rule(
             require(kind != "concat" && (dot || kind != "socket"))?;
         }
         script.push(' ');
-        render_match(script, fields, resolver)?;
+        render_match(script, fields, resolver, instances)?;
     }
     write_fmt(writeln!(script, " {verdict}"))
 }
@@ -271,14 +284,49 @@ fn require_renewal_matches<'a>(
             "meta skuid" => right.as_u64() == Some(0),
             "udp sport" => right.as_u64() == Some(68),
             "udp dport" => right.as_u64() == Some(67),
-            "socket" => right.as_str() == Some(DHCPCD_CGROUP_PATH),
+            "socket" => right.is_string(),
             _ => true,
         })?;
     }
     Ok(())
 }
 
-fn render_dhcpcd_route(script: &mut String, expressions: &[Value]) -> Result<()> {
+fn validate_dhcp_instance_socket(expressions: &[Value], instances: &InstanceCgroups) -> Result<()> {
+    let ifname = expressions
+        .iter()
+        .find(|expr| {
+            expr.pointer("/match/left/meta/key").and_then(Value::as_str) == Some("oifname")
+        })
+        .and_then(|expr| expr.pointer("/match/right"))
+        .and_then(Value::as_str)
+        .ok_or(NftError::Invalid)?;
+    let socket = expressions
+        .iter()
+        .find(|expr| expr.pointer("/match/left/socket").is_some())
+        .ok_or(NftError::Invalid)?;
+    let path = crate::helper::dhcp_networkd::dhcpcd_instance_cgroup(ifname);
+    let Some(path) = path.filter(|path| instances.contains_key(path)) else {
+        return Ok(());
+    };
+    let concat = expressions
+        .iter()
+        .find(|expr| expr.pointer("/match/left/concat").is_some())
+        .and_then(|expr| expr.pointer("/match/left/concat"))
+        .and_then(Value::as_array)
+        .ok_or(NftError::Invalid)?;
+    require(
+        concat.len() == DHCP_KEY_FIELDS.len()
+            && selector(&concat[2])? == "meta oif"
+            && selector(&concat[3])? == "meta oifname",
+    )?;
+    require(socket.pointer("/match/right").and_then(Value::as_str) == Some(path.as_str()))
+}
+
+fn render_dhcpcd_route(
+    script: &mut String,
+    expressions: &[Value],
+    instances: &InstanceCgroups,
+) -> Result<()> {
     let [
         header @ ..,
         ciaddr,
@@ -318,7 +366,6 @@ fn render_dhcpcd_route(script: &mut String, expressions: &[Value]) -> Result<()>
             .and_then(Value::as_u64)
             != Some(escape_mark),
     )?;
-
     let [op, left, right] = match_fields(ciaddr)?;
     let ("payload", payload) = single(left)? else {
         return Err(NftError::Invalid);
@@ -339,6 +386,16 @@ fn render_dhcpcd_route(script: &mut String, expressions: &[Value]) -> Result<()>
         return Err(NftError::Invalid);
     };
     let ifname = text(ifname)?;
+    let instance_path = crate::helper::dhcp_networkd::dhcpcd_instance_cgroup(ifname);
+    let socket_right = socket.pointer("/match/right").ok_or(NftError::Invalid)?;
+    if let Some(path) = instance_path
+        .as_ref()
+        .filter(|path| instances.contains_key(*path))
+    {
+        require(socket_right.as_str() == Some(path))?;
+    } else {
+        require(socket_right.as_str() == Some(DHCPCD_CGROUP_PATH))?;
+    }
     require(
         address == lease
             && selector(destination)? == "ip daddr"
@@ -350,12 +407,12 @@ fn render_dhcpcd_route(script: &mut String, expressions: &[Value]) -> Result<()>
 
     for expr in header {
         script.push(' ');
-        render_match(script, single(expr)?.1, None)?;
+        render_match(script, single(expr)?.1, None, instances)?;
     }
     write_fmt(write!(script, " @th,160,32 {ciaddr}"))?;
     for expr in [dscp, original_mark, socket] {
         script.push(' ');
-        render_match(script, single(expr)?.1, None)?;
+        render_match(script, single(expr)?.1, None, instances)?;
     }
     write_fmt(writeln!(
         script,
@@ -415,7 +472,8 @@ fn require_dhcp_selectors(expressions: &[Value]) -> Result<()> {
             "socket" => match right.as_str() {
                 Some(NM_DHCP_CGROUP_PATH | DHCPCD_CGROUP_PATH) => root,
                 Some(DHCP_CGROUP) => !root,
-                _ => false,
+                Some(_) => root,
+                None => false,
             },
             _ => true,
         })?;
@@ -486,6 +544,7 @@ fn render_match(
     script: &mut String,
     fields: &Value,
     resolver: Option<ResolverCgroup>,
+    instances: &InstanceCgroups,
 ) -> Result<()> {
     let [op, left, right] = exact(fields, ["op", "left", "right"])?;
     let op = text(op)?;
@@ -495,12 +554,21 @@ fn render_match(
         "socket" => {
             let [name, level] = exact(data, ["key", "level"])?;
             require(op == "==" && text(name)? == "cgroupv2")?;
-            let level = number(level, 2, 2)?;
+            let level = number(level, 2, 3)?;
             return if let Some(path @ (DHCP_CGROUP | NM_DHCP_CGROUP_PATH | DHCPCD_CGROUP_PATH)) =
                 right.as_str()
             {
+                require(level == 2)?;
                 write_fmt(write!(script, "socket cgroupv2 level {level} \"{path}\""))
+            } else if let Some(path) = right.as_str().filter(|path| instances.contains_key(*path)) {
+                let (expected, fd) = instances.get(path).ok_or(NftError::Evidence)?;
+                require(level == 3 && *expected != 0 && *fd >= 3)?;
+                write_fmt(write!(
+                    script,
+                    "socket cgroupv2 level 3 \"../../../proc/self/fd/{fd}\""
+                ))
             } else {
+                require(level == 2)?;
                 let id = number(right, 1, u64::MAX)?;
                 let (expected, fd) = resolver.ok_or(NftError::Evidence)?;
                 require(id == expected && fd >= 3)?;
@@ -734,11 +802,22 @@ mod tests {
             "right": super::CT_DIRECTION_REPLY
         });
         let mut rendered = String::new();
-        super::render_match(&mut rendered, &selector, None).unwrap();
+        super::render_match(
+            &mut rendered,
+            &selector,
+            None,
+            &super::InstanceCgroups::new(),
+        )
+        .unwrap();
         assert_eq!(rendered, "ct direction reply");
         selector["right"] = json!(0);
         assert_eq!(
-            super::render_match(&mut String::new(), &selector, None),
+            super::render_match(
+                &mut String::new(),
+                &selector,
+                None,
+                &super::InstanceCgroups::new()
+            ),
             Err(NftError::Invalid)
         );
     }

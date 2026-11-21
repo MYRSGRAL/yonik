@@ -1,6 +1,6 @@
 use super::*;
 use crate::managed_network::firewall::{
-    BoundTransport, IpPrefix, LanException, PrivateRoute, TransportProtocol,
+    BoundTransport, DHCPCD_CGROUP_PATH, IpPrefix, LanException, PrivateRoute, TransportProtocol,
 };
 
 fn policy() -> PublicBlockPolicy {
@@ -529,7 +529,7 @@ fn dhcpcd_сверяет_форму_правил_ядра_и_порядок_вы
     .unwrap();
     assert_eq!(
         handles.dhcpcd_route,
-        BTreeMap::from([(route_handle, NonZeroU64::new(2500).unwrap())])
+        BTreeMap::from([(route_handle, (NonZeroU64::new(2500).unwrap(), 2))])
     );
     assert_eq!(check(&live, &table, &policy), Ok(()));
     for (path, altered) in [
@@ -552,6 +552,59 @@ fn dhcpcd_сверяет_форму_правил_ядра_и_порядок_вы
         .as_array_mut()
         .unwrap()
         .swap(accept, accept + 1);
+    assert_eq!(check(&live, &table, &policy), Err(NftError::Evidence));
+}
+
+#[test]
+fn dhcpcd_instance_требует_уровень_и_точную_cgroup_по_ifname() {
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap(),
+    )
+    .unwrap();
+    wire["dhcp_renewal_anchor"] = json!(true);
+    wire["dhcp_renewal_rule"] = json!({
+        "ifindex":7,"ifname":"test-dhcp","address":"192.0.2.10","server":"192.0.2.1",
+        "uid":0,"dhcpcd":true,"dhcpcd_instance":true,"cgroup_id":2500,"dscp":0,"mark":0,
+        "namespace_device":3,"namespace_inode":11
+    });
+    wire["dhcpcd_route"] = json!({"source":"198.19.7.1","mark":1000});
+    let policy: PublicBlockPolicy = serde_json::from_value(wire).unwrap();
+    let instance = crate::helper::dhcp_networkd::dhcpcd_instance_cgroup("test-dhcp").unwrap();
+    let table = block_table(owner(), 2, 5, &policy);
+    let mut live = listing(&table, &policy);
+    assert_eq!(check(&live, &table, &policy), Ok(()));
+
+    let mut instances = BTreeMap::new();
+    instances.insert(instance.clone(), (2500, 9));
+    let script = String::from_utf8(
+        text::render_with_instances(&policy.commands(&table.name), None, &instances).unwrap(),
+    )
+    .unwrap();
+    assert!(script.contains("socket cgroupv2 level 3 \"../../../proc/self/fd/9\""));
+
+    let route_index = live["nftables"]
+        .as_array_mut()
+        .unwrap()
+        .iter()
+        .position(|item| {
+            item.pointer("/rule/chain").and_then(Value::as_str) == Some(DHCPCD_ROUTE_CHAIN)
+        })
+        .unwrap();
+    live["nftables"][route_index]["rule"]["expr"][10]["match"]["left"]["socket"]
+        .as_object_mut()
+        .unwrap()
+        .remove("level");
+    assert_eq!(check(&live, &table, &policy), Ok(()));
+    live["nftables"][route_index]["rule"]["expr"][10]["match"]["left"]["socket"]["level"] =
+        json!(2);
+    assert_eq!(check(&live, &table, &policy), Err(NftError::Evidence));
+    live["nftables"][route_index]["rule"]["expr"][10]["match"]["left"]["socket"]["level"] =
+        json!(3);
+    live["nftables"][route_index]["rule"]["expr"][10]["match"]["right"] = json!(DHCPCD_CGROUP_PATH);
+    assert_eq!(check(&live, &table, &policy), Err(NftError::Evidence));
+    live["nftables"][route_index]["rule"]["expr"][10]["match"]["right"] = json!(instance);
+    live["nftables"][route_index]["rule"]["expr"][11]["match"]["left"]["concat"][3] =
+        json!("other-iface");
     assert_eq!(check(&live, &table, &policy), Err(NftError::Evidence));
 }
 

@@ -1,9 +1,10 @@
 //! Типизированная публичная блокировка. Проверка принадлежности интерфейсов — задача адаптера.
-use crate::helper::dhcp_networkd::NETWORKD_DSCPS;
+use crate::helper::dhcp_networkd::{NETWORKD_DSCPS, dhcpcd_instance_cgroup};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
@@ -269,6 +270,8 @@ struct DhcpRule {
     network_manager: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     dhcpcd: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    dhcpcd_instance: bool,
     cgroup_id: NonZeroU64,
     dscp: u8,
     mark: u32,
@@ -318,6 +321,7 @@ impl DhcpRule {
             uid: path.uid,
             network_manager: path.network_manager,
             dhcpcd: path.dhcpcd,
+            dhcpcd_instance: path.dhcpcd_instance,
             cgroup_id: path.cgroup_id,
             dscp: mask.trailing_zeros() as u8,
             mark: path.route_mark,
@@ -331,14 +335,31 @@ impl DhcpRule {
         (1 << self.dscp) | self.additional_dscps.map_or(0, NonZeroU64::get)
     }
 
-    fn cgroup_path(&self) -> &'static str {
-        if self.network_manager {
+    fn cgroup_path(&self) -> Cow<'static, str> {
+        if self.dhcpcd_instance {
+            return Cow::Owned(
+                dhcpcd_instance_cgroup(&String::from(self.ifname))
+                    .expect("Имя экземпляра проверено при построении политики"),
+            );
+        }
+        Cow::Borrowed(if self.network_manager {
             NM_DHCP_CGROUP_PATH
         } else if self.dhcpcd {
             DHCPCD_CGROUP_PATH
         } else {
             DHCP_CGROUP_PATH
-        }
+        })
+    }
+
+    fn cgroup_selector(&self) -> Value {
+        compare(
+            json!({"socket":{"key":"cgroupv2","level":self.cgroup_level()}}),
+            json!(self.cgroup_path()),
+        )
+    }
+
+    fn cgroup_level(&self) -> u8 {
+        if self.dhcpcd_instance { 3 } else { 2 }
     }
 
     fn requires_root(&self) -> bool {
@@ -364,10 +385,7 @@ impl DhcpRule {
                 compare(payload("udp", "dport"), json!(67)),
                 compare(payload("ip", "dscp"), json!(dscp)),
                 meta("mark", json!(self.mark)),
-                compare(
-                    json!({"socket":{"key":"cgroupv2","level":2}}),
-                    json!(self.cgroup_path()),
-                ),
+                self.cgroup_selector(),
                 compare(addresses_and_link, json!(format!("@{DHCP_RENEWAL_SET}"))),
                 json!({"accept":null}),
             ],
@@ -396,10 +414,7 @@ impl DhcpRule {
                 ),
                 compare(payload("ip", "dscp"), json!(self.dscp)),
                 meta("mark", json!(self.mark)),
-                compare(
-                    json!({"socket":{"key":"cgroupv2","level":2}}),
-                    json!(DHCPCD_CGROUP_PATH),
-                ),
+                self.cgroup_selector(),
                 compare(
                     json!({"concat":[self.address,payload("ip","daddr"),self.ifindex,self.ifname]}),
                     json!(format!("@{DHCP_RENEWAL_SET}")),
@@ -857,11 +872,11 @@ impl PublicBlockPolicy {
         Ok(self)
     }
 
-    pub(super) fn dhcpcd_cgroup_id(&self) -> Option<NonZeroU64> {
+    pub(super) fn dhcp_instance_cgroups(&self) -> impl Iterator<Item = (String, NonZeroU64)> + '_ {
         self.dhcp_rules()
             .iter()
-            .find(|rule| rule.dhcpcd)
-            .map(|rule| rule.cgroup_id)
+            .filter(|rule| rule.dhcpcd_instance)
+            .map(|rule| (rule.cgroup_path().into_owned(), rule.cgroup_id))
     }
 
     /// Добавляет правило для проверенного сокета. Набор разрешённых лизингов пуст.
@@ -890,14 +905,8 @@ impl PublicBlockPolicy {
         }) {
             return Err(PolicyError::Interface);
         }
-        for path in [DHCP_CGROUP_PATH, NM_DHCP_CGROUP_PATH, DHCPCD_CGROUP_PATH] {
-            let mut group = rules.iter().filter(|rule| rule.cgroup_path() == path);
-            if let Some(first) = group.next() {
-                if group.any(|rule| rule.cgroup_id != first.cgroup_id || rule.uid != first.uid) {
-                    return Err(PolicyError::Interface);
-                }
-            }
-        }
+        let mut group_identities = std::collections::BTreeMap::new();
+        let mut instance_ids = std::collections::BTreeSet::new();
         for rule in &rules {
             let name = String::from(rule.ifname);
             if !self.dhcp_renewal_anchor
@@ -905,12 +914,23 @@ impl PublicBlockPolicy {
                 || Some(rule.ifindex) == self.tun_ifindex
                 || rule.dscp > 63
                 || (rule.network_manager && rule.dhcpcd)
+                || (rule.dhcpcd_instance
+                    && (!rule.dhcpcd
+                        || dhcpcd_instance_cgroup(&name).is_none()
+                        || !instance_ids.insert(rule.cgroup_id)))
                 || (rule.uid == 0) != rule.requires_root()
                 || rule.uid == u32::MAX
                 || (rule.requires_root() && rule.additional_dscps.is_some())
                 || !name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+            {
+                return Err(PolicyError::Interface);
+            }
+            let identity = (rule.cgroup_id, rule.uid);
+            if group_identities
+                .insert(rule.cgroup_path(), identity)
+                .is_some_and(|previous| previous != identity || rule.dhcpcd_instance)
             {
                 return Err(PolicyError::Interface);
             }
@@ -956,9 +976,9 @@ impl PublicBlockPolicy {
     pub(super) fn dhcp_cgroup_for_interface(
         &self,
         index: NonZeroU32,
-    ) -> Option<(&'static str, NonZeroU64)> {
+    ) -> Option<(Cow<'static, str>, NonZeroU64, u8)> {
         let rule = self.dhcp_rule(index)?;
-        Some((rule.cgroup_path(), rule.cgroup_id))
+        Some((rule.cgroup_path(), rule.cgroup_id, rule.cgroup_level()))
     }
 
     fn dhcp_rule(&self, index: NonZeroU32) -> Option<&DhcpRule> {
@@ -1620,11 +1640,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             mixed.dhcp_cgroup_for_interface(networkd.ifindex),
-            Some((DHCP_CGROUP_PATH, networkd.cgroup_id))
+            Some((Cow::Borrowed(DHCP_CGROUP_PATH), networkd.cgroup_id, 2))
         );
         assert_eq!(
             mixed.dhcp_cgroup_for_interface(nm.ifindex),
-            Some((NM_DHCP_CGROUP_PATH, nm.cgroup_id))
+            Some((Cow::Borrowed(NM_DHCP_CGROUP_PATH), nm.cgroup_id, 2))
         );
         let persisted = serde_json::to_value(&mixed).unwrap();
         assert_eq!(
@@ -1679,7 +1699,11 @@ mod tests {
         assert_eq!(serde_json::to_value(&restored).unwrap(), persisted);
         assert_eq!(
             restored.dhcp_cgroup_for_interface(NonZeroU32::new(3).unwrap()),
-            Some(("system.slice/dhcpcd.service", NonZeroU64::new(31).unwrap()))
+            Some((
+                Cow::Borrowed(DHCPCD_CGROUP_PATH),
+                NonZeroU64::new(31).unwrap(),
+                2
+            ))
         );
 
         let mut changed = persisted.clone();
@@ -1708,6 +1732,48 @@ mod tests {
         assert!(serde_json::from_value::<PublicBlockPolicy>(persisted.clone()).is_ok());
         persisted["dhcp_renewal_rule"][2]["cgroup_id"] = json!(32);
         assert!(serde_json::from_value::<PublicBlockPolicy>(persisted).is_err());
+    }
+
+    #[test]
+    fn dhcpcd_instance_requires_a_unique_group_for_its_interface() {
+        let first = json!({
+            "ifindex": 3, "ifname": "test-wifi", "address": "192.0.2.10",
+            "server": "192.0.2.1", "uid": 0, "cgroup_id": 31,
+            "dscp": 0, "mark": 0, "namespace_device": 4, "namespace_inode": 5,
+            "dhcpcd": true, "dhcpcd_instance": true
+        });
+        let mut second = first.clone();
+        second["ifindex"] = json!(4);
+        second["ifname"] = json!("eth0.100");
+        second["address"] = json!("192.0.2.11");
+        second["cgroup_id"] = json!(32);
+        let mut persisted = serde_json::to_value(
+            policy(vec![], vec![], vec![])
+                .with_dhcp_renewal_anchor(true)
+                .unwrap(),
+        )
+        .unwrap();
+        persisted["dhcp_renewal_rule"] = json!([first, second]);
+        let restored: PublicBlockPolicy = serde_json::from_value(persisted.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), persisted);
+        assert_eq!(
+            restored.dhcp_cgroup_for_interface(NonZeroU32::new(3).unwrap()),
+            Some((
+                Cow::Borrowed("system.slice/system-dhcpcd.slice/dhcpcd@test\\x2dwifi.service"),
+                NonZeroU64::new(31).unwrap(),
+                3,
+            ))
+        );
+        assert_eq!(restored.dhcp_instance_cgroups().count(), 2);
+        for (field, value) in [
+            ("ifname", json!("test-wifi")),
+            ("cgroup_id", json!(31)),
+            ("dhcpcd", json!(false)),
+        ] {
+            let mut invalid = persisted.clone();
+            invalid["dhcp_renewal_rule"][1][field] = value;
+            assert!(serde_json::from_value::<PublicBlockPolicy>(invalid).is_err());
+        }
     }
 
     #[test]

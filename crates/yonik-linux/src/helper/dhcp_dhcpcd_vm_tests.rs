@@ -1,6 +1,8 @@
 use super::{
-    dhcp_dhcpcd_control::read_lease, memory::ByteBudget, resolver_stub::CaptureCredits,
-    systemd_network_service::same_pid,
+    dhcp_dhcpcd_control::read_lease,
+    memory::ByteBudget,
+    resolver_stub::CaptureCredits,
+    systemd_network_service::{dhcpcd_daemon, same_pid, trusted_connection},
 };
 use crate::{
     Cancellation,
@@ -31,6 +33,20 @@ async fn native_dhcpcd_reads_instance_control_socket() -> Result<(), Box<dyn std
     assert_eq!(
         fs::read_to_string(format!("/proc/{}/cgroup", lease.peer_pid))?,
         "0::/system.slice/system-dhcpcd.slice/dhcpcd@dhcpcd\\x2dprobe.service\n"
+    );
+    let connection = trusted_connection().await?;
+    let bus = zbus::fdo::DBusProxy::new(&connection).await?;
+    let daemon = dhcpcd_daemon(&connection, &bus, lease.peer_pid, "dhcpcd-probe").await?;
+    let group = fs::metadata(
+        "/sys/fs/cgroup/system.slice/system-dhcpcd.slice/dhcpcd@dhcpcd\\x2dprobe.service",
+    )?;
+    assert!(daemon.dhcpcd_instance && daemon.pid == lease.peer_pid);
+    assert_eq!(daemon.group.0, group.dev());
+    assert_eq!(daemon.group.1.get(), group.ino());
+    assert!(
+        dhcpcd_daemon(&connection, &bus, lease.peer_pid, "other")
+            .await
+            .is_err()
     );
     Ok(())
 }
