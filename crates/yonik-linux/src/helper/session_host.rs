@@ -17,7 +17,8 @@ use crate::helper::{
     },
 };
 use crate::{
-    Cancellation, KernelRoute, LinuxLink, LinuxTopology, NetworkStamp, RouteKind, RouteQuery,
+    Cancellation, KernelRoute, LinuxLink, LinuxTopology, NetworkReadError, NetworkStamp, RouteKind,
+    RouteQuery,
     managed_network::{
         PublicPolicyPhase, QuarantineIntent, Resource, Scope,
         firewall::{BoundDirect, MAX_BOUND_DIRECT, PrivateRoute, ResolverTls},
@@ -25,7 +26,8 @@ use crate::{
     },
     network::{
         RouteCapture, TopologyCapture, lookup_route_captured, read_topology_captured,
-        reread_changed_route, same_captured_kernel_route, same_captured_topology,
+        reread_changed_route, reread_changed_topology, same_captured_kernel_route,
+        same_captured_topology,
     },
     read_topology,
     worker::WorkerPayload,
@@ -1337,6 +1339,73 @@ fn fresh_cancel() -> (tokio::sync::watch::Sender<bool>, Cancellation) {
 }
 
 impl Backend {
+    async fn capture_session_baseline(
+        &self,
+        uid: u32,
+        cancel: &mut Cancellation,
+    ) -> Result<
+        (
+            NetworkStamp,
+            PreparedContext,
+            LinuxTopology,
+            TopologyCapture,
+        ),
+        ServiceError,
+    > {
+        const IFA_F_TENTATIVE: u32 = 0x40;
+        const IFA_F_DADFAILED: u32 = 0x08;
+        const IFF_RUNNING: u32 = 0x40;
+
+        let mut watch = self.watch.clone();
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                cancel.check().map_err(|_| ServiceError::Cancelled)?;
+                if !watch.is_open() {
+                    return Err(ServiceError::Unavailable);
+                }
+                let stamp = self.snapshot()?.stamp;
+                let (topology, capture) = reread_changed_topology(cancel, DEADLINE).await.map_err(
+                    |error| match error {
+                        NetworkReadError::Cancelled => ServiceError::Cancelled,
+                        _ => unavailable(error),
+                    },
+                )?;
+                // Завершение DAD меняет флаги IPv6-адреса и может добавить
+                // маршрут. Снимок для Prepare берём заново после этого события.
+                let mut pending: BTreeSet<_> = topology
+                    .addresses
+                    .iter()
+                    .filter(|address| {
+                        address.address.is_ipv6()
+                            && address.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED)
+                                == IFA_F_TENTATIVE
+                    })
+                    .map(|address| address.index)
+                    .collect();
+                for link in &topology.links {
+                    // На неработающем линке tentative-адрес может остаться бессрочно.
+                    if link.flags & (IFF_UP | IFF_RUNNING) != IFF_UP | IFF_RUNNING {
+                        pending.remove(&link.index);
+                    }
+                }
+                if pending.is_empty() {
+                    let context = self.context(uid)?;
+                    if watch.is_open() && self.snapshot()?.is_current(stamp) {
+                        return Ok((stamp, context, topology, capture));
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(ServiceError::Cancelled),
+                    changed = watch.changed() => changed.map_err(unavailable)?,
+                }
+            }
+        })
+        .await
+        .map_err(|_| stale())?
+    }
+
     pub(super) async fn recover_quarantine(
         &mut self,
     ) -> Result<Option<std::time::Instant>, ServiceError> {
@@ -1442,11 +1511,8 @@ impl Backend {
             return Err(ServiceError::Unsupported);
         }
         let owner = self.owner(uid)?;
-        let context = self.context(uid)?;
-        let stamp = self.snapshot()?.stamp;
-        let (baseline, baseline_capture) = read_topology_captured(cancel, DEADLINE)
-            .await
-            .map_err(unavailable)?;
+        let (stamp, context, baseline, baseline_capture) =
+            self.capture_session_baseline(uid, cancel).await?;
         let bytes = topology_bytes(&baseline);
         if bytes > MAX_BASELINE_BYTES {
             return Err(ServiceError::Unavailable);
@@ -1884,12 +1950,9 @@ impl Backend {
             .into_server()
             .map_err(|_| ServiceError::InvalidRequest)?;
         let (endpoint, protocol) = endpoint(&server)?;
-        let context = self.context(uid)?;
-        let stamp = self.snapshot()?.stamp;
         let owner = self.owner(uid)?;
-        let (baseline, baseline_capture) = read_topology_captured(cancel, DEADLINE)
-            .await
-            .map_err(unavailable)?;
+        let (stamp, context, baseline, baseline_capture) =
+            self.capture_session_baseline(uid, cancel).await?;
         let bytes = topology_bytes(&baseline);
         if bytes > MAX_BASELINE_BYTES {
             return Err(ServiceError::Unavailable);

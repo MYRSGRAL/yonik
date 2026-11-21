@@ -1411,6 +1411,10 @@ async fn installed_fake_dns_after_network_change_in_vm(
                     wait_for_networkmanager_after_suspend(previous_acks).await?;
                 }
                 let state = state_after_route_events(&connection).await?;
+                require(
+                    !networkmanager_suspend || state["state"] != "tunnel_starting",
+                    "Стенд NetworkManager не остановил старую сессию после смены сети",
+                )?;
                 let mut current = (old_v4, old_v6);
                 if state["state"] != "tunnel_starting" {
                     require(
@@ -1432,6 +1436,9 @@ async fn installed_fake_dns_after_network_change_in_vm(
                         call(&connection, "Unlock", empty.clone()).await?;
                     }
                     check_only_fake_is_filtered(old_v4, old_v6).await?;
+                    if networkmanager_suspend {
+                        begin_fixture_ipv6_dad()?;
+                    }
                     drain = start_fake_dns_in_vm(
                         &connection,
                         &server,
@@ -1441,6 +1448,12 @@ async fn installed_fake_dns_after_network_change_in_vm(
                         &token,
                     )
                     .await?;
+                    if networkmanager_suspend {
+                        check_fixture_ipv6_dad(false)?;
+                        eprintln!(
+                            "{engine:?}: повторное подключение дождалось завершения IPv6 DAD"
+                        );
+                    }
                     current = (
                         getent_fake_dns("ahostsv4", "example.test").await?,
                         getent_fake_dns("ahostsv6", "example.test").await?,
@@ -1476,6 +1489,22 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 "Worker не остановлен после продления DHCP",
             )?;
             require(dhcp_renewal_set()?.is_none(), "Набор DHCP пережил Stop")?;
+            if networkmanager_suspend && state_fixture_ipv6_dad()?.contains(FIXTURE_DAD_ADDRESS) {
+                require(
+                    Command::new("ip")
+                        .args([
+                            "-6",
+                            "address",
+                            "del",
+                            FIXTURE_DAD_ADDRESS,
+                            "dev",
+                            "yonik-outer",
+                        ])
+                        .status()?
+                        .success(),
+                    "Стенд не удалил проверочный IPv6-адрес",
+                )?;
+            }
             if kill_switch {
                 call(&connection, "Unlock", empty.clone()).await?;
             }
@@ -1721,6 +1750,58 @@ async fn fixture_suspend_and_check_dhcp(allow_absent: bool) -> Result {
         state.trim() == "empty" || (allow_absent && state.trim() == "absent"),
         "Перед S3 сохранялось действующее DHCP-разрешение",
     )
+}
+
+#[cfg(feature = "test-support")]
+const FIXTURE_DAD_ADDRESS: &str = "2001:db8:7470:53::1/128";
+
+#[cfg(feature = "test-support")]
+fn state_fixture_ipv6_dad() -> Result<String> {
+    let output = Command::new("ip")
+        .args([
+            "-6",
+            "-o",
+            "address",
+            "show",
+            "dev",
+            "yonik-outer",
+            "to",
+            FIXTURE_DAD_ADDRESS,
+        ])
+        .output()?;
+    require(output.status.success(), "Стенд не прочитал IPv6-адрес")?;
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+#[cfg(feature = "test-support")]
+fn check_fixture_ipv6_dad(pending: bool) -> Result {
+    let state = state_fixture_ipv6_dad()?;
+    require(
+        state.contains(FIXTURE_DAD_ADDRESS)
+            && state.split_whitespace().any(|field| field == "tentative") == pending
+            && !state.split_whitespace().any(|field| field == "dadfailed"),
+        "Состояние IPv6 DAD на проверочном интерфейсе не совпало с ожидаемым",
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn begin_fixture_ipv6_dad() -> Result {
+    fs::write("/proc/sys/net/ipv6/conf/yonik-outer/dad_transmits", "2\n")?;
+    require(
+        Command::new("ip")
+            .args([
+                "-6",
+                "address",
+                "add",
+                FIXTURE_DAD_ADDRESS,
+                "dev",
+                "yonik-outer",
+            ])
+            .status()?
+            .success(),
+        "Стенд не добавил IPv6-адрес для проверки DAD",
+    )?;
+    check_fixture_ipv6_dad(true)
 }
 
 #[cfg(feature = "test-support")]
