@@ -3,7 +3,7 @@
 use super::{MAX_OUTPUT, NftError};
 use crate::managed_network::firewall::{
     CT_DIRECTION_REPLY, DHCP_CGROUP_PATH as DHCP_CGROUP, DHCP_RENEWAL_CHAIN as DHCP_CHAIN,
-    DHCP_RENEWAL_SET as DHCP_SET, DhcpRenewalKey, MAX_DHCP_RENEWALS,
+    DHCP_RENEWAL_SET as DHCP_SET, DhcpRenewalKey, MAX_DHCP_RENEWALS, NM_DHCP_CGROUP_PATH,
 };
 use serde_json::Value;
 use std::{fmt::Write as _, net::IpAddr};
@@ -217,6 +217,14 @@ fn require_dhcp_selectors(expressions: &[Value]) -> Result<()> {
         "concat",
     ];
     require(expressions.len() == required.len())?;
+    let uid = expressions[5]
+        .pointer("/match/right")
+        .ok_or(NftError::Invalid)?;
+    let cgroup = if number(uid, 0, u64::from(u32::MAX - 1))? == 0 {
+        NM_DHCP_CGROUP_PATH
+    } else {
+        DHCP_CGROUP
+    };
     for (expr, expected) in expressions.iter().zip(required) {
         let ("match", fields) = single(expr)? else {
             return Err(NftError::Invalid);
@@ -233,7 +241,7 @@ fn require_dhcp_selectors(expressions: &[Value]) -> Result<()> {
             "ip saddr" | "ip daddr" => right.is_string(),
             "udp sport" => right.as_u64() == Some(68),
             "udp dport" => right.as_u64() == Some(67),
-            "socket" => right.as_str() == Some(DHCP_CGROUP),
+            "socket" => right.as_str() == Some(cgroup),
             _ => true,
         })?;
     }
@@ -313,11 +321,8 @@ fn render_match(
             let [name, level] = exact(data, ["key", "level"])?;
             require(op == "==" && text(name)? == "cgroupv2")?;
             let level = number(level, 2, 2)?;
-            return if right.as_str() == Some(DHCP_CGROUP) {
-                write_fmt(write!(
-                    script,
-                    "socket cgroupv2 level {level} \"{DHCP_CGROUP}\""
-                ))
+            return if let Some(path @ (DHCP_CGROUP | NM_DHCP_CGROUP_PATH)) = right.as_str() {
+                write_fmt(write!(script, "socket cgroupv2 level {level} \"{path}\""))
             } else {
                 let id = number(right, 1, u64::MAX)?;
                 let (expected, fd) = resolver.ok_or(NftError::Evidence)?;

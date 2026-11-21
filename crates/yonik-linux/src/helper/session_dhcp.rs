@@ -42,10 +42,10 @@ async fn capture_leases(
                 diagnostic_result(
                     "dhcp_capture_lease",
                     tokio::time::timeout(DHCP_PROBE_TIMEOUT, async {
-                        let result = DhcpNetworkdLease::capture(index, &mut token).await;
+                        let result = DhcpNetworkdLease::capture_managed(index, &mut token).await;
                         // ACK может обновить лизинг или закрыть временный сокет между чтениями.
                         if matches!(result, Err(crate::NetworkReadError::Changed)) {
-                            DhcpNetworkdLease::capture(index, &mut token).await
+                            DhcpNetworkdLease::capture_managed(index, &mut token).await
                         } else {
                             result
                         }

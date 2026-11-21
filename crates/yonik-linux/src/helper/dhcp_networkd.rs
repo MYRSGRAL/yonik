@@ -1,10 +1,10 @@
-//! Привязка DHCPv4-лизинга networkd к маршруту и проверяемым параметрам пакета.
+//! Привязка системного DHCPv4-лизинга к маршруту и параметрам сокета.
 
 use super::{
     memory::ByteBudget,
     resolver_stub::CaptureCredits,
     systemd_network_service::{
-        Daemon, NetworkService, daemon as capture_daemon, same_pid, trusted_connection,
+        Daemon, NetworkService, daemon as capture_daemon, property, same_pid, trusted_connection,
     },
 };
 use crate::{
@@ -25,6 +25,7 @@ use rustix::{
 };
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     net::Ipv4Addr,
     num::{NonZeroU32, NonZeroU64},
     os::fd::OwnedFd,
@@ -32,7 +33,12 @@ use std::{
     time::Duration,
 };
 use tokio::time::Instant;
-use zbus::{Connection, fdo::DBusProxy, names::OwnedUniqueName};
+use zbus::{
+    Connection,
+    fdo::DBusProxy,
+    names::OwnedUniqueName,
+    zvariant::{OwnedObjectPath, OwnedValue},
+};
 
 const VALIDITY: Duration = Duration::from_secs(2);
 pub(crate) const DHCP_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -56,10 +62,23 @@ struct Lease {
     address: Ipv4Addr,
     server: Ipv4Addr,
     prefix: u8,
-    acquired: u64,
-    t1: u64,
-    t2: u64,
-    address_lifetimes: Option<[u64; 2]>,
+    timing: LeaseTiming,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LeaseTiming {
+    Networkd {
+        acquired: u64,
+        t1: u64,
+        t2: u64,
+        address_lifetimes: Option<[u64; 2]>,
+    },
+    NetworkManager {
+        config: OwnedObjectPath,
+        acquired: u64,
+        expiry: u64,
+        duration: u32,
+    },
 }
 
 #[derive(Deserialize)]
@@ -150,10 +169,12 @@ fn parse_lease(json: &str, index: u32, now: u64) -> Result<Lease, Error> {
         address: address_bytes,
         server,
         prefix: address.prefix_length,
-        acquired: lease.acquired,
-        t1: lease.t1,
-        t2: lease.t2,
-        address_lifetimes,
+        timing: LeaseTiming::Networkd {
+            acquired: lease.acquired,
+            t1: lease.t1,
+            t2: lease.t2,
+            address_lifetimes,
+        },
     })
 }
 
@@ -168,12 +189,14 @@ fn ipv4(bytes: Vec<u8>) -> Result<Ipv4Addr, Error> {
 
 pub struct DhcpNetworkdLease {
     lease: Lease,
+    service: NetworkService,
     daemon: Daemon,
     namespace: NetworkNamespace,
     socket: Option<Listener>,
     routes: Vec<(KernelRoute, RouteCapture)>,
     pidfd: OwnedFd,
     expires: u64,
+    address_lifetimes: Option<[u64; 2]>,
     cancellation: Cancellation,
     revoked: bool,
 }
@@ -181,6 +204,26 @@ pub struct DhcpNetworkdLease {
 impl DhcpNetworkdLease {
     /// Читает только networkd и ядро. Разрешение nft требует отдельной установки.
     pub async fn capture(index: NonZeroU32, cancel: &mut Cancellation) -> Result<Self, Error> {
+        Self::capture_service(index, NetworkService::Networkd, cancel).await
+    }
+
+    pub(super) async fn capture_managed(
+        index: NonZeroU32,
+        cancel: &mut Cancellation,
+    ) -> Result<Self, Error> {
+        match Self::capture(index, cancel).await {
+            Err(Error::Unavailable | Error::Unsupported) => {
+                Self::capture_service(index, NetworkService::NetworkManager, cancel).await
+            }
+            result => result,
+        }
+    }
+
+    async fn capture_service(
+        index: NonZeroU32,
+        service: NetworkService,
+        cancel: &mut Cancellation,
+    ) -> Result<Self, Error> {
         cancel.check().map_err(|_| Error::Cancelled)?;
         let deadline = Instant::now() + VALIDITY;
         let expires = boottime()?
@@ -190,7 +233,7 @@ impl DhcpNetworkdLease {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(Error::Cancelled),
-            result = tokio::time::timeout_at(deadline, collect(index, &mut operation_cancel, deadline, expires)) =>
+            result = tokio::time::timeout_at(deadline, collect(index, service, &mut operation_cancel, deadline, expires)) =>
                 result.map_err(|_| Error::Timeout)?,
         }
     }
@@ -200,7 +243,7 @@ impl DhcpNetworkdLease {
         let now = boottime().ok()?;
         if self.revoked
             || self.cancellation.check().is_err()
-            || now >= self.expires.min(self.lease.t2)
+            || now >= self.expires
             || !same_pid(&self.pidfd, self.daemon.pid).ok()?
         {
             return None;
@@ -211,7 +254,11 @@ impl DhcpNetworkdLease {
             ifname: &self.lease.name,
             address: self.lease.address,
             prefix_len: self.lease.prefix,
-            acquired: self.lease.acquired,
+            acquired: match self.lease.timing {
+                LeaseTiming::Networkd { acquired, .. }
+                | LeaseTiming::NetworkManager { acquired, .. } => acquired,
+            },
+            network_manager: self.service == NetworkService::NetworkManager,
             server: self.lease.server,
             uid: self.daemon.uid,
             cgroup_id: self.daemon.group.1,
@@ -225,7 +272,7 @@ impl DhcpNetworkdLease {
                 .routes
                 .iter()
                 .fold(0, |mask, (route, _)| mask | (1 << (route.query.tos() >> 2))),
-            expires_boottime_micros: self.expires.min(self.lease.t2),
+            expires_boottime_micros: self.expires,
         })
     }
 
@@ -237,7 +284,7 @@ impl DhcpNetworkdLease {
     }
 
     pub(crate) fn address_expiries(&self) -> Option<[Instant; 2]> {
-        let [preferred, valid] = self.lease.address_lifetimes?;
+        let [preferred, valid] = self.address_lifetimes?;
         let now = boottime().ok()?;
         let sample = Instant::now();
         let expiry =
@@ -253,13 +300,14 @@ impl DhcpNetworkdLease {
         if !was_current {
             return Err(Error::Changed);
         }
-        let mut current = Self::capture(
+        let mut current = Self::capture_service(
             NonZeroU32::new(self.lease.index).ok_or(Error::Malformed)?,
+            self.service,
             cancel,
         )
         .await?;
         self.cancellation.check().map_err(|_| Error::Cancelled)?;
-        if boottime()? >= self.expires.min(self.lease.t2)
+        if boottime()? >= self.expires
             || !same_pid(&self.pidfd, self.daemon.pid)?
             || self.daemon != current.daemon
             || self.lease != current.lease
@@ -287,6 +335,7 @@ pub struct DhcpRenewalPath<'a> {
     pub address: Ipv4Addr,
     pub prefix_len: u8,
     pub(crate) acquired: u64,
+    pub(crate) network_manager: bool,
     pub server: Ipv4Addr,
     pub uid: u32,
     pub cgroup_id: NonZeroU64,
@@ -300,41 +349,67 @@ pub struct DhcpRenewalPath<'a> {
 
 async fn collect(
     index: NonZeroU32,
+    service: NetworkService,
     cancel: &mut Cancellation,
     deadline: Instant,
     expires: u64,
 ) -> Result<DhcpNetworkdLease, Error> {
     let connection = trusted_connection().await?;
     let bus = DBusProxy::new(&connection).await.map_err(unavailable)?;
-    let daemon = capture_daemon(&connection, &bus, NetworkService::Networkd).await?;
+    let daemon = capture_daemon(&connection, &bus, service).await?;
     let raw = i32::try_from(daemon.pid).map_err(unavailable)?;
     let pidfd = pidfd_open(
         Pid::from_raw(raw).ok_or(Error::Malformed)?,
         PidfdFlags::NONBLOCK,
     )
     .map_err(unavailable)?;
-    let lease = describe(&connection, &daemon.owner, index.get()).await?;
     let (topology, timing) = read_topology_captured(cancel, remaining(deadline)?).await?;
     let link = topology
         .links
         .iter()
         .find(|link| link.index == index.get())
         .ok_or(Error::Changed)?;
+    let ifname = std::str::from_utf8(&link.name).map_err(|_| Error::Unsupported)?;
+    let describe_current = || async {
+        match service {
+            NetworkService::Networkd => describe(&connection, &daemon.owner, index.get()).await,
+            NetworkService::NetworkManager => {
+                describe_network_manager(&connection, &daemon.owner, index.get(), ifname).await
+            }
+            NetworkService::Resolved => Err(Error::Unsupported),
+        }
+    };
+    let lease = describe_current().await?;
     // UP и LOWER_UP, ARPHRD_ETHER. Не выдаём доказательство для down/loopback.
     if link.flags & (1 | 0x10000) != (1 | 0x10000)
         || link.link_type != 1
         || link.name != lease.name.as_bytes()
-        || !topology.addresses.iter().any(|address| {
+    {
+        return Err(Error::Changed);
+    }
+    let kernel_address = topology
+        .addresses
+        .iter()
+        .find(|address| {
             address.index == index.get()
                 && address.family == 2
                 && address.prefix_len == lease.prefix
                 && address.local.unwrap_or(address.address) == lease.address
                 && address.flags & (0x08 | 0x40) == 0
         })
-    {
-        return Err(Error::Changed);
-    }
-    let socket = sample_socket(topology.namespace, &lease, &daemon, deadline).await?;
+        .ok_or(Error::Changed)?;
+    let (cutoff, address_lifetimes) = match lease.timing {
+        LeaseTiming::Networkd {
+            t2,
+            address_lifetimes,
+            ..
+        } => (t2, address_lifetimes),
+        LeaseTiming::NetworkManager {
+            expiry, duration, ..
+        } => network_manager_expiries(kernel_address, expiry, duration, timing.family(2).start)?,
+    };
+    let expires = expires.min(cutoff);
+    let socket = sample_socket(topology.namespace, &lease, &daemon, service, deadline).await?;
     let observed = socket
         .map(|socket| socket.tos.zip(socket.mark).ok_or(Error::Unsupported))
         .transpose()?;
@@ -343,6 +418,7 @@ async fn collect(
     // networkd может открыть сокет вместе с первой отправкой. Проверяем
     // каждый штатный DSCP, который nftables сможет проверить на самом пакете.
     let candidates = match &observed {
+        Some((tos, _)) if service == NetworkService::NetworkManager => std::slice::from_ref(tos),
         Some((tos, mark)) if *mark != 0 || !standard.contains(tos) => std::slice::from_ref(tos),
         _ => &standard,
     };
@@ -393,22 +469,24 @@ async fn collect(
     }
     let (after, after_timing) = read_topology_captured(cancel, remaining(deadline)?).await?;
     if !same_captured_topology(&topology, timing, &after, after_timing)
-        || lease != describe(&connection, &daemon.owner, index.get()).await?
-        || daemon != capture_daemon(&connection, &bus, NetworkService::Networkd).await?
-        || socket != sample_socket(topology.namespace, &lease, &daemon, deadline).await?
+        || lease != describe_current().await?
+        || daemon != capture_daemon(&connection, &bus, service).await?
+        || socket != sample_socket(topology.namespace, &lease, &daemon, service, deadline).await?
         || !same_pid(&pidfd, daemon.pid)?
-        || boottime()? >= expires.min(lease.t2)
+        || boottime()? >= expires
     {
         return Err(Error::Changed);
     }
     Ok(DhcpNetworkdLease {
         lease,
+        service,
         daemon,
         namespace: topology.namespace,
         socket,
         routes,
         pidfd,
         expires,
+        address_lifetimes,
         cancellation: cancel.clone(),
         revoked: false,
     })
@@ -418,11 +496,13 @@ async fn sample_socket(
     namespace: NetworkNamespace,
     lease: &Lease,
     daemon: &Daemon,
+    service: NetworkService,
     deadline: Instant,
 ) -> Result<Option<Listener>, Error> {
     let uid = daemon.uid;
     let group = daemon.group.1.get();
     let address = lease.address.octets();
+    let server = lease.server.octets();
     let index = lease.index;
     let (fds, pending, bytes) = &*CAPTURE_BUDGET;
     let credits = CaptureCredits::reserve_shared(fds, pending, bytes).map_err(unavailable)?;
@@ -448,14 +528,22 @@ async fn sample_socket(
         let mut matches = rows.iter().filter(|socket| {
             socket.family == 2
                 && socket.local[..4] == address
-                && socket.remote_port == 0
+                && if service == NetworkService::NetworkManager {
+                    socket.state == 1
+                        && socket.remote_port == SERVER_PORT
+                        && socket.remote[..4] == server
+                } else {
+                    socket.remote_port == 0
+                }
                 && socket.interface == index
                 && socket.uid == uid
                 && socket.cgroup == group
                 && socket.inode != 0
         });
         let socket = matches.next().copied();
-        if matches.next().is_some() {
+        if matches.next().is_some()
+            || (socket.is_none() && service == NetworkService::NetworkManager)
+        {
             return Err(Error::Unsupported);
         }
         Ok(socket)
@@ -488,6 +576,152 @@ async fn describe(
     let body = reply.body();
     let json: &str = body.deserialize().map_err(unavailable)?;
     parse_lease(json, index, boottime()?)
+}
+
+async fn describe_network_manager(
+    connection: &Connection,
+    owner: &OwnedUniqueName,
+    index: u32,
+    ifname: &str,
+) -> Result<Lease, Error> {
+    const MANAGER: &str = "org.freedesktop.NetworkManager";
+    const DEVICE: &str = "org.freedesktop.NetworkManager.Device";
+    let proxy = zbus::Proxy::new(
+        connection,
+        owner.as_str(),
+        "/org/freedesktop/NetworkManager",
+        MANAGER,
+    )
+    .await
+    .map_err(unavailable)?;
+    let reply = proxy
+        .call_method("GetDeviceByIpIface", &(ifname,))
+        .await
+        .map_err(unavailable)?;
+    if reply.body().len() > MAX_REPLY {
+        return Err(Error::Limit);
+    }
+    let device: OwnedObjectPath = reply.body().deserialize().map_err(unavailable)?;
+    let properties = zbus::Proxy::new(
+        connection,
+        owner.as_str(),
+        device.as_str(),
+        "org.freedesktop.DBus.Properties",
+    )
+    .await
+    .map_err(unavailable)?;
+    if property::<u32>(&properties, DEVICE, "State").await? != 100
+        || property::<String>(&properties, DEVICE, "IpInterface").await? != ifname
+    {
+        return Err(Error::Unsupported);
+    }
+    let config: OwnedObjectPath = property(&properties, DEVICE, "Dhcp4Config").await?;
+    if config.as_str() == "/" {
+        return Err(Error::Unsupported);
+    }
+    let properties = zbus::Proxy::new(
+        connection,
+        owner.as_str(),
+        config.as_str(),
+        "org.freedesktop.DBus.Properties",
+    )
+    .await
+    .map_err(unavailable)?;
+    let options: HashMap<String, OwnedValue> = property(
+        &properties,
+        "org.freedesktop.NetworkManager.DHCP4Config",
+        "Options",
+    )
+    .await?;
+    let read = |key: &str| {
+        options
+            .get(key)
+            .ok_or(Error::Unsupported)
+            .and_then(|value| <&str>::try_from(value).map_err(|_| Error::Malformed))
+    };
+    let ip = |key| {
+        let address: Ipv4Addr = read(key)?.parse().map_err(|_| Error::Malformed)?;
+        ipv4(address.octets().to_vec())
+    };
+    let address = ip("ip_address")?;
+    let server = ip("dhcp_server_identifier")?;
+    let mask = u32::from(
+        read("subnet_mask")?
+            .parse::<Ipv4Addr>()
+            .map_err(|_| Error::Malformed)?,
+    );
+    let prefix = mask.leading_ones();
+    if prefix == 0 || mask.trailing_zeros() != 32 - prefix || address == server {
+        return Err(Error::Unsupported);
+    }
+    let expiry: u64 = read("expiry")?.parse().map_err(|_| Error::Malformed)?;
+    let duration: u32 = read("dhcp_lease_time")?
+        .parse()
+        .map_err(|_| Error::Malformed)?;
+    let acquired = expiry
+        .checked_sub(u64::from(duration))
+        .ok_or(Error::Malformed)?;
+    Ok(Lease {
+        index,
+        name: ifname.to_owned(),
+        address,
+        server,
+        prefix: prefix as u8,
+        timing: LeaseTiming::NetworkManager {
+            config,
+            acquired,
+            expiry,
+            duration,
+        },
+    })
+}
+
+fn network_manager_expiries(
+    address: &crate::network::LinuxAddress,
+    expiry: u64,
+    duration: u32,
+    captured: Instant,
+) -> Result<(u64, Option<[u64; 2]>), Error> {
+    let mut cache = address
+        .unknown
+        .iter()
+        .filter(|attribute| attribute.kind == 6);
+    let bytes: &[u8; 16] = cache
+        .next()
+        .ok_or(Error::Unsupported)?
+        .value
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Malformed)?;
+    if cache.next().is_some() {
+        return Err(Error::Malformed);
+    }
+    let preferred = u32::from_ne_bytes(bytes[..4].try_into().map_err(|_| Error::Malformed)?);
+    let valid = u32::from_ne_bytes(bytes[4..8].try_into().map_err(|_| Error::Malformed)?);
+    let wall = u64::try_from(clock_gettime(ClockId::Realtime).tv_sec).map_err(unavailable)?;
+    let wall_remaining = expiry.checked_sub(wall).ok_or(Error::Changed)?;
+    if preferred <= 1
+        || preferred > valid
+        || valid > duration
+        || duration == u32::MAX
+        || wall_remaining == 0
+        || wall_remaining > u64::from(duration)
+        || wall_remaining.abs_diff(u64::from(valid)) > 2
+    {
+        return Err(Error::Unsupported);
+    }
+    let boot = boottime()?;
+    let before = boot
+        .checked_sub(u64::try_from(captured.elapsed().as_micros()).map_err(unavailable)?)
+        .ok_or(Error::Changed)?;
+    let add = |seconds: u32| {
+        before
+            .checked_add(u64::from(seconds) * 1_000_000)
+            .ok_or(Error::Limit)
+    };
+    // Ядро округляет остаток до секунд. Вычитаем секунду для допуска;
+    // исходные сроки нужны только для сверки принятого обновления адреса.
+    Ok((add(preferred - 1)?, Some([add(preferred)?, add(valid)?])))
 }
 
 fn boottime() -> Result<u64, Error> {

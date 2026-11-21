@@ -18,6 +18,7 @@ const OUTPUT_CHAIN: &str = "output";
 pub(super) const DHCP_RENEWAL_CHAIN: &str = "dhcp_renewal";
 pub(super) const DHCP_RENEWAL_SET: &str = "dhcp_renewal_leases";
 pub(super) const DHCP_CGROUP_PATH: &str = "system.slice/systemd-networkd.service";
+pub(super) const NM_DHCP_CGROUP_PATH: &str = "system.slice/NetworkManager.service";
 pub(crate) const MAX_DHCP_RENEWALS: usize = 8;
 pub(super) const RESOLVED_CGROUP_PATH: &str = "system.slice/systemd-resolved.service";
 const MAX_RESOLVER_TLS_ENDPOINTS: usize = 16;
@@ -260,7 +261,9 @@ struct DhcpRule {
     ifname: InterfaceName,
     address: Ipv4Addr,
     server: Ipv4Addr,
-    uid: NonZeroU32,
+    uid: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    network_manager: bool,
     cgroup_id: NonZeroU64,
     dscp: u8,
     mark: u32,
@@ -288,7 +291,8 @@ impl DhcpRule {
             ifname: InterfaceName::try_from(path.ifname.to_owned())?,
             address: path.address,
             server: path.server,
-            uid: interface(path.uid)?,
+            uid: path.uid,
+            network_manager: path.network_manager,
             cgroup_id: path.cgroup_id,
             dscp: mask.trailing_zeros() as u8,
             mark: path.route_mark,
@@ -300,6 +304,14 @@ impl DhcpRule {
 
     fn dscp_mask(&self) -> u64 {
         (1 << self.dscp) | self.additional_dscps.map_or(0, NonZeroU64::get)
+    }
+
+    fn cgroup_path(&self) -> &'static str {
+        if self.network_manager {
+            NM_DHCP_CGROUP_PATH
+        } else {
+            DHCP_CGROUP_PATH
+        }
     }
 
     fn command(&self, table: &str, dscp: u8) -> Value {
@@ -316,14 +328,14 @@ impl DhcpRule {
                 compare(payload("ip", "daddr"), json!(self.server)),
                 meta("oif", json!(self.ifindex.get())),
                 meta("oifname", json!(String::from(self.ifname))),
-                meta("skuid", json!(self.uid.get())),
+                meta("skuid", json!(self.uid)),
                 compare(payload("udp", "sport"), json!(68)),
                 compare(payload("udp", "dport"), json!(67)),
                 compare(payload("ip", "dscp"), json!(dscp)),
                 meta("mark", json!(self.mark)),
                 compare(
                     json!({"socket":{"key":"cgroupv2","level":2}}),
-                    json!(DHCP_CGROUP_PATH),
+                    json!(self.cgroup_path()),
                 ),
                 compare(addresses_and_link, json!(format!("@{DHCP_RENEWAL_SET}"))),
                 json!({"accept":null}),
@@ -738,12 +750,20 @@ impl PublicBlockPolicy {
         rules.sort_unstable_by_key(|rule| rule.ifindex);
         if rules.windows(2).any(|pair| {
             pair[0].ifindex == pair[1].ifindex
-                || pair[0].cgroup_id != pair[1].cgroup_id
-                || pair[0].uid != pair[1].uid
                 || pair[0].namespace_device != pair[1].namespace_device
                 || pair[0].namespace_inode != pair[1].namespace_inode
         }) {
             return Err(PolicyError::Interface);
+        }
+        for network_manager in [false, true] {
+            let mut group = rules
+                .iter()
+                .filter(|rule| rule.network_manager == network_manager);
+            if let Some(first) = group.next() {
+                if group.any(|rule| rule.cgroup_id != first.cgroup_id || rule.uid != first.uid) {
+                    return Err(PolicyError::Interface);
+                }
+            }
         }
         for rule in &rules {
             let name = String::from(rule.ifname);
@@ -751,6 +771,9 @@ impl PublicBlockPolicy {
                 || rule.ifindex == self.loopback_ifindex
                 || Some(rule.ifindex) == self.tun_ifindex
                 || rule.dscp > 63
+                || (rule.uid == 0) != rule.network_manager
+                || rule.uid == u32::MAX
+                || (rule.network_manager && rule.additional_dscps.is_some())
                 || !name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
@@ -796,6 +819,14 @@ impl PublicBlockPolicy {
             (rule.namespace_device, rule.namespace_inode.get()),
             rule.cgroup_id,
         ))
+    }
+
+    pub(super) fn dhcp_cgroup_for_interface(
+        &self,
+        index: NonZeroU32,
+    ) -> Option<(&'static str, NonZeroU64)> {
+        let rule = self.dhcp_rule(index)?;
+        Some((rule.cgroup_path(), rule.cgroup_id))
     }
 
     fn dhcp_rule(&self, index: NonZeroU32) -> Option<&DhcpRule> {
@@ -946,6 +977,13 @@ impl PublicBlockPolicy {
             hash.update(device.to_le_bytes());
             hash.update(inode.to_le_bytes());
             hash.update(cgroup.get().to_le_bytes());
+            if self.dhcp_rules().iter().any(|rule| rule.network_manager) {
+                hash.update(b"dhcp-cgroups\0");
+                for rule in self.dhcp_rules() {
+                    hash.update(rule.ifindex.get().to_le_bytes());
+                    hash.update(rule.cgroup_id.get().to_le_bytes());
+                }
+            }
         }
         if let Some(((device, inode), cgroup)) = self.resolver_tls_identity() {
             hash.update(b"resolver-tls\0");
@@ -1388,6 +1426,51 @@ mod tests {
         )
         .expect("Тестовый endpoint")
     }
+
+    #[test]
+    fn dhcp_owners_share_policy_without_sharing_cgroups_or_uids() {
+        let raw = json!({
+            "ifindex": 2, "ifname": "eth0", "address": "192.0.2.10",
+            "server": "192.0.2.1", "uid": 987, "cgroup_id": 30,
+            "dscp": 32, "mark": 0, "namespace_device": 4, "namespace_inode": 5
+        });
+        let networkd: DhcpRule = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&networkd).unwrap(), raw);
+        let mut nm = networkd.clone();
+        nm.ifindex = NonZeroU32::new(3).unwrap();
+        nm.ifname = InterfaceName::try_from("eth1".to_owned()).unwrap();
+        nm.cgroup_id = NonZeroU64::new(25).unwrap();
+        nm.uid = 0;
+        let base = policy(vec![], vec![], vec![])
+            .with_dhcp_renewal_anchor(true)
+            .unwrap();
+        assert!(
+            base.clone()
+                .with_dhcp_rule_config(vec![nm.clone()])
+                .is_err()
+        );
+        nm.network_manager = true;
+        let mixed = base
+            .clone()
+            .with_dhcp_rule_config(vec![networkd.clone(), nm.clone()])
+            .unwrap();
+        assert_eq!(
+            mixed.dhcp_cgroup_for_interface(networkd.ifindex),
+            Some((DHCP_CGROUP_PATH, networkd.cgroup_id))
+        );
+        assert_eq!(
+            mixed.dhcp_cgroup_for_interface(nm.ifindex),
+            Some((NM_DHCP_CGROUP_PATH, nm.cgroup_id))
+        );
+        let persisted = serde_json::to_value(&mixed).unwrap();
+        let restored: PublicBlockPolicy = serde_json::from_value(persisted).unwrap();
+        assert_eq!(mixed.digest(), restored.digest());
+        nm.cgroup_id = NonZeroU64::new(26).unwrap();
+        let changed = base.with_dhcp_rule_config(vec![networkd, nm]).unwrap();
+        assert_eq!(mixed.commands("fixture"), changed.commands("fixture"));
+        assert_ne!(mixed.digest(), changed.digest());
+    }
+
     fn direct(prefix: IpPrefix, ifindex: u32, ifname: &str) -> BoundDirect {
         let gateway: IpAddr = if prefix.address.is_ipv4() {
             "192.0.2.1".parse().unwrap()

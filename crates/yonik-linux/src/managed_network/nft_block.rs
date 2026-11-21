@@ -2,12 +2,12 @@ use super::*;
 use crate::helper::dhcp_networkd::{DHCP_PROBE_CONCURRENCY, DHCP_PROBE_TIMEOUT, DhcpNetworkdLease};
 use crate::managed_network::PublicPolicyPhase;
 use crate::managed_network::firewall::{
-    DHCP_CGROUP_PATH, DHCP_RENEWAL_CHAIN, DHCP_RENEWAL_SET, MAX_DHCP_RENEWALS, RESOLVED_CGROUP_PATH,
+    DHCP_RENEWAL_CHAIN, DHCP_RENEWAL_SET, MAX_DHCP_RENEWALS, RESOLVED_CGROUP_PATH,
 };
 use futures_util::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     num::{NonZeroU32, NonZeroU64},
 };
 
@@ -203,29 +203,49 @@ fn verify_dhcp_element(
 
 #[derive(Default, PartialEq, Eq)]
 struct CgroupHandles {
-    dhcp: BTreeSet<NonZeroU64>,
-    resolver_tls: BTreeSet<NonZeroU64>,
+    dhcp: BTreeMap<NonZeroU64, NonZeroU64>,
+    resolver_tls: BTreeMap<NonZeroU64, NonZeroU64>,
 }
 
 fn normalize_policy_rule(
     rule: &mut Value,
     policy: &PublicBlockPolicy,
     resolve: &impl Fn(&str) -> Result<u32, NftError>,
-) -> Result<Option<&'static str>, NftError> {
+) -> Result<Option<NonZeroU64>, NftError> {
     normalize_rule(rule, resolve)?;
-    let (path, identity) = if rule["chain"] == DHCP_RENEWAL_CHAIN {
-        (DHCP_CGROUP_PATH, policy.dhcp_rule_identity())
+    let (path, id) = if rule["chain"] == DHCP_RENEWAL_CHAIN {
+        let index = rule["expr"]
+            .as_array()
+            .and_then(|expr| {
+                expr.iter().find(|entry| {
+                    entry
+                        .pointer("/match/left/meta/key")
+                        .and_then(Value::as_str)
+                        == Some("oif")
+                })
+            })
+            .and_then(|entry| entry.pointer("/match/right"))
+            .and_then(Value::as_u64)
+            .and_then(|index| u32::try_from(index).ok())
+            .and_then(NonZeroU32::new)
+            .ok_or(NftError::Evidence)?;
+        policy
+            .dhcp_cgroup_for_interface(index)
+            .ok_or(NftError::Evidence)?
     } else if rule["chain"] == "output"
         && rule["expr"]
             .as_array()
             .is_some_and(|expr| expr.iter().any(is_cgroup_match))
     {
-        (RESOLVED_CGROUP_PATH, policy.resolver_tls_identity())
+        (
+            RESOLVED_CGROUP_PATH,
+            policy.resolver_tls_identity().ok_or(NftError::Evidence)?.1,
+        )
     } else {
         return Ok(None);
     };
-    normalize_cgroup(rule, path, identity.ok_or(NftError::Evidence)?.1)?;
-    Ok(Some(path))
+    normalize_cgroup(rule, path, id)?;
+    Ok(Some(id))
 }
 
 fn verify_rules(
@@ -287,13 +307,15 @@ fn verify_rules(
             }
         }
         if kind == "rule" {
-            let matched = match normalize_policy_rule(&mut data, policy, &resolve)? {
-                Some(DHCP_CGROUP_PATH) => handles.dhcp.insert(handle),
-                Some(RESOLVED_CGROUP_PATH) => handles.resolver_tls.insert(handle),
-                _ => true,
-            };
-            if !matched {
-                return Err(NftError::Evidence);
+            if let Some(id) = normalize_policy_rule(&mut data, policy, &resolve)? {
+                let binding = if data["chain"] == DHCP_RENEWAL_CHAIN {
+                    &mut handles.dhcp
+                } else {
+                    &mut handles.resolver_tls
+                };
+                if binding.insert(handle, id).is_some() {
+                    return Err(NftError::Evidence);
+                }
             }
         }
         actual.push(json!({kind: data}));
@@ -571,7 +593,7 @@ impl NftExecutor {
                 policy.resolver_tls_identity(),
             ),
         ] {
-            let Some((namespace, id)) = identity else {
+            let Some((namespace, _)) = identity else {
                 continue;
             };
             checked_kernel = true;
@@ -583,14 +605,15 @@ impl NftExecutor {
             if namespace != self.owner.namespace()
                 || namespace != (observed.device, observed.inode)
                 || matches.len() != expected.len()
-                || matches
-                    .iter()
-                    .any(|rule| rule.level != 2 || rule.cgroup_id != id)
+                || matches.iter().any(|rule| {
+                    rule.level != 2 || expected.get(&rule.rule_handle) != Some(&rule.cgroup_id)
+                })
                 || matches
                     .iter()
                     .map(|rule| rule.rule_handle)
                     .collect::<BTreeSet<_>>()
-                    != *expected
+                    .len()
+                    != expected.len()
             {
                 return Err(NftError::Evidence);
             }

@@ -9,6 +9,7 @@ gen_require(`
     type ephemeral_port_t, sysctl_net_t;
     type systemd_logind_t, systemd_networkd_t, systemd_networkd_unit_file_t;
     type systemd_resolved_t, systemd_resolved_unit_file_t;
+    type NetworkManager_t, NetworkManager_unit_file_t;
 ')
 
 type yonik_helper_t;
@@ -68,12 +69,15 @@ policykit_dbus_chat(yonik_helper_t)
 systemd_chat_resolved(yonik_helper_t)
 networkmanager_dbus_chat(yonik_helper_t)
 
-# Снимок DHCP сверяет D-Bus, cgroup процесса networkd и сокет UDP в ядре.
+# Снимок DHCP сверяет D-Bus, cgroup службы и сокет UDP в ядре.
 allow yonik_helper_t systemd_networkd_t:dbus send_msg;
 allow systemd_networkd_t yonik_helper_t:dbus send_msg;
 allow yonik_helper_t systemd_networkd_unit_file_t:service status;
 allow yonik_helper_t systemd_networkd_t:dir search;
 allow yonik_helper_t systemd_networkd_t:file { open read };
+allow yonik_helper_t NetworkManager_unit_file_t:service status;
+allow yonik_helper_t NetworkManager_t:dir search;
+allow yonik_helper_t NetworkManager_t:file { open read };
 # Привязка DoT сверяет статус юнита и читает cgroup и stat процесса resolved.
 allow yonik_helper_t systemd_resolved_unit_file_t:service status;
 allow yonik_helper_t systemd_resolved_t:dir search;

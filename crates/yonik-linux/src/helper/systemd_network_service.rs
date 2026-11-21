@@ -28,9 +28,10 @@ const DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum NetworkService {
     Networkd,
+    NetworkManager,
     Resolved,
 }
 
@@ -42,6 +43,12 @@ impl NetworkService {
                 "/org/freedesktop/systemd1/unit/systemd_2dnetworkd_2eservice",
                 "/system.slice/systemd-networkd.service",
                 "systemd-networkd.service",
+            ),
+            Self::NetworkManager => (
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/systemd1/unit/NetworkManager_2eservice",
+                "/system.slice/NetworkManager.service",
+                "NetworkManager.service",
             ),
             Self::Resolved => (
                 "org.freedesktop.resolve1",
@@ -153,7 +160,7 @@ pub(super) async fn daemon(
         .get_connection_unix_user(name(owner.as_str())?)
         .await
         .map_err(unavailable)?;
-    if pid <= 1 || uid == 0 || uid == u32::MAX {
+    if pid <= 1 || (uid == 0) != (service == NetworkService::NetworkManager) || uid == u32::MAX {
         return Err(Error::Unsupported);
     }
     let properties = zbus::Proxy::new(
@@ -183,7 +190,7 @@ pub(super) async fn daemon(
         return Err(Error::Changed);
     }
     let resolved = matches!(service, NetworkService::Resolved);
-    if resolved
+    if (resolved || service == NetworkService::NetworkManager)
         && property::<bool>(&properties, "org.freedesktop.systemd1.Service", "Delegate").await?
     {
         return Err(Error::Unsupported);
@@ -221,7 +228,7 @@ pub(super) async fn daemon(
     })
 }
 
-async fn property<T: TryFrom<zbus::zvariant::OwnedValue>>(
+pub(super) async fn property<T: TryFrom<zbus::zvariant::OwnedValue>>(
     proxy: &zbus::Proxy<'_>,
     interface: &str,
     key: &str,
