@@ -390,6 +390,67 @@ fn networkmanager_fixture_engine() -> Result<Engine> {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая Debian VM с dhcpcd и свежим лизингом на dhcpcd-probe"]
+async fn production_helper_fake_dns_during_dhcpcd_renewal() -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let engine = match std::env::var("YONIK_DHCPCD_ENGINE")?.as_str() {
+        "xray" => Engine::Xray,
+        "sing-box" => Engine::SingBox,
+        _ => return Err(io::Error::other("Для стенда dhcpcd нужен xray или sing-box").into()),
+    };
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let policy = scoped_fake_dns_proxy_policy()?;
+    let (_owner, token) = yonik_linux::Cancellation::new();
+    let drain =
+        start_fake_dns_in_vm(&connection, &server, engine, true, Some(&policy), &token).await?;
+    require_no_dhcp_permission(false)?;
+    let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+    let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+    check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+    let worker = networkmanager_dhcp_worker_pid()?;
+    tokio::time::timeout(Duration::from_secs(34), async {
+        loop {
+            let journal = Command::new("/usr/bin/journalctl")
+                .args(["-b", "-u", "yonik-dhcpcd-client", "--no-pager", "-o", "cat"])
+                .output()?;
+            require(journal.status.success(), "Не прочитан журнал dhcpcd")?;
+            if String::from_utf8_lossy(&journal.stdout).contains("renewing lease of 10.234.16.10") {
+                return Ok::<(), Box<dyn std::error::Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(350)).await;
+        }
+    })
+    .await??;
+    require(
+        networkmanager_dhcp_worker_pid()? == worker,
+        "Worker сменился во время продления dhcpcd",
+    )?;
+    require_no_dhcp_permission(false)?;
+    let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+    let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+    check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+    eprintln!("{engine:?}: Fake A/AAAA и IPv4/IPv6 TCP/UDP прошли после попытки продления dhcpcd");
+    call(&connection, "Stop", json!({"version":1})).await?;
+    require(
+        tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+        "Worker не остановлен",
+    )?;
+    call(&connection, "Unlock", json!({"version":1})).await?;
+    require(
+        resolver_file_state()? == resolver_before,
+        "Изменился /etc/resolv.conf",
+    )
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная VM с нативным DoT на внешнем линке и известной приватной зоной"]
 async fn production_helper_rejects_native_dot_with_private_dns() -> Result {
     guard()?;
@@ -1988,7 +2049,7 @@ fn require_no_dhcp_permission(allow_absent: bool) -> Result {
             set.get("elem")
                 .is_none_or(|entries| entries.as_array().is_some_and(Vec::is_empty))
         }),
-        "Без login1 появилось DHCP-разрешение либо пропал набор активной политики",
+        "Появилось DHCP-разрешение либо пропал набор активной политики",
     )
 }
 
