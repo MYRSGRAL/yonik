@@ -882,6 +882,74 @@ async fn production_helper_fake_dns_after_resolver_restart_and_ttl() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая VM с установленным helper и обоими движками"]
+async fn production_helper_fake_dns_rejects_old_addresses_after_engine_switch() -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let (_owner, token) = yonik_linux::Cancellation::new();
+    let policy = scoped_fake_dns_proxy_policy()?;
+    let mut previous: Option<([std::net::IpAddr; 2], tokio::time::Instant, u32)> = None;
+    for engine in [Engine::Xray, Engine::SingBox, Engine::Xray] {
+        let drain =
+            start_fake_dns_in_vm(&connection, &server, engine, false, Some(&policy), &token)
+                .await?;
+        if let Some(([old_v4, old_v6], _, old_pid)) = previous {
+            require(
+                networkmanager_dhcp_worker_pid()? != old_pid,
+                "Смена движка оставила прежний worker",
+            )?;
+            let (ipv4, ipv6) = tokio::join!(
+                check_fake_flow_blocked((old_v4, 40000).into()),
+                check_fake_flow_blocked((old_v6, 40000).into()),
+            );
+            ipv4?;
+            ipv6?;
+        }
+        let issued_by = tokio::time::Instant::now();
+        let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+        let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+        require(
+            v4.is_ipv4() && v6.is_ipv6(),
+            "NSS вернул неверные семейства",
+        )?;
+        if let Some(([old_v4, old_v6], old_issued_by, _)) = previous {
+            require(
+                issued_by - old_issued_by < yonik_linux::fake_service::MAX_FAKE_TTL
+                    && v4 != old_v4
+                    && v6 != old_v6,
+                "Смена движка переиспользовала старый Fake-IP либо вышла за DNS TTL",
+            )?;
+        }
+        check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+        if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
+            check_https_through_tun(&certificate, None).await?;
+        }
+        let worker = networkmanager_dhcp_worker_pid()?;
+        call(&connection, "Stop", json!({"version":1})).await?;
+        require(
+            tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+            "Worker не завершился после Stop",
+        )?;
+        check_only_fake_is_filtered(v4, v6).await?;
+        previous = Some(([v4, v6], issued_by, worker));
+        eprintln!("{engine:?}: завершена проверка смены движка и защиты Fake-IP");
+    }
+    check_fallback_dns_in_vm("restored.test").await?;
+    require(
+        resolver_file_state()? == resolver_before,
+        "Смена движка изменила /etc/resolv.conf",
+    )
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная Debian VM с tools/fixtures/wireguard_vm.py и wg"]
 async fn production_helper_fake_dns_preserves_external_wireguard() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::WireGuard).await
