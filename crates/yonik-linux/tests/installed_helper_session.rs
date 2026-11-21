@@ -366,7 +366,7 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-#[ignore = "одноразовая VM с обычным resolv.conf и CNAME для edge-bootstrap.test и edge-expiring.test"]
+#[ignore = "одноразовая VM со штатным DNS и CNAME для edge-bootstrap.test и edge-expiring.test"]
 async fn production_helper_named_proxy_checks_cname_ttl_at_apply() -> Result {
     use yonik_linux::system_client::ClientError;
 
@@ -435,6 +435,42 @@ async fn production_helper_named_proxy_checks_cname_ttl_at_apply() -> Result {
         );
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая VM с чужим TCP-слушателем на адресе resolved stub"]
+async fn production_helper_named_proxy_rejects_foreign_resolved_stub() -> Result {
+    use yonik_linux::system_client::ClientError;
+
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let (_owner, cancel) = yonik_linux::Cancellation::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut client = SystemClient::on_connection(connection, deadline, cancel.clone()).await?;
+    let report = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@edge-bootstrap.test:24443?security=tls"
+            .to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&report.servers[0])?;
+    let result = client
+        .prepare_profile(&server, Engine::Xray, false, deadline, cancel.clone())
+        .await;
+    require(
+        matches!(result, Err(ClientError::Unsupported)),
+        &format!(
+            "Ожидался отказ для чужого сокета stub, получено {:?}",
+            result.err()
+        ),
+    )?;
+    require(
+        client.state(deadline, cancel).await? == State::NoManagedPolicy,
+        "Чужой stub установил сетевое состояние",
+    )?;
+    require(resolver_file_state()? == before, "Изменился resolv.conf")
 }
 
 #[cfg(feature = "test-support")]

@@ -140,9 +140,11 @@ pub async fn read_resolve1_snapshot(
     cancel: &mut Cancellation,
     timeout: Duration,
 ) -> Result<Resolve1Snapshot, ResolverError> {
-    Ok(read_snapshot(cancel, timeout, SnapshotScope::Configured)
-        .await?
-        .config)
+    Ok(
+        read_snapshot(cancel, timeout, SnapshotScope::Configured, false)
+            .await?
+            .config,
+    )
 }
 
 pub(crate) async fn read_resolve1_tun_snapshot(
@@ -150,7 +152,14 @@ pub(crate) async fn read_resolve1_tun_snapshot(
     timeout: Duration,
     own_link: Option<u32>,
 ) -> Result<Resolve1TunSnapshot, ResolverError> {
-    read_snapshot(cancel, timeout, SnapshotScope::Tun { own_link }).await
+    read_snapshot(cancel, timeout, SnapshotScope::Tun { own_link }, false).await
+}
+
+pub(crate) async fn read_bootstrap_resolve1_snapshot(
+    cancel: &mut Cancellation,
+    timeout: Duration,
+) -> Result<Resolve1TunSnapshot, ResolverError> {
+    read_snapshot(cancel, timeout, SnapshotScope::Tun { own_link: None }, true).await
 }
 
 #[derive(Clone, Copy)]
@@ -163,6 +172,7 @@ async fn read_snapshot(
     cancel: &mut Cancellation,
     timeout: Duration,
     scope: SnapshotScope,
+    require_daemon: bool,
 ) -> Result<Resolve1TunSnapshot, ResolverError> {
     if timeout.is_zero() || timeout > MAX_TIMEOUT {
         return Err(ResolverError::Limit);
@@ -172,18 +182,24 @@ async fn read_snapshot(
             biased;
             _ = cancel.cancelled() => Err(ResolverError::Cancelled),
             result = async {
-                let connection = Connection::system().await.map_err(bus_error)?;
-                let mut snapshot = read_connection(&connection, scope).await?;
-                if snapshot.sockets.iter().any(|socket| socket.transport != Resolve1Transport::Plain) {
-                    let (verified, daemon) = bind_resolved(async |connection, expected_owner| {
-                        read_connection_for_owner(connection, scope, expected_owner).await
-                    }).await?;
-                    if verified != snapshot {
-                        return Err(ResolverError::NetworkChanged);
+                let observed = if require_daemon {
+                    None
+                } else {
+                    let connection = Connection::system().await.map_err(bus_error)?;
+                    let snapshot = read_connection(&connection, scope).await?;
+                    if snapshot.sockets.iter().all(|socket| socket.transport == Resolve1Transport::Plain) {
+                        return Ok(snapshot);
                     }
-                    snapshot.daemon = Some(daemon);
+                    Some(snapshot)
+                };
+                let (mut verified, daemon) = bind_resolved(async |connection, expected_owner| {
+                    read_connection_for_owner(connection, scope, expected_owner).await
+                }).await?;
+                if observed.is_some_and(|snapshot| verified != snapshot) {
+                    return Err(ResolverError::NetworkChanged);
                 }
-                Ok(snapshot)
+                verified.daemon = Some(daemon);
+                Ok(verified)
             } => result,
         }
     })

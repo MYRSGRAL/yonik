@@ -8,6 +8,7 @@ use rustix::net::{
     socket_with,
 };
 use std::{
+    net::SocketAddrV4,
     os::unix::fs::MetadataExt,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -19,6 +20,7 @@ const MAX_PROCESSES: usize = 256;
 const MAX_TASKS: usize = 256;
 const MAX_FDS_PER_TASK: usize = 256;
 const MAX_DIAG_RECORDS: usize = 65536;
+const DNS_TCP_PEER_DEADLINE: std::time::Duration = std::time::Duration::from_millis(400);
 const INET_DIAG_TOS: u16 = 5;
 const INET_DIAG_PROTOCOL: u16 = 10;
 const INET_DIAG_MARK: u16 = 15;
@@ -81,6 +83,7 @@ pub(crate) struct ListenerDump {
     scanned: usize,
     poisoned: bool,
     rows: ListenerSet,
+    tcp_peer: Option<(SocketAddrV4, SocketAddrV4)>,
 }
 impl ListenerDump {
     pub(crate) fn new(protocol: u8, port: u16) -> Result<Self, Unavailable> {
@@ -102,7 +105,17 @@ impl ListenerDump {
                 rows: [None; 64],
                 count: 0,
             },
+            tcp_peer: None,
         })
+    }
+
+    fn tcp_peer(server: SocketAddrV4, client: SocketAddrV4) -> Result<Self, Unavailable> {
+        if client.port() == 0 {
+            return Err(Unavailable::Malformed);
+        }
+        let mut dump = Self::new(6, server.port())?;
+        dump.tcp_peer = Some((server, client));
+        Ok(dump)
     }
     pub(crate) fn begin_v6(&mut self) -> Result<(), Unavailable> {
         if self.poisoned
@@ -130,12 +143,19 @@ impl ListenerDump {
         if self.protocol == RAW_PROTOCOL {
             b[19] = 17; // sdiag_raw_protocol в inet_diag_req_raw.
         }
-        let states = if self.protocol == 6 {
+        let states = if self.tcp_peer.is_some() {
+            1u32 << 1
+        } else if self.protocol == 6 {
             1u32 << 10
         } else {
             u32::MAX
         };
         b[20..24].copy_from_slice(&states.to_ne_bytes());
+        if let Some((server, client)) = self.tcp_peer {
+            // Фильтр ядра сокращает dump. Полный 4-tuple сверяется по ответу.
+            b[24..26].copy_from_slice(&server.port().to_be_bytes());
+            b[26..28].copy_from_slice(&client.port().to_be_bytes());
+        }
         // Ни адрес, ни interface/cookie/UID не фильтруют wildcard/reuseport.
         b[64..72].fill(255);
         b
@@ -204,10 +224,19 @@ impl ListenerDump {
                 return Err(Unavailable::Limit);
             }
             let port = u16::from_be_bytes([body[4], body[5]]);
-            if port == self.port && self.protocol == 6 && body[1] != 10 {
+            let matches = port == self.port
+                && self.tcp_peer.is_none_or(|(server, client)| {
+                    body[6..8] == client.port().to_be_bytes()
+                        && body[8..12] == server.ip().octets()
+                        && body[24..28] == client.ip().octets()
+                });
+            let tcp_state = if self.tcp_peer.is_some() { 1 } else { 10 };
+            if matches && self.protocol == 6 && body[1] != tcp_state {
                 return Err(Unavailable::Coverage);
             }
-            if port == self.port && (self.protocol != 6 || body[1] == 10) {
+            let inode = u32n(&body[68..72])?;
+            // До accept ядро может показать соединение без файлового inode.
+            if matches && (self.tcp_peer.is_none() || inode != 0) {
                 if self.rows.count == 64 {
                     return Err(Unavailable::Limit);
                 }
@@ -296,7 +325,7 @@ impl ListenerDump {
                     remote_port: u16::from_be_bytes([body[6], body[7]]),
                     interface: u32n(&body[40..44])?,
                     uid: u32n(&body[64..68])?,
-                    inode: u32n(&body[68..72])?,
+                    inode,
                     cookie,
                     cgroup: group,
                     tos,
@@ -318,10 +347,14 @@ impl ListenerDump {
         Ok(false)
     }
     pub(crate) fn finish(self) -> Result<ListenerSet, Unavailable> {
-        if self.poisoned || self.done != [true, self.protocol != RAW_PROTOCOL] {
+        if self.poisoned || self.done != [true, self.both_families()] {
             return Err(Unavailable::Coverage);
         }
         Ok(self.rows)
+    }
+
+    fn both_families(&self) -> bool {
+        self.protocol != RAW_PROTOCOL && self.tcp_peer.is_none()
     }
 }
 
@@ -374,6 +407,33 @@ mod listener_pure_tests {
             .expect("Завершение IPv4");
         dump.begin_v6().expect("Начало IPv6");
         assert_ne!(dump.request()[18] & (1 << 4), 0);
+    }
+
+    #[test]
+    fn tcp_peer_dump_matches_only_the_established_server_tuple() {
+        let server = "127.0.0.53:53".parse().unwrap();
+        let client: SocketAddrV4 = "127.0.0.1:40553".parse().unwrap();
+        let mut dump = ListenerDump::tcp_peer(server, client).unwrap();
+        assert_eq!(dump.request()[20..24], (1u32 << 1).to_ne_bytes());
+        assert_eq!(dump.request()[24..28], [0, 53, 158, 105]);
+        let mut wire = message(2, 53, 11);
+        wire[17] = 1;
+        wire[22..24].copy_from_slice(&client.port().to_be_bytes());
+        wire[40..44].copy_from_slice(&[127, 0, 0, 2]);
+        dump.consume(&wire, ReturnFlags::empty(), true).unwrap();
+        wire[40..44].copy_from_slice(&client.ip().octets());
+        wire[84..88].fill(0);
+        dump.consume(&wire, ReturnFlags::empty(), true).unwrap();
+        wire[84..88].copy_from_slice(&100u32.to_ne_bytes());
+        dump.consume(&wire, ReturnFlags::empty(), true).unwrap();
+        dump.consume(&done(1), ReturnFlags::empty(), true).unwrap();
+        let rows = dump.finish().unwrap();
+        let found: Vec<_> = rows.iter().collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].uid, found[0].cgroup, found[0].cookie),
+            (991, 42, 11)
+        );
     }
 
     #[test]
@@ -560,6 +620,40 @@ pub(crate) fn listener_census(
     namespace: (u64, u64),
     deadline: Instant,
     cancel: &AtomicBool,
+    credit: &crate::helper::resolver_stub::CaptureCredits,
+) -> Result<ListenerSet, Unavailable> {
+    socket_rows(
+        ListenerDump::new(protocol, port)?,
+        namespace,
+        deadline,
+        cancel,
+        credit,
+    )
+}
+
+pub(crate) fn tcp_server_socket(
+    server: SocketAddrV4,
+    client: SocketAddrV4,
+    namespace: (u64, u64),
+    deadline: Instant,
+    cancel: &AtomicBool,
+    credit: &crate::helper::resolver_stub::CaptureCredits,
+) -> Result<Option<Listener>, Unavailable> {
+    let dump = ListenerDump::tcp_peer(server, client)?;
+    let rows = socket_rows(dump, namespace, deadline, cancel, credit)?;
+    let mut rows = rows.iter().copied();
+    let found = rows.next();
+    if rows.next().is_some() {
+        return Err(Unavailable::Coverage);
+    }
+    Ok(found)
+}
+
+fn socket_rows(
+    mut dump: ListenerDump,
+    namespace: (u64, u64),
+    deadline: Instant,
+    cancel: &AtomicBool,
     _credit: &crate::helper::resolver_stub::CaptureCredits,
 ) -> Result<ListenerSet, Unavailable> {
     if cancel.load(Ordering::Acquire) {
@@ -569,8 +663,14 @@ pub(crate) fn listener_census(
     if begun >= deadline || namespace == (0, 0) {
         return Err(Unavailable::Timeout);
     }
-    let deadline = deadline.min(begun + DEADLINE);
-    let mut dump = ListenerDump::new(protocol, port)?;
+    // TCP остаётся закреплённым на время запроса. Первое чтение может
+    // ждать загрузки tcp_diag; бюджет атрибуции потока для этого короток.
+    let limit = if dump.tcp_peer.is_some() {
+        DNS_TCP_PEER_DEADLINE
+    } else {
+        DEADLINE
+    };
+    let deadline = deadline.min(begun + limit);
     let socket = socket_with(
         AddressFamily::NETLINK,
         SocketType::RAW,
@@ -587,8 +687,7 @@ pub(crate) fn listener_census(
         return Err(Unavailable::Authority);
     }
     rustix::net::sockopt::set_socket_recv_buffer_size(&socket, 32768).map_err(diag_error)?;
-    // Отправка DHCPv4 с raw-сокета использует только AF_INET.
-    for family in 0..if protocol == RAW_PROTOCOL { 1 } else { 2 } {
+    for family in 0..if dump.both_families() { 2 } else { 1 } {
         if family == 1 {
             dump.begin_v6()?;
         }

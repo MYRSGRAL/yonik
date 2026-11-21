@@ -1,8 +1,12 @@
 //! Подтверждение числового адреса прокси по штатному DNS до запуска TUN.
-use super::{DEADLINE, checked_route, stale, unavailable, valid_proxy_ip};
+use super::{DEADLINE, checked_route, diagnostic_result, stale, unavailable, valid_proxy_ip};
 use crate::{
     Cancellation, KernelRoute, LinuxTopology, RouteQuery, TransportProtocol,
-    helper::ServiceError,
+    attribution::broker::kernel::{Listener, tcp_server_socket},
+    helper::{
+        ServiceError, memory::ByteBudget, resolver_stub::CaptureCredits,
+        systemd_network_service::Daemon,
+    },
     managed_network::Ownership,
     network::{RouteCapture, reread_changed_route, same_captured_kernel_route},
     resolver::{
@@ -12,24 +16,41 @@ use crate::{
             is_reserved_fake,
         },
         inspect_host_resolv_conf, read_system_resolv_conf,
+        resolve1::{Resolve1TunSnapshot, read_bootstrap_resolve1_snapshot},
     },
 };
 use std::{
     collections::BTreeSet,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZeroU32,
     os::{fd::AsFd, unix::fs::MetadataExt},
+    sync::{LazyLock, atomic::AtomicBool},
     time::{Duration, Instant},
 };
-use tokio::net::{TcpSocket, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use yonik_engine::fake_dns::DomainName;
 use yonik_nsfs::socket_namespace::bind_unconnected_private_dns_socket;
 
 pub(super) struct BootstrapAddress {
-    source: PlainResolverSnapshot,
+    source: ResolverSource,
     answers: PolicyRrset,
     routes: Vec<BoundRoute>,
 }
+
+#[derive(PartialEq, Eq)]
+enum ResolverSource {
+    Plain(PlainResolverSnapshot),
+    Resolved(ResolvConfLayout, Box<Resolve1TunSnapshot>),
+}
+
+const RESOLVED_STUB: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 53), 53);
+static STUB_CAPTURE_BUDGET: LazyLock<(ByteBudget, ByteBudget, ByteBudget)> = LazyLock::new(|| {
+    (
+        ByteBudget::new(16),
+        ByteBudget::new(4),
+        ByteBudget::new(4 * 65536),
+    )
+});
 
 impl BootstrapAddress {
     pub(super) async fn resolve(
@@ -53,13 +74,21 @@ impl BootstrapAddress {
             biased;
             _ = stop.cancelled() => Err(ServiceError::Cancelled),
             result = tokio::time::timeout(DEADLINE, async {
-                let source = read_source().await?;
-                let &address = source.nameservers().first().ok_or(ServiceError::Unsupported)?;
-                if !valid_proxy_ip(address) || is_reserved_fake(address) {
-                    return Err(ServiceError::Unsupported);
-                }
-                let peer = SocketAddr::new(address, 53);
-                let (answers, routes) = lookup(name, peer, &source, baseline, owner, table, cancel).await?;
+                let source = diagnostic_result("bootstrap_source", read_source(cancel).await)?;
+                let (answers, routes) = match &source {
+                    ResolverSource::Plain(plain) => {
+                        let &address = plain.nameservers().first().ok_or(ServiceError::Unsupported)?;
+                        if !valid_proxy_ip(address) || is_reserved_fake(address) {
+                            return Err(ServiceError::Unsupported);
+                        }
+                        let peer = SocketAddr::new(address, 53);
+                        lookup(name, peer, plain, baseline, owner, table, cancel).await?
+                    }
+                    ResolverSource::Resolved(_, snapshot) => {
+                        let daemon = snapshot.daemon.as_ref().ok_or(ServiceError::Unsupported)?;
+                        (lookup_resolved(name, owner.namespace(), daemon, cancel).await?, Vec::new())
+                    }
+                };
                 let proof = Self { source, answers, routes };
                 proof.verify(cancel).await?;
                 Ok(proof)
@@ -90,7 +119,7 @@ impl BootstrapAddress {
 
     pub(super) async fn verify(&self, cancel: &mut Cancellation) -> Result<(), ServiceError> {
         self.check_fresh()?;
-        if read_source().await? != self.source {
+        if read_source(cancel).await? != self.source {
             return Err(stale());
         }
         for route in &self.routes {
@@ -115,12 +144,110 @@ fn permits_name(name: &DomainName, private: &BTreeSet<String>) -> bool {
             })
 }
 
-async fn read_source() -> Result<PlainResolverSnapshot, ServiceError> {
-    tokio::task::spawn_blocking(|| {
-        if inspect_host_resolv_conf() != ResolvConfLayout::RegularFile {
-            return Err(ServiceError::Unsupported);
+async fn read_source(cancel: &mut Cancellation) -> Result<ResolverSource, ServiceError> {
+    let (layout, plain) = tokio::task::spawn_blocking(|| {
+        let layout = inspect_host_resolv_conf();
+        let plain = (layout == ResolvConfLayout::RegularFile)
+            .then(read_system_resolv_conf)
+            .transpose()
+            .map_err(resolver_error)?;
+        Ok::<_, ServiceError>((layout, plain))
+    })
+    .await
+    .map_err(unavailable)??;
+    if let Some(plain) = plain {
+        if !plain.is_resolved_stub() {
+            return Ok(ResolverSource::Plain(plain));
         }
-        read_system_resolv_conf().map_err(resolver_error)
+    } else if !matches!(
+        layout,
+        ResolvConfLayout::ResolvedStub
+            | ResolvConfLayout::ResolvedStaticStub
+            | ResolvConfLayout::ResolvedUplink
+    ) {
+        return Err(ServiceError::Unsupported);
+    }
+    let snapshot = diagnostic_result(
+        "bootstrap_resolve1_snapshot",
+        read_bootstrap_resolve1_snapshot(cancel, DEADLINE).await,
+    )
+    .map_err(resolver_error)?;
+    Ok(ResolverSource::Resolved(layout, Box::new(snapshot)))
+}
+
+async fn lookup_resolved(
+    name: &DomainName,
+    namespace: (u64, u64),
+    daemon: &Daemon,
+    cancel: &mut Cancellation,
+) -> Result<PolicyRrset, ServiceError> {
+    let peer = SocketAddr::V4(RESOLVED_STUB);
+    let mut stream = diagnostic_result("bootstrap_stub_connect", TcpStream::connect(peer).await)
+        .map_err(unavailable)?;
+    let SocketAddr::V4(client) = stream.local_addr().map_err(unavailable)? else {
+        return Err(ServiceError::Unsupported);
+    };
+    if !client.ip().is_loopback() || stream.peer_addr().map_err(unavailable)? != peer {
+        return Err(ServiceError::Unsupported);
+    }
+    let start = Instant::now();
+    let first = loop {
+        if let Some(socket) = capture_stub_peer(client, namespace).await? {
+            check_stub_peer(socket, daemon)?;
+            break socket;
+        }
+        if start.elapsed() >= Duration::from_millis(150) {
+            return Err(ServiceError::Unavailable);
+        }
+        cancel.check().map_err(|_| ServiceError::Cancelled)?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let a = forward_tcp(&mut stream, peer, &dns_question(name, 1), DEADLINE, cancel)
+        .await
+        .map_err(resolver_error)?;
+    let aaaa = forward_tcp(&mut stream, peer, &dns_question(name, 28), DEADLINE, cancel)
+        .await
+        .map_err(resolver_error)?;
+    let last = capture_stub_peer(client, namespace)
+        .await?
+        .ok_or_else(stale)?;
+    check_stub_peer(last, daemon)?;
+    if (first.inode, first.cookie) != (last.inode, last.cookie) {
+        return Err(stale());
+    }
+    a.reject_addresses(is_reserved_fake)
+        .map_err(resolver_error)?;
+    aaaa.reject_addresses(is_reserved_fake)
+        .map_err(resolver_error)?;
+    a.policy_address_pair(&aaaa).map_err(resolver_error)
+}
+
+fn check_stub_peer(socket: Listener, daemon: &Daemon) -> Result<(), ServiceError> {
+    if socket.uid != daemon.uid || socket.cgroup != daemon.group.1.get() || socket.inode == 0 {
+        return Err(ServiceError::Unsupported);
+    }
+    Ok(())
+}
+
+async fn capture_stub_peer(
+    client: SocketAddrV4,
+    namespace: (u64, u64),
+) -> Result<Option<Listener>, ServiceError> {
+    let (fds, pending, bytes) = &*STUB_CAPTURE_BUDGET;
+    let credits = CaptureCredits::reserve_shared(fds, pending, bytes).map_err(unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        diagnostic_result(
+            "bootstrap_stub_peer",
+            tcp_server_socket(
+                RESOLVED_STUB,
+                client,
+                namespace,
+                Instant::now() + DEADLINE,
+                &AtomicBool::new(false),
+                &credits,
+            ),
+        )
+        .map_err(unavailable)
     })
     .await
     .map_err(unavailable)?

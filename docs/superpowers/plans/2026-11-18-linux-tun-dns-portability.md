@@ -1152,9 +1152,18 @@ IPv4-сценарий с теми же проверками прошёл пов�
   [Ответ ResolveRecord](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.resolve1.html)
   В тех же версиях systemd TCP-ответы с 127.0.0.53 и 127.0.0.54
   содержат CNAME вместе с конечной A или AAAA. Содержимое и метаданные
-  `/etc/resolv.conf` совпали. Для подключения stub к Prepare требуется
-  привязать TCP-ответ к проверенному владельцу systemd-resolved. Вариант
-  127.0.0.53 сохраняет системную проверку DNSSEC.
+  `/etc/resolv.conf` совпали. Prepare использует полный stub 127.0.0.53.
+  Helper сверяет UID и cgroup серверной стороны установленного TCP
+  соединения с владельцем systemd-resolved. После ответа проверяет
+  тот же inode и cookie, а до Apply повторно читает снимок службы и DNS.
+  Путь через 127.0.0.53 сохраняет системную проверку DNSSEC.
+  В Arch x86-64 и Debian 13 обновлённые helper и worker запущены
+  поверх установленных пакетов. Чужой слушатель на 127.0.0.53:53
+  принял TCP и не получил DNS-запроса. Штатный stub на обеих системах
+  прошёл истечение CNAME перед Apply и свежий запуск Xray и sing-box
+  с Fake A/AAAA и TCP/UDP через TLS-прокси. Содержимое и метаданные
+  `/etc/resolv.conf` совпали. Debian-стенд создал системного пользователя
+  штатной командой `systemd-sysusers` после установки тестового пакета.
   [Режимы stub systemd-resolved](https://www.freedesktop.org/software/systemd/man/latest/resolved.conf.html#DNSStubListener=)
   После проверки маршрута Prepare закрепляет тот же IP в конфигурации
   движка и сверяет исходные адрес и порт. Тесты компилятора проверили

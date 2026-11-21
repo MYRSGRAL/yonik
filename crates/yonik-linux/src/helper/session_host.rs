@@ -1855,7 +1855,10 @@ impl Backend {
         request: SystemProfileRequest,
         cancel: &mut Cancellation,
     ) -> Result<GuardArtifact, ServiceError> {
-        self.prepare_profile_inner(uid, request, None, cancel).await
+        diagnostic_result(
+            "prepare_system_profile",
+            self.prepare_profile_inner(uid, request, None, cancel).await,
+        )
     }
     async fn prepare_profile_inner(
         &mut self,
@@ -1905,9 +1908,11 @@ impl Backend {
         if endpoint.is_none() && self.private_dns_zones.is_err() {
             return Err(ServiceError::Unsupported);
         }
-        let owner = self.owner(uid)?;
-        let (stamp, context, baseline, baseline_capture) =
-            self.capture_session_baseline(uid, cancel).await?;
+        let owner = diagnostic_result("prepare_profile_owner", self.owner(uid))?;
+        let (stamp, context, baseline, baseline_capture) = diagnostic_result(
+            "prepare_profile_baseline",
+            self.capture_session_baseline(uid, cancel).await,
+        )?;
         let bytes = topology_bytes(&baseline);
         if bytes > MAX_BASELINE_BYTES {
             return Err(ServiceError::Unavailable);
@@ -1917,7 +1922,7 @@ impl Backend {
         let memory = config_budget()
             .reserve(bytes * 2 + 128 * 1024)
             .map_err(unavailable)?;
-        let worker_uid = worker_uid()?;
+        let worker_uid = diagnostic_result("prepare_profile_worker_uid", worker_uid())?;
         if worker_uid == uid {
             return Err(ServiceError::Unavailable);
         }
