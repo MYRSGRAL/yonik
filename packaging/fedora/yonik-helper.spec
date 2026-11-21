@@ -45,7 +45,9 @@ Requires:       systemd
 %install
 install -Dm755 binaries/yonik-helper %{buildroot}%{yonik_libdir}/yonik-helper
 install -Dm755 binaries/yonik-worker %{buildroot}%{yonik_libdir}/yonik-worker
-install -Dm644 packaging/systemd/* -t %{buildroot}%{_unitdir}/
+install -Dm644 packaging/systemd/*.service packaging/systemd/*.socket -t %{buildroot}%{_unitdir}/
+install -Dm644 packaging/systemd/sleep.target.d/50-yonik-dhcp-sleep.conf \
+    %{buildroot}%{_unitdir}/sleep.target.d/50-yonik-dhcp-sleep.conf
 cp -a packaging/fedora/systemd/*.service.d %{buildroot}%{_unitdir}/
 install -Dm644 packaging/sysusers/*.conf -t %{buildroot}%{_sysusersdir}/
 install -Dm644 packaging/dbus/*.conf -t %{buildroot}%{_datadir}/dbus-1/system.d/
@@ -59,9 +61,10 @@ cmp binaries/yonik-worker %{buildroot}%{yonik_libdir}/yonik-worker
 set -eu
 semodule -X %{yonik_policy_priority} -i %{yonik_policy_dir}/yonik_helper.pp
 restorecon -F %{yonik_libdir}/yonik-helper %{yonik_libdir}/yonik-worker \
-    %{_unitdir}/yonik-worker{,-check}.{service,socket}
+    %{_unitdir}/yonik-worker{,-check}.{service,socket} \
+    %{_unitdir}/sleep.target.d/50-yonik-dhcp-sleep.conf
 restorecon -RF %{_unitdir}/yonik-worker{,-check}.service.d
-for directory in /run/yonik /run/yonik-worker /var/lib/yonik; do
+for directory in /run/yonik /run/yonik-dhcp-sleep /run/yonik-worker /var/lib/yonik; do
     if [ -d "$directory" ]; then
         restorecon -RF "$directory"
     fi
@@ -86,7 +89,7 @@ if [ "$1" -eq 0 ] && [ -d /run/systemd/system ]; then
         fi
     fi
     systemctl stop yonik-helper.service yonik-worker.service yonik-worker-check.service \
-        yonik-worker.socket yonik-worker-check.socket
+        yonik-worker.socket yonik-worker-check.socket yonik-dhcp-sleep.service
 fi
 
 %postun
@@ -94,7 +97,7 @@ set -eu
 if [ "$1" -eq 0 ]; then
     semodule -X %{yonik_policy_priority} -r yonik_helper
     # Данные StateDirectory сохраняются. Возвращаем штатную метку после удаления политики.
-    for directory in /run/yonik /run/yonik-worker /var/lib/yonik; do
+    for directory in /run/yonik /run/yonik-dhcp-sleep /run/yonik-worker /var/lib/yonik; do
         if [ -d "$directory" ]; then
             restorecon -RF "$directory"
         fi
@@ -110,6 +113,9 @@ fi
 %{yonik_libdir}/yonik-helper
 %{yonik_libdir}/yonik-worker
 %{_unitdir}/yonik-helper.service
+%{_unitdir}/yonik-dhcp-sleep.service
+%dir %{_unitdir}/sleep.target.d
+%{_unitdir}/sleep.target.d/50-yonik-dhcp-sleep.conf
 %{_unitdir}/yonik-worker.service
 %{_unitdir}/yonik-worker.socket
 %{_unitdir}/yonik-worker-check.service

@@ -1,0 +1,18 @@
+[Unit]
+Description=Yonik — завершение временных разрешений DHCP перед сном
+DefaultDependencies=no
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=root
+RuntimeDirectory=yonik-dhcp-sleep
+RuntimeDirectoryMode=0700
+TimeoutStartSec=5s
+ExecStart=/usr/lib/yonik/yonik-helper --quiesce-dhcp-before-sleep
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict

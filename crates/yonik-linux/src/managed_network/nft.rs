@@ -339,12 +339,16 @@ impl NftExecutor {
         let mut command = Command::new(format!("/proc/self/fd/{}", self.executable.as_raw_fd()));
         if let Some(directories) = pinned_cgroups {
             for directory in directories {
-                yonik_nsfs::nft_cgroup_fd::install_nft_cgroup_fd(
-                    command.as_std_mut(),
-                    directory.into(),
-                )
-                .map_err(|_| NftError::Io)?;
+                yonik_nsfs::nft_cgroup_fd::inherit_nft_fd(command.as_std_mut(), directory.into())
+                    .map_err(|_| NftError::Io)?;
             }
+        }
+        if dhcp_write.is_some() {
+            let writer = crate::helper::dhcp_sleep::lock_dhcp_nft_writer()
+                .map_err(|_| NftError::Evidence)?;
+            // nft удерживает flock до завершения даже при SIGKILL процесса helper.
+            yonik_nsfs::nft_cgroup_fd::inherit_nft_fd(command.as_std_mut(), writer)
+                .map_err(|_| NftError::Io)?;
         }
         command.arg("-n");
         if !text_input {

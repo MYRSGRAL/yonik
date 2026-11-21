@@ -9,6 +9,7 @@ mod dhcp_dhcpcd_control;
 mod dhcp_dhcpcd_vm_tests;
 pub mod dhcp_networkd;
 pub(crate) mod dhcp_sleep;
+pub use dhcp_sleep::quiesce_dhcp_before_sleep;
 pub mod fence;
 mod kernel_evidence;
 pub(crate) mod native_bootstrap;

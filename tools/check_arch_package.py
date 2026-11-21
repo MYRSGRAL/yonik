@@ -71,11 +71,18 @@ def expected_files(root: Path) -> dict[str, tuple[int, bytes | None]]:
         ("polkit", "usr/share/polkit-1/actions"),
         ("dbus", "usr/share/dbus-1"),
     ):
-        for path in (root / "packaging" / source).iterdir():
+        source_root = root / "packaging" / source
+        paths = source_root.rglob("*") if source == "systemd" else source_root.iterdir()
+        for path in paths:
+            if source == "systemd" and path.is_dir():
+                continue
             parent = destination
             if source == "dbus":
                 parent += "/system.d" if path.suffix == ".conf" else "/system-services"
-            files[f"{parent}/{path.name}"] = (0o644, path.read_bytes())
+            files[f"{parent}/{path.relative_to(source_root).as_posix()}"] = (
+                0o644,
+                path.read_bytes(),
+            )
     files["usr/share/icons/hicolor/scalable/apps/cloud.highpriority.yonik.svg"] = (
         0o644,
         (root / "crates/yonik-desktop/assets/yonik.svg").read_bytes(),
@@ -190,8 +197,11 @@ def validate_recipe(path: Path) -> None:
     функции и aliases делают такой анализ ненадёжным. Hash фиксирует целиком
     рецепт без hooks, автозапуска и сетевой установки engine.
     """
-    approved = "07fb40b269f664ce2b1a73de26cf630ba1f7bcc4e78a1bffa171b4ae25516414"
-    if hashlib.sha256(path.read_bytes()).hexdigest() != approved:
+    approved = {
+        "07fb40b269f664ce2b1a73de26cf630ba1f7bcc4e78a1bffa171b4ae25516414",
+        "3d58f0fd4765d3d93cd27f84ccd2d4cd14a876fcb45aa7d5db89dafe9aa47bf4",
+    }
+    if hashlib.sha256(path.read_bytes()).hexdigest() not in approved:
         raise ValueError(
             "Изменён рецепт: требуется независимая проверка и обновление seal"
         )

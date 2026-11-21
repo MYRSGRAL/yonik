@@ -1,5 +1,8 @@
 /usr/lib/yonik/yonik-helper -- gen_context(system_u:object_r:yonik_helper_exec_t,s0)
 /run/yonik(/.*)? gen_context(system_u:object_r:yonik_helper_run_t,s0)
+/run/yonik/dhcp-writer\.lock -- gen_context(system_u:object_r:yonik_dhcp_lock_t,s0)
+/run/yonik-dhcp-sleep -d gen_context(system_u:object_r:yonik_helper_run_t,s0)
+/usr/lib/systemd/system/sleep\.target\.d/50-yonik-dhcp-sleep\.conf -- gen_context(system_u:object_r:yonik_sleep_config_t,s0)
 /var/lib/yonik(/.*)? gen_context(system_u:object_r:yonik_helper_state_t,s0)
 /usr/lib/systemd/system/yonik-worker(-check)?\.(service|socket) -- gen_context(system_u:object_r:yonik_worker_unit_t,s0)
 /usr/lib/systemd/system/yonik-worker(-check)?\.service\.d(/10-timeout-abort\.conf)? gen_context(system_u:object_r:yonik_worker_unit_t,s0)

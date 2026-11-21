@@ -6,8 +6,8 @@ fn main() -> ExitCode {
         Cancellation,
         helper::{
             SystemSessionHost, fence::verify_worker_fence, launch_standalone_sandbox,
-            launch_standalone_worker, run_system_service, standalone_sandbox_argument,
-            standalone_worker_argument,
+            launch_standalone_worker, quiesce_dhcp_before_sleep, run_system_service,
+            standalone_sandbox_argument, standalone_worker_argument,
         },
         worker::WorkerMode,
     };
@@ -26,6 +26,14 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
+            };
+        } else if argument == "--quiesce-dhcp-before-sleep" {
+            return match quiesce_dhcp_before_sleep() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Не удалось отозвать DHCP-разрешения перед сном: {error}");
+                    ExitCode::FAILURE
+                }
             };
         } else if let Some(result) =
             [WorkerMode::Check, WorkerMode::Run]

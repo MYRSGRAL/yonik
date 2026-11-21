@@ -326,7 +326,7 @@ fn open_unit_group(path: &str) -> Result<(u64, NonZeroU64), Error> {
     ))
 }
 
-async fn systemd_owner(bus: &DBusProxy<'_>) -> Result<OwnedUniqueName, Error> {
+pub(super) async fn systemd_owner(bus: &DBusProxy<'_>) -> Result<OwnedUniqueName, Error> {
     let name = |value| BusName::try_from(value).map_err(unavailable);
     let owner = bus
         .get_name_owner(name(SYSTEMD)?)

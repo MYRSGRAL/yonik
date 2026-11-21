@@ -1,6 +1,12 @@
 //! Отзыв права публиковать DHCP-элементы до перехода logind в сон.
 use futures_util::StreamExt;
+use rustix::{
+    fd::OwnedFd as RuntimeFd,
+    fs::{self, FileType, FlockOperation, Mode, OFlags},
+    io::Errno,
+};
 use std::{
+    io,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -19,7 +25,74 @@ const QUIESCE_BUDGET: Duration = Duration::from_secs(2);
 const MIN_DELAY_MICROS: u64 = 2_500_000;
 // 650 мс в ядре плюс запас на округление тиков и сборку элемента.
 const DHCP_DRAIN_TIME: Duration = Duration::from_millis(750);
+const RUNTIME: &str = "/run/yonik";
+const SLEEP_RUNTIME: &str = "/run/yonik-dhcp-sleep";
+const SLEEP_UNIT: &str = "yonik-dhcp-sleep.service";
+const SLEEP_REQUIREMENT: &str = "/usr/lib/systemd/system/sleep.target.d/50-yonik-dhcp-sleep.conf";
+const SLEEP_ORDER: &str =
+    "[Unit]\nRequires=yonik-dhcp-sleep.service\nAfter=yonik-dhcp-sleep.service\n";
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn open_root_runtime(path: &str) -> std::result::Result<RuntimeFd, Errno> {
+    let directory = fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let stat = fs::fstat(&directory)?;
+    if stat.st_uid != 0 || stat.st_mode & 0o077 != 0 {
+        return Err(Errno::ACCESS);
+    }
+    Ok(directory)
+}
+
+fn open_writer_lock(runtime: &RuntimeFd, create: bool) -> std::result::Result<RuntimeFd, Errno> {
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    flags.set(OFlags::CREATE, create);
+    let lock = fs::openat(runtime, "dhcp-writer.lock", flags, Mode::RUSR | Mode::WUSR)?;
+    let stat = fs::fstat(&lock)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_uid != 0
+        || stat.st_mode & 0o777 != 0o600
+        || stat.st_nlink != 1
+    {
+        return Err(Errno::ACCESS);
+    }
+    Ok(lock)
+}
+
+pub(crate) fn lock_dhcp_nft_writer() -> io::Result<RuntimeFd> {
+    if std::fs::read_to_string(SLEEP_REQUIREMENT)? != SLEEP_ORDER {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    let runtime = open_root_runtime(RUNTIME)?;
+    let writer = open_writer_lock(&runtime, true)?;
+    fs::flock(&writer, FlockOperation::NonBlockingLockExclusive)?;
+    match std::fs::symlink_metadata(SLEEP_RUNTIME) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(writer),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::ErrorKind::PermissionDenied.into()),
+    }
+}
+
+/// Системная служба удерживает свой RuntimeDirectory до окончания сна.
+pub fn quiesce_dhcp_before_sleep() -> io::Result<()> {
+    if !rustix::process::geteuid().is_root() {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    let _sleep_runtime = open_root_runtime(SLEEP_RUNTIME)?;
+    let _writer =
+        match open_root_runtime(RUNTIME).and_then(|runtime| open_writer_lock(&runtime, false)) {
+            Ok(writer) => {
+                fs::flock(&writer, FlockOperation::LockExclusive)?;
+                Some(writer)
+            }
+            Err(Errno::NOENT) => None,
+            Err(error) => return Err(error.into()),
+        };
+    std::thread::sleep(DHCP_DRAIN_TIME);
+    Ok(())
+}
 
 pub(crate) struct DhcpSleep {
     generation: AtomicU64,
@@ -151,6 +224,40 @@ async fn connect() -> Result<(zbus::Connection, zbus::names::OwnedUniqueName)> {
     Ok((connection, owner))
 }
 
+async fn verify_sleep_target(connection: &zbus::Connection) -> Result<()> {
+    let bus = zbus::fdo::DBusProxy::new(connection).await?;
+    let owner = super::systemd_network_service::systemd_owner(&bus)
+        .await
+        .map_err(|_| "Не подтверждён владелец systemd PID 1")?;
+    let manager = Proxy::new(
+        connection,
+        owner.as_str(),
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+    )
+    .await?;
+    let target: zbus::zvariant::OwnedObjectPath =
+        manager.call("LoadUnit", &("sleep.target",)).await?;
+    let target = Proxy::new(
+        connection,
+        owner.as_str(),
+        target.as_str(),
+        "org.freedesktop.systemd1.Unit",
+    )
+    .await?;
+    for property in ["Requires", "After"] {
+        if !target
+            .get_property::<Vec<String>>(property)
+            .await?
+            .iter()
+            .any(|unit| unit == SLEEP_UNIT)
+        {
+            return Err("systemd не загрузил обязательную службу отзыва DHCP перед сном".into());
+        }
+    }
+    Ok(())
+}
+
 async fn inhibit(manager: &Proxy<'_>, inhibitor: &mut Inhibitor) -> Result<()> {
     if manager.get_property::<u64>("InhibitDelayMaxUSec").await? < MIN_DELAY_MICROS {
         return Err("Недостаточный срок задержки сна login1".into());
@@ -174,6 +281,7 @@ async fn inhibit(manager: &Proxy<'_>, inhibitor: &mut Inhibitor) -> Result<()> {
 
 async fn watch_connection(gate: Arc<DhcpSleep>, wake: &Notify) -> Result<()> {
     let (connection, owner) = tokio::time::timeout(CONNECT_BUDGET, connect()).await??;
+    tokio::time::timeout(QUIESCE_BUDGET, verify_sleep_target(&connection)).await??;
     let manager: Proxy<'_> = zbus::proxy::Builder::new(&connection)
         .destination(owner.as_str())?
         .path(PATH)?

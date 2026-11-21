@@ -25,6 +25,21 @@ manage_dirs_pattern(yonik_helper_t, yonik_helper_run_t, yonik_helper_run_t)
 manage_files_pattern(yonik_helper_t, yonik_helper_run_t, yonik_helper_run_t)
 allow init_t yonik_helper_run_t:dir manage_dir_perms;
 type_transition init_t var_run_t:dir yonik_helper_run_t "yonik";
+type_transition init_t var_run_t:dir yonik_helper_run_t "yonik-dhcp-sleep";
+
+type yonik_dhcp_lock_t;
+files_pid_file(yonik_dhcp_lock_t)
+type_transition yonik_helper_t yonik_helper_run_t:file yonik_dhcp_lock_t "dhcp-writer.lock";
+allow yonik_helper_t yonik_dhcp_lock_t:file { create getattr open read lock };
+# nft удерживает тот же дескриптор даже после аварийного выхода helper.
+allow iptables_t yonik_helper_t:fd use;
+allow iptables_t yonik_dhcp_lock_t:file { getattr read };
+
+type yonik_sleep_config_t;
+systemd_unit_file(yonik_sleep_config_t)
+allow yonik_helper_t yonik_sleep_config_t:file read_file_perms;
+# sleep.target принадлежит системному пакету. Helper только сверяет связи unit.
+allow yonik_helper_t systemd_unit_file_t:service status;
 
 type yonik_helper_state_t;
 files_type(yonik_helper_state_t)
