@@ -49,6 +49,95 @@ impl Ops<BorrowedFd<'_>> for Kernel {
 pub fn socket_namespace(socket: impl AsFd) -> io::Result<OwnedFd> {
     checked(&Kernel, &socket.as_fd())
 }
+/// Закрепляет процесс, связанный ядром с подключённым Unix stream.
+pub fn unix_peer_pidfd(socket: impl AsFd) -> io::Result<OwnedFd> {
+    let fd = socket.as_fd();
+    if rustix::net::sockopt::socket_domain(fd)? != rustix::net::AddressFamily::UNIX
+        || rustix::net::sockopt::socket_type(fd)? != rustix::net::SocketType::STREAM
+        || rustix::net::getpeername(fd)?.is_none()
+    {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let peer = unix_peer_raw::pidfd(fd)?;
+    if !rustix::io::fcntl_getfd(&peer)?.contains(rustix::io::FdFlags::CLOEXEC) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(peer)
+}
+
+#[allow(unsafe_code)]
+mod unix_peer_raw {
+    use std::{
+        io,
+        os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    };
+
+    pub(super) fn pidfd(socket: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+        let expected = size_of::<libc::c_int>() as libc::socklen_t;
+        let mut length = expected;
+        let mut raw: libc::c_int = -1;
+        // SAFETY: SO_PEERPIDFD возвращает новый FD в одном c_int.
+        // Оба указателя ведут на инициализированные значения нужного размера.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERPIDFD,
+                (&raw mut raw).cast(),
+                &raw mut length,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if raw < 0 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // SAFETY: при успешном getsockopt ядро выдало этот FD текущему процессу.
+        let peer = unsafe { OwnedFd::from_raw_fd(raw) };
+        if length != expected {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(peer)
+    }
+}
+
+#[cfg(test)]
+mod unix_peer_tests {
+    use super::*;
+    use std::{
+        fs,
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
+
+    #[test]
+    fn pidfd_belongs_to_the_peer_of_an_actual_stream() -> io::Result<()> {
+        let (stream, _peer) = UnixStream::pair()?;
+        let pidfd = match unix_peer_pidfd(&stream) {
+            Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => return Ok(()),
+            result => result?,
+        };
+        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?;
+        assert!(
+            info.lines()
+                .any(|line| line == format!("Pid:\t{}", std::process::id()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_non_stream_socket() -> io::Result<()> {
+        let datagram = std::os::unix::net::UnixDatagram::unbound()?;
+        assert_eq!(
+            unix_peer_pidfd(datagram)
+                .expect_err("Требуется Unix stream")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        Ok(())
+    }
+}
+
 /// Только чтение SO_MARK actual profile socket; не general getsockopt API.
 pub fn profile_socket_mark(socket: impl AsFd) -> io::Result<u32> {
     udp_raw::mark(socket.as_fd())

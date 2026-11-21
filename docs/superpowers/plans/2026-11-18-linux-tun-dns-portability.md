@@ -662,9 +662,16 @@ IPv4-сценарий с теми же проверками прошёл пов�
   сдвинул `tstamp` на 21,02 с и нижнюю границу срока на 20,72 с при
   неизменных `cstamp` и PID. Счётчик cgroup зарегистрировал один
   unicast DHCPREQUEST. В обоих режимах содержимое и метаданные
-  `/etc/resolv.conf` совпали до и после. Для реализации остаются
-  привязка pidfd к peer самого соединения, проверка смены владельца
-  интерфейса и установленные прогоны с активным TUN.
+  `/etc/resolv.conf` совпали до и после. Этот стенд открывал pidfd по
+  числовому PID из `SO_PEERCRED`.
+  Тестовая сборка Rust-клиента подтвердила в Debian 13 пакетный
+  `dhcpcd.service` до и после второго DHCPACK. Она получает pidfd
+  через `SO_PEERPIDFD`, читает DUMPLEASE без запуска процесса и
+  сверяет cgroup по ответу IPv4 SOCK_DIAG для raw UDP. В обоих снимках
+  совпали PID, inode raw-сокета, cgroup, TOS и mark. Тест выполнялся
+  с `CAP_NET_ADMIN` и `NoNewPrivileges=yes`. Чтение требует ядра с
+  `SO_PEERPIDFD` и однозначный ответ DHCPv4 без дополнительной записи
+  IPv4LL. В штатном helper эти данные ещё не подключены к допуску DHCP.
   [Нативный DHCPv4-транспорт dhcpcd](https://github.com/NetworkConfiguration/dhcpcd/blob/v10.1.0/src/dhcp.c)
   nftables 1.0.9
   и 1.1.3 требуют путь cgroup при текстовой установке, поэтому её смену

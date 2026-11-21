@@ -20,7 +20,9 @@ const MAX_TASKS: usize = 256;
 const MAX_FDS_PER_TASK: usize = 256;
 const MAX_DIAG_RECORDS: usize = 65536;
 const INET_DIAG_TOS: u16 = 5;
+const INET_DIAG_PROTOCOL: u16 = 10;
 const INET_DIAG_MARK: u16 = 15;
+const RAW_PROTOCOL: u8 = 255;
 
 fn u32n(b: &[u8]) -> Result<u32, Unavailable> {
     Ok(u32::from_ne_bytes(
@@ -82,7 +84,10 @@ pub(crate) struct ListenerDump {
 }
 impl ListenerDump {
     pub(crate) fn new(protocol: u8, port: u16) -> Result<Self, Unavailable> {
-        if !matches!(protocol, 6 | 17) || port == 0 {
+        if !matches!(protocol, 6 | 17 | RAW_PROTOCOL)
+            || port == 0
+            || (protocol == RAW_PROTOCOL && port != 17)
+        {
             return Err(Unavailable::Malformed);
         }
         Ok(Self {
@@ -100,7 +105,12 @@ impl ListenerDump {
         })
     }
     pub(crate) fn begin_v6(&mut self) -> Result<(), Unavailable> {
-        if self.poisoned || !self.done[0] || self.done[1] || self.family != 2 {
+        if self.poisoned
+            || !self.done[0]
+            || self.done[1]
+            || self.family != 2
+            || self.protocol == RAW_PROTOCOL
+        {
             self.poisoned = true;
             return Err(Unavailable::Coverage);
         }
@@ -117,6 +127,9 @@ impl ListenerDump {
         b[16] = self.family;
         b[17] = self.protocol;
         b[18] = 1 << (INET_DIAG_TOS - 1);
+        if self.protocol == RAW_PROTOCOL {
+            b[19] = 17; // sdiag_raw_protocol в inet_diag_req_raw.
+        }
         let states = if self.protocol == 6 {
             1u32 << 10
         } else {
@@ -194,7 +207,7 @@ impl ListenerDump {
             if port == self.port && self.protocol == 6 && body[1] != 10 {
                 return Err(Unavailable::Coverage);
             }
-            if port == self.port && (self.protocol == 17 || body[1] == 10) {
+            if port == self.port && (self.protocol != 6 || body[1] == 10) {
                 if self.rows.count == 64 {
                     return Err(Unavailable::Limit);
                 }
@@ -202,6 +215,7 @@ impl ListenerDump {
                 let mut v6only = None;
                 let mut tos = None;
                 let mut mark = None;
+                let mut raw_protocol = None;
                 let mut at = 72;
                 while at < body.len() {
                     let h = body.get(at..at + 4).ok_or(Unavailable::Malformed)?;
@@ -222,6 +236,14 @@ impl ListenerDump {
                         }
                         INET_DIAG_MARK => {
                             if mark.replace(u32n(value)?).is_some() {
+                                return Err(Unavailable::Malformed);
+                            }
+                        }
+                        INET_DIAG_PROTOCOL if self.protocol == RAW_PROTOCOL => {
+                            let [value] = value else {
+                                return Err(Unavailable::Malformed);
+                            };
+                            if raw_protocol.replace(*value).is_some() {
                                 return Err(Unavailable::Malformed);
                             }
                         }
@@ -261,6 +283,9 @@ impl ListenerDump {
                 if group == 0 || cookie == 0 || cookie == u64::MAX {
                     return Err(Unavailable::Coverage);
                 }
+                if self.protocol == RAW_PROTOCOL && raw_protocol != Some(17) {
+                    return Err(Unavailable::Coverage);
+                }
                 let row = Listener {
                     family: self.family,
                     protocol: self.protocol,
@@ -293,7 +318,7 @@ impl ListenerDump {
         Ok(false)
     }
     pub(crate) fn finish(self) -> Result<ListenerSet, Unavailable> {
-        if self.poisoned || self.done != [true; 2] {
+        if self.poisoned || self.done != [true, self.protocol != RAW_PROTOCOL] {
             return Err(Unavailable::Coverage);
         }
         Ok(self.rows)
@@ -349,6 +374,36 @@ mod listener_pure_tests {
             .expect("Завершение IPv4");
         dump.begin_v6().expect("Начало IPv6");
         assert_ne!(dump.request()[18] & (1 << 4), 0);
+    }
+
+    #[test]
+    fn raw_udp_dump_checks_protocol_and_completes_with_ipv4_only() {
+        let mut wire = message(2, 17, 29);
+        wire.extend_from_slice(&[5, 0, 0, 0, 17, 0, 0, 0]);
+        let attr = wire.len() - 8;
+        wire[attr..attr + 2].copy_from_slice(&5u16.to_ne_bytes());
+        wire[attr + 2..attr + 4].copy_from_slice(&INET_DIAG_PROTOCOL.to_ne_bytes());
+        let length = wire.len() as u32;
+        wire[..4].copy_from_slice(&length.to_ne_bytes());
+        let mut dump = ListenerDump::new(RAW_PROTOCOL, 17).expect("Запрос raw UDP");
+        assert_eq!(dump.request()[16..20], [2, RAW_PROTOCOL, 16, 17]);
+        dump.consume(&wire, ReturnFlags::empty(), true)
+            .expect("Сокет raw UDP");
+        dump.consume(&done(1), ReturnFlags::empty(), true)
+            .expect("Завершение IPv4");
+        let rows = dump.finish().expect("Полный список IPv4");
+        assert_eq!(
+            rows.iter().next().expect("Сокет raw UDP").protocol,
+            RAW_PROTOCOL
+        );
+
+        wire[attr + 4] = 1;
+        assert!(matches!(
+            ListenerDump::new(RAW_PROTOCOL, 17)
+                .expect("Запрос raw UDP")
+                .consume(&wire, ReturnFlags::empty(), true),
+            Err(Unavailable::Coverage)
+        ));
     }
 
     #[test]
@@ -532,7 +587,8 @@ pub(crate) fn listener_census(
         return Err(Unavailable::Authority);
     }
     rustix::net::sockopt::set_socket_recv_buffer_size(&socket, 32768).map_err(diag_error)?;
-    for family in 0..2 {
+    // Отправка DHCPv4 с raw-сокета использует только AF_INET.
+    for family in 0..if protocol == RAW_PROTOCOL { 1 } else { 2 } {
         if family == 1 {
             dump.begin_v6()?;
         }
