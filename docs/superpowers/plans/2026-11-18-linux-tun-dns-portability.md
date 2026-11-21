@@ -546,6 +546,14 @@ IPv4-сценарий с теми же проверками прошёл пов�
   клиент открывает подключённый сокет при принятии лизинга, а при
   переходе к повторной привязке переключается на приём DHCP на канальном
   уровне. [Исходный код клиента NetworkManager 1.58.1](https://github.com/NetworkManager/NetworkManager/blob/1.58.1/src/n-dhcp4/src/n-dhcp4-c-probe.c)
+  Для проверки используется `production_helper_networkmanager_dhcp_renewal`
+  из `installed_helper_session` с `test-support`. Для каждого движка нужна
+  свежая VM с установленным helper, обычным стендом Fake DNS и
+  `tools/fixtures/networkmanager_dhcp.sh`. Стенд запускает собственный
+  DHCP-сервер в отдельном сетевом пространстве. Запуск теста требует
+  `YONIK_NM_DHCP_ENGINE=xray` или `YONIK_NM_DHCP_ENGINE=sing-box`.
+  Тест проверяет повторный DHCPACK при том же PID worker, восстановление
+  после Stop и неизменность `/etc/resolv.conf`.
   Поддержка продления под NetworkManager и проверки других DHCP-менеджеров
   остаются открытыми.
   nftables 1.0.9

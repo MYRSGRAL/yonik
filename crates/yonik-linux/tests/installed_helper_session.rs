@@ -366,6 +366,25 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "чистая VM с NetworkManager и tools/fixtures/networkmanager_dhcp.sh"]
+async fn production_helper_networkmanager_dhcp_renewal() -> Result {
+    let engine = match std::env::var("YONIK_NM_DHCP_ENGINE")?.as_str() {
+        "xray" => Engine::Xray,
+        "sing-box" => Engine::SingBox,
+        _ => return Err(io::Error::other("Для стенда нужен xray или sing-box").into()),
+    };
+    let policy = scoped_fake_dns_proxy_policy()?;
+    installed_fake_dns(
+        None,
+        HelperLifecycle::NetworkManagerDhcp(engine),
+        Some(&policy),
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная VM с нативным DoT на внешнем линке и известной приватной зоной"]
 async fn production_helper_rejects_native_dot_with_private_dns() -> Result {
     guard()?;
@@ -2567,7 +2586,60 @@ async fn installed_resolved_fake_dns_policy(mixed: bool) -> Result {
 enum HelperLifecycle {
     Normal,
     Crash(Engine),
+    NetworkManagerDhcp(Engine),
     Shutdown(StandaloneService),
+}
+
+#[cfg(feature = "test-support")]
+fn networkmanager_dhcp_ack_count() -> Result<usize> {
+    let output = Command::new("/usr/bin/journalctl")
+        .args([
+            "--boot",
+            "--unit=yonik-nm-lease-server.service",
+            "--no-pager",
+            "--output=cat",
+        ])
+        .output()?;
+    require(output.status.success(), "Журнал DHCP-стенда недоступен")?;
+    Ok(std::str::from_utf8(&output.stdout)?
+        .lines()
+        .filter(|line| line.ends_with("sending ACK to 10.233.53.10"))
+        .count())
+}
+
+#[cfg(feature = "test-support")]
+fn networkmanager_dhcp_worker_pid() -> Result<u32> {
+    let output = Command::new("/usr/bin/systemctl")
+        .args([
+            "show",
+            "--property=MainPID",
+            "--value",
+            "yonik-worker.service",
+        ])
+        .output()?;
+    require(output.status.success(), "MainPID worker недоступен")?;
+    let pid = std::str::from_utf8(&output.stdout)?.trim().parse()?;
+    require(pid > 1, "Worker DHCP-стенда завершился")?;
+    Ok(pid)
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_networkmanager_dhcp_renewal(initial_acks: usize, worker: u32) -> Result {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(28);
+    loop {
+        require(
+            networkmanager_dhcp_worker_pid()? == worker,
+            "Worker сменился во время продления DHCP",
+        )?;
+        if networkmanager_dhcp_ack_count()? > initial_acks {
+            return Ok(());
+        }
+        require(
+            tokio::time::Instant::now() < deadline,
+            "Сервер не выдал повторный DHCPACK при активном TUN",
+        )?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -2699,11 +2771,18 @@ async fn installed_fake_dns(
         Ok("1") | Err(std::env::VarError::NotPresent) => None,
         _ => return Err(io::Error::other("Неизвестный движок стенда FallbackDNS").into()),
     };
+    if let HelperLifecycle::NetworkManagerDhcp(engine) = lifecycle {
+        require(
+            fallback_engine.is_none_or(|selected| selected == engine),
+            "Выбор движка для DHCP и FallbackDNS должен совпадать",
+        )?;
+    }
     for engine in [Engine::Xray, Engine::SingBox]
         .into_iter()
-        .filter(
-            |engine| !matches!(lifecycle, HelperLifecycle::Crash(selected) if *engine != selected),
-        )
+        .filter(|engine| {
+            !matches!(lifecycle, HelperLifecycle::Crash(selected)
+                | HelperLifecycle::NetworkManagerDhcp(selected) if *engine != selected)
+        })
         .filter(|engine| fallback_engine.is_none_or(|selected| *engine == selected))
     {
         let crash = matches!(lifecycle, HelperLifecycle::Crash(_));
@@ -2715,9 +2794,26 @@ async fn installed_fake_dns(
         if fallback_search {
             check_fallback_search_in_vm("printer", true).await?;
         }
+        let initial_acks = if matches!(lifecycle, HelperLifecycle::NetworkManagerDhcp(_)) {
+            let count = networkmanager_dhcp_ack_count()?;
+            require(count == 1, "Стенду нужен свежий лизинг с первым DHCPACK")?;
+            Some(count)
+        } else {
+            None
+        };
         let (_owner, token) = yonik_linux::Cancellation::new();
         let drain =
             start_fake_dns_in_vm(&connection, &server, engine, kill_switch, policy, &token).await?;
+        let dhcp_worker = if let Some(initial_acks) = initial_acks {
+            let worker = networkmanager_dhcp_worker_pid()?;
+            require(
+                networkmanager_dhcp_ack_count()? == initial_acks,
+                "DHCPACK уже получен к началу проверки активного TUN",
+            )?;
+            Some((initial_acks, worker))
+        } else {
+            None
+        };
         require(
             resolver_file_state()? == resolver_before,
             "Запуск изменил /etc/resolv.conf",
@@ -2946,6 +3042,11 @@ async fn installed_fake_dns(
                 )?;
             }
         }
+        let dhcp_renewal = if let Some((initial_acks, worker)) = dhcp_worker {
+            wait_for_networkmanager_dhcp_renewal(initial_acks, worker).await
+        } else {
+            Ok(())
+        };
         let stopped = call(&connection, "Stop", empty.clone()).await?;
         require(
             if kill_switch {
@@ -3003,6 +3104,7 @@ async fn installed_fake_dns(
             resolver_file_state()? == resolver_before,
             "Остановка изменила /etc/resolv.conf",
         )?;
+        dhcp_renewal?;
         eprintln!(
             "{engine:?} установленный helper, системный DNS, TCP/UDP IPv4/IPv6 и восстановление подтверждены"
         );
