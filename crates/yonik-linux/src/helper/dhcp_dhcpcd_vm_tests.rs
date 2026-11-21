@@ -13,6 +13,29 @@ use std::{
 use tokio::time::Instant;
 
 #[tokio::test]
+#[ignore = "одноразовая Arch VM со службой dhcpcd@.service и лизингом dhcpcd-probe"]
+async fn native_dhcpcd_reads_instance_control_socket() -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(
+        std::env::var("YONIK_PRODUCTION_HELPER_VM").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        fs::read_to_string("/sys/class/dmi/id/sys_vendor")?.trim(),
+        "QEMU"
+    );
+    let lease = read_lease("dhcpcd-probe", Instant::now() + Duration::from_secs(1)).await?;
+    assert_eq!(lease.address, Ipv4Addr::new(10, 234, 16, 10));
+    assert_eq!(lease.server, Ipv4Addr::new(10, 234, 16, 1));
+    assert_eq!((lease.prefix, lease.duration), (24, 46));
+    assert!(same_pid(&lease.peer_pidfd, lease.peer_pid)?);
+    assert_eq!(
+        fs::read_to_string(format!("/proc/{}/cgroup", lease.peer_pid))?,
+        "0::/system.slice/system-dhcpcd.slice/dhcpcd@dhcpcd\\x2dprobe.service\n"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "одноразовая Debian VM с пакетным dhcpcd.service и лизингом dhcpcd-probe"]
 async fn native_dhcpcd_proves_control_peer_and_raw_socket() -> Result<(), Box<dyn std::error::Error>>
 {

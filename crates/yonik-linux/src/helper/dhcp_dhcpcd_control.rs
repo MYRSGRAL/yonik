@@ -22,7 +22,6 @@ const MAX_INTERFACE_NAME: usize = 15;
 const MAX_RECORD_BYTES: usize = 16_384;
 const MAX_LEASE_SECONDS: u32 = 365 * 24 * 60 * 60;
 static CONTROL: Mutex<()> = Mutex::const_new(());
-const PRIVATE_SOCKET: &str = "/run/dhcpcd/sock";
 
 #[derive(Clone, Copy)]
 enum ReplyFormat {
@@ -90,35 +89,65 @@ async fn before_deadline<T>(
 async fn read_candidates(ifname: &str) -> Result<ControlLease, Error> {
     let ipv4 = format!("/run/dhcpcd/{ifname}-4.unpriv.sock");
     let dual_stack = format!("/run/dhcpcd/{ifname}.unpriv.sock");
+    if let Some(lease) = read_unique_lease(
+        ["/run/dhcpcd/unpriv.sock", &ipv4, &dual_stack],
+        ifname,
+        ReplyFormat::Legacy,
+    )
+    .await?
+    {
+        return Ok(lease);
+    }
+    if !private_socket_parents_are_trusted()? {
+        return Err(Error::Unavailable);
+    }
+    let ipv4 = format!("/run/dhcpcd/{ifname}-4.sock");
+    let dual_stack = format!("/run/dhcpcd/{ifname}.sock");
+    read_unique_lease(
+        ["/run/dhcpcd/sock", &ipv4, &dual_stack],
+        ifname,
+        ReplyFormat::StatusPrefixed,
+    )
+    .await?
+    .ok_or(Error::Unavailable)
+}
+
+async fn read_unique_lease(
+    paths: [&str; 3],
+    ifname: &str,
+    format: ReplyFormat,
+) -> Result<Option<ControlLease>, Error> {
     let mut lease = None;
-    for path in ["/run/dhcpcd/unpriv.sock", &ipv4, &dual_stack] {
-        let Some(candidate) = read_candidate(path, ifname, ReplyFormat::Legacy).await? else {
+    for path in paths {
+        if matches!(format, ReplyFormat::StatusPrefixed) && !private_socket_is_trusted(path)? {
+            continue;
+        }
+        let Some(candidate) = read_candidate(path, ifname, format).await? else {
             continue;
         };
         if lease.replace(candidate).is_some() {
             return Err(Error::Changed);
         }
     }
-    if let Some(lease) = lease {
-        return Ok(lease);
-    }
-    if !private_socket_is_trusted()? {
-        return Err(Error::Unavailable);
-    }
-    read_candidate(PRIVATE_SOCKET, ifname, ReplyFormat::StatusPrefixed)
-        .await?
-        .ok_or(Error::Unavailable)
+    Ok(lease)
 }
 
-fn private_socket_is_trusted() -> Result<bool, Error> {
-    let metadata = |path| fs::symlink_metadata(path).map_err(|_| Error::Unavailable);
+fn private_socket_parents_are_trusted() -> Result<bool, Error> {
     for parent in ["/run", "/run/dhcpcd"] {
-        let dir = metadata(parent)?;
+        let dir = fs::symlink_metadata(parent).map_err(|_| Error::Unavailable)?;
         if !dir.is_dir() || dir.uid() != 0 || dir.mode() & 0o022 != 0 {
             return Ok(false);
         }
     }
-    let socket = metadata(PRIVATE_SOCKET)?;
+    Ok(true)
+}
+
+fn private_socket_is_trusted(path: &str) -> Result<bool, Error> {
+    let socket = match fs::symlink_metadata(path) {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(Error::Unavailable),
+    };
     Ok(socket.file_type().is_socket()
         && socket.uid() == 0
         && socket.gid() == 0
