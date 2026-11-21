@@ -1285,17 +1285,20 @@ enum FakeDnsNetworkChange {
     },
     DhcpReconnect,
     DhcpRenewal,
-    NetworkManagerSuspend(Engine),
+    NetworkManagerSuspend(Option<Engine>),
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "одноразовая Fedora VM с NetworkManager, ACPI S3 и hook стенда DHCP"]
 async fn production_helper_fake_dns_networkmanager_suspend() -> Result {
-    installed_fake_dns_after_network_change(FakeDnsNetworkChange::NetworkManagerSuspend(
-        networkmanager_fixture_engine()?,
-    ))
-    .await
+    let engine = if std::env::var("YONIK_NM_DHCP_ENGINE").as_deref() == Ok("both") {
+        None
+    } else {
+        Some(networkmanager_fixture_engine()?)
+    };
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::NetworkManagerSuspend(engine))
+        .await
 }
 
 #[cfg(feature = "test-support")]
@@ -1338,7 +1341,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         dhcp_links.push(("yonik-dhcp2", "10.203.3.10", "10.203.3.1"));
     }
     for (engine, kill_switch) in [(Engine::Xray, true), (Engine::SingBox, false)] {
-        if matches!(change, FakeDnsNetworkChange::NetworkManagerSuspend(selected) if selected != engine)
+        if matches!(change, FakeDnsNetworkChange::NetworkManagerSuspend(Some(selected)) if selected != engine)
         {
             continue;
         }
@@ -1401,14 +1404,20 @@ async fn installed_fake_dns_after_network_change_in_vm(
         if change == FakeDnsNetworkChange::DhcpRenewal || networkmanager_suspend {
             if networkmanager_suspend || std::env::var_os("YONIK_DHCP_SLEEP_FIXTURE").is_some() {
                 let networkmanager_acks = if networkmanager_suspend {
-                    wait_for_dhcp_renewal_set(&networkmanager_links, false).await?;
-                    Some(networkmanager_dhcp_ack_count()?)
+                    wait_for_dhcp_renewal_set(&networkmanager_links, false)
+                        .await
+                        .map_err(|error| io::Error::other(format!("{engine:?} до S3: {error}")))?;
+                    let ack_count = networkmanager_dhcp_ack_count()?;
+                    eprintln!("{engine:?}: перед S3 допуск DHCP есть, DHCPACK={ack_count}");
+                    Some(ack_count)
                 } else {
                     None
                 };
                 fixture_suspend_and_check_dhcp(networkmanager_suspend).await?;
                 if let Some(previous_acks) = networkmanager_acks {
                     wait_for_networkmanager_after_suspend(previous_acks).await?;
+                    let ack_count = networkmanager_dhcp_ack_count()?;
+                    eprintln!("{engine:?}: после S3 получен новый DHCPACK, DHCPACK={ack_count}");
                 }
                 let state = state_after_route_events(&connection).await?;
                 require(
@@ -1467,7 +1476,11 @@ async fn installed_fake_dns_after_network_change_in_vm(
                     );
                 }
                 if let Some(previous_acks) = networkmanager_acks {
-                    wait_for_dhcp_renewal_set(&networkmanager_links, false).await?;
+                    wait_for_dhcp_renewal_set(&networkmanager_links, false)
+                        .await
+                        .map_err(|error| {
+                            io::Error::other(format!("{engine:?} после S3: {error}"))
+                        })?;
                     require(
                         networkmanager_dhcp_ack_count()? > previous_acks,
                         "NetworkManager не получил новый DHCPACK после S3",

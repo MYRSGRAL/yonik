@@ -20,6 +20,9 @@ use std::{
 };
 
 const ADMISSION_TIMEOUT: Duration = Duration::from_millis(450);
+// Начальное чтение может совпасть с восстановлением D-Bus и сети после сна.
+// Периодические чтения и проверка перед обновлением nft используют короткий лимит.
+const ADMISSION_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 // По две волны на чтение и повторную сверку восьми лизингов, отдельно nft.
 const REFRESH_BUDGET: Duration = Duration::from_millis(900);
@@ -34,6 +37,7 @@ pub(super) struct DhcpRefresh {
 async fn capture_leases(
     indices: impl IntoIterator<Item = NonZeroU32>,
     cancel: &Cancellation,
+    timeout: Duration,
 ) -> Vec<DhcpNetworkdLease> {
     stream::iter(indices)
         .map(|index| {
@@ -41,7 +45,7 @@ async fn capture_leases(
             async move {
                 diagnostic_result(
                     "dhcp_capture_lease",
-                    tokio::time::timeout(DHCP_PROBE_TIMEOUT, async {
+                    tokio::time::timeout(timeout, async {
                         let result = DhcpNetworkdLease::capture_managed(index, &mut token).await;
                         // ACK может обновить лизинг или закрыть временный сокет между чтениями.
                         if matches!(result, Err(crate::NetworkReadError::Changed)) {
@@ -88,7 +92,7 @@ pub(super) async fn select_policy(
     if candidates.len() > MAX_DHCP_RENEWALS {
         return None;
     }
-    let leases = capture_leases(candidates, cancel).await;
+    let leases = capture_leases(candidates, cancel, ADMISSION_PROBE_TIMEOUT).await;
     let mut policy = policy.clone();
     let mut selected = BTreeMap::new();
     for lease in &leases {
@@ -184,23 +188,27 @@ impl Backend {
         else {
             return Vec::new();
         };
-        let mut addresses: Vec<_> = capture_leases(refresh.initial_leases.keys().copied(), cancel)
-            .await
-            .iter()
-            .filter_map(|lease| {
-                let index = policy.matches_dhcp_lease(lease)?;
-                let path = lease.path()?;
-                if path.acquired <= *refresh.initial_leases.get(&index)? {
-                    return None;
-                }
-                Some(RenewedDhcpAddress {
-                    index: path.interface,
-                    local: path.address,
-                    prefix: path.prefix_len,
-                    expiries: lease.address_expiries()?,
-                })
+        let mut addresses: Vec<_> = capture_leases(
+            refresh.initial_leases.keys().copied(),
+            cancel,
+            DHCP_PROBE_TIMEOUT,
+        )
+        .await
+        .iter()
+        .filter_map(|lease| {
+            let index = policy.matches_dhcp_lease(lease)?;
+            let path = lease.path()?;
+            if path.acquired <= *refresh.initial_leases.get(&index)? {
+                return None;
+            }
+            Some(RenewedDhcpAddress {
+                index: path.interface,
+                local: path.address,
+                prefix: path.prefix_len,
+                expiries: lease.address_expiries()?,
             })
-            .collect();
+        })
+        .collect();
         addresses.sort_unstable_by_key(|address| address.index);
         addresses
     }
@@ -224,7 +232,12 @@ impl Backend {
             return;
         };
         let (_owner, mut cancel) = fresh_cancel();
-        let mut leases = capture_leases(refresh.initial_leases.keys().copied(), &cancel).await;
+        let mut leases = capture_leases(
+            refresh.initial_leases.keys().copied(),
+            &cancel,
+            DHCP_PROBE_TIMEOUT,
+        )
+        .await;
         if let Ok(mut nft) = self.executor(journal.ownership()) {
             let _refresh = diagnostic_result(
                 "dhcp_refresh",
