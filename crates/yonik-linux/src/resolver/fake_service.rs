@@ -1,10 +1,14 @@
 //! Loopback-транспорт для ограниченных ответов по подтверждённой DNS-политике.
 
 use std::{
-    io,
+    io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZeroU16,
-    sync::Mutex,
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{SyncSender, sync_channel},
+    },
     time::{Duration, Instant},
 };
 
@@ -21,7 +25,7 @@ use yonik_engine::fake_dns::{
 };
 use yonik_engine::resource_bundle::{
     AnswerSet, Cidr, Destination, DestinationFlow, Evaluation, EvaluationContext, Policy,
-    Resolution, ResolverPath, Route,
+    PolicyFault, Resolution, ResolverPath, Route,
 };
 
 use crate::{
@@ -31,6 +35,7 @@ use crate::{
         handle_flow_with_policy,
     },
     forward::{PolicyProxyResolver, boottime_now},
+    resolver::ResolverError,
 };
 use std::sync::Arc;
 
@@ -41,16 +46,49 @@ const TCP_IDLE: Duration = Duration::from_secs(5);
 pub const MAX_FAKE_TTL: Duration = Duration::from_secs(30);
 const POLICY_DNS_BUDGET: Duration = Duration::from_secs(3);
 
+fn report_dns_policy_unresolved() {
+    static REPORTER: OnceLock<Option<SyncSender<()>>> = OnceLock::new();
+    // stderr может задержаться в сборщике журнала. Один поток пишет,
+    // а DNS и TUN продолжают работать даже при заполненной очереди.
+    if let Some(sender) = REPORTER.get_or_init(|| {
+        let (sender, receiver) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("yonik-dns-log".into())
+            .spawn(move || {
+                for () in receiver {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "{}",
+                        FakeFlowError::DnsPolicyUnresolved
+                    );
+                }
+            })
+            .ok()
+            .map(|_| sender)
+    }) {
+        let _ = sender.try_send(());
+    }
+}
+
 pub(crate) struct CidrFlowPolicy<'a> {
     policy: &'a Policy,
     resolver: Arc<PolicyProxyResolver>,
     leases: &'a FakeDnsLeases,
     pools: Vec<Cidr>,
+    reported_unresolved: AtomicBool,
     pub(crate) direct_auth: SocksCredentials,
     pub(crate) udp_slots: tokio::sync::Semaphore,
 }
 
 impl CidrFlowPolicy<'_> {
+    fn dns_policy_unresolved(&self) -> FakeFlowError {
+        // Один безопасный диагноз за сессию, даже при потоке UDP-отказов.
+        if !self.reported_unresolved.swap(true, Ordering::Relaxed) {
+            report_dns_policy_unresolved();
+        }
+        FakeFlowError::DnsPolicyUnresolved
+    }
+
     pub(crate) async fn select(
         &self,
         mapping: &FakeMapping,
@@ -91,7 +129,10 @@ impl CidrFlowPolicy<'_> {
             .resolver
             .lookup(&mapping.name, POLICY_DNS_BUDGET, &mut cancel)
             .await
-            .map_err(|_| FakeFlowError::PolicyDenied)?;
+            .map_err(|error| match error {
+                ResolverError::Cancelled => FakeFlowError::Cancelled,
+                _ => self.dns_policy_unresolved(),
+            })?;
         if self.leases.lookup(mapping.address, mapping.epoch).as_ref() != Some(mapping) {
             return Err(FakeFlowError::UnknownFakeIp);
         }
@@ -115,6 +156,10 @@ impl CidrFlowPolicy<'_> {
                     direct: decision.action == Route::Direct,
                     valid_until,
                 })
+            }
+            Evaluation::NeedResolution(ResolverPath::Policy)
+            | Evaluation::Rejected(PolicyFault::DnsPolicyUnresolved) => {
+                Err(self.dns_policy_unresolved())
             }
             _ => Err(FakeFlowError::PolicyDenied),
         }
@@ -305,6 +350,7 @@ impl FakeDnsBridgeListeners {
                     resolver,
                     leases,
                     pools,
+                    reported_unresolved: AtomicBool::new(false),
                     direct_auth,
                     udp_slots: tokio::sync::Semaphore::new(MAX_RESOLVED_UDP_FLOWS),
                 })
@@ -493,6 +539,7 @@ mod tests {
             .unwrap(),
             leases: &leases,
             pools: vec!["198.18.4.0/24".parse().unwrap()],
+            reported_unresolved: AtomicBool::new(false),
             direct_auth: auth(),
             udp_slots: tokio::sync::Semaphore::new(1),
         };

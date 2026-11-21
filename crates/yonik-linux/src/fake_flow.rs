@@ -87,6 +87,7 @@ pub enum FakeFlowError {
     Timeout,
     UnknownFakeIp,
     PolicyDenied,
+    DnsPolicyUnresolved,
     Protocol,
     UpstreamRejected,
     UdpPeerRejected,
@@ -103,6 +104,9 @@ impl std::fmt::Display for FakeFlowError {
             Self::Timeout => "Превышен timeout SOCKS handshake",
             Self::UnknownFakeIp => "Fake-IP не найден в активном реестре",
             Self::PolicyDenied => "Политика Fake DNS отклонила назначение",
+            Self::DnsPolicyUnresolved => {
+                "DNS_POLICY_UNRESOLVED: обязательное DNS-разрешение не подтверждено"
+            }
             Self::Protocol => "Некорректный SOCKS протокол",
             Self::UpstreamRejected => "Локальное ядро отклонило SOCKS соединение",
             Self::UdpPeerRejected => "UDP пакет пришёл не от клиента этой SOCKS ассоциации",

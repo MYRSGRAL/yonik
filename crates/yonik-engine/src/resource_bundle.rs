@@ -7,8 +7,8 @@ use std::{
 };
 pub use yonik_domain::{
     Action, AnswerSet, Cidr, Conditions, Destination, DestinationFlow, DomainName, DomainPattern,
-    Evaluation, EvaluationContext, Policy, Resolution, ResolverPath, ResourceConditions,
-    ResourceRule, Route, Rule,
+    Evaluation, EvaluationContext, Policy, PolicyFault, Resolution, ResolverPath,
+    ResourceConditions, ResourceRule, Route, Rule,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
