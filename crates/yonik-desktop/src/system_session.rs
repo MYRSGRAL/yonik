@@ -277,6 +277,14 @@ impl SystemSession {
             self.capability = Some(Instant::now());
         }
         let result = self.client.state(deadline, cancel).await;
+        if matches!(result, Ok(State::NoManagedPolicy | State::RecoveryRequired))
+            && !matches!(
+                tokio::time::timeout_at(deadline, self.drain_output()).await,
+                Ok(true)
+            )
+        {
+            return self.record(Err(ClientError::Unavailable));
+        }
         self.record(result)
     }
     pub async fn stop(

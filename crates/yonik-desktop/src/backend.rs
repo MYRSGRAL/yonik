@@ -5274,11 +5274,20 @@ async fn run(
                                 actor.state.status = "Unknown";
                             } else {
                                 if flight.connecting || (flight.mutating && result.is_err()) { system_active = !matches!(result, Err(ClientError::Unsupported | ClientError::Denied | ClientError::InvalidRequest | ClientError::Busy)); }
-                                if !flight.connecting && system_stop { system_active = !matches!(result, Ok(SystemState::NoManagedPolicy | SystemState::VerifiedRules | SystemState::RecoveryRequired)); system_stop = false; }
+                                if flight.stopping {
+                                    system_active = !matches!(result, Ok(SystemState::NoManagedPolicy | SystemState::VerifiedRules | SystemState::RecoveryRequired));
+                                    system_stop = false;
+                                }
                                 match result {
                                     Ok(state) => {
-                                        if state == SystemState::NoManagedPolicy { system_active = false; }
-                                        else if matches!(state, SystemState::TunnelStarting | SystemState::Unknown) { system_active = true; }
+                                        match state {
+                                            SystemState::NoManagedPolicy => system_active = false,
+                                            SystemState::TunnelStarting | SystemState::Unknown => system_active = true,
+                                            // После State остаётся публичная блокировка, а worker
+                                            // и ресурсы сессии уже завершены самим helper.
+                                            SystemState::RecoveryRequired if !flight.mutating => system_active = false,
+                                            _ => {}
+                                        }
                                         record_system(&mut actor.state, state)
                                     },
                                     Err(error) => {
@@ -7510,6 +7519,7 @@ pub(crate) struct Flight {
     pub request_id: Option<u64>,
     pub source_generation: Option<i64>,
     pub connecting: bool,
+    stopping: bool,
     pub mutating: bool,
     pub cancel_on_network_change: bool,
 }
@@ -7533,6 +7543,7 @@ impl Flight {
             Operation::PolicyConnect(_, _, _, revision, _) => Some(*revision),
             _ => None,
         };
+        let stopping = matches!(operation, Operation::Stop);
         let mutating = !matches!(operation, Operation::State);
         let (cancel, cancellation) = Cancellation::new();
         let task = tokio::spawn(async move {
@@ -7612,6 +7623,7 @@ impl Flight {
             request_id: None,
             source_generation: None,
             connecting,
+            stopping,
             mutating,
             cancel_on_network_change,
         }
