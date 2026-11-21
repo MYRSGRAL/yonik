@@ -921,6 +921,34 @@ async fn production_helper_fake_dns_after_resolvconf_update() -> Result {
 #[tokio::test]
 #[ignore = "одноразовая Debian VM с сохранённой wg.test, WireGuard и двумя DNS под resolvconf"]
 async fn production_helper_fake_dns_protects_zone_after_resolvconf_route_change() -> Result {
+    check_saved_zone_after_resolvconf_route_change(false).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая Debian VM с сохранённой wg.test, WireGuard и двумя DNS под resolvconf"]
+async fn production_helper_fake_dns_keeps_zone_between_workers_with_kill_switch() -> Result {
+    check_saved_zone_after_resolvconf_route_change(true).await
+}
+
+#[cfg(feature = "test-support")]
+async fn check_private_queries_blocked(address: std::net::IpAddr, name: &str) -> Result {
+    let peer = (address, 53).into();
+    for qtype in [1, 28] {
+        let (udp, tcp) = tokio::join!(
+            ask_fixture_dns(peer, name, qtype, false),
+            ask_fixture_dns(peer, name, qtype, true),
+        );
+        require(
+            udp.is_err() && tcp.is_err(),
+            "Приватная зона доступна через публичный DNS",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn check_saved_zone_after_resolvconf_route_change(kill_switch: bool) -> Result {
     guard()?;
     let _lock = vm_lock::acquire()?;
     wait_for_fixture_link().await?;
@@ -952,7 +980,7 @@ async fn production_helper_fake_dns_protects_zone_after_resolvconf_route_change(
                 &connection,
                 &server,
                 engine,
-                false,
+                kill_switch,
                 Some(&policy),
                 &token,
                 &domains,
@@ -962,16 +990,7 @@ async fn production_helper_fake_dns_protects_zone_after_resolvconf_route_change(
         let old_v4 = getent_fake_dns("ahostsv4", "example.test").await?;
         let old_v6 = getent_fake_dns("ahostsv6", "example.test").await?;
         check_fixture_resolver(initial, "192.0.2.99", old_v4, old_v6).await?;
-        for qtype in [1, 28] {
-            for tcp in [false, true] {
-                require(
-                    ask_fixture_dns((initial, 53).into(), "before.wg.test", qtype, tcp)
-                        .await
-                        .is_err(),
-                    "Сохранённая приватная зона доступна через публичный DNS",
-                )?;
-            }
-        }
+        check_private_queries_blocked(initial, "before.wg.test").await?;
         require(
             resolver_file_state()? == baseline,
             "TUN изменил источник DNS",
@@ -980,14 +999,34 @@ async fn production_helper_fake_dns_protects_zone_after_resolvconf_route_change(
             route("add", "blackhole")?.success(),
             "Стенд не отозвал маршрут приватного DNS",
         )?;
+        let stopped = tokio::time::timeout(Duration::from_secs(15), drain.drained());
+        let during_stop = async {
+            if kill_switch {
+                check_private_queries_blocked(initial, "transition.wg.test").await?;
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        let (stopped, during_stop) = tokio::join!(stopped, during_stop);
+        during_stop?;
         require(
-            tokio::time::timeout(Duration::from_secs(15), drain.drained()).await?,
+            stopped?,
             "Сетевой наблюдатель не остановил worker после смены маршрута",
         )?;
+        let state = state_after_route_events(&connection).await?;
         require(
-            state_after_route_events(&connection).await?["state"] == "no_managed_policy",
+            if kill_switch {
+                matches!(
+                    state["state"].as_str(),
+                    Some("recovery_required" | "verified_rules")
+                )
+            } else {
+                state["state"] == "no_managed_policy"
+            },
             "Helper не завершил предыдущую сессию",
         )?;
+        if kill_switch {
+            check_private_queries_blocked(initial, "stopped.wg.test").await?;
+        }
         require(
             resolver_file_state()? == baseline,
             "Смена только маршрута изменила источник DNS",
@@ -1004,21 +1043,28 @@ async fn production_helper_fake_dns_protects_zone_after_resolvconf_route_change(
             published.contents != baseline.contents,
             "resolvconf не опубликовал новый адрес DNS",
         )?;
-        check_only_fake_is_filtered(old_v4, old_v6).await?;
-        let drain = start().await?;
+        let drain = if kill_switch {
+            check_private_queries_blocked(updated, "updated.wg.test").await?;
+            let (started, protection) = tokio::join!(
+                start(),
+                check_private_queries_blocked(updated, "prepare.wg.test")
+            );
+            protection?;
+            let drain = started?;
+            tokio::try_join!(
+                check_fake_flow_blocked((old_v4, 40000).into()),
+                check_fake_flow_blocked((old_v6, 40000).into()),
+            )?;
+            eprintln!("{engine:?}: YONIK_PRIVATE_ZONE_BETWEEN_WORKERS_OK");
+            drain
+        } else {
+            check_only_fake_is_filtered(old_v4, old_v6).await?;
+            start().await?
+        };
         let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
         let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
         check_fixture_resolver(updated, "192.0.2.100", v4, v6).await?;
-        for qtype in [1, 28] {
-            for tcp in [false, true] {
-                require(
-                    ask_fixture_dns((updated, 53).into(), "after.wg.test", qtype, tcp)
-                        .await
-                        .is_err(),
-                    "Приватная зона разрешилась после отзыва маршрута",
-                )?;
-            }
-        }
+        check_private_queries_blocked(updated, "after.wg.test").await?;
         check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
         call(&connection, "Stop", json!({"version":1})).await?;
         require(
@@ -1029,6 +1075,9 @@ async fn production_helper_fake_dns_protects_zone_after_resolvconf_route_change(
             resolver_file_state()? == published,
             "Повторный запуск или Stop изменили конфигурацию resolvconf",
         )?;
+        if kill_switch {
+            call(&connection, "Unlock", json!({"version":1})).await?;
+        }
         require(
             route("del", "blackhole")?.success(),
             "Стенд не восстановил приватный маршрут",
