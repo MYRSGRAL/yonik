@@ -8,7 +8,9 @@ use super::{
 use crate::{
     Cancellation, NetworkReadError, RouteKind, RouteQuery, TransportProtocol,
     fake_flow::WorkerOnlyLoopbackIsolation,
-    fake_service::{FakeDnsBridgeListeners, FakeDnsLeases, MAX_FAKE_TTL},
+    fake_service::{
+        FakeDnsBridgeListeners, FakeDnsLeases, MAX_FAKE_TTL, WireGuardOwner, WireGuardPrefixes,
+    },
     managed_network::{
         Journal,
         firewall::{BoundDirect, IpPrefix, ResolverRelay},
@@ -248,7 +250,7 @@ pub(super) struct PreparedFakeDns {
     pub config: SystemFakeDnsBridge,
     pub loopback: Ipv4Addr,
     pub direct_egress: Vec<BoundDirect>,
-    pub protected_prefixes: Vec<IpPrefix>,
+    pub protected_prefixes: WireGuardPrefixes,
     marker: IpAddr,
     suffixes: Vec<String>,
     private_dns_zones: BTreeSet<String>,
@@ -657,7 +659,7 @@ fn contains_private_dns_zone(zones: &BTreeSet<String>, name: &str) -> bool {
             .any(|(index, _)| zones.contains(&name[index + 1..]))
 }
 
-fn fake_wireguard_prefixes(baseline: &LinuxTopology) -> Result<Vec<IpPrefix>, ServiceError> {
+fn fake_wireguard_prefixes(baseline: &LinuxTopology) -> Result<WireGuardPrefixes, ServiceError> {
     let wireguard: BTreeSet<_> = baseline
         .links
         .iter()
@@ -665,44 +667,62 @@ fn fake_wireguard_prefixes(baseline: &LinuxTopology) -> Result<Vec<IpPrefix>, Se
         .map(|link| link.index)
         .collect();
     if wireguard.is_empty() {
-        return Ok(Vec::new());
+        return Ok(WireGuardPrefixes::new());
     }
-    let is_wireguard = |index: u32| wireguard.contains(&index);
-    let nexthops: BTreeSet<_> = baseline
+    let nexthops: BTreeMap<_, _> = baseline
         .nexthops
         .iter()
-        .filter(|hop| hop.output_interface.is_some_and(is_wireguard))
-        .map(|hop| hop.id)
+        .filter_map(|hop| {
+            let index = hop
+                .output_interface
+                .filter(|index| wireguard.contains(index))?;
+            Some((hop.id, WireGuardOwner::Interface(index)))
+        })
         .collect();
-    let groups: BTreeSet<_> = baseline
+    // Общая nexthop-группа разбирается один раз для всех её маршрутов.
+    let groups: BTreeMap<_, _> = baseline
         .nexthops
         .iter()
-        .filter(|hop| hop.group.iter().any(|member| nexthops.contains(&member.id)))
-        .map(|hop| hop.id)
+        .filter_map(|hop| {
+            let owner = hop
+                .group
+                .iter()
+                .filter_map(|member| nexthops.get(&member.id).copied())
+                .reduce(WireGuardOwner::merge)?;
+            Some((hop.id, owner))
+        })
         .collect();
-    // Те же защищённые префиксы проверяют nftables и ответы DNS политики.
-    baseline
-        .routes
-        .iter()
-        .filter(|route| {
-            route.destination.length > 0
-                && RouteKind::from(route.kind) == RouteKind::Unicast
-                && (route.output_interface.is_some_and(is_wireguard)
-                    || route
-                        .multipath
-                        .iter()
-                        .any(|hop| is_wireguard(hop.output_interface))
-                    || route
-                        .nexthop_id
-                        .is_some_and(|id| nexthops.contains(&id) || groups.contains(&id)))
-        })
-        .map(|route| (route.destination.address, route.destination.length))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|(address, length)| {
-            IpPrefix::new(address, length).map_err(|_| ServiceError::Unavailable)
-        })
-        .collect()
+    let mut prefixes = WireGuardPrefixes::new();
+    for route in &baseline.routes {
+        if route.destination.length == 0 || RouteKind::from(route.kind) != RouteKind::Unicast {
+            continue;
+        }
+        let named_owners = route.nexthop_id.into_iter().flat_map(|id| {
+            nexthops
+                .get(&id)
+                .into_iter()
+                .chain(groups.get(&id))
+                .copied()
+        });
+        let owner = route
+            .output_interface
+            .into_iter()
+            .chain(route.multipath.iter().map(|hop| hop.output_interface))
+            .filter(|index| wireguard.contains(index))
+            .map(WireGuardOwner::Interface)
+            .chain(named_owners)
+            .reduce(WireGuardOwner::merge);
+        if let Some(owner) = owner {
+            let prefix = IpPrefix::new(route.destination.address, route.destination.length)
+                .map_err(|_| ServiceError::Unavailable)?;
+            // Диагнозу достаточно одного индекса или признака неоднозначности.
+            prefixes
+                .entry(prefix)
+                .and_modify(|prior| *prior = prior.merge(owner))
+                .or_insert(owner);
+        }
+    }
+    Ok(prefixes)
 }
 
 impl PreparedFakeDns {
@@ -1165,7 +1185,7 @@ impl PreparedFakeDns {
                 for_task
                     .cidr_policy
                     .as_ref()
-                    .map(|policy| (policy.policy(), for_task.protected_prefixes.as_slice())),
+                    .map(|policy| (policy.policy(), &for_task.protected_prefixes)),
                 cancel,
             );
             tokio::pin!(serving);

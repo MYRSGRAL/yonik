@@ -1,6 +1,7 @@
 //! Loopback-транспорт для ограниченных ответов по подтверждённой DNS-политике.
 
 use std::{
+    collections::BTreeMap,
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZeroU16,
@@ -67,29 +68,50 @@ fn report_dns_policy_error(message: &'static str) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WireGuardOwner {
+    Interface(u32),
+    Multiple,
+}
+
+impl WireGuardOwner {
+    pub(crate) fn merge(self, other: Self) -> Self {
+        if self == other { self } else { Self::Multiple }
+    }
+}
+
+pub(crate) type WireGuardPrefixes = BTreeMap<IpPrefix, WireGuardOwner>;
+
 fn check_private_policy_answer(
     addresses: &[IpAddr],
-    protected_prefixes: &[IpPrefix],
+    protected_prefixes: &WireGuardPrefixes,
 ) -> Result<(), FakeFlowError> {
     if protected_prefixes.is_empty() {
         return Ok(());
     }
     let mut public = false;
-    let mut private = false;
+    let mut vpn = None;
     for address in addresses {
-        if protected_prefixes
+        let address = address.to_canonical();
+        let mut owners = protected_prefixes
             .iter()
-            .any(|prefix| prefix.contains(address.to_canonical()))
-        {
-            private = true;
-        } else {
-            public = true;
-        }
-        if public && private {
-            return Err(FakeFlowError::DnsPolicyAmbiguous);
+            .filter(|(prefix, _)| prefix.contains(address))
+            .map(|(_, owner)| *owner);
+        match owners.next() {
+            Some(owner)
+                if public
+                    || owner == WireGuardOwner::Multiple
+                    || vpn.is_some_and(|prior| prior != owner)
+                    || owners.any(|other| other != owner) =>
+            {
+                return Err(FakeFlowError::DnsPolicyAmbiguous);
+            }
+            Some(owner) => vpn = Some(owner),
+            None if vpn.is_some() => return Err(FakeFlowError::DnsPolicyAmbiguous),
+            None => public = true,
         }
     }
-    if private {
+    if vpn.is_some() {
         Err(FakeFlowError::PolicyDenied)
     } else {
         Ok(())
@@ -101,7 +123,7 @@ pub(crate) struct CidrFlowPolicy<'a> {
     resolver: Arc<PolicyProxyResolver>,
     leases: &'a FakeDnsLeases,
     pools: Vec<Cidr>,
-    protected_prefixes: &'a [IpPrefix],
+    protected_prefixes: &'a WireGuardPrefixes,
     reported_unresolved: AtomicBool,
     reported_ambiguous: AtomicBool,
     pub(crate) direct_auth: SocksCredentials,
@@ -362,7 +384,7 @@ impl FakeDnsBridgeListeners {
         leases: &FakeDnsLeases,
         epoch: DnsEpoch,
         approved: &(impl Fn(&FakeDnsQuestion) -> bool + Sync),
-        policy: Option<(&Policy, &[IpPrefix])>,
+        policy: Option<(&Policy, &WireGuardPrefixes)>,
         cancel: Cancellation,
     ) -> io::Result<()> {
         let expected = bridge.helper_endpoints().map(SocketAddr::V4);
@@ -572,16 +594,25 @@ mod tests {
     #[test]
     fn ответ_политики_не_выбирает_адрес_из_защищённой_сети() {
         let prefixes = [
-            IpPrefix::new("10.80.0.0".parse().unwrap(), 16).unwrap(),
-            IpPrefix::new("fd80:1::".parse().unwrap(), 48).unwrap(),
-        ];
+            (
+                IpPrefix::new("10.80.0.0".parse().unwrap(), 16).unwrap(),
+                WireGuardOwner::Interface(3),
+            ),
+            (
+                IpPrefix::new("fd80:1::".parse().unwrap(), 48).unwrap(),
+                WireGuardOwner::Interface(3),
+            ),
+        ]
+        .into();
         let public = "203.0.113.45".parse().unwrap();
         let private_v4 = "10.80.4.1".parse().unwrap();
         let private_v6 = "fd80:1::3".parse().unwrap();
         let mapped = "::ffff:10.80.4.1".parse().unwrap();
 
         assert!(check_private_policy_answer(&[public], &prefixes).is_ok());
-        assert!(check_private_policy_answer(&[public, private_v6], &[]).is_ok());
+        assert!(
+            check_private_policy_answer(&[public, private_v6], &WireGuardPrefixes::new()).is_ok()
+        );
         for private in [private_v4, private_v6, mapped] {
             assert!(matches!(
                 check_private_policy_answer(&[private], &prefixes),
@@ -594,6 +625,50 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn ответ_из_двух_wireguard_сетей_неоднозначен() {
+        let v4_prefix = IpPrefix::new("10.80.0.0".parse().unwrap(), 16).unwrap();
+        let v6_prefix = IpPrefix::new("fd80:1::".parse().unwrap(), 48).unwrap();
+        let v4 = "10.80.4.1".parse().unwrap();
+        let v6 = "fd80:1::3".parse().unwrap();
+        let same_vpn = [
+            (v4_prefix, WireGuardOwner::Interface(3)),
+            (v6_prefix, WireGuardOwner::Interface(3)),
+        ]
+        .into();
+        let different_vpns = [
+            (v4_prefix, WireGuardOwner::Interface(3)),
+            (v6_prefix, WireGuardOwner::Interface(8)),
+        ]
+        .into();
+        let overlapping = [(v4_prefix, WireGuardOwner::Multiple)].into();
+
+        assert!(matches!(
+            check_private_policy_answer(&[v4, v6], &same_vpn),
+            Err(FakeFlowError::PolicyDenied)
+        ));
+        for addresses in [[v4, v6], [v6, v4]] {
+            assert!(matches!(
+                check_private_policy_answer(&addresses, &different_vpns),
+                Err(FakeFlowError::DnsPolicyAmbiguous)
+            ));
+        }
+        assert!(matches!(
+            check_private_policy_answer(&[v4], &overlapping),
+            Err(FakeFlowError::DnsPolicyAmbiguous)
+        ));
+        let nested_prefix = IpPrefix::new("10.80.4.0".parse().unwrap(), 24).unwrap();
+        let nested = [
+            (v4_prefix, WireGuardOwner::Interface(3)),
+            (nested_prefix, WireGuardOwner::Interface(8)),
+        ]
+        .into();
+        assert!(matches!(
+            check_private_policy_answer(&[v4], &nested),
+            Err(FakeFlowError::DnsPolicyAmbiguous)
+        ));
     }
 
     #[tokio::test]
@@ -630,7 +705,7 @@ mod tests {
             .unwrap(),
             leases: &leases,
             pools: vec!["198.18.4.0/24".parse().unwrap()],
-            protected_prefixes: &[],
+            protected_prefixes: &WireGuardPrefixes::new(),
             reported_unresolved: AtomicBool::new(false),
             reported_ambiguous: AtomicBool::new(false),
             direct_auth: auth(),

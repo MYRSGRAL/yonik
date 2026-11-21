@@ -2329,7 +2329,7 @@ impl Backend {
         let private_routes = artifact
             .fake_dns
             .iter()
-            .flat_map(|dns| dns.protected_prefixes.iter().copied())
+            .flat_map(|dns| dns.protected_prefixes.keys().copied())
             .map(|prefix| PrivateRoute::new(prefix, None))
             .collect::<Result<Vec<_>, _>>()
             .map_err(unavailable)?;

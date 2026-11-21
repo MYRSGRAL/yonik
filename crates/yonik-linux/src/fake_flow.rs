@@ -98,7 +98,7 @@ pub enum FakeFlowError {
 
 impl FakeFlowError {
     pub(crate) const DNS_POLICY_AMBIGUOUS: &str =
-        "DNS_POLICY_AMBIGUOUS: ответ DNS политики содержит публичные и защищённые адреса";
+        "DNS_POLICY_AMBIGUOUS: адреса ответа DNS политики относятся к разным сетям";
     pub(crate) const DNS_POLICY_UNRESOLVED: &str =
         "DNS_POLICY_UNRESOLVED: обязательное DNS-разрешение не подтверждено";
 }
