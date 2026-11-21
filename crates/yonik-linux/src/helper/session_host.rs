@@ -21,7 +21,7 @@ use crate::{
     RouteQuery,
     managed_network::{
         PublicPolicyPhase, QuarantineIntent, Resource, Scope,
-        firewall::{BoundDirect, MAX_BOUND_DIRECT, PrivateRoute, ResolverTls},
+        firewall::{BoundDirect, MAX_BOUND_DIRECT, PrivateRoute, ResolverTls, prefixes_overlap},
         tun::TunExecutor,
     },
     network::{
@@ -1217,6 +1217,7 @@ fn bound_literal_direct(
     baseline: &LinuxTopology,
     worker_uid: u32,
     mark: u32,
+    fake_dns: bool,
 ) -> Result<Vec<BoundDirect>, ServiceError> {
     let mut prefixes = BTreeSet::new();
     for (address, length) in policy.enabled_direct_prefixes() {
@@ -1227,6 +1228,16 @@ fn bound_literal_direct(
     }
     if prefixes.is_empty() {
         return Ok(Vec::new());
+    }
+    let mut protected = BTreeSet::new();
+    if !fake_dns {
+        protected.extend(session_fake_dns::wireguard_prefixes(baseline)?.into_keys());
+        for private in &policy.policy().private_networks {
+            let cidr = &private.network;
+            let prefix = IpPrefix::new(cidr.network(), cidr.prefix_len())
+                .map_err(|_| ServiceError::Unsupported)?;
+            protected.insert(prefix);
+        }
     }
     let uplinks: HashMap<_, _> = baseline
         .links
@@ -1247,6 +1258,12 @@ fn bound_literal_direct(
     let mut egress = BTreeSet::new();
     for (address, length) in prefixes {
         let prefix = IpPrefix::new(address, length).map_err(|_| ServiceError::Unsupported)?;
+        if protected
+            .iter()
+            .any(|&private| prefixes_overlap(prefix, private))
+        {
+            return Err(ServiceError::Unsupported);
+        }
         let before = egress.len();
         // Снимок ограничивает допустимые uplink и шлюзы. nft сверяет
         // фактический маршрут каждого пакета и отсекает connected-сети.
@@ -1279,7 +1296,7 @@ fn bound_literal_direct(
                 }
             }
         }
-        if egress.len() == before {
+        if fake_dns && egress.len() == before {
             return Err(ServiceError::Unsupported);
         }
     }
@@ -1942,7 +1959,13 @@ impl Backend {
         .map_err(unavailable)?;
         let direct_egress = match &policy {
             Some(policy) if fake_dns_requested || (!attribution_required && bundle.is_none()) => {
-                bound_literal_direct(policy, &baseline, worker_uid, plan.socket_mark())?
+                bound_literal_direct(
+                    policy,
+                    &baseline,
+                    worker_uid,
+                    plan.socket_mark(),
+                    fake_dns_requested,
+                )?
             }
             _ => Vec::new(),
         };

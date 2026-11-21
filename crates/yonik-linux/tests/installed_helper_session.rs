@@ -1032,7 +1032,7 @@ async fn production_helper_ip_only_direct_is_bound_to_the_gateway() -> Result {
     let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
     let policy = yonik_engine::policy_wire::SystemPolicy::parse(
         &json!({"version":1,"default_action":"proxy","lan":[],"private_networks":[],"private_domains":[],
-            "user_rules":[{"id":1,"enabled":true,"action":"direct","ip_cidr":["192.0.2.192/27","2001:db8:7471::/64"],
+            "user_rules":[{"id":1,"enabled":true,"action":"direct","ip_cidr":["192.0.2.192/27","2001:db8:7471::/64","2001:db8:76ff::/64"],
                 "domain":[],"domain_suffix":[],"executable_paths":[]}],"preset_rules":[]})
         .to_string(),
     )?;
@@ -1054,6 +1054,7 @@ async fn production_helper_ip_only_direct_is_bound_to_the_gateway() -> Result {
             "Direct не запустил TUN",
         )?;
         check_literal_direct_traffic().await?;
+        check_fake_flow_blocked("[2001:db8:76ff::2]:40000".parse()?).await?;
         require(
             client.stop(deadline(), cancel.clone()).await? == State::NoManagedPolicy,
             "Stop не очистил Direct",
@@ -1066,6 +1067,55 @@ async fn production_helper_ip_only_direct_is_bound_to_the_gateway() -> Result {
         eprintln!("{engine:?}: Direct через шлюз и блокировка доступа без шлюза прошли");
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая VM с WireGuard-маршрутами и альтернативным физическим шлюзом"]
+async fn production_helper_ip_only_direct_rejects_protected_prefixes() -> Result {
+    use yonik_linux::system_client::ClientError;
+
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let (_owner, cancel) = yonik_linux::Cancellation::new();
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(25);
+    let mut client = SystemClient::on_connection(
+        zbus::Connection::system().await?,
+        deadline(),
+        cancel.clone(),
+    )
+    .await?;
+    for cidr in ["192.0.2.192/27", "2001:db8:7471::/64"] {
+        let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+            &json!({"version":1,"default_action":"proxy","lan":[],"private_networks":[],"private_domains":[],
+                "user_rules":[{"id":1,"enabled":true,"action":"direct","ip_cidr":[cidr],
+                    "domain":[],"domain_suffix":[],"executable_paths":[]}],"preset_rules":[]})
+            .to_string(),
+        )?;
+        for engine in [Engine::Xray, Engine::SingBox] {
+            let result = client
+                .prepare_profile_policy(&server, engine, false, &policy, deadline(), cancel.clone())
+                .await;
+            require(
+                matches!(result, Err(ClientError::Unsupported)),
+                "Direct разрешил пересечение с защищённым маршрутом WireGuard",
+            )?;
+            require(
+                client.state(deadline(), cancel.clone()).await? == State::NoManagedPolicy,
+                "Отклонённый профиль изменил сетевое состояние",
+            )?;
+        }
+    }
+    require(
+        resolver_file_state()? == resolver_before,
+        "Изменился resolv.conf",
+    )
 }
 
 #[cfg(feature = "test-support")]

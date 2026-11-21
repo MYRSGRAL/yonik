@@ -658,7 +658,9 @@ fn contains_private_dns_zone(zones: &BTreeSet<String>, name: &str) -> bool {
             .any(|(index, _)| zones.contains(&name[index + 1..]))
 }
 
-fn fake_wireguard_prefixes(baseline: &LinuxTopology) -> Result<WireGuardPrefixes, ServiceError> {
+pub(super) fn wireguard_prefixes(
+    baseline: &LinuxTopology,
+) -> Result<WireGuardPrefixes, ServiceError> {
     let wireguard: BTreeSet<_> = baseline
         .links
         .iter()
@@ -977,7 +979,7 @@ impl PreparedFakeDns {
             source,
             resolved,
             cidr_policy,
-            protected_prefixes: fake_wireguard_prefixes(topology)?,
+            protected_prefixes: wireguard_prefixes(topology)?,
             tls_peers,
             resolver_relay,
             plain,

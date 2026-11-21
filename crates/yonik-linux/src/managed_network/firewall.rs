@@ -1527,7 +1527,7 @@ impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
 fn interface(value: u32) -> Result<NonZeroU32, PolicyError> {
     NonZeroU32::new(value).ok_or(PolicyError::Interface)
 }
-fn prefixes_overlap(first: IpPrefix, second: IpPrefix) -> bool {
+pub(crate) fn prefixes_overlap(first: IpPrefix, second: IpPrefix) -> bool {
     first.contains(second.address) || second.contains(first.address)
 }
 fn compare(left: Value, right: Value) -> Value {
