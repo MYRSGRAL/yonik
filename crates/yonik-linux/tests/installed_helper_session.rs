@@ -1461,7 +1461,15 @@ enum FakeDnsNetworkChange {
     },
     DhcpReconnect,
     DhcpRenewal,
+    DhcpSuspendWithoutLogind,
     NetworkManagerSuspend(Option<Engine>),
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая Debian VM с networkd, ACPI S3, отключённым login1 и hook стенда"]
+async fn production_helper_fake_dns_suspend_without_logind() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::DhcpSuspendWithoutLogind).await
 }
 
 #[cfg(feature = "test-support")]
@@ -1504,12 +1512,28 @@ async fn installed_fake_dns_after_network_change_in_vm(
         tokio::time::sleep(yonik_linux::fake_service::MAX_FAKE_TTL).await;
     }
     let (_owner, mut token) = yonik_linux::Cancellation::new();
-    let after_ttl = change == FakeDnsNetworkChange::ResolverRestartAfterTtl;
-    let resolver_restart = change == FakeDnsNetworkChange::ResolverRestart || after_ttl;
+    let no_logind = change == FakeDnsNetworkChange::DhcpSuspendWithoutLogind;
+    // Реестр использует BOOTTIME, поэтому сон входит в срок аренды Fake-IP.
+    // В сценарии S3 подтверждаем блокировку перед новым DNS-ответом после TTL.
+    let after_ttl = change == FakeDnsNetworkChange::ResolverRestartAfterTtl || no_logind;
+    let resolver_restart = matches!(
+        change,
+        FakeDnsNetworkChange::ResolverRestart | FakeDnsNetworkChange::ResolverRestartAfterTtl
+    );
     let dhcp = matches!(
         change,
-        FakeDnsNetworkChange::DhcpReconnect | FakeDnsNetworkChange::DhcpRenewal
+        FakeDnsNetworkChange::DhcpReconnect
+            | FakeDnsNetworkChange::DhcpRenewal
+            | FakeDnsNetworkChange::DhcpSuspendWithoutLogind
     );
+    if no_logind {
+        let bus = zbus::fdo::DBusProxy::new(&connection).await?;
+        require(
+            !bus.name_has_owner("org.freedesktop.login1".try_into()?)
+                .await?,
+            "Сценарий требует отсутствия login1",
+        )?;
+    }
     let networkmanager_suspend = matches!(change, FakeDnsNetworkChange::NetworkManagerSuspend(_));
     let networkmanager_links = [("yonik-nm-lease", "10.233.53.10", "10.233.53.1")];
     let mut dhcp_links = vec![("yonik-dhcp", "10.203.2.10", "10.203.2.1")];
@@ -1538,6 +1562,9 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 dhcp_renewal_set()?.is_some(),
                 "Нет набора DHCP в активной политике",
             )?;
+        }
+        if no_logind {
+            require_no_dhcp_permission(false)?;
         }
         if change == FakeDnsNetworkChange::DhcpRenewal {
             check_running_dhcp_renewal(&dhcp_links).await?;
@@ -1589,7 +1616,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 } else {
                     None
                 };
-                fixture_suspend_and_check_dhcp(networkmanager_suspend).await?;
+                fixture_suspend_and_check_dhcp(networkmanager_suspend, false).await?;
                 if let Some(previous_acks) = networkmanager_acks {
                     wait_for_networkmanager_after_suspend(previous_acks).await?;
                     let ack_count = networkmanager_dhcp_ack_count()?;
@@ -1728,6 +1755,12 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 eprintln!("{engine:?}: resolvconf опубликовал новый DNS-сервер");
             }
             FakeDnsNetworkChange::DhcpReconnect => control_dhcp_fixture("disconnect")?,
+            FakeDnsNetworkChange::DhcpSuspendWithoutLogind => {
+                fixture_suspend_and_check_dhcp(false, true).await?;
+                require_no_dhcp_permission(true)?;
+                eprintln!("{engine:?}: перед S3 и после пробуждения DHCP-допуск отсутствует");
+                control_dhcp_fixture("disconnect")?;
+            }
             FakeDnsNetworkChange::DhcpRenewal | FakeDnsNetworkChange::NetworkManagerSuspend(_) => {
                 unreachable!("Сценарий продления завершён")
             }
@@ -1812,6 +1845,9 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 dhcp_renewal_set()?.is_some(),
                 "Нет набора DHCP после переподключения",
             )?;
+        }
+        if no_logind {
+            require_no_dhcp_permission(false)?;
         }
         if after_ttl {
             // После TTL адрес может быть выдан заново. В новой сессии проверяем
@@ -1903,7 +1939,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
 }
 
 #[cfg(feature = "test-support")]
-async fn fixture_suspend_and_check_dhcp(allow_absent: bool) -> Result {
+async fn fixture_suspend_and_check_dhcp(allow_absent: bool, without_logind: bool) -> Result {
     let pre = std::path::Path::new("/run/yonik-dhcp-sleep-pre");
     let post = std::path::Path::new("/run/yonik-dhcp-sleep-post");
     for marker in [pre, post] {
@@ -1913,7 +1949,11 @@ async fn fixture_suspend_and_check_dhcp(allow_absent: bool) -> Result {
             Err(error) => return Err(error.into()),
         }
     }
-    require(
+    let status = if without_logind {
+        Command::new("/usr/bin/systemctl")
+            .args(["start", "--no-block", "systemd-suspend.service"])
+            .status()?
+    } else {
         Command::new("/usr/bin/busctl")
             .args([
                 "call",
@@ -1925,9 +1965,8 @@ async fn fixture_suspend_and_check_dhcp(allow_absent: bool) -> Result {
                 "false",
             ])
             .status()?
-            .success(),
-        "logind отклонил запрос на сон",
-    )?;
+    };
+    require(status.success(), "Стенд отклонил запрос на сон")?;
     tokio::time::timeout(Duration::from_secs(12), async {
         while !post.exists() {
             tokio::time::sleep(Duration::from_millis(40)).await;
@@ -1938,6 +1977,18 @@ async fn fixture_suspend_and_check_dhcp(allow_absent: bool) -> Result {
     require(
         state.trim() == "empty" || (allow_absent && state.trim() == "absent"),
         "Перед S3 сохранялось действующее DHCP-разрешение",
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn require_no_dhcp_permission(allow_absent: bool) -> Result {
+    let set = dhcp_renewal_set()?;
+    require(
+        set.as_ref().map_or(allow_absent, |set| {
+            set.get("elem")
+                .is_none_or(|entries| entries.as_array().is_some_and(Vec::is_empty))
+        }),
+        "Без login1 появилось DHCP-разрешение либо пропал набор активной политики",
     )
 }
 
