@@ -6,7 +6,7 @@ use crate::{
     Cancellation,
     helper::dhcp_networkd::{DHCP_PROBE_CONCURRENCY, DHCP_PROBE_TIMEOUT, DhcpNetworkdLease},
     managed_network::{
-        firewall::MAX_DHCP_RENEWALS,
+        firewall::{DhcpcdRoute, MAX_DHCP_RENEWALS},
         nft::{NftError, NftExecutor},
     },
     network::RenewedDhcpAddress,
@@ -69,6 +69,7 @@ async fn capture_leases(
 pub(super) async fn select_policy(
     baseline: &LinuxTopology,
     policy: &PublicBlockPolicy,
+    repair: Option<DhcpcdRoute>,
     cancel: &mut Cancellation,
 ) -> Option<(DhcpInterfaces, PublicBlockPolicy)> {
     let ipv4: BTreeSet<_> = baseline
@@ -96,13 +97,17 @@ pub(super) async fn select_policy(
     let mut policy = policy.clone();
     let mut selected = BTreeMap::new();
     for lease in &leases {
-        if let (Some(path), Ok(bound)) =
-            (lease.path(), policy.clone().with_dhcp_renewal_rule(lease))
-        {
-            if let Some(index) = NonZeroU32::new(path.interface) {
-                selected.insert(index, path.acquired);
-                policy = bound;
-            }
+        let Some(path) = lease.path() else { continue };
+        let bound = policy.clone().with_dhcp_renewal_rule(lease);
+        let bound = if path.dhcpcd {
+            let Some(repair) = repair else { continue };
+            bound.and_then(|policy| policy.with_dhcpcd_route(Some(repair)))
+        } else {
+            bound
+        };
+        if let (Some(index), Ok(bound)) = (NonZeroU32::new(path.interface), bound) {
+            selected.insert(index, path.acquired);
+            policy = bound;
         }
     }
     (!selected.is_empty()).then_some((selected, policy))

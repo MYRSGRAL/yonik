@@ -19,6 +19,9 @@ pub(super) const DHCP_RENEWAL_CHAIN: &str = "dhcp_renewal";
 pub(super) const DHCP_RENEWAL_SET: &str = "dhcp_renewal_leases";
 pub(super) const DHCP_CGROUP_PATH: &str = "system.slice/systemd-networkd.service";
 pub(super) const NM_DHCP_CGROUP_PATH: &str = "system.slice/NetworkManager.service";
+pub(super) const DHCPCD_CGROUP_PATH: &str = "system.slice/dhcpcd.service";
+pub(super) const DHCPCD_ROUTE_CHAIN: &str = "dhcpcd_route";
+pub(super) const DHCPCD_EGRESS_CHAIN: &str = "dhcpcd_egress";
 pub(crate) const MAX_DHCP_RENEWALS: usize = 8;
 pub(super) const RESOLVED_CGROUP_PATH: &str = "system.slice/systemd-resolved.service";
 const MAX_RESOLVER_TLS_ENDPOINTS: usize = 16;
@@ -264,6 +267,8 @@ struct DhcpRule {
     uid: u32,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     network_manager: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    dhcpcd: bool,
     cgroup_id: NonZeroU64,
     dscp: u8,
     mark: u32,
@@ -271,6 +276,25 @@ struct DhcpRule {
     namespace_inode: NonZeroU64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     additional_dscps: Option<NonZeroU64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DhcpcdRoute {
+    source: Ipv4Addr,
+    mark: NonZeroU32,
+}
+
+impl DhcpcdRoute {
+    pub(crate) fn new(source: Ipv4Addr, mark: u32) -> Result<Self, PolicyError> {
+        if !matches!(source.octets(), [198, 18 | 19, _, 1]) {
+            return Err(PolicyError::Interface);
+        }
+        Ok(Self {
+            source,
+            mark: NonZeroU32::new(mark).ok_or(PolicyError::Mark)?,
+        })
+    }
 }
 
 pub(super) struct DhcpRenewalKey {
@@ -293,6 +317,7 @@ impl DhcpRule {
             server: path.server,
             uid: path.uid,
             network_manager: path.network_manager,
+            dhcpcd: path.dhcpcd,
             cgroup_id: path.cgroup_id,
             dscp: mask.trailing_zeros() as u8,
             mark: path.route_mark,
@@ -309,9 +334,15 @@ impl DhcpRule {
     fn cgroup_path(&self) -> &'static str {
         if self.network_manager {
             NM_DHCP_CGROUP_PATH
+        } else if self.dhcpcd {
+            DHCPCD_CGROUP_PATH
         } else {
             DHCP_CGROUP_PATH
         }
+    }
+
+    fn requires_root(&self) -> bool {
+        self.network_manager || self.dhcpcd
     }
 
     fn command(&self, table: &str, dscp: u8) -> Value {
@@ -341,6 +372,70 @@ impl DhcpRule {
                 json!({"accept":null}),
             ],
         )
+    }
+
+    fn route_command(&self, table: &str, tun: NonZeroU32, route: DhcpcdRoute) -> Value {
+        let payload = |protocol, field| json!({"payload":{"protocol":protocol,"field":field}});
+        // ciaddr находится в BOOTP payload после 8 байт UDP и 12 байт BOOTP.
+        // У dhcpcd один raw-сокет на службу, поэтому адрес из заголовка IP
+        // после первого поиска маршрута не позволяет различить лизинги.
+        rule_in(
+            table,
+            DHCPCD_ROUTE_CHAIN,
+            vec![
+                meta("nfproto", json!("ipv4")),
+                meta("oif", json!(tun.get())),
+                compare(payload("ip", "saddr"), json!(route.source)),
+                compare(payload("ip", "daddr"), json!(self.server)),
+                meta("skuid", json!(self.uid)),
+                compare(payload("udp", "sport"), json!(68)),
+                compare(payload("udp", "dport"), json!(67)),
+                compare(
+                    json!({"payload":{"base":"th","offset":160,"len":32}}),
+                    json!(u32::from(self.address)),
+                ),
+                compare(payload("ip", "dscp"), json!(self.dscp)),
+                meta("mark", json!(self.mark)),
+                compare(
+                    json!({"socket":{"key":"cgroupv2","level":2}}),
+                    json!(DHCPCD_CGROUP_PATH),
+                ),
+                compare(
+                    json!({"concat":[self.address,payload("ip","daddr"),self.ifindex,self.ifname]}),
+                    json!(format!("@{DHCP_RENEWAL_SET}")),
+                ),
+                json!({"mangle":{"key":payload("ip","saddr"),"value":self.address}}),
+                json!({"mangle":{"key":{"meta":{"key":"mark"}},"value":route.mark}}),
+            ],
+        )
+    }
+
+    fn egress_commands(&self, table: &str, route: DhcpcdRoute) -> [Value; 2] {
+        let payload = |protocol, field| json!({"payload":{"protocol":protocol,"field":field}});
+        let mut drop = vec![
+            meta("nfproto", json!("ipv4")),
+            compare(payload("ip", "saddr"), json!(self.address)),
+            compare(payload("ip", "daddr"), json!(self.server)),
+            compare(payload("udp", "sport"), json!(68)),
+            compare(payload("udp", "dport"), json!(67)),
+            meta("mark", json!(route.mark)),
+        ];
+        let mut accept = drop.clone();
+        accept.extend([
+            compare(payload("ip", "dscp"), json!(self.dscp)),
+            meta("oif", json!(self.ifindex.get())),
+            meta("oifname", json!(String::from(self.ifname))),
+            compare(
+                json!({"concat":[payload("ip","saddr"),payload("ip","daddr"),{"meta":{"key":"oif"}},{"meta":{"key":"oifname"}}]}),
+                json!(format!("@{DHCP_RENEWAL_SET}")),
+            ),
+            json!({"accept":null}),
+        ]);
+        drop.push(json!({"drop":null}));
+        [
+            rule_in(table, DHCPCD_EGRESS_CHAIN, accept),
+            rule_in(table, DHCPCD_EGRESS_CHAIN, drop),
+        ]
     }
 }
 
@@ -381,6 +476,8 @@ pub struct PublicBlockPolicy {
     dhcp_renewal_anchor: bool,
     #[serde(rename = "dhcp_renewal_rule", skip_serializing_if = "Option::is_none")]
     dhcp_renewal_rules: Option<Box<DhcpRules>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dhcpcd_route: Option<DhcpcdRoute>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resolver_tls: Option<Box<ResolverTls>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -545,6 +642,9 @@ impl PublicBlockPolicy {
                 .iter()
                 .map(|rule| rule.dscp_mask().count_ones() as usize)
                 .sum::<usize>()
+            + self.dhcpcd_route.map_or(0, |_| {
+                self.dhcp_rules().iter().filter(|rule| rule.dhcpcd).count() * 3
+            })
     }
 
     pub(crate) fn with_bound_direct(
@@ -611,6 +711,7 @@ impl PublicBlockPolicy {
         .with_bound_direct(self.bound_direct.clone())?
         .with_dhcp_renewal_anchor(self.dhcp_renewal_anchor)?
         .with_dhcp_rule_config(self.dhcp_rules().to_vec())?
+        .with_dhcpcd_route(self.dhcpcd_route)?
         .with_resolver_tls(self.resolver_tls.as_deref().cloned())?
         .with_resolver_relay(self.resolver_relay.as_deref().cloned())
     }
@@ -669,6 +770,7 @@ impl PublicBlockPolicy {
             isolated_loopback: None,
             dhcp_renewal_anchor: false,
             dhcp_renewal_rules: None,
+            dhcpcd_route: None,
             resolver_tls: None,
             resolver_relay: None,
         })
@@ -729,6 +831,39 @@ impl PublicBlockPolicy {
         self.dhcp_renewal_anchor
     }
 
+    pub(crate) fn with_dhcpcd_route(
+        mut self,
+        route: Option<DhcpcdRoute>,
+    ) -> Result<Self, PolicyError> {
+        self.dhcpcd_route = route;
+        if let Some(route) = route {
+            DhcpcdRoute::new(route.source, route.mark.get())?;
+            let mut tuples = std::collections::BTreeSet::new();
+            for rule in self.dhcp_rules().iter().filter(|rule| rule.dhcpcd) {
+                if rule.address == route.source
+                    || rule.mark == route.mark.get()
+                    || !tuples.insert((rule.address, rule.server))
+                {
+                    return Err(PolicyError::Interface);
+                }
+            }
+            if tuples.is_empty() || self.tun_ifindex.is_none() {
+                return Err(PolicyError::Interface);
+            }
+        }
+        if self.exception_count() > MAX_EXCEPTIONS {
+            return Err(PolicyError::Limit);
+        }
+        Ok(self)
+    }
+
+    pub(super) fn dhcpcd_cgroup_id(&self) -> Option<NonZeroU64> {
+        self.dhcp_rules()
+            .iter()
+            .find(|rule| rule.dhcpcd)
+            .map(|rule| rule.cgroup_id)
+    }
+
     /// Добавляет правило для проверенного сокета. Набор разрешённых лизингов пуст.
     pub fn with_dhcp_renewal_rule(
         mut self,
@@ -755,10 +890,8 @@ impl PublicBlockPolicy {
         }) {
             return Err(PolicyError::Interface);
         }
-        for network_manager in [false, true] {
-            let mut group = rules
-                .iter()
-                .filter(|rule| rule.network_manager == network_manager);
+        for path in [DHCP_CGROUP_PATH, NM_DHCP_CGROUP_PATH, DHCPCD_CGROUP_PATH] {
+            let mut group = rules.iter().filter(|rule| rule.cgroup_path() == path);
             if let Some(first) = group.next() {
                 if group.any(|rule| rule.cgroup_id != first.cgroup_id || rule.uid != first.uid) {
                     return Err(PolicyError::Interface);
@@ -771,9 +904,10 @@ impl PublicBlockPolicy {
                 || rule.ifindex == self.loopback_ifindex
                 || Some(rule.ifindex) == self.tun_ifindex
                 || rule.dscp > 63
-                || (rule.uid == 0) != rule.network_manager
+                || (rule.network_manager && rule.dhcpcd)
+                || (rule.uid == 0) != rule.requires_root()
                 || rule.uid == u32::MAX
-                || (rule.network_manager && rule.additional_dscps.is_some())
+                || (rule.requires_root() && rule.additional_dscps.is_some())
                 || !name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
@@ -807,10 +941,8 @@ impl PublicBlockPolicy {
             }
         }
         self.dhcp_renewal_rules = (!rules.is_empty()).then(|| Box::new(DhcpRules(rules)));
-        if self.exception_count() > MAX_EXCEPTIONS {
-            return Err(PolicyError::Limit);
-        }
-        Ok(self)
+        let route = self.dhcpcd_route;
+        self.with_dhcpcd_route(route)
     }
 
     pub(super) fn dhcp_rule_identity(&self) -> Option<((u64, u64), NonZeroU64)> {
@@ -977,7 +1109,7 @@ impl PublicBlockPolicy {
             hash.update(device.to_le_bytes());
             hash.update(inode.to_le_bytes());
             hash.update(cgroup.get().to_le_bytes());
-            if self.dhcp_rules().iter().any(|rule| rule.network_manager) {
+            if self.dhcp_rules().iter().any(DhcpRule::requires_root) {
                 hash.update(b"dhcp-cgroups\0");
                 for rule in self.dhcp_rules() {
                     hash.update(rule.ifindex.get().to_le_bytes());
@@ -1010,6 +1142,20 @@ impl PublicBlockPolicy {
                 for dscp in (rule.dscp..64).filter(|dscp| rule.dscp_mask() & (1 << dscp) != 0) {
                     commands.push(rule.command(table_name, dscp));
                 }
+            }
+        }
+        if let (Some(route), Some(tun)) = (self.dhcpcd_route, self.tun_ifindex) {
+            commands.push(json!({"add":{"chain":{
+                "family":"inet","table":table_name,"name":DHCPCD_ROUTE_CHAIN,
+                "type":"route","hook":"output","prio":-300,"policy":"accept"
+            }}}));
+            commands.push(json!({"add":{"chain":{
+                "family":"inet","table":table_name,"name":DHCPCD_EGRESS_CHAIN,
+                "type":"filter","hook":"postrouting","prio":110,"policy":"accept"
+            }}}));
+            for rule in self.dhcp_rules().iter().filter(|rule| rule.dhcpcd) {
+                commands.push(rule.route_command(table_name, tun, route));
+                commands.extend(rule.egress_commands(table_name, route));
             }
         }
         commands.push(
@@ -1326,6 +1472,8 @@ struct PublicBlockPolicyDto {
     #[serde(default)]
     dhcp_renewal_rule: Option<DhcpRulesDto>,
     #[serde(default)]
+    dhcpcd_route: Option<DhcpcdRoute>,
+    #[serde(default)]
     resolver_tls: Option<ResolverTls>,
     #[serde(default)]
     resolver_relay: Option<ResolverRelay>,
@@ -1350,6 +1498,7 @@ impl TryFrom<PublicBlockPolicyDto> for PublicBlockPolicy {
             Some(DhcpRulesDto::Single(rule)) => vec![rule],
             Some(DhcpRulesDto::Multiple(rules)) => rules,
         })?
+        .with_dhcpcd_route(value.dhcpcd_route)?
         .with_resolver_tls(value.resolver_tls)?
         .with_resolver_relay(value.resolver_relay)
     }
@@ -1444,6 +1593,21 @@ mod tests {
         let base = policy(vec![], vec![], vec![])
             .with_dhcp_renewal_anchor(true)
             .unwrap();
+        let legacy = base
+            .clone()
+            .with_dhcp_rule_config(vec![networkd.clone()])
+            .unwrap();
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(legacy_json["dhcp_renewal_rule"], raw);
+        let restored_legacy: PublicBlockPolicy = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            restored_legacy.digest(),
+            [
+                0x87, 0xf7, 0x68, 0xc5, 0x78, 0xd0, 0x32, 0x03, 0x4f, 0x8d, 0xe1, 0x0a, 0x85, 0x80,
+                0x4f, 0xd4, 0xe9, 0x7f, 0xdb, 0x8b, 0x55, 0x2b, 0x71, 0x36, 0x67, 0x0b, 0x11, 0x31,
+                0xf5, 0xe7, 0x30, 0xbd
+            ]
+        );
         assert!(
             base.clone()
                 .with_dhcp_rule_config(vec![nm.clone()])
@@ -1463,12 +1627,141 @@ mod tests {
             Some((NM_DHCP_CGROUP_PATH, nm.cgroup_id))
         );
         let persisted = serde_json::to_value(&mixed).unwrap();
+        assert_eq!(
+            persisted["dhcp_renewal_rule"],
+            json!([
+                raw,
+                {
+                    "ifindex": 3, "ifname": "eth1", "address": "192.0.2.10",
+                    "server": "192.0.2.1", "uid": 0, "cgroup_id": 25,
+                    "dscp": 32, "mark": 0, "namespace_device": 4, "namespace_inode": 5,
+                    "network_manager": true
+                }
+            ])
+        );
         let restored: PublicBlockPolicy = serde_json::from_value(persisted).unwrap();
-        assert_eq!(mixed.digest(), restored.digest());
+        assert_eq!(
+            restored.digest(),
+            [
+                0x9f, 0x85, 0x70, 0x49, 0x06, 0xd8, 0x7c, 0xaf, 0x05, 0x4d, 0x20, 0x82, 0x77, 0xf3,
+                0xfa, 0x10, 0xac, 0xee, 0x91, 0x13, 0x6c, 0xd4, 0x6d, 0x30, 0x07, 0x65, 0x63, 0xbc,
+                0xa0, 0xac, 0x35, 0x25
+            ]
+        );
         nm.cgroup_id = NonZeroU64::new(26).unwrap();
         let changed = base.with_dhcp_rule_config(vec![networkd, nm]).unwrap();
         assert_eq!(mixed.commands("fixture"), changed.commands("fixture"));
         assert_ne!(mixed.digest(), changed.digest());
+    }
+
+    #[test]
+    fn persisted_dhcpcd_rule_distinguishes_owners_and_checks_cgroup_identity() {
+        let networkd = json!({
+            "ifindex": 2, "ifname": "eth0", "address": "192.0.2.10",
+            "server": "192.0.2.1", "uid": 987, "cgroup_id": 30,
+            "dscp": 32, "mark": 0, "namespace_device": 4, "namespace_inode": 5
+        });
+        let mut dhcpcd = networkd.clone();
+        dhcpcd["ifindex"] = json!(3);
+        dhcpcd["ifname"] = json!("eth1");
+        dhcpcd["uid"] = json!(0);
+        dhcpcd["cgroup_id"] = json!(31);
+        dhcpcd["dhcpcd"] = json!(true);
+        let mut persisted = serde_json::to_value(
+            policy(vec![], vec![], vec![])
+                .with_dhcp_renewal_anchor(true)
+                .unwrap(),
+        )
+        .unwrap();
+        persisted["dhcp_renewal_rule"] = json!([networkd, dhcpcd]);
+
+        let restored: PublicBlockPolicy = serde_json::from_value(persisted.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), persisted);
+        assert_eq!(
+            restored.dhcp_cgroup_for_interface(NonZeroU32::new(3).unwrap()),
+            Some(("system.slice/dhcpcd.service", NonZeroU64::new(31).unwrap()))
+        );
+
+        let mut changed = persisted.clone();
+        changed["dhcp_renewal_rule"][1]["cgroup_id"] = json!(32);
+        let changed: PublicBlockPolicy = serde_json::from_value(changed).unwrap();
+        assert_eq!(restored.commands("fixture"), changed.commands("fixture"));
+        assert_ne!(restored.digest(), changed.digest());
+
+        for (key, value) in [
+            ("network_manager", json!(true)),
+            ("uid", json!(998)),
+            ("additional_dscps", json!(1_u64 << 48)),
+        ] {
+            let mut invalid = persisted.clone();
+            invalid["dhcp_renewal_rule"][1][key] = value;
+            assert!(serde_json::from_value::<PublicBlockPolicy>(invalid).is_err());
+        }
+
+        let mut conflicting = dhcpcd;
+        conflicting["ifindex"] = json!(4);
+        conflicting["ifname"] = json!("eth2");
+        persisted["dhcp_renewal_rule"]
+            .as_array_mut()
+            .unwrap()
+            .push(conflicting);
+        assert!(serde_json::from_value::<PublicBlockPolicy>(persisted.clone()).is_ok());
+        persisted["dhcp_renewal_rule"][2]["cgroup_id"] = json!(32);
+        assert!(serde_json::from_value::<PublicBlockPolicy>(persisted).is_err());
+    }
+
+    #[test]
+    fn dhcpcd_route_carries_the_timed_lease_and_checks_real_egress() {
+        let base = policy(vec![], vec![], vec![])
+            .with_dhcp_renewal_anchor(true)
+            .unwrap();
+        let mut stored = serde_json::to_value(&base).unwrap();
+        let lease = json!({
+            "ifindex": 3, "ifname": "eth1", "address": "192.0.2.10",
+            "server": "192.0.2.1", "uid": 0, "cgroup_id": 31, "dhcpcd": true,
+            "dscp": 0, "mark": 0, "namespace_device": 4, "namespace_inode": 5
+        });
+        stored["dhcp_renewal_rule"] = json!([lease]);
+        stored["dhcpcd_route"] = json!({"source":"198.18.10.1","mark":355});
+        let configured: PublicBlockPolicy = serde_json::from_value(stored.clone()).unwrap();
+        let restored: PublicBlockPolicy =
+            serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
+        assert_eq!(configured.digest(), restored.digest());
+        assert_eq!(
+            configured
+                .with_additional_transport(&[])
+                .unwrap()
+                .commands("fixture"),
+            restored.commands("fixture")
+        );
+        let commands = restored.commands("fixture");
+        let in_chain = |name| {
+            commands.iter().filter(move |command| {
+                command.pointer("/add/rule/chain").and_then(Value::as_str) == Some(name)
+            })
+        };
+        let route = in_chain(DHCPCD_ROUTE_CHAIN).next().unwrap();
+        assert_eq!(
+            route["add"]["rule"]["expr"][7]["match"]["right"],
+            json!(u32::from(Ipv4Addr::new(192, 0, 2, 10)))
+        );
+        assert_eq!(
+            route["add"]["rule"]["expr"][11]["match"]["right"],
+            json!("@dhcp_renewal_leases")
+        );
+        let egress: Vec<_> = in_chain(DHCPCD_EGRESS_CHAIN).collect();
+        assert_eq!(egress.len(), 2);
+        assert_eq!(egress[0]["add"]["rule"]["expr"][7]["match"]["right"], 3);
+        assert_eq!(egress[1]["add"]["rule"]["expr"][6], json!({"drop":null}));
+
+        let mut other_link = lease;
+        other_link["ifindex"] = json!(4);
+        other_link["ifname"] = json!("eth2");
+        stored["dhcp_renewal_rule"]
+            .as_array_mut()
+            .unwrap()
+            .push(other_link);
+        assert!(serde_json::from_value::<PublicBlockPolicy>(stored).is_err());
     }
 
     fn direct(prefix: IpPrefix, ifindex: u32, ifname: &str) -> BoundDirect {

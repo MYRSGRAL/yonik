@@ -129,23 +129,7 @@ pub(super) async fn daemon(
 ) -> Result<Daemon, Error> {
     let (bus_name, object, group_path, unit_name) = service.identity();
     let name = |value| BusName::try_from(value).map_err(unavailable);
-    let systemd = bus
-        .get_name_owner(name(SYSTEMD)?)
-        .await
-        .map_err(unavailable)?;
-    if bus
-        .get_connection_unix_user(name(systemd.as_str())?)
-        .await
-        .map_err(unavailable)?
-        != 0
-        || bus
-            .get_connection_unix_process_id(name(systemd.as_str())?)
-            .await
-            .map_err(unavailable)?
-            != 1
-    {
-        return Err(Error::Unsupported);
-    }
+    let systemd = systemd_owner(bus).await?;
     let owner = bus
         .get_name_owner(name(bus_name)?)
         .await
@@ -202,6 +186,82 @@ pub(super) async fn daemon(
             "DynamicUser",
         )
         .await?;
+    Ok(Daemon {
+        owner,
+        uid,
+        dynamic_uid,
+        pid,
+        invocation,
+        group: unit_group(unit_name)?,
+    })
+}
+
+pub(super) async fn dhcpcd_daemon(
+    connection: &Connection,
+    bus: &DBusProxy<'_>,
+    peer_pid: u32,
+) -> Result<Daemon, Error> {
+    const UNIT: &str = "org.freedesktop.systemd1.Unit";
+    const SERVICE: &str = "org.freedesktop.systemd1.Service";
+    const GROUP: &str = "/system.slice/dhcpcd.service";
+    let owner = systemd_owner(bus).await?;
+    let properties = zbus::Proxy::new(
+        connection,
+        owner.as_str(),
+        "/org/freedesktop/systemd1/unit/dhcpcd_2eservice",
+        "org.freedesktop.DBus.Properties",
+    )
+    .await
+    .map_err(unavailable)?;
+    let invocation: Vec<u8> = property(&properties, UNIT, "InvocationID").await?;
+    let invocation: [u8; 16] = invocation.try_into().map_err(|_| Error::Malformed)?;
+    let main_pid: u32 = property(&properties, SERVICE, "MainPID").await?;
+    let expected = format!("0::{GROUP}\n");
+    // При privsep управляющий сокет обслуживает отдельный процесс unit.
+    if invocation == [0; 16]
+        || peer_pid <= 1
+        || main_pid <= 1
+        || property::<String>(&properties, UNIT, "ActiveState").await? != "active"
+        || property::<String>(&properties, SERVICE, "ControlGroup").await? != GROUP
+        || property::<bool>(&properties, SERVICE, "Delegate").await?
+        || read_proc(&format!("/proc/{main_pid}/cgroup"))? != expected
+        || read_proc(&format!("/proc/{peer_pid}/cgroup"))? != expected
+    {
+        return Err(Error::Changed);
+    }
+    Ok(Daemon {
+        owner,
+        uid: 0,
+        dynamic_uid: false,
+        pid: peer_pid,
+        invocation,
+        group: unit_group("dhcpcd.service")?,
+    })
+}
+
+async fn systemd_owner(bus: &DBusProxy<'_>) -> Result<OwnedUniqueName, Error> {
+    let name = |value| BusName::try_from(value).map_err(unavailable);
+    let owner = bus
+        .get_name_owner(name(SYSTEMD)?)
+        .await
+        .map_err(unavailable)?;
+    if bus
+        .get_connection_unix_user(name(owner.as_str())?)
+        .await
+        .map_err(unavailable)?
+        != 0
+        || bus
+            .get_connection_unix_process_id(name(owner.as_str())?)
+            .await
+            .map_err(unavailable)?
+            != 1
+    {
+        return Err(Error::Unsupported);
+    }
+    Ok(owner)
+}
+
+fn unit_group(unit_name: &str) -> Result<(u64, NonZeroU64), Error> {
     let cgroup = open("/sys/fs/cgroup", DIRECTORY, Mode::empty()).map_err(unavailable)?;
     let slice = openat(&cgroup, "system.slice", DIRECTORY, Mode::empty()).map_err(unavailable)?;
     let unit =
@@ -214,18 +274,10 @@ pub(super) async fn daemon(
     {
         return Err(Error::Unsupported);
     }
-    let group = (
+    Ok((
         metadata.dev(),
         NonZeroU64::new(metadata.ino()).ok_or(Error::Unsupported)?,
-    );
-    Ok(Daemon {
-        owner,
-        uid,
-        dynamic_uid,
-        pid,
-        invocation,
-        group,
-    })
+    ))
 }
 
 pub(super) async fn property<T: TryFrom<zbus::zvariant::OwnedValue>>(

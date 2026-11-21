@@ -228,6 +228,12 @@ impl SessionNetworkPlan {
     pub fn socket_mark(&self) -> u32 {
         self.mark
     }
+    pub(super) fn ipv4_source(&self) -> Option<Ipv4Addr> {
+        match self.addresses[0].address() {
+            IpAddr::V4(source) => Some(source),
+            IpAddr::V6(_) => None,
+        }
+    }
     pub fn routing_table(&self) -> u32 {
         self.table
     }

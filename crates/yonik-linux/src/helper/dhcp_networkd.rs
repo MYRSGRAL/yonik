@@ -1,10 +1,12 @@
 //! Привязка системного DHCPv4-лизинга к маршруту и параметрам сокета.
 
 use super::{
+    dhcp_dhcpcd_control::{ControlLease, read_lease as read_dhcpcd},
     memory::ByteBudget,
     resolver_stub::CaptureCredits,
     systemd_network_service::{
-        Daemon, NetworkService, daemon as capture_daemon, property, same_pid, trusted_connection,
+        Daemon, NetworkService, daemon as capture_daemon, dhcpcd_daemon, property, same_pid,
+        trusted_connection,
     },
 };
 use crate::{
@@ -12,7 +14,7 @@ use crate::{
     RouteKind, RouteQuery, TransportProtocol,
     attribution::broker::{
         Unavailable as SocketReadError,
-        kernel::{Listener, listener_census},
+        kernel::{Listener, ListenerSet, listener_census},
     },
     network::{
         RouteCapture, lookup_route_captured, read_topology_captured, same_captured_kernel_route,
@@ -79,6 +81,16 @@ enum LeaseTiming {
         expiry: u64,
         duration: u32,
     },
+    Dhcpcd {
+        acquired: u64,
+        duration: u32,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DhcpSource {
+    Bus(NetworkService),
+    Dhcpcd,
 }
 
 #[derive(Deserialize)]
@@ -189,7 +201,7 @@ fn ipv4(bytes: Vec<u8>) -> Result<Ipv4Addr, Error> {
 
 pub struct DhcpNetworkdLease {
     lease: Lease,
-    service: NetworkService,
+    source: DhcpSource,
     daemon: Daemon,
     namespace: NetworkNamespace,
     socket: Option<Listener>,
@@ -204,24 +216,29 @@ pub struct DhcpNetworkdLease {
 impl DhcpNetworkdLease {
     /// Читает только networkd и ядро. Разрешение nft требует отдельной установки.
     pub async fn capture(index: NonZeroU32, cancel: &mut Cancellation) -> Result<Self, Error> {
-        Self::capture_service(index, NetworkService::Networkd, cancel).await
+        Self::capture_source(index, DhcpSource::Bus(NetworkService::Networkd), cancel).await
     }
 
     pub(super) async fn capture_managed(
         index: NonZeroU32,
         cancel: &mut Cancellation,
     ) -> Result<Self, Error> {
-        match Self::capture(index, cancel).await {
-            Err(Error::Unavailable | Error::Unsupported) => {
-                Self::capture_service(index, NetworkService::NetworkManager, cancel).await
+        for source in [
+            DhcpSource::Bus(NetworkService::Networkd),
+            DhcpSource::Bus(NetworkService::NetworkManager),
+            DhcpSource::Dhcpcd,
+        ] {
+            match Self::capture_source(index, source, cancel).await {
+                Err(Error::Unavailable | Error::Unsupported) if source != DhcpSource::Dhcpcd => {}
+                result => return result,
             }
-            result => result,
         }
+        Err(Error::Unavailable)
     }
 
-    async fn capture_service(
+    async fn capture_source(
         index: NonZeroU32,
-        service: NetworkService,
+        source: DhcpSource,
         cancel: &mut Cancellation,
     ) -> Result<Self, Error> {
         cancel.check().map_err(|_| Error::Cancelled)?;
@@ -233,8 +250,12 @@ impl DhcpNetworkdLease {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(Error::Cancelled),
-            result = tokio::time::timeout_at(deadline, collect(index, service, &mut operation_cancel, deadline, expires)) =>
-                result.map_err(|_| Error::Timeout)?,
+            result = tokio::time::timeout_at(deadline, async {
+                match source {
+                    DhcpSource::Bus(service) => collect(index, service, &mut operation_cancel, deadline, expires).await,
+                    DhcpSource::Dhcpcd => collect_dhcpcd(index, &mut operation_cancel, deadline, expires).await,
+                }
+            }) => result.map_err(|_| Error::Timeout)?,
         }
     }
 
@@ -256,9 +277,11 @@ impl DhcpNetworkdLease {
             prefix_len: self.lease.prefix,
             acquired: match self.lease.timing {
                 LeaseTiming::Networkd { acquired, .. }
-                | LeaseTiming::NetworkManager { acquired, .. } => acquired,
+                | LeaseTiming::NetworkManager { acquired, .. }
+                | LeaseTiming::Dhcpcd { acquired, .. } => acquired,
             },
-            network_manager: self.service == NetworkService::NetworkManager,
+            network_manager: self.source == DhcpSource::Bus(NetworkService::NetworkManager),
+            dhcpcd: self.source == DhcpSource::Dhcpcd,
             server: self.lease.server,
             uid: self.daemon.uid,
             cgroup_id: self.daemon.group.1,
@@ -300,9 +323,9 @@ impl DhcpNetworkdLease {
         if !was_current {
             return Err(Error::Changed);
         }
-        let mut current = Self::capture_service(
+        let mut current = Self::capture_source(
             NonZeroU32::new(self.lease.index).ok_or(Error::Malformed)?,
-            self.service,
+            self.source,
             cancel,
         )
         .await?;
@@ -336,6 +359,7 @@ pub struct DhcpRenewalPath<'a> {
     pub prefix_len: u8,
     pub(crate) acquired: u64,
     pub(crate) network_manager: bool,
+    pub(crate) dhcpcd: bool,
     pub server: Ipv4Addr,
     pub uid: u32,
     pub cgroup_id: NonZeroU64,
@@ -407,6 +431,7 @@ async fn collect(
         LeaseTiming::NetworkManager {
             expiry, duration, ..
         } => network_manager_expiries(kernel_address, expiry, duration, timing.family(2).start)?,
+        LeaseTiming::Dhcpcd { .. } => return Err(Error::Unsupported),
     };
     let expires = expires.min(cutoff);
     let socket = sample_socket(topology.namespace, &lease, &daemon, service, deadline).await?;
@@ -479,7 +504,7 @@ async fn collect(
     }
     Ok(DhcpNetworkdLease {
         lease,
-        service,
+        source: DhcpSource::Bus(service),
         daemon,
         namespace: topology.namespace,
         socket,
@@ -504,52 +529,202 @@ async fn sample_socket(
     let address = lease.address.octets();
     let server = lease.server.octets();
     let index = lease.index;
+    let rows = socket_rows(namespace, 17, CLIENT_PORT, deadline).await?;
+    let mut matches = rows.iter().filter(|socket| {
+        socket.family == 2
+            && socket.local[..4] == address
+            && if service == NetworkService::NetworkManager {
+                socket.state == 1
+                    && socket.remote_port == SERVER_PORT
+                    && socket.remote[..4] == server
+            } else {
+                socket.remote_port == 0
+            }
+            && socket.interface == index
+            && socket.uid == uid
+            && socket.cgroup == group
+            && socket.inode != 0
+    });
+    let socket = matches.next().copied();
+    if matches.next().is_some() || (socket.is_none() && service == NetworkService::NetworkManager) {
+        return Err(Error::Unsupported);
+    }
+    Ok(socket)
+}
+
+async fn socket_rows(
+    namespace: NetworkNamespace,
+    protocol: u8,
+    port: u16,
+    deadline: Instant,
+) -> Result<ListenerSet, Error> {
     let (fds, pending, bytes) = &*CAPTURE_BUDGET;
     let credits = CaptureCredits::reserve_shared(fds, pending, bytes).map_err(unavailable)?;
     tokio::task::spawn_blocking(move || {
         let cancelled = AtomicBool::new(false);
         let read = || {
             listener_census(
-                17,
-                CLIENT_PORT,
+                protocol,
+                port,
                 (namespace.device, namespace.inode),
                 deadline.into_std(),
                 &cancelled,
                 &credits,
             )
         };
-        let rows = match read() {
-            // Первый запрос может истечь при загрузке обработчика SOCK_DIAG.
-            // Повтор с новым сокетом сохраняет общий deadline снимка.
+        match read() {
+            // Повтор после загрузки обработчика SOCK_DIAG в пределах исходного дедлайна.
             Err(SocketReadError::Timeout) if Instant::now() < deadline => read(),
             result => result,
         }
-        .map_err(unavailable)?;
-        let mut matches = rows.iter().filter(|socket| {
-            socket.family == 2
-                && socket.local[..4] == address
-                && if service == NetworkService::NetworkManager {
-                    socket.state == 1
-                        && socket.remote_port == SERVER_PORT
-                        && socket.remote[..4] == server
-                } else {
-                    socket.remote_port == 0
-                }
-                && socket.interface == index
-                && socket.uid == uid
-                && socket.cgroup == group
-                && socket.inode != 0
-        });
-        let socket = matches.next().copied();
-        if matches.next().is_some()
-            || (socket.is_none() && service == NetworkService::NetworkManager)
-        {
-            return Err(Error::Unsupported);
-        }
-        Ok(socket)
+        .map_err(unavailable)
     })
     .await
     .map_err(unavailable)?
+}
+
+async fn dhcpcd_socket(
+    namespace: NetworkNamespace,
+    group: NonZeroU64,
+    index: NonZeroU32,
+    address: Ipv4Addr,
+    deadline: Instant,
+) -> Result<Listener, Error> {
+    const IPPROTO_RAW: u8 = 255;
+    const IPPROTO_UDP: u16 = 17;
+    let rows = socket_rows(namespace, IPPROTO_RAW, IPPROTO_UDP, deadline).await?;
+    let mut matches = rows.iter().filter(|socket| {
+        socket.uid == 0
+            && socket.cgroup == group.get()
+            && socket.inode != 0
+            && (socket.interface == 0 || socket.interface == index.get())
+            && (socket.local[..4] == [0; 4] || socket.local[..4] == address.octets())
+            && socket.remote == [0; 16]
+            && socket.remote_port == 0
+    });
+    let socket = matches.next().copied().ok_or(Error::Unsupported)?;
+    if matches.next().is_some() {
+        return Err(Error::Unsupported);
+    }
+    Ok(socket)
+}
+
+async fn collect_dhcpcd(
+    index: NonZeroU32,
+    cancel: &mut Cancellation,
+    deadline: Instant,
+    expires: u64,
+) -> Result<DhcpNetworkdLease, Error> {
+    let connection = trusted_connection().await?;
+    let bus = DBusProxy::new(&connection).await.map_err(unavailable)?;
+    let (topology, timing) = read_topology_captured(cancel, remaining(deadline)?).await?;
+    let link = topology
+        .links
+        .iter()
+        .find(|link| link.index == index.get())
+        .ok_or(Error::Changed)?;
+    if link.flags & (1 | 0x10000) != (1 | 0x10000) || link.link_type != 1 {
+        return Err(Error::Unsupported);
+    }
+    if !topology.addresses.iter().any(|address| {
+        address.index == index.get()
+            && address.family == 2
+            && address.scope == 0
+            && address.flags & (0x08 | 0x40 | 0x80) == 0
+    }) {
+        return Err(Error::Unsupported);
+    }
+    let name = std::str::from_utf8(&link.name).map_err(|_| Error::Unsupported)?;
+    let state = read_dhcpcd(name, deadline).await?;
+    let daemon = dhcpcd_daemon(&connection, &bus, state.peer_pid).await?;
+    let mut candidates = topology.addresses.iter().filter(|address| {
+        address.index == index.get()
+            && address.family == 2
+            && address.scope == 0
+            && address.prefix_len == state.prefix
+            && address.local.unwrap_or(address.address) == state.address
+            && address.flags & (0x08 | 0x40 | 0x80) == 0
+    });
+    let address = candidates.next().ok_or(Error::Changed)?;
+    if candidates.next().is_some() {
+        return Err(Error::Changed);
+    }
+    let lease_time = dhcpcd_lifetimes(address, state.duration, timing.family(2).start)?;
+    let expires = expires.min(lease_time.cutoff);
+    let socket = dhcpcd_socket(
+        topology.namespace,
+        daemon.group.1,
+        index,
+        state.address,
+        deadline,
+    )
+    .await?;
+    let (tos, mark) = socket.tos.zip(socket.mark).ok_or(Error::Unsupported)?;
+    let query = RouteQuery::new(state.server.into(), daemon.uid)
+        .with_source(state.address.into())?
+        .with_interfaces(None, Some(index))
+        .with_mark(mark)
+        .with_tos(tos)
+        .with_transport(TransportProtocol::Udp, Some(CLIENT_PORT), Some(SERVER_PORT));
+    let route = lookup_route_captured(query, cancel, remaining(deadline)?).await?;
+    if route.0.namespace != topology.namespace
+        || route.0.kind != RouteKind::Unicast
+        || route.0.output_interface != Some(index)
+        || !route.0.incomplete.is_empty()
+    {
+        return Err(Error::Unsupported);
+    }
+    let after_state = read_dhcpcd(name, deadline).await?;
+    let (after, after_timing) = read_topology_captured(cancel, remaining(deadline)?).await?;
+    if !same_captured_topology(&topology, timing, &after, after_timing)
+        || !same_dhcpcd_lease(&state, &after_state)?
+        || daemon != dhcpcd_daemon(&connection, &bus, state.peer_pid).await?
+        || socket
+            != dhcpcd_socket(
+                topology.namespace,
+                daemon.group.1,
+                index,
+                state.address,
+                deadline,
+            )
+            .await?
+        || !same_pid(&state.peer_pidfd, state.peer_pid)?
+        || boottime()? >= expires
+    {
+        return Err(Error::Changed);
+    }
+    Ok(DhcpNetworkdLease {
+        lease: Lease {
+            index: index.get(),
+            name: name.to_owned(),
+            address: state.address,
+            server: state.server,
+            prefix: state.prefix,
+            timing: LeaseTiming::Dhcpcd {
+                acquired: lease_time.acquired,
+                duration: state.duration,
+            },
+        },
+        source: DhcpSource::Dhcpcd,
+        daemon,
+        namespace: topology.namespace,
+        socket: Some(socket),
+        routes: vec![route],
+        pidfd: state.peer_pidfd,
+        expires,
+        address_lifetimes: Some(lease_time.expiries),
+        cancellation: cancel.clone(),
+        revoked: false,
+    })
+}
+
+fn same_dhcpcd_lease(before: &ControlLease, after: &ControlLease) -> Result<bool, Error> {
+    Ok(before.peer_pid == after.peer_pid
+        && before.address == after.address
+        && before.server == after.server
+        && before.prefix == after.prefix
+        && before.duration == after.duration
+        && same_pid(&after.peer_pidfd, after.peer_pid)?)
 }
 
 async fn describe(
@@ -682,22 +857,7 @@ fn network_manager_expiries(
     duration: u32,
     captured: Instant,
 ) -> Result<(u64, Option<[u64; 2]>), Error> {
-    let mut cache = address
-        .unknown
-        .iter()
-        .filter(|attribute| attribute.kind == 6);
-    let bytes: &[u8; 16] = cache
-        .next()
-        .ok_or(Error::Unsupported)?
-        .value
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::Malformed)?;
-    if cache.next().is_some() {
-        return Err(Error::Malformed);
-    }
-    let preferred = u32::from_ne_bytes(bytes[..4].try_into().map_err(|_| Error::Malformed)?);
-    let valid = u32::from_ne_bytes(bytes[4..8].try_into().map_err(|_| Error::Malformed)?);
+    let [preferred, valid, _, _] = address_cache(address)?;
     let wall = u64::try_from(clock_gettime(ClockId::Realtime).tv_sec).map_err(unavailable)?;
     let wall_remaining = expiry.checked_sub(wall).ok_or(Error::Changed)?;
     if preferred <= 1
@@ -725,13 +885,92 @@ fn network_manager_expiries(
 }
 
 fn boottime() -> Result<u64, Error> {
-    let time = clock_gettime(ClockId::Boottime);
+    clock_micros(ClockId::Boottime)
+}
+
+fn clock_micros(clock: ClockId) -> Result<u64, Error> {
+    let time = clock_gettime(clock);
     let seconds = u64::try_from(time.tv_sec).map_err(unavailable)?;
     let nanos = u64::try_from(time.tv_nsec).map_err(unavailable)?;
     seconds
         .checked_mul(1_000_000)
         .and_then(|value| value.checked_add(nanos / 1000))
         .ok_or(Error::Limit)
+}
+
+fn address_cache(address: &crate::network::LinuxAddress) -> Result<[u32; 4], Error> {
+    let mut cache = address
+        .unknown
+        .iter()
+        .filter(|attribute| attribute.kind == 6);
+    let bytes = &cache.next().ok_or(Error::Unsupported)?.value;
+    if bytes.len() != 16 || cache.next().is_some() {
+        return Err(Error::Malformed);
+    }
+    let mut fields = [0; 4];
+    for (field, bytes) in fields.iter_mut().zip(bytes.chunks_exact(4)) {
+        *field = u32::from_ne_bytes(bytes.try_into().map_err(|_| Error::Malformed)?);
+    }
+    Ok(fields)
+}
+
+struct DhcpcdLifetimes {
+    acquired: u64,
+    cutoff: u64,
+    expiries: [u64; 2],
+}
+
+fn dhcpcd_lifetimes(
+    address: &crate::network::LinuxAddress,
+    duration: u32,
+    captured: Instant,
+) -> Result<DhcpcdLifetimes, Error> {
+    let [preferred, valid, _, updated] = address_cache(address)?;
+    let boot = boottime()?;
+    let mono = clock_micros(ClockId::Monotonic)?;
+    let elapsed = u64::try_from(captured.elapsed().as_micros()).map_err(unavailable)?;
+    let captured_mono_cs = mono.checked_sub(elapsed).ok_or(Error::Changed)? / 10_000;
+    let captured_boot = boot.checked_sub(elapsed).ok_or(Error::Changed)?;
+    checked_dhcpcd_lifetimes(
+        preferred,
+        valid,
+        updated,
+        duration,
+        captured_mono_cs,
+        captured_boot,
+    )
+}
+
+fn checked_dhcpcd_lifetimes(
+    preferred: u32,
+    valid: u32,
+    updated: u32,
+    duration: u32,
+    captured_mono_cs: u64,
+    captured_boot: u64,
+) -> Result<DhcpcdLifetimes, Error> {
+    // IFA_CACHEINFO хранит tstamp в сотых секунды с переполнением u32.
+    let age_cs = u64::from((captured_mono_cs as u32).wrapping_sub(updated));
+    let duration_cs = u64::from(duration) * 100;
+    if preferred <= 1
+        || preferred >= valid
+        || valid > duration
+        || age_cs >= duration_cs
+        || (age_cs + u64::from(valid) * 100).abs_diff(duration_cs) > 110
+    {
+        return Err(Error::Changed);
+    }
+    let add = |seconds: u32| {
+        captured_boot
+            .checked_add(u64::from(seconds) * 1_000_000)
+            .ok_or(Error::Limit)
+    };
+    let acquired = captured_mono_cs.checked_sub(age_cs).ok_or(Error::Changed)?;
+    Ok(DhcpcdLifetimes {
+        acquired,
+        cutoff: add(preferred - 1)?,
+        expiries: [add(preferred)?, add(valid)?],
+    })
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, Error> {
@@ -753,7 +992,7 @@ fn unavailable<T: std::fmt::Debug>(_error: T) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, parse_lease, same_pid};
+    use super::{Error, checked_dhcpcd_lifetimes, parse_lease, same_pid};
     use serde_json::json;
 
     fn describe() -> serde_json::Value {
@@ -782,6 +1021,27 @@ mod tests {
             parse_lease(&link.to_string(), 3, 200),
             Err(Error::Unsupported)
         );
+    }
+
+    #[test]
+    fn reconstructs_current_dhcpcd_generation_across_cacheinfo_wrap() {
+        let generation = u64::from(u32::MAX) + 1 - 20;
+        let sampled =
+            checked_dhcpcd_lifetimes(34, 40, generation as u32, 42, generation + 240, 500)
+                .expect("Лизинг с согласованным сроком");
+        assert_eq!(sampled.acquired, generation);
+        assert_eq!(sampled.cutoff, 33_000_500);
+        assert_eq!(sampled.expiries, [34_000_500, 40_000_500]);
+    }
+
+    #[test]
+    fn rejects_dhcpcd_lease_with_stale_or_expired_address_time() {
+        for (preferred, valid, updated) in [(34, 40, 650), (0, 5, 400), (39, 42, 750)] {
+            assert!(matches!(
+                checked_dhcpcd_lifetimes(preferred, valid, updated, 42, 1000, 500),
+                Err(Error::Changed)
+            ));
+        }
     }
 
     #[test]

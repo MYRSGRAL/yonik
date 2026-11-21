@@ -7,8 +7,9 @@ use std::{
 
 use rustix::net::{SendFlags, send};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, Interest},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, Interest},
     net::UnixStream,
+    sync::Mutex,
     time::{Instant, timeout_at},
 };
 
@@ -17,6 +18,7 @@ use crate::NetworkReadError as Error;
 const MAX_INTERFACE_NAME: usize = 15;
 const MAX_RECORD_BYTES: usize = 16_384;
 const MAX_LEASE_SECONDS: u32 = 365 * 24 * 60 * 60;
+static CONTROL: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug)]
 pub(super) struct ControlLease {
@@ -40,7 +42,12 @@ pub(super) async fn read_lease(ifname: &str, deadline: Instant) -> Result<Contro
     if !valid_interface_name(ifname) {
         return Err(Error::Malformed);
     }
-    before_deadline(deadline, read_candidates(ifname)).await
+    before_deadline(deadline, async {
+        // При privsep dhcpcd обрабатывает ровно одного управляющего клиента.
+        let _client = CONTROL.lock().await;
+        read_candidates(ifname).await
+    })
+    .await
 }
 
 fn valid_interface_name(ifname: &str) -> bool {
@@ -86,7 +93,7 @@ async fn read_candidates(ifname: &str) -> Result<ControlLease, Error> {
 }
 
 async fn read_candidate(path: &str, ifname: &str) -> Result<Option<ControlLease>, Error> {
-    let stream = match UnixStream::connect(path).await {
+    let mut stream = match UnixStream::connect(path).await {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -121,7 +128,13 @@ async fn read_candidate(path: &str, ifname: &str) -> Result<Option<ControlLease>
     if sent != request.len() {
         return Err(Error::Truncated);
     }
-    Ok(read_reply(stream, ifname).await?.map(|lease| ControlLease {
+    let reply = read_reply(&mut stream, ifname).await?;
+    stream.shutdown().await.map_err(read_error)?;
+    // Дожидаемся обработки EOF на стороне службы до запроса следующего клиента.
+    if stream.read(&mut [0]).await.map_err(read_error)? != 0 {
+        return Err(Error::Malformed);
+    }
+    Ok(reply.map(|lease| ControlLease {
         peer_pid,
         peer_pidfd,
         address: lease.address,

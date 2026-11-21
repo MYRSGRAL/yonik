@@ -409,6 +409,152 @@ fn dhcp_rule_only_accepts_the_exact_short_lived_element() {
     }
 }
 
+fn политика_dhcpcd() -> (PublicBlockPolicy, PublicBlockPolicy) {
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap(),
+    )
+    .unwrap();
+    wire["dhcp_renewal_anchor"] = json!(true);
+    wire["dhcp_renewal_rule"] = json!({
+        "ifindex":7,"ifname":"test-dhcp","address":"192.0.2.10","server":"192.0.2.1",
+        "uid":0,"dhcpcd":true,"cgroup_id":2500,"dscp":0,"mark":0,
+        "namespace_device":3,"namespace_inode":11
+    });
+    let legacy = serde_json::from_value(wire.clone()).unwrap();
+    wire["dhcpcd_route"] = json!({"source":"198.19.7.1","mark":1000});
+    (legacy, serde_json::from_value(wire).unwrap())
+}
+
+#[test]
+fn dhcpcd_сериализует_только_точное_исправление_маршрута() {
+    let (legacy, policy) = политика_dhcpcd();
+    let table = block_table(owner(), 2, 5, &policy);
+    assert_ne!(policy.digest(), legacy.digest());
+    assert_eq!(
+        policy.clone().with_dhcpcd_route(None).unwrap().digest(),
+        legacy.digest()
+    );
+    let mut commands = policy.commands(&table.name);
+    let script = String::from_utf8(text::render(&commands, None).unwrap()).unwrap();
+    assert!(
+        script.contains("dhcpcd_route { type route hook output priority -300; policy accept; }")
+    );
+    assert!(
+        script.contains(
+            "dhcpcd_egress { type filter hook postrouting priority 110; policy accept; }"
+        )
+    );
+    assert!(script.contains(concat!(
+        "dhcpcd_route meta nfproto ipv4 meta oif 8 ip saddr 198.19.7.1 ip daddr 192.0.2.1 ",
+        "meta skuid 0 udp sport 68 udp dport 67 @th,160,32 3221225994 ip dscp 0 meta mark 0 ",
+        "socket cgroupv2 level 2 \"system.slice/dhcpcd.service\" 192.0.2.10 . ip daddr . 7 . ",
+        "\"test-dhcp\" @dhcp_renewal_leases ip saddr set 192.0.2.10 meta mark set 1000\n"
+    )));
+    assert!(script.contains(concat!(
+        "dhcpcd_egress meta nfproto ipv4 ip saddr 192.0.2.10 ip daddr 192.0.2.1 ",
+        "udp sport 68 udp dport 67 meta mark 1000 ip dscp 0 meta oif 7 meta oifname \"test-dhcp\" ",
+        "ip saddr . ip daddr . meta oif . meta oifname @dhcp_renewal_leases accept\n"
+    )));
+    assert!(script.contains(concat!(
+        "dhcpcd_egress meta nfproto ipv4 ip saddr 192.0.2.10 ip daddr 192.0.2.1 ",
+        "udp sport 68 udp dport 67 meta mark 1000 drop\n"
+    )));
+    let route = commands
+        .iter_mut()
+        .find(|command| command["add"]["rule"]["chain"] == DHCPCD_ROUTE_CHAIN)
+        .unwrap();
+    for (path, altered) in [
+        ("/add/rule/expr/4/match/right", json!(991)),
+        ("/add/rule/expr/7/match/left/payload/offset", json!(128)),
+        ("/add/rule/expr/7/match/right", json!(1)),
+        ("/add/rule/expr/10/match/left/socket/level", json!(1)),
+        (
+            "/add/rule/expr/11/match/left/concat/3",
+            json!("test-dhcp\" accept"),
+        ),
+        ("/add/rule/expr/12/mangle/value", json!("192.0.2.12")),
+        ("/add/rule/expr/13/mangle/value", json!(0)),
+    ] {
+        let mut invalid = route.clone();
+        *invalid.pointer_mut(path).unwrap() = altered;
+        assert_eq!(text::render(&[invalid], None), Err(NftError::Invalid));
+    }
+}
+
+#[test]
+fn dhcpcd_сверяет_форму_правил_ядра_и_порядок_выходной_цепочки() {
+    let (_, policy) = политика_dhcpcd();
+    let table = block_table(owner(), 2, 5, &policy);
+    let mut live = listing(&table, &policy);
+    let items = live["nftables"].as_array_mut().unwrap();
+    items.sort_by_key(
+        |item| match item.pointer("/rule/chain").and_then(Value::as_str) {
+            Some("output") => 1,
+            Some(DHCPCD_EGRESS_CHAIN) => 2,
+            Some(DHCPCD_ROUTE_CHAIN) => 3,
+            _ => 0,
+        },
+    );
+    let route = items
+        .iter()
+        .position(|item| item["rule"]["chain"] == DHCPCD_ROUTE_CHAIN)
+        .unwrap();
+    let accept = items
+        .iter()
+        .position(|item| item["rule"]["chain"] == DHCPCD_EGRESS_CHAIN)
+        .unwrap();
+    let route_handle = NonZeroU64::new(items[route]["rule"]["handle"].as_u64().unwrap()).unwrap();
+    let expr = &mut items[route]["rule"]["expr"];
+    expr[1]["match"]["right"] = json!("8");
+    expr[8]["match"]["right"] = json!("cs0");
+    expr[10]["match"]["left"]["socket"]
+        .as_object_mut()
+        .unwrap()
+        .remove("level");
+    expr[11]["match"]["left"]["concat"][2] = json!("test-dhcp");
+    items[accept]["rule"]["expr"][6]["match"]["right"] = json!("cs0");
+
+    let handles = verify_rules(
+        &serde_json::to_vec(&live).unwrap(),
+        &table,
+        &policy,
+        |name| {
+            if name == "test-dhcp" {
+                Ok(7)
+            } else {
+                Err(NftError::Evidence)
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        handles.dhcpcd_route,
+        BTreeMap::from([(route_handle, NonZeroU64::new(2500).unwrap())])
+    );
+    assert_eq!(check(&live, &table, &policy), Ok(()));
+    for (path, altered) in [
+        ("/7/match/right", json!(1)),
+        ("/8/match/right", json!("cs1")),
+        (
+            "/10/match/right",
+            json!("system.slice/systemd-networkd.service"),
+        ),
+        ("/11/match/left/concat/2", json!("другой-интерфейс")),
+        ("/13/mangle/value", json!(1001)),
+    ] {
+        let mut invalid = live.clone();
+        *invalid["nftables"][route]["rule"]["expr"]
+            .pointer_mut(path)
+            .unwrap() = altered;
+        assert_eq!(check(&invalid, &table, &policy), Err(NftError::Evidence));
+    }
+    live["nftables"]
+        .as_array_mut()
+        .unwrap()
+        .swap(accept, accept + 1);
+    assert_eq!(check(&live, &table, &policy), Err(NftError::Evidence));
+}
+
 #[test]
 fn applied_requires_exact_rules_not_only_ownership_comment() {
     let policy = policy();

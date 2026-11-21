@@ -2,7 +2,8 @@ use super::*;
 use crate::helper::dhcp_networkd::{DHCP_PROBE_CONCURRENCY, DHCP_PROBE_TIMEOUT, DhcpNetworkdLease};
 use crate::managed_network::PublicPolicyPhase;
 use crate::managed_network::firewall::{
-    DHCP_RENEWAL_CHAIN, DHCP_RENEWAL_SET, MAX_DHCP_RENEWALS, RESOLVED_CGROUP_PATH,
+    DHCP_RENEWAL_CHAIN, DHCP_RENEWAL_SET, DHCPCD_CGROUP_PATH, DHCPCD_EGRESS_CHAIN,
+    DHCPCD_ROUTE_CHAIN, MAX_DHCP_RENEWALS, RESOLVED_CGROUP_PATH,
 };
 use futures_util::{StreamExt, stream};
 use sha2::{Digest, Sha256};
@@ -204,7 +205,51 @@ fn verify_dhcp_element(
 #[derive(Default, PartialEq, Eq)]
 struct CgroupHandles {
     dhcp: BTreeMap<NonZeroU64, NonZeroU64>,
+    dhcpcd_route: BTreeMap<NonZeroU64, NonZeroU64>,
     resolver_tls: BTreeMap<NonZeroU64, NonZeroU64>,
+}
+
+fn normalize_dhcpcd_rule(
+    rule: &mut Value,
+    resolve: &impl Fn(&str) -> Result<u32, NftError>,
+) -> Result<(), NftError> {
+    let route = rule["chain"] == DHCPCD_ROUTE_CHAIN;
+    let expressions = rule["expr"].as_array_mut().ok_or(NftError::Evidence)?;
+    for expression in expressions {
+        if expression.pointer("/match/left/payload/protocol") == Some(&json!("ip"))
+            && expression.pointer("/match/left/payload/field") == Some(&json!("dscp"))
+        {
+            if let Some(dscp) = expression
+                .pointer("/match/right")
+                .and_then(Value::as_str)
+                .and_then(nft_dscp_number)
+            {
+                expression["match"]["right"] = json!(dscp);
+            }
+        }
+        if route {
+            if let Some(index) = expression.pointer_mut("/match/left/concat/2") {
+                if let Some(name) = index.as_str() {
+                    *index = json!(resolve_nft_ifindex(name, resolve)?);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn nft_dscp_number(name: &str) -> Option<u8> {
+    // nft использует символические обозначения даже при JSON-выводе.
+    match name.as_bytes() {
+        [b'c', b's', class @ b'0'..=b'7'] => Some((class - b'0') * 8),
+        [b'a', b'f', class @ b'1'..=b'4', drop @ b'1'..=b'3'] => {
+            Some((class - b'0') * 8 + (drop - b'0') * 2)
+        }
+        b"ef" => Some(46),
+        b"va" => Some(44),
+        b"le" => Some(1),
+        _ => None,
+    }
 }
 
 fn normalize_policy_rule(
@@ -213,6 +258,12 @@ fn normalize_policy_rule(
     resolve: &impl Fn(&str) -> Result<u32, NftError>,
 ) -> Result<Option<NonZeroU64>, NftError> {
     normalize_rule(rule, resolve)?;
+    if matches!(
+        rule["chain"].as_str(),
+        Some(DHCPCD_ROUTE_CHAIN | DHCPCD_EGRESS_CHAIN)
+    ) {
+        normalize_dhcpcd_rule(rule, resolve)?;
+    }
     let (path, id) = if rule["chain"] == DHCP_RENEWAL_CHAIN {
         let index = rule["expr"]
             .as_array()
@@ -232,6 +283,11 @@ fn normalize_policy_rule(
         policy
             .dhcp_cgroup_for_interface(index)
             .ok_or(NftError::Evidence)?
+    } else if rule["chain"] == DHCPCD_ROUTE_CHAIN {
+        (
+            DHCPCD_CGROUP_PATH,
+            policy.dhcpcd_cgroup_id().ok_or(NftError::Evidence)?,
+        )
     } else if rule["chain"] == "output"
         && rule["expr"]
             .as_array()
@@ -308,10 +364,11 @@ fn verify_rules(
         }
         if kind == "rule" {
             if let Some(id) = normalize_policy_rule(&mut data, policy, &resolve)? {
-                let binding = if data["chain"] == DHCP_RENEWAL_CHAIN {
-                    &mut handles.dhcp
-                } else {
-                    &mut handles.resolver_tls
+                let binding = match data["chain"].as_str() {
+                    Some(DHCP_RENEWAL_CHAIN) => &mut handles.dhcp,
+                    Some(DHCPCD_ROUTE_CHAIN) => &mut handles.dhcpcd_route,
+                    Some("output") => &mut handles.resolver_tls,
+                    _ => return Err(NftError::Evidence),
                 };
                 if binding.insert(handle, id).is_some() {
                     return Err(NftError::Evidence);
@@ -340,21 +397,25 @@ fn verify_rules(
         expected.push(data);
     }
     if policy.has_dhcp_renewal_anchor() {
-        // Порядок объектов разных типов зависит от nft. Порядок правил
-        // внутри output остаётся частью проверки.
+        // Порядок объектов разных типов и цепочек зависит от nft. Стабильная
+        // сортировка сохраняет порядок правил внутри каждой цепочки.
         let rank = |item: &Value| {
             if item.get("set").is_some() {
-                0
-            } else if item.pointer("/chain/name").and_then(Value::as_str)
-                == Some(DHCP_RENEWAL_CHAIN)
-            {
-                1
-            } else if item.pointer("/rule/chain").and_then(Value::as_str)
-                == Some(DHCP_RENEWAL_CHAIN)
-            {
-                2
+                return 0;
+            }
+            let (chain, offset) = if let Some(chain) = item.pointer("/chain/name") {
+                (chain, 0)
+            } else if let Some(chain) = item.pointer("/rule/chain") {
+                (chain, 1)
             } else {
-                3
+                return 9;
+            };
+            match chain.as_str() {
+                Some(DHCP_RENEWAL_CHAIN) => 1 + offset,
+                Some(DHCPCD_ROUTE_CHAIN) => 3 + offset,
+                Some(DHCPCD_EGRESS_CHAIN) => 5 + offset,
+                Some("output") => 7 + offset,
+                _ => 9,
             }
         };
         actual.sort_by_key(rank);
@@ -586,6 +647,13 @@ impl NftExecutor {
                 DHCP_RENEWAL_CHAIN,
                 &handles.dhcp,
                 policy.dhcp_rule_identity(),
+            ),
+            (
+                DHCPCD_ROUTE_CHAIN,
+                &handles.dhcpcd_route,
+                policy
+                    .dhcp_rule_identity()
+                    .filter(|_| !handles.dhcpcd_route.is_empty()),
             ),
             (
                 "output",

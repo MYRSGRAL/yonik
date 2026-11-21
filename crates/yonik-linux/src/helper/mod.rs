@@ -4,7 +4,6 @@
 //! `PeerIdentity` — снимок, а не разрешение на будущий Apply: перед каждым
 //! Prepare/Apply нужна новая проверка непосредственно перед эффектами.
 
-#[cfg(test)]
 mod dhcp_dhcpcd_control;
 #[cfg(test)]
 mod dhcp_dhcpcd_vm_tests;

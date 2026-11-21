@@ -2397,8 +2397,15 @@ impl Backend {
                 .and_then(|policy| policy.with_resolver_relay(fake_dns.resolver_relay.clone()))
                 .map_err(unavailable)?;
             if self.profile_owner.is_some() {
+                let repair = artifact.plan.ipv4_source().and_then(|source| {
+                    crate::managed_network::firewall::DhcpcdRoute::new(
+                        source,
+                        artifact.plan.socket_mark(),
+                    )
+                    .ok()
+                });
                 if let Some((indices, bound)) =
-                    session_dhcp::select_policy(&artifact.baseline, &policy, cancel).await
+                    session_dhcp::select_policy(&artifact.baseline, &policy, repair, cancel).await
                 {
                     let mut executor = self.executor(owner)?;
                     if session_dhcp::check_policy(&mut executor, &bound).await {
