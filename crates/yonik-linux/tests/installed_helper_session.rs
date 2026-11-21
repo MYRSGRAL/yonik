@@ -2803,7 +2803,10 @@ async fn installed_resolved_fake_dns_policy(mixed: bool) -> Result {
         })
     })
     .collect();
+    let mut preset_rules = Vec::new();
     if mixed {
+        // Личный Proxy для early.example.test конфликтует с младшим пресетом Direct.
+        preset_rules.extend(rules.pop());
         rules.splice(0..0, [
             json!({"id": 4, "enabled": true, "action": "proxy", "domain": ["early.example.test"],
                 "domain_suffix": [], "ip_cidr": [], "executable_paths": []}),
@@ -2820,7 +2823,7 @@ async fn installed_resolved_fake_dns_policy(mixed: bool) -> Result {
     let policy = yonik_engine::policy_wire::SystemPolicy::parse(
         &json!({
             "version": 1, "default_action": "proxy", "lan": [], "private_networks": [],
-            "private_domains": [], "user_rules": rules, "preset_rules": []
+            "private_domains": [], "user_rules": rules, "preset_rules": preset_rules
         })
         .to_string(),
     )?;
