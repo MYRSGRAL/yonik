@@ -2687,17 +2687,32 @@ enum FakeDnsPolicyWitness {
 }
 
 #[cfg(feature = "test-support")]
+#[derive(PartialEq, Eq)]
+enum ResolvedDnsFixture {
+    Cidrs,
+    Mixed,
+    PartialDirect,
+}
+
+#[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "одноразовая Debian VM с VLESS peer и DNS для проверки CIDR"]
 async fn production_helper_resolved_fake_dns_cidrs() -> Result {
-    installed_resolved_fake_dns_policy(false).await
+    installed_resolved_fake_dns_policy(ResolvedDnsFixture::Cidrs).await
 }
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "одноразовая Debian VM с VLESS peer и DNS для смешанных правил"]
 async fn production_helper_resolved_fake_dns_mixed() -> Result {
-    installed_resolved_fake_dns_policy(true).await
+    installed_resolved_fake_dns_policy(ResolvedDnsFixture::Mixed).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая VM с доступным Direct echo 203.0.113.47 и неполным DNS-ответом"]
+async fn production_helper_resolved_fake_dns_partial_direct() -> Result {
+    installed_resolved_fake_dns_policy(ResolvedDnsFixture::PartialDirect).await
 }
 
 #[cfg(feature = "test-support")]
@@ -2784,15 +2799,25 @@ async fn production_helper_rejects_private_cidrs_in_fake_dns_profile() -> Result
 }
 
 #[cfg(feature = "test-support")]
-async fn installed_resolved_fake_dns_policy(mixed: bool) -> Result {
+async fn installed_resolved_fake_dns_policy(fixture: ResolvedDnsFixture) -> Result {
     require(
         std::env::var("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER").is_ok(),
         "Стенду нужен DNS политики",
     )?;
+    let mixed = fixture != ResolvedDnsFixture::Cidrs;
+    let partial_direct = fixture == ResolvedDnsFixture::PartialDirect;
+    let mut proxy = vec!["2001:db8:746f::2/128"];
+    let mut direct = vec!["192.0.2.201/32", "2001:db8:7471::2/128"];
+    // Для D-05 имеющийся A совпадает только с младшим Direct.
+    if partial_direct {
+        direct.push("203.0.113.47/32");
+    } else {
+        proxy.push("203.0.113.47/32");
+    }
     let mut rules: Vec<_> = [
-        ("proxy", ["2001:db8:746f::2/128", "203.0.113.47/32"]),
-        ("block", ["203.0.113.46/32", "2001:db8:746f::48/128"]),
-        ("direct", ["192.0.2.201/32", "2001:db8:7471::2/128"]),
+        ("proxy", proxy),
+        ("block", vec!["203.0.113.46/32", "2001:db8:746f::48/128"]),
+        ("direct", direct),
     ]
     .into_iter()
     .enumerate()
@@ -2816,8 +2841,12 @@ async fn installed_resolved_fake_dns_policy(mixed: bool) -> Result {
                 "domain": ["mixed-direct.example.test"], "domain_suffix": [],
                 "ip_cidr": ["192.0.2.202/32"], "executable_paths": []}),
         ]);
+        let mut fallback_names = vec!["blocked.example.test"];
+        if !partial_direct {
+            fallback_names.push("failed.example.test");
+        }
         rules.push(json!({"id": 6, "enabled": true, "action": "proxy",
-            "domain": ["blocked.example.test", "failed.example.test"],
+            "domain": fallback_names,
             "domain_suffix": [], "ip_cidr": [], "executable_paths": []}));
     }
     let policy = yonik_engine::policy_wire::SystemPolicy::parse(
