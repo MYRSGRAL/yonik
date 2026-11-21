@@ -3059,6 +3059,16 @@ async fn restart_fixture_resolver(connection: &zbus::Connection) -> Result {
 
 #[cfg(feature = "test-support")]
 fn change_fixture_peer_route(operation: &str) -> Result {
+    if std::env::var_os("YONIK_WIFI_ROUTE_FIXTURE").is_some() {
+        return require(
+            Command::new("/usr/bin/bash")
+                .arg("/run/yonik-wifi-setup/switch.sh")
+                .arg(operation)
+                .status()?
+                .success(),
+            "Стенд не переключил точку доступа и маршрут тестового VLESS peer",
+        );
+    }
     require(
         Command::new("/usr/bin/ip")
             .args([
