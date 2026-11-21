@@ -2,7 +2,7 @@ policy_module(yonik_helper, 1.0)
 
 gen_require(`
     type init_t, iptables_t, etc_t, var_t, var_lib_t, var_run_t;
-    type systemd_unit_file_t;
+    type power_unit_file_t, systemd_unit_file_t;
     type fs_t, nsfs_t;
     type initrc_t, unconfined_t;
     type ifconfig_t;
@@ -39,7 +39,7 @@ type yonik_sleep_config_t;
 systemd_unit_file(yonik_sleep_config_t)
 allow yonik_helper_t yonik_sleep_config_t:file read_file_perms;
 # sleep.target принадлежит системному пакету. Helper только сверяет связи unit.
-allow yonik_helper_t systemd_unit_file_t:service status;
+allow yonik_helper_t power_unit_file_t:service status;
 
 type yonik_helper_state_t;
 files_type(yonik_helper_state_t)
