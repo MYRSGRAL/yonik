@@ -2036,6 +2036,7 @@ enum FakeDnsNetworkChange {
     DhcpReconnect,
     DhcpRenewal,
     DhcpSuspendWithoutLogind,
+    DhcpSuspendWithShortInhibitor,
     NetworkManagerSuspend(Option<Engine>),
 }
 
@@ -2044,6 +2045,14 @@ enum FakeDnsNetworkChange {
 #[ignore = "одноразовая Debian VM с networkd, ACPI S3, отключённым login1 и hook стенда"]
 async fn production_helper_fake_dns_suspend_without_logind() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::DhcpSuspendWithoutLogind).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая Debian VM с networkd, ACPI S3 и InhibitDelayMaxSec=1s"]
+async fn production_helper_fake_dns_suspend_with_short_inhibitor() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::DhcpSuspendWithShortInhibitor)
+        .await
 }
 
 #[cfg(feature = "test-support")]
@@ -2087,9 +2096,12 @@ async fn installed_fake_dns_after_network_change_in_vm(
     }
     let (_owner, mut token) = yonik_linux::Cancellation::new();
     let no_logind = change == FakeDnsNetworkChange::DhcpSuspendWithoutLogind;
+    let short_inhibitor = change == FakeDnsNetworkChange::DhcpSuspendWithShortInhibitor;
+    let suspend_without_dhcp_permission = no_logind || short_inhibitor;
     // Реестр использует BOOTTIME, поэтому сон входит в срок аренды Fake-IP.
     // В сценарии S3 подтверждаем блокировку перед новым DNS-ответом после TTL.
-    let after_ttl = change == FakeDnsNetworkChange::ResolverRestartAfterTtl || no_logind;
+    let after_ttl =
+        change == FakeDnsNetworkChange::ResolverRestartAfterTtl || suspend_without_dhcp_permission;
     let resolver_restart = matches!(
         change,
         FakeDnsNetworkChange::ResolverRestart | FakeDnsNetworkChange::ResolverRestartAfterTtl
@@ -2099,6 +2111,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         FakeDnsNetworkChange::DhcpReconnect
             | FakeDnsNetworkChange::DhcpRenewal
             | FakeDnsNetworkChange::DhcpSuspendWithoutLogind
+            | FakeDnsNetworkChange::DhcpSuspendWithShortInhibitor
     );
     if no_logind {
         let bus = zbus::fdo::DBusProxy::new(&connection).await?;
@@ -2106,6 +2119,19 @@ async fn installed_fake_dns_after_network_change_in_vm(
             !bus.name_has_owner("org.freedesktop.login1".try_into()?)
                 .await?,
             "Сценарий требует отсутствия login1",
+        )?;
+    }
+    if short_inhibitor {
+        let logind = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .await?;
+        require(
+            logind.get_property::<u64>("InhibitDelayMaxUSec").await? == 1_000_000,
+            "Сценарий требует действующего login1 с задержкой 1 с",
         )?;
     }
     let networkmanager_suspend = matches!(change, FakeDnsNetworkChange::NetworkManagerSuspend(_));
@@ -2137,7 +2163,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 "Нет набора DHCP в активной политике",
             )?;
         }
-        if no_logind {
+        if suspend_without_dhcp_permission {
             require_no_dhcp_permission(false)?;
         }
         if change == FakeDnsNetworkChange::DhcpRenewal {
@@ -2329,8 +2355,9 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 eprintln!("{engine:?}: resolvconf опубликовал новый DNS-сервер");
             }
             FakeDnsNetworkChange::DhcpReconnect => control_dhcp_fixture("disconnect")?,
-            FakeDnsNetworkChange::DhcpSuspendWithoutLogind => {
-                fixture_suspend_and_check_dhcp(false, true).await?;
+            FakeDnsNetworkChange::DhcpSuspendWithoutLogind
+            | FakeDnsNetworkChange::DhcpSuspendWithShortInhibitor => {
+                fixture_suspend_and_check_dhcp(false, no_logind).await?;
                 require_no_dhcp_permission(true)?;
                 eprintln!("{engine:?}: перед S3 и после пробуждения DHCP-допуск отсутствует");
                 control_dhcp_fixture("disconnect")?;
@@ -2420,7 +2447,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 "Нет набора DHCP после переподключения",
             )?;
         }
-        if no_logind {
+        if suspend_without_dhcp_permission {
             require_no_dhcp_permission(false)?;
         }
         if after_ttl {
