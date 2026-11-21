@@ -79,6 +79,12 @@ async fn kill_helper_and_wait_for_recovery(
     original_pid: u32,
     expected_state: &str,
 ) -> Result {
+    kill_fixture_helper()?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_for_helper_recovery(connection, original_pid, expected_state).await
+}
+
+fn kill_fixture_helper() -> Result {
     require(
         Command::new("/usr/bin/systemctl")
             .args([
@@ -90,8 +96,14 @@ async fn kill_helper_and_wait_for_recovery(
             .status()?
             .success(),
         "SIGKILL не выполнен",
-    )?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    )
+}
+
+async fn wait_for_helper_recovery(
+    connection: &zbus::Connection,
+    original_pid: u32,
+    expected_state: &str,
+) -> Result {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         if helper_pid().is_ok_and(|pid| pid != original_pid) {
@@ -2061,6 +2073,98 @@ async fn production_helper_fake_dns_suspend_with_short_inhibitor() -> Result {
 #[ignore = "одноразовая Debian VM с networkd и действующим login1"]
 async fn production_helper_fake_dns_revokes_dhcp_on_login1_loss() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::DhcpLogin1Loss).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая Debian VM с networkd, logind, ACPI S3 и hook наблюдения за DHCP"]
+async fn production_helper_fake_dns_quiesces_dhcp_after_crash_before_s3() -> Result {
+    check_dhcp_quiesces_before_s3(true).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая Debian VM с networkd, прямым systemd-suspend и hook наблюдения за DHCP"]
+async fn production_helper_fake_dns_quiesces_dhcp_before_direct_s3() -> Result {
+    check_dhcp_quiesces_before_s3(false).await
+}
+
+#[cfg(feature = "test-support")]
+async fn check_dhcp_quiesces_before_s3(crash: bool) -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let (engine, kill_switch) = match std::env::var("YONIK_CRASH_SLEEP_ENGINE")?.as_str() {
+        "xray" => (Engine::Xray, true),
+        "sing-box" => (Engine::SingBox, false),
+        _ => return Err(io::Error::other("Неизвестный движок стенда").into()),
+    };
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+        r#"{"version":1,"default_action":"proxy","user_rules":[],"preset_rules":[],"lan":[],"private_networks":[],"private_domains":[]}"#,
+    )?;
+    let (_owner, token) = yonik_linux::Cancellation::new();
+    let drain = start_fake_dns_in_vm(
+        &connection,
+        &server,
+        engine,
+        kill_switch,
+        Some(&policy),
+        &token,
+    )
+    .await?;
+    let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+    let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+    check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+    let previous = helper_pid()?;
+    check_running_dhcp_renewal(&[
+        ("yonik-dhcp", "10.203.2.10", "10.203.2.1"),
+        ("yonik-dhcp2", "10.203.3.10", "10.203.3.1"),
+    ])
+    .await?;
+    eprintln!("{engine:?}: DHCP-допуск действовал до вмешательства стенда");
+    if crash {
+        kill_fixture_helper()?;
+    }
+    let sleep = fixture_suspend_and_check_dhcp(true, !crash).await;
+    let post = fs::read_to_string("/run/yonik-dhcp-sleep-post");
+    if crash {
+        let expected = if kill_switch {
+            "recovery_required"
+        } else {
+            "no_managed_policy"
+        };
+        wait_for_helper_recovery(&connection, previous, expected).await?;
+    } else {
+        require(helper_pid()? == previous, "Стенд перезапустил helper")?;
+        call(&connection, "Stop", json!({"version":1})).await?;
+    }
+    require(
+        tokio::time::timeout(Duration::from_secs(4), drain.drained()).await?,
+        "Прежний worker не завершился",
+    )?;
+    if kill_switch {
+        call(&connection, "Unlock", json!({"version":1})).await?;
+    }
+    require(
+        dhcp_renewal_set()?.is_none(),
+        "DHCP-набор пережил восстановление",
+    )?;
+    check_only_fake_is_filtered(v4, v6).await?;
+    require(
+        resolver_file_state()? == resolver_before,
+        "Изменился resolv.conf",
+    )?;
+    sleep?;
+    require(
+        matches!(post?.trim(), "empty" | "absent"),
+        "После S3 сохранилось действующее DHCP-разрешение",
+    )
 }
 
 #[cfg(feature = "test-support")]
