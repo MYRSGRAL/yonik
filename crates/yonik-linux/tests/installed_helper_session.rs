@@ -2035,6 +2035,7 @@ enum FakeDnsNetworkChange {
     },
     DhcpReconnect,
     DhcpRenewal,
+    DhcpLogin1Loss,
     DhcpSuspendWithoutLogind,
     DhcpSuspendWithShortInhibitor,
     NetworkManagerSuspend(Option<Engine>),
@@ -2053,6 +2054,13 @@ async fn production_helper_fake_dns_suspend_without_logind() -> Result {
 async fn production_helper_fake_dns_suspend_with_short_inhibitor() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::DhcpSuspendWithShortInhibitor)
         .await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая Debian VM с networkd и действующим login1"]
+async fn production_helper_fake_dns_revokes_dhcp_on_login1_loss() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::DhcpLogin1Loss).await
 }
 
 #[cfg(feature = "test-support")]
@@ -2110,6 +2118,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         change,
         FakeDnsNetworkChange::DhcpReconnect
             | FakeDnsNetworkChange::DhcpRenewal
+            | FakeDnsNetworkChange::DhcpLogin1Loss
             | FakeDnsNetworkChange::DhcpSuspendWithoutLogind
             | FakeDnsNetworkChange::DhcpSuspendWithShortInhibitor
     );
@@ -2204,8 +2213,18 @@ async fn installed_fake_dns_after_network_change_in_vm(
             resolver_file_state()? == resolver_before,
             "Сессия изменила /etc/resolv.conf до вмешательства стенда",
         )?;
-        if change == FakeDnsNetworkChange::DhcpRenewal || networkmanager_suspend {
-            if networkmanager_suspend || std::env::var_os("YONIK_DHCP_SLEEP_FIXTURE").is_some() {
+        if matches!(
+            change,
+            FakeDnsNetworkChange::DhcpRenewal | FakeDnsNetworkChange::DhcpLogin1Loss
+        ) || networkmanager_suspend
+        {
+            if change == FakeDnsNetworkChange::DhcpLogin1Loss {
+                let targets = [(old_v4, 40000).into(), (old_v6, 40000).into()];
+                check_dhcp_after_login1_replacement(&connection, &dhcp_links, targets).await?;
+                eprintln!("{engine:?}: допуск DHCP отозван и восстановлен без перезапуска worker");
+            } else if networkmanager_suspend
+                || std::env::var_os("YONIK_DHCP_SLEEP_FIXTURE").is_some()
+            {
                 let networkmanager_acks = if networkmanager_suspend {
                     wait_for_dhcp_renewal_set(&networkmanager_links, false)
                         .await
@@ -2362,7 +2381,9 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 eprintln!("{engine:?}: перед S3 и после пробуждения DHCP-допуск отсутствует");
                 control_dhcp_fixture("disconnect")?;
             }
-            FakeDnsNetworkChange::DhcpRenewal | FakeDnsNetworkChange::NetworkManagerSuspend(_) => {
+            FakeDnsNetworkChange::DhcpRenewal
+            | FakeDnsNetworkChange::DhcpLogin1Loss
+            | FakeDnsNetworkChange::NetworkManagerSuspend(_) => {
                 unreachable!("Сценарий продления завершён")
             }
         }
@@ -2585,11 +2606,97 @@ async fn fixture_suspend_and_check_dhcp(allow_absent: bool, without_logind: bool
 fn require_no_dhcp_permission(allow_absent: bool) -> Result {
     let set = dhcp_renewal_set()?;
     require(
-        set.as_ref().map_or(allow_absent, |set| {
-            set.get("elem")
-                .is_none_or(|entries| entries.as_array().is_some_and(Vec::is_empty))
-        }),
+        set.as_ref().map_or(allow_absent, dhcp_permission_set_empty),
         "Появилось DHCP-разрешение либо пропал набор активной политики",
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn dhcp_permission_set_empty(set: &Value) -> bool {
+    set.get("elem")
+        .is_none_or(|entries| entries.as_array().is_some_and(Vec::is_empty))
+}
+
+#[cfg(feature = "test-support")]
+async fn check_dhcp_after_login1_replacement(
+    connection: &zbus::Connection,
+    links: &[(&str, &str, &str)],
+    targets: [std::net::SocketAddr; 2],
+) -> Result {
+    let login1 = zbus::names::BusName::try_from("org.freedesktop.login1")?;
+    let bus = zbus::fdo::DBusProxy::new(connection).await?;
+    let previous = bus.get_name_owner(login1.clone()).await?;
+    let worker = networkmanager_dhcp_worker_pid()?;
+    check_running_dhcp_renewal(links).await?;
+    require(
+        Command::new("/usr/bin/systemctl")
+            .args(["mask", "--runtime", "--now", "systemd-logind.service"])
+            .status()?
+            .success(),
+        "Стенд не остановил login1",
+    )?;
+    require(
+        !bus.name_has_owner(login1.clone()).await?,
+        "На шине сохранился владелец login1",
+    )?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let set = dhcp_renewal_set()?
+                .ok_or_else(|| io::Error::other("Набор DHCP исчез из активной сессии"))?;
+            if dhcp_permission_set_empty(&set) {
+                return Ok::<_, Box<dyn std::error::Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("DHCP-разрешение не истекло после потери login1"))??;
+    eprintln!("DHCP-набор опустел после потери владельца login1");
+    tokio::try_join!(check_tun_traffic_to(targets), async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            require_no_dhcp_permission(false)?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    })?;
+    require(
+        Command::new("/usr/bin/systemctl")
+            .args(["unmask", "--runtime", "systemd-logind.service"])
+            .status()?
+            .success(),
+        "Стенд не снял runtime-маску login1",
+    )?;
+    require(
+        Command::new("/usr/bin/systemctl")
+            .args(["start", "systemd-logind.service"])
+            .status()?
+            .success(),
+        "Стенд не восстановил login1",
+    )?;
+    let current = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            match bus.get_name_owner(login1.clone()).await {
+                Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("Новый login1 не получил имя на шине"))??;
+    require(
+        current != previous,
+        "На шине остался прежний владелец login1",
+    )?;
+    eprintln!("Новый login1 получил имя на шине");
+    check_running_dhcp_renewal(links).await?;
+    renew_dhcp_links(connection, links, None).await?;
+    check_tun_traffic_to(targets).await?;
+    require(
+        networkmanager_dhcp_worker_pid()? == worker,
+        "Замена владельца login1 перезапустила worker",
     )
 }
 
