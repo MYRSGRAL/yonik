@@ -2032,7 +2032,6 @@ impl Backend {
             yonik_engine::compile_system(&server, request.engine, port, &tun)
                 .map_err(|_| ServiceError::Unsupported)?
         };
-        let config = config.with_local_runtime_logging();
         let query = RouteQuery::new(endpoint, worker_uid)
             .with_mark(plan.socket_mark())
             .with_transport(protocol, None, Some(server.endpoint().port()));
@@ -2040,6 +2039,10 @@ impl Backend {
             .await
             .map_err(unavailable)?;
         checked_route(&route, owner, plan.routing_table())?;
+        let config = config
+            .bind_system_proxy_address(&server, endpoint)
+            .map_err(|_| ServiceError::Unsupported)?
+            .with_local_runtime_logging();
         let mut routes = vec![ProfileRoute {
             dns: false,
             endpoint,

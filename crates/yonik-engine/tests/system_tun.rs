@@ -25,6 +25,80 @@ fn value(config: yonik_engine::CompiledConfig) -> serde_json::Value {
     config.write_sensitive(&mut bytes).unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
+
+#[test]
+fn system_proxy_dials_pinned_ip_and_preserves_tls_and_websocket_names() {
+    let report = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@edge.example:24443?security=tls&type=ws&host=front.example\ntrojan://fixture@edge.example:24443?security=tls&sni=tls.example"
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(report.servers.len(), 2);
+    for engine in [Engine::Xray, Engine::SingBox] {
+        for (index, server) in report.servers.iter().enumerate() {
+            let (address, sni) = [
+                ("192.0.2.10", "edge.example"),
+                ("2001:db8::10", "tls.example"),
+            ][index];
+            let config = value(
+                compile_system(server, engine, NonZeroU16::new(10808).unwrap(), &settings())
+                    .unwrap()
+                    .bind_system_proxy_address(server, address.parse().unwrap())
+                    .unwrap(),
+            );
+            let proxy = &config["outbounds"][0];
+            match engine {
+                Engine::Xray => {
+                    let field = ["vnext", "servers"][index];
+                    assert_eq!(proxy["settings"][field][0]["address"], address);
+                    assert_eq!(proxy["settings"][field][0]["port"], 24443);
+                    assert_eq!(proxy["streamSettings"]["tlsSettings"]["serverName"], sni);
+                    if index == 0 {
+                        assert_eq!(
+                            proxy["streamSettings"]["wsSettings"]["host"],
+                            "front.example"
+                        );
+                    }
+                }
+                Engine::SingBox => {
+                    assert_eq!(proxy["server"], address);
+                    assert_eq!(proxy["server_port"], 24443);
+                    assert_eq!(proxy["tls"]["server_name"], sni);
+                    if index == 0 {
+                        assert_eq!(proxy["transport"]["headers"]["Host"], "front.example");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn system_proxy_binding_rejects_a_different_port_or_host() {
+    let report = source();
+    let other = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@127.0.0.1:24444?security=tls\nvless://00112233-4455-6677-8899-aabbccddeeff@127.0.0.2:24443?security=tls"
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(other.servers.len(), 2);
+    for engine in [Engine::Xray, Engine::SingBox] {
+        for server in &other.servers {
+            let config = compile_system(
+                &report.servers[0],
+                engine,
+                NonZeroU16::new(10808).unwrap(),
+                &settings(),
+            )
+            .unwrap();
+            assert!(matches!(
+                config.bind_system_proxy_address(server, server.endpoint().host().parse().unwrap()),
+                Err(CompileError::InvalidParameter)
+            ));
+        }
+    }
+}
+
 #[test]
 fn system_inbound_retains_profile_and_never_enables_automatic_network_control() {
     let report = source();
