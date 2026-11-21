@@ -2816,7 +2816,7 @@ async fn installed_fake_dns_with_domain_policy(
         FakeDnsPolicyWitness::Domains => None,
         FakeDnsPolicyWitness::LiteralBlock | FakeDnsPolicyWitness::LiteralDirect => Some("block"),
         FakeDnsPolicyWitness::LiteralProxy => Some("proxy"),
-        FakeDnsPolicyWitness::ResolvedCidrs | FakeDnsPolicyWitness::ResolvedMixed => {
+        FakeDnsPolicyWitness::ResolvedCidrs | FakeDnsPolicyWitness::ResolvedMixed { .. } => {
             unreachable!("У проверок DNS политики свой профиль")
         }
     };
@@ -2859,7 +2859,7 @@ enum FakeDnsPolicyWitness {
     LiteralProxy,
     LiteralDirect,
     ResolvedCidrs,
-    ResolvedMixed,
+    ResolvedMixed { guarded_proxy: bool },
 }
 
 #[cfg(feature = "test-support")]
@@ -2868,6 +2868,7 @@ enum ResolvedDnsFixture {
     Cidrs,
     Mixed,
     PartialDirect,
+    GuardedProxy,
 }
 
 #[cfg(feature = "test-support")]
@@ -2889,6 +2890,13 @@ async fn production_helper_resolved_fake_dns_mixed() -> Result {
 #[ignore = "одноразовая VM с доступным Direct echo 203.0.113.47 и неполным DNS-ответом"]
 async fn production_helper_resolved_fake_dns_partial_direct() -> Result {
     installed_resolved_fake_dns_policy(ResolvedDnsFixture::PartialDirect).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая VM с WireGuard-маршрутом для DNS-ответа guarded.example.test"]
+async fn production_helper_resolved_fake_dns_guarded_proxy() -> Result {
+    installed_resolved_fake_dns_policy(ResolvedDnsFixture::GuardedProxy).await
 }
 
 #[cfg(feature = "test-support")]
@@ -2982,6 +2990,7 @@ async fn installed_resolved_fake_dns_policy(fixture: ResolvedDnsFixture) -> Resu
     )?;
     let mixed = fixture != ResolvedDnsFixture::Cidrs;
     let partial_direct = fixture == ResolvedDnsFixture::PartialDirect;
+    let guarded_proxy = fixture == ResolvedDnsFixture::GuardedProxy;
     let mut proxy = vec!["2001:db8:746f::2/128"];
     let mut direct = vec!["192.0.2.201/32", "2001:db8:7471::2/128"];
     // Для D-05 имеющийся A совпадает только с младшим Direct.
@@ -3007,9 +3016,13 @@ async fn installed_resolved_fake_dns_policy(fixture: ResolvedDnsFixture) -> Resu
     let mut preset_rules = Vec::new();
     if mixed {
         // Личный Proxy для early.example.test конфликтует с младшим пресетом Direct.
+        let mut early_names = vec!["early.example.test"];
+        if guarded_proxy {
+            early_names.push("guarded.example.test");
+        }
         preset_rules.extend(rules.pop());
         rules.splice(0..0, [
-            json!({"id": 4, "enabled": true, "action": "proxy", "domain": ["early.example.test"],
+            json!({"id": 4, "enabled": true, "action": "proxy", "domain": early_names,
                 "domain_suffix": [], "ip_cidr": [], "executable_paths": []}),
             json!({"id": 5, "enabled": true, "action": "block", "domain": ["combined.example.test"],
                 "domain_suffix": [], "ip_cidr": ["203.0.113.50/32"], "executable_paths": []}),
@@ -3037,7 +3050,7 @@ async fn installed_resolved_fake_dns_policy(fixture: ResolvedDnsFixture) -> Resu
         HelperLifecycle::Normal,
         Some(&policy),
         Some(if mixed {
-            FakeDnsPolicyWitness::ResolvedMixed
+            FakeDnsPolicyWitness::ResolvedMixed { guarded_proxy }
         } else {
             FakeDnsPolicyWitness::ResolvedCidrs
         }),
@@ -3402,15 +3415,26 @@ async fn installed_fake_dns(
             )?;
             eprintln!("{engine:?}: невыданные Fake-IP заблокированы по TCP/UDP IPv4/IPv6");
         }
-        if let Some(witness) = &policy_witness {
+        if let Some(FakeDnsPolicyWitness::ResolvedMixed {
+            guarded_proxy: true,
+        }) = &policy_witness
+        {
+            for database in ["ahostsv4", "ahostsv6"] {
+                let guarded = getent_fake_dns(database, "guarded.example.test").await?;
+                check_fake_flow_blocked((guarded, 40000).into()).await?;
+            }
+            let early_v4 = getent_fake_dns("ahostsv4", "early.example.test").await?;
+            let early_v6 = getent_fake_dns("ahostsv6", "early.example.test").await?;
+            check_tun_traffic_to([(early_v4, 40000).into(), (early_v6, 40000).into()]).await?;
+        } else if let Some(witness) = &policy_witness {
             let mut blocked_names = vec!["blocked.example.test"];
             if matches!(
                 witness,
-                FakeDnsPolicyWitness::ResolvedCidrs | FakeDnsPolicyWitness::ResolvedMixed
+                FakeDnsPolicyWitness::ResolvedCidrs | FakeDnsPolicyWitness::ResolvedMixed { .. }
             ) {
                 blocked_names.push("failed.example.test");
             }
-            if matches!(witness, FakeDnsPolicyWitness::ResolvedMixed) {
+            if matches!(witness, FakeDnsPolicyWitness::ResolvedMixed { .. }) {
                 blocked_names.push("combined.example.test");
             }
             for name in blocked_names {
@@ -3420,7 +3444,8 @@ async fn installed_fake_dns(
                 }
             }
             match witness {
-                FakeDnsPolicyWitness::ResolvedCidrs | FakeDnsPolicyWitness::ResolvedMixed => {
+                FakeDnsPolicyWitness::ResolvedCidrs
+                | FakeDnsPolicyWitness::ResolvedMixed { .. } => {
                     let direct_v4 = getent_fake_dns("ahostsv4", "direct.example.test").await?;
                     let direct_v6 = getent_fake_dns("ahostsv6", "direct.example.test").await?;
                     check_tun_traffic_to([(direct_v4, 40000).into(), (direct_v6, 40000).into()])
@@ -3428,7 +3453,7 @@ async fn installed_fake_dns(
                     eprintln!(
                         "{engine:?}: полученные по DNS адреса проверены по CIDR на TCP и UDP"
                     );
-                    if matches!(witness, FakeDnsPolicyWitness::ResolvedMixed) {
+                    if matches!(witness, FakeDnsPolicyWitness::ResolvedMixed { .. }) {
                         let early_v4 = getent_fake_dns("ahostsv4", "early.example.test").await?;
                         let early_v6 = getent_fake_dns("ahostsv6", "early.example.test").await?;
                         check_tun_traffic_to([(early_v4, 40000).into(), (early_v6, 40000).into()])
