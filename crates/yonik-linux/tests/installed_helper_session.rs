@@ -389,9 +389,18 @@ fn networkmanager_fixture_engine() -> Result<Engine> {
 }
 
 #[cfg(feature = "test-support")]
+fn dhcpcd_fixture_journal(unit: &str) -> Result<String> {
+    let journal = Command::new("/usr/bin/journalctl")
+        .args(["-b", "-u", unit, "--no-pager", "-o", "cat"])
+        .output()?;
+    require(journal.status.success(), "Не прочитан журнал стенда dhcpcd")?;
+    Ok(String::from_utf8(journal.stdout)?)
+}
+
+#[cfg(feature = "test-support")]
 #[tokio::test]
-#[ignore = "одноразовая Debian VM с dhcpcd и свежим лизингом на dhcpcd-probe"]
-async fn production_helper_fake_dns_during_dhcpcd_renewal() -> Result {
+#[ignore = "одноразовая Debian VM с dhcpcd и 46-секундным лизингом на dhcpcd-probe"]
+async fn production_helper_fake_dns_during_dhcpcd_rebind() -> Result {
     guard()?;
     let _lock = vm_lock::acquire()?;
     wait_for_fixture_link().await?;
@@ -415,13 +424,15 @@ async fn production_helper_fake_dns_during_dhcpcd_renewal() -> Result {
     let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
     check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
     let worker = networkmanager_dhcp_worker_pid()?;
+    let client_journal = || dhcpcd_fixture_journal("yonik-dhcpcd-client");
+    let renewal = "renewing lease of 10.234.16.10";
+    require(
+        !client_journal()?.contains(renewal),
+        "Начальная проверка TUN завершилась после первой попытки продления",
+    )?;
     tokio::time::timeout(Duration::from_secs(34), async {
         loop {
-            let journal = Command::new("/usr/bin/journalctl")
-                .args(["-b", "-u", "yonik-dhcpcd-client", "--no-pager", "-o", "cat"])
-                .output()?;
-            require(journal.status.success(), "Не прочитан журнал dhcpcd")?;
-            if String::from_utf8_lossy(&journal.stdout).contains("renewing lease of 10.234.16.10") {
+            if client_journal()?.contains(renewal) {
                 return Ok::<(), Box<dyn std::error::Error>>(());
             }
             tokio::time::sleep(Duration::from_millis(350)).await;
@@ -437,12 +448,36 @@ async fn production_helper_fake_dns_during_dhcpcd_renewal() -> Result {
     let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
     check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
     eprintln!("{engine:?}: Fake A/AAAA и IPv4/IPv6 TCP/UDP прошли после попытки продления dhcpcd");
-    call(&connection, "Stop", json!({"version":1})).await?;
     require(
-        tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
-        "Worker не остановлен",
+        tokio::time::timeout(Duration::from_secs(32), drain.drained()).await?,
+        "Worker продолжил работу после перепривязки лизинга dhcpcd",
     )?;
-    call(&connection, "Unlock", json!({"version":1})).await?;
+    let journal = client_journal()?;
+    require(
+        journal.contains("failed to renew DHCP, rebinding")
+            && journal.contains("dhcpcd-run-hooks REBIND")
+            && dhcpcd_fixture_journal("yonik-dhcpcd-server")?
+                .matches("sending ACK to 10.234.16.10")
+                .count()
+                == 2,
+        "Стенд не подтвердил второй DHCPACK и штатный REBIND",
+    )?;
+    let state = state_after_route_events(&connection).await?;
+    require(
+        matches!(
+            state["state"].as_str(),
+            Some("recovery_required" | "verified_rules")
+        ),
+        "После перепривязки лизинга helper не сохранил kill switch",
+    )?;
+    for destination in [(v4, 40000).into(), (v6, 40000).into()] {
+        check_fake_flow_blocked(destination).await?;
+    }
+    require(
+        call(&connection, "Unlock", json!({"version":1})).await?["state"] == "no_managed_policy",
+        "Unlock не очистил правила после перепривязки лизинга",
+    )?;
+    eprintln!("{engine:?}: worker остановлен, kill switch и защита Fake-IP сработали");
     require(
         resolver_file_state()? == resolver_before,
         "Изменился /etc/resolv.conf",
