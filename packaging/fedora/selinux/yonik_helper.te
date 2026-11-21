@@ -1,7 +1,7 @@
 policy_module(yonik_helper, 1.0)
 
 gen_require(`
-    type init_t, iptables_t, var_t, var_lib_t, var_run_t;
+    type init_t, iptables_t, etc_t, var_t, var_lib_t, var_run_t;
     type systemd_unit_file_t;
     type fs_t, nsfs_t;
     type initrc_t, unconfined_t;
@@ -9,7 +9,7 @@ gen_require(`
     type ephemeral_port_t, sysctl_net_t;
     type systemd_logind_t, systemd_networkd_t, systemd_networkd_unit_file_t;
     type systemd_resolved_t, systemd_resolved_unit_file_t;
-    type NetworkManager_t, NetworkManager_unit_file_t;
+    type NetworkManager_t, NetworkManager_unit_file_t, NetworkManager_var_run_t;
 ')
 
 type yonik_helper_t;
@@ -78,6 +78,10 @@ allow yonik_helper_t systemd_networkd_t:file { open read };
 allow yonik_helper_t NetworkManager_unit_file_t:service status;
 allow yonik_helper_t NetworkManager_t:dir search;
 allow yonik_helper_t NetworkManager_t:file { open read };
+# Helper открывает каталог NetworkManager при чтении доверенного файла DNS.
+# Inotify отслеживает замену файла и симлинка через их родительские каталоги.
+allow yonik_helper_t NetworkManager_var_run_t:dir { getattr open read search watch };
+allow yonik_helper_t etc_t:dir watch;
 # Привязка DoT сверяет статус юнита и читает cgroup и stat процесса resolved.
 allow yonik_helper_t systemd_resolved_unit_file_t:service status;
 allow yonik_helper_t systemd_resolved_t:dir search;
