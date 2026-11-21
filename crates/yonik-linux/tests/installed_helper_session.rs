@@ -368,11 +368,7 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
 #[tokio::test]
 #[ignore = "чистая VM с NetworkManager и tools/fixtures/networkmanager_dhcp.sh"]
 async fn production_helper_networkmanager_dhcp_renewal() -> Result {
-    let engine = match std::env::var("YONIK_NM_DHCP_ENGINE")?.as_str() {
-        "xray" => Engine::Xray,
-        "sing-box" => Engine::SingBox,
-        _ => return Err(io::Error::other("Для стенда нужен xray или sing-box").into()),
-    };
+    let engine = networkmanager_fixture_engine()?;
     let policy = scoped_fake_dns_proxy_policy()?;
     installed_fake_dns(
         None,
@@ -381,6 +377,15 @@ async fn production_helper_networkmanager_dhcp_renewal() -> Result {
         None,
     )
     .await
+}
+
+#[cfg(feature = "test-support")]
+fn networkmanager_fixture_engine() -> Result<Engine> {
+    match std::env::var("YONIK_NM_DHCP_ENGINE")?.as_str() {
+        "xray" => Ok(Engine::Xray),
+        "sing-box" => Ok(Engine::SingBox),
+        _ => Err(io::Error::other("Для стенда нужен xray или sing-box").into()),
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -1280,6 +1285,17 @@ enum FakeDnsNetworkChange {
     },
     DhcpReconnect,
     DhcpRenewal,
+    NetworkManagerSuspend(Engine),
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая Fedora VM с NetworkManager, ACPI S3 и hook стенда DHCP"]
+async fn production_helper_fake_dns_networkmanager_suspend() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::NetworkManagerSuspend(
+        networkmanager_fixture_engine()?,
+    ))
+    .await
 }
 
 #[cfg(feature = "test-support")]
@@ -1315,11 +1331,17 @@ async fn installed_fake_dns_after_network_change_in_vm(
         change,
         FakeDnsNetworkChange::DhcpReconnect | FakeDnsNetworkChange::DhcpRenewal
     );
+    let networkmanager_suspend = matches!(change, FakeDnsNetworkChange::NetworkManagerSuspend(_));
+    let networkmanager_links = [("yonik-nm-lease", "10.233.53.10", "10.233.53.1")];
     let mut dhcp_links = vec![("yonik-dhcp", "10.203.2.10", "10.203.2.1")];
     if std::env::var_os("YONIK_DHCP_SECOND_FIXTURE").is_some() {
         dhcp_links.push(("yonik-dhcp2", "10.203.3.10", "10.203.3.1"));
     }
     for (engine, kill_switch) in [(Engine::Xray, true), (Engine::SingBox, false)] {
+        if matches!(change, FakeDnsNetworkChange::NetworkManagerSuspend(selected) if selected != engine)
+        {
+            continue;
+        }
         if dhcp {
             check_dhcp_fixture_dns("10.203.2.1", &mut token).await?;
         }
@@ -1376,9 +1398,18 @@ async fn installed_fake_dns_after_network_change_in_vm(
             resolver_file_state()? == resolver_before,
             "Сессия изменила /etc/resolv.conf до вмешательства стенда",
         )?;
-        if change == FakeDnsNetworkChange::DhcpRenewal {
-            if std::env::var_os("YONIK_DHCP_SLEEP_FIXTURE").is_some() {
-                fixture_suspend_and_check_dhcp().await?;
+        if change == FakeDnsNetworkChange::DhcpRenewal || networkmanager_suspend {
+            if networkmanager_suspend || std::env::var_os("YONIK_DHCP_SLEEP_FIXTURE").is_some() {
+                let networkmanager_acks = if networkmanager_suspend {
+                    wait_for_dhcp_renewal_set(&networkmanager_links, false).await?;
+                    Some(networkmanager_dhcp_ack_count()?)
+                } else {
+                    None
+                };
+                fixture_suspend_and_check_dhcp(networkmanager_suspend).await?;
+                if let Some(previous_acks) = networkmanager_acks {
+                    wait_for_networkmanager_after_suspend(previous_acks).await?;
+                }
                 let state = state_after_route_events(&connection).await?;
                 let mut current = (old_v4, old_v6);
                 if state["state"] != "tunnel_starting" {
@@ -1422,13 +1453,23 @@ async fn installed_fake_dns_after_network_change_in_vm(
                         "{engine:?}: установлена новая сессия, прежние Fake-IP заблокированы"
                     );
                 }
-                check_running_dhcp_renewal(&dhcp_links).await?;
-                renew_dhcp_links(&connection, &dhcp_links, None).await?;
+                if let Some(previous_acks) = networkmanager_acks {
+                    wait_for_dhcp_renewal_set(&networkmanager_links, false).await?;
+                    require(
+                        networkmanager_dhcp_ack_count()? > previous_acks,
+                        "NetworkManager не получил новый DHCPACK после S3",
+                    )?;
+                } else {
+                    check_running_dhcp_renewal(&dhcp_links).await?;
+                    renew_dhcp_links(&connection, &dhcp_links, None).await?;
+                }
                 check_tun_traffic_to([(current.0, 40000).into(), (current.1, 40000).into()])
                     .await?;
                 eprintln!("{engine:?}: DHCP и Fake A/AAAA проверены после S3");
             }
-            check_running_dhcp_renewal(&dhcp_links).await?;
+            if !networkmanager_suspend {
+                check_running_dhcp_renewal(&dhcp_links).await?;
+            }
             call(&connection, "Stop", empty.clone()).await?;
             require(
                 tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
@@ -1469,7 +1510,9 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 eprintln!("{engine:?}: resolvconf опубликовал новый DNS-сервер");
             }
             FakeDnsNetworkChange::DhcpReconnect => control_dhcp_fixture("disconnect")?,
-            FakeDnsNetworkChange::DhcpRenewal => unreachable!("Сценарий продления завершён"),
+            FakeDnsNetworkChange::DhcpRenewal | FakeDnsNetworkChange::NetworkManagerSuspend(_) => {
+                unreachable!("Сценарий продления завершён")
+            }
         }
         // До закрытия вывода не обращаемся к helper по D-Bus. Только его
         // наблюдатель сетевых событий может остановить этот worker.
@@ -1642,7 +1685,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
 }
 
 #[cfg(feature = "test-support")]
-async fn fixture_suspend_and_check_dhcp() -> Result {
+async fn fixture_suspend_and_check_dhcp(allow_absent: bool) -> Result {
     let pre = std::path::Path::new("/run/yonik-dhcp-sleep-pre");
     let post = std::path::Path::new("/run/yonik-dhcp-sleep-post");
     for marker in [pre, post] {
@@ -1673,10 +1716,37 @@ async fn fixture_suspend_and_check_dhcp() -> Result {
         }
     })
     .await?;
+    let state = fs::read_to_string(pre)?;
     require(
-        fs::read_to_string(pre)?.trim() == "empty",
+        state.trim() == "empty" || (allow_absent && state.trim() == "absent"),
         "Перед S3 сохранялось действующее DHCP-разрешение",
     )
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_networkmanager_after_suspend(previous_acks: usize) -> Result {
+    let monitor = yonik_linux::NetworkMonitor::start()?;
+    let mut watch = monitor.watch();
+    let ready = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            // Лизинг может появиться раньше последних изменений маршрутов и DNS.
+            let has_lease = watch.current().fully_observed()
+                && networkmanager_dhcp_ack_count()? > previous_acks;
+            let quiet = if has_lease {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(200)
+            };
+            match tokio::time::timeout(quiet, watch.changed()).await {
+                Ok(change) => change?,
+                Err(_) if has_lease => return Ok::<_, Box<dyn std::error::Error>>(()),
+                Err(_) => {}
+            }
+        }
+    })
+    .await;
+    require(monitor.shutdown().await, "Не завершён наблюдатель сети")?;
+    ready.map_err(|_| io::Error::other("NetworkManager не восстановил лизинг и стабильную сеть"))?
 }
 
 #[cfg(feature = "test-support")]
@@ -1700,6 +1770,14 @@ fn dhcp_renewal_set() -> Result<Option<Value>> {
 
 #[cfg(feature = "test-support")]
 async fn check_running_dhcp_renewal(links: &[(&str, &str, &str)]) -> Result {
+    wait_for_dhcp_renewal_set(links, true).await
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_dhcp_renewal_set(
+    links: &[(&str, &str, &str)],
+    require_exact_links: bool,
+) -> Result {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(set) = dhcp_renewal_set()? {
@@ -1723,12 +1801,13 @@ async fn check_running_dhcp_renewal(links: &[(&str, &str, &str)]) -> Result {
                                 && element.pointer("/elem/expires") == Some(&json!(0))
                         };
                     require(
-                        elements
-                            .iter()
-                            .all(|element| links.iter().any(|link| matches(element, link))),
+                        !require_exact_links
+                            || elements
+                                .iter()
+                                .all(|element| links.iter().any(|link| matches(element, link))),
                         "Активный DHCP-элемент содержит другой лизинг или таймер",
                     )?;
-                    if elements.len() == links.len()
+                    if (!require_exact_links || elements.len() == links.len())
                         && links
                             .iter()
                             .all(|link| elements.iter().any(|element| matches(element, link)))
