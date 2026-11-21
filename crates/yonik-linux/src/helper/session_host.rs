@@ -1971,14 +1971,22 @@ impl Backend {
             .port();
         let port = NonZeroU16::new(port).ok_or(ServiceError::Unavailable)?;
         let tun = plan.compiler_tun().map_err(unavailable)?;
+        let query = RouteQuery::new(endpoint, worker_uid)
+            .with_mark(plan.socket_mark())
+            .with_transport(protocol, None, Some(server.endpoint().port()));
+        let (route, route_capture) = lookup_route_captured(query, cancel, DEADLINE)
+            .await
+            .map_err(unavailable)?;
+        checked_route(&route, owner, plan.routing_table())?;
         let config = if let Some(policy) = policy.as_ref() {
             let probe =
                 TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(unavailable)?;
             let probe_port = NonZeroU16::new(probe.local_addr().map_err(unavailable)?.port())
                 .ok_or(ServiceError::Unavailable)?;
             if let Some(fake_dns) = &fake_dns {
-                yonik_engine::compile_system_fake_dns_policy(
+                yonik_engine::compile_system_fake_dns_policy_at(
                     &server,
+                    endpoint,
                     request.engine,
                     port,
                     probe_port,
@@ -2020,8 +2028,9 @@ impl Backend {
                 .map_err(|_| ServiceError::Unsupported)?
             }
         } else if let Some(fake_dns) = &fake_dns {
-            yonik_engine::compile_system_fake_dns_bridge(
+            yonik_engine::compile_system_fake_dns_bridge_at(
                 &server,
+                endpoint,
                 request.engine,
                 port,
                 &tun,
@@ -2032,17 +2041,14 @@ impl Backend {
             yonik_engine::compile_system(&server, request.engine, port, &tun)
                 .map_err(|_| ServiceError::Unsupported)?
         };
-        let query = RouteQuery::new(endpoint, worker_uid)
-            .with_mark(plan.socket_mark())
-            .with_transport(protocol, None, Some(server.endpoint().port()));
-        let (route, route_capture) = lookup_route_captured(query, cancel, DEADLINE)
-            .await
-            .map_err(unavailable)?;
-        checked_route(&route, owner, plan.routing_table())?;
-        let config = config
-            .bind_system_proxy_address(&server, endpoint)
-            .map_err(|_| ServiceError::Unsupported)?
-            .with_local_runtime_logging();
+        let config = if fake_dns.is_some() {
+            config
+        } else {
+            config
+                .bind_system_proxy_address(&server, endpoint)
+                .map_err(|_| ServiceError::Unsupported)?
+        }
+        .with_local_runtime_logging();
         let mut routes = vec![ProfileRoute {
             dns: false,
             endpoint,

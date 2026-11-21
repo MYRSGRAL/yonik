@@ -288,26 +288,39 @@ pub fn compile_system_fake_dns_bridge(
     tun: &SystemTun,
     bridge: &SystemFakeDnsBridge,
 ) -> Result<CompiledConfig, CompileError> {
-    validate_bridge(server, port, tun, bridge)?;
+    let remote = server
+        .endpoint()
+        .host()
+        .parse()
+        .map_err(|_| CompileError::InvalidParameter)?;
+    compile_system_fake_dns_bridge_at(server, remote, engine, port, tun, bridge)
+}
+
+/// Компилирует Fake DNS для IP прокси, проверенного вызывающей стороной.
+pub fn compile_system_fake_dns_bridge_at(
+    server: &ParsedServer,
+    remote: IpAddr,
+    engine: Engine,
+    port: NonZeroU16,
+    tun: &SystemTun,
+    bridge: &SystemFakeDnsBridge,
+) -> Result<CompiledConfig, CompileError> {
+    validate_bridge(remote, port, tun, bridge)?;
     attach_fake_dns(
         compile(server, engine, port)?,
         tun,
         bridge,
         ScopedFakePolicy::ProxyOnly,
-    )
+    )?
+    .bind_system_proxy_address(server, remote)
 }
 
 fn validate_bridge(
-    server: &ParsedServer,
+    remote: IpAddr,
     port: NonZeroU16,
     tun: &SystemTun,
     bridge: &SystemFakeDnsBridge,
 ) -> Result<(), CompileError> {
-    let remote: IpAddr = server
-        .endpoint()
-        .host()
-        .parse()
-        .map_err(|_| CompileError::InvalidParameter)?;
     if remote.is_loopback()
         || bridge.dns_address == remote
         || bridge.pools.iter().any(|pool| pool.contains(remote))
@@ -324,6 +337,7 @@ fn validate_bridge(
         })
         || tun.addresses.iter().any(|address| {
             address.address == bridge.dns_address
+                || same_ip_address(address.address, remote)
                 || bridge
                     .pools
                     .iter()
@@ -704,6 +718,29 @@ pub fn compile_system_fake_dns_policy(
     bridge: &SystemFakeDnsBridge,
     suffixes: &[String],
 ) -> Result<CompiledConfig, PolicyCompileError> {
+    let remote = server
+        .endpoint()
+        .host()
+        .parse()
+        .map_err(|_| PolicyCompileError::Server(CompileError::InvalidParameter))?;
+    compile_system_fake_dns_policy_at(
+        server, remote, engine, port, probe_port, policy, tun, bridge, suffixes,
+    )
+}
+
+/// Компилирует правила Fake DNS для IP прокси, проверенного вызывающей стороной.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_system_fake_dns_policy_at(
+    server: &ParsedServer,
+    remote: IpAddr,
+    engine: Engine,
+    port: NonZeroU16,
+    probe_port: NonZeroU16,
+    policy: &Policy,
+    tun: &SystemTun,
+    bridge: &SystemFakeDnsBridge,
+    suffixes: &[String],
+) -> Result<CompiledConfig, PolicyCompileError> {
     let mode = match bridge.resolved_direct_auth() {
         Some(direct_auth) if SystemFakeDnsBridge::supports_resolved_cidr_policy(policy) => {
             let proxy_suffixes =
@@ -737,7 +774,7 @@ pub fn compile_system_fake_dns_policy(
         return Err(crate::PolicyCompileError::ProbePort);
     }
 
-    validate_bridge(server, port, tun, bridge).map_err(crate::PolicyCompileError::Server)?;
+    validate_bridge(remote, port, tun, bridge).map_err(PolicyCompileError::Server)?;
     let config = match mode {
         ScopedFakePolicy::ProxyOnly => {
             crate::routing::compile_tun_policy(server, engine, port, probe_port, policy)
@@ -757,7 +794,9 @@ pub fn compile_system_fake_dns_policy(
             server, engine, port, probe_port, policy,
         ),
     }?;
-    attach_fake_dns(config, tun, bridge, mode).map_err(PolicyCompileError::Server)
+    attach_fake_dns(config, tun, bridge, mode)
+        .and_then(|config| config.bind_system_proxy_address(server, remote))
+        .map_err(PolicyCompileError::Server)
 }
 
 fn plain_dns_tag(index: usize) -> String {
@@ -1629,6 +1668,78 @@ mod tests {
             ),
             Err(CompileError::ListenerConflict)
         ));
+    }
+
+    #[test]
+    fn named_proxy_uses_one_checked_address_in_both_fake_dns_profiles() {
+        let report = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@edge.example:24443?security=tls"
+                .to_vec(),
+        )
+        .unwrap();
+        let server = &report.servers[0];
+        let tun = SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
+        let bridge = empty_bridge()
+            .with_plain_dns_endpoints(vec![("192.0.2.53:1053".parse().unwrap(), port(12557))])
+            .unwrap();
+        let policy = Policy::default();
+        let address = "192.0.2.10".parse().unwrap();
+        for engine in [Engine::Xray, Engine::SingBox] {
+            let compile = |address, with_policy| {
+                if with_policy {
+                    compile_system_fake_dns_policy_at(
+                        server,
+                        address,
+                        engine,
+                        port(12556),
+                        port(12558),
+                        &policy,
+                        &tun,
+                        &bridge,
+                        &[],
+                    )
+                } else {
+                    compile_system_fake_dns_bridge_at(
+                        server,
+                        address,
+                        engine,
+                        port(12556),
+                        &tun,
+                        &bridge,
+                    )
+                    .map_err(PolicyCompileError::Server)
+                }
+            };
+            for with_policy in [false, true] {
+                let config = compile(address, with_policy).unwrap();
+                let proxy = &config.value["outbounds"][0];
+                match engine {
+                    Engine::Xray => {
+                        assert_eq!(proxy["settings"]["vnext"][0]["address"], "192.0.2.10");
+                        assert_eq!(
+                            proxy["streamSettings"]["tlsSettings"]["serverName"],
+                            "edge.example"
+                        );
+                    }
+                    Engine::SingBox => {
+                        assert_eq!(proxy["server"], "192.0.2.10");
+                        assert_eq!(proxy["tls"]["server_name"], "edge.example");
+                    }
+                }
+                for collision in [
+                    "198.18.0.1",
+                    "198.18.0.2",
+                    "198.18.4.1",
+                    "fd10::1",
+                    "192.0.2.53",
+                ] {
+                    assert!(matches!(
+                        compile(collision.parse().unwrap(), with_policy),
+                        Err(PolicyCompileError::Server(CompileError::InvalidParameter))
+                    ));
+                }
+            }
+        }
     }
 
     #[test]

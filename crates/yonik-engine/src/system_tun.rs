@@ -7,7 +7,8 @@ use yonik_import::{ParsedServer, Protocol};
 
 mod fake_bridge;
 pub use fake_bridge::{
-    SystemFakeDnsBridge, compile_system_fake_dns_bridge, compile_system_fake_dns_policy,
+    SystemFakeDnsBridge, compile_system_fake_dns_bridge, compile_system_fake_dns_bridge_at,
+    compile_system_fake_dns_policy, compile_system_fake_dns_policy_at,
     validate_scoped_fake_dns_policy,
 };
 
