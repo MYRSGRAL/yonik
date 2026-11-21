@@ -919,6 +919,133 @@ async fn production_helper_fake_dns_after_resolvconf_update() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая Debian VM с сохранённой wg.test, WireGuard и двумя DNS под resolvconf"]
+async fn production_helper_fake_dns_protects_zone_after_resolvconf_route_change() -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let (_owner, token) = yonik_linux::Cancellation::new();
+    let policy = scoped_fake_dns_proxy_policy()?;
+    let domains = ["example.test".to_owned(), "wg.test".to_owned()];
+    let initial = "10.203.1.2".parse::<std::net::IpAddr>()?;
+    let updated = "10.203.1.6".parse::<std::net::IpAddr>()?;
+    let private = "10.42.1.2:53".parse()?;
+    let route = |operation, kind| {
+        Command::new("ip")
+            .args(["route", operation, kind, "10.42.1.2/32"])
+            .status()
+    };
+    for engine in [Engine::Xray, Engine::SingBox] {
+        let baseline = resolver_file_state()?;
+        require(
+            ask_fixture_dns(private, "before.wg.test", 1, false).await?
+                == std::net::Ipv4Addr::new(10, 42, 1, 2),
+            "Приватный DNS недоступен до запуска TUN",
+        )?;
+        let start = || {
+            start_fake_dns_in_vm_with_domains(
+                &connection,
+                &server,
+                engine,
+                false,
+                Some(&policy),
+                &token,
+                &domains,
+            )
+        };
+        let drain = start().await?;
+        let old_v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+        let old_v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+        check_fixture_resolver(initial, "192.0.2.99", old_v4, old_v6).await?;
+        for qtype in [1, 28] {
+            for tcp in [false, true] {
+                require(
+                    ask_fixture_dns((initial, 53).into(), "before.wg.test", qtype, tcp)
+                        .await
+                        .is_err(),
+                    "Сохранённая приватная зона доступна через публичный DNS",
+                )?;
+            }
+        }
+        require(
+            resolver_file_state()? == baseline,
+            "TUN изменил источник DNS",
+        )?;
+        require(
+            route("add", "blackhole")?.success(),
+            "Стенд не отозвал маршрут приватного DNS",
+        )?;
+        require(
+            tokio::time::timeout(Duration::from_secs(15), drain.drained()).await?,
+            "Сетевой наблюдатель не остановил worker после смены маршрута",
+        )?;
+        require(
+            state_after_route_events(&connection).await?["state"] == "no_managed_policy",
+            "Helper не завершил предыдущую сессию",
+        )?;
+        require(
+            resolver_file_state()? == baseline,
+            "Смена только маршрута изменила источник DNS",
+        )?;
+        require(
+            ask_fixture_dns(private, "unreachable.wg.test", 1, false)
+                .await
+                .is_err(),
+            "Старый приватный маршрут всё ещё доступен",
+        )?;
+        switch_fixture_resolver(updated)?;
+        let published = resolver_file_state()?;
+        require(
+            published.contents != baseline.contents,
+            "resolvconf не опубликовал новый адрес DNS",
+        )?;
+        check_only_fake_is_filtered(old_v4, old_v6).await?;
+        let drain = start().await?;
+        let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+        let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+        check_fixture_resolver(updated, "192.0.2.100", v4, v6).await?;
+        for qtype in [1, 28] {
+            for tcp in [false, true] {
+                require(
+                    ask_fixture_dns((updated, 53).into(), "after.wg.test", qtype, tcp)
+                        .await
+                        .is_err(),
+                    "Приватная зона разрешилась после отзыва маршрута",
+                )?;
+            }
+        }
+        check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+        call(&connection, "Stop", json!({"version":1})).await?;
+        require(
+            tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+            "Stop не завершил worker",
+        )?;
+        require(
+            resolver_file_state()? == published,
+            "Повторный запуск или Stop изменили конфигурацию resolvconf",
+        )?;
+        require(
+            route("del", "blackhole")?.success(),
+            "Стенд не восстановил приватный маршрут",
+        )?;
+        switch_fixture_resolver(initial)?;
+        require(
+            ask_fixture_dns(private, "restored.wg.test", 1, false).await?
+                == std::net::Ipv4Addr::new(10, 42, 1, 2),
+            "Приватный DNS не восстановился после возврата маршрута",
+        )?;
+        eprintln!("{engine:?}: YONIK_SAVED_ZONE_RESOLVCONF_ROUTE_OK");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная VM с OpenRC или runit, resolvconf и двумя DNS-серверами"]
 async fn production_helper_native_init_after_resolvconf_update() -> Result {
     let init = StandaloneService::native()?.init();

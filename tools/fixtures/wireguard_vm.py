@@ -36,7 +36,7 @@ class PrivateDns(socketserver.BaseRequestHandler):
         query, server = self.request
         if not 17 <= len(query) <= 512 or query[4:6] != b"\x00\x01":
             return
-        for label in (b"before", b"active", b"after"):
+        for label in (b"before", b"active", b"after", b"unreachable", b"restored"):
             name = bytes([len(label)]) + label + b"\x02wg\x04test\x00"
             question_end = 12 + len(name) + 4
             if (
