@@ -587,27 +587,30 @@ fn worker_uid_is_dedicated_and_unambiguous() {
 }
 
 #[test]
-fn hostname_and_unbound_transport_are_denied_before_effects() {
-    for value in [
-        "vless://11111111-1111-1111-1111-111111111111@192.0.2.5:443",
-        "vless://11111111-1111-1111-1111-111111111111@example.org:443",
-        "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443",
+fn only_a_literal_address_can_skip_bootstrap() {
+    use crate::TransportProtocol::Tcp;
+    for (value, expected) in [
+        (
+            "vless://11111111-1111-1111-1111-111111111111@192.0.2.5:443",
+            Ok((Some("192.0.2.5".parse().unwrap()), Tcp)),
+        ),
+        (
+            "vless://11111111-1111-1111-1111-111111111111@example.org:443",
+            Ok((None, Tcp)),
+        ),
+        (
+            "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443",
+            Err(ServiceError::Unsupported),
+        ),
     ] {
         let mut report = yonik_import::import_bytes(value.as_bytes().to_vec()).unwrap();
         let server = report.servers.remove(0);
-        if value.contains("192.0.2.5") {
-            assert_eq!(
-                endpoint(&server),
-                Ok(("192.0.2.5".parse().unwrap(), crate::TransportProtocol::Tcp))
-            );
-        } else {
-            assert_eq!(endpoint(&server), Err(ServiceError::Unsupported));
-        }
+        assert_eq!(endpoint(&server), expected);
     }
 }
 
 #[tokio::test]
-async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_worker() {
+async fn actual_backend_rejects_hostname_without_private_zone_state() {
     let monitor = crate::NetworkMonitor::start().unwrap();
     let mut backend = super::Backend {
         profile_owner: None,

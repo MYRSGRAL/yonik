@@ -34,8 +34,11 @@ use crate::{
 };
 #[path = "native_owner.rs"]
 pub(in crate::helper) mod native_owner;
+#[path = "session_bootstrap.rs"]
+mod session_bootstrap;
 #[path = "session_dhcp.rs"]
 mod session_dhcp;
+use session_bootstrap::BootstrapAddress;
 use sha2::Digest;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -387,6 +390,7 @@ pub(super) struct SessionArtifact {
     native_owner_stamp: Option<native_owner::NativeArtifactStamp>,
     fake_dns: Option<Arc<PreparedFakeDns>>,
     resolver_tls: Option<ResolvedTlsEgress>,
+    bootstrap: Option<BootstrapAddress>,
 }
 
 struct ResolvedTlsEgress {
@@ -1144,20 +1148,9 @@ fn parse_worker_uid(bytes: &[u8]) -> Result<u32, ServiceError> {
 
 fn endpoint(
     server: &yonik_import::ParsedServer,
-) -> Result<(IpAddr, crate::TransportProtocol), ServiceError> {
-    // До доверенного DNS provenance hostname не порождает ни исключения nft,
-    // ни конфигурацию, способную самостоятельно выбрать другой endpoint.
-    let address: IpAddr = server
-        .endpoint()
-        .host()
-        .parse()
-        .map_err(|_| ServiceError::Unsupported)?;
-    if address.is_unspecified()
-        || address.is_loopback()
-        || address.is_multicast()
-        || matches!(address, IpAddr::V4(ip) if ip.is_broadcast() || ip.is_link_local())
-        || matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local() || ip.to_ipv4().is_some())
-    {
+) -> Result<(Option<IpAddr>, crate::TransportProtocol), ServiceError> {
+    let address = server.endpoint().host().parse().ok();
+    if address.is_some_and(|ip| !valid_proxy_ip(ip)) {
         return Err(ServiceError::Unsupported);
     }
     if !matches!(
@@ -1175,6 +1168,14 @@ fn endpoint(
         return Err(ServiceError::Unsupported);
     }
     Ok((address, crate::TransportProtocol::Tcp))
+}
+
+fn valid_proxy_ip(address: IpAddr) -> bool {
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || matches!(address, IpAddr::V4(ip) if ip.is_broadcast() || ip.is_link_local())
+        || matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local() || ip.to_ipv4().is_some()))
 }
 fn checked_route(route: &KernelRoute, owner: Ownership, table: u32) -> Result<u32, ServiceError> {
     if (route.namespace.device, route.namespace.inode) != owner.namespace()
@@ -1681,6 +1682,7 @@ impl Backend {
             native_owner_stamp: Some(self.native_owner.reserve()?),
             fake_dns: None,
             resolver_tls: None,
+            bootstrap: None,
         };
         artifact.revalidate_routes(cancel, None).await?;
         let mut nonce = [0; 32];
@@ -1900,6 +1902,9 @@ impl Backend {
             .into_server()
             .map_err(|_| ServiceError::InvalidRequest)?;
         let (endpoint, protocol) = endpoint(&server)?;
+        if endpoint.is_none() && self.private_dns_zones.is_err() {
+            return Err(ServiceError::Unsupported);
+        }
         let owner = self.owner(uid)?;
         let (stamp, context, baseline, baseline_capture) =
             self.capture_session_baseline(uid, cancel).await?;
@@ -1964,6 +1969,47 @@ impl Backend {
         } else {
             (plan, None)
         };
+        let bootstrap = if endpoint.is_none() {
+            let name = server
+                .endpoint()
+                .host()
+                .parse()
+                .map_err(|_| ServiceError::InvalidRequest)?;
+            if policy.as_ref().is_some_and(|policy| {
+                policy
+                    .policy()
+                    .private_domains
+                    .iter()
+                    .any(|zone| zone.domain.matches(&name))
+            }) {
+                return Err(ServiceError::Unsupported);
+            }
+            let saved = self
+                .private_dns_zones
+                .as_ref()
+                .map_err(unavailable)?
+                .saved_zones(uid)
+                .map_err(unavailable)?;
+            let proof = self
+                .watch
+                .clone()
+                .run_while_current(
+                    stamp,
+                    BootstrapAddress::resolve(
+                        &name,
+                        &saved,
+                        &baseline,
+                        owner,
+                        plan.routing_table(),
+                        cancel,
+                    ),
+                )
+                .await
+                .ok_or_else(stale)??;
+            Some(proof)
+        } else {
+            None
+        };
         let port = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .map_err(unavailable)?
             .local_addr()
@@ -1971,13 +2017,34 @@ impl Backend {
             .port();
         let port = NonZeroU16::new(port).ok_or(ServiceError::Unavailable)?;
         let tun = plan.compiler_tun().map_err(unavailable)?;
-        let query = RouteQuery::new(endpoint, worker_uid)
-            .with_mark(plan.socket_mark())
-            .with_transport(protocol, None, Some(server.endpoint().port()));
-        let (route, route_capture) = lookup_route_captured(query, cancel, DEADLINE)
-            .await
-            .map_err(unavailable)?;
-        checked_route(&route, owner, plan.routing_table())?;
+        let mut selected = None;
+        let candidates = endpoint
+            .into_iter()
+            .chain(bootstrap.iter().flat_map(BootstrapAddress::addresses));
+        for address in candidates {
+            if let Some(proof) = &bootstrap {
+                proof.check_fresh()?;
+            }
+            let query = RouteQuery::new(address, worker_uid)
+                .with_mark(plan.socket_mark())
+                .with_transport(protocol, None, Some(server.endpoint().port()));
+            let route = lookup_route_captured(query, cancel, DEADLINE)
+                .await
+                .map_err(unavailable)
+                .and_then(|(route, capture)| {
+                    checked_route(&route, owner, plan.routing_table())?;
+                    Ok((address, route, capture))
+                });
+            match route {
+                Ok(route) => {
+                    selected = Some(route);
+                    break;
+                }
+                Err(error) if bootstrap.is_none() => return Err(error),
+                Err(_) => cancel.check().map_err(|_| ServiceError::Cancelled)?,
+            }
+        }
+        let (endpoint, route, route_capture) = selected.ok_or(ServiceError::Unsupported)?;
         let config = if let Some(policy) = policy.as_ref() {
             let probe =
                 TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(unavailable)?;
@@ -2147,6 +2214,9 @@ impl Backend {
             return Err(ServiceError::Unsupported);
         }
         self.worker_uncertain = false;
+        if let Some(bootstrap) = &bootstrap {
+            bootstrap.verify(cancel).await?;
+        }
         let context_matches = self.context(uid)? == context;
         let stamp_matches = self.snapshot()?.is_current(stamp);
         let (current, current_capture) = read_topology_captured(cancel, DEADLINE)
@@ -2227,6 +2297,7 @@ impl Backend {
             memory,
             fake_dns,
             resolver_tls,
+            bootstrap,
         };
         Ok(GuardArtifact {
             bytes,
@@ -2278,6 +2349,9 @@ impl Backend {
             || artifact.revalidate_routes(cancel, None).await.is_err()
         {
             return Err(stale());
+        }
+        if let Some(bootstrap) = &artifact.bootstrap {
+            bootstrap.verify(cancel).await?;
         }
         let owner = self.ensure_owner(uid)?;
         self.invalidate()?;
@@ -2437,6 +2511,9 @@ impl Backend {
             .await
             .map_err(unavailable)?;
         cancel.check().map_err(|_| ServiceError::Cancelled)?;
+        if let Some(bootstrap) = &artifact.bootstrap {
+            bootstrap.check_fresh()?;
+        }
         let ticket = if artifact.attribution_required {
             self.retain_canonical_queue(&artifact.plan, &tun, cancel)
                 .await?;

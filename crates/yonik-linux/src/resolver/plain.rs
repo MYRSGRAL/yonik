@@ -76,6 +76,14 @@ impl ResolverOptions {
 }
 
 impl PlainResolverSnapshot {
+    pub(crate) fn bootstrap_tcp_only(&self) -> bool {
+        self.options.flags.contains("use-vc")
+    }
+
+    pub(crate) fn bootstrap_ipv6_enabled(&self) -> bool {
+        !self.options.flags.contains("no-aaaa")
+    }
+
     pub fn nameservers(&self) -> &[IpAddr] {
         &self.nameservers
     }

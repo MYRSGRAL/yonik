@@ -24,6 +24,7 @@ use super::{ResolverError, dot::DotPeer};
 mod policy_proxy;
 mod policy_rrset;
 pub use policy_proxy::PolicyProxyResolver;
+pub(crate) use policy_proxy::dns_question;
 pub use policy_rrset::PolicyRrset;
 
 const HEADER_LEN: usize = 12;

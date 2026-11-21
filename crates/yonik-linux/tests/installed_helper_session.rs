@@ -366,6 +366,79 @@ async fn production_helper_scoped_fake_dns_policy() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая VM с обычным resolv.conf и CNAME для edge-bootstrap.test и edge-expiring.test"]
+async fn production_helper_named_proxy_checks_cname_ttl_at_apply() -> Result {
+    use yonik_linux::system_client::ClientError;
+
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let (_owner, cancel) = yonik_linux::Cancellation::new();
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(25);
+    let mut client =
+        SystemClient::on_connection(connection.clone(), deadline(), cancel.clone()).await?;
+    let profile = |host: &str| -> Result<yonik_import::ServerIntent> {
+        let report = yonik_import::import_bytes(
+            format!("vless://00112233-4455-6677-8899-aabbccddeeff@{host}:24443?security=tls&sni=doh.test")
+                .into_bytes(),
+        )?;
+        Ok(yonik_import::ServerIntent::from_server(&report.servers[0])?)
+    };
+    let expiring = profile("edge-expiring.test")?;
+    let usable = profile("edge-bootstrap.test")?;
+    let domains = ["example.test".to_owned()];
+    let policy = scoped_fake_dns_proxy_policy()?;
+    for engine in [Engine::Xray, Engine::SingBox] {
+        let prepared = client
+            .prepare_fake_dns_policy_profile(
+                &expiring,
+                engine,
+                false,
+                &domains,
+                &policy,
+                deadline(),
+                cancel.clone(),
+            )
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("{engine:?} Prepare короткого TTL: {error:?}"))
+            })?;
+        tokio::time::sleep(Duration::from_secs(21)).await;
+        let expired = client.apply(prepared, deadline(), cancel.clone()).await;
+        require(
+            matches!(expired, Err(ClientError::Stale)),
+            "Apply принял просроченный CNAME",
+        )?;
+        require(
+            client.state(deadline(), cancel.clone()).await? == State::NoManagedPolicy,
+            "Просроченный Apply установил сетевое состояние",
+        )?;
+        let drain =
+            start_fake_dns_in_vm(&connection, &usable, engine, false, Some(&policy), &cancel)
+                .await?;
+        let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+        let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+        check_tun_traffic_to([(v4, 40000).into(), (v6, 40000).into()]).await?;
+        require(
+            client.stop(deadline(), cancel.clone()).await? == State::NoManagedPolicy,
+            "Stop не очистил состояние",
+        )?;
+        require(
+            tokio::time::timeout(Duration::from_secs(6), drain.drained()).await?,
+            "Worker остался активен после Stop",
+        )?;
+        require(resolver_file_state()? == before, "Изменился resolv.conf")?;
+        eprintln!(
+            "{engine:?}: истёкший CNAME отклонён, свежий профиль прошёл Fake A/AAAA и TCP/UDP"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "чистая VM с NetworkManager и tools/fixtures/networkmanager_dhcp.sh"]
 async fn production_helper_networkmanager_dhcp_renewal() -> Result {
     let engine = networkmanager_fixture_engine()?;

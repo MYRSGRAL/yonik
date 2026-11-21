@@ -118,7 +118,7 @@ fn valid_upstream(address: IpAddr) -> bool {
         }
 }
 
-fn dns_question(name: &DomainName, kind: u16) -> Vec<u8> {
+pub(crate) fn dns_question(name: &DomainName, kind: u16) -> Vec<u8> {
     let name = name.as_str();
     let mut query = Vec::with_capacity(name.len() + 18);
     query.extend_from_slice(&[0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
