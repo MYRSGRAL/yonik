@@ -1239,6 +1239,80 @@ async fn production_helper_fake_dns_after_resolver_restart_and_ttl() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая VM с изменяемым DNS политики и защищённым префиксом"]
+async fn production_helper_fake_dns_rechecks_private_answer_after_ttl() -> Result {
+    use yonik_linux::fake_service::MAX_FAKE_TTL;
+
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    require(
+        std::env::var_os("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER").is_some(),
+        "Стенду нужен DNS политики",
+    )?;
+    let engine = match std::env::var("YONIK_D07_ENGINE")?.as_str() {
+        "xray" => Engine::Xray,
+        "sing-box" => Engine::SingBox,
+        _ => return Err(io::Error::other("Неизвестный движок стенда").into()),
+    };
+    let phase = "/run/yonik-d07-phase";
+    fs::write(phase, "public")?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+        r#"{"version":1,"default_action":"proxy","lan":[],"private_networks":[],"private_domains":[],
+            "user_rules":[{"id":1,"enabled":true,"action":"proxy","domain":["early.example.test"],
+                "domain_suffix":[],"ip_cidr":[],"executable_paths":[]}],
+            "preset_rules":[{"id":2,"enabled":true,"action":"block","domain":[],
+                "domain_suffix":[],"ip_cidr":["203.0.113.50/32"],"executable_paths":[]}]}"#,
+    )?;
+    let (_owner, token) = yonik_linux::Cancellation::new();
+    let drain =
+        start_fake_dns_in_vm(&connection, &server, engine, false, Some(&policy), &token).await?;
+    let worker = networkmanager_dhcp_worker_pid()?;
+    let name = "early.example.test";
+    let old_v4 = getent_fake_dns("ahostsv4", name).await?;
+    let old_v6 = getent_fake_dns("ahostsv6", name).await?;
+    let expiry = tokio::time::Instant::now() + MAX_FAKE_TTL;
+    check_tun_traffic_to([(old_v4, 40000).into(), (old_v6, 40000).into()]).await?;
+    tokio::time::sleep_until(expiry).await;
+    fs::write(phase, "expired")?;
+    tokio::try_join!(
+        check_fake_flow_blocked((old_v4, 40000).into()),
+        check_fake_flow_blocked((old_v6, 40000).into()),
+    )?;
+    eprintln!("{engine:?}: старые Fake-IP после TTL заблокированы до нового запроса");
+    fs::write(phase, "guarded")?;
+    let new_v4 = getent_fake_dns("ahostsv4", name).await?;
+    let new_v6 = getent_fake_dns("ahostsv6", name).await?;
+    tokio::try_join!(
+        check_fake_flow_blocked((new_v4, 40000).into()),
+        check_fake_flow_blocked((new_v6, 40000).into()),
+    )?;
+    require(
+        networkmanager_dhcp_worker_pid()? == worker,
+        "Проверка TTL должна пройти при неизменном worker",
+    )?;
+    call(&connection, "Stop", json!({"version":1})).await?;
+    require(
+        tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+        "Worker не завершился после Stop",
+    )?;
+    check_only_fake_is_filtered(new_v4, new_v6).await?;
+    require(
+        resolver_file_state()? == resolver_before,
+        "Проверка TTL изменила /etc/resolv.conf",
+    )?;
+    eprintln!("{engine:?}: YONIK_D07_PRIVATE_RECLASSIFICATION_OK");
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "одноразовая VM с установленным helper и обоими движками"]
 async fn production_helper_fake_dns_rejects_old_addresses_after_engine_switch() -> Result {
     guard()?;
