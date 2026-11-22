@@ -63,7 +63,9 @@ def relay_peer() -> None:
         name, _, question_end = read_question(query)
         if name.startswith("_svc."):
             assert query[10:12] == b"\x00\x01"
-            assert query[question_end:] == b"\x00\x00\x29\x04\xd0\x00\x00\x80\x00\x00\x00"
+            assert (
+                query[question_end:] == b"\x00\x00\x29\x04\xd0\x00\x00\x80\x00\x00\x00"
+            )
         return make_response(query, Reply(addresses=("10.42.1.2",)))
 
     with ExitStack() as opened:
