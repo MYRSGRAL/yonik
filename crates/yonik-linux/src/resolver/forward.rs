@@ -22,6 +22,8 @@ use crate::{Cancellation, managed_network::FAKE_POOLS};
 use super::{ResolverError, dot::DotPeer};
 
 mod policy_proxy;
+#[cfg(test)]
+pub(crate) use policy_proxy::tests as policy_proxy_fixture;
 mod policy_rrset;
 pub use policy_proxy::PolicyProxyResolver;
 pub(crate) use policy_proxy::dns_question;

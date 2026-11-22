@@ -601,6 +601,139 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn смена_dns_при_аутентификации_сохраняет_проверенный_ip_в_connect() {
+        use crate::forward::{
+            dns_question,
+            policy_proxy_fixture::{
+                ANSWER_A, UPSTREAM, answer_with_a, credentials, receive_question,
+            },
+        };
+        use std::sync::atomic::AtomicUsize;
+        use yonik_engine::{fake_dns::DomainName, policy_wire::SystemPolicy};
+
+        let name: DomainName = "host.test".parse().unwrap();
+        let (mut leases, fake_ip) = leases();
+        leases.ready_after = Duration::ZERO;
+        let epoch = make_epoch(1);
+        leases.advance_epoch(epoch).unwrap();
+        leases
+            .answer(&dns_question(&name, 1), epoch, |_| true)
+            .unwrap();
+        let mapping = leases.lookup(fake_ip, epoch).unwrap();
+        let policy = SystemPolicy::parse(
+            r#"{"version":1,"default_action":"proxy","lan":[],"private_networks":[],"private_domains":[],"user_rules":[],"preset_rules":[]}"#,
+        )
+        .unwrap();
+        let protected_prefixes = [(
+            IpPrefix::new("10.80.0.0".parse().unwrap(), 16).unwrap(),
+            WireGuardOwner::Interface(3),
+        )]
+        .into();
+        let dns = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let flow_policy = CidrFlowPolicy {
+            policy: policy.policy(),
+            resolver: PolicyProxyResolver::new(dns.local_addr().unwrap(), UPSTREAM, credentials())
+                .unwrap(),
+            leases: &leases,
+            pools: vec!["198.18.4.0/24".parse().unwrap()],
+            protected_prefixes: &protected_prefixes,
+            reported_unresolved: AtomicBool::new(false),
+            reported_ambiguous: AtomicBool::new(false),
+            direct_auth: credentials(),
+            udp_slots: tokio::sync::Semaphore::new(1),
+        };
+        let changed = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let dns_changed = Arc::clone(&changed);
+        let dns_requests = Arc::clone(&requests);
+        let dns_peer = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (socket, _) = dns.accept().await.unwrap();
+                let question = receive_question(socket).await;
+                let address = if dns_changed.load(Ordering::Acquire) {
+                    Ipv4Addr::new(10, 80, 4, 8)
+                } else {
+                    ANSWER_A
+                };
+                dns_requests.fetch_add(1, Ordering::Release);
+                answer_with_a(question, address).await;
+            }
+        });
+
+        let core = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let core_address = core.local_addr().unwrap();
+        let core_peer = async {
+            let (mut socket, _) = core.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 2]);
+            socket.write_all(&[5, 2]).await.unwrap();
+            let mut auth = [0; 18];
+            socket.read_exact(&mut auth).await.unwrap();
+            assert_eq!(&auth, b"\x01\x08resolver\x07fixture");
+            assert_eq!(requests.load(Ordering::Acquire), 2);
+            // К этому моменту выбор адреса завершён, CONNECT ещё не отправлен.
+            changed.store(true, Ordering::Release);
+            socket.write_all(&[1, 0]).await.unwrap();
+            let mut request = [0; 10];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, [5, 1, 0, 1, 192, 0, 2, 3, 1, 187]);
+            socket
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        };
+        let bridge = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut client = TcpStream::connect(bridge.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (incoming, _) = bridge.accept().await.unwrap();
+        let client_request = async move {
+            client
+                .write_all(b"\x05\x01\x02\x01\x08resolver\x07fixture")
+                .await
+                .unwrap();
+            let mut auth = [0; 4];
+            client.read_exact(&mut auth).await.unwrap();
+            assert_eq!(auth, [5, 2, 1, 0]);
+            client
+                .write_all(&[5, 1, 0, 1, 198, 18, 4, 2, 1, 187])
+                .await
+                .unwrap();
+            let mut reply = [0; 10];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[..2], [5, 0]);
+        };
+        let credentials = credentials();
+        let (_owner, cancel) = Cancellation::new();
+        let (result, (), ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                handle_flow_with_policy(
+                    incoming,
+                    core_address,
+                    &credentials,
+                    &credentials,
+                    None,
+                    |address| leases.lookup(address, epoch),
+                    Some(&flow_policy),
+                    cancel.clone(),
+                ),
+                core_peer,
+                client_request,
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(requests.load(Ordering::Acquire), 2);
+        assert!(matches!(
+            flow_policy.select(&mapping, cancel).await,
+            Err(FakeFlowError::DnsPolicyAmbiguous),
+        ));
+        dns_peer.await.unwrap();
+    }
+
     #[test]
     fn ответ_политики_не_выбирает_адрес_из_защищённой_сети() {
         let prefixes = [

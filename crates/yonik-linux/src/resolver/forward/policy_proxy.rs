@@ -133,7 +133,7 @@ pub(crate) fn dns_question(name: &DomainName, kind: u16) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tokio::{
@@ -142,15 +142,16 @@ mod tests {
         time::timeout,
     };
 
-    const UPSTREAM: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)), 5353);
-    const ANSWER_A: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 3);
+    pub(crate) const UPSTREAM: SocketAddr =
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)), 5353);
+    pub(crate) const ANSWER_A: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 3);
     const NAME: &[u8] = b"\x04host\x04test\x00";
 
-    fn credentials() -> SocksCredentials {
+    pub(crate) fn credentials() -> SocksCredentials {
         SocksCredentials::new(b"resolver", b"fixture").unwrap()
     }
 
-    async fn receive_question(mut socket: TcpStream) -> (TcpStream, Vec<u8>, u16) {
+    pub(crate) async fn receive_question(mut socket: TcpStream) -> (TcpStream, Vec<u8>, u16) {
         let mut greeting = [0; 3];
         socket.read_exact(&mut greeting).await.unwrap();
         assert_eq!(greeting, [5, 1, 2]);
@@ -180,11 +181,15 @@ mod tests {
     }
 
     async fn answer(question: (TcpStream, Vec<u8>, u16)) {
+        answer_with_a(question, ANSWER_A).await;
+    }
+
+    pub(crate) async fn answer_with_a(question: (TcpStream, Vec<u8>, u16), ipv4: Ipv4Addr) {
         let (mut socket, mut packet, kind) = question;
         packet[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
         packet[6..8].copy_from_slice(&1u16.to_be_bytes());
         let v6: std::net::Ipv6Addr = "2001:db8::9".parse().unwrap();
-        let a = ANSWER_A.octets();
+        let a = ipv4.octets();
         let aaaa = v6.octets();
         let address: &[u8] = match kind {
             1 => &a,
