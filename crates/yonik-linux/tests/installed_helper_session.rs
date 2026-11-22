@@ -1209,6 +1209,101 @@ async fn production_helper_fake_dns_after_resolver_revert() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая VM с systemd-resolved и отдельной службой исходного DNS"]
+async fn production_helper_fake_dns_during_upstream_dns_outage() -> Result {
+    guard()?;
+    let _lock = vm_lock::acquire()?;
+    wait_for_fixture_link().await?;
+    let resolver_before = resolver_file_state()?;
+    let connection = zbus::Connection::system().await?;
+    let imported = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
+    )?;
+    let server = yonik_import::ServerIntent::from_server(&imported.servers[0])?;
+    let policy = yonik_engine::policy_wire::SystemPolicy::parse(
+        r#"{"version":1,"default_action":"proxy","user_rules":[],"preset_rules":[],"lan":[],"private_networks":[],"private_domains":[]}"#,
+    )?;
+    let (_owner, token) = yonik_linux::Cancellation::new();
+    for (engine, kill_switch) in [(Engine::Xray, true), (Engine::SingBox, false)] {
+        let drain = start_fake_dns_in_vm(
+            &connection,
+            &server,
+            engine,
+            kill_switch,
+            Some(&policy),
+            &token,
+        )
+        .await?;
+        let v4 = getent_fake_dns("ahostsv4", "example.test").await?;
+        let v6 = getent_fake_dns("ahostsv6", "example.test").await?;
+        let destinations = [(v4, 40000).into(), (v6, 40000).into()];
+        check_tun_traffic_to(destinations).await?;
+        check_fallback_search_in_vm("real.test", true).await?;
+        let worker = networkmanager_dhcp_worker_pid()?;
+
+        require(
+            Command::new("/usr/bin/systemctl")
+                .args(["stop", "yonik-upstream-dns-fixture.service"])
+                .status()?
+                .success(),
+            "Стенд не остановил исходный DNS",
+        )?;
+        let outage: Result = async {
+            let query = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::process::Command::new("/usr/bin/resolvectl")
+                    .args(["-4", "--protocol=dns", "--cache=no", "query", "real.test"])
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await;
+            if let Ok(output) = query {
+                require(
+                    !output?.status.success(),
+                    "Исходный DNS ответил во время сбоя",
+                )?;
+            }
+            check_tun_traffic_to(destinations).await?;
+            require(
+                networkmanager_dhcp_worker_pid()? == worker,
+                "При недоступном исходном DNS сменился worker",
+            )
+        }
+        .await;
+        require(
+            Command::new("/usr/bin/systemctl")
+                .args(["start", "yonik-upstream-dns-fixture.service"])
+                .status()?
+                .success(),
+            "Стенд не восстановил исходный DNS",
+        )?;
+        outage?;
+        check_fallback_search_in_vm("real.test", true).await?;
+        check_tun_traffic_to(destinations).await?;
+        require(
+            networkmanager_dhcp_worker_pid()? == worker,
+            "При восстановлении исходного DNS сменился worker",
+        )?;
+        call(&connection, "Stop", json!({"version":1})).await?;
+        require(
+            tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
+            "Worker остался после Stop",
+        )?;
+        if kill_switch {
+            call(&connection, "Unlock", json!({"version":1})).await?;
+        }
+        check_fallback_dns_in_vm("restored.test").await?;
+        require(
+            resolver_file_state()? == resolver_before,
+            "Сбой исходного DNS изменил /etc/resolv.conf",
+        )?;
+        eprintln!("{engine:?}: исходный DNS восстановился без замены worker и Fake-IP");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "одноразовая VM с DNS-over-TLS на линке yonik-outer"]
 async fn production_helper_xray_after_dot_mode_change() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::ResolverDotMode(Engine::Xray))
