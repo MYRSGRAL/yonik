@@ -24,6 +24,7 @@ pub(super) mod session_host;
 use session_host::{ActiveSession, HelperTunCustody, SessionArtifact};
 
 const STATE_PATH: &str = "/run/yonik/network";
+const PACKAGE_MAINTENANCE: &str = "/run/yonik-package-maintenance";
 const PRIVATE_DNS_STATE_PATH: &str = "/var/lib/yonik";
 const MAX_PLAN_BYTES: usize = 64 * 1024;
 const RT_SCOPE_LINK: u8 = 253;
@@ -478,6 +479,19 @@ impl Backend {
         mut cancel: Cancellation,
     ) -> Result<Reply, ServiceError> {
         cancel.check().map_err(|_| ServiceError::Cancelled)?;
+        // Проверка выполняется под тем же допуском, что и снимок State.
+        // Операция dpkg сначала закрывает Apply, затем запрашивает снимок.
+        if matches!(
+            operation,
+            Operation::Apply(..) | Operation::ApplyProfile(..)
+        ) && self.path == Path::new(STATE_PATH)
+            && !matches!(
+                std::fs::symlink_metadata(PACKAGE_MAINTENANCE),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            return Err(super::service::busy_at("package_maintenance"));
+        }
         match operation {
             Operation::NativeEligibility => {
                 cancel.check().map_err(|_| ServiceError::Cancelled)?;

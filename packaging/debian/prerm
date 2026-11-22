@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+
+action=$1
+case "$action" in
+    remove|upgrade|failed-upgrade) ;;
+    *) exit 0 ;;
+esac
+[ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ] || exit 0
+
+maintenance=/run/yonik-package-maintenance
+check_inactive_policy() {
+    state=$(busctl --timeout=20s "$@" call cloud.highpriority.yonik.Network1 \
+        /cloud/highpriority/yonik/Network cloud.highpriority.yonik.Network1 \
+        State s '{"version":1}') || state=
+    if [ "$state" != 's "{\"state\":\"no_managed_policy\",\"version\":1}"' ]; then
+        if [ "$action" = remove ]; then
+            printf '%s\n' 'Удаление Yonik отложено. Остановите сессию и разблокируйте сеть в Yonik.' >&2
+        else
+            printf '%s\n' 'Обновление Yonik отложено. Остановите сессию и разблокируйте сеть в Yonik.' >&2
+        fi
+        return 1
+    fi
+}
+
+# Dpkg уже держит блокировку. Каталог может остаться после прерванного dpkg.
+if [ -d "$maintenance" ]; then
+    rmdir -- "$maintenance"
+fi
+# Активируем helper при наличии состояния для восстановления после его выхода.
+if [ -d /run/yonik ]; then
+    check_inactive_policy
+fi
+mkdir -m0700 -- "$maintenance"
+trap 'rmdir -- "$maintenance"' EXIT
+# Apply и запуск helper теперь запрещены. Повторный снимок учитывает операции,
+# успевшие получить допуск перед созданием каталога.
+if [ -d /run/yonik ]; then
+    check_inactive_policy --auto-start=no
+fi
+
+systemctl stop yonik-helper.service yonik-worker.service yonik-worker-check.service \
+    yonik-worker.socket yonik-worker-check.socket yonik-dhcp-sleep.service
+trap - EXIT
