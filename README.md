@@ -4,16 +4,12 @@
 
 [English](README.md) · [Русский](README.ru.md)
 
-An open-source native Linux proxy client built with Rust and Qt Quick.
-The supported user workflow is local SOCKS5 through Xray-core or sing-box
-for explicitly configured applications. Android is deferred.
-
-The GUI supports subscription import and updates, profile selection, connection
-control, HTTPS/TCP checks, favorites, a system tray, startup settings and diagnostics.
-Subscriptions and credentials are encrypted using a key held by Secret Service.
-The routing editor saves drafts; system TUN, DNS/Fake-IP, kill switch and applying
-system routing through the GUI remain unavailable. Helper, worker and network
-test implementations do not establish readiness of these user-facing features.
+A native, open source proxy client in development. Linux first, Android later.
+The Linux client manages subscriptions, local SOCKS5 and system connections
+through an installed helper. System TUN with Fake DNS has been tested with
+Xray and sing-box. The matrix covers Debian, Ubuntu, Fedora, Arch Linux and
+Arch Linux ARM, with graphical sessions tested on GNOME Wayland and Xfce X11.
+[System TUN and Fake DNS test matrix](docs/superpowers/plans/2026-11-18-linux-tun-dns-portability.md#матрица-проверенных-конфигураций)
 
 See the [Linux user guide](docs/user/linux-en.md) for build requirements, pinned
 engine versions, startup, data storage and limitations, and the

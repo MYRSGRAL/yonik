@@ -50,8 +50,11 @@ mod network;
 pub use network::{
     IpPrefix, KernelRoute, LinuxAddress, LinuxLink, LinuxNexthop, LinuxRoute, LinuxRule,
     LinuxTopology, LookupIncomplete, NetworkAttribute, NetworkNamespace, NetworkReadError,
-    NexthopMember, RouteKind, RouteNexthop, RouteQuery, TransportProtocol, local_vpn_split_cidrs,
-    lookup_route, read_topology,
+    NexthopMember, NftSocketCgroupMatch, RouteKind, RouteNexthop, RouteQuery, TransportProtocol,
+    WireGuardDevice, WireGuardPacketLease, WireGuardPeer, WireGuardReadReceipt,
+    WireGuardSocketObservation, WireGuardSocketObserver, WireGuardUdpPath,
+    WireGuardUdpRouteSnapshot, local_vpn_split_cidrs, lookup_route, read_nft_socket_cgroup_matches,
+    read_topology, read_wireguard_device, read_wireguard_device_observed,
 };
 #[cfg(target_os = "linux")]
 mod resolver;
@@ -121,3 +124,6 @@ pub mod bundle_request;
 // Закрытый legacy worker output transport.
 #[cfg(target_os = "linux")]
 mod output_transport;
+
+#[cfg(target_os = "linux")]
+pub mod fake_flow;

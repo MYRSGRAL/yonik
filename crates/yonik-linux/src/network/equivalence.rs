@@ -2,7 +2,7 @@
 //! Не обновляет поколения и не заменяет guards потери Netlink/DNS/manager events.
 use super::topology::TopologyCapture;
 use super::{KernelRoute, LinuxAddress, LinuxLink, LinuxRoute, LinuxTopology, NetworkAttribute};
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, net::Ipv4Addr, time::Duration};
 use tokio::time::Instant;
 
 #[derive(Clone, Copy)]
@@ -68,6 +68,8 @@ fn parse_clock_ticks(bytes: &[u8]) -> Option<u64> {
 enum Context {
     Link,
     Address(Option<(CaptureWindow, CaptureWindow)>),
+    RenewedDhcp(CaptureWindow, [Instant; 2]),
+    DhcpLifetimeDrift,
     Route(Option<(RouteCapture, RouteCapture)>),
     Families,
     Inet6,
@@ -82,7 +84,7 @@ macro_rules! equal_record {
     }};
 }
 pub(crate) fn same_external_topology(left: &LinuxTopology, right: &LinuxTopology) -> bool {
-    same_topology(left, right, None)
+    same_topology(left, right, None, &[], None)
 }
 pub(crate) fn same_captured_topology(
     left: &LinuxTopology,
@@ -90,7 +92,37 @@ pub(crate) fn same_captured_topology(
     right: &LinuxTopology,
     right_time: TopologyCapture,
 ) -> bool {
-    same_topology(left, right, Some((left_time, right_time)))
+    same_topology(left, right, Some((left_time, right_time)), &[], None)
+}
+#[derive(Clone, Copy)]
+pub(crate) struct RenewedDhcpAddress {
+    pub(crate) index: u32,
+    pub(crate) local: Ipv4Addr,
+    pub(crate) prefix: u8,
+    pub(crate) expiries: [Instant; 2],
+}
+
+pub(crate) fn same_session_topology(
+    left: (&LinuxTopology, TopologyCapture),
+    right: (&LinuxTopology, TopologyCapture),
+    dhcp: &[RenewedDhcpAddress],
+) -> bool {
+    same_topology(left.0, right.0, Some((left.1, right.1)), dhcp, None)
+}
+
+/// Только основание для повторного чтения. Принятие требует свежего DHCP proof.
+pub(crate) fn only_dhcp_lifetimes_changed(
+    left: (&LinuxTopology, TopologyCapture),
+    right: (&LinuxTopology, TopologyCapture),
+    is_dhcp_address: &dyn Fn(&LinuxAddress) -> bool,
+) -> bool {
+    same_topology(
+        left.0,
+        right.0,
+        Some((left.1, right.1)),
+        &[],
+        Some(is_dhcp_address),
+    )
 }
 #[cfg(test)]
 pub(crate) fn diagnostic_class_matches(
@@ -134,6 +166,8 @@ fn same_topology(
     left: &LinuxTopology,
     right: &LinuxTopology,
     times: Option<(TopologyCapture, TopologyCapture)>,
+    dhcp: &[RenewedDhcpAddress],
+    is_dhcp_address: Option<&dyn Fn(&LinuxAddress) -> bool>,
 ) -> bool {
     let LinuxTopology {
         namespace: _,
@@ -154,6 +188,29 @@ fn same_topology(
             .all(|(a, b)| same_link(a, b))
         && left.addresses.len() == right.addresses.len()
         && left.addresses.iter().zip(&right.addresses).all(|(a, b)| {
+            if a.family == 2
+                && is_dhcp_address.is_some_and(|known| known(a))
+                && compare_address(a, b, Context::DhcpLifetimeDrift)
+            {
+                return true;
+            }
+            let renewal = dhcp
+                .binary_search_by_key(&a.index, |address| address.index)
+                .ok();
+            if let (Some(position), Some((_, capture))) = (renewal, times) {
+                let address = &dhcp[position];
+                if a.family == 2
+                    && a.index == address.index
+                    && a.prefix_len == address.prefix
+                    && a.local.unwrap_or(a.address) == address.local
+                {
+                    return compare_address(
+                        a,
+                        b,
+                        Context::RenewedDhcp(capture.family(2), address.expiries),
+                    );
+                }
+            }
             same_address(
                 a,
                 b,
@@ -169,7 +226,7 @@ fn same_topology(
             )
         })
 }
-fn same_link(left: &LinuxLink, right: &LinuxLink) -> bool {
+pub(super) fn same_link(left: &LinuxLink, right: &LinuxLink) -> bool {
     equal_record!(LinuxLink,left,right,unknown,Context::Link;index,link_type,flags,name,alias,mtu,master,parent,kind,operational_state)
 }
 fn same_address(
@@ -177,7 +234,10 @@ fn same_address(
     right: &LinuxAddress,
     times: Option<(CaptureWindow, CaptureWindow)>,
 ) -> bool {
-    equal_record!(LinuxAddress,left,right,unknown,Context::Address(times);family,index,address,local,prefix_len,scope,flags)
+    compare_address(left, right, Context::Address(times))
+}
+fn compare_address(left: &LinuxAddress, right: &LinuxAddress, context: Context) -> bool {
+    equal_record!(LinuxAddress,left,right,unknown,context;family,index,address,local,prefix_len,scope,flags)
 }
 fn same_route(
     left: &LinuxRoute,
@@ -235,6 +295,10 @@ fn value_equal(kind: u16, left: &[u8], right: &[u8], context: Context) -> bool {
         }
         // ifa_cacheinfo: preferred/valid lifetimes остаются частью binding.
         (Context::Address(times), 6) => address_cache_equal(left, right, times),
+        (Context::RenewedDhcp(window, expiries), 6) => {
+            renewed_dhcp_cache(left, right, window, expiries)
+        }
+        (Context::DhcpLifetimeDrift, 6) => dhcp_cache_update(left, right).is_some(),
         // rta_cacheinfo: сохраняем expires и error, не сравниваем ref/use/clock.
         (Context::Route(times), 12) => {
             left.len() == 32
@@ -270,6 +334,45 @@ fn value_equal(kind: u16, left: &[u8], right: &[u8], context: Context) -> bool {
         }
         _ => left == right,
     }
+}
+
+fn renewed_dhcp_cache(
+    left: &[u8],
+    right: &[u8],
+    window: CaptureWindow,
+    expiries: [Instant; 2],
+) -> bool {
+    let Some((preferred, valid)) = dhcp_cache_update(left, right) else {
+        return false;
+    };
+    // Демон и ядро переводят остаток срока в целые секунды. Учитываем
+    // одну секунду по обе стороны измерения и проверяем оба срока.
+    let matches_expiry = |seconds: u32, expected: Instant| {
+        let low = window.start + Duration::from_secs(u64::from(seconds - 1));
+        let high = window.end + Duration::from_secs(u64::from(seconds) + 1);
+        Instant::now().max(window.end) < low && low <= expected && expected <= high
+    };
+    matches_expiry(preferred, expiries[0]) && matches_expiry(valid, expiries[1])
+}
+
+fn dhcp_cache_update(left: &[u8], right: &[u8]) -> Option<(u32, u32)> {
+    if left.len() != 16 || right.len() != 16 || left[8..12] != right[8..12] {
+        return None;
+    }
+    let read_lifetimes = |bytes: &[u8]| {
+        let preferred = u32::from_ne_bytes(bytes[..4].try_into().expect("Проверены 16 байт"));
+        let valid = u32::from_ne_bytes(bytes[4..8].try_into().expect("Проверены 16 байт"));
+        (preferred, valid)
+    };
+    let (old_preferred, old_valid) = read_lifetimes(left);
+    let (preferred, valid) = read_lifetimes(right);
+    (old_preferred > 0
+        && old_preferred <= old_valid
+        && old_valid < u32::MAX
+        && preferred > 1
+        && preferred <= valid
+        && valid < u32::MAX)
+        .then_some((preferred, valid))
 }
 fn route_expiry_equal(
     a: i64,
@@ -415,6 +518,38 @@ mod tests {
         let mut bytes = vec![0; 32];
         bytes[8..12].copy_from_slice(&expires.to_ne_bytes());
         bytes
+    }
+    #[test]
+    fn renewed_dhcp_cache_preserves_creation_time_and_finite_liveness() {
+        let bytes = |words: [u32; 4]| {
+            words
+                .into_iter()
+                .flat_map(u32::to_ne_bytes)
+                .collect::<Vec<_>>()
+        };
+        let old = bytes([80, 100, 10, 20]);
+        let now = Instant::now();
+        let window = CaptureWindow {
+            start: now,
+            end: now,
+        };
+        let expiry = [now + Duration::from_secs(120); 2];
+        assert!(renewed_dhcp_cache(
+            &old,
+            &bytes([120, 120, 10, 40]),
+            window,
+            expiry
+        ));
+        for invalid in [
+            [120, 120, 11, 40],
+            [0, 120, 10, 40],
+            [1, 120, 10, 40],
+            [121, 120, 10, 40],
+            [180, 180, 10, 40],
+            [120, u32::MAX, 10, 40],
+        ] {
+            assert!(!renewed_dhcp_cache(&old, &bytes(invalid), window, expiry));
+        }
     }
     #[test]
     fn finite_ra_route_natural_countdown_remains_equivalent() {

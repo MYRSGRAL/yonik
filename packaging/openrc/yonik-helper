@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+
+description="Системный сетевой помощник Yonik"
+command="/usr/lib/yonik/yonik-helper"
+command_args="--standalone-service"
+supervisor="supervise-daemon"
+umask="0077"
+retry="TERM/60/KILL/5"
+respawn_delay=2
+respawn_max=5
+respawn_period=60
+
+depend() {
+    need dbus
+    use cgroups
+}

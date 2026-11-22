@@ -95,7 +95,7 @@ fn observe_rule(topology: &LinuxTopology, expected: TunRule) -> Result<bool, Tun
     }
     Ok(true)
 }
-fn parent(
+pub(super) fn parent(
     executor: &TunExecutor,
     journal: &Journal,
     tun_id: u64,
@@ -173,33 +173,20 @@ pub(super) fn check_references(
 fn check_table(
     topology: &LinuxTopology,
     journal: &Journal,
+    tun_id: u64,
     index: u32,
     expected: TunRule,
     require_default: bool,
 ) -> Result<(), TunError> {
     let mut default = false;
+    let loopback = config::loopback_ifindex(topology);
     for value in topology.routes.iter().filter(|r| r.table == expected.table) {
         let owned = journal.records().iter().any(|record| {
-            let Resource::Route {
-                table,
-                destination,
-                prefix_len,
-                priority,
-                protocol,
-                ifindex,
-            } = record.resource()
-            else {
-                return false;
-            };
             record.scope() == Scope::Session
                 && (record.state() == RecordState::Confirmed
                     || !require_default && record.state() == RecordState::CleanupRemaining)
-                && *table == expected.table
-                && *ifindex == index
-                && *protocol == 253
-                && super::TunRoute::new(*destination, *prefix_len, *table, *priority)
-                    .ok()
-                    .is_some_and(|route| config::route_matches(value, index, route))
+                && config::recorded_route(record.resource(), tun_id, index)
+                    .is_some_and(|route| config::route_matches(value, index, loopback, route))
         });
         if !owned {
             return Err(TunError::Foreign);
@@ -233,7 +220,7 @@ impl TunExecutor {
         let operation = lease().await?;
         let before = self.configuration_snapshot().await?;
         let index = parent(self, journal, tun_id, &before, true)?;
-        check_table(&before, journal, index, rule, true)?;
+        check_table(&before, journal, tun_id, index, rule, true)?;
         check_references(&before, journal, index, rule.table, None)?;
         // Проверка конфликта priority происходит до записи intent, но совпавший
         // чужой объект всё равно никогда не становится нашим.
@@ -260,7 +247,7 @@ impl TunExecutor {
         if parent(self, journal, tun_id, &topology, true)? != index {
             return Err(TunError::Evidence);
         }
-        check_table(&topology, journal, index, rule, true)?;
+        check_table(&topology, journal, tun_id, index, rule, true)?;
         check_references(&topology, journal, index, rule.table, None)?;
         if observe_rule(&topology, rule)? {
             if fresh || state != RecordState::Confirmed {
@@ -278,7 +265,7 @@ impl TunExecutor {
             {
                 return Err(TunError::Evidence);
             }
-            check_table(&topology, journal, index, rule, true)?;
+            check_table(&topology, journal, tun_id, index, rule, true)?;
             check_references(&topology, journal, index, rule.table, Some(rule))?;
         }
         journal.reconcile(self.owner, id, Reconciled::Owned)?;
@@ -326,7 +313,7 @@ impl TunExecutor {
         {
             return Err(TunError::Evidence);
         }
-        check_table(&topology, journal, index, rule, false)?;
+        check_table(&topology, journal, tun_id, index, rule, false)?;
         check_references(&topology, journal, index, rule.table, Some(rule))?;
         journal.reconcile(self.owner, id, Reconciled::Owned)?;
         journal.mark_cleanup(self.owner, id)?;

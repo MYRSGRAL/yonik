@@ -411,6 +411,40 @@ fn encode_data_v4(
     Ok(f)
 }
 
+/// Идентификатор профиля с машинным кодом фильтра и доказательством для x86-64.
+pub(super) const fn fixed_profile_digest() -> Option<[u8; 32]> {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_pointer_width = "64",
+        target_env = "gnu"
+    ))]
+    {
+        Some(yonik_nsfs::fixed_self_fence::PROFILE_DIGEST)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_pointer_width = "64",
+        target_env = "gnu"
+    )))]
+    {
+        None
+    }
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_pointer_width = "64",
+    target_env = "gnu"
+)))]
+pub(super) fn verify_fixed_report(_: &[u8; FRAME], _: &Expected) -> Result<(), Error> {
+    Err(Error::EvidenceUnavailable)
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_pointer_width = "64",
+    target_env = "gnu"
+))]
 /// Проверка покрытия после authenticated v4 transport и immutable producer validation.
 /// Хеш ссылки не подпись: доверие producer проверяется отдельно до вызова.
 pub(super) fn verify_fixed_report(frame: &[u8; FRAME], expected: &Expected) -> Result<(), Error> {
@@ -950,7 +984,12 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_pointer_width = "64",
+    target_env = "gnu"
+))]
 mod fixed_coverage_tests {
     use super::*;
     use sha2::{Digest, Sha256};

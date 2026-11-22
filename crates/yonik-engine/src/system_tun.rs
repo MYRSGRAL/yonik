@@ -3,7 +3,14 @@ use crate::{CompileError, CompiledConfig, Engine, PolicyCompileError, compile};
 use serde_json::json;
 use std::{fmt, net::IpAddr, num::NonZeroU16, str::FromStr};
 use yonik_domain::Policy;
-use yonik_import::ParsedServer;
+use yonik_import::{ParsedServer, Protocol};
+
+mod fake_bridge;
+pub use fake_bridge::{
+    SystemFakeDnsBridge, compile_system_fake_dns_bridge, compile_system_fake_dns_bridge_at,
+    compile_system_fake_dns_policy, compile_system_fake_dns_policy_at,
+    validate_scoped_fake_dns_policy,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SystemTunAddress {
@@ -84,6 +91,61 @@ impl SystemTun {
 impl fmt::Debug for SystemTun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SystemTun(<скрыто>)")
+    }
+}
+
+impl CompiledConfig {
+    /// Закрепляет проверенный helper адрес подключения. TLS и транспортные
+    /// параметры уже сформированы из исходного профиля.
+    pub fn bind_system_proxy_address(
+        mut self,
+        server: &ParsedServer,
+        address: IpAddr,
+    ) -> Result<Self, CompileError> {
+        let invalid = CompileError::InvalidParameter;
+        let endpoint = server.endpoint();
+        if endpoint
+            .host()
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip != address)
+            || !self.value["inbounds"].as_array().is_some_and(|inbounds| {
+                inbounds
+                    .iter()
+                    .any(|inbound| inbound["tag"] == "system-tun")
+            })
+        {
+            return Err(invalid);
+        }
+        let mut proxies = self.value["outbounds"]
+            .as_array_mut()
+            .ok_or(invalid)?
+            .iter_mut()
+            .filter(|outbound| outbound["tag"] == "proxy");
+        let proxy = proxies.next().ok_or(invalid)?;
+        if proxies.next().is_some() {
+            return Err(invalid);
+        }
+        let (target, host, port) = match self.engine {
+            Engine::Xray => {
+                let field = match server.protocol() {
+                    Protocol::Vless | Protocol::Vmess => "vnext",
+                    _ => "servers",
+                };
+                let Some([target]) = proxy["settings"][field]
+                    .as_array_mut()
+                    .map(Vec::as_mut_slice)
+                else {
+                    return Err(invalid);
+                };
+                (target, "address", "port")
+            }
+            Engine::SingBox => (proxy, "server", "server_port"),
+        };
+        if target[host] != endpoint.host() || target[port] != endpoint.port() {
+            return Err(invalid);
+        }
+        target[host] = json!(address.to_string());
+        Ok(self)
     }
 }
 

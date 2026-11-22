@@ -1,13 +1,163 @@
-//! Read-only факты systemd-resolved. Не меняет DNS и не разрешает Apply.
-//! Требуется Tokio runtime с включёнными I/O и time. Снимок описывает daemon,
-//! а не системный resolver или namespace; peer credentials не дают права Apply.
+//! Наблюдение раскладки resolv.conf и read-only API systemd-resolved.
+//! Для снимка и подписки нужен Tokio runtime с включёнными I/O и time.
+//! Снимок описывает daemon; наблюдения и peer credentials не дают права Apply.
 
 mod config;
+pub(crate) mod dot;
+pub mod fake_service;
+pub(crate) mod file_watch;
+pub mod forward;
+mod plain;
+pub(crate) mod plain_relay;
+pub(crate) mod resolve1;
 mod socket;
 mod wire;
 
+#[cfg(test)]
+mod host_layout_tests {
+    use super::{ResolvConfLayout, inspect_resolv_conf, known_resolv_conf_target};
+    use std::{
+        fs,
+        os::unix::fs::{DirBuilderExt, symlink},
+        path::Path,
+    };
+
+    #[test]
+    fn классифицирует_только_точные_системные_пути() {
+        for (path, expected) in [
+            (
+                "/run/systemd/resolve/stub-resolv.conf",
+                ResolvConfLayout::ResolvedStub,
+            ),
+            (
+                "/run/systemd/resolve/resolv.conf",
+                ResolvConfLayout::ResolvedUplink,
+            ),
+            (
+                "/run/NetworkManager/resolv.conf",
+                ResolvConfLayout::NetworkManager,
+            ),
+            ("/run/resolvconf/resolv.conf", ResolvConfLayout::Resolvconf),
+            (
+                "/tmp/run/systemd/resolve/stub-resolv.conf",
+                ResolvConfLayout::UnknownSymlink,
+            ),
+            (
+                "/run/NetworkManager/no-stub-resolv.conf",
+                ResolvConfLayout::UnknownSymlink,
+            ),
+        ] {
+            assert_eq!(known_resolv_conf_target(Path::new(path)), expected);
+        }
+    }
+
+    #[test]
+    fn различает_файл_битую_ссылку_и_необычный_объект() {
+        let mut nonce = [0; 8];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let nonce = u64::from_ne_bytes(nonce);
+        let directory = std::env::temp_dir().join(format!("yonik-dns-host-{nonce:016x}"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let target = directory.join("generated");
+        let config = directory.join("resolv.conf");
+        assert_eq!(inspect_resolv_conf(&config), ResolvConfLayout::Missing);
+        symlink("generated", &config).unwrap();
+        assert_eq!(
+            inspect_resolv_conf(&config),
+            ResolvConfLayout::BrokenSymlink
+        );
+        fs::write(&target, []).unwrap();
+        assert_eq!(
+            inspect_resolv_conf(&config),
+            ResolvConfLayout::UnknownSymlink
+        );
+        assert_eq!(inspect_resolv_conf(&target), ResolvConfLayout::RegularFile);
+        assert_eq!(inspect_resolv_conf(&directory), ResolvConfLayout::Other);
+        fs::remove_file(config).unwrap();
+        fs::remove_file(target).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+}
+
 pub use config::*;
+#[cfg(feature = "test-support")]
+pub(crate) use plain::{FIXTURE_DNS_SOURCE, read_fixture_dns_source};
+pub use plain::{PlainResolverSnapshot, read_system_resolv_conf};
+pub(crate) use plain::{SYSTEM_RESOLV_CONF, plain_resolver_path, read_managed_resolv_conf};
+#[cfg(feature = "test-support")]
+pub use resolve1::{Resolve1ApplyError, Resolve1Prepared, apply_link_dns, prepare_link_dns};
+pub use resolve1::{
+    Resolve1Domain, Resolve1Endpoint, Resolve1Scope, Resolve1Snapshot, read_resolve1_snapshot,
+};
 pub use socket::ResolverPeer;
+
+/// Раскладка файла, которую видит процесс. Активность DNS-службы и путь
+/// запросов через NSS нужно проверять отдельно.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvConfLayout {
+    ResolvedStub,
+    ResolvedStaticStub,
+    ResolvedUplink,
+    NetworkManager,
+    Resolvconf,
+    RegularFile,
+    UnknownSymlink,
+    BrokenSymlink,
+    Missing,
+    Other,
+    Unreadable,
+}
+
+/// Читает метаданные файла и цель ссылки, не открывая DNS-конфигурацию.
+pub fn inspect_host_resolv_conf() -> ResolvConfLayout {
+    inspect_resolv_conf(std::path::Path::new("/etc/resolv.conf"))
+}
+
+fn inspect_resolv_conf(path: &std::path::Path) -> ResolvConfLayout {
+    use std::{fs, io::ErrorKind};
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return ResolvConfLayout::Missing,
+        Err(_) => return ResolvConfLayout::Unreadable,
+    };
+    if metadata.is_file() {
+        return ResolvConfLayout::RegularFile;
+    }
+    if !metadata.is_symlink() {
+        return ResolvConfLayout::Other;
+    }
+    let target = match fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return ResolvConfLayout::BrokenSymlink;
+        }
+        Err(_) => return ResolvConfLayout::Unreadable,
+    };
+    match fs::metadata(&target) {
+        Ok(metadata) if metadata.is_file() => known_resolv_conf_target(&target),
+        Ok(_) => ResolvConfLayout::Other,
+        Err(error) if error.kind() == ErrorKind::NotFound => ResolvConfLayout::BrokenSymlink,
+        Err(_) => ResolvConfLayout::Unreadable,
+    }
+}
+
+fn known_resolv_conf_target(target: &std::path::Path) -> ResolvConfLayout {
+    match target.to_str() {
+        Some("/run/systemd/resolve/stub-resolv.conf") => ResolvConfLayout::ResolvedStub,
+        Some("/usr/lib/systemd/resolv.conf" | "/lib/systemd/resolv.conf") => {
+            ResolvConfLayout::ResolvedStaticStub
+        }
+        Some("/run/systemd/resolve/resolv.conf") => ResolvConfLayout::ResolvedUplink,
+        Some("/run/NetworkManager/resolv.conf") => ResolvConfLayout::NetworkManager,
+        Some("/run/resolvconf/resolv.conf") => ResolvConfLayout::Resolvconf,
+        _ => ResolvConfLayout::UnknownSymlink,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolverError {

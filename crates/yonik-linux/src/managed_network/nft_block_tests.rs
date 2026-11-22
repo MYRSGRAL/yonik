@@ -1,6 +1,6 @@
 use super::*;
 use crate::managed_network::firewall::{
-    BoundTransport, IpPrefix, LanException, PrivateRoute, TransportProtocol,
+    BoundTransport, DHCPCD_CGROUP_PATH, IpPrefix, LanException, PrivateRoute, TransportProtocol,
 };
 
 fn policy() -> PublicBlockPolicy {
@@ -23,13 +23,589 @@ fn listing(table: &Table, policy: &PublicBlockPolicy) -> Value {
     json!({"nftables":items})
 }
 fn check(value: &Value, table: &Table, policy: &PublicBlockPolicy) -> Result<(), NftError> {
-    verify_rules(&serde_json::to_vec(value).unwrap(), table, policy, |name| {
-        if name == "lo" {
-            Ok(1)
-        } else {
-            Err(NftError::Evidence)
-        }
-    })
+    verify_rules(
+        &serde_json::to_vec(value).unwrap(),
+        table,
+        policy,
+        |name| match name {
+            "lo" => Ok(1),
+            "test-dhcp" => Ok(7),
+            "другой-интерфейс" => Ok(8),
+            _ => Err(NftError::Evidence),
+        },
+    )
+    .map(|_| ())
+}
+
+#[test]
+fn правило_dot_проверяет_cgroup_и_защищает_физический_сокет() {
+    let base = PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap();
+    let mut wire = serde_json::to_value(&base).unwrap();
+    wire["resolver_tls"] = json!({
+        "uid": 991, "cgroup_id": 2500, "namespace_device": 3, "namespace_inode": 11,
+        "endpoints": [
+            {"peer": "192.0.2.53:1853", "ifindex": 7, "ifname": "test-dhcp"},
+            {"peer": "192.0.2.53:1853", "ifindex": 7, "ifname": "test-dhcp", "protocol": "Udp"},
+        ],
+    });
+    let active: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    assert_ne!(base.digest(), active.digest());
+    assert_eq!(active.with_additional_transport(&[]).unwrap(), active);
+    let table = block_table(owner(), 2, 5, &active);
+    let request = request(Action::InstallBlock(&table, &active));
+    let commands = request["nftables"].as_array().unwrap();
+    assert_eq!(text::render(commands, None), Err(NftError::Evidence));
+    let script = String::from_utf8(text::render(commands, Some((2500, 9))).unwrap()).unwrap();
+    assert!(script.contains(
+        "meta skuid 991 meta mark 0 socket cgroupv2 level 2 \"../../../proc/self/fd/9\" accept"
+    ));
+    assert!(script.contains("meta l4proto udp udp dport 1853 meta skuid 991"));
+    let mut observed = listing(&table, &active);
+    assert_eq!(check(&observed, &table, &active), Ok(()));
+    let rules = observed["nftables"].as_array_mut().unwrap();
+    let position = rules
+        .iter()
+        .position(|rule| {
+            rule["rule"]["expr"].as_array().is_some_and(|expr| {
+                expr.iter()
+                    .any(|entry| entry.pointer("/match/left/socket").is_some())
+            })
+        })
+        .unwrap();
+    let guard = &rules[position + 1]["rule"]["expr"];
+    assert_eq!(
+        guard.as_array().unwrap().last(),
+        Some(&json!({"drop":null}))
+    );
+    let expr = rules[position]["rule"]["expr"].as_array_mut().unwrap();
+    let socket = expr
+        .iter_mut()
+        .find(|entry| entry.pointer("/match/left/socket").is_some())
+        .unwrap();
+    socket["match"]["right"] = json!(2501);
+    assert_eq!(check(&observed, &table, &active), Err(NftError::Evidence));
+    let mut fake_pool = wire.clone();
+    fake_pool["resolver_tls"]["endpoints"][0]["peer"] = json!("198.19.224.1:1853");
+    assert!(serde_json::from_value::<PublicBlockPolicy>(fake_pool).is_err());
+    wire["resolver_tls"]["endpoints"][0]["ifindex"] = json!(8);
+    assert!(serde_json::from_value::<PublicBlockPolicy>(wire).is_err());
+}
+
+#[tokio::test]
+#[ignore = "Требует изолированную network namespace и cgroup службы resolved"]
+async fn ядро_nft_подтверждает_точную_cgroup_dot() {
+    use std::os::unix::fs::MetadataExt;
+
+    let netns = File::open("/proc/thread-self/ns/net").unwrap();
+    let (device, inode) = namespace(&netns).unwrap();
+    let host = std::env::var("YONIK_NFT_TEST_HOST_NETNS").unwrap();
+    assert_ne!(host, format!("{device}:{inode}"));
+    let owner = Ownership::new(1000, 7, 9, device, inode).unwrap();
+    let mut executor = NftExecutor::open(owner).unwrap();
+    let socket = rustix::net::socket(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        None,
+    )
+    .unwrap();
+    let index = |name| rustix::net::netdevice::name_to_index(&socket, name).unwrap();
+    let id = std::fs::metadata(format!("/sys/fs/cgroup/{RESOLVED_CGROUP_PATH}"))
+        .unwrap()
+        .ino();
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(
+            index("lo"),
+            Some(index("dottun0")),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    wire["resolver_tls"] = json!({
+        "uid": 991, "cgroup_id": id, "namespace_device": device, "namespace_inode": inode,
+        "endpoints": [
+            {"peer": "192.0.2.53:1853", "ifindex": index("dottest0"), "ifname": "dottest0"},
+            {"peer": "[2001:db8::53]:853", "ifindex": index("dottest0"), "ifname": "dottest0"}
+        ],
+    });
+    let policy: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    let path = std::env::temp_dir().join(format!("yonik-dot-nft-{}", std::process::id()));
+    let mut journal = Journal::open(&path, owner).unwrap();
+    executor
+        .ensure_public_block(&mut journal, 2, 5, &policy)
+        .await
+        .unwrap();
+    let table = block_table(owner, 2, 5, &policy);
+    let (_operation, mut cancel) = crate::Cancellation::new();
+    let (_, observed) =
+        crate::read_nft_socket_cgroup_matches(&table.name, "output", &mut cancel, DEADLINE)
+            .await
+            .unwrap();
+    assert_eq!(observed.len(), 2);
+    assert!(
+        observed
+            .iter()
+            .all(|entry| entry.cgroup_id.get() == id && entry.level == 2)
+    );
+    wire["resolver_tls"]["cgroup_id"] = json!(id ^ 1);
+    let wrong = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        executor.verify_public_block(&table, &wrong).await,
+        Err(NftError::Evidence)
+    );
+    executor
+        .remove_public_block(&mut journal, 2, &policy)
+        .await
+        .unwrap();
+    drop(journal);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn dhcp_anchor_is_inert_and_rejects_unexpected_kernel_contents() {
+    let prefix = IpPrefix::new("192.0.2.0".parse().expect("Префикс"), 24).expect("CIDR");
+    let route = PrivateRoute::new(prefix, None).expect("Защита приватной сети");
+    let active = PublicBlockPolicy::new(1, Some(8), vec![route], vec![], vec![], vec![])
+        .expect("Активная политика");
+    let mut wire = serde_json::to_value(&active).expect("Запись политики");
+    assert!(wire.get("dhcp_renewal_anchor").is_none());
+    wire["dhcp_renewal_anchor"] = json!(true);
+    let reserved = serde_json::from_value::<PublicBlockPolicy>(wire.clone())
+        .expect("Политика с пустой DHCP-цепочкой");
+    assert_ne!(active.digest(), reserved.digest());
+    assert_eq!(
+        reserved
+            .with_additional_transport(&[])
+            .expect("Пересобранная политика"),
+        reserved
+    );
+    let table = block_table(owner(), 2, 5, &reserved);
+    let original = listing(&table, &reserved);
+    assert_eq!(check(&original, &table, &reserved), Ok(()));
+    let data = original["nftables"].as_array().expect("Список nftables");
+    let set = data
+        .iter()
+        .position(|object| object.get("set").is_some())
+        .expect("Пустой набор DHCP");
+    let position = |verdict: &str| {
+        data.iter()
+            .position(|entry| {
+                entry
+                    .pointer("/rule/expr")
+                    .and_then(Value::as_array)
+                    .is_some_and(|expr| expr.iter().any(|item| item.get(verdict).is_some()))
+            })
+            .expect("Вердикт output")
+    };
+    assert!(position("drop") < position("jump"));
+    let mut populated = original.clone();
+    populated["nftables"][set]["set"]["elem"] = json!(["192.0.2.10"]);
+    assert_eq!(
+        check(&populated, &table, &reserved),
+        Err(NftError::Evidence)
+    );
+    let mut unexpected_rule = original;
+    unexpected_rule["nftables"].as_array_mut().expect("Список nftables").push(json!({
+        "rule":{"family":"inet","table":table.name,"chain":"dhcp_renewal","handle":200,"expr":[{"accept":null}]}
+    }));
+    assert_eq!(
+        check(&unexpected_rule, &table, &reserved),
+        Err(NftError::Evidence)
+    );
+    wire["tun_ifindex"] = Value::Null;
+    assert!(serde_json::from_value::<PublicBlockPolicy>(wire).is_err());
+}
+
+#[test]
+fn dhcp_rule_keeps_cgroup_inode_in_durable_identity() {
+    let mut policy = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![])
+            .expect("Активная политика"),
+    )
+    .expect("Запись политики");
+    policy["dhcp_renewal_anchor"] = json!(true);
+    policy["dhcp_renewal_rule"] = json!({
+        "ifindex": 7, "ifname": "test-dhcp", "address": "192.0.2.10", "server": "192.0.2.1",
+        "uid": 999, "cgroup_id": 2500, "dscp": 32, "mark": 0,
+        "namespace_device":3,"namespace_inode":11
+    });
+    let first = serde_json::from_value::<PublicBlockPolicy>(policy.clone()).expect("Политика DHCP");
+    policy["dhcp_renewal_rule"]["cgroup_id"] = json!(2501);
+    let second =
+        serde_json::from_value::<PublicBlockPolicy>(policy.clone()).expect("Другая cgroup");
+    assert_ne!(first.digest(), second.digest());
+    policy["dhcp_renewal_rule"]["ifname"] = json!("bad*");
+    assert!(serde_json::from_value::<PublicBlockPolicy>(policy).is_err());
+}
+
+#[test]
+fn dhcp_rules_accept_independent_keys_and_keep_the_legacy_single_rule() {
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap(),
+    )
+    .unwrap();
+    wire["dhcp_renewal_anchor"] = json!(true);
+    let first = json!({
+        "ifindex":7,"ifname":"test-dhcp","address":"192.0.2.10","server":"192.0.2.1",
+        "uid":999,"cgroup_id":2500,"dscp":32,"mark":0,"namespace_device":3,"namespace_inode":11
+    });
+    let mut second = first.clone();
+    second["ifindex"] = json!(9);
+    second["ifname"] = json!("second-dhcp");
+    second["address"] = json!("192.0.2.20");
+    wire["dhcp_renewal_rule"] = first.clone();
+    let single: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(single).unwrap(), wire);
+    wire["dhcp_renewal_rule"] = json!([second, first]);
+    let policy: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    let table = block_table(owner(), 2, 5, &policy);
+    let mut active = listing(&table, &policy);
+    assert_eq!(check(&active, &table, &policy), Ok(()));
+    let set = active["nftables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|item| item.get("set").is_some())
+        .unwrap();
+    let first_element = json!({"elem":{"val":{"concat":["192.0.2.10","192.0.2.1",7,"test-dhcp"]},"timeout":0,"expires":0}});
+    let second_element = json!({"elem":{"val":{"concat":["192.0.2.20","192.0.2.1",9,"second-dhcp"]},"timeout":0,"expires":0}});
+    for elements in [
+        json!([second_element, first_element]),
+        json!([second_element]),
+        json!([]),
+    ] {
+        active["nftables"][set]["set"]["elem"] = elements;
+        assert_eq!(check(&active, &table, &policy), Ok(()));
+    }
+    let mut cross_link = first_element.clone();
+    cross_link["elem"]["val"]["concat"][2] = json!(9);
+    for elements in [
+        json!([second_element, first_element, second_element]),
+        json!([second_element, cross_link]),
+    ] {
+        active["nftables"][set]["set"]["elem"] = elements;
+        assert_eq!(check(&active, &table, &policy), Err(NftError::Evidence));
+    }
+
+    for (field, invalid) in [
+        ("ifindex", json!(7)),
+        ("cgroup_id", json!(2501)),
+        ("namespace_device", json!(4)),
+    ] {
+        let mut bad = wire.clone();
+        bad["dhcp_renewal_rule"][0][field] = invalid;
+        assert!(serde_json::from_value::<PublicBlockPolicy>(bad).is_err());
+    }
+}
+
+#[test]
+fn dhcp_dscps_share_one_timed_key_and_require_each_exact_rule() {
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap(),
+    )
+    .unwrap();
+    wire["dhcp_renewal_anchor"] = json!(true);
+    wire["dhcp_renewal_rule"] = json!({
+        "ifindex":7,"ifname":"test-dhcp","address":"192.0.2.10","server":"192.0.2.1",
+        "uid":999,"cgroup_id":2500,"dscp":0,"mark":0,"namespace_device":3,"namespace_inode":11
+    });
+    let legacy: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&legacy).unwrap(), wire);
+    wire["dhcp_renewal_rule"]["additional_dscps"] = json!((1u64 << 32) | (1u64 << 48));
+    let policy: PublicBlockPolicy = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&policy).unwrap(), wire);
+    assert_eq!(policy.dhcp_rule_count(), 1);
+    assert_ne!(legacy.digest(), policy.digest());
+    let table = block_table(owner(), 2, 5, &policy);
+    let mut state = listing(&table, &policy);
+    let entries = state["nftables"].as_array_mut().unwrap();
+    let set = entries
+        .iter_mut()
+        .find_map(|entry| entry.get_mut("set"))
+        .unwrap();
+    set["elem"] = json!([{"elem":{"val":{"concat":["192.0.2.10","192.0.2.1",7,"test-dhcp"]},"timeout":0,"expires":0}}]);
+    let rules: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry["rule"]["chain"] == DHCP_RENEWAL_CHAIN)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(rules.len(), 3);
+    for (&index, expected) in rules.iter().zip([0, 32, 48]) {
+        let comparison = entries[index]["rule"]["expr"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|expr| expr.pointer("/match/left/payload/field") == Some(&json!("dscp")))
+            .unwrap();
+        assert_eq!(comparison["match"]["right"], expected);
+    }
+    assert_eq!(check(&state, &table, &policy), Ok(()));
+    state["nftables"].as_array_mut().unwrap().remove(rules[1]);
+    assert_eq!(check(&state, &table, &policy), Err(NftError::Evidence));
+    for invalid in [1u64, 1 << 1, 1 << 63] {
+        wire["dhcp_renewal_rule"]["additional_dscps"] = json!(invalid);
+        assert!(serde_json::from_value::<PublicBlockPolicy>(wire.clone()).is_err());
+    }
+}
+
+#[test]
+fn dhcp_rule_only_accepts_the_exact_short_lived_element() {
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![])
+            .expect("Активная политика"),
+    )
+    .expect("Запись политики");
+    wire["dhcp_renewal_anchor"] = json!(true);
+    wire["dhcp_renewal_rule"] = json!({
+        "ifindex": 7, "ifname": "test-dhcp", "address": "192.0.2.10", "server": "192.0.2.1",
+        "uid": 999, "cgroup_id": 2500, "dscp": 32, "mark": 0,
+        "namespace_device":3,"namespace_inode":11
+    });
+    let policy = serde_json::from_value::<PublicBlockPolicy>(wire).expect("Политика DHCP");
+    let table = block_table(owner(), 2, 5, &policy);
+    let mut live = listing(&table, &policy);
+    let set_index = live["nftables"]
+        .as_array()
+        .expect("Список nftables")
+        .iter()
+        .position(|object| object.get("set").is_some())
+        .expect("Набор DHCP");
+    let value = json!({"concat":["192.0.2.10","192.0.2.1",7,"test-dhcp"]});
+    let allowed = json!({"elem":{"val":value,"timeout":0,"expires":0}});
+    live["nftables"][set_index]["set"]["elem"] = json!([allowed]);
+    let read = |listing: &Value| check(listing, &table, &policy);
+    assert_eq!(read(&live), Ok(()));
+    let mut counted = live.clone();
+    counted["nftables"][set_index]["set"]["count"] = json!("2");
+    assert_eq!(read(&counted), Err(NftError::Evidence));
+    counted["nftables"][set_index]["set"]["count"] = json!(2);
+    assert_eq!(read(&counted), Ok(()));
+
+    let with_elements = |elements: Value| {
+        let mut modified = counted.clone();
+        modified["nftables"][set_index]["set"]["elem"] = elements;
+        modified
+    };
+    for index in ["7", "test-dhcp"] {
+        let element = json!({"elem":{"val":{"concat":["192.0.2.10","192.0.2.1",index,"test-dhcp"]},"timeout":0,"expires":0}});
+        assert_eq!(read(&with_elements(json!([element]))), Ok(()));
+    }
+
+    for forbidden in [
+        json!([value]),
+        json!([{"elem":{"val":value,"timeout":0}}]),
+        json!([{"elem":{"val":value,"timeout":1,"expires":0}}]),
+        json!([{"elem":{"val":value,"timeout":0,"expires":1}}]),
+        json!([{"elem":{"val":value,"timeout":0,"expires":0,"comment":"изменено"}}]),
+        json!([{"elem":{"val":{"concat":["192.0.2.10","192.0.2.2",7,"test-dhcp"]},"timeout":0,"expires":0}}]),
+        json!([{"elem":{"val":{"concat":["192.0.2.10","192.0.2.1","другой-интерфейс","test-dhcp"]},"timeout":0,"expires":0}}]),
+        json!([allowed, allowed]),
+    ] {
+        assert_eq!(read(&with_elements(forbidden)), Err(NftError::Evidence));
+    }
+}
+
+fn политика_dhcpcd() -> (PublicBlockPolicy, PublicBlockPolicy) {
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap(),
+    )
+    .unwrap();
+    wire["dhcp_renewal_anchor"] = json!(true);
+    wire["dhcp_renewal_rule"] = json!({
+        "ifindex":7,"ifname":"test-dhcp","address":"192.0.2.10","server":"192.0.2.1",
+        "uid":0,"dhcpcd":true,"cgroup_id":2500,"dscp":0,"mark":0,
+        "namespace_device":3,"namespace_inode":11
+    });
+    let legacy = serde_json::from_value(wire.clone()).unwrap();
+    wire["dhcpcd_route"] = json!({"source":"198.19.7.1","mark":1000});
+    (legacy, serde_json::from_value(wire).unwrap())
+}
+
+#[test]
+fn dhcpcd_сериализует_только_точное_исправление_маршрута() {
+    let (legacy, policy) = политика_dhcpcd();
+    let table = block_table(owner(), 2, 5, &policy);
+    assert_ne!(policy.digest(), legacy.digest());
+    assert_eq!(
+        policy.clone().with_dhcpcd_route(None).unwrap().digest(),
+        legacy.digest()
+    );
+    let mut commands = policy.commands(&table.name);
+    let script = String::from_utf8(text::render(&commands, None).unwrap()).unwrap();
+    assert!(
+        script.contains("dhcpcd_route { type route hook output priority -300; policy accept; }")
+    );
+    assert!(
+        script.contains(
+            "dhcpcd_egress { type filter hook postrouting priority 110; policy accept; }"
+        )
+    );
+    assert!(script.contains(concat!(
+        "dhcpcd_route meta nfproto ipv4 meta oif 8 ip saddr 198.19.7.1 ip daddr 192.0.2.1 ",
+        "meta skuid 0 udp sport 68 udp dport 67 @th,160,32 3221225994 ip dscp 0 meta mark 0 ",
+        "socket cgroupv2 level 2 \"system.slice/dhcpcd.service\" 192.0.2.10 . ip daddr . 7 . ",
+        "\"test-dhcp\" @dhcp_renewal_leases ip saddr set 192.0.2.10 meta mark set 1000\n"
+    )));
+    assert!(script.contains(concat!(
+        "dhcpcd_egress meta nfproto ipv4 ip saddr 192.0.2.10 ip daddr 192.0.2.1 ",
+        "udp sport 68 udp dport 67 meta mark 1000 ip dscp 0 meta oif 7 meta oifname \"test-dhcp\" ",
+        "ip saddr . ip daddr . meta oif . meta oifname @dhcp_renewal_leases accept\n"
+    )));
+    assert!(script.contains(concat!(
+        "dhcpcd_egress meta nfproto ipv4 ip saddr 192.0.2.10 ip daddr 192.0.2.1 ",
+        "udp sport 68 udp dport 67 meta mark 1000 drop\n"
+    )));
+    let route = commands
+        .iter_mut()
+        .find(|command| command["add"]["rule"]["chain"] == DHCPCD_ROUTE_CHAIN)
+        .unwrap();
+    for (path, altered) in [
+        ("/add/rule/expr/4/match/right", json!(991)),
+        ("/add/rule/expr/7/match/left/payload/offset", json!(128)),
+        ("/add/rule/expr/7/match/right", json!(1)),
+        ("/add/rule/expr/10/match/left/socket/level", json!(1)),
+        (
+            "/add/rule/expr/11/match/left/concat/3",
+            json!("test-dhcp\" accept"),
+        ),
+        ("/add/rule/expr/12/mangle/value", json!("192.0.2.12")),
+        ("/add/rule/expr/13/mangle/value", json!(0)),
+    ] {
+        let mut invalid = route.clone();
+        *invalid.pointer_mut(path).unwrap() = altered;
+        assert_eq!(text::render(&[invalid], None), Err(NftError::Invalid));
+    }
+}
+
+#[test]
+fn dhcpcd_сверяет_форму_правил_ядра_и_порядок_выходной_цепочки() {
+    let (_, policy) = политика_dhcpcd();
+    let table = block_table(owner(), 2, 5, &policy);
+    let mut live = listing(&table, &policy);
+    let items = live["nftables"].as_array_mut().unwrap();
+    items.sort_by_key(
+        |item| match item.pointer("/rule/chain").and_then(Value::as_str) {
+            Some("output") => 1,
+            Some(DHCPCD_EGRESS_CHAIN) => 2,
+            Some(DHCPCD_ROUTE_CHAIN) => 3,
+            _ => 0,
+        },
+    );
+    let route = items
+        .iter()
+        .position(|item| item["rule"]["chain"] == DHCPCD_ROUTE_CHAIN)
+        .unwrap();
+    let accept = items
+        .iter()
+        .position(|item| item["rule"]["chain"] == DHCPCD_EGRESS_CHAIN)
+        .unwrap();
+    let route_handle = NonZeroU64::new(items[route]["rule"]["handle"].as_u64().unwrap()).unwrap();
+    let expr = &mut items[route]["rule"]["expr"];
+    expr[1]["match"]["right"] = json!("8");
+    expr[8]["match"]["right"] = json!("cs0");
+    expr[10]["match"]["left"]["socket"]
+        .as_object_mut()
+        .unwrap()
+        .remove("level");
+    expr[11]["match"]["left"]["concat"][2] = json!("test-dhcp");
+    items[accept]["rule"]["expr"][6]["match"]["right"] = json!("cs0");
+
+    let handles = verify_rules(
+        &serde_json::to_vec(&live).unwrap(),
+        &table,
+        &policy,
+        |name| {
+            if name == "test-dhcp" {
+                Ok(7)
+            } else {
+                Err(NftError::Evidence)
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        handles.dhcpcd_route,
+        BTreeMap::from([(route_handle, (NonZeroU64::new(2500).unwrap(), 2))])
+    );
+    assert_eq!(check(&live, &table, &policy), Ok(()));
+    for (path, altered) in [
+        ("/7/match/right", json!(1)),
+        ("/8/match/right", json!("cs1")),
+        (
+            "/10/match/right",
+            json!("system.slice/systemd-networkd.service"),
+        ),
+        ("/11/match/left/concat/2", json!("другой-интерфейс")),
+        ("/13/mangle/value", json!(1001)),
+    ] {
+        let mut invalid = live.clone();
+        *invalid["nftables"][route]["rule"]["expr"]
+            .pointer_mut(path)
+            .unwrap() = altered;
+        assert_eq!(check(&invalid, &table, &policy), Err(NftError::Evidence));
+    }
+    live["nftables"]
+        .as_array_mut()
+        .unwrap()
+        .swap(accept, accept + 1);
+    assert_eq!(check(&live, &table, &policy), Err(NftError::Evidence));
+}
+
+#[test]
+fn dhcpcd_instance_требует_уровень_и_точную_cgroup_по_ifname() {
+    let mut wire = serde_json::to_value(
+        PublicBlockPolicy::new(1, Some(8), vec![], vec![], vec![], vec![]).unwrap(),
+    )
+    .unwrap();
+    wire["dhcp_renewal_anchor"] = json!(true);
+    wire["dhcp_renewal_rule"] = json!({
+        "ifindex":7,"ifname":"test-dhcp","address":"192.0.2.10","server":"192.0.2.1",
+        "uid":0,"dhcpcd":true,"dhcpcd_instance":true,"cgroup_id":2500,"dscp":0,"mark":0,
+        "namespace_device":3,"namespace_inode":11
+    });
+    wire["dhcpcd_route"] = json!({"source":"198.19.7.1","mark":1000});
+    let policy: PublicBlockPolicy = serde_json::from_value(wire).unwrap();
+    let instance = crate::helper::dhcp_networkd::dhcpcd_instance_cgroup("test-dhcp").unwrap();
+    let table = block_table(owner(), 2, 5, &policy);
+    let mut live = listing(&table, &policy);
+    assert_eq!(check(&live, &table, &policy), Ok(()));
+
+    let mut instances = BTreeMap::new();
+    instances.insert(instance.clone(), (2500, 9));
+    let script = String::from_utf8(
+        text::render_with_instances(&policy.commands(&table.name), None, &instances).unwrap(),
+    )
+    .unwrap();
+    assert!(script.contains("socket cgroupv2 level 3 \"../../../proc/self/fd/9\""));
+
+    let route_index = live["nftables"]
+        .as_array_mut()
+        .unwrap()
+        .iter()
+        .position(|item| {
+            item.pointer("/rule/chain").and_then(Value::as_str) == Some(DHCPCD_ROUTE_CHAIN)
+        })
+        .unwrap();
+    live["nftables"][route_index]["rule"]["expr"][10]["match"]["left"]["socket"]
+        .as_object_mut()
+        .unwrap()
+        .remove("level");
+    assert_eq!(check(&live, &table, &policy), Ok(()));
+    live["nftables"][route_index]["rule"]["expr"][10]["match"]["left"]["socket"]["level"] =
+        json!(2);
+    assert_eq!(check(&live, &table, &policy), Err(NftError::Evidence));
+    live["nftables"][route_index]["rule"]["expr"][10]["match"]["left"]["socket"]["level"] =
+        json!(3);
+    live["nftables"][route_index]["rule"]["expr"][10]["match"]["right"] = json!(DHCPCD_CGROUP_PATH);
+    assert_eq!(check(&live, &table, &policy), Err(NftError::Evidence));
+    live["nftables"][route_index]["rule"]["expr"][10]["match"]["right"] = json!(instance);
+    live["nftables"][route_index]["rule"]["expr"][11]["match"]["left"]["concat"][3] =
+        json!("other-iface");
+    assert_eq!(check(&live, &table, &policy), Err(NftError::Evidence));
 }
 
 #[test]

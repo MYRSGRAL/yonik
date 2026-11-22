@@ -149,19 +149,9 @@ fn existing(directory: &File, name: &str, flags: OFlags) -> Result<Option<File>,
 }
 
 pub(super) fn read(directory: &File) -> Result<Option<Document>, JournalError> {
-    let Some(file) = existing(directory, JOURNAL, OFlags::RDONLY)? else {
+    let Some(bytes) = read_bounded(directory, JOURNAL, MAX_JOURNAL_BYTES)? else {
         return Ok(None);
     };
-    if file.metadata().map_err(|_| JournalError::Io)?.len() > MAX_JOURNAL_BYTES as u64 {
-        return Err(JournalError::Limit);
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_JOURNAL_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| JournalError::Io)?;
-    if bytes.len() > MAX_JOURNAL_BYTES {
-        return Err(JournalError::Limit);
-    }
     // Каждая историческая версия разбирается собственной строгой схемой:
     // новые поля нельзя незаметно протащить через миграцию старого формата.
     let value: serde_json::Value =
@@ -182,6 +172,17 @@ pub(super) fn read(directory: &File) -> Result<Option<Document>, JournalError> {
         public_policy: Option<super::PublicPolicyRecord>,
         policy_sequence: u64,
     }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyV3 {
+        version: u32,
+        ownership: super::Ownership,
+        records: Vec<super::Record>,
+        public_policy: Option<super::PublicPolicyRecord>,
+        policy_sequence: u64,
+        #[serde(deserialize_with = "super::session_state::deserialize_recovery")]
+        session_recovery: Option<super::SessionRecoveryRecord>,
+    }
     let document = match value.get("version").and_then(serde_json::Value::as_u64) {
         Some(1) => {
             let legacy: LegacyV1 =
@@ -193,6 +194,7 @@ pub(super) fn read(directory: &File) -> Result<Option<Document>, JournalError> {
                 public_policy: None,
                 policy_sequence: 0,
                 session_recovery: None,
+                fake_quarantine: None,
             }
         }
         Some(2) => {
@@ -205,9 +207,23 @@ pub(super) fn read(directory: &File) -> Result<Option<Document>, JournalError> {
                 public_policy: legacy.public_policy,
                 policy_sequence: legacy.policy_sequence,
                 session_recovery: None,
+                fake_quarantine: None,
             }
         }
-        Some(3) => serde_json::from_slice(&bytes).map_err(|_| JournalError::Corrupt)?,
+        Some(3) => {
+            let legacy: LegacyV3 =
+                serde_json::from_slice(&bytes).map_err(|_| JournalError::Corrupt)?;
+            Document {
+                version: legacy.version,
+                ownership: legacy.ownership,
+                records: legacy.records,
+                public_policy: legacy.public_policy,
+                policy_sequence: legacy.policy_sequence,
+                session_recovery: legacy.session_recovery,
+                fake_quarantine: None,
+            }
+        }
+        Some(4) => serde_json::from_slice(&bytes).map_err(|_| JournalError::Corrupt)?,
         Some(_) => return Err(JournalError::Version),
         None => return Err(JournalError::Corrupt),
     };
@@ -219,14 +235,44 @@ pub(super) fn write(directory: &File, document: &Document) -> Result<(), Journal
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(JournalError::Limit);
     }
-    // Нельзя заменить небезопасный существующий journal, даже атомарным rename.
-    existing(directory, JOURNAL, OFlags::RDONLY)?;
-    let mut pending = match existing(directory, PENDING, OFlags::WRONLY)? {
+    write_atomic(directory, JOURNAL, PENDING, &bytes)
+}
+
+pub(super) fn read_bounded(
+    directory: &File,
+    name: &str,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, JournalError> {
+    let Some(file) = existing(directory, name, OFlags::RDONLY)? else {
+        return Ok(None);
+    };
+    if file.metadata().map_err(|_| JournalError::Io)?.len() > limit as u64 {
+        return Err(JournalError::Limit);
+    }
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| JournalError::Io)?;
+    if bytes.len() > limit {
+        return Err(JournalError::Limit);
+    }
+    Ok(Some(bytes))
+}
+
+pub(super) fn write_atomic(
+    directory: &File,
+    name: &str,
+    temporary: &str,
+    bytes: &[u8],
+) -> Result<(), JournalError> {
+    // Небезопасный существующий файл нельзя заменить даже атомарным rename.
+    existing(directory, name, OFlags::RDONLY)?;
+    let mut pending = match existing(directory, temporary, OFlags::WRONLY)? {
         Some(file) => file,
         None => File::from(
             fs::openat(
                 directory,
-                PENDING,
+                temporary,
                 FILE_FLAGS | OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
                 Mode::from_raw_mode(0o600),
             )
@@ -235,9 +281,9 @@ pub(super) fn write(directory: &File, document: &Document) -> Result<(), Journal
     };
     safe_file(&pending)?;
     pending.set_len(0).map_err(|_| JournalError::Io)?;
-    pending.write_all(&bytes).map_err(|_| JournalError::Io)?;
+    pending.write_all(bytes).map_err(|_| JournalError::Io)?;
     pending.sync_all().map_err(|_| JournalError::Io)?;
-    fs::renameat(directory, PENDING, directory, JOURNAL).map_err(|_| JournalError::Io)?;
+    fs::renameat(directory, temporary, directory, name).map_err(|_| JournalError::Io)?;
     directory
         .sync_all()
         .map_err(|_| JournalError::UncertainWrite)

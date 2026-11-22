@@ -152,7 +152,7 @@ impl InstalledContract {
         let directory = child(&child(&child(&root()?, "usr")?, "lib")?, "yonik")?;
         let metadata = fixed_file(&directory, "native-profile-v1.json")?;
         let deployment = parse(&metadata)?;
-        if deployment.policy_sha256 != yonik_nsfs::fixed_self_fence::PROFILE_DIGEST {
+        if Some(deployment.policy_sha256) != super::kernel_evidence::fixed_profile_digest() {
             return Err(Error::Untrusted);
         }
         let image = fixed_file(&directory, "yonik-worker")?;

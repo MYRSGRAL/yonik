@@ -2,14 +2,32 @@
 
 [Русский](linux-ru.md) · [Project home](../../README.md)
 
-Applies to base `48ce74304a3fb7263ccc7e2c06d96394113a687d`: Linux,
-CachyOS/Arch x86_64, KDE Plasma/Wayland. Android is deferred. The working user
-path is local SOCKS5 for explicitly configured applications. System TUN,
-DNS/Fake-IP, kill switch and applying application routes through the GUI remain
-unavailable (`system_tun=false`). Bundling a helper does not enable these features. No actual registered System
-profile is supplied; draft admission work does not enable this user path.
-Full P25 acceptance is not claimed: licenses, runtime composition and performance
-requirements remain open.
+## System connection
+
+On the current branch, system TUN and Fake DNS use an installed helper. Network
+changes require access to the system D-Bus and polkit authorization. The helper
+loads engines from a trusted system registry. The matrix lists the tested
+distribution versions, service managers and graphical sessions.
+[Tested configurations](../superpowers/plans/2026-11-18-linux-tun-dns-portability.md#матрица-проверенных-конфигураций)
+
+For a server profile, choose **System connection** in **Connection mode**.
+To enable Fake DNS, set **Fake DNS domain suffixes** and select **Proxy** as
+the default action. Xray and sing-box are available in this mode. Leaving
+the suffixes empty turns Fake DNS off. Yonik reads `/etc/resolv.conf`, and the
+system DNS manager controls the file. Firefox using system DNS can receive a
+Fake-IP. Firefox using its own DoH receives an address from its chosen provider
+and sends HTTPS through the system TUN.
+
+When CIDR rules need real addresses for Fake DNS names, enter a
+**Fake DNS policy resolver** under **Settings → Connection** and select
+**Save DNS**. Use `IP:port` or `[IPv6]:port` for a DNS-over-TCP server
+reachable through the selected proxy. Clear the field to disable policy DNS
+lookups. Stop the connection before changing the address.
+
+The build and installation commands below cover base revision
+`48ce74304a3fb7263ccc7e2c06d96394113a687d` and local SOCKS5 on
+Arch/CachyOS x86-64. Full P25 acceptance still covers open work on licensing,
+runtime composition and performance.
 
 ## Build and verify provenance
 
@@ -165,9 +183,10 @@ power-loss durability.
 
 ## Package install, update, rollback and removal
 
-The [Arch recipe](../../packaging/arch/README.md) pins **e33fa190**, not this guide's
-base. It builds GUI/helper/worker; engine runtime is supplied separately. Follow
-the recipe in a disposable VM without `makepkg -i/-s`. Validate the archive first:
+The Arch recipe pins its own source revision and builds the GUI, helper and
+worker. Engines are supplied separately. Build in a disposable VM without
+`makepkg -i/-s` and validate the archive before installation.
+[Arch package recipe](../../packaging/arch/README.md)
 
 ```sh
 python tools/check_arch_package.py /absolute/path/yonik.pkg.tar.zst

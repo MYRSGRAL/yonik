@@ -1,0 +1,203 @@
+policy_module(yonik_helper, 1.0)
+
+gen_require(`
+    type init_t, iptables_t, etc_t, var_t, var_lib_t, var_run_t;
+    type power_unit_file_t, systemd_unit_file_t;
+    type fs_t, nsfs_t;
+    type initrc_t, unconfined_t;
+    type ifconfig_t;
+    type ephemeral_port_t, sysctl_net_t;
+    type systemd_logind_t, systemd_networkd_t, systemd_networkd_unit_file_t;
+    type systemd_resolved_t, systemd_resolved_unit_file_t;
+    type NetworkManager_t, NetworkManager_unit_file_t, NetworkManager_var_run_t;
+')
+
+type yonik_helper_t;
+type yonik_helper_exec_t;
+init_daemon_domain(yonik_helper_t, yonik_helper_exec_t)
+
+type yonik_helper_run_t;
+files_pid_file(yonik_helper_run_t)
+
+allow init_t yonik_helper_t:process2 nnp_transition;
+
+manage_dirs_pattern(yonik_helper_t, yonik_helper_run_t, yonik_helper_run_t)
+manage_files_pattern(yonik_helper_t, yonik_helper_run_t, yonik_helper_run_t)
+allow init_t yonik_helper_run_t:dir manage_dir_perms;
+type_transition init_t var_run_t:dir yonik_helper_run_t "yonik";
+type_transition init_t var_run_t:dir yonik_helper_run_t "yonik-dhcp-sleep";
+
+type yonik_dhcp_lock_t;
+files_pid_file(yonik_dhcp_lock_t)
+type_transition yonik_helper_t yonik_helper_run_t:file yonik_dhcp_lock_t "dhcp-writer.lock";
+allow yonik_helper_t yonik_dhcp_lock_t:file { create getattr open read lock };
+# nft удерживает тот же дескриптор даже после аварийного выхода helper.
+allow iptables_t yonik_helper_t:fd use;
+allow iptables_t yonik_dhcp_lock_t:file { getattr read };
+
+type yonik_sleep_config_t;
+systemd_unit_file(yonik_sleep_config_t)
+allow yonik_helper_t yonik_sleep_config_t:file read_file_perms;
+# sleep.target принадлежит системному пакету. Helper только сверяет связи unit.
+allow yonik_helper_t power_unit_file_t:service status;
+
+type yonik_helper_state_t;
+files_type(yonik_helper_state_t)
+
+manage_dirs_pattern(yonik_helper_t, yonik_helper_state_t, yonik_helper_state_t)
+manage_files_pattern(yonik_helper_t, yonik_helper_state_t, yonik_helper_state_t)
+allow init_t yonik_helper_state_t:dir manage_dir_perms;
+type_transition init_t var_lib_t:dir yonik_helper_state_t "yonik";
+
+# Хранилище открывается по дескрипторам каталогов и подтверждает имя через fsync родителя.
+files_search_var_lib(yonik_helper_t)
+allow yonik_helper_t { var_t var_lib_t }:dir { getattr open read };
+
+allow yonik_helper_t self:capability net_admin;
+allow yonik_helper_t self:netlink_route_socket { create_netlink_socket_perms nlmsg_read };
+allow yonik_helper_t self:unix_stream_socket create_stream_socket_perms;
+allow yonik_helper_t self:tcp_socket create_stream_socket_perms;
+allow yonik_helper_t self:udp_socket create_socket_perms;
+allow yonik_helper_t self:fifo_file rw_fifo_file_perms;
+allow yonik_helper_t self:process { getcap setcap signal };
+
+corenet_rw_tun_tap_dev(yonik_helper_t)
+dev_read_urand(yonik_helper_t)
+dev_rw_null(yonik_helper_t)
+files_search_pids(yonik_helper_t)
+fs_read_cgroup_files(yonik_helper_t)
+fs_list_cgroup_dirs(yonik_helper_t)
+fs_getattr_cgroup(yonik_helper_t)
+fs_read_nsfs_files(yonik_helper_t)
+kernel_read_system_state(yonik_helper_t)
+kernel_read_network_state(yonik_helper_t)
+auth_use_nsswitch(yonik_helper_t)
+sysnet_read_config(yonik_helper_t)
+miscfiles_read_localization(yonik_helper_t)
+
+dbus_system_bus_client(yonik_helper_t)
+dbus_acquire_svc_system_dbusd(yonik_helper_t)
+init_dbus_chat(yonik_helper_t)
+allow yonik_helper_t init_t:system status;
+init_use_fds(yonik_helper_t)
+policykit_dbus_chat(yonik_helper_t)
+systemd_chat_resolved(yonik_helper_t)
+networkmanager_dbus_chat(yonik_helper_t)
+
+# Снимок DHCP сверяет D-Bus, cgroup службы и сокет UDP в ядре.
+allow yonik_helper_t systemd_networkd_t:dbus send_msg;
+allow systemd_networkd_t yonik_helper_t:dbus send_msg;
+allow yonik_helper_t systemd_networkd_unit_file_t:service status;
+allow yonik_helper_t systemd_networkd_t:dir search;
+allow yonik_helper_t systemd_networkd_t:file { open read };
+allow yonik_helper_t NetworkManager_unit_file_t:service status;
+allow yonik_helper_t NetworkManager_t:dir search;
+allow yonik_helper_t NetworkManager_t:file { open read };
+# Helper открывает каталог NetworkManager при чтении доверенного файла DNS.
+# Inotify отслеживает замену файла и симлинка через их родительские каталоги.
+allow yonik_helper_t NetworkManager_var_run_t:dir { getattr open read search watch };
+allow yonik_helper_t etc_t:dir watch;
+# Привязка DoT сверяет статус юнита и читает cgroup и stat процесса resolved.
+allow yonik_helper_t systemd_resolved_unit_file_t:service status;
+allow yonik_helper_t systemd_resolved_t:dir search;
+allow yonik_helper_t systemd_resolved_t:file { open read };
+allow yonik_helper_t self:netlink_tcpdiag_socket { create getattr ioctl setopt write read nlmsg_read };
+# SIOCGSKNS и fstatfs подтверждают сетевое пространство сокета.
+allowxperm yonik_helper_t self:netlink_tcpdiag_socket ioctl 0x894c;
+allow yonik_helper_t nsfs_t:filesystem getattr;
+# Сверка числового inode cgroup читает правило через NFT_MSG_GETRULE.
+allow yonik_helper_t self:netlink_netfilter_socket { create bind getattr write read };
+
+# Перед сном logind ждёт закрытия возвращённого им дескриптора inhibitor.
+allow yonik_helper_t systemd_logind_t:dbus send_msg;
+allow systemd_logind_t yonik_helper_t:dbus send_msg;
+systemd_use_fds_logind(yonik_helper_t)
+systemd_write_inhibit_pipes(yonik_helper_t)
+
+iptables_domtrans(yonik_helper_t)
+allow yonik_helper_t iptables_t:process2 nnp_transition;
+sysnet_domtrans_ifconfig(yonik_helper_t)
+sysnet_nnp_domtrans_ifconfig(yonik_helper_t)
+
+type yonik_helper_tmpfs_t;
+files_tmpfs_file(yonik_helper_tmpfs_t)
+allow yonik_helper_t yonik_helper_tmpfs_t:file manage_file_perms;
+fs_tmpfs_filetrans(yonik_helper_t, yonik_helper_tmpfs_t, file)
+
+type yonik_worker_unit_t;
+systemd_unit_file(yonik_worker_unit_t)
+allow yonik_helper_t systemd_unit_file_t:dir { getattr open read search };
+allow yonik_helper_t yonik_worker_unit_t:file read_file_perms;
+allow yonik_helper_t yonik_worker_unit_t:service { start status stop };
+allow yonik_helper_t yonik_worker_unit_t:dir { getattr open read search };
+allow yonik_helper_t yonik_worker_unit_t:lnk_file read_lnk_file_perms;
+
+type yonik_worker_run_t;
+files_pid_file(yonik_worker_run_t)
+allow init_t yonik_worker_run_t:dir manage_dir_perms;
+allow init_t yonik_worker_run_t:sock_file manage_sock_file_perms;
+type_transition init_t var_run_t:dir yonik_worker_run_t "yonik-worker";
+allow yonik_helper_t yonik_worker_run_t:dir { getattr open read search };
+stream_connect_pattern(yonik_helper_t, yonik_worker_run_t, yonik_worker_run_t, init_t)
+
+# Проверка stdout/stderr через fstatfs подтверждает тип pipefs.
+allow yonik_helper_t fs_t:filesystem getattr;
+
+type yonik_worker_t;
+type yonik_worker_exec_t;
+init_daemon_domain(yonik_worker_t, yonik_worker_exec_t)
+allow init_t yonik_worker_t:process2 nnp_transition;
+
+# Открытые на запись каналы ApplyOutputV1 проверяет помощник перед передачей.
+allow yonik_worker_t initrc_t:fifo_file { getattr write };
+allow yonik_worker_t unconfined_t:fifo_file { getattr write };
+allow yonik_worker_t init_t:fifo_file { getattr write };
+allow yonik_worker_t { initrc_t unconfined_t }:fd use;
+
+# Worker получает запечатанные memfd через собственный UNIX-сокет.
+# SELinux проверяет режим O_RDWR при получении FD, запись блокируют seals.
+allow yonik_worker_t yonik_helper_t:fd use;
+allow yonik_worker_t yonik_helper_tmpfs_t:file { getattr read write map execute execute_no_trans };
+allow yonik_worker_t fs_t:filesystem getattr;
+allow yonik_worker_t self:capability net_admin;
+allow yonik_worker_t self:process { getcap setcap signal };
+allow yonik_worker_t self:unix_stream_socket create_stream_socket_perms;
+allow yonik_worker_t self:tcp_socket create_stream_socket_perms;
+allow yonik_worker_t self:udp_socket create_socket_perms;
+allow yonik_worker_t self:netlink_route_socket { create_netlink_socket_perms nlmsg_read };
+allow yonik_worker_t self:fifo_file rw_fifo_file_perms;
+allow yonik_worker_t init_t:unix_stream_socket rw_stream_socket_perms;
+allow yonik_helper_t yonik_worker_t:dir { read search getattr open };
+allow yonik_helper_t yonik_worker_t:file read_file_perms;
+
+corenet_rw_tun_tap_dev(yonik_worker_t)
+dev_rw_null(yonik_worker_t)
+dev_read_urand(yonik_worker_t)
+auth_use_nsswitch(yonik_worker_t)
+sysnet_read_config(yonik_worker_t)
+kernel_read_system_state(yonik_worker_t)
+kernel_read_network_state(yonik_worker_t)
+fs_read_nsfs_files(yonik_worker_t)
+init_use_fds(yonik_worker_t)
+corenet_tcp_connect_all_ports(yonik_worker_t)
+corenet_tcp_bind_all_unreserved_ports(yonik_worker_t)
+corenet_udp_bind_all_unreserved_ports(yonik_worker_t)
+corenet_tcp_bind_generic_node(yonik_worker_t)
+corenet_udp_bind_generic_node(yonik_worker_t)
+allow yonik_helper_t yonik_worker_exec_t:file read_file_perms;
+allow yonik_helper_t yonik_worker_t:unix_stream_socket connectto;
+
+# Worker создаёт свою проверенную копию ядра и конфигурации в memfd.
+type yonik_worker_tmpfs_t;
+files_tmpfs_file(yonik_worker_tmpfs_t)
+allow yonik_worker_t yonik_worker_tmpfs_t:file { manage_file_perms map execute execute_no_trans };
+fs_tmpfs_filetrans(yonik_worker_t, yonik_worker_tmpfs_t, file)
+
+# ip создаёт постоянный TUN, worker присоединяет свою очередь к нему.
+allow yonik_worker_t ifconfig_t:tun_socket relabelfrom;
+allow yonik_worker_t self:tun_socket { relabelto attach_queue };
+
+# Локальный мост Fake-IP соединяется с worker через порт, выбранный ядром.
+allow yonik_helper_t ephemeral_port_t:tcp_socket name_connect;
+allow yonik_worker_t sysctl_net_t:dir search;
+allow yonik_worker_t sysctl_net_t:file read_file_perms;

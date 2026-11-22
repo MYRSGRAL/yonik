@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+[ -z "${DPKG_ROOT:-}" ] || exit 0
+case "$1" in
+    remove)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload
+        fi
+        ;;
+    purge) ;;
+    *) exit 0 ;;
+esac
+if [ -d /run/yonik-package-maintenance ]; then
+    rmdir -- /run/yonik-package-maintenance
+fi

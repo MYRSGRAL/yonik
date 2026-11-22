@@ -395,6 +395,14 @@
       "retryable": false
     },
     {
+      "code": "FAKE_DNS_POLICY",
+      "message_key": "fake_dns_policy",
+      "ru": "Для Fake DNS выберите «Прокси» по умолчанию. Доменные правила должны входить в указанные суффиксы.",
+      "en": "Select Proxy as the default for Fake DNS. Domain rules must be covered by the configured suffixes.",
+      "stage": "operation",
+      "retryable": false
+    },
+    {
       "code": "BROAD",
       "message_key": "broad",
       "ru": "Подтвердите правило для любого трафика",

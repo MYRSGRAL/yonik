@@ -1,6 +1,7 @@
 //! Не ptrace и не generic ioctl: actual socket → retained network namespace FD.
 use std::{
     io,
+    num::NonZeroU32,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
 };
 trait Ops<S> {
@@ -48,9 +49,125 @@ impl Ops<BorrowedFd<'_>> for Kernel {
 pub fn socket_namespace(socket: impl AsFd) -> io::Result<OwnedFd> {
     checked(&Kernel, &socket.as_fd())
 }
+/// Закрепляет процесс, связанный ядром с подключённым Unix stream.
+pub fn unix_peer_pidfd(socket: impl AsFd) -> io::Result<OwnedFd> {
+    let fd = socket.as_fd();
+    if rustix::net::sockopt::socket_domain(fd)? != rustix::net::AddressFamily::UNIX
+        || rustix::net::sockopt::socket_type(fd)? != rustix::net::SocketType::STREAM
+        || rustix::net::getpeername(fd)?.is_none()
+    {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let peer = unix_peer_raw::pidfd(fd)?;
+    if !rustix::io::fcntl_getfd(&peer)?.contains(rustix::io::FdFlags::CLOEXEC) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(peer)
+}
+
+#[allow(unsafe_code)]
+mod unix_peer_raw {
+    use std::{
+        io,
+        os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    };
+
+    pub(super) fn pidfd(socket: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+        let expected = size_of::<libc::c_int>() as libc::socklen_t;
+        let mut length = expected;
+        let mut raw: libc::c_int = -1;
+        // SAFETY: SO_PEERPIDFD возвращает новый FD в одном c_int.
+        // Оба указателя ведут на инициализированные значения нужного размера.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERPIDFD,
+                (&raw mut raw).cast(),
+                &raw mut length,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if raw < 0 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // SAFETY: при успешном getsockopt ядро выдало этот FD текущему процессу.
+        let peer = unsafe { OwnedFd::from_raw_fd(raw) };
+        if length != expected {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(peer)
+    }
+}
+
+#[cfg(test)]
+mod unix_peer_tests {
+    use super::*;
+    use std::{
+        fs,
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
+
+    #[test]
+    fn pidfd_belongs_to_the_peer_of_an_actual_stream() -> io::Result<()> {
+        let (stream, _peer) = UnixStream::pair()?;
+        let pidfd = match unix_peer_pidfd(&stream) {
+            Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => return Ok(()),
+            result => result?,
+        };
+        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?;
+        assert!(
+            info.lines()
+                .any(|line| line == format!("Pid:\t{}", std::process::id()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_non_stream_socket() -> io::Result<()> {
+        let datagram = std::os::unix::net::UnixDatagram::unbound()?;
+        assert_eq!(
+            unix_peer_pidfd(datagram)
+                .expect_err("Требуется Unix stream")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        Ok(())
+    }
+}
+
 /// Только чтение SO_MARK actual profile socket; не general getsockopt API.
 pub fn profile_socket_mark(socket: impl AsFd) -> io::Result<u32> {
     udp_raw::mark(socket.as_fd())
+}
+/// Устанавливает и перечитывает SO_MARK нового IP-сокета до connect.
+pub fn mark_unconnected_dns_socket(socket: impl AsFd, mark: NonZeroU32) -> io::Result<()> {
+    let fd = socket.as_fd();
+    ensure_unconnected(fd)?;
+    udp_raw::mark_dns(fd, mark)
+}
+
+/// Привязывает новый DNS-сокет к подтверждённому индексу интерфейса.
+/// Существующая привязка и метка не могут быть заменены.
+/// При ошибке вызывающий закрывает сокет.
+pub fn bind_unconnected_private_dns_socket(
+    socket: impl AsFd,
+    ifindex: NonZeroU32,
+    mark: u32,
+) -> io::Result<()> {
+    let fd = socket.as_fd();
+    ensure_unconnected(fd)?;
+    udp_raw::bind_private_dns(fd, ifindex, mark)
+}
+
+fn ensure_unconnected(fd: BorrowedFd<'_>) -> io::Result<()> {
+    match rustix::net::getpeername(fd) {
+        Ok(None) | Err(rustix::io::Errno::NOTCONN) => Ok(()),
+        Ok(Some(_)) => Err(io::ErrorKind::AlreadyExists.into()),
+        Err(error) => Err(error.into()),
+    }
 }
 /// Consuming close ровно двух retained handles. Даже EINTR не повторяется:
 /// numeric FD после close больше не принадлежит caller. Ошибка означает Unknown.
@@ -148,7 +265,7 @@ fn udp_ancillary(bytes: &[u8]) -> io::Result<u32> {
 }
 #[allow(unsafe_code)]
 mod udp_raw {
-    use super::{UdpPeek, io, udp_ancillary};
+    use super::{NonZeroU32, UdpPeek, io, udp_ancillary};
     use std::os::fd::{AsRawFd, BorrowedFd};
     fn option(fd: BorrowedFd<'_>, level: i32, name: i32) -> io::Result<i32> {
         let mut value = 0i32;
@@ -189,6 +306,64 @@ mod udp_raw {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+    fn validate_dns_socket(fd: BorrowedFd<'_>) -> io::Result<()> {
+        let domain = option(fd, libc::SOL_SOCKET, libc::SO_DOMAIN)?;
+        let socket_type = option(fd, libc::SOL_SOCKET, libc::SO_TYPE)?;
+        let protocol = option(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL)?;
+        if !matches!(domain, libc::AF_INET | libc::AF_INET6)
+            || !matches!(
+                (socket_type, protocol),
+                (libc::SOCK_DGRAM, libc::IPPROTO_UDP) | (libc::SOCK_STREAM, libc::IPPROTO_TCP)
+            )
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(())
+    }
+    pub(super) fn mark_dns(fd: BorrowedFd<'_>, value: NonZeroU32) -> io::Result<()> {
+        validate_dns_socket(fd)?;
+        set_dns_mark(fd, value.get())
+    }
+    fn set_dns_mark(fd: BorrowedFd<'_>, value: u32) -> io::Result<()> {
+        let current = mark(fd)?;
+        if current != 0 && current != value {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        if value == 0 {
+            return Ok(());
+        }
+        set(fd, libc::SOL_SOCKET, libc::SO_MARK, value as i32)?;
+        if mark(fd)? != value {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(())
+    }
+    pub(super) fn bind_private_dns(
+        fd: BorrowedFd<'_>,
+        ifindex: NonZeroU32,
+        value: u32,
+    ) -> io::Result<()> {
+        // Linux UAPI asm-generic/socket.h и отдельный UAPI SPARC.
+        #[cfg(not(any(target_arch = "sparc", target_arch = "sparc64")))]
+        const SO_BINDTOIFINDEX: i32 = 62;
+        #[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+        const SO_BINDTOIFINDEX: i32 = 0x0041;
+        validate_dns_socket(fd)?;
+        let index = i32::try_from(ifindex.get()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let current_mark = mark(fd)?;
+        if current_mark != 0 && current_mark != value {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        match option(fd, libc::SOL_SOCKET, SO_BINDTOIFINDEX)? {
+            0 => set(fd, libc::SOL_SOCKET, SO_BINDTOIFINDEX, index)?,
+            current if current == index => {}
+            _ => return Err(io::ErrorKind::InvalidInput.into()),
+        }
+        if option(fd, libc::SOL_SOCKET, SO_BINDTOIFINDEX)? != index {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        set_dns_mark(fd, value)
     }
     fn socket(fd: BorrowedFd<'_>) -> io::Result<()> {
         if option(fd, libc::SOL_SOCKET, libc::SO_TYPE)? != libc::SOCK_DGRAM

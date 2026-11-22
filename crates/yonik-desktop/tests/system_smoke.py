@@ -29,6 +29,8 @@ def fixture(address: str, scenario: str, log: Path) -> None:
     bus = dbus.bus.BusConnection(address)
     _name = dbus.service.BusName(NAME, bus)
     state = "no_managed_policy"
+    revoke_first_session = scenario in ("reconnect-retained", "reconnect-state-unknown")
+    revoke_unconfirmed = scenario == "reconnect-state-unknown"
 
     def record(method: str) -> None:
         with log.open("a") as stream:
@@ -75,12 +77,17 @@ def fixture(address: str, scenario: str, log: Path) -> None:
                 ok(json.dumps(dict(version=1, handle=[42] * 32)))
 
         @dbus.service.method(
-            NAME, in_signature="s", out_signature="s", async_callbacks=("ok", "error")
+            NAME, in_signature="sah", out_signature="s", async_callbacks=("ok", "error")
         )
-        def Apply(self, request: str, ok: object, error: object) -> None:
+        def ApplyOutputV1(
+            self, request: str, output: list, ok: object, error: object
+        ) -> None:
             nonlocal state
             record("Apply")
             assert json.loads(request)["handle"] == [42] * 32
+            assert len(output) == 2
+            for writer in output:
+                os.close(writer.take())
             state = "tunnel_starting"
             if scenario == "owner":
                 GLib.timeout_add(
@@ -103,8 +110,15 @@ def fixture(address: str, scenario: str, log: Path) -> None:
             NAME, in_signature="s", out_signature="s", async_callbacks=("ok", "error")
         )
         def State(self, request: str, ok: object, error: object) -> None:
-            nonlocal state
+            nonlocal state, revoke_first_session, revoke_unconfirmed
             record("State")
+            if revoke_first_session and state == "tunnel_starting":
+                if revoke_unconfirmed:
+                    revoke_unconfirmed = False
+                    ok(json.dumps(dict(version=1, state="unknown")))
+                    return
+                revoke_first_session = False
+                state = "recovery_required"
             if scenario.startswith("retained-") and state == "verified_rules":
                 if scenario == "retained-timeout-unlock":
                     GLib.timeout_add(
@@ -152,7 +166,9 @@ def fixture(address: str, scenario: str, log: Path) -> None:
                 "unknown"
                 if scenario == "stopunknown"
                 else (
-                    "recovery_required" if scenario == "recovery" else "verified_rules"
+                    "recovery_required"
+                    if scenario in ("recovery", "reconnect-retained", "reconnect-state-unknown")
+                    else "verified_rules"
                 )
             )
             return json.dumps(dict(version=1, state=state))
@@ -268,6 +284,48 @@ def run(binary: Path, output: Path, scenario: str) -> None:
                     {"when": {"status": "TunnelStarting"}, "command": {"command": "stop"}},
                     {"when": {"status": "VerifiedRules", "can_stop": False}, "command": {"command": "system_unlock"}},
                     {"when": {"system_state": "NoManagedPolicy", "system_busy": False}, "command": {"command": "shutdown"}},
+                ]
+            elif scenario in ("reconnect-retained", "reconnect-state-unknown"):
+                if scenario == "reconnect-state-unknown":
+                    steps.append(
+                        ui(
+                            "key",
+                            "mainConnectButton",
+                            key="Tab",
+                            when={
+                                "system_state": "Unknown",
+                                "system_busy": False,
+                                "can_stop": True,
+                                "can_connect": False,
+                            },
+                        )
+                    )
+                steps += [
+                    ui(
+                        "click",
+                        "mainConnectButton",
+                        when={
+                            "system_state": "RecoveryRequired",
+                            "system_busy": False,
+                            "can_connect": True,
+                            "can_stop": False,
+                            "can_unlock": True,
+                        },
+                    ),
+                    ui(
+                        "click",
+                        "mainConnectButton",
+                        when={"system_state": "TunnelStarting", "can_stop": True},
+                    ),
+                    {
+                        "when": {
+                            "system_state": "RecoveryRequired",
+                            "system_busy": False,
+                            "can_stop": False,
+                            "can_unlock": True,
+                        },
+                        "command": {"command": "shutdown"},
+                    },
                 ]
             elif scenario == "shutdown":
                 steps += [
@@ -478,6 +536,12 @@ def run(binary: Path, output: Path, scenario: str) -> None:
                 assert "Prepare" in calls and "Apply" not in calls
             if scenario == "normal":
                 assert calls.count("Prepare") == 2 and calls.count("Apply") == 2
+            if scenario in ("reconnect-retained", "reconnect-state-unknown"):
+                assert [
+                    method
+                    for method in calls
+                    if method in ("Prepare", "Apply", "Stop", "Unlock")
+                ] == ["Prepare", "Apply", "Prepare", "Apply", "Stop"]
             if scenario == "unsupported":
                 assert (
                     "Prepare" not in calls
@@ -517,6 +581,8 @@ if __name__ == "__main__":
             "shutdown",
             "owner",
             "recovery",
+            "reconnect-retained",
+            "reconnect-state-unknown",
             "stopunknown",
             "timeout",
             "retained-error-unlock",

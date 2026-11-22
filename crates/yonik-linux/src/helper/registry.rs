@@ -1512,10 +1512,11 @@ mod tests {
         };
         serde_json::json!({"engine":name,"version":engine.version(),"sha256":format!("{:x}",Hasher::digest(ELF))})
     }
-    fn bytes(snapshot: &mut BinarySnapshot) -> Vec<u8> {
-        snapshot.file.seek(SeekFrom::Start(0)).unwrap();
+    fn bytes(snapshot: &BinarySnapshot) -> Vec<u8> {
+        let mut file = snapshot.file();
+        file.seek(SeekFrom::Start(0)).unwrap();
         let mut bytes = Vec::new();
-        snapshot.file.read_to_end(&mut bytes).unwrap();
+        file.read_to_end(&mut bytes).unwrap();
         bytes
     }
 
@@ -1529,17 +1530,17 @@ mod tests {
                 .err(),
             Some(RegistryError::MissingEngine)
         );
-        let mut image = registry
+        let image = registry
             .snapshot_for_uid(Engine::Xray, fixture.uid())
             .unwrap();
-        assert_eq!(bytes(&mut image), ELF);
-        assert!(image.file.write_all(b"replace").is_err());
+        assert_eq!(bytes(&image), ELF);
+        assert!(image.file().write_all(b"replace").is_err());
         fixture
             .manifest(&serde_json::json!({"schema":1,"engines":[entry("xray"),entry("sing-box")]}));
         let registry = fixture.registry().unwrap();
         for engine in [Engine::Xray, Engine::SingBox] {
             assert_eq!(
-                bytes(&mut registry.snapshot_for_uid(engine, fixture.uid()).unwrap()),
+                bytes(&registry.snapshot_for_uid(engine, fixture.uid()).unwrap()),
                 ELF
             );
         }
@@ -1557,12 +1558,12 @@ mod tests {
             .snapshot_with_budget(Engine::Xray, fixture.uid(), &budget)
             .unwrap();
         assert_eq!(
-            first.file.metadata().unwrap().ino(),
-            second.file.metadata().unwrap().ino()
+            first.file().metadata().unwrap().ino(),
+            second.file().metadata().unwrap().ino()
         );
         assert_eq!(
-            first.file.metadata().unwrap().dev(),
-            second.file.metadata().unwrap().dev()
+            first.file().metadata().unwrap().dev(),
+            second.file().metadata().unwrap().dev()
         );
         assert_eq!(budget.used(), ELF.len());
         let weak = first.weak_image();
@@ -1596,9 +1597,9 @@ mod tests {
                 }));
             }
             let snapshots: Vec<_> = tasks.into_iter().map(|task| task.join().unwrap()).collect();
-            let first = snapshots[0].file.metadata().unwrap();
+            let first = snapshots[0].file().metadata().unwrap();
             for snapshot in &snapshots {
-                let metadata = snapshot.file.metadata().unwrap();
+                let metadata = snapshot.file().metadata().unwrap();
                 assert_eq!((metadata.dev(), metadata.ino()), (first.dev(), first.ino()));
             }
             assert_eq!(budget.used(), ELF.len());
@@ -1642,7 +1643,7 @@ mod tests {
     fn live_cache_never_bypasses_source_trust_or_replacement_hash() {
         let fixture = Fixture::new();
         let registry = fixture.registry().unwrap();
-        let mut image = registry
+        let image = registry
             .snapshot_for_uid(Engine::Xray, fixture.uid())
             .unwrap();
         fixture.mode("xray", 0o722);
@@ -1663,14 +1664,14 @@ mod tests {
             registry.snapshot_for_uid(Engine::Xray, fixture.uid()).err(),
             Some(RegistryError::HashMismatch)
         );
-        assert_eq!(bytes(&mut image), ELF);
+        assert_eq!(bytes(&image), ELF);
         fixture.binary("xray", ELF);
         let replacement = registry
             .snapshot_for_uid(Engine::Xray, fixture.uid())
             .unwrap();
         assert_ne!(
-            image.file.metadata().unwrap().ino(),
-            replacement.file.metadata().unwrap().ino()
+            image.file().metadata().unwrap().ino(),
+            replacement.file().metadata().unwrap().ino()
         );
         let mut changed = ELF.to_vec();
         *changed.last_mut().unwrap() ^= 1;
@@ -1853,8 +1854,8 @@ mod tests {
         let renamed = fixture.0.with_extension("renamed");
         fs::rename(&fixture.0, &renamed).unwrap();
         fs::create_dir(&fixture.0).unwrap();
-        let mut image = registry.snapshot_for_uid(Engine::Xray, uid).unwrap();
-        assert_eq!(bytes(&mut image), ELF);
+        let image = registry.snapshot_for_uid(Engine::Xray, uid).unwrap();
+        assert_eq!(bytes(&image), ELF);
         fs::remove_dir(&fixture.0).unwrap();
         fs::rename(&renamed, &fixture.0).unwrap();
 
@@ -1862,12 +1863,12 @@ mod tests {
         regular_metadata(&source, uid, BinarySnapshot::MAX_SIZE, true).unwrap();
         fs::rename(fixture.0.join("xray"), fixture.0.join("old")).unwrap();
         fixture.binary("xray", b"\x7fELFreplacement");
-        let mut from_fd =
+        let from_fd =
             BinarySnapshot::load_file(source, registry.entries[0].hash, Engine::Xray).unwrap();
-        assert_eq!(bytes(&mut from_fd), ELF);
+        assert_eq!(bytes(&from_fd), ELF);
         fixture.binary("old", b"\x7fELFafter snapshot");
-        assert_eq!(bytes(&mut image), ELF);
-        assert_eq!(bytes(&mut from_fd), ELF);
+        assert_eq!(bytes(&image), ELF);
+        assert_eq!(bytes(&from_fd), ELF);
         assert_eq!(
             registry.snapshot_for_uid(Engine::Xray, uid).err(),
             Some(RegistryError::HashMismatch)

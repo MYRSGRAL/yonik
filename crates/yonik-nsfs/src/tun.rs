@@ -1,6 +1,12 @@
 //! Только три согласованных fixed ioctl. Queue не передаёт owning FD и не реализует Clone.
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu")))]
-compile_error!("TUN wrapper проверен только для Linux x86_64 GNU");
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_pointer_width = "64",
+    target_endian = "little",
+    target_env = "gnu"
+)))]
+compile_error!("TUN wrapper требует проверенный Linux GNU ABI x86_64 или AArch64");
 use std::{
     fs::{File, OpenOptions},
     io,
@@ -109,7 +115,8 @@ mod kernel {
     pub(super) fn attach(queue: &File, name: &str, framing: Framing) -> Result<()> {
         let mut r = Ifreq::new(name)?;
         r.data[..2].copy_from_slice(&framing.flags().to_ne_bytes());
-        // SAFETY: x86_64 Linux ifreq 40 bytes, writable, pointer lives through ioctl.
+        // SAFETY: на поддерживаемых ABI Linux ifreq занимает 40 байт.
+        // Указатель доступен для записи и живёт до возврата ioctl.
         if unsafe { libc::ioctl(queue.as_raw_fd(), 0x400454ca, &mut r) } < 0 {
             return Err(io::Error::last_os_error());
         }

@@ -40,7 +40,11 @@ package() {
     install -Dm755 "$CARGO_TARGET_DIR/release/yonik-desktop" "$pkgdir/usr/bin/yonik-desktop"
     install -Dm755 "$CARGO_TARGET_DIR/release/yonik-helper" "$pkgdir/usr/lib/yonik/yonik-helper"
     install -Dm755 "$CARGO_TARGET_DIR/release/yonik-worker" "$pkgdir/usr/lib/yonik/yonik-worker"
-    install -Dm644 packaging/systemd/* -t "$pkgdir/usr/lib/systemd/system/"
+    install -Dm644 packaging/systemd/*.service packaging/systemd/*.socket -t "$pkgdir/usr/lib/systemd/system/"
+    if test -f packaging/systemd/yonik-dhcp-sleep.service; then
+        install -Dm644 packaging/systemd/sleep.target.d/50-yonik-dhcp-sleep.conf \
+            "$pkgdir/usr/lib/systemd/system/sleep.target.d/50-yonik-dhcp-sleep.conf"
+    fi
     install -Dm644 packaging/sysusers/* -t "$pkgdir/usr/lib/sysusers.d/"
     install -Dm644 packaging/dbus/*.conf -t "$pkgdir/usr/share/dbus-1/system.d/"
     install -Dm644 packaging/dbus/*.service -t "$pkgdir/usr/share/dbus-1/system-services/"

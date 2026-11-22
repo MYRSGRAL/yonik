@@ -4,6 +4,12 @@
 //! `PeerIdentity` — снимок, а не разрешение на будущий Apply: перед каждым
 //! Prepare/Apply нужна новая проверка непосредственно перед эффектами.
 
+mod dhcp_dhcpcd_control;
+#[cfg(test)]
+mod dhcp_dhcpcd_vm_tests;
+pub mod dhcp_networkd;
+pub(crate) mod dhcp_sleep;
+pub use dhcp_sleep::quiesce_dhcp_before_sleep;
 pub mod fence;
 mod kernel_evidence;
 pub(crate) mod native_bootstrap;
@@ -12,10 +18,23 @@ pub(crate) mod native_profile_channel;
 pub mod profile_intent;
 mod protection_host;
 pub(crate) mod resolver_stub;
+mod session_fake_dns;
 mod session_network;
+mod session_supervisor;
+mod standalone_launcher;
+mod standalone_mounts;
+mod standalone_seccomp;
+mod standalone_supervisor;
 pub use session_network::SessionNetworkPlan;
+pub use standalone_launcher::{
+    launch_standalone_sandbox, launch_standalone_worker, standalone_sandbox_argument,
+    standalone_worker_argument,
+};
 pub(crate) mod run_authorization;
+pub(crate) mod systemd_network_service;
 mod systemd_worker;
+mod worker_identity;
+mod worker_paths;
 pub use protection_host::SystemProtectionHost as SystemSessionHost;
 pub use protection_host::{GuardArtifact, SystemProtectionHost};
 pub use systemd_worker::{
@@ -225,6 +244,25 @@ impl PeerAuthorizer {
         })
     }
 
+    async fn activate_authority(
+        &self,
+        cancel: &mut Cancellation,
+    ) -> Result<(), AuthorizationError> {
+        bounded(cancel, Instant::now() + SETUP_TIMEOUT, async {
+            let daemon = zbus::fdo::DBusProxy::new(&self.connection)
+                .await
+                .map_err(|_| AuthorizationError::Unavailable)?;
+            let authority = zbus::names::WellKnownName::try_from(AUTHORITY)
+                .map_err(|_| AuthorizationError::InvalidReply)?;
+            daemon
+                .start_service_by_name(authority, 0)
+                .await
+                .map_err(|_| AuthorizationError::Unavailable)?;
+            self.trusted_owner().await.map(|_| ())
+        })
+        .await
+    }
+
     /// `message` должен происходить из входящего вызова доверенного server transport.
     /// UID из тела сообщения никогда не используется. Details всегда пусты.
     pub async fn authorize(
@@ -249,11 +287,7 @@ impl PeerAuthorizer {
         .await?;
         let (uid, owner) = bounded(&mut cancel, setup_deadline(deadline), async {
             let uid = self.uid(&sender).await?;
-            let owner = self.owner().await?;
-            let authority_uid = self.uid(&owner).await?;
-            if authority_uid != 0 && authority_uid != self.expected_authority_uid {
-                return Err(AuthorizationError::UntrustedAuthority);
-            }
+            let owner = self.trusted_owner().await?;
             Ok((uid, owner))
         })
         .await?;
@@ -404,6 +438,15 @@ impl PeerAuthorizer {
             .and_then(|v| u32::try_from(v).ok())
             .filter(|pid| *pid != 0)
             .ok_or(AuthorizationError::PeerGone)
+    }
+
+    async fn trusted_owner(&self) -> Result<String, AuthorizationError> {
+        let owner = self.owner().await?;
+        let uid = self.uid(&owner).await?;
+        if uid != 0 && uid != self.expected_authority_uid {
+            return Err(AuthorizationError::UntrustedAuthority);
+        }
+        Ok(owner)
     }
 
     async fn owner(&self) -> Result<String, AuthorizationError> {

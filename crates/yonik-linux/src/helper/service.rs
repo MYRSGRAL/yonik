@@ -1,6 +1,6 @@
 //! Ограниченный versioned D-Bus transport: идентичность берётся только у daemon.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,7 @@ pub enum ServiceError {
     Cancelled,
 }
 pub(super) const STOP_WAIT_BOUND: Duration = Duration::from_secs(30);
+const APPLY_CONTEXT_BOUND: Duration = Duration::from_secs(2);
 async fn wait_for_host<'a, H>(
     host: &'a Mutex<H>,
     cancel: &mut Cancellation,
@@ -60,7 +61,7 @@ async fn wait_for_host<'a, H>(
     }
 }
 pub(super) fn busy_at(_stage: &str) -> ServiceError {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if std::env::var_os("YONIK_SESSION_DIAGNOSTICS").as_deref() == Some(std::ffi::OsStr::new("1")) {
         eprintln!("session busy stage={_stage}");
     }
@@ -107,6 +108,8 @@ pub struct SystemProfileRequest {
     pub engine: yonik_engine::Engine,
     pub kill_switch: bool,
     pub policy: Option<yonik_engine::policy_wire::SystemPolicy>,
+    pub(super) fake_dns_domains: Option<Vec<String>>,
+    pub(super) fake_dns_policy_resolver: Option<SocketAddr>,
     pub(crate) peer: Option<Arc<crate::attribution::PeerProcess>>,
 }
 impl std::fmt::Debug for SystemProfileRequest {
@@ -130,6 +133,9 @@ pub struct BundleDigests {
 /// Единственный владелец привилегированных эффектов; dispatcher сериализует доступ.
 pub trait ProtectionHost: Send + 'static {
     type Artifact: PreparedArtifact;
+    fn shutdown(&mut self) -> impl Future<Output = Result<(), ServiceError>> + Send {
+        async { Ok(()) }
+    }
     fn prepare_full_profile(
         &mut self,
         _uid: u32,
@@ -148,6 +154,9 @@ pub trait ProtectionHost: Send + 'static {
         }
     }
     fn bundle_transport(&self) -> bool {
+        false
+    }
+    fn system_tun(&self) -> bool {
         false
     }
     fn prepare_bundle(
@@ -173,6 +182,13 @@ pub trait ProtectionHost: Send + 'static {
         async { Err(ServiceError::Unsupported) }
     }
     fn context(&self, uid: u32) -> Result<PreparedContext, ServiceError>;
+    fn context_for_apply(
+        &self,
+        uid: u32,
+        _cancel: Cancellation,
+    ) -> impl Future<Output = Result<PreparedContext, ServiceError>> + Send {
+        std::future::ready(self.context(uid))
+    }
     fn apply(
         &mut self,
         uid: u32,
@@ -245,6 +261,21 @@ struct PolicyProfilePrepareRequest<'a> {
     server: &'a serde_json::value::RawValue,
     #[serde(borrow)]
     policy: &'a serde_json::value::RawValue,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FakeDnsProfilePrepareRequest<'a> {
+    version: u32,
+    mode: String,
+    engine: ProfileEngine,
+    kill_switch: bool,
+    #[serde(borrow)]
+    server: &'a serde_json::value::RawValue,
+    fake_dns_domains: Vec<String>,
+    #[serde(default)]
+    fake_dns_policy_resolver: Option<SocketAddr>,
+    #[serde(default, borrow)]
+    policy: Option<&'a serde_json::value::RawValue>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -365,8 +396,10 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                     }
                     Ok(Request::Prepare(dto.allow_lan))
                 }
-                "system_profile" | "system_profile_policy" => {
-                    let (dto, policy) = if route.mode == "system_profile_policy" {
+                "system_profile" | "system_profile_policy" | "system_profile_fake_dns" => {
+                    let (dto, policy, fake_dns_domains, fake_dns_policy_resolver) = if route.mode
+                        == "system_profile_policy"
+                    {
                         if !yonik_engine::policy_wire::bounded_depth(json, 6)
                             || !json.trim_start().starts_with('{')
                         {
@@ -386,11 +419,48 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                                 server: dto.server,
                             },
                             Some(policy),
+                            None,
+                            None,
+                        )
+                    } else if route.mode == "system_profile_fake_dns" {
+                        let dto: FakeDnsProfilePrepareRequest<'_> =
+                            serde_json::from_str(json).map_err(|_| ServiceError::InvalidRequest)?;
+                        if dto.policy.is_none() && !cfg!(feature = "test-support") {
+                            return Err(ServiceError::Unsupported);
+                        }
+                        if dto.policy.is_none() && dto.fake_dns_policy_resolver.is_some() {
+                            return Err(ServiceError::InvalidRequest);
+                        }
+                        let policy_resolver = dto
+                            .fake_dns_policy_resolver
+                            .map(crate::forward::PolicyProxyResolver::validate_upstream)
+                            .transpose()
+                            .map_err(|_| ServiceError::InvalidRequest)?;
+                        let domains =
+                            super::session_fake_dns::canonical_suffixes(&dto.fake_dns_domains)?;
+                        let policy = dto
+                            .policy
+                            .map(|policy| {
+                                yonik_engine::policy_wire::SystemPolicy::parse(policy.get())
+                            })
+                            .transpose()
+                            .map_err(|_| ServiceError::InvalidRequest)?;
+                        (
+                            ProfilePrepareRequest {
+                                version: dto.version,
+                                mode: dto.mode,
+                                engine: dto.engine,
+                                kill_switch: dto.kill_switch,
+                                server: dto.server,
+                            },
+                            policy,
+                            Some(domains),
+                            policy_resolver,
                         )
                     } else {
                         let dto: ProfilePrepareRequest<'_> =
                             serde_json::from_str(json).map_err(|_| ServiceError::InvalidRequest)?;
-                        (dto, None)
+                        (dto, None, None, None)
                     };
                     let dto: ProfilePrepareRequest<'_> = dto;
                     if dto.version != 1 || dto.mode != route.mode {
@@ -411,6 +481,8 @@ fn parse(message: &Message) -> Result<Request, ServiceError> {
                         engine,
                         kill_switch: dto.kill_switch,
                         policy,
+                        fake_dns_domains,
+                        fake_dns_policy_resolver,
                         peer: None,
                     })))
                 }
@@ -486,6 +558,7 @@ pub(super) async fn serve_with_broker<H: ProtectionHost>(
         .request_name(SERVICE_NAME)
         .await
         .map_err(|_| ServiceError::Unavailable)?;
+    let system_tun = host.system_tun();
     let host = Arc::new(Mutex::new(host));
     let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
     let (stop, worker_cancel) = Cancellation::new();
@@ -509,7 +582,7 @@ pub(super) async fn serve_with_broker<H: ProtectionHost>(
                 let broker = broker.clone(); let host = host.clone(); let peers=Arc::clone(&peers); let child_cancel = worker_cancel.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let result = dispatch(&broker, &host, &peers, &message, child_cancel).await;
+                    let result = dispatch(&broker, &host, &peers, &message, child_cancel, system_tun).await;
                     send_result(broker.connection(), &message, result).await;
                 });
             }
@@ -518,8 +591,9 @@ pub(super) async fn serve_with_broker<H: ProtectionHost>(
     peers.revoke_all();
     let _ = stop.send(true);
     while tasks.join_next().await.is_some() {}
+    let cleanup = host.lock().await.shutdown().await;
     let _ = connection.release_name(SERVICE_NAME).await;
-    result
+    result.and(cleanup)
 }
 
 fn forget_disconnected<A: PreparedArtifact>(
@@ -553,6 +627,7 @@ async fn dispatch<H: ProtectionHost>(
     peers: &PeerTracker,
     message: &Message,
     mut cancel: Cancellation,
+    system_tun: bool,
 ) -> Result<String, ServiceError> {
     let request = parse(message)?;
     let sender = super::sender(message)?;
@@ -591,7 +666,7 @@ async fn dispatch<H: ProtectionHost>(
         }
         Request::Introspect => return Ok(INTROSPECTION.to_owned()),
         Request::Capabilities => {
-            serde_json::json!({"version":1,"public_protection":true,"system_tun":false,"allow_lan":false})
+            serde_json::json!({"version":1,"public_protection":true,"system_tun":system_tun,"allow_lan":false})
         }
         Request::NativePrepareEligibility => {
             cancel.check().map_err(|_| ServiceError::Cancelled)?;
@@ -697,16 +772,26 @@ async fn dispatch<H: ProtectionHost>(
                 _ => None,
             };
             let mut guard = None;
+            let guard_slot = &mut guard;
+            let mut context_cancel = cancel.clone();
             let artifact = broker
-                .claim_for_apply(message, handle, Prompt::Allow, cancel.clone(), || {
-                    let locked = host.try_lock().map_err(|_| {
-                        let _ = busy_at("apply_outer_host");
-                        PreparedError::Capacity
-                    })?;
-                    let context = locked.context(uid).map_err(as_prepared)?;
-                    guard = Some(locked);
-                    Ok(context)
-                })
+                .claim_for_apply_deferred(
+                    message,
+                    handle,
+                    Prompt::Allow,
+                    cancel.clone(),
+                    || async move {
+                        let locked = wait_for_host(host, &mut context_cancel, APPLY_CONTEXT_BOUND)
+                            .await
+                            .map_err(as_prepared)?;
+                        let context = locked
+                            .context_for_apply(uid, context_cancel)
+                            .await
+                            .map_err(as_prepared)?;
+                        *guard_slot = Some(locked);
+                        Ok(context)
+                    },
+                )
                 .await?;
             let mut host = guard.ok_or(ServiceError::Unavailable)?;
             let state = if let Some(output) = output {

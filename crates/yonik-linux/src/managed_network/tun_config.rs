@@ -13,6 +13,8 @@ use std::{
 mod tests;
 
 const ROUTE_PROTOCOL: u8 = 253;
+const RTN_UNICAST: u8 = 1;
+const RTN_THROW: u8 = 9;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TunAddress {
@@ -51,6 +53,7 @@ pub struct TunRoute {
     prefix_len: u8,
     table: u32,
     priority: u32,
+    kind: u8,
 }
 impl TunRoute {
     pub fn new(
@@ -75,7 +78,36 @@ impl TunRoute {
             prefix_len,
             table,
             priority,
+            kind: RTN_UNICAST,
         })
+    }
+    /// Более точный маршрут прерывает поиск в своей таблице. Допуск выхода
+    /// через следующий результат RPDB обязан отдельно ограничивать firewall.
+    pub fn new_throw(
+        destination: IpAddr,
+        prefix_len: u8,
+        table: u32,
+        priority: u32,
+    ) -> Result<Self, TunError> {
+        if prefix_len == 0 {
+            return Err(TunError::Invalid);
+        }
+        let mut route = Self::new(destination, prefix_len, table, priority)?;
+        route.kind = RTN_THROW;
+        Ok(route)
+    }
+    pub(super) fn kind(self) -> u8 {
+        self.kind
+    }
+    pub(super) fn is_throw(self) -> bool {
+        self.kind == RTN_THROW
+    }
+    pub(super) fn scope(self) -> u8 {
+        if self.destination.is_ipv4() && !self.is_throw() {
+            253
+        } else {
+            0
+        }
     }
     pub fn destination(self) -> IpAddr {
         self.destination
@@ -88,6 +120,52 @@ impl TunRoute {
     }
     pub fn priority(self) -> u32 {
         self.priority
+    }
+
+    fn resource(self, tun_id: u64, ifindex: u32) -> Resource {
+        if self.is_throw() {
+            Resource::ThrowRoute {
+                tun_id,
+                ifindex,
+                table: self.table,
+                destination: self.destination,
+                prefix_len: self.prefix_len,
+                priority: self.priority,
+            }
+        } else {
+            Resource::Route {
+                table: self.table,
+                destination: self.destination,
+                prefix_len: self.prefix_len,
+                priority: self.priority,
+                protocol: ROUTE_PROTOCOL,
+                ifindex,
+            }
+        }
+    }
+}
+
+pub(super) fn recorded_route(resource: &Resource, tun_id: u64, index: u32) -> Option<TunRoute> {
+    match *resource {
+        Resource::Route {
+            table,
+            destination,
+            prefix_len,
+            priority,
+            protocol: ROUTE_PROTOCOL,
+            ifindex,
+        } if ifindex == index => TunRoute::new(destination, prefix_len, table, priority).ok(),
+        Resource::ThrowRoute {
+            tun_id: parent,
+            ifindex,
+            table,
+            destination,
+            prefix_len,
+            priority,
+        } if parent == tun_id && ifindex == index => {
+            TunRoute::new_throw(destination, prefix_len, table, priority).ok()
+        }
+        _ => None,
     }
 }
 pub(super) fn ownership(executor: &TunExecutor, journal: &Journal) -> Result<(), TunError> {
@@ -173,7 +251,29 @@ fn observe_address(
     }
     Ok(true)
 }
-pub(super) fn route_matches(value: &LinuxRoute, index: u32, expected: TunRoute) -> bool {
+pub(super) fn loopback_ifindex(topology: &LinuxTopology) -> Option<u32> {
+    let mut indices = topology.links.iter().filter(|link| link.flags & 8 != 0);
+    let first = indices.next()?.index;
+    indices.next().is_none().then_some(first)
+}
+
+pub(super) fn route_matches(
+    value: &LinuxRoute,
+    index: u32,
+    loopback: Option<u32>,
+    expected: TunRoute,
+) -> bool {
+    let output_matches = if expected.is_throw() {
+        if expected.destination.is_ipv4() {
+            value.output_interface.is_none()
+        } else {
+            // Ядро привязывает IPv6 reject nexthop к loopback.
+            loopback.is_some() && value.output_interface == loopback
+        }
+    } else {
+        value.output_interface == Some(index)
+    };
+    let allowed_flags = if expected.is_throw() { 0 } else { 16 };
     value.family
         == if expected.destination.is_ipv4() {
             2
@@ -187,21 +287,16 @@ pub(super) fn route_matches(value: &LinuxRoute, index: u32, expected: TunRoute) 
         && value.table == expected.table
         && value.priority == Some(expected.priority)
         && value.protocol == ROUTE_PROTOCOL
-        && value.output_interface == Some(index)
+        && output_matches
         && value.gateway.is_none()
         && value.preferred_source.is_none()
         && value.input_interface.is_none()
-        && value.kind == 1
-        && value.scope
-            == if expected.destination.is_ipv4() {
-                253
-            } else {
-                0
-            }
+        && value.kind == expected.kind()
+        && value.scope == expected.scope()
         && value.tos == 0
         // LINKDOWN выставляется kernel до открытия очереди engine и снимается
         // при attach; это состояние carrier, а не дополнительный selector.
-        && value.flags & !16 == 0
+        && value.flags & !allowed_flags == 0
         && value.multipath.is_empty()
         && value.nexthop_id.is_none()
         && value.unknown.iter().all(|a| match a.kind {
@@ -223,7 +318,9 @@ fn observe_route(
     let Some(found) = candidates.next() else {
         return Ok(false);
     };
-    if candidates.next().is_some() || !route_matches(found, index, expected) {
+    if candidates.next().is_some()
+        || !route_matches(found, index, loopback_ifindex(topology), expected)
+    {
         return Err(TunError::Foreign);
     }
     Ok(true)
@@ -234,43 +331,40 @@ fn check_route_rules(
     index: u32,
     expected: TunRoute,
 ) -> Result<(), TunError> {
+    if expected.is_throw()
+        && topology
+            .rules
+            .iter()
+            .any(|rule| rule.table == expected.table)
+    {
+        return Err(TunError::Foreign);
+    }
     super::rule::check_references(topology, journal, index, expected.table, None)
 }
 
 fn check_route_table(
     topology: &LinuxTopology,
     journal: &Journal,
+    tun_id: u64,
     index: u32,
     expected: TunRoute,
 ) -> Result<(), TunError> {
     check_route_rules(topology, journal, index, expected)?;
-    let known: BTreeMap<_, _> = journal
-        .records()
-        .iter()
-        .filter_map(|record| {
-            let Resource::Route {
-                table,
-                destination,
-                prefix_len,
-                priority,
-                protocol,
-                ifindex,
-            } = record.resource()
-            else {
-                return None;
-            };
-            if record.scope() != Scope::Session
-                || record.state() != RecordState::Confirmed
-                || *table != expected.table
-                || *protocol != ROUTE_PROTOCOL
-                || *ifindex != index
-            {
-                return None;
+    let mut known = BTreeMap::new();
+    for record in journal.records().iter().filter(|record| {
+        record.scope() == Scope::Session && record.state() == RecordState::Confirmed
+    }) {
+        if let Some(route) = recorded_route(record.resource(), tun_id, index)
+            .filter(|route| route.table == expected.table)
+        {
+            let key = (route.destination, route.prefix_len, route.priority);
+            if known.insert(key, route).is_some() {
+                return Err(TunError::Foreign);
             }
-            let route = TunRoute::new(*destination, *prefix_len, *table, *priority).ok()?;
-            Some(((*destination, *prefix_len, *priority), route))
-        })
-        .collect();
+        }
+    }
+    let loopback = loopback_ifindex(topology);
+    let mut has_anchor = !expected.is_throw();
     for route in topology
         .routes
         .iter()
@@ -288,12 +382,19 @@ fn check_route_table(
         );
         if known
             .get(&key)
-            .is_none_or(|expected| !route_matches(route, index, *expected))
+            .is_none_or(|expected| !route_matches(route, index, loopback, *expected))
         {
             return Err(TunError::Foreign);
         }
+        has_anchor |= route.kind == RTN_UNICAST
+            && route.destination.length == 0
+            && route.destination.address.is_ipv4() == expected.destination.is_ipv4();
     }
-    Ok(())
+    if has_anchor {
+        Ok(())
+    } else {
+        Err(TunError::Evidence)
+    }
 }
 
 fn kernel_link_local(address: &LinuxAddress, index: u32) -> bool {
@@ -615,19 +716,21 @@ impl TunExecutor {
         let before = self.configuration_snapshot().await?;
         let index =
             parent_index(self, journal, tun_id, &before, true)?.ok_or(TunError::Evidence)?;
-        check_route_rules(&before, journal, index, route)?;
+        if route.is_throw() {
+            check_route_table(&before, journal, tun_id, index, route)?;
+            if !journal.records().iter().any(|record| record.id() == id)
+                && observe_route(&before, index, route)?
+            {
+                return Err(TunError::Foreign);
+            }
+        } else {
+            check_route_rules(&before, journal, index, route)?;
+        }
         let fresh = journal.intent(
             self.owner,
             Scope::Session,
             id,
-            Resource::Route {
-                table: route.table,
-                destination: route.destination,
-                prefix_len: route.prefix_len,
-                priority: route.priority,
-                protocol: ROUTE_PROTOCOL,
-                ifindex: index,
-            },
+            route.resource(tun_id, index),
         )?;
         let state = record_state(journal, id)?;
         journal.require_reconciliation(self.owner, id)?;
@@ -635,7 +738,7 @@ impl TunExecutor {
         if parent_index(self, journal, tun_id, &topology, true)? != Some(index) {
             return Err(TunError::Evidence);
         }
-        check_route_table(&topology, journal, index, route)?;
+        check_route_table(&topology, journal, tun_id, index, route)?;
         if observe_route(&topology, index, route)? {
             if fresh || state != RecordState::Confirmed {
                 return Err(TunError::Evidence);
@@ -660,6 +763,9 @@ impl TunExecutor {
             {
                 return Err(TunError::Evidence);
             }
+            if route.is_throw() {
+                check_route_table(&topology, journal, tun_id, index, route)?;
+            }
         }
         journal.reconcile(self.owner, id, Reconciled::Owned)?;
         Ok(())
@@ -677,27 +783,20 @@ impl TunExecutor {
             .iter()
             .find(|r| r.id() == id)
             .ok_or(JournalError::Missing)?;
-        let Resource::Route {
-            table,
-            destination,
-            prefix_len,
-            priority,
-            protocol,
-            ifindex,
-        } = record.resource()
-        else {
-            return Err(TunError::Invalid);
+        let index = match *record.resource() {
+            Resource::Route { ifindex, .. } | Resource::ThrowRoute { ifindex, .. } => ifindex,
+            _ => return Err(TunError::Invalid),
         };
-        if record.scope() != Scope::Session || *protocol != ROUTE_PROTOCOL {
+        if record.scope() != Scope::Session {
             return Err(TunError::Invalid);
         }
-        let (index, route, state) = (
-            *ifindex,
-            TunRoute::new(*destination, *prefix_len, *table, *priority)?,
-            record.state(),
-        );
+        let route = recorded_route(record.resource(), tun_id, index).ok_or(TunError::Invalid)?;
+        let state = record.state();
         // Удаление даже не-default маршрута не должно менять путь действующей RPDB.
-        if journal.records().iter().any(|record| matches!(record.resource(), Resource::TunRule { table, .. } if *table == route.table)) {
+        if journal.records().iter().any(|other| {
+            matches!(other.resource(), Resource::TunRule { table, .. } if *table == route.table)
+                || record.resource().anchors_throw_route(other.resource())
+        }) {
             return Err(JournalError::Conflict.into());
         }
         journal.require_reconciliation(self.owner, id)?;
@@ -711,6 +810,9 @@ impl TunExecutor {
             || parent_index(self, journal, tun_id, &topology, false)? != Some(index)
         {
             return Err(TunError::Evidence);
+        }
+        if route.is_throw() {
+            check_route_table(&topology, journal, tun_id, index, route)?;
         }
         journal.reconcile(self.owner, id, Reconciled::Owned)?;
         journal.mark_cleanup(self.owner, id)?;

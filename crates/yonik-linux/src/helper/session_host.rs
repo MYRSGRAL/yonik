@@ -5,38 +5,56 @@ use super::{
     PreparedContext, ProtectionState, PublicBlockPolicy, PublicPolicyRecovery, ServiceError,
     compile_protection, stale, unavailable,
 };
+use crate::helper::session_supervisor::SessionSupervisor;
 use crate::helper::{
     SessionNetworkPlan, SystemWorkerSupervisor, TrustedRegistry, WorkerLiveness, WorkerTicket,
     memory::{ByteLease, config_budget},
     service::SystemProfileRequest,
+    session_fake_dns::{self, ActiveFakeDns, PreparedFakeDns, PublicationHorizon},
+    session_network::{
+        ExternalTopologyCheck, FIRST_RESOLVER_RULE, FIRST_THROW_ROUTE, LAST_RESOLVER_RULE,
+        LAST_THROW_ROUTE,
+    },
 };
 use crate::{
-    Cancellation, KernelRoute, LinuxLink, LinuxTopology, NetworkStamp, RouteKind, RouteQuery,
-    managed_network::{Resource, Scope, tun::TunExecutor},
+    Cancellation, KernelRoute, LinuxLink, LinuxTopology, NetworkReadError, NetworkStamp, RouteKind,
+    RouteQuery,
+    managed_network::{
+        PublicPolicyPhase, QuarantineIntent, Resource, Scope,
+        firewall::{BoundDirect, MAX_BOUND_DIRECT, PrivateRoute, ResolverTls, prefixes_overlap},
+        tun::TunExecutor,
+    },
     network::{
         RouteCapture, TopologyCapture, lookup_route_captured, read_topology_captured,
-        same_captured_kernel_route, same_captured_topology,
+        reread_changed_route, reread_changed_topology, same_captured_kernel_route,
+        same_captured_topology,
     },
     read_topology,
     worker::WorkerPayload,
 };
 #[path = "native_owner.rs"]
 pub(in crate::helper) mod native_owner;
+#[path = "session_bootstrap.rs"]
+mod session_bootstrap;
+#[path = "session_dhcp.rs"]
+mod session_dhcp;
+use session_bootstrap::BootstrapAddress;
 use sha2::Digest;
 use std::{
+    collections::{BTreeSet, HashMap},
     fs::File,
     io::Read,
     mem::size_of,
     net::{IpAddr, TcpListener},
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroU32},
     os::unix::fs::MetadataExt,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-// Диагностика доступна только lib-test и явно включается в disposable fixture.
+// Диагностика явно включается в тестовом стенде.
 fn diagnostic_result<T, E: std::fmt::Debug>(_stage: &str, result: Result<T, E>) -> Result<T, E> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if std::env::var_os("YONIK_SESSION_DIAGNOSTICS").as_deref() == Some(std::ffi::OsStr::new("1")) {
         eprintln!(
             "session diagnostic {}: {:?}",
@@ -50,7 +68,7 @@ fn diagnostic_value<T: std::fmt::Debug, E: std::fmt::Debug>(
     _stage: &str,
     result: Result<T, E>,
 ) -> Result<T, E> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if std::env::var_os("YONIK_SESSION_DIAGNOSTICS").as_deref() == Some(std::ffi::OsStr::new("1")) {
         eprintln!("session diagnostic {}: {:?}", _stage, result);
     }
@@ -103,6 +121,7 @@ fn diagnostic_link(stage: &str, expected: &LinuxLink, actual: &LinuxLink) {
 }
 
 const DEADLINE: Duration = Duration::from_secs(3);
+const DHCP_TOPOLOGY_RETRY_BUDGET: Duration = Duration::from_millis(300);
 const MAX_BASELINE_BYTES: usize = 3 * 1024 * 1024;
 const MAX_PASSWD_BYTES: u64 = 1024 * 1024;
 const TUN_ID: u64 = 16;
@@ -217,8 +236,18 @@ pub(super) fn spawn_safety<B: Send + 'static>(
     }))
 }
 pub(super) fn reconcile_network_event(backend: &mut Backend, runtime: &tokio::runtime::Handle) {
+    if backend
+        .active
+        .as_ref()
+        .is_none_or(|active| active.fake_dns.is_none())
+    {
+        runtime.block_on(backend.update_quarantine_timer());
+    }
     // Legacy public protection живёт независимо; источник событий не меняет её.
-    if !backend.has_session() && !backend.worker_uncertain {
+    if !backend.has_session()
+        && !backend.worker_uncertain
+        && !public_unlock_pending(backend.journal.as_ref())
+    {
         return;
     }
     let Some(uid) = backend
@@ -359,6 +388,81 @@ pub(super) struct SessionArtifact {
     peer: Option<Arc<crate::attribution::PeerProcess>>,
     memory: ByteLease,
     native_owner_stamp: Option<native_owner::NativeArtifactStamp>,
+    direct_egress: Vec<BoundDirect>,
+    fake_dns: Option<Arc<PreparedFakeDns>>,
+    resolver_tls: Option<ResolvedTlsEgress>,
+    bootstrap: Option<BootstrapAddress>,
+}
+
+struct ResolvedTlsEgress {
+    policy: ResolverTls,
+    routes: Vec<(KernelRoute, RouteCapture)>,
+}
+
+impl ResolvedTlsEgress {
+    async fn prepare(
+        fake_dns: &PreparedFakeDns,
+        plan: SessionNetworkPlan,
+        baseline: &LinuxTopology,
+        owner: Ownership,
+        cancel: &mut Cancellation,
+    ) -> Result<(SessionNetworkPlan, Option<Self>), ServiceError> {
+        let peers = fake_dns.tls_peers();
+        if peers.is_empty() {
+            return Ok((plan, None));
+        }
+        // Нативный DoT скрывает имя запроса от реле. При исчезновении
+        // маршрута приватной зоны resolved может отправить её публичному DNS.
+        if !fake_dns.private_dns_zones().is_empty() {
+            return Err(ServiceError::Unsupported);
+        }
+        let daemon = fake_dns.tls_daemon().ok_or(ServiceError::Unavailable)?;
+        let mut routes = Vec::with_capacity(peers.len());
+        let mut rules = Vec::with_capacity(peers.len());
+        let mut endpoints = Vec::with_capacity(peers.len());
+        for &(peer, transport, route_link) in peers {
+            let query = RouteQuery::new(peer.ip(), daemon.uid)
+                .with_interfaces(None, route_link.and_then(NonZeroU32::new))
+                .with_transport(transport, None, Some(peer.port()));
+            let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
+                .await
+                .map_err(unavailable)?;
+            let index = checked_route(&route, owner, plan.routing_table())?;
+            if route_link.is_some_and(|expected| expected != index)
+                || !session_fake_dns::usable_resolver_link(baseline, index)
+            {
+                return Err(ServiceError::Unsupported);
+            }
+            let link = baseline
+                .links
+                .iter()
+                .find(|link| link.index == index)
+                .ok_or(ServiceError::Unsupported)?;
+            let name = String::from_utf8(link.name.clone()).map_err(unavailable)?;
+            let table = route.table.ok_or(ServiceError::Unsupported)?;
+            endpoints.push((peer, transport, index, name));
+            rules.push((peer, transport, table));
+            routes.push((route, capture));
+        }
+        let policy = ResolverTls::new(daemon.uid, daemon.group.1, owner.namespace(), endpoints)
+            .map_err(unavailable)?;
+        let plan = plan
+            .with_resolver_routes(baseline, daemon.uid, &rules)
+            .map_err(unavailable)?;
+        Ok((plan, Some(Self { policy, routes })))
+    }
+
+    async fn verify(&self, cancel: &mut Cancellation) -> Result<(), ServiceError> {
+        for (expected, capture) in &self.routes {
+            let (route, timing) = reread_changed_route(expected.query.clone(), cancel, DEADLINE)
+                .await
+                .map_err(unavailable)?;
+            if !same_captured_kernel_route(expected, &route, Some((*capture, timing))) {
+                return Err(stale());
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Clone)]
 struct ProfileRoute {
@@ -370,13 +474,24 @@ struct ProfileRoute {
     capture: RouteCapture,
 }
 impl SessionArtifact {
+    pub(super) fn prepared_context(&self) -> PreparedContext {
+        self.context
+    }
+
     pub(super) fn retained_bytes(&self) -> usize {
         self.payload.retained_bytes() + self.memory.bytes()
     }
     fn query(&self, route: &ProfileRoute) -> RouteQuery {
-        RouteQuery::new(route.endpoint, self.worker_uid)
+        RouteQuery::new(route.endpoint, self.route_uid(route))
             .with_mark(self.plan.socket_mark())
             .with_transport(route.protocol, None, Some(route.port))
+    }
+    fn route_uid(&self, route: &ProfileRoute) -> u32 {
+        if route.dns && self.fake_dns.is_some() {
+            0
+        } else {
+            self.worker_uid
+        }
     }
     async fn revalidate_routes(
         &self,
@@ -422,12 +537,26 @@ impl SessionArtifact {
                 .revalidate(profile, cancel)
                 .map_err(unavailable)?;
         }
+        if let Some(fake_dns) = &self.fake_dns {
+            fake_dns.verify_tls(own_index).await?;
+        }
+        if let Some(resolver_tls) = &self.resolver_tls {
+            resolver_tls.verify(cancel).await?;
+        }
         let mut transports = Vec::with_capacity(self.routes.len());
         let mut dns = Vec::new();
         for captured in &self.routes {
-            let (route, stamp) = lookup_route_captured(self.query(captured), cancel, DEADLINE)
+            // При подъёме собственного TUN уведомление carrier может прервать
+            // GETROUTE. Свежий ответ всё равно сравнивается с маршрутом Prepare.
+            let (route, stamp) = reread_changed_route(self.query(captured), cancel, DEADLINE)
                 .await
-                .map_err(unavailable)?;
+                .map_err(|error| {
+                    let _ = diagnostic_value::<(), _>(
+                        "profile_route_lookup_dns_protocol_error",
+                        Err((captured.dns, captured.protocol, error)),
+                    );
+                    unavailable(error)
+                })?;
             let index = checked_route(&route, self.owner, self.plan.routing_table())?;
             if own_index == Some(index)
                 || !same_captured_kernel_route(
@@ -451,7 +580,7 @@ impl SessionArtifact {
                 protocol,
                 captured.port,
                 index,
-                self.worker_uid,
+                self.route_uid(captured),
                 self.plan.socket_mark(),
             )
             .map_err(unavailable)?;
@@ -472,7 +601,9 @@ pub(super) struct ActiveSession {
     ticket: WorkerTicket,
     index: u32,
     link: LinuxLink,
-    _exit_watch: SafetyTask,
+    exit_watch: SafetyTask,
+    fake_dns: Option<ActiveFakeDns>,
+    dhcp_refresh: Option<session_dhcp::DhcpRefresh>,
 }
 
 /// Sideband использует тот же serial backend и durable journal. Отдельного
@@ -1018,20 +1149,9 @@ fn parse_worker_uid(bytes: &[u8]) -> Result<u32, ServiceError> {
 
 fn endpoint(
     server: &yonik_import::ParsedServer,
-) -> Result<(IpAddr, crate::TransportProtocol), ServiceError> {
-    // До доверенного DNS provenance hostname не порождает ни исключения nft,
-    // ни конфигурацию, способную самостоятельно выбрать другой endpoint.
-    let address: IpAddr = server
-        .endpoint()
-        .host()
-        .parse()
-        .map_err(|_| ServiceError::Unsupported)?;
-    if address.is_unspecified()
-        || address.is_loopback()
-        || address.is_multicast()
-        || matches!(address, IpAddr::V4(ip) if ip.is_broadcast() || ip.is_link_local())
-        || matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local() || ip.to_ipv4().is_some())
-    {
+) -> Result<(Option<IpAddr>, crate::TransportProtocol), ServiceError> {
+    let address = server.endpoint().host().parse().ok();
+    if address.is_some_and(|ip| !valid_proxy_ip(ip)) {
         return Err(ServiceError::Unsupported);
     }
     if !matches!(
@@ -1049,6 +1169,14 @@ fn endpoint(
         return Err(ServiceError::Unsupported);
     }
     Ok((address, crate::TransportProtocol::Tcp))
+}
+
+fn valid_proxy_ip(address: IpAddr) -> bool {
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || matches!(address, IpAddr::V4(ip) if ip.is_broadcast() || ip.is_link_local())
+        || matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local() || ip.to_ipv4().is_some()))
 }
 fn checked_route(route: &KernelRoute, owner: Ownership, table: u32) -> Result<u32, ServiceError> {
     if (route.namespace.device, route.namespace.inode) != owner.namespace()
@@ -1083,11 +1211,223 @@ fn checked_route(route: &KernelRoute, owner: Ownership, table: u32) -> Result<u3
         .map(|index| index.get())
         .ok_or(ServiceError::Unsupported)
 }
+
+fn bound_literal_direct(
+    policy: &yonik_engine::policy_wire::SystemPolicy,
+    baseline: &LinuxTopology,
+    worker_uid: u32,
+    mark: u32,
+    fake_dns: bool,
+) -> Result<Vec<BoundDirect>, ServiceError> {
+    let mut prefixes = BTreeSet::new();
+    for (address, length) in policy.enabled_direct_prefixes() {
+        prefixes.insert((address, length));
+        if prefixes.len() > MAX_BOUND_DIRECT {
+            return Err(ServiceError::Unsupported);
+        }
+    }
+    if prefixes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut protected = BTreeSet::new();
+    if !fake_dns {
+        protected.extend(session_fake_dns::wireguard_prefixes(baseline)?.into_keys());
+        for private in &policy.policy().private_networks {
+            let cidr = &private.network;
+            let prefix = IpPrefix::new(cidr.network(), cidr.prefix_len())
+                .map_err(|_| ServiceError::Unsupported)?;
+            protected.insert(prefix);
+        }
+    }
+    let uplinks: HashMap<_, _> = baseline
+        .links
+        .iter()
+        .filter(|link| {
+            link.flags & IFF_UP != 0
+                && link.flags & IFF_LOOPBACK == 0
+                && link.link_type == ARPHRD_ETHER
+                && matches!(
+                    link.kind.as_deref(),
+                    None | Some(
+                        b"veth" | b"vlan" | b"bridge" | b"bond" | b"team" | b"macvlan" | b"ipvlan"
+                    )
+                )
+        })
+        .map(|link| (link.index, &link.name))
+        .collect();
+    let mut egress = BTreeSet::new();
+    for (address, length) in prefixes {
+        let prefix = IpPrefix::new(address, length).map_err(|_| ServiceError::Unsupported)?;
+        if protected
+            .iter()
+            .any(|&private| prefixes_overlap(prefix, private))
+        {
+            return Err(ServiceError::Unsupported);
+        }
+        let before = egress.len();
+        // Снимок ограничивает допустимые uplink и шлюзы. nft сверяет
+        // фактический маршрут каждого пакета и отсекает connected-сети.
+        for route in baseline.routes.iter().filter(|route| {
+            RouteKind::from(route.kind) == RouteKind::Unicast
+                && route.nexthop_id.is_none()
+                && route.destination.address.is_ipv4() == address.is_ipv4()
+                && (route.destination.length == 0
+                    || prefix.contains(route.destination.address)
+                    || IpPrefix::new(route.destination.address, route.destination.length)
+                        .is_ok_and(|routed| routed.contains(address)))
+        }) {
+            let gateways = route.output_interface.zip(route.gateway).into_iter().chain(
+                route
+                    .multipath
+                    .iter()
+                    .filter_map(|hop| hop.gateway.map(|gateway| (hop.output_interface, gateway))),
+            );
+            for (index, gateway) in gateways {
+                let Some(name) = uplinks.get(&index) else {
+                    continue;
+                };
+                let name = std::str::from_utf8(name).map_err(|_| ServiceError::Unsupported)?;
+                egress.insert(
+                    BoundDirect::new(prefix, index, name, worker_uid, mark, gateway)
+                        .map_err(|_| ServiceError::Unsupported)?,
+                );
+                if egress.len() > MAX_BOUND_DIRECT {
+                    return Err(ServiceError::Unsupported);
+                }
+            }
+        }
+        if fake_dns && egress.len() == before {
+            return Err(ServiceError::Unsupported);
+        }
+    }
+    Ok(egress.into_iter().collect())
+}
+
 fn fresh_cancel() -> (tokio::sync::watch::Sender<bool>, Cancellation) {
     Cancellation::new()
 }
 
 impl Backend {
+    async fn capture_session_baseline(
+        &self,
+        uid: u32,
+        cancel: &mut Cancellation,
+    ) -> Result<
+        (
+            NetworkStamp,
+            PreparedContext,
+            LinuxTopology,
+            TopologyCapture,
+        ),
+        ServiceError,
+    > {
+        const IFA_F_TENTATIVE: u32 = 0x40;
+        const IFA_F_DADFAILED: u32 = 0x08;
+        const IFF_RUNNING: u32 = 0x40;
+
+        let mut watch = self.watch.clone();
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                cancel.check().map_err(|_| ServiceError::Cancelled)?;
+                if !watch.is_open() {
+                    return Err(ServiceError::Unavailable);
+                }
+                let stamp = self.snapshot()?.stamp;
+                let (topology, capture) = reread_changed_topology(cancel, DEADLINE).await.map_err(
+                    |error| match error {
+                        NetworkReadError::Cancelled => ServiceError::Cancelled,
+                        _ => unavailable(error),
+                    },
+                )?;
+                // Завершение DAD меняет флаги IPv6-адреса и может добавить
+                // маршрут. Снимок для Prepare берём заново после этого события.
+                let mut pending: BTreeSet<_> = topology
+                    .addresses
+                    .iter()
+                    .filter(|address| {
+                        address.address.is_ipv6()
+                            && address.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED)
+                                == IFA_F_TENTATIVE
+                    })
+                    .map(|address| address.index)
+                    .collect();
+                for link in &topology.links {
+                    // На неработающем линке tentative-адрес может остаться бессрочно.
+                    if link.flags & (IFF_UP | IFF_RUNNING) != IFF_UP | IFF_RUNNING {
+                        pending.remove(&link.index);
+                    }
+                }
+                if pending.is_empty() {
+                    let context = self.context(uid)?;
+                    if watch.is_open() && self.snapshot()?.is_current(stamp) {
+                        return Ok((stamp, context, topology, capture));
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(ServiceError::Cancelled),
+                    changed = watch.changed() => changed.map_err(unavailable)?,
+                }
+            }
+        })
+        .await
+        .map_err(|_| stale())?
+    }
+
+    pub(super) async fn recover_quarantine(
+        &mut self,
+    ) -> Result<Option<std::time::Instant>, ServiceError> {
+        let Some(journal) = self
+            .journal
+            .as_ref()
+            .filter(|journal| journal.fake_quarantine().is_some())
+        else {
+            return Ok(None);
+        };
+        self.executor(journal.ownership())?
+            .recover_fake_quarantine(self.journal.as_mut().ok_or(ServiceError::Unavailable)?)
+            .await
+            .map_err(unavailable)
+    }
+
+    async fn update_quarantine_timer(&mut self) {
+        let observed = self.recover_quarantine().await;
+        let recheck = std::time::Instant::now() + Duration::from_secs(5);
+        let next = match observed {
+            Ok(Some(deadline)) => Some(recheck.min(deadline + Duration::from_secs(1))),
+            Ok(None) => None,
+            Err(_) => Some(recheck),
+        };
+        self.fake_dns_reap = next.map(|deadline| {
+            let notify = Arc::clone(&self.exited);
+            SafetyTask(tokio::spawn(async move {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                notify.notify_one();
+            }))
+        });
+    }
+
+    async fn arm_session_quarantine(
+        &mut self,
+        artifact: &SessionArtifact,
+        ifindex: u32,
+    ) -> Result<std::time::Instant, ServiceError> {
+        let intent = QuarantineIntent {
+            tun: Some(artifact.plan.quarantine_tun(ifindex)),
+            horizon_ms: session_fake_dns::HOLD_MS,
+        };
+        let result = self
+            .executor(artifact.owner)?
+            .arm_fake_quarantine(
+                self.journal.as_mut().ok_or(ServiceError::Unavailable)?,
+                intent,
+            )
+            .await;
+        let deadline = diagnostic_result("fake_ip_quarantine", result).map_err(unavailable)?;
+        self.fake_dns_reap = None;
+        Ok(deadline)
+    }
     pub(super) async fn prepare_full_profile(
         &mut self,
         uid: u32,
@@ -1140,11 +1480,8 @@ impl Backend {
             return Err(ServiceError::Unsupported);
         }
         let owner = self.owner(uid)?;
-        let context = self.context(uid)?;
-        let stamp = self.snapshot()?.stamp;
-        let (baseline, baseline_capture) = read_topology_captured(cancel, DEADLINE)
-            .await
-            .map_err(unavailable)?;
+        let (stamp, context, baseline, baseline_capture) =
+            self.capture_session_baseline(uid, cancel).await?;
         let bytes = topology_bytes(&baseline);
         if bytes > MAX_BASELINE_BYTES {
             return Err(ServiceError::Unavailable);
@@ -1361,6 +1698,10 @@ impl Backend {
             peer: Some(peer),
             memory,
             native_owner_stamp: Some(self.native_owner.reserve()?),
+            direct_egress: Vec::new(),
+            fake_dns: None,
+            resolver_tls: None,
+            bootstrap: None,
         };
         artifact.revalidate_routes(cancel, None).await?;
         let mut nonce = [0; 32];
@@ -1419,13 +1760,13 @@ impl Backend {
                         .any(|record| record.scope() == Scope::Session)
             })
     }
-    async fn supervisor(&mut self) -> Result<&mut SystemWorkerSupervisor, ServiceError> {
+    async fn supervisor(&mut self) -> Result<&mut SessionSupervisor, ServiceError> {
         if self.supervisor.is_none() {
-            self.supervisor = Some(
+            self.supervisor = Some(SessionSupervisor::Systemd(Box::new(
                 SystemWorkerSupervisor::system()
                     .await
                     .map_err(unavailable)?,
-            );
+            )));
         }
         self.supervisor.as_mut().ok_or(ServiceError::Unavailable)
     }
@@ -1497,6 +1838,8 @@ impl Backend {
         let profile = SystemProfileRequest {
             server: intent.server,
             policy: Some(intent.policy),
+            fake_dns_domains: None,
+            fake_dns_policy_resolver: None,
             engine: intent.engine,
             kill_switch: intent.requirements.kill_switch,
             peer: request.peer,
@@ -1519,6 +1862,8 @@ impl Backend {
             result=self.supervisor()=>result?,
         };
         supervisor
+            .systemd()
+            .map_err(unavailable)?
             .attest_preparation(peer, source, cancel, deadline)
             .await
             .map_err(|_| ServiceError::Unsupported)
@@ -1529,7 +1874,10 @@ impl Backend {
         request: SystemProfileRequest,
         cancel: &mut Cancellation,
     ) -> Result<GuardArtifact, ServiceError> {
-        self.prepare_profile_inner(uid, request, None, cancel).await
+        diagnostic_result(
+            "prepare_system_profile",
+            self.prepare_profile_inner(uid, request, None, cancel).await,
+        )
     }
     async fn prepare_profile_inner(
         &mut self,
@@ -1541,10 +1889,25 @@ impl Backend {
         if self.has_session() || self.worker_uncertain {
             return Err(ServiceError::Busy);
         }
-        let attribution_required = request
-            .policy
+        let policy = request.policy.map(Arc::new);
+        let attribution_required = policy
             .as_ref()
             .is_some_and(|policy| policy.requires_attribution());
+        let resolved_cidrs = request.fake_dns_domains.is_some()
+            && request.fake_dns_policy_resolver.is_some()
+            && policy.as_ref().is_some_and(|policy| {
+                yonik_engine::SystemFakeDnsBridge::supports_resolved_cidr_policy(policy.policy())
+            });
+        if let Some(suffixes) = &request.fake_dns_domains {
+            if attribution_required || bundle.is_some() {
+                return Err(ServiceError::Unsupported);
+            }
+            if let Some(policy) = policy.as_ref().filter(|_| !resolved_cidrs) {
+                yonik_engine::validate_scoped_fake_dns_policy(policy.policy(), suffixes)
+                    .map_err(|_| ServiceError::Unsupported)?;
+            }
+            self.fake_dns.check_cold_start()?;
+        }
         if attribution_required {
             self.ensure_peer_attestation(
                 Arc::clone(request.peer.as_ref().ok_or(ServiceError::Unsupported)?),
@@ -1561,12 +1924,14 @@ impl Backend {
             .into_server()
             .map_err(|_| ServiceError::InvalidRequest)?;
         let (endpoint, protocol) = endpoint(&server)?;
-        let context = self.context(uid)?;
-        let stamp = self.snapshot()?.stamp;
-        let owner = self.owner(uid)?;
-        let (baseline, baseline_capture) = read_topology_captured(cancel, DEADLINE)
-            .await
-            .map_err(unavailable)?;
+        if endpoint.is_none() && self.private_dns_zones.is_err() {
+            return Err(ServiceError::Unsupported);
+        }
+        let owner = diagnostic_result("prepare_profile_owner", self.owner(uid))?;
+        let (stamp, context, baseline, baseline_capture) = diagnostic_result(
+            "prepare_profile_baseline",
+            self.capture_session_baseline(uid, cancel).await,
+        )?;
         let bytes = topology_bytes(&baseline);
         if bytes > MAX_BASELINE_BYTES {
             return Err(ServiceError::Unavailable);
@@ -1576,24 +1941,158 @@ impl Backend {
         let memory = config_budget()
             .reserve(bytes * 2 + 128 * 1024)
             .map_err(unavailable)?;
-        let worker_uid = worker_uid()?;
+        let worker_uid = diagnostic_result("prepare_profile_worker_uid", worker_uid())?;
         if worker_uid == uid {
             return Err(ServiceError::Unavailable);
         }
-        let plan = SessionNetworkPlan::reserve_for_engine(owner, &baseline, request.engine)
-            .map_err(unavailable)?;
+        let fake_dns_requested = request.fake_dns_domains.is_some();
+        let plan = if fake_dns_requested {
+            SessionNetworkPlan::reserve_for_fake_dns(
+                owner,
+                &baseline,
+                request.engine,
+                &session_fake_dns::POOLS,
+            )
+        } else {
+            SessionNetworkPlan::reserve_for_engine(owner, &baseline, request.engine)
+        }
+        .map_err(unavailable)?;
+        let direct_egress = match &policy {
+            Some(policy) if fake_dns_requested || (!attribution_required && bundle.is_none()) => {
+                bound_literal_direct(
+                    policy,
+                    &baseline,
+                    worker_uid,
+                    plan.socket_mark(),
+                    fake_dns_requested,
+                )?
+            }
+            _ => Vec::new(),
+        };
+        let fake_dns = match request.fake_dns_domains {
+            Some(domains) => {
+                let saved = self
+                    .private_dns_zones
+                    .as_ref()
+                    .map_err(unavailable)?
+                    .saved_zones(uid)
+                    .map_err(unavailable)?;
+                let prepared = PreparedFakeDns::new(
+                    &plan,
+                    &baseline,
+                    session_fake_dns::RequestedDnsZones {
+                        fake_suffixes: domains,
+                        saved_private: saved,
+                    },
+                    request.fake_dns_policy_resolver,
+                    policy.as_ref().filter(|_| resolved_cidrs).cloned(),
+                    cancel,
+                )
+                .await?;
+                Some(Arc::new(prepared))
+            }
+            None => None,
+        };
+        let (plan, resolver_tls) = if let Some(fake_dns) = &fake_dns {
+            ResolvedTlsEgress::prepare(fake_dns, plan, &baseline, owner, cancel).await?
+        } else {
+            (plan, None)
+        };
+        let bootstrap = if endpoint.is_none() {
+            let name = server
+                .endpoint()
+                .host()
+                .parse()
+                .map_err(|_| ServiceError::InvalidRequest)?;
+            if policy.as_ref().is_some_and(|policy| {
+                policy
+                    .policy()
+                    .private_domains
+                    .iter()
+                    .any(|zone| zone.domain.matches(&name))
+            }) {
+                return Err(ServiceError::Unsupported);
+            }
+            let saved = self
+                .private_dns_zones
+                .as_ref()
+                .map_err(unavailable)?
+                .saved_zones(uid)
+                .map_err(unavailable)?;
+            let proof = self
+                .watch
+                .clone()
+                .run_while_current(
+                    stamp,
+                    BootstrapAddress::resolve(
+                        &name,
+                        &saved,
+                        &baseline,
+                        owner,
+                        plan.routing_table(),
+                        cancel,
+                    ),
+                )
+                .await
+                .ok_or_else(stale)??;
+            Some(proof)
+        } else {
+            None
+        };
         let port = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .map_err(unavailable)?
             .local_addr()
             .map_err(unavailable)?
             .port();
         let port = NonZeroU16::new(port).ok_or(ServiceError::Unavailable)?;
-        let config = if let Some(policy) = request.policy.as_ref() {
+        let tun = plan.compiler_tun().map_err(unavailable)?;
+        let mut selected = None;
+        let candidates = endpoint
+            .into_iter()
+            .chain(bootstrap.iter().flat_map(BootstrapAddress::addresses));
+        for address in candidates {
+            if let Some(proof) = &bootstrap {
+                proof.check_fresh()?;
+            }
+            let query = RouteQuery::new(address, worker_uid)
+                .with_mark(plan.socket_mark())
+                .with_transport(protocol, None, Some(server.endpoint().port()));
+            let route = lookup_route_captured(query, cancel, DEADLINE)
+                .await
+                .map_err(unavailable)
+                .and_then(|(route, capture)| {
+                    checked_route(&route, owner, plan.routing_table())?;
+                    Ok((address, route, capture))
+                });
+            match route {
+                Ok(route) => {
+                    selected = Some(route);
+                    break;
+                }
+                Err(error) if bootstrap.is_none() => return Err(error),
+                Err(_) => cancel.check().map_err(|_| ServiceError::Cancelled)?,
+            }
+        }
+        let (endpoint, route, route_capture) = selected.ok_or(ServiceError::Unsupported)?;
+        let config = if let Some(policy) = policy.as_ref() {
             let probe =
                 TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(unavailable)?;
             let probe_port = NonZeroU16::new(probe.local_addr().map_err(unavailable)?.port())
                 .ok_or(ServiceError::Unavailable)?;
-            if let Some(bundle) = &bundle {
+            if let Some(fake_dns) = &fake_dns {
+                yonik_engine::compile_system_fake_dns_policy_at(
+                    &server,
+                    endpoint,
+                    request.engine,
+                    port,
+                    probe_port,
+                    policy.policy(),
+                    &tun,
+                    &fake_dns.config,
+                    fake_dns.suffixes(),
+                )
+                .map_err(|_| ServiceError::Unsupported)?
+            } else if let Some(bundle) = &bundle {
                 let bound = yonik_engine::resource_bundle::BoundPolicy::bind(
                     policy.policy(),
                     bundle.revision,
@@ -1610,7 +2109,7 @@ impl Backend {
                     &bound,
                     bundle.revision,
                     &bundle.identity,
-                    &plan.compiler_tun().map_err(unavailable)?,
+                    &tun,
                 )
                 .map_err(|_| ServiceError::Unsupported)?
             } else {
@@ -1620,20 +2119,80 @@ impl Backend {
                     port,
                     probe_port,
                     policy.policy(),
-                    &plan.compiler_tun().map_err(unavailable)?,
+                    &tun,
                 )
                 .map_err(|_| ServiceError::Unsupported)?
             }
-        } else {
-            yonik_engine::compile_system(
+        } else if let Some(fake_dns) = &fake_dns {
+            yonik_engine::compile_system_fake_dns_bridge_at(
                 &server,
+                endpoint,
                 request.engine,
                 port,
-                &plan.compiler_tun().map_err(unavailable)?,
+                &tun,
+                &fake_dns.config,
             )
             .map_err(|_| ServiceError::Unsupported)?
+        } else {
+            yonik_engine::compile_system(&server, request.engine, port, &tun)
+                .map_err(|_| ServiceError::Unsupported)?
         };
-        let config = config.with_local_runtime_logging();
+        let config = if fake_dns.is_some() {
+            config
+        } else {
+            config
+                .bind_system_proxy_address(&server, endpoint)
+                .map_err(|_| ServiceError::Unsupported)?
+        }
+        .with_local_runtime_logging();
+        let mut routes = vec![ProfileRoute {
+            dns: false,
+            endpoint,
+            port: server.endpoint().port(),
+            protocol,
+            route,
+            capture: route_capture,
+        }];
+        if let Some(fake_dns) = &fake_dns {
+            for (peer, protocol, expected_link) in fake_dns.relay_routes() {
+                let query = RouteQuery::new(peer.ip(), 0)
+                    .with_mark(plan.socket_mark())
+                    .with_transport(protocol, None, Some(peer.port()));
+                let (route, capture) = lookup_route_captured(query, cancel, DEADLINE)
+                    .await
+                    .map_err(unavailable)?;
+                let index = checked_route(&route, owner, plan.routing_table())?;
+                if expected_link.is_some_and(|expected| expected != index)
+                    || fake_dns.uses_resolve1()
+                        && !session_fake_dns::usable_resolver_link(&baseline, index)
+                {
+                    return Err(ServiceError::Unsupported);
+                }
+                routes.push(ProfileRoute {
+                    dns: true,
+                    endpoint: peer.ip(),
+                    port: peer.port(),
+                    protocol,
+                    route,
+                    capture,
+                });
+            }
+        }
+        let block = compile_protection(&baseline, false)?;
+        self.executor(owner)?
+            .check_public_policy(&block)
+            .await
+            .map_err(unavailable)?;
+        let mut watch = self.watch.clone();
+        cancel.check().map_err(|_| ServiceError::Cancelled)?;
+        if !watch.is_open() {
+            return Err(ServiceError::Unavailable);
+        }
+        if !self.snapshot()?.is_current(stamp) {
+            return Err(stale());
+        }
+        // Создание снимка читает весь ELF. До него отсеиваем изменения,
+        // обнаруженные, пока шли асинхронные проверки сети.
         if self.registry.is_none() {
             self.registry = Some(TrustedRegistry::system().map_err(unavailable)?);
         }
@@ -1657,37 +2216,36 @@ impl Backend {
         } else {
             WorkerPayload::new(binary, config).map_err(unavailable)?
         });
-        let query = RouteQuery::new(endpoint, worker_uid)
-            .with_mark(plan.socket_mark())
-            .with_transport(protocol, None, Some(server.endpoint().port()));
-        let (route, route_capture) = lookup_route_captured(query, cancel, DEADLINE)
-            .await
-            .map_err(unavailable)?;
-        checked_route(&route, owner, plan.routing_table())?;
-        let block = compile_protection(&baseline, false)?;
-        self.executor(owner)?
-            .check_public_policy(&block)
-            .await
-            .map_err(unavailable)?;
+        cancel.check().map_err(|_| ServiceError::Cancelled)?;
         self.worker_uncertain = true;
-        let result = self
-            .supervisor()
-            .await?
-            .check(Arc::clone(&payload), cancel)
-            .await;
-        if result.is_err() {
+        let result = watch
+            .run_while_current(
+                stamp,
+                self.supervisor().await?.check(Arc::clone(&payload), cancel),
+            )
+            .await
+            .map(|result| diagnostic_result("check_profile_worker", result));
+        if !matches!(result, Some(Ok(()))) {
             // Отмена check тоже обязана остановить activation и подтвердить cgroup.
             let (_keep, mut cleanup) = fresh_cancel();
             if self.supervisor().await?.recover(&mut cleanup).await.is_ok() {
                 self.worker_uncertain = false;
             }
-            return Err(if cancel.check().is_err() {
-                ServiceError::Cancelled
-            } else {
-                ServiceError::Unsupported
-            });
+            cancel.check().map_err(|_| ServiceError::Cancelled)?;
+            if result.is_none() {
+                self.snapshot()?;
+                return Err(if self.worker_uncertain || !watch.is_open() {
+                    ServiceError::Unavailable
+                } else {
+                    stale()
+                });
+            }
+            return Err(ServiceError::Unsupported);
         }
         self.worker_uncertain = false;
+        if let Some(bootstrap) = &bootstrap {
+            bootstrap.verify(cancel).await?;
+        }
         let context_matches = self.context(uid)? == context;
         let stamp_matches = self.snapshot()?.is_current(stamp);
         let (current, current_capture) = read_topology_captured(cancel, DEADLINE)
@@ -1697,9 +2255,14 @@ impl Backend {
             same_captured_topology(&baseline, baseline_capture, &current, current_capture);
         let uid_matches = worker_uid == self::worker_uid()?;
         if !context_matches || !stamp_matches || !topology_matches || !uid_matches {
-            #[cfg(test)]
-            eprintln!(
-                "Актуальность Prepare: context={context_matches}, stamp={stamp_matches}, topology={topology_matches}, worker_uid={uid_matches}"
+            let _ = diagnostic_value::<(), _>(
+                "profile_prepare_freshness_context_stamp_topology_uid",
+                Err((
+                    context_matches,
+                    stamp_matches,
+                    topology_matches,
+                    uid_matches,
+                )),
             );
             return Err(stale());
         }
@@ -1743,14 +2306,7 @@ impl Backend {
             full_profile: None,
             physical: None,
             owner,
-            routes: vec![ProfileRoute {
-                dns: false,
-                endpoint,
-                port: server.endpoint().port(),
-                protocol,
-                route,
-                capture: route_capture,
-            }],
+            routes,
             native_owner_stamp: if attribution_required {
                 Some(self.native_owner.reserve()?)
             } else {
@@ -1768,6 +2324,10 @@ impl Backend {
             attribution_required,
             peer: request.peer,
             memory,
+            direct_egress,
+            fake_dns,
+            resolver_tls,
+            bootstrap,
         };
         Ok(GuardArtifact {
             bytes,
@@ -1820,8 +2380,18 @@ impl Backend {
         {
             return Err(stale());
         }
+        if let Some(bootstrap) = &artifact.bootstrap {
+            bootstrap.verify(cancel).await?;
+        }
         let owner = self.ensure_owner(uid)?;
         self.invalidate()?;
+        if let Some(fake_dns) = &artifact.fake_dns {
+            self.private_dns_zones
+                .as_mut()
+                .map_err(unavailable)?
+                .store_zones(owner.owner_uid(), fake_dns.private_dns_zones())
+                .map_err(unavailable)?;
+        }
         self.journal
             .as_mut()
             .ok_or(ServiceError::Unavailable)?
@@ -1869,6 +2439,13 @@ impl Backend {
         output: Option<crate::output_transport::ValidatedWriters>,
         cancel: &mut Cancellation,
     ) -> Result<ProtectionState, ServiceError> {
+        let private_routes = artifact
+            .fake_dns
+            .iter()
+            .flat_map(|dns| dns.protected_prefixes.keys().copied())
+            .map(|prefix| PrivateRoute::new(prefix, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(unavailable)?;
         self.policy(owner, compile_protection(&artifact.baseline, false)?)
             .await?;
         cancel.check().map_err(|_| ServiceError::Cancelled)?;
@@ -1909,9 +2486,50 @@ impl Backend {
             })
             .map(|link| link.index)
             .collect();
-        let policy = PublicBlockPolicy::new(loopback, Some(index), vec![], vec![], transports, dns)
-            .and_then(|policy| policy.with_link_control(controls))
-            .map_err(unavailable)?;
+        let mut policy = PublicBlockPolicy::new(
+            loopback,
+            Some(index),
+            private_routes,
+            vec![],
+            transports,
+            dns,
+        )
+        .and_then(|policy| policy.with_link_control(controls))
+        .and_then(|policy| policy.with_bound_direct(artifact.direct_egress.clone()))
+        .map_err(unavailable)?;
+        let mut dhcp_interface = None;
+        if let Some(fake_dns) = &artifact.fake_dns {
+            policy = policy
+                .with_isolated_loopback(fake_dns.loopback, artifact.worker_uid)
+                .and_then(|policy| policy.with_dhcp_renewal_anchor(true))
+                .and_then(|policy| {
+                    policy.with_resolver_tls(
+                        artifact.resolver_tls.as_ref().map(|tls| tls.policy.clone()),
+                    )
+                })
+                .and_then(|policy| policy.with_resolver_relay(fake_dns.resolver_relay.clone()))
+                .map_err(unavailable)?;
+            if self.profile_owner.is_some() {
+                let repair = artifact.plan.ipv4_source().and_then(|source| {
+                    crate::managed_network::firewall::DhcpcdRoute::new(
+                        source,
+                        artifact.plan.socket_mark(),
+                    )
+                    .ok()
+                });
+                if let Some((indices, bound)) =
+                    session_dhcp::select_policy(&artifact.baseline, &policy, repair, cancel).await
+                {
+                    let mut executor = self.executor(owner)?;
+                    if session_dhcp::check_policy(&mut executor, &bound).await {
+                        policy = bound;
+                        dhcp_interface = Some(indices);
+                    }
+                }
+            }
+        }
+        cancel.check().map_err(|_| ServiceError::Cancelled)?;
+        let policy_fingerprint = policy.digest();
         self.policy(owner, policy).await?;
         artifact
             .plan
@@ -1923,6 +2541,9 @@ impl Backend {
             .await
             .map_err(unavailable)?;
         cancel.check().map_err(|_| ServiceError::Cancelled)?;
+        if let Some(bootstrap) = &artifact.bootstrap {
+            bootstrap.check_fresh()?;
+        }
         let ticket = if artifact.attribution_required {
             self.retain_canonical_queue(&artifact.plan, &tun, cancel)
                 .await?;
@@ -1947,11 +2568,13 @@ impl Backend {
             watch_worker_exit(ticket.pid(), Arc::clone(&self.exited)),
         )?;
         let active = ActiveSession {
-            _exit_watch: exit_watch,
+            exit_watch,
             artifact,
             ticket,
             index,
             link,
+            fake_dns: None,
+            dhcp_refresh: None,
         };
         // Сохраняем ticket до verification: даже ошибка снимка не теряет worker.
         self.active = Some(active);
@@ -1963,6 +2586,61 @@ impl Backend {
             self.worker_uncertain = false;
         }
         self.verify_session(cancel).await?;
+        if let Some(fake_dns) = self
+            .active
+            .as_ref()
+            .and_then(|active| active.artifact.fake_dns.clone())
+        {
+            use crate::fake_flow::WorkerOnlyLoopbackIsolation;
+            let isolation = WorkerOnlyLoopbackIsolation::verified_by(|| {
+                matches!(
+                    self.journal.as_ref().and_then(Journal::public_policy).map(|record| record.phase()),
+                    Some(PublicPolicyPhase::Stable { policy }) if policy.digest() == policy_fingerprint
+                )
+            }).map_err(unavailable)?;
+            cancel.check().map_err(|_| ServiceError::Cancelled)?;
+            let artifact = Arc::clone(
+                &self
+                    .active
+                    .as_ref()
+                    .ok_or(ServiceError::Unavailable)?
+                    .artifact,
+            );
+            let horizon =
+                PublicationHorizon::new(self.arm_session_quarantine(&artifact, index).await?);
+            let active_dns = fake_dns
+                .start(
+                    index,
+                    isolation,
+                    self.fake_dns.leases()?,
+                    yonik_engine::fake_dns::DnsEpoch {
+                        network: self.epoch,
+                        engine: self.epoch,
+                        resolver: self.epoch,
+                    },
+                    horizon,
+                    Arc::clone(&self.exited),
+                )
+                .await?;
+            cancel.check().map_err(|_| ServiceError::Cancelled)?;
+            self.active
+                .as_mut()
+                .ok_or(ServiceError::Unavailable)?
+                .fake_dns = Some(active_dns);
+        }
+        if let Some((backend, runtime)) = &self.profile_owner {
+            if let Some(indices) = dhcp_interface {
+                self.active
+                    .as_mut()
+                    .ok_or(ServiceError::Unavailable)?
+                    .dhcp_refresh = Some(session_dhcp::spawn_refresh(
+                    backend.clone(),
+                    runtime,
+                    self.epoch,
+                    indices,
+                ));
+            }
+        }
         if self
             .active
             .as_ref()
@@ -1977,6 +2655,8 @@ impl Backend {
                 .supervisor
                 .as_mut()
                 .ok_or(ServiceError::Unavailable)?
+                .systemd()
+                .map_err(unavailable)?
                 .native_attached(ticket)
                 .await
                 .map_err(unavailable)?
@@ -1987,16 +2667,20 @@ impl Backend {
         self.bindings = None;
         Ok(ProtectionState::TunnelStarting)
     }
-    async fn verify_network_facts(
-        &mut self,
+    async fn check_external_network_facts(
+        &self,
         artifact: &SessionArtifact,
         index: u32,
         link: &LinuxLink,
+        dhcp_retry_policy: Option<&PublicBlockPolicy>,
         cancel: &mut Cancellation,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<ExternalTopologyCheck, ServiceError> {
         let (current, current_capture) = diagnostic_result(
             "topology_read",
-            read_topology_captured(cancel, DEADLINE).await,
+            // Подключение worker к TUN может изменить carrier во время dump.
+            // Повторяется только чтение; baseline, generation guards и
+            // последующая проверка маршрутов остаются прежними.
+            crate::network::reread_changed_topology(cancel, DEADLINE).await,
         )
         .map_err(unavailable)?;
         let current_link = current
@@ -2010,19 +2694,54 @@ impl Backend {
             diagnostic_link("raw", link, current_link);
             return diagnostic_result("same_link_contract", Err(stale()));
         }
-        diagnostic_result(
+        let dhcp = self.verified_dhcp_addresses(cancel).await;
+        diagnostic_value(
             "external_verification",
             artifact.plan.verify_external_captured(
-                &artifact.baseline,
-                artifact.baseline_capture,
-                current,
-                current_capture,
+                (&artifact.baseline, artifact.baseline_capture),
+                (current, current_capture),
                 self.journal.as_ref().ok_or(ServiceError::Unavailable)?,
                 index,
+                &dhcp,
+                dhcp_retry_policy,
             ),
         )
-        .map_err(unavailable)?;
-        artifact.revalidate_routes(cancel, Some(index)).await?;
+        .map_err(unavailable)
+    }
+
+    async fn verify_network_facts(
+        &mut self,
+        artifact: &SessionArtifact,
+        index: u32,
+        link: &LinuxLink,
+        cancel: &mut Cancellation,
+    ) -> Result<(), ServiceError> {
+        let mut check = self
+            .check_external_network_facts(
+                artifact,
+                index,
+                link,
+                self.dhcp_topology_retry_policy(),
+                cancel,
+            )
+            .await?;
+        if check == ExternalTopologyCheck::RetryDhcpLifetimes {
+            // Снимок ядра и DHCP-ответ могли прийти по разные стороны ACK.
+            // Новый снимок проходит полную проверку, повторно пробовать нельзя.
+            check = tokio::time::timeout(
+                DHCP_TOPOLOGY_RETRY_BUDGET,
+                self.check_external_network_facts(artifact, index, link, None, cancel),
+            )
+            .await
+            .map_err(unavailable)??;
+        }
+        if check != ExternalTopologyCheck::Verified {
+            return Err(ServiceError::Unavailable);
+        }
+        diagnostic_result(
+            "profile_routes",
+            artifact.revalidate_routes(cancel, Some(index)).await,
+        )?;
         let owner = self
             .journal
             .as_ref()
@@ -2047,6 +2766,10 @@ impl Backend {
     }
     async fn verify_session(&mut self, cancel: &mut Cancellation) -> Result<(), ServiceError> {
         let active = self.active.as_ref().ok_or(ServiceError::Unavailable)?;
+        let horizon = active.fake_dns.as_ref().map(|dns| dns.horizon.clone());
+        if let Some(dns) = &active.fake_dns {
+            diagnostic_result("fake_dns_active", dns.verify().await)?;
+        }
         let supervisor = self.supervisor.as_ref().ok_or(ServiceError::Unavailable)?;
         if diagnostic_value("observe_before", supervisor.observe(&active.ticket).await)
             .map_err(unavailable)?
@@ -2087,6 +2810,26 @@ impl Backend {
                 Err(ServiceError::Unavailable),
             );
         }
+        if let Some(horizon) = horizon {
+            let deadline = self
+                .recover_quarantine()
+                .await?
+                .ok_or(ServiceError::Unavailable)?;
+            if !self
+                .journal
+                .as_ref()
+                .and_then(Journal::fake_quarantine)
+                .is_some_and(|record| {
+                    record.is_present_for_tun(&artifact.plan.quarantine_tun(index))
+                })
+            {
+                return Err(ServiceError::Unavailable);
+            }
+            horizon.constrain(deadline)?;
+            if horizon.needs_refresh() {
+                horizon.extend(self.arm_session_quarantine(&artifact, index).await?)?;
+            }
+        }
         Ok(())
     }
     pub(super) async fn observe_session(
@@ -2109,6 +2852,8 @@ impl Backend {
                     .supervisor
                     .as_mut()
                     .ok_or(ServiceError::Unavailable)?
+                    .systemd()
+                    .map_err(unavailable)?
                     .native_attached(ticket)
                     .await
                 {
@@ -2139,19 +2884,33 @@ impl Backend {
         unlock: bool,
     ) -> Result<ProtectionState, ServiceError> {
         let owner = self.owner(uid)?;
-        let keep_block = keep_after_stop(
-            unlock,
-            self.journal
-                .as_ref()
-                .and_then(Journal::session_recovery)
-                .map(|record| record.kill_switch()),
-        );
+        if unlock {
+            if let Some(journal) = &mut self.journal {
+                journal
+                    .confirm_authorized_session_unlock(owner)
+                    .map_err(unavailable)?;
+            }
+        }
+        if let Some(active) = &mut self.active {
+            active.fake_dns = None;
+        }
+        self.revoke_session_dhcp().await;
+        let keep_block = !public_unlock_pending(self.journal.as_ref())
+            && keep_after_stop(
+                unlock,
+                self.journal
+                    .as_ref()
+                    .and_then(Journal::session_recovery)
+                    .map(|record| record.kill_switch()),
+            );
         let has_journal = self.journal.is_some();
         let mut recovery = BackendRecovery {
             backend: self,
             owner,
         };
-        match recover_ordered(&mut recovery, has_journal, keep_block).await {
+        let result = recover_ordered(&mut recovery, has_journal, keep_block).await;
+        self.update_quarantine_timer().await;
+        match result {
             Ok(()) => Ok(if keep_block && has_journal {
                 ProtectionState::RecoveryRequired
             } else {
@@ -2178,6 +2937,14 @@ enum RecoveryFailure {
 }
 fn keep_after_stop(unlock: bool, disposition: Option<bool>) -> bool {
     !unlock && disposition.unwrap_or(true)
+}
+fn public_unlock_pending(journal: Option<&Journal>) -> bool {
+    matches!(
+        journal
+            .and_then(Journal::public_policy)
+            .map(|record| record.phase()),
+        Some(PublicPolicyPhase::Removing { .. })
+    )
 }
 async fn recover_ordered(
     host: &mut impl RecoveryHost,
@@ -2221,13 +2988,25 @@ impl RecoveryHost for BackendRecovery<'_> {
         Ok(())
     }
     async fn restrict(&mut self) -> Result<(), ServiceError> {
-        let (_keep, mut cancel) = fresh_cancel();
-        let topology = read_topology(&mut cancel, DEADLINE)
-            .await
-            .map_err(unavailable)?;
-        self.backend
-            .policy(self.owner, compile_protection(&topology, false)?)
-            .await?;
+        if public_unlock_pending(self.backend.journal.as_ref()) {
+            // Removing записывается только после подтверждённого teardown.
+            if self.backend.journal.as_ref().is_none_or(|journal| {
+                journal
+                    .records()
+                    .iter()
+                    .any(|record| record.scope() == Scope::Session)
+            }) {
+                return Err(ServiceError::Unavailable);
+            }
+        } else {
+            let (_keep, mut cancel) = fresh_cancel();
+            let topology = read_topology(&mut cancel, DEADLINE)
+                .await
+                .map_err(unavailable)?;
+            self.backend
+                .policy(self.owner, compile_protection(&topology, false)?)
+                .await?;
+        }
         self.backend
             .supervisor
             .as_mut()
@@ -2249,6 +3028,7 @@ impl RecoveryHost for BackendRecovery<'_> {
         .await
     }
     async fn unlock(&mut self) -> Result<(), ServiceError> {
+        self.backend.recover_quarantine().await?;
         let id = self
             .backend
             .journal
@@ -2299,15 +3079,35 @@ async fn cleanup_records(owner: Ownership, journal: &mut Journal) -> Result<(), 
                 | (17 | 18, Resource::Address { tun_id: 16, .. })
                 | (19 | 20, Resource::Route { .. })
                 | (21 | 22, Resource::TunRule { tun_id: 16, .. })
+                | (
+                    FIRST_RESOLVER_RULE..=LAST_RESOLVER_RULE,
+                    Resource::ResolverRule { tun_id: 16, .. }
+                )
+                | (
+                    FIRST_THROW_ROUTE..=LAST_THROW_ROUTE,
+                    Resource::ThrowRoute { tun_id: 16, .. }
+                )
         )
     }) {
         return Err(ServiceError::Unavailable);
     }
-    records.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
+    records.sort_by_key(|(id, resource)| {
+        std::cmp::Reverse((
+            matches!(
+                resource,
+                Resource::TunRule { .. } | Resource::ResolverRule { .. }
+            ),
+            *id,
+        ))
+    });
     let mut executor = TunExecutor::open(owner).map_err(unavailable)?;
     for (id, resource) in records {
         match resource {
             Resource::TunRule { tun_id, .. } => executor.remove_rule(journal, tun_id, id).await,
+            Resource::ResolverRule { tun_id, .. } => {
+                executor.remove_resolver_rule(journal, tun_id, id).await
+            }
+            Resource::ThrowRoute { tun_id, .. } => executor.remove_route(journal, tun_id, id).await,
             Resource::Route { .. } => executor.remove_route(journal, TUN_ID, id).await,
             Resource::Address { tun_id, .. } => executor.remove_address(journal, tun_id, id).await,
             Resource::Tun { .. } => executor.remove_tun(journal, id).await,

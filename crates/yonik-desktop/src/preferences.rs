@@ -34,6 +34,10 @@ pub(crate) struct Preferences {
     pub language: String,
     #[serde(default)]
     pub proxy_fetch_dns: Option<std::net::SocketAddr>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_fake_dns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_fake_dns_policy_resolver: Option<std::net::SocketAddr>,
     #[serde(default = "default_interval")]
     pub subscription_interval_seconds: u32,
     #[serde(default)]
@@ -54,10 +58,24 @@ impl Default for Preferences {
             probe_status: 204,
             language: "ru".into(),
             proxy_fetch_dns: None,
+            system_fake_dns: Vec::new(),
+            system_fake_dns_policy_resolver: None,
             subscription_interval_seconds: default_interval(),
             subscription_background: false,
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn system_fake_dns_suffixes_are_optional_and_validated_on_load() {
+    let mut saved = serde_json::to_value(Preferences::default()).unwrap();
+    saved.as_object_mut().unwrap().remove("system_fake_dns");
+    assert!(valid(&serde_json::from_value(saved.clone()).unwrap()));
+    saved["system_fake_dns"] = serde_json::json!(["example.test"]);
+    assert!(valid(&serde_json::from_value(saved.clone()).unwrap()));
+    saved["system_fake_dns"] = serde_json::json!(["127.0.0.1"]);
+    assert!(!valid(&serde_json::from_value(saved).unwrap()));
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SaveOutcome {
@@ -317,6 +335,10 @@ fn valid(p: &Preferences) -> bool {
             .is_none_or(crate::startup_policy::Target::valid)
         && p.subscription_interval_seconds >= default_interval()
         && p.proxy_fetch_dns.is_none_or(valid_proxy_fetch_dns)
+        && valid_system_fake_dns(&p.system_fake_dns)
+        && p.system_fake_dns_policy_resolver.is_none_or(|address| {
+            yonik_linux::forward::PolicyProxyResolver::validate_upstream(address).is_ok()
+        })
         && matches!(p.engine.as_str(), "xray" | "sing-box")
         && matches!(p.language.as_str(), "ru" | "en")
         && p.probe_url.len() <= 2048
@@ -324,6 +346,15 @@ fn valid(p: &Preferences) -> bool {
         && yonik_linux::ProbeTarget::new(&p.probe_url, std::time::Duration::from_secs(5))
             .and_then(|t| t.with_expected_status(p.probe_status))
             .is_ok()
+}
+
+pub(crate) fn valid_system_fake_dns(suffixes: &[String]) -> bool {
+    suffixes.len() <= 32
+        && suffixes.iter().map(String::len).sum::<usize>() + suffixes.len().saturating_sub(1) * 2
+            <= 1024
+        && suffixes
+            .iter()
+            .all(|suffix| suffix.parse::<yonik_domain::DomainName>().is_ok())
 }
 
 /// Проверка тем же API, которое выполняет Proxy fetch; сетевых обращений нет.

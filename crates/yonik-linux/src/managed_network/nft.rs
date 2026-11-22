@@ -1,13 +1,25 @@
 //! Типизированные nftables-ресурсы с durable-учётом и проверкой владения.
 //! Неоднозначность оставляет durable intent; Drop не обещает сетевую очистку.
-use super::firewall::PublicBlockPolicy;
 use super::{
     Journal, JournalError, NftFamily, Ownership, Reconciled, RecordState, Resource, Scope,
 };
-use rustix::fs::{self, FileType, Mode, OFlags};
+use super::{
+    executable::NetworkTool,
+    firewall::{PublicBlockPolicy, RESOLVED_CGROUP_PATH},
+};
+use crate::helper::dhcp_sleep::DhcpSleepTicket;
+use rustix::fs;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{fmt, fs::File, os::fd::AsRawFd, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    fs::File,
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
@@ -19,10 +31,6 @@ const MAX_OUTPUT: usize = 256 * 1024;
 // удерживает общий permit до kill/wait, даже после Drop исходного executor.
 static PROCESS_LIMIT: Semaphore = Semaphore::const_new(1);
 const DEADLINE: Duration = Duration::from_secs(5);
-const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NftError {
@@ -58,6 +66,30 @@ impl From<JournalError> for NftError {
     fn from(error: JournalError) -> Self {
         Self::Journal(error)
     }
+}
+
+fn open_pinned_cgroup(path: &str, expected_inode: u64) -> Result<File, NftError> {
+    let flags =
+        fs::OFlags::PATH | fs::OFlags::DIRECTORY | fs::OFlags::NOFOLLOW | fs::OFlags::CLOEXEC;
+    let mut directory =
+        fs::open("/sys/fs/cgroup", flags, fs::Mode::empty()).map_err(|_| NftError::Evidence)?;
+    for component in path.split('/') {
+        if component.is_empty() || matches!(component, "." | "..") {
+            return Err(NftError::Evidence);
+        }
+        directory = fs::openat(&directory, component, flags, fs::Mode::empty())
+            .map_err(|_| NftError::Evidence)?;
+    }
+    let file = File::from(directory);
+    let metadata = file.metadata().map_err(|_| NftError::Evidence)?;
+    if metadata.ino() != expected_inode
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || fs::fstatfs(&file).map_err(|_| NftError::Evidence)?.f_type as u64 != 0x6367_7270
+    {
+        return Err(NftError::Evidence);
+    }
+    Ok(file)
 }
 
 struct Table {
@@ -102,6 +134,7 @@ enum Action<'a> {
     InstallBlock(&'a Table, &'a PublicBlockPolicy),
     CheckBlock(&'a Table, &'a PublicBlockPolicy),
     ReplaceBlock(&'a Table, u64, &'a Table, &'a PublicBlockPolicy),
+    Quarantine(Vec<Value>),
 }
 fn request(action: Action<'_>) -> Value {
     let command = match action {
@@ -128,9 +161,15 @@ fn request(action: Action<'_>) -> Value {
             commands.extend(policy.commands(&new.name));
             return json!({"nftables": commands});
         }
+        Action::Quarantine(commands) => return json!({"nftables": commands}),
     };
     json!({"nftables":[command]})
 }
+
+#[path = "nft_quarantine.rs"]
+mod quarantine;
+#[path = "nft_text.rs"]
+mod text;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -185,47 +224,6 @@ fn observe_json(bytes: &[u8], expected: &Table) -> Result<Observation, NftError>
     Ok(found.map_or(Observation::Absent, Observation::Owned))
 }
 
-fn trusted_executable() -> Result<File, NftError> {
-    let mut directory = File::from(
-        fs::open("/", DIRECTORY_FLAGS, Mode::empty()).map_err(|_| NftError::UnsafeExecutable)?,
-    );
-    for name in ["usr", "bin"] {
-        check_trusted(&directory, false)?;
-        directory = File::from(
-            fs::openat(&directory, name, DIRECTORY_FLAGS, Mode::empty())
-                .map_err(|_| NftError::UnsafeExecutable)?,
-        );
-    }
-    check_trusted(&directory, false)?;
-    let file = File::from(
-        fs::openat(
-            &directory,
-            "nft",
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map_err(|_| NftError::UnsafeExecutable)?,
-    );
-    check_trusted(&file, true)?;
-    Ok(file)
-}
-fn check_trusted(file: &File, executable: bool) -> Result<(), NftError> {
-    let stat = fs::fstat(file).map_err(|_| NftError::UnsafeExecutable)?;
-    let expected = if executable {
-        FileType::RegularFile
-    } else {
-        FileType::Directory
-    };
-    if stat.st_uid != 0
-        || stat.st_mode & 0o022 != 0
-        || FileType::from_raw_mode(stat.st_mode) != expected
-        || executable
-            && (stat.st_nlink != 1 || stat.st_mode & 0o111 == 0 || stat.st_mode & 0o6000 != 0)
-    {
-        return Err(NftError::UnsafeExecutable);
-    }
-    Ok(())
-}
 fn namespace(file: &File) -> Result<(u64, u64), NftError> {
     let stat = fs::fstat(file).map_err(|_| NftError::Namespace)?;
     Ok((stat.st_dev, stat.st_ino))
@@ -246,7 +244,9 @@ impl NftExecutor {
             return Err(NftError::Namespace);
         }
         Ok(Self {
-            executable: trusted_executable()?,
+            executable: NetworkTool::Nft
+                .open()
+                .map_err(|_| NftError::UnsafeExecutable)?,
             netns,
             owner,
             gate: Arc::new(Semaphore::new(1)),
@@ -263,7 +263,59 @@ impl NftExecutor {
     }
     async fn run(&mut self, action: Action<'_>) -> Result<Vec<u8>, NftError> {
         let check_only = matches!(&action, Action::CheckBlock(..));
-        let bytes = serde_json::to_vec(&request(action)).map_err(|_| NftError::Invalid)?;
+        let policy = match &action {
+            Action::InstallBlock(_, policy)
+            | Action::CheckBlock(_, policy)
+            | Action::ReplaceBlock(_, _, _, policy) => Some(*policy),
+            _ => None,
+        };
+        let resolver = policy.and_then(PublicBlockPolicy::resolver_tls_identity);
+        let mut pinned_cgroups = Vec::new();
+        let mut resolver_pin = None;
+        if let Some((namespace, id)) = resolver {
+            if namespace != self.owner.namespace() {
+                return Err(NftError::Namespace);
+            }
+            let file = open_pinned_cgroup(RESOLVED_CGROUP_PATH, id.get())?;
+            resolver_pin = Some((id.get(), file.as_raw_fd()));
+            pinned_cgroups.push(file);
+        }
+        let mut instances = BTreeMap::new();
+        if let Some(policy) = policy {
+            for (path, id) in policy.dhcp_instance_cgroups() {
+                if instances.contains_key(&path) || instances.len() >= 16 {
+                    return Err(NftError::Evidence);
+                }
+                let file = open_pinned_cgroup(&path, id.get())?;
+                let descriptor = file.as_raw_fd();
+                instances.insert(path, (id.get(), descriptor));
+                pinned_cgroups.push(file);
+            }
+        }
+        let text_input = !pinned_cgroups.is_empty()
+            || policy.is_some_and(|policy| policy.dhcp_rule_identity().is_some());
+        let request = request(action);
+        let bytes = if text_input {
+            text::render_with_instances(
+                request["nftables"].as_array().ok_or(NftError::Invalid)?,
+                resolver_pin,
+                &instances,
+            )?
+        } else {
+            serde_json::to_vec(&request).map_err(|_| NftError::Invalid)?
+        };
+        self.run_batch(bytes, text_input, check_only, None, Some(pinned_cgroups))
+            .await
+    }
+
+    async fn run_batch(
+        &mut self,
+        bytes: Vec<u8>,
+        text_input: bool,
+        check_only: bool,
+        dhcp_sleep: Option<&DhcpSleepTicket>,
+        pinned_cgroups: Option<Vec<File>>,
+    ) -> Result<Vec<u8>, NftError> {
         if bytes.len() > MAX_OUTPUT {
             return Err(NftError::Invalid);
         }
@@ -276,8 +328,32 @@ impl NftExecutor {
             .map_err(|_| NftError::Timeout)?
             .map_err(|_| NftError::Io)?;
         self.check_namespace()?;
+        let dhcp_write = dhcp_sleep
+            .map(|ticket| ticket.begin().ok_or(NftError::Evidence))
+            .transpose()?;
+        let deadline = if dhcp_write.is_some() {
+            block::DHCP_NFT_BUDGET
+        } else {
+            DEADLINE
+        };
         let mut command = Command::new(format!("/proc/self/fd/{}", self.executable.as_raw_fd()));
-        command.args(["-j", "-n"]);
+        if let Some(directories) = pinned_cgroups {
+            for directory in directories {
+                yonik_nsfs::nft_cgroup_fd::inherit_nft_fd(command.as_std_mut(), directory.into())
+                    .map_err(|_| NftError::Io)?;
+            }
+        }
+        if dhcp_write.is_some() {
+            let writer = crate::helper::dhcp_sleep::lock_dhcp_nft_writer()
+                .map_err(|_| NftError::Evidence)?;
+            // nft удерживает flock до завершения даже при SIGKILL процесса helper.
+            yonik_nsfs::nft_cgroup_fd::inherit_nft_fd(command.as_std_mut(), writer)
+                .map_err(|_| NftError::Io)?;
+        }
+        command.arg("-n");
+        if !text_input {
+            command.arg("-j");
+        }
         if check_only {
             command.arg("-c");
         }
@@ -291,7 +367,8 @@ impl NftExecutor {
             .kill_on_drop(true)
             .spawn()
             .map_err(|_| NftError::Io)?;
-        own_child(child, bytes, gate, global, DEADLINE)?
+        drop(command);
+        own_child(child, bytes, gate, global, dhcp_write, deadline)?
             .wait()
             .await
     }
@@ -416,6 +493,7 @@ fn own_child(
     bytes: Vec<u8>,
     gate: OwnedSemaphorePermit,
     global: SemaphorePermit<'static>,
+    dhcp_write: Option<OwnedSemaphorePermit>,
     deadline: Duration,
 ) -> Result<Running, NftError> {
     let mut input = child.stdin.take().ok_or(NftError::Io)?;
@@ -426,7 +504,7 @@ fn own_child(
     // Задача сохраняет владение Child после отмены вызывающего future,
     // убивает и wait/reap-ит его; kill_on_drop страхует shutdown runtime.
     tokio::spawn(async move {
-        let (_gate, _global) = (gate, global);
+        let (_gate, _global, _dhcp_write) = (gate, global, dhcp_write);
         let work = async {
             let write = async {
                 input.write_all(&bytes).await.map_err(|_| NftError::Io)?;

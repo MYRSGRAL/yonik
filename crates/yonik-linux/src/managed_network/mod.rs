@@ -6,14 +6,20 @@
 //! Helper обязан сверить namespace, собственную метку ресурса и его атрибуты.
 //! Drop/отмена не очищает сеть и не удаляет неоднозначные намерения.
 
+mod executable;
+mod fake_quarantine;
 pub mod firewall;
 pub mod nft;
 mod policy_state;
 pub mod private_bindings;
+mod private_dns_state;
+mod quarantine_state;
 mod session_state;
 mod storage;
 pub mod tun;
 pub use policy_state::{PublicPolicyPhase, PublicPolicyRecord};
+pub(crate) use private_dns_state::PrivateDnsJournal;
+pub(crate) use quarantine_state::{FAKE_POOLS, QuarantineIntent, QuarantineTun};
 pub use session_state::SessionRecoveryRecord;
 
 use serde::{Deserialize, Serialize};
@@ -113,6 +119,15 @@ pub enum Resource {
         protocol: u8,
         ifindex: u32,
     },
+    /// ifindex подтверждает родительский TUN, а не выход RTN_THROW.
+    ThrowRoute {
+        tun_id: u64,
+        ifindex: u32,
+        table: u32,
+        destination: IpAddr,
+        prefix_len: u8,
+        priority: u32,
+    },
     /// Фиксированное RPDB-правило собственного TUN: invert, полная маска, protocol 253.
     TunRule {
         tun_id: u64,
@@ -121,6 +136,14 @@ pub enum Resource {
         table: u32,
         mark: u32,
         ipv6: bool,
+    },
+    /// Физический маршрут исходного резолвера. В журнале хранится отпечаток селекторов.
+    ResolverRule {
+        tun_id: u64,
+        ifindex: u32,
+        priority: u32,
+        ipv6: bool,
+        digest: [u8; 32],
     },
     Rule {
         priority: u32,
@@ -139,6 +162,31 @@ pub enum Resource {
 }
 
 impl Resource {
+    fn parent_tun_id(&self) -> Option<u64> {
+        match *self {
+            Self::Address { tun_id, .. }
+            | Self::TunRule { tun_id, .. }
+            | Self::ResolverRule { tun_id, .. }
+            | Self::ThrowRoute { tun_id, .. } => Some(tun_id),
+            _ => None,
+        }
+    }
+
+    fn route_table(&self) -> Option<u32> {
+        match *self {
+            Self::Route { table, .. } | Self::ThrowRoute { table, .. } => Some(table),
+            _ => None,
+        }
+    }
+
+    fn anchors_throw_route(&self, other: &Self) -> bool {
+        matches!((self, other), (
+            Self::Route { table, ifindex, destination, prefix_len: 0, .. },
+            Self::ThrowRoute { table: other_table, ifindex: other_index, destination: other_destination, .. },
+        ) if table == other_table && ifindex == other_index
+            && destination.is_ipv4() == other_destination.is_ipv4())
+    }
+
     fn validate(&self, scope: Scope) -> Result<(), JournalError> {
         if scope == Scope::PublicBlock && !matches!(self, Self::NftTable { .. }) {
             return Err(JournalError::Invalid);
@@ -184,6 +232,19 @@ impl Resource {
                 };
                 *table != 0 && canonical && *protocol != 0 && *ifindex != 0
             }
+            Self::ThrowRoute {
+                tun_id,
+                ifindex,
+                table,
+                destination,
+                prefix_len,
+                priority,
+            } => {
+                *tun_id != 0
+                    && (1..=i32::MAX as u32).contains(ifindex)
+                    && tun::TunRoute::new_throw(*destination, *prefix_len, *table, *priority)
+                        .is_ok()
+            }
             Self::TunRule {
                 tun_id,
                 ifindex,
@@ -198,6 +259,18 @@ impl Resource {
                     && (1..32766).contains(priority)
                     && (256..u32::MAX).contains(table)
                     && (1..=i32::MAX as u32).contains(mark)
+            }
+            Self::ResolverRule {
+                tun_id,
+                ifindex,
+                priority,
+                digest,
+                ..
+            } => {
+                *tun_id != 0
+                    && (1..=i32::MAX as u32).contains(ifindex)
+                    && (1..32766).contains(priority)
+                    && *digest != [0; 32]
             }
             Self::Rule {
                 priority,
@@ -272,10 +345,14 @@ struct Document {
     policy_sequence: u64,
     #[serde(deserialize_with = "session_state::deserialize_recovery")]
     session_recovery: Option<SessionRecoveryRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fake_quarantine: Option<quarantine_state::FakeQuarantineRecord>,
 }
 impl Document {
     fn validate(&self) -> Result<(), JournalError> {
-        if self.version != 3 {
+        if (self.version, self.fake_quarantine.is_some()) != (3, false)
+            && (self.version, self.fake_quarantine.is_some()) != (4, true)
+        {
             return Err(JournalError::Version);
         }
         self.ownership.validate()?;
@@ -301,9 +378,7 @@ impl Document {
             })
             .collect();
         for record in &self.records {
-            if let Resource::Address { tun_id, .. } | Resource::TunRule { tun_id, .. } =
-                record.resource
-            {
+            if let Some(tun_id) = record.resource.parent_tun_id() {
                 if !tun_ids.contains(&tun_id) {
                     return Err(JournalError::Invalid);
                 }
@@ -311,6 +386,9 @@ impl Document {
         }
         if let Some(policy) = &self.public_policy {
             policy.validate(self)?;
+        }
+        if let Some(record) = &self.fake_quarantine {
+            record.validate(self)?;
         }
         Ok(())
     }
@@ -431,6 +509,7 @@ impl Journal {
             public_policy: None,
             policy_sequence: 0,
             session_recovery: None,
+            fake_quarantine: None,
         });
         if migrated {
             document.version = 3;
@@ -554,6 +633,17 @@ impl Journal {
                             return Err(JournalError::Conflict);
                         }
                         document.public_policy = None;
+                        if document
+                            .session_recovery
+                            .as_ref()
+                            .is_some_and(|session| !session.kill_switch())
+                            && !document
+                                .records
+                                .iter()
+                                .any(|record| record.scope == Scope::Session)
+                        {
+                            document.session_recovery = None;
+                        }
                     }
                 }
                 document.records.remove(index);
@@ -657,12 +747,10 @@ impl Journal {
         }
         self.persist(document)?;
         let mut removed = 0;
-        let mut address_children = BTreeMap::<u64, usize>::new();
+        let mut tun_children = BTreeMap::<u64, usize>::new();
         for record in &self.document.records {
-            if let Resource::Address { tun_id, .. } | Resource::TunRule { tun_id, .. } =
-                record.resource
-            {
-                *address_children.entry(tun_id).or_default() += 1;
+            if let Some(tun_id) = record.resource.parent_tun_id() {
+                *tun_children.entry(tun_id).or_default() += 1;
             }
         }
         for id in ids {
@@ -675,12 +763,16 @@ impl Journal {
             // Даже при unwind/cancellation следующая попытка требует новой сверки.
             self.reconciled.remove(&id);
             if matches!(self.document.records[index].resource, Resource::Tun { .. })
-                && address_children.get(&id).copied().unwrap_or(0) != 0
+                && tun_children.get(&id).copied().unwrap_or(0) != 0
             {
                 continue;
             }
-            if let Resource::Route { table, .. } = self.document.records[index].resource {
-                if self.document.records.iter().any(|record| matches!(record.resource, Resource::TunRule { table: used, .. } if used == table)) {
+            let resource = &self.document.records[index].resource;
+            if let Some(table) = resource.route_table() {
+                if self.document.records.iter().any(|record| {
+                    matches!(record.resource, Resource::TunRule { table: used, .. } if used == table)
+                        || resource.anchors_throw_route(&record.resource)
+                }) {
                     continue;
                 }
             }
@@ -695,10 +787,8 @@ impl Journal {
                     document.public_policy = None;
                 }
                 self.persist(document)?;
-                if let Resource::Address { tun_id, .. } | Resource::TunRule { tun_id, .. } =
-                    removed_record.resource
-                {
-                    if let Some(count) = address_children.get_mut(&tun_id) {
+                if let Some(tun_id) = removed_record.resource.parent_tun_id() {
+                    if let Some(count) = tun_children.get_mut(&tun_id) {
                         *count -= 1;
                     }
                 }

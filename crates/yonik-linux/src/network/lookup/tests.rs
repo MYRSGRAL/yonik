@@ -90,6 +90,33 @@ fn selected_path_preserves_table_gateway_source_and_nexthop() {
 }
 
 #[test]
+fn ipv6_router_preference_is_known_and_preserved() {
+    let query = RouteQuery::new(Ipv6Addr::LOCALHOST.into(), 0);
+    let namespace = NetworkNamespace {
+        device: 1,
+        inode: 2,
+    };
+    let mut bytes = response(1);
+    bytes[..3].copy_from_slice(&[10, 128, 0]);
+    add_attribute(&mut bytes, 20, &[0]);
+    let route = parse_reply(&bytes, query.clone(), namespace).expect("предпочтение IPv6");
+    assert!(route.incomplete.is_empty());
+    assert_eq!(route.attributes.len(), 1);
+    assert_eq!(route.attributes[0].kind, 20);
+    assert_eq!(route.attributes[0].value, [0]);
+
+    for invalid in [&[2][..], &[0, 0][..]] {
+        let mut malformed = response(1);
+        malformed[..3].copy_from_slice(&[10, 128, 0]);
+        add_attribute(&mut malformed, 20, invalid);
+        assert_eq!(
+            parse_reply(&malformed, query.clone(), namespace).err(),
+            Some(NetworkReadError::Malformed)
+        );
+    }
+}
+
+#[test]
 fn ambiguous_multipath_is_preserved_without_selecting_first() {
     let mut bytes = response(1);
     add_attribute(&mut bytes, 9, &[8, 0, 0, 0, 9, 0, 0, 0]);

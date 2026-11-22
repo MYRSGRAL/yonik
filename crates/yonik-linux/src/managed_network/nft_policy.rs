@@ -96,6 +96,12 @@ impl NftExecutor {
         desired: PublicBlockPolicy,
     ) -> Result<u64, NftError> {
         self.check_namespace()?;
+        if desired
+            .dhcp_rule_identity()
+            .is_some_and(|(namespace, _)| namespace != self.owner.namespace())
+        {
+            return Err(NftError::Namespace);
+        }
         let revision = journal.begin_public_policy(self.owner, id, table_id, desired.clone())?;
         match self.recover_public_policy(journal).await? {
             PublicPolicyRecovery::DesiredRules { revision: actual } if actual == revision => {

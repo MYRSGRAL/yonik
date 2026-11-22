@@ -1,9 +1,10 @@
 //! Доверенный host public-protection IPC. Файловый I/O и nft работают в отдельной
 //! blocking-задаче: private D-Bus dispatcher не ждёт fsync на своём runtime.
 use super::service::{ProtectionHost, ProtectionState, ServiceError};
+use super::session_fake_dns::FakeDnsState;
 use super::{PreparedArtifact, PreparedContext, PreparedError};
 use crate::managed_network::{
-    Journal, Ownership,
+    Journal, JournalError, Ownership, PrivateDnsJournal,
     firewall::{IpPrefix, LanException, PublicBlockPolicy},
     nft::{NftExecutor, PublicPolicyRecovery},
 };
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     num::NonZeroU64,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -23,12 +24,14 @@ pub(super) mod session_host;
 use session_host::{ActiveSession, HelperTunCustody, SessionArtifact};
 
 const STATE_PATH: &str = "/run/yonik/network";
+const PACKAGE_MAINTENANCE: &str = "/run/yonik-package-maintenance";
+const PRIVATE_DNS_STATE_PATH: &str = "/var/lib/yonik";
 const MAX_PLAN_BYTES: usize = 64 * 1024;
 const RT_SCOPE_LINK: u8 = 253;
 const RT_TABLE_MAIN: u32 = 254;
 const RTPROT_KERNEL: u8 = 2;
-const ARPHRD_ETHER: u16 = 1;
-const IFF_UP: u32 = 1;
+pub(super) const ARPHRD_ETHER: u16 = 1;
+pub(super) const IFF_UP: u32 = 1;
 const IFF_LOOPBACK: u32 = 8;
 
 #[derive(Serialize, Deserialize)]
@@ -79,22 +82,30 @@ pub struct SystemProtectionHost {
     _monitor: NetworkMonitor,
     runtime: tokio::runtime::Handle,
     _safety: Option<session_host::SafetyTask>,
+    _dhcp_sleep: Option<super::dhcp_sleep::DhcpSleepTask>,
+    standalone: bool,
 }
+const PROFILE_ADMISSION_BOUND: Duration = Duration::from_secs(2);
+
 struct Backend {
     profile_owner: Option<(std::sync::Weak<Mutex<Backend>>, tokio::runtime::Handle)>,
     path: PathBuf,
     journal: Option<Journal>,
+    private_dns_zones: Result<PrivateDnsJournal, JournalError>,
     watch: NetworkWatch,
     seed: u64,
     epoch: u64,
     native_eligibility: Option<super::native_profile::VerifiedStaticInstalledImage>,
     native_owner: session_host::native_owner::NativeOwnerState,
     bindings: Option<NetworkStamp>,
-    supervisor: Option<super::SystemWorkerSupervisor>,
+    supervisor: Option<super::session_supervisor::SessionSupervisor>,
     worker_uncertain: bool,
     active: Option<ActiveSession>,
     tun_custody: Option<HelperTunCustody>,
     registry: Option<super::TrustedRegistry>,
+    fake_dns: FakeDnsState,
+    fake_dns_reap: Option<session_host::SafetyTask>,
+    dhcp_sleep: Arc<super::dhcp_sleep::DhcpSleep>,
     exited: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     isolated: bool,
@@ -105,7 +116,7 @@ enum Operation {
     PrepareProfile(u32, Box<super::service::SystemProfileRequest>),
     PrepareFullProfile(u32, Box<super::profile_intent::FullProfileRequest>),
     PrepareBundle(u32, Box<super::service::SystemBundleRequest>),
-    Apply(u32, GuardPlan, NetworkStamp),
+    Apply(u32, Box<GuardPlan>, NetworkStamp),
     ApplyProfile(
         u32,
         Arc<SessionArtifact>,
@@ -140,17 +151,58 @@ fn namespace() -> Result<(u64, u64), ServiceError> {
     let metadata = std::fs::metadata("/proc/thread-self/ns/net").map_err(unavailable)?;
     Ok((metadata.dev(), metadata.ino()))
 }
+fn open_startup_state(path: &Path) -> Result<(Option<Journal>, FakeDnsState), ServiceError> {
+    let journal = Journal::open_existing(path).map_err(unavailable)?;
+    if journal
+        .as_ref()
+        .is_some_and(|j| Some(j.ownership().namespace()) != namespace().ok())
+    {
+        return Err(ServiceError::Unavailable);
+    }
+    let fake_dns = FakeDnsState::new(journal.as_ref());
+    Ok((journal, fake_dns))
+}
+
 impl SystemProtectionHost {
     pub async fn system(mut cancel: Cancellation) -> Result<Self, ServiceError> {
         if rustix::process::geteuid().as_raw() != 0 {
             return Err(ServiceError::Unavailable);
         }
-        Self::create(PathBuf::from(STATE_PATH), &mut cancel, false).await
+        Self::create(PathBuf::from(STATE_PATH), &mut cancel, false, None).await
     }
+
+    pub async fn system_standalone(mut cancel: Cancellation) -> Result<Self, ServiceError> {
+        use super::{
+            session_supervisor::SessionSupervisor, standalone_supervisor::StandaloneSupervisor,
+        };
+        if !rustix::process::geteuid().is_root() {
+            return Err(ServiceError::Unavailable);
+        }
+        let mut supervisor = StandaloneSupervisor::open().map_err(unavailable)?;
+        supervisor.recover(&mut cancel).await.map_err(unavailable)?;
+        StandaloneSupervisor::ensure_tun_device(&mut cancel)
+            .await
+            .map_err(unavailable)?;
+        super::PeerAuthorizer::system(cancel.clone())
+            .await
+            .map_err(ServiceError::Authorization)?
+            .activate_authority(&mut cancel)
+            .await
+            .map_err(ServiceError::Authorization)?;
+        Self::create(
+            PathBuf::from(STATE_PATH),
+            &mut cancel,
+            false,
+            Some(SessionSupervisor::Standalone(Box::new(supervisor))),
+        )
+        .await
+    }
+
     async fn create(
         path: PathBuf,
         cancel: &mut Cancellation,
         isolated: bool,
+        supervisor: Option<super::session_supervisor::SessionSupervisor>,
     ) -> Result<Self, ServiceError> {
         let monitor = NetworkMonitor::start().map_err(unavailable)?;
         let mut watch = monitor.watch();
@@ -165,30 +217,43 @@ impl SystemProtectionHost {
         let seed = u64::from_le_bytes(random).max(1);
         let exited = Arc::new(tokio::sync::Notify::new());
         let backend_exited = Arc::clone(&exited);
+        let standalone = matches!(
+            &supervisor,
+            Some(super::session_supervisor::SessionSupervisor::Standalone(_))
+        );
+        let dhcp_sleep = Arc::new(super::dhcp_sleep::DhcpSleep::default());
+        let sleep_watch = (!isolated)
+            .then(|| super::dhcp_sleep::watch(Arc::clone(&dhcp_sleep), Arc::clone(&exited)));
         let backend = tokio::task::spawn_blocking(move || {
-            let journal = Journal::open_existing(&path).map_err(unavailable)?;
-            if journal
-                .as_ref()
-                .is_some_and(|j| Some(j.ownership().namespace()) != namespace().ok())
-            {
-                return Err(ServiceError::Unavailable);
-            }
+            let (journal, fake_dns) = open_startup_state(&path)?;
+            let private_dns_path = if isolated {
+                path.join("private-dns")
+            } else {
+                PathBuf::from(PRIVATE_DNS_STATE_PATH)
+            };
+            // Повреждение DNS-состояния блокирует Fake DNS. Stop и
+            // восстановление ресурсов по сетевому журналу остаются доступны.
+            let private_dns_zones = PrivateDnsJournal::open(&private_dns_path, journal.as_ref());
             let _fixture_only = isolated;
             Ok::<_, ServiceError>(Backend {
                 profile_owner: None,
                 path,
                 journal,
+                private_dns_zones,
                 watch,
                 seed,
                 epoch: 1,
                 native_eligibility: None,
                 native_owner: session_host::native_owner::NativeOwnerState::fresh(),
                 bindings: None,
-                supervisor: None,
+                supervisor,
                 worker_uncertain: false,
                 active: None,
                 tun_custody: None,
                 registry: None,
+                fake_dns,
+                fake_dns_reap: None,
+                dhcp_sleep,
                 exited: backend_exited,
                 #[cfg(test)]
                 isolated,
@@ -215,14 +280,16 @@ impl SystemProtectionHost {
             _monitor: monitor,
             runtime,
             _safety: Some(safety),
+            _dhcp_sleep: sleep_watch,
+            standalone,
         })
     }
     async fn job(&self, operation: Operation, cancel: Cancellation) -> Result<Reply, ServiceError> {
         cancel.check().map_err(|_| ServiceError::Cancelled)?;
         let shared = Arc::clone(&self.backend);
         let runtime = self.runtime.clone();
-        if matches!(operation, Operation::Stop(_)) {
-            // Единственный допущенный Stop ожидает FIFO gate до spawn_blocking.
+        if matches!(operation, Operation::Stop(_) | Operation::Unlock(_)) {
+            // Допущенная остановка или разблокировка ожидает FIFO gate до spawn_blocking.
             // Drop caller не отменяет уже допущенную задачу и durable cleanup.
             let slot = Arc::clone(&self.stop_admission)
                 .try_acquire_owned()
@@ -237,9 +304,15 @@ impl SystemProtectionHost {
             .await
             .map_err(unavailable)?;
         }
-        let permit = Arc::clone(&self.operations)
-            .try_acquire_owned()
-            .map_err(|_| super::service::busy_at("backend_operation_capacity"))?;
+        let operations = Arc::clone(&self.operations);
+        let permit = if matches!(operation, Operation::ApplyProfile(..)) {
+            let mut admission = cancel.clone();
+            wait_for_stop(operations, &mut admission, PROFILE_ADMISSION_BOUND).await?
+        } else {
+            operations
+                .try_acquire_owned()
+                .map_err(|_| super::service::busy_at("backend_operation_capacity"))?
+        };
         drop(self.backend.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => super::service::busy_at("backend_job_preflight"),
             _ => ServiceError::Unavailable,
@@ -251,7 +324,7 @@ impl SystemProtectionHost {
         path: PathBuf,
         mut cancel: Cancellation,
     ) -> Result<Self, ServiceError> {
-        Self::create(path, &mut cancel, true).await
+        Self::create(path, &mut cancel, true, None).await
     }
 }
 async fn wait_for_stop(
@@ -284,6 +357,27 @@ async fn execute_job(
     .map_err(unavailable)?
 }
 impl Backend {
+    async fn shutdown_standalone(&mut self, cancel: &mut Cancellation) -> Result<(), ServiceError> {
+        use super::session_supervisor::SessionSupervisor;
+        if self.has_session() {
+            let uid = self
+                .journal
+                .as_ref()
+                .ok_or(ServiceError::Unavailable)?
+                .ownership()
+                .owner_uid();
+            return match self.finish_session(uid, false).await? {
+                ProtectionState::NoManagedPolicy | ProtectionState::RecoveryRequired => Ok(()),
+                _ => Err(ServiceError::Unavailable),
+            };
+        }
+        // Публичная политика и истекающий Fake-IP карантин живут без сессии.
+        let Some(SessionSupervisor::Standalone(supervisor)) = &mut self.supervisor else {
+            return Err(ServiceError::Unavailable);
+        };
+        supervisor.recover(cancel).await.map_err(unavailable)
+    }
+
     fn snapshot(&self) -> Result<crate::NetworkSnapshot, ServiceError> {
         let snapshot = self.watch.current();
         if !snapshot.coverage.routes || snapshot.exhausted {
@@ -355,7 +449,13 @@ impl Backend {
         if self.has_session() || self.worker_uncertain {
             return self.observe_session(uid).await;
         }
-        if self.journal.is_none() {
+        // Карантин Fake-IP может пережить сессию и сохранить UID её владельца.
+        // Для этого случая State не нужен executor от имени текущего клиента.
+        if self.journal.as_ref().is_none_or(|journal| {
+            journal.records().is_empty()
+                && journal.public_policy().is_none()
+                && journal.session_recovery().is_none()
+        }) {
             return Ok(ProtectionState::NoManagedPolicy);
         }
         let mut executor = self.executor(owner)?;
@@ -379,6 +479,19 @@ impl Backend {
         mut cancel: Cancellation,
     ) -> Result<Reply, ServiceError> {
         cancel.check().map_err(|_| ServiceError::Cancelled)?;
+        // Проверка выполняется под тем же допуском, что и снимок State.
+        // Операция dpkg сначала закрывает Apply, затем запрашивает снимок.
+        if matches!(
+            operation,
+            Operation::Apply(..) | Operation::ApplyProfile(..)
+        ) && self.path == Path::new(STATE_PATH)
+            && !matches!(
+                std::fs::symlink_metadata(PACKAGE_MAINTENANCE),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            return Err(super::service::busy_at("package_maintenance"));
+        }
         match operation {
             Operation::NativeEligibility => {
                 cancel.check().map_err(|_| ServiceError::Cancelled)?;
@@ -527,6 +640,7 @@ impl Backend {
                 if self.has_session() || self.worker_uncertain {
                     return self.finish_session(uid, true).await.map(Reply::State);
                 }
+                self.recover_quarantine().await?;
                 if let Some(journal) = &self.journal {
                     let id = journal.public_policy().map(|p| p.id()).unwrap_or(1);
                     let mut executor = self.executor(owner)?;
@@ -594,6 +708,30 @@ fn compile_protection(
 }
 impl ProtectionHost for SystemProtectionHost {
     type Artifact = GuardArtifact;
+
+    async fn shutdown(&mut self) -> Result<(), ServiceError> {
+        if !self.standalone {
+            return Ok(());
+        }
+        drop(self._safety.take());
+        drop(self._dhcp_sleep.take());
+        let (owner, mut cancel) = Cancellation::new();
+        let permit = wait_for_stop(
+            Arc::clone(&self.operations),
+            &mut cancel,
+            super::service::STOP_WAIT_BOUND,
+        )
+        .await?;
+        let shared = Arc::clone(&self.backend);
+        let runtime = self.runtime.clone();
+        tokio::task::spawn_blocking(move || {
+            let (_owner, _permit) = (owner, permit);
+            let mut backend = shared.lock().map_err(unavailable)?;
+            runtime.block_on(backend.shutdown_standalone(&mut cancel))
+        })
+        .await
+        .map_err(unavailable)?
+    }
     async fn prepare_full_profile(
         &mut self,
         uid: u32,
@@ -619,13 +757,20 @@ impl ProtectionHost for SystemProtectionHost {
         &mut self,
         cancel: Cancellation,
     ) -> Result<bool, ServiceError> {
+        if self.standalone {
+            cancel.check().map_err(|_| ServiceError::Cancelled)?;
+            return Ok(false);
+        }
         match self.job(Operation::NativeEligibility, cancel).await? {
             Reply::NativeEligibility(value) => Ok(value),
             _ => Err(ServiceError::Unavailable),
         }
     }
     fn bundle_transport(&self) -> bool {
-        true
+        !self.standalone
+    }
+    fn system_tun(&self) -> bool {
+        self.standalone
     }
     async fn prepare_bundle(
         &mut self,
@@ -657,7 +802,11 @@ impl ProtectionHost for SystemProtectionHost {
         else {
             return Err(ServiceError::Unavailable);
         };
-        let context = self.context(uid)?;
+        let context = artifact
+            .session
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .prepared_context();
         if !self._monitor.watch().current().is_current(artifact.stamp) {
             return Err(stale());
         }
@@ -689,6 +838,19 @@ impl ProtectionHost for SystemProtectionHost {
             })?
             .context(uid)
     }
+    async fn context_for_apply(
+        &self,
+        uid: u32,
+        mut cancel: Cancellation,
+    ) -> Result<PreparedContext, ServiceError> {
+        let _permit = wait_for_stop(
+            Arc::clone(&self.operations),
+            &mut cancel,
+            PROFILE_ADMISSION_BOUND,
+        )
+        .await?;
+        self.context(uid)
+    }
     async fn apply(
         &mut self,
         uid: u32,
@@ -710,7 +872,10 @@ impl ProtectionHost for SystemProtectionHost {
         let plan: GuardPlan =
             serde_json::from_slice(&artifact.bytes).map_err(|_| ServiceError::InvalidRequest)?;
         match self
-            .job(Operation::Apply(uid, plan, artifact.stamp), cancel)
+            .job(
+                Operation::Apply(uid, Box::new(plan), artifact.stamp),
+                cancel,
+            )
             .await?
         {
             Reply::State(state) => Ok(state),

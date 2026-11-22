@@ -1,4 +1,267 @@
 use super::*;
+use crate::helper::worker_paths::{empty_events, open_worker_directory};
+
+#[path = "standalone_check_vm.rs"]
+mod standalone_check_vm;
+
+fn require_cgroup_fixture_vm() {
+    assert_eq!(
+        std::env::var("YONIK_PRODUCTION_HELPER_VM").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        std::fs::read_to_string("/etc/yonik-production-helper-vm").unwrap(),
+        "yonik-production-helper-disposable-v1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+            .unwrap()
+            .trim(),
+        "QEMU"
+    );
+    assert_eq!(rustix::process::getuid().as_raw(), 0);
+}
+
+const PORTABLE_FIXTURE_PREFIX: &str = "yonik-worker-proof-";
+const PORTABLE_FIXTURE_ROLE: &str = "YONIK_WORKER_PROOF_ROLE";
+const PORTABLE_FIXTURE_ROOT: &str = "YONIK_WORKER_PROOF_ROOT";
+const PORTABLE_FIXTURE_CHILD: &str = "helper::systemd_worker::tests::portable_worker_fixture_child";
+
+#[test]
+#[ignore = "Внутренний subprocess disposable QEMU VM"]
+fn portable_worker_fixture_child() {
+    use std::{os::unix::process::CommandExt, process::Command};
+    require_cgroup_fixture_vm();
+    let root = std::env::var(PORTABLE_FIXTURE_ROOT).unwrap();
+    let parent = root.strip_prefix(PORTABLE_FIXTURE_PREFIX).unwrap();
+    assert!(parent.parse::<u32>().is_ok_and(|pid| pid > 1));
+    match std::env::var(PORTABLE_FIXTURE_ROLE).unwrap().as_str() {
+        "controller" => {
+            let mut children = [
+                spawn_portable_fixture(&root, "check"),
+                spawn_portable_fixture(&root, "run"),
+            ];
+            std::thread::sleep(Duration::from_secs(30));
+            for child in &mut children {
+                let _ = child.kill();
+                child.wait().unwrap();
+            }
+        }
+        role @ ("check" | "run") => {
+            WorkerCgroups::open(&root)
+                .unwrap()
+                .join_current(role)
+                .unwrap();
+            panic!(
+                "Не удалось выполнить fixture: {}",
+                Command::new("/usr/bin/sleep").arg("30").exec()
+            );
+        }
+        _ => panic!("Неизвестная роль fixture"),
+    }
+}
+
+fn spawn_portable_fixture(root: &str, role: &str) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", PORTABLE_FIXTURE_CHILD])
+        .env(PORTABLE_FIXTURE_ROOT, root)
+        .env(PORTABLE_FIXTURE_ROLE, role)
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "Только disposable QEMU VM, отдельные cgroup Check и Run"]
+fn standalone_worker_placement_and_recovery_after_controller_exit() {
+    use std::time::Instant as StdInstant;
+    require_cgroup_fixture_vm();
+    let root = format!("{PORTABLE_FIXTURE_PREFIX}{}", std::process::id());
+    let path = std::path::Path::new("/sys/fs/cgroup").join(&root);
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(
+        WorkerCgroups::open(&root).unwrap().join_current("check"),
+        Err(WorkerSupervisorError::Unavailable)
+    );
+    let check = path.join("check");
+    let run = path.join("run");
+    std::fs::create_dir(&check).unwrap();
+    std::fs::create_dir(&run).unwrap();
+    let mut controller = spawn_portable_fixture(&root, "controller");
+    let sleep = std::fs::canonicalize("/usr/bin/sleep").unwrap();
+    let launched = || {
+        [&check, &run].into_iter().all(|group| {
+            std::fs::read_to_string(group.join("cgroup.procs"))
+                .ok()
+                .and_then(|pids| pids.trim().parse::<u32>().ok())
+                .is_some_and(|pid| {
+                    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|image| image == sleep)
+                })
+        })
+    };
+    let deadline = StdInstant::now() + Duration::from_secs(5);
+    while !launched() && StdInstant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let both_launched = launched();
+    controller.kill().unwrap();
+    controller.wait().unwrap();
+
+    let recovery = WorkerCgroups::open(&root).unwrap();
+    let occupied = !recovery.empty("check").unwrap() && !recovery.empty("run").unwrap();
+    assert!(
+        std::process::Command::new("/usr/bin/mount")
+            .arg("--bind")
+            .arg(&run)
+            .arg(&check)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let substituted = recovery.kill_group("check");
+    assert!(
+        std::process::Command::new("/usr/bin/umount")
+            .arg(&check)
+            .status()
+            .unwrap()
+            .success()
+    );
+    recovery.kill_group("check").unwrap();
+    let deadline = StdInstant::now() + Duration::from_secs(2);
+    while !recovery.empty("check").unwrap() && StdInstant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let isolated = recovery.empty("check").unwrap() && !recovery.empty("run").unwrap();
+    recovery.kill_group("run").unwrap();
+    let deadline = StdInstant::now() + Duration::from_secs(2);
+    while !recovery.empty("run").unwrap() && StdInstant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(recovery.empty("run").unwrap());
+    std::fs::remove_dir(check).unwrap();
+    std::fs::remove_dir(run).unwrap();
+    std::fs::remove_dir(path).unwrap();
+    assert_eq!(substituted, Err(WorkerSupervisorError::Untrusted));
+    assert!(both_launched && occupied && isolated);
+}
+
+#[test]
+#[ignore = "Только disposable QEMU VM с доступной для записи cgroup v2"]
+fn worker_cgroup_recovery_observes_nested_process() {
+    use std::{process::Command, time::Instant as StdInstant};
+    require_cgroup_fixture_vm();
+    struct Fixture {
+        root: std::path::PathBuf,
+        process: Option<std::process::Child>,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(process) = self.process.as_mut() {
+                let _ = process.kill();
+                let _ = process.wait();
+            }
+            let _ = std::fs::remove_dir(self.root.join("worker/nested"));
+            let _ = std::fs::remove_dir(self.root.join("worker"));
+            let _ = std::fs::remove_dir(self.root.join("replacement"));
+            let _ = std::fs::remove_dir(&self.root);
+        }
+    }
+
+    let parent = format!("yonik-fence-test-{}", std::process::id());
+    let root = std::path::Path::new("/sys/fs/cgroup").join(&parent);
+    std::fs::create_dir(&root).unwrap();
+    let mut fixture = Fixture {
+        root,
+        process: None,
+    };
+    let initial = WorkerCgroups::open(&parent).unwrap();
+    assert!(initial.empty("worker").unwrap());
+    let nested = fixture.root.join("worker/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let mut process = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+    let pid = process.id();
+    assert!(process.try_wait().unwrap().is_none());
+    fixture.process = Some(process);
+    std::fs::write(nested.join("cgroup.procs"), pid.to_string()).unwrap();
+    drop(initial);
+
+    let recovered = WorkerCgroups::open(&parent).unwrap();
+    assert!(!recovered.empty("worker").unwrap());
+    std::fs::write(fixture.root.join("worker/cgroup.kill"), "1").unwrap();
+    let process = fixture.process.as_mut().unwrap();
+    let deadline = StdInstant::now() + Duration::from_secs(2);
+    while process.try_wait().unwrap().is_none() || !recovered.empty("worker").unwrap() {
+        assert!(StdInstant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::remove_dir(nested).unwrap();
+    let worker = fixture.root.join("worker");
+    let replacement = fixture.root.join("replacement");
+    std::fs::create_dir(&replacement).unwrap();
+    assert!(
+        Command::new("/usr/bin/mount")
+            .arg("--bind")
+            .arg(&replacement)
+            .arg(&worker)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mount_result = recovered.empty("worker");
+    assert!(
+        Command::new("/usr/bin/umount")
+            .arg(&worker)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(mount_result, Err(WorkerSupervisorError::Untrusted));
+    std::fs::remove_dir(replacement).unwrap();
+    std::fs::remove_dir(worker).unwrap();
+    assert!(recovered.empty("worker").unwrap());
+    std::fs::remove_dir(&fixture.root).unwrap();
+    std::fs::create_dir(&fixture.root).unwrap();
+    assert_eq!(recovered.empty("worker"), Err(WorkerSupervisorError::Stale));
+    assert!(
+        WorkerCgroups::open(&parent)
+            .unwrap()
+            .empty("worker")
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+#[ignore = "Только disposable QEMU VM с установленными worker units"]
+async fn recover_confirms_cgroup_in_systemd_sandbox() -> Result<()> {
+    require_cgroup_fixture_vm();
+    let mut supervisor = SystemWorkerSupervisor::system().await?;
+    let (_sender, mut cancel) = Cancellation::new();
+    let mode = WorkerMode::Check;
+    let deadline = Instant::now() + DEADLINE;
+    supervisor.begin(mode, &mut cancel, deadline).await?;
+    let connection = tokio::net::UnixStream::connect(mode.channel()).await;
+    let result = async {
+        connection.as_ref().map_err(unavailable)?;
+        loop {
+            if supervisor.state(mode).await?.active == "active" {
+                if supervisor.fence.empty(mode)? {
+                    return Err(WorkerSupervisorError::Stale);
+                }
+                break Ok(());
+            }
+            if Instant::now() >= deadline {
+                break Err(WorkerSupervisorError::Timeout);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    .await;
+    let cleanup = supervisor.recover(&mut cancel).await;
+    drop(connection);
+    result?;
+    cleanup?;
+    assert!(supervisor.fence.empty(mode)?);
+    Ok(())
+}
 
 #[test]
 fn cgroup_events_requires_a_single_zero_populated_field() {
@@ -48,6 +311,32 @@ fn fixed_units_have_no_client_supplied_names() {
     );
 }
 
+#[test]
+fn worker_accepts_only_its_vendor_timeout_abort_mask() {
+    let worker = WorkerMode::Run.service();
+    let check = WorkerMode::Check.service();
+    let mask = |name| format!("/usr/lib/systemd/system/{name}.d/10-timeout-abort.conf");
+    assert!(worker_drop_ins_allowed(worker, &[]));
+    assert!(worker_drop_ins_allowed(worker, &[mask(worker)]));
+    assert!(worker_drop_ins_allowed(check, &[mask(check)]));
+    assert!(!worker_drop_ins_allowed(worker, &[mask(check)]));
+    assert!(!worker_drop_ins_allowed(
+        worker,
+        &[
+            mask(worker),
+            "/usr/lib/systemd/system/service.d/10-timeout-abort.conf".into()
+        ]
+    ));
+    assert!(!worker_drop_ins_allowed(
+        WorkerMode::Run.socket(),
+        &[mask(WorkerMode::Run.socket())]
+    ));
+    assert!(!worker_drop_ins_allowed(
+        worker,
+        &[mask(worker).replace("/usr/lib", "/etc")]
+    ));
+}
+
 use std::sync::Mutex;
 
 struct PrivateBus {
@@ -88,6 +377,7 @@ impl Drop for PrivateBus {
 #[derive(Default)]
 struct FakeState {
     jobs: Vec<(String, String)>,
+    loaded_units: Vec<String>,
     populated: bool,
     pid: u32,
     invocation: Vec<u8>,
@@ -119,6 +409,7 @@ impl FakeManager {
         {
             return Err(zbus::fdo::Error::InvalidArgs("Неизвестный unit".into()));
         }
+        self.0.lock().unwrap().loaded_units.push(name.to_owned());
         Ok(OwnedObjectPath::try_from(format!("/test/{}", name.replace(['.', '-'], "_"))).unwrap())
     }
     async fn start_unit(
@@ -318,6 +609,17 @@ impl Fixture {
     }
 }
 #[tokio::test]
+async fn worker_state_reads_unit_and_service_from_one_path_lookup() {
+    let fixture = Fixture::new().await;
+    let mode = WorkerMode::Run;
+    let state = fixture.supervisor.state(mode).await.unwrap();
+    assert_eq!(state.active, "inactive");
+    assert_eq!(state.pid, 0);
+    assert_eq!(state.invocation, vec![7; 16]);
+    assert_eq!(fixture.state.lock().unwrap().loaded_units, [mode.service()]);
+}
+
+#[tokio::test]
 async fn cleanup_stops_both_sockets_before_services_and_confirms_empty() {
     let mut fixture = Fixture::new().await;
     fixture.state.lock().unwrap().delay_ms = 20;
@@ -429,6 +731,10 @@ async fn cancelled_cleanup_retains_transfer_until_recovery_waits_for_it() {
             WorkerAck {
                 pid: 42,
                 status: WorkerStatus::Accepted,
+            },
+            WorkerTicket {
+                pid: 42,
+                invocation: [3; 16],
             },
             None,
         ))
@@ -602,19 +908,19 @@ fn missing_cgroup_is_empty_but_symlink_and_wrong_type_are_unknown() {
     std::fs::create_dir(&path).unwrap();
     let parent = File::open(&path).unwrap();
     assert!(
-        open_worker_group(&parent, WorkerMode::Run)
+        open_worker_directory(&parent, WorkerMode::Run.service())
             .unwrap()
             .is_none()
     );
     std::fs::write(path.join(WorkerMode::Run.service()), b"").unwrap();
-    assert!(open_worker_group(&parent, WorkerMode::Run).is_err());
+    assert!(open_worker_directory(&parent, WorkerMode::Run.service()).is_err());
     std::fs::remove_file(path.join(WorkerMode::Run.service())).unwrap();
     std::os::unix::fs::symlink(&path, path.join(WorkerMode::Run.service())).unwrap();
-    assert!(open_worker_group(&parent, WorkerMode::Run).is_err());
+    assert!(open_worker_directory(&parent, WorkerMode::Run.service()).is_err());
     std::fs::remove_file(path.join(WorkerMode::Run.service())).unwrap();
     std::fs::create_dir(path.join(WorkerMode::Run.service())).unwrap();
     assert!(
-        open_worker_group(&parent, WorkerMode::Run)
+        open_worker_directory(&parent, WorkerMode::Run.service())
             .unwrap()
             .is_some()
     );
@@ -909,6 +1215,55 @@ pub(super) fn binding_test_payload() -> Arc<WorkerPayload> {
     )
     .unwrap();
     Arc::new(WorkerPayload::new(binary, config).unwrap())
+}
+
+#[test]
+fn ordinary_check_cannot_ack_after_its_supervisor_deadline() {
+    use std::io::{Read, Write};
+
+    let payload = binding_test_payload();
+    let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let receiver = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        server.read_to_end(&mut bytes).unwrap();
+        if !bytes.is_empty() {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = server.write_all(b"YNKA\x00\x00\x00\x2a\x01");
+        }
+    });
+    let result = send_ordinary_payload(
+        &payload,
+        &client,
+        WorkerMode::Check,
+        None,
+        Instant::now() + Duration::from_millis(50),
+    );
+    drop(client);
+    receiver.join().unwrap();
+    assert_eq!(result, Err(WorkerSupervisorError::Protocol));
+}
+
+#[test]
+fn ordinary_run_respects_its_supervisor_deadline() {
+    use std::io::{Read, Write};
+
+    let payload = binding_test_payload();
+    let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let receiver = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        server.read_to_end(&mut bytes).unwrap();
+        if !bytes.is_empty() {
+            server.write_all(b"YNKA\x00\x00\x00\x2a\x02").unwrap();
+        }
+        bytes
+    });
+    let result = send_ordinary_payload(&payload, &client, WorkerMode::Run, None, Instant::now());
+    drop(client);
+    assert!(result.is_err());
+    assert!(receiver.join().unwrap().is_empty());
 }
 
 #[test]

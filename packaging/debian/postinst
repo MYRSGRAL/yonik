@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+if [ -n "${DPKG_ROOT:-}" ]; then
+    if [ "$1" = configure ]; then
+        systemd-sysusers --root="$DPKG_ROOT" yonik-worker.conf
+    fi
+    exit 0
+fi
+if [ "$1" = configure ]; then
+    systemd-sysusers /usr/lib/sysusers.d/yonik-worker.conf
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+    fi
+fi
+
+case "$1" in
+    configure|abort-upgrade|abort-remove|abort-deconfigure)
+        if [ -d /run/yonik-package-maintenance ]; then
+            rmdir -- /run/yonik-package-maintenance
+        fi
+        ;;
+esac

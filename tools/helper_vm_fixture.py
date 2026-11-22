@@ -61,6 +61,8 @@ def install(payload: Path) -> None:
     }
     for name in [
         "yonik-helper.service",
+        "yonik-dhcp-sleep.service",
+        "sleep.target.d/50-yonik-dhcp-sleep.conf",
         "yonik-worker.service",
         "yonik-worker.socket",
         "yonik-worker-check.service",

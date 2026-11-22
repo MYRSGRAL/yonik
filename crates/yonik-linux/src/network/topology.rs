@@ -5,6 +5,7 @@ mod tests;
 
 use super::read::{
     self, NetlinkReader, NetworkAttribute, NetworkNamespace, NetworkReadError, ReadOperation,
+    retry_snapshot,
 };
 use crate::Cancellation;
 use std::{
@@ -277,6 +278,13 @@ pub(crate) async fn read_topology_captured(
         return Err(NetworkReadError::Timeout);
     }
     Ok((result, capture))
+}
+
+pub(crate) async fn reread_changed_topology(
+    cancel: &mut Cancellation,
+    timeout: Duration,
+) -> Result<(LinuxTopology, TopologyCapture), NetworkReadError> {
+    retry_snapshot(cancel, timeout, read_topology_captured).await
 }
 
 type Error = NetworkReadError;

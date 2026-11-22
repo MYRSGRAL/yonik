@@ -5,25 +5,35 @@ mod equivalence;
 #[cfg(test)]
 pub(crate) use equivalence::diagnostic_class_matches;
 pub(crate) use equivalence::{
-    same_captured_kernel_route, same_captured_topology, same_external_topology,
+    RenewedDhcpAddress, only_dhcp_lifetimes_changed, same_captured_kernel_route,
+    same_captured_topology, same_external_topology, same_session_topology,
 };
 mod local_vpn;
 mod lookup;
+mod nft_cgroup;
 pub(crate) use equivalence::RouteCapture;
 pub use local_vpn::local_vpn_split_cidrs;
-pub(crate) use lookup::lookup_route_captured;
+pub(crate) use lookup::{lookup_route_captured, reread_changed_route};
 mod read;
 mod route;
 mod topology;
+mod wireguard;
+mod wireguard_transport;
 pub use lookup::{
     KernelRoute, LookupIncomplete, RouteKind, RouteQuery, TransportProtocol, lookup_route,
 };
+pub use nft_cgroup::{NftSocketCgroupMatch, read_nft_socket_cgroup_matches};
 pub use read::{NetworkAttribute, NetworkNamespace, NetworkReadError};
 pub use topology::{
     IpPrefix, LinuxAddress, LinuxLink, LinuxNexthop, LinuxRoute, LinuxRule, LinuxTopology,
     NexthopMember, RouteNexthop, read_topology,
 };
-pub(crate) use topology::{TopologyCapture, read_topology_captured};
+pub(crate) use topology::{TopologyCapture, read_topology_captured, reread_changed_topology};
+pub use wireguard::{
+    WireGuardDevice, WireGuardPeer, WireGuardReadReceipt, WireGuardSocketObservation,
+    WireGuardSocketObserver, read_wireguard_device, read_wireguard_device_observed,
+};
+pub use wireguard_transport::{WireGuardPacketLease, WireGuardUdpPath, WireGuardUdpRouteSnapshot};
 
 use std::fmt;
 use tokio::sync::watch;
@@ -75,6 +85,35 @@ impl NetworkWatch {
     }
     pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         self.0.changed().await
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.0.has_changed().is_ok()
+    }
+
+    /// Прерывает ожидание при смене поколения или закрытии наблюдателя.
+    /// Вызывающий отвечает за восстановление после отмены операции.
+    pub(crate) async fn run_while_current<T>(
+        &mut self,
+        stamp: NetworkStamp,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
+        tokio::pin!(operation);
+        while self.current().is_current(stamp) {
+            tokio::select! {
+                biased;
+                changed = self.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                output = &mut operation => {
+                    return (self.current().is_current(stamp) && self.is_open())
+                        .then_some(output);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -300,6 +339,48 @@ mod tests {
             publisher.changed(NetworkSource::Resolver);
         }
         assert_eq!(rx.borrow().stamp.generation, before.generation + 10_000);
+    }
+
+    #[tokio::test]
+    async fn prepare_check_stops_when_network_generation_changes() {
+        let (publisher, receiver) = publisher();
+        publisher.ready(NetworkSource::Routes);
+        let mut watch = NetworkWatch(receiver);
+        let stamp = watch.current().stamp;
+        let entered = std::cell::Cell::new(false);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let (result, ()) = tokio::join!(
+                biased;
+                watch.run_while_current(stamp, async {
+                    entered.set(true);
+                    std::future::pending::<u8>().await
+                }),
+                async {
+                    assert!(entered.get());
+                    publisher.changed(NetworkSource::Resolver);
+                },
+            );
+            result
+        })
+        .await
+        .expect("смена поколения должна прервать ожидание Check");
+        assert_eq!(result, None);
+        assert_eq!(
+            watch
+                .run_while_current(stamp, async {
+                    panic!("устаревший Check не запускается")
+                })
+                .await,
+            None::<()>,
+        );
+        let current = watch.current().stamp;
+        assert_eq!(
+            watch.run_while_current(current, async { 42 }).await,
+            Some(42)
+        );
+        drop(publisher);
+        assert_eq!(watch.run_while_current(current, async { 42 }).await, None);
     }
 
     #[test]

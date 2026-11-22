@@ -46,6 +46,8 @@ mod native_data;
 pub mod role_handoff;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+// Холодная проверка большого образа sing-box может занять больше пяти секунд.
+const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 fn remaining_budget(deadline: Instant) -> Result<Duration, WorkerError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -319,11 +321,8 @@ impl WorkerPayload {
             binary_hash: binary.trusted_hash(),
             config_hash,
         };
-        validate_file(
-            &binary.file,
-            binary.file.metadata().map_err(|_| WorkerError::Io)?.len() as usize,
-            header.binary_hash,
-        )?;
+        // BinarySnapshot уже проверил SHA-256 и запечатал файл. Worker
+        // независимо проверяет ELF при приёме дескриптора через сокет.
         let retained = header
             .length
             .checked_mul(if binary.engine == Engine::SingBox {
@@ -392,7 +391,7 @@ impl WorkerPayload {
             image: self.image_hash(),
             image_bytes: self
                 .binary
-                .file
+                .file()
                 .metadata()
                 .map_err(|_| WorkerError::Io)?
                 .len(),
@@ -539,7 +538,7 @@ impl WorkerPayload {
             header[96..100].copy_from_slice(&[0, 2, 1, 2]);
             header.extend_from_slice(&resources);
         }
-        let mut fds = vec![self.binary.file.as_fd(), self.config.as_fd()];
+        let mut fds = vec![self.binary.file().as_fd(), self.config.as_fd()];
         if let Some(resources) = &self.resources {
             fds.extend(resources.artifacts.iter().map(|f| f.as_fd()));
         }
@@ -1132,7 +1131,7 @@ fn worker_owned_config(
 }
 fn command(binary: &BinarySnapshot) -> Command {
     use std::os::fd::AsRawFd;
-    let mut command = Command::new(format!("/proc/self/fd/{}", binary.file.as_raw_fd()));
+    let mut command = Command::new(format!("/proc/self/fd/{}", binary.file().as_raw_fd()));
     command
         .env_clear()
         .env("LANG", "C")
@@ -1222,7 +1221,7 @@ async fn check_assets(
         }
         Ok(())
     };
-    tokio::time::timeout(TIMEOUT, operation)
+    tokio::time::timeout(CONFIG_CHECK_TIMEOUT, operation)
         .await
         .map_err(|_| WorkerError::Timeout)?
 }
@@ -1313,7 +1312,7 @@ async fn serve_stream(mut stream: UnixStream, mode: WorkerMode) -> Result<(), Wo
                 &mut command,
                 profile_capsule.as_deref(),
                 &config.file,
-                &binary.file,
+                binary.file(),
                 assets.as_ref().map(native_assets::Assets::root_fd),
             );
             if let Some(assets) = assets.as_mut() {

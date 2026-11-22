@@ -66,7 +66,7 @@ jobs:
           )
           yonik_network_test="$(python3 -c 'import json,sys; rows=[json.loads(line) for line in open(sys.argv[1])]; paths=[r["executable"] for r in rows if r.get("reason")=="compiler-artifact" and r.get("target",{}).get("name")=="yonik_linux" and r.get("profile",{}).get("test") and r.get("executable")]; assert len(paths)==1, paths; print(paths[0])' "$RUNNER_TEMP/yonik-network-tests.jsonl")"
           install --mode=0755 "$yonik_network_test" "$yonik_ci_stage/yonik-linux-tests"
-          for yonik_case in owned-tun tun-config tun-rule tun-projection session-network public-block durable-policy service; do
+          for yonik_case in trusted-tools owned-tun tun-config tun-rule tun-projection session-network session-attach public-block durable-policy service; do
             sudo /usr/bin/python3 "$yonik_ci_stage/tools/managed_network_smoke.py" "$yonik_ci_stage/yonik-linux-tests" --case "$yonik_case"
           done
       - name: Проверить пакет из 10000 TCP-серий на loopback

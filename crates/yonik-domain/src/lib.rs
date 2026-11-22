@@ -3,6 +3,7 @@
 mod cidr;
 mod domain;
 mod evaluation;
+mod fake_ip;
 mod policy;
 
 pub use cidr::{Cidr, InvalidCidr};
@@ -11,6 +12,7 @@ pub use evaluation::{
     AnswerSet, Destination, DestinationFlow, DnsEpoch, Evaluation, EvaluationContext, FakeMapping,
     PolicyFault, PrivateDomain, Resolution, ResolverPath, VpnId,
 };
+pub use fake_ip::{FakeIpError, FakeIpFamily, FakeIpGrant, FakeIpLeaseTable};
 pub use policy::{
     Action, AndroidPackageId, Conditions, Decision, Flow, PlatformSource, Policy, PrivateNetwork,
     Route, Rule, RuleOrigin, process_name_selector,

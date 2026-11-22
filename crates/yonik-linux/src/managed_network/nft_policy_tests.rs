@@ -43,6 +43,27 @@ fn deny() -> PublicBlockPolicy {
     PublicBlockPolicy::new(1, None, vec![], vec![], vec![], vec![]).unwrap()
 }
 
+#[test]
+fn session_unlock_survives_restart_without_reinstalling_the_public_block() {
+    let area = Area::new();
+    let owner = owner();
+    let mut journal = Journal::open(&area.0, owner).unwrap();
+    journal.begin_session(owner, true).unwrap();
+    journal.begin_public_policy(owner, 2, 5, deny()).unwrap();
+    journal.confirm_authorized_session_unlock(owner).unwrap();
+    drop(journal);
+
+    let mut journal = Journal::open(&area.0, owner).unwrap();
+    assert!(!journal.session_recovery().unwrap().kill_switch());
+    journal.begin_public_unlock(owner, 2).unwrap();
+    journal.reconcile(owner, 2, Reconciled::Absent).unwrap();
+    drop(journal);
+
+    let journal = Journal::open(&area.0, owner).unwrap();
+    assert!(journal.public_policy().is_none());
+    assert!(journal.session_recovery().is_none());
+}
+
 #[tokio::test]
 async fn cancelled_apply_preserves_durable_payload_before_first_effect() {
     use futures_util::FutureExt;

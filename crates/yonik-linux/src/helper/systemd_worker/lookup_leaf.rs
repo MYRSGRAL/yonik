@@ -299,23 +299,7 @@ fn parse_primary_gid(passwd: &str, uid: u32) -> Result<u32> {
     found.ok_or(WorkerSupervisorError::Unavailable)
 }
 fn leaf_empty(name: &str) -> Result<bool> {
-    let mut directory = root()?;
-    for component in ["sys", "fs", "cgroup"] {
-        directory = child(&directory, component)?;
-    }
-    if fstatfs(&directory).map_err(unavailable)?.f_type as u64 != 0x6367_7270 {
-        return Err(WorkerSupervisorError::Untrusted);
-    }
-    let directory = child(&directory, "system.slice")?;
-    let group = match openat(&directory, name, DIR_FLAGS, Mode::empty()) {
-        Ok(fd) => File::from(fd),
-        Err(rustix::io::Errno::NOENT) => return Ok(true),
-        Err(error) => return Err(unavailable(error)),
-    };
-    trusted(&group, true)?;
-    empty_events(&read_bounded(File::from(
-        openat(&group, "cgroup.events", FILE_FLAGS, Mode::empty()).map_err(unavailable)?,
-    ))?)
+    WorkerCgroups::open("system.slice")?.empty(name)
 }
 
 pub(super) struct LeafPending {

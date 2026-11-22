@@ -3,6 +3,7 @@
 
 #[path = "resolver_policy.rs"]
 mod resolver_policy;
+pub(super) use resolver_policy::production::bounded_socket;
 
 use crate::attribution::broker::kernel::{Listener, ListenerSet};
 use std::net::{IpAddr, SocketAddr};
@@ -41,10 +42,6 @@ impl CaptureCredits {
             _bytes: bytes,
         })
     }
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Нет легитимного StubBind policy producer")
-    )]
     pub(super) fn reserve_shared(
         fds: &super::memory::ByteBudget,
         pending: &super::memory::ByteBudget,
@@ -580,6 +577,8 @@ mod observation {
                 cookie,
                 cgroup: 42,
                 v6only: false,
+                tos: None,
+                mark: None,
             }
         }
         fn fake() -> Fake {

@@ -1,16 +1,20 @@
 //! Владелец двух фиксированных systemd worker, с подтверждением пустой cgroup.
 //! Accepted подтверждает передачу FD, но не готовность сети и не Applied.
 use super::run_authorization::{RunAuthority, RunAuthorization, RunRevocationGuard};
+use super::worker_identity::{
+    WorkerCredentials, WorkerProcess, process_start as bootstrap_start, verify_process,
+};
+pub(super) use super::worker_paths::{FILE_FLAGS, child, root, trusted};
+use super::worker_paths::{WorkerCgroups, read_bounded};
 use crate::{
     Cancellation,
     worker::{WorkerAck, WorkerMode, WorkerPayload, WorkerStatus},
 };
 use futures_util::StreamExt;
-use rustix::fs::{Mode, OFlags, fstatfs, open, openat};
+use rustix::fs::{Mode, OFlags, openat};
 use std::{
     collections::HashMap,
     fs::File,
-    io::Read,
     os::unix::fs::MetadataExt,
     sync::{
         Arc,
@@ -35,9 +39,11 @@ const UNIT_IFACE: &str = "org.freedesktop.systemd1.Unit";
 const SERVICE_IFACE: &str = "org.freedesktop.systemd1.Service";
 const SOCKET_IFACE: &str = "org.freedesktop.systemd1.Socket";
 const DEADLINE: Duration = Duration::from_secs(8);
+// При активации worker сначала копирует и проверяет образ до 128 МиБ.
+const ACTIVATION_DEADLINE: Duration = Duration::from_secs(15);
 static OWNED: AtomicBool = AtomicBool::new(false);
 type Properties = HashMap<String, OwnedValue>;
-type TransferResult = Result<(WorkerAck, Option<InvocationBinding>)>;
+type TransferResult = Result<(WorkerAck, WorkerTicket, Option<InvocationBinding>)>;
 type ExecCommands = Vec<(String, Vec<String>, bool, u64, u64, u64, u64, u32, i32, i32)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,10 +94,10 @@ impl Drop for Permit {
 }
 
 /// Неподделываемая локальная ссылка на конкретную invocation, не только PID.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct WorkerTicket {
-    pid: u32,
-    invocation: [u8; 16],
+    pub(super) pid: u32,
+    pub(super) invocation: [u8; 16],
 }
 impl WorkerTicket {
     pub fn pid(&self) -> u32 {
@@ -277,54 +283,18 @@ impl BootstrapUnitObservation {
         if io.now() >= self.expires {
             return Err(WorkerSupervisorError::UnitProofGap);
         }
-        use std::os::fd::AsRawFd;
-        let info = io.read(&format!("/proc/self/fdinfo/{}", self.pidfd.as_raw_fd()))?;
-        if info.lines().find_map(|line| {
-            line.strip_prefix("Pid:")
-                .and_then(|v| v.trim().parse::<u32>().ok())
-        }) != Some(self.pid)
-            || parse_bootstrap_start(&io.read(&format!("/proc/{}/stat", self.pid))?)? != self.start
-        {
-            return Err(WorkerSupervisorError::Stale);
-        }
-        let status = io.read(&format!("/proc/{}/status", self.pid))?;
-        let uids = status
-            .lines()
-            .find_map(|line| line.strip_prefix("Uid:"))
-            .ok_or(WorkerSupervisorError::Untrusted)?;
-        let uids = uids
-            .split_whitespace()
-            .map(str::parse::<u32>)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(unavailable)?;
-        let gids = status
-            .lines()
-            .find_map(|line| line.strip_prefix("Gid:"))
-            .ok_or(WorkerSupervisorError::Untrusted)?;
-        let gids = gids
-            .split_whitespace()
-            .map(str::parse::<u32>)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(unavailable)?;
-        if uids != [self.uid; 4]
-            || gids != [self.gid; 4]
-            || io.read(&format!("/proc/{}/cgroup", self.pid))?
-                != format!("0::{}\n", WorkerMode::Run.cgroup())
-        {
-            return Err(WorkerSupervisorError::Stale);
-        }
-        Ok(())
+        verify_process(
+            &self.pidfd,
+            self.pid,
+            self.start,
+            WorkerCredentials {
+                uid: self.uid,
+                gid: self.gid,
+            },
+            WorkerMode::Run.cgroup(),
+            |path| io.read(path),
+        )
     }
-}
-fn bootstrap_start(pid: u32) -> Result<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(unavailable)?;
-    parse_bootstrap_start(&stat)
-}
-fn parse_bootstrap_start(stat: &str) -> Result<u64> {
-    stat.rsplit_once(')')
-        .and_then(|(_, tail)| tail.split_whitespace().nth(19))
-        .and_then(|v| v.parse().ok())
-        .ok_or(WorkerSupervisorError::Untrusted)
 }
 
 /// Связывает удерживаемый immutable payload с одной canonical invocation.
@@ -422,7 +392,7 @@ trait WorkerFence: Send + Sync {
 struct SystemFence;
 impl WorkerFence for SystemFence {
     fn empty(&self, mode: WorkerMode) -> Result<bool> {
-        cgroup_empty(mode)
+        WorkerCgroups::open("system.slice")?.empty(mode.service())
     }
 }
 impl WorkerState {
@@ -457,6 +427,49 @@ impl WorkerMode {
     }
 }
 
+pub(super) fn installed_worker_credentials() -> Result<WorkerCredentials> {
+    let etc = child(&root()?, "etc")?;
+    let passwd =
+        File::from(openat(&etc, "passwd", FILE_FLAGS, Mode::empty()).map_err(unavailable)?);
+    trusted(&passwd, false)?;
+    let passwd = read_bounded(passwd)?;
+    let mut entries = passwd
+        .lines()
+        .filter(|line| line.starts_with("yonik-worker:"));
+    let entry = entries.next().ok_or(WorkerSupervisorError::Untrusted)?;
+    if entries.next().is_some() {
+        return Err(WorkerSupervisorError::Untrusted);
+    }
+    let uid = entry
+        .split(':')
+        .nth(2)
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v != 0)
+        .ok_or(WorkerSupervisorError::Untrusted)?;
+    let gid = entry
+        .split(':')
+        .nth(3)
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v != 0)
+        .ok_or(WorkerSupervisorError::Untrusted)?;
+    let group = File::from(openat(&etc, "group", FILE_FLAGS, Mode::empty()).map_err(unavailable)?);
+    trusted(&group, false)?;
+    let groups = read_bounded(group)?;
+    let mut groups = groups
+        .lines()
+        .filter(|line| line.starts_with("yonik-worker:"));
+    if groups
+        .next()
+        .and_then(|line| line.split(':').nth(2))
+        .and_then(|v| v.parse::<u32>().ok())
+        != Some(gid)
+        || groups.next().is_some()
+    {
+        return Err(WorkerSupervisorError::Untrusted);
+    }
+    Ok(WorkerCredentials { uid, gid })
+}
+
 fn native_activation_ready(active: &str, pid: u32) -> Result<bool> {
     match (active, pid) {
         ("active", 1..) => Ok(true),
@@ -465,7 +478,7 @@ fn native_activation_ready(active: &str, pid: u32) -> Result<bool> {
     }
 }
 /// Отмена выигрывает select, но завершённый неполученный результат остаётся owning.
-async fn wait_owned<T>(
+pub(super) async fn wait_owned<T>(
     slot: &mut Option<JoinHandle<T>>,
     cancel: &mut Cancellation,
     deadline: Instant,
@@ -711,46 +724,7 @@ impl SystemWorkerSupervisor {
             ) {
                 return Err(WorkerSupervisorError::UnitProofGap);
             }
-            let etc = child(&root()?, "etc")?;
-            let passwd =
-                File::from(openat(&etc, "passwd", FILE_FLAGS, Mode::empty()).map_err(unavailable)?);
-            trusted(&passwd, false)?;
-            let passwd = read_bounded(passwd)?;
-            let mut entries = passwd
-                .lines()
-                .filter(|line| line.starts_with("yonik-worker:"));
-            let entry = entries.next().ok_or(WorkerSupervisorError::Untrusted)?;
-            if entries.next().is_some() {
-                return Err(WorkerSupervisorError::Untrusted);
-            }
-            let uid = entry
-                .split(':')
-                .nth(2)
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|v| *v != 0)
-                .ok_or(WorkerSupervisorError::Untrusted)?;
-            let gid = entry
-                .split(':')
-                .nth(3)
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|v| *v != 0)
-                .ok_or(WorkerSupervisorError::Untrusted)?;
-            let group =
-                File::from(openat(&etc, "group", FILE_FLAGS, Mode::empty()).map_err(unavailable)?);
-            trusted(&group, false)?;
-            let groups = read_bounded(group)?;
-            let mut groups = groups
-                .lines()
-                .filter(|line| line.starts_with("yonik-worker:"));
-            if groups
-                .next()
-                .and_then(|line| line.split(':').nth(2))
-                .and_then(|v| v.parse::<u32>().ok())
-                != Some(gid)
-                || groups.next().is_some()
-            {
-                return Err(WorkerSupervisorError::Untrusted);
-            }
+            let WorkerCredentials { uid, gid } = installed_worker_credentials()?;
             let pid =
                 rustix::process::Pid::from_raw(i32::try_from(state.pid).map_err(unavailable)?)
                     .ok_or(WorkerSupervisorError::Untrusted)?;
@@ -781,7 +755,7 @@ impl SystemWorkerSupervisor {
         payload: Arc<WorkerPayload>,
         cancel: &mut Cancellation,
     ) -> Result<()> {
-        let deadline = Instant::now() + DEADLINE;
+        let deadline = Instant::now() + ACTIVATION_DEADLINE;
         self.begin(WorkerMode::Check, cancel, deadline).await?;
         let ack = self
             .send(payload, WorkerMode::Check, cancel, deadline)
@@ -1124,9 +1098,9 @@ impl SystemWorkerSupervisor {
     ) -> Result<(WorkerTicket, Option<AuthorizedLease>)> {
         // Guard живёт в future, а не в blocking task: drop отзывает поздний ACK.
         let revocation = authorization.as_ref().map(RunAuthorization::guard);
-        let deadline = Instant::now() + DEADLINE;
+        let deadline = Instant::now() + ACTIVATION_DEADLINE;
         self.begin(WorkerMode::Run, cancel, deadline).await?;
-        let (ack, binding) = self
+        let (ack, ticket, binding) = self
             .send_inner(
                 payload,
                 WorkerMode::Run,
@@ -1146,17 +1120,9 @@ impl SystemWorkerSupervisor {
                 binding.accept(ack)
             })
             .transpose()?;
-        let invocation: [u8; 16] = state
-            .invocation
-            .try_into()
-            .map_err(|_| WorkerSupervisorError::Protocol)?;
-        if ack.pid != state.pid || invocation == [0; 16] || state.active != "active" {
-            return Err(WorkerSupervisorError::Protocol);
+        if ack.pid != ticket.pid || !ticket.matches(&state) || state.active != "active" {
+            return Err(WorkerSupervisorError::Stale);
         }
-        let ticket = WorkerTicket {
-            pid: ack.pid,
-            invocation,
-        };
         self.current = Some(WorkerTicket {
             pid: ticket.pid,
             invocation: ticket.invocation,
@@ -1250,7 +1216,7 @@ impl SystemWorkerSupervisor {
     ) -> Result<WorkerAck> {
         self.send_inner(payload, mode, None, None, cancel, deadline)
             .await
-            .map(|(ack, _)| ack)
+            .map(|(ack, _, _)| ack)
     }
     async fn send_inner(
         &mut self,
@@ -1324,18 +1290,32 @@ impl SystemWorkerSupervisor {
         } else {
             None
         };
+        let ordinary = if binding.is_none() {
+            Some(
+                self.capture_worker_for_payload(mode, cancel, deadline)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let permit = Arc::clone(&self.permit);
         self.transfer = Some(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             if let Some(binding) = binding {
+                let ticket = WorkerTicket {
+                    pid: binding.observation.pid,
+                    invocation: binding.observation.invocation,
+                };
                 binding
                     .transfer(&stream)
-                    .map(|(ack, binding)| (ack, Some(binding)))
+                    .map(|(ack, binding)| (ack, ticket, Some(binding)))
             } else {
-                payload
-                    .send_output(&stream, mode, output)
-                    .map(|ack| (ack, None))
-                    .map_err(|_| WorkerSupervisorError::Protocol)
+                let (ticket, process, credentials) =
+                    ordinary.ok_or(WorkerSupervisorError::Protocol)?;
+                let ack = process.transfer(credentials, mode.cgroup(), || {
+                    send_ordinary_payload(&payload, &stream, mode, output, deadline)
+                })?;
+                Ok((ack, ticket, None))
             }
         }));
         let handle = self
@@ -1350,12 +1330,44 @@ impl SystemWorkerSupervisor {
         if self.transfer.as_ref().is_some_and(JoinHandle::is_finished) {
             self.transfer = None;
         }
-        let (ack, binding) = result?;
+        let (ack, ticket, binding) = result?;
         if let Some(binding) = &binding {
             self.revalidate_binding(binding, cancel, deadline).await?;
         }
-        Ok((ack, binding))
+        Ok((ack, ticket, binding))
     }
+
+    async fn capture_worker_for_payload(
+        &self,
+        mode: WorkerMode,
+        cancel: &mut Cancellation,
+        deadline: Instant,
+    ) -> Result<(WorkerTicket, WorkerProcess, WorkerCredentials)> {
+        let credentials = installed_worker_credentials()?;
+        let state = loop {
+            let state = bounded(cancel, deadline, self.state(mode)).await?;
+            if native_activation_ready(&state.active, state.pid)? {
+                break state;
+            }
+            bounded(cancel, deadline, async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            })
+            .await?;
+        };
+        let ticket = WorkerTicket {
+            pid: state.pid,
+            invocation: state.invocation.try_into().map_err(unavailable)?,
+        };
+        let process = WorkerProcess::capture(ticket.pid)?;
+        process.verify(credentials, mode.cgroup())?;
+        let after = bounded(cancel, deadline, self.state(mode)).await?;
+        if after.active != "active" || !ticket.matches(&after) {
+            return Err(WorkerSupervisorError::Stale);
+        }
+        Ok((ticket, process, credentials))
+    }
+
     pub(super) async fn validate_native_profile_context(
         &self,
         observation: &BootstrapUnitObservation,
@@ -1389,6 +1401,17 @@ impl SystemWorkerSupervisor {
         for mode in [WorkerMode::Check, WorkerMode::Run] {
             bounded(cancel, deadline, self.unit_job("StopUnit", mode.socket())).await?;
         }
+        // При отмене Check отправитель ждёт ACK от уже активного сервиса.
+        // Останавливаем этот Check до ожидания его передачи.
+        let stop_check_first = self.pending == Some(WorkerMode::Check) && self.transfer.is_some();
+        if stop_check_first {
+            bounded(
+                cancel,
+                deadline,
+                self.unit_job("StopUnit", WorkerMode::Check.service()),
+            )
+            .await?;
+        }
         if let Some(handle) = self.native_admission.as_mut() {
             let result = bounded(cancel, deadline, async {
                 handle.await.map_err(unavailable)
@@ -1415,15 +1438,13 @@ impl SystemWorkerSupervisor {
             .await?;
             self.native_transfer = None;
         }
-        if let Some(handle) = self.transfer.as_mut() {
-            bounded(cancel, deadline, async {
-                let _result = handle.await.map_err(unavailable)?;
-                Ok(())
-            })
-            .await?;
-            self.transfer = None;
+        if self.transfer.is_some() {
+            let _result = wait_owned(&mut self.transfer, cancel, deadline).await?;
         }
         for mode in [WorkerMode::Check, WorkerMode::Run] {
+            if mode == WorkerMode::Check && stop_check_first {
+                continue;
+            }
             if mode == WorkerMode::Run {
                 if let Some(ticket) = self.current.as_ref() {
                     let state = bounded(cancel, deadline, self.state(mode)).await?;
@@ -1541,6 +1562,9 @@ impl SystemWorkerSupervisor {
     }
     async fn properties(&self, unit: &str, interface: &str) -> Result<Properties> {
         let path = self.path(unit).await?;
+        self.properties_at(&path, interface).await
+    }
+    async fn properties_at(&self, path: &OwnedObjectPath, interface: &str) -> Result<Properties> {
         let proxy = zbus::Proxy::new(
             &self.connection,
             self.owner.as_str(),
@@ -1555,8 +1579,9 @@ impl SystemWorkerSupervisor {
             .map_err(unavailable)
     }
     async fn state(&self, mode: WorkerMode) -> Result<WorkerState> {
-        let unit = self.properties(mode.service(), UNIT_IFACE).await?;
-        let service = self.properties(mode.service(), SERVICE_IFACE).await?;
+        let path = self.path(mode.service()).await?;
+        let unit = self.properties_at(&path, UNIT_IFACE).await?;
+        let service = self.properties_at(&path, SERVICE_IFACE).await?;
         let cgroup = string(&service, "ControlGroup")?;
         if !cgroup.is_empty() && cgroup != mode.cgroup() {
             return Err(WorkerSupervisorError::Untrusted);
@@ -1589,11 +1614,13 @@ impl SystemWorkerSupervisor {
                 (mode.service(), SERVICE_IFACE),
                 (mode.socket(), SOCKET_IFACE),
             ] {
-                let unit = self.properties(name, UNIT_IFACE).await?;
+                let path = self.path(name).await?;
+                let unit = self.properties_at(&path, UNIT_IFACE).await?;
+                let drop_ins = strings(&unit, "DropInPaths")?;
                 if string(&unit, "LoadState")? != "loaded"
                     || string(&unit, "FragmentPath")? != format!("/usr/lib/systemd/system/{name}")
                     || boolean(&unit, "Transient")?
-                    || !strings(&unit, "DropInPaths")?.is_empty()
+                    || !worker_drop_ins_allowed(name, &drop_ins)
                 {
                     return Err(WorkerSupervisorError::Untrusted);
                 }
@@ -1605,7 +1632,13 @@ impl SystemWorkerSupervisor {
                         return Err(WorkerSupervisorError::Untrusted);
                     }
                 }
-                let properties = self.properties(name, interface).await?;
+                let properties = self.properties_at(&path, interface).await?;
+                if !drop_ins.is_empty() {
+                    verify_worker_timeout_abort_mask(name)?;
+                    if string(&properties, "TimeoutStopFailureMode")? != "terminate" {
+                        return Err(WorkerSupervisorError::Untrusted);
+                    }
+                }
                 if interface == SERVICE_IFACE {
                     validate_service(&properties, mode)?;
                 } else {
@@ -1615,6 +1648,45 @@ impl SystemWorkerSupervisor {
         }
         Ok(())
     }
+}
+
+const WORKER_TIMEOUT_ABORT_MASK: &str = "10-timeout-abort.conf";
+
+fn worker_drop_ins_allowed(name: &str, paths: &[String]) -> bool {
+    match paths {
+        [] => true,
+        [path] if matches!(name, "yonik-worker.service" | "yonik-worker-check.service") => {
+            path == &format!("/usr/lib/systemd/system/{name}.d/{WORKER_TIMEOUT_ABORT_MASK}")
+        }
+        _ => false,
+    }
+}
+
+fn verify_worker_timeout_abort_mask(name: &str) -> Result<()> {
+    // Fedora перечисляет даже замаскированный drop-in. Читаем саму ссылку
+    // из проверенного каталога по FD, не открывая её цель.
+    let directory = child(&systemd_unit_directory()?, &format!("{name}.d"))?;
+    let mask = File::from(
+        openat(
+            &directory,
+            WORKER_TIMEOUT_ABORT_MASK,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(unavailable)?,
+    );
+    let metadata = mask.metadata().map_err(unavailable)?;
+    if !metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || rustix::fs::readlinkat(&mask, "", Vec::new())
+            .map_err(unavailable)?
+            .as_bytes()
+            != b"/dev/null"
+    {
+        return Err(WorkerSupervisorError::Untrusted);
+    }
+    Ok(())
 }
 fn unavailable<T>(_: T) -> WorkerSupervisorError {
     WorkerSupervisorError::Unavailable
@@ -1835,6 +1907,25 @@ fn validate_socket(p: &Properties, mode: WorkerMode) -> Result<()> {
     }
     Ok(())
 }
+fn send_ordinary_payload(
+    payload: &WorkerPayload,
+    stream: &std::os::unix::net::UnixStream,
+    mode: WorkerMode,
+    output: Option<crate::output_transport::ValidatedWriters>,
+    deadline: Instant,
+) -> Result<WorkerAck> {
+    // До ACK worker проверяет и копирует образ ядра. Используем остаток
+    // общего срока оркестратора, включая время активации службы.
+    let ack = payload
+        .send_output_before(stream, mode, output, deadline.into_std())
+        .map_err(|_| WorkerSupervisorError::Protocol)?;
+    // Относительный тайм-аут сокета может округлить остаток срока вверх.
+    if Instant::now() >= deadline {
+        return Err(WorkerSupervisorError::Timeout);
+    }
+    Ok(ack)
+}
+
 async fn bounded<T>(
     cancel: &mut Cancellation,
     deadline: Instant,
@@ -1843,47 +1934,16 @@ async fn bounded<T>(
     tokio::select! {biased; _=cancel.cancelled()=>Err(WorkerSupervisorError::Cancelled),_=tokio::time::sleep_until(deadline)=>Err(WorkerSupervisorError::Timeout),result=operation=>result}
 }
 
-pub(super) const FILE_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::CLOEXEC)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::NONBLOCK);
-const DIR_FLAGS: OFlags = FILE_FLAGS.union(OFlags::DIRECTORY);
-pub(super) fn trusted(file: &File, directory: bool) -> Result<()> {
-    let m = file.metadata().map_err(unavailable)?;
-    if m.uid() != 0
-        || m.mode() & 0o022 != 0
-        || (directory && !m.is_dir())
-        || (!directory && !m.is_file())
-    {
-        return Err(WorkerSupervisorError::Untrusted);
-    }
-    Ok(())
-}
-pub(super) fn child(parent: &File, name: &str) -> Result<File> {
-    let file = File::from(openat(parent, name, DIR_FLAGS, Mode::empty()).map_err(unavailable)?);
-    trusted(&file, true)?;
-    Ok(file)
-}
-pub(super) fn root() -> Result<File> {
-    let file = File::from(open("/", DIR_FLAGS, Mode::empty()).map_err(unavailable)?);
-    trusted(&file, true)?;
-    Ok(file)
-}
-fn read_bounded(file: File) -> Result<String> {
-    let mut contents = String::new();
-    file.take(16 * 1024 + 1)
-        .read_to_string(&mut contents)
-        .map_err(unavailable)?;
-    if contents.len() > 16 * 1024 {
-        return Err(WorkerSupervisorError::Untrusted);
-    }
-    Ok(contents)
-}
-pub(super) fn verify_installed() -> Result<()> {
+fn systemd_unit_directory() -> Result<File> {
     let mut parent = root()?;
     for component in ["usr", "lib", "systemd", "system"] {
         parent = child(&parent, component)?;
     }
+    Ok(parent)
+}
+
+pub(super) fn verify_installed() -> Result<()> {
+    let parent = systemd_unit_directory()?;
     for (name, expected) in [
         (
             "yonik-worker.service",
@@ -1951,57 +2011,6 @@ fn verify_socket(mode: WorkerMode) -> Result<()> {
     // Каталог root не позволяет UID worker подменить сокет после stat.
     Ok(())
 }
-fn cgroup_empty(mode: WorkerMode) -> Result<bool> {
-    let mut directory = root()?;
-    for component in ["sys", "fs", "cgroup"] {
-        directory = child(&directory, component)?;
-    }
-    if fstatfs(&directory).map_err(unavailable)?.f_type as u64 != 0x6367_7270 {
-        return Err(WorkerSupervisorError::Untrusted);
-    }
-    let parent = child(&directory, "system.slice")?;
-    let Some(group) = open_worker_group(&parent, mode)? else {
-        return Ok(true);
-    };
-    trusted(&group, true)?;
-    let events = File::from(
-        openat(&group, "cgroup.events", FILE_FLAGS, Mode::empty()).map_err(unavailable)?,
-    );
-    empty_events(&read_bounded(events)?)
-}
-// Вызывающий проверяет root-владельца parent и cgroup2fs до интерпретации ENOENT.
-fn open_worker_group(parent: &File, mode: WorkerMode) -> Result<Option<File>> {
-    match openat(parent, mode.service(), DIR_FLAGS, Mode::empty()) {
-        Ok(fd) => Ok(Some(File::from(fd))),
-        Err(rustix::io::Errno::NOENT) => Ok(None),
-        Err(_) => Err(WorkerSupervisorError::Unavailable),
-    }
-}
-fn empty_events(contents: &str) -> Result<bool> {
-    if !contents.ends_with('\n') {
-        return Err(WorkerSupervisorError::Untrusted);
-    }
-    let mut populated = None;
-    for line in contents.lines() {
-        let (name, value) = line
-            .split_once(' ')
-            .ok_or(WorkerSupervisorError::Untrusted)?;
-        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(WorkerSupervisorError::Untrusted);
-        }
-        if name == "populated" {
-            if populated.is_some() {
-                return Err(WorkerSupervisorError::Untrusted);
-            }
-            populated = Some(match value {
-                "0" => true,
-                "1" => false,
-                _ => return Err(WorkerSupervisorError::Untrusted),
-            });
-        }
-    }
-    populated.ok_or(WorkerSupervisorError::Untrusted)
-}
 #[cfg(test)]
 #[path = "systemd_worker_tests.rs"]
 mod tests;
@@ -2056,6 +2065,7 @@ pub(super) fn unit_raw_identity_result(
     let mut run = unit_owner_result(owner, payload);
     let observation = &mut run.lease.binding.observation;
     let mut fields = vec!["0"; 20];
+    fields[0] = "S";
     fields[19] = "1";
     observation.fixture_io = Some(FixtureIdentityIo {
         now: Instant::now(),

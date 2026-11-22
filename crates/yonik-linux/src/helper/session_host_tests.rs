@@ -2,6 +2,267 @@ use super::{
     RecoveryFailure, RecoveryHost, ServiceError, endpoint, keep_after_stop, parse_worker_uid,
     recover_ordered, same_link_contract,
 };
+
+struct StartupJournal(std::path::PathBuf);
+
+impl StartupJournal {
+    fn new(case: &str) -> Self {
+        let mut random = [0; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        Self(std::env::temp_dir().join(format!(
+            "yonik-startup-{case}-{:x}",
+            u64::from_le_bytes(random)
+        )))
+    }
+
+    fn owner() -> crate::managed_network::Ownership {
+        let (dev, ino) = super::super::namespace().unwrap();
+        crate::managed_network::Ownership::new(rustix::process::getuid().as_raw(), 77, 1, dev, ino)
+            .unwrap()
+    }
+}
+
+impl Drop for StartupJournal {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0.join("journal.json"));
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+#[tokio::test]
+#[ignore = "Одноразовая QEMU VM в отдельном сетевом namespace"]
+async fn throw_routes_resume_cleanup_after_reopen() {
+    use crate::{
+        Cancellation,
+        helper::SessionNetworkPlan,
+        managed_network::{Journal, Resource, tun::TunExecutor},
+    };
+    use std::{fs, process::Command, time::Duration};
+
+    assert_eq!(
+        std::env::var("YONIK_PRODUCTION_HELPER_VM").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+            .unwrap()
+            .trim(),
+        "QEMU"
+    );
+    assert_eq!(
+        fs::read_to_string("/etc/yonik-production-helper-vm").unwrap(),
+        "yonik-production-helper-disposable-v1\n"
+    );
+    assert_ne!(
+        fs::read_link("/proc/thread-self/ns/net").unwrap(),
+        fs::read_link("/proc/1/ns/net").unwrap()
+    );
+    let ip = |arguments: &[&str]| {
+        let output = Command::new("/usr/bin/ip")
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    ip(&["link", "set", "lo", "up"]);
+    ip(&["link", "add", "throw-outer", "type", "dummy"]);
+    ip(&["link", "set", "throw-outer", "up"]);
+    ip(&["-4", "addr", "add", "192.0.2.1/24", "dev", "throw-outer"]);
+    ip(&[
+        "-6",
+        "addr",
+        "add",
+        "2001:db8:42::1/64",
+        "dev",
+        "throw-outer",
+        "nodad",
+    ]);
+
+    let journal_path = StartupJournal::new("throw-routes");
+    let owner = StartupJournal::owner();
+    let (_keep, mut cancel) = Cancellation::new();
+    let read_topology = |mut cancel| async move {
+        crate::read_topology(&mut cancel, Duration::from_secs(3))
+            .await
+            .unwrap()
+    };
+    let baseline = read_topology(cancel.clone()).await;
+    let plan = SessionNetworkPlan::reserve(owner, &baseline)
+        .unwrap()
+        .with_throw_routes(&[
+            ("192.0.2.0".parse().unwrap(), 24),
+            ("2001:db8:42::".parse().unwrap(), 64),
+        ])
+        .unwrap();
+    let mut journal = Journal::open(&journal_path.0, owner).unwrap();
+    let mut executor = TunExecutor::open(owner).unwrap();
+    let index = plan.configure(&mut executor, &mut journal).await.unwrap();
+    plan.capture(&mut executor, &mut journal, index)
+        .await
+        .unwrap();
+    let current = read_topology(cancel.clone()).await;
+    let tun_name = std::str::from_utf8(
+        &current
+            .links
+            .iter()
+            .find(|link| link.index == index)
+            .unwrap()
+            .name,
+    )
+    .unwrap()
+    .to_owned();
+    plan.verify_external(&baseline, current, &journal, index)
+        .unwrap();
+    for (family, destination) in [("-4", "192.0.2.2"), ("-6", "2001:db8:42::2")] {
+        let result: serde_json::Value =
+            serde_json::from_slice(&ip(&[family, "-j", "route", "get", destination])).unwrap();
+        assert_eq!(result[0]["dev"], "throw-outer");
+    }
+    assert_eq!(
+        journal
+            .records()
+            .iter()
+            .filter(|record| matches!(record.resource(), Resource::ThrowRoute { .. }))
+            .count(),
+        2
+    );
+
+    let table = plan.routing_table().to_string();
+    drop(executor);
+    drop(journal);
+    drop(plan);
+    let mut journal = Journal::open(&journal_path.0, owner).unwrap();
+    let foreign = [
+        "throw",
+        "203.0.113.0/24",
+        "table",
+        &table,
+        "proto",
+        "253",
+        "metric",
+        "77",
+    ];
+    for operation in ["add", "del"] {
+        let mut arguments = vec!["-4", "route", operation];
+        arguments.extend(foreign);
+        ip(&arguments);
+        if operation == "add" {
+            let before = ip(&["-4", "-j", "route", "show", "table", &table]);
+            assert!(super::cleanup_records(owner, &mut journal).await.is_err());
+            let after = ip(&["-4", "-j", "route", "show", "table", &table]);
+            assert_eq!(before, after);
+        }
+    }
+    let anchor = [
+        "default", "dev", &tun_name, "table", &table, "proto", "253", "scope", "link", "metric",
+        "100",
+    ];
+    for operation in ["del", "add"] {
+        let mut arguments = vec!["-4", "route", operation];
+        arguments.extend(anchor);
+        ip(&arguments);
+        if operation == "del" {
+            assert!(super::cleanup_records(owner, &mut journal).await.is_err());
+            assert!(journal.records().iter().any(|record| matches!(
+                record.resource(), Resource::ThrowRoute { destination, .. } if destination.is_ipv4()
+            )));
+            let routes: serde_json::Value =
+                serde_json::from_slice(&ip(&["-4", "-j", "route", "show", "table", &table]))
+                    .unwrap();
+            assert_eq!(routes[0]["type"], "throw");
+            assert_eq!(routes[0]["dst"], "192.0.2.0/24");
+        }
+    }
+    super::cleanup_records(owner, &mut journal).await.unwrap();
+    assert!(journal.records().is_empty());
+    let after = crate::read_topology(&mut cancel, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(crate::network::same_external_topology(&baseline, &after));
+    eprintln!("Оба маршрута throw удалены после переоткрытия журнала. Чужая запись не изменилась");
+}
+
+#[test]
+fn fake_dns_startup_issues_immediately_without_previous_quarantine() {
+    use yonik_engine::fake_dns::{DnsEpoch, FakeDnsQuestion};
+
+    let path = StartupJournal::new("empty");
+    let epoch = DnsEpoch {
+        network: 1,
+        engine: 1,
+        resolver: 1,
+    };
+    let question = FakeDnsQuestion::parse(
+        b"\x01\x23\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x04test\x00\x00\x01\x00\x01",
+    )
+    .unwrap();
+    for journal_exists in [false, true] {
+        if journal_exists {
+            drop(crate::managed_network::Journal::open(&path.0, StartupJournal::owner()).unwrap());
+        }
+        let (journal, mut fake_dns) = super::super::open_startup_state(&path.0).unwrap();
+        assert_eq!(journal.is_some(), journal_exists);
+        assert!(fake_dns.check_cold_start().is_ok());
+        let leases = fake_dns.leases().unwrap();
+        leases.advance_epoch(epoch).unwrap();
+        let response = leases.synthesize(&question, epoch);
+        assert_eq!(response[3] & 15, 0);
+        assert_eq!(&response[6..8], &[0, 1]);
+        let tail: [u8; 10] = response[response.len() - 10..].try_into().unwrap();
+        let ttl = u32::from_be_bytes(tail[..4].try_into().unwrap());
+        assert!((1..=30).contains(&ttl));
+        assert_eq!(&tail[4..6], &[0, 4]);
+        let address = std::net::Ipv4Addr::new(tail[6], tail[7], tail[8], tail[9]);
+        assert_eq!(
+            leases.lookup(address.into(), epoch).unwrap().name.as_str(),
+            "example.test"
+        );
+    }
+}
+
+#[test]
+fn fake_dns_startup_waits_when_journal_contains_quarantine_intent() {
+    use crate::managed_network::{Journal, QuarantineIntent};
+
+    let path = StartupJournal::new("quarantine");
+    let owner = StartupJournal::owner();
+    let mut journal = Journal::open(&path.0, owner).unwrap();
+    journal
+        .begin_fake_quarantine(
+            owner,
+            42,
+            QuarantineIntent {
+                tun: None,
+                horizon_ms: 90_000,
+            },
+        )
+        .unwrap();
+    drop(journal);
+
+    let (_, mut fake_dns) = super::super::open_startup_state(&path.0).unwrap();
+    assert!(matches!(
+        fake_dns.check_cold_start(),
+        Err(ServiceError::Busy)
+    ));
+    assert!(matches!(fake_dns.leases(), Err(ServiceError::Busy)));
+}
+
+#[test]
+fn fake_dns_startup_fails_closed_when_journal_is_corrupt() {
+    let path = StartupJournal::new("corrupt");
+    drop(crate::managed_network::Journal::open(&path.0, StartupJournal::owner()).unwrap());
+    std::fs::write(path.0.join("journal.json"), b"{").unwrap();
+    assert!(matches!(
+        super::super::open_startup_state(&path.0),
+        Err(ServiceError::Unavailable)
+    ));
+}
+
 #[test]
 fn dns_proxy_static_route_facts_are_exact_and_never_uid_only() {
     let facts = crate::helper::native_profile_channel::dns_transport::fake_facts(
@@ -61,6 +322,7 @@ fn actor_fixture() -> super::super::SystemProtectionHost {
             profile_owner: None,
             path: "/run/yonik/unused-actor-test".into(),
             journal: None,
+            private_dns_zones: Err(crate::managed_network::JournalError::Missing),
             watch: monitor.watch(),
             seed: 1,
             epoch: 1,
@@ -72,12 +334,17 @@ fn actor_fixture() -> super::super::SystemProtectionHost {
             active: None,
             tun_custody: None,
             registry: None,
+            fake_dns: super::session_fake_dns::FakeDnsState::new(None),
+            fake_dns_reap: None,
+            dhcp_sleep: Default::default(),
             exited: std::sync::Arc::new(tokio::sync::Notify::new()),
             isolated: true,
         })),
         _monitor: monitor,
         runtime: tokio::runtime::Handle::current(),
         _safety: None,
+        _dhcp_sleep: None,
+        standalone: false,
     }
 }
 
@@ -237,6 +504,39 @@ async fn background_tasks_keep_running_after_blocking_job_returns() {
 }
 
 #[tokio::test]
+async fn state_reports_no_managed_policy_with_another_users_quarantine() {
+    use crate::helper::service::{ProtectionHost, ProtectionState};
+    use crate::managed_network::{Journal, Ownership, QuarantineIntent};
+
+    let path = StartupJournal::new("state-quarantine-owner");
+    let (dev, ino) = super::super::namespace().unwrap();
+    let owner = Ownership::new(1000, 77, 1, dev, ino).unwrap();
+    let mut journal = Journal::open(&path.0, owner).unwrap();
+    journal
+        .begin_fake_quarantine(
+            owner,
+            42,
+            QuarantineIntent {
+                tun: None,
+                horizon_ms: 90_000,
+            },
+        )
+        .unwrap();
+
+    let mut host = actor_fixture();
+    host.backend.lock().unwrap().journal = Some(journal);
+    let (_keep, cancel) = crate::Cancellation::new();
+    assert_eq!(
+        host.state(0, cancel).await,
+        Ok(ProtectionState::NoManagedPolicy)
+    );
+    let backend = host.backend.lock().unwrap();
+    let journal = backend.journal.as_ref().unwrap();
+    assert_eq!(journal.ownership(), owner);
+    assert!(journal.fake_quarantine().is_some());
+}
+
+#[tokio::test]
 async fn dropping_caller_does_not_release_backend_before_effect_finishes() {
     let host = std::sync::Arc::new(actor_fixture());
     let (_keep, cancel) = crate::Cancellation::new();
@@ -287,32 +587,36 @@ fn worker_uid_is_dedicated_and_unambiguous() {
 }
 
 #[test]
-fn hostname_and_unbound_transport_are_denied_before_effects() {
-    for value in [
-        "vless://11111111-1111-1111-1111-111111111111@192.0.2.5:443",
-        "vless://11111111-1111-1111-1111-111111111111@example.org:443",
-        "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443",
+fn only_a_literal_address_can_skip_bootstrap() {
+    use crate::TransportProtocol::Tcp;
+    for (value, expected) in [
+        (
+            "vless://11111111-1111-1111-1111-111111111111@192.0.2.5:443",
+            Ok((Some("192.0.2.5".parse().unwrap()), Tcp)),
+        ),
+        (
+            "vless://11111111-1111-1111-1111-111111111111@example.org:443",
+            Ok((None, Tcp)),
+        ),
+        (
+            "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443",
+            Err(ServiceError::Unsupported),
+        ),
     ] {
         let mut report = yonik_import::import_bytes(value.as_bytes().to_vec()).unwrap();
         let server = report.servers.remove(0);
-        if value.contains("192.0.2.5") {
-            assert_eq!(
-                endpoint(&server),
-                Ok(("192.0.2.5".parse().unwrap(), crate::TransportProtocol::Tcp))
-            );
-        } else {
-            assert_eq!(endpoint(&server), Err(ServiceError::Unsupported));
-        }
+        assert_eq!(endpoint(&server), expected);
     }
 }
 
 #[tokio::test]
-async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_worker() {
+async fn actual_backend_rejects_hostname_without_private_zone_state() {
     let monitor = crate::NetworkMonitor::start().unwrap();
     let mut backend = super::Backend {
         profile_owner: None,
         path: "/run/yonik/unused-denied-session-test".into(),
         journal: None,
+        private_dns_zones: Err(crate::managed_network::JournalError::Missing),
         watch: monitor.watch(),
         seed: 1,
         epoch: 1,
@@ -324,6 +628,9 @@ async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_wor
         active: None,
         tun_custody: None,
         registry: None,
+        fake_dns: super::session_fake_dns::FakeDnsState::new(None),
+        fake_dns_reap: None,
+        dhcp_sleep: Default::default(),
         exited: std::sync::Arc::new(tokio::sync::Notify::new()),
         isolated: true,
     };
@@ -333,6 +640,8 @@ async fn actual_backend_rejects_hostname_without_opening_journal_registry_or_wor
     .unwrap();
     let request = crate::helper::service::SystemProfileRequest {
         policy: None,
+        fake_dns_domains: None,
+        fake_dns_policy_resolver: None,
         peer: None,
         server: yonik_import::ServerIntent::from_server(&report.servers[0]).unwrap(),
         engine: yonik_engine::Engine::Xray,
@@ -773,6 +1082,27 @@ async fn authorized_stop_waits_for_exact_backend_guard_used_by_safety() {
 }
 
 #[tokio::test]
+async fn prepared_context_waits_for_the_safety_operation() {
+    use crate::helper::ProtectionHost;
+
+    let host = actor_fixture();
+    let safety = std::sync::Arc::clone(&host.operations)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let (_keep, cancel) = crate::Cancellation::new();
+    let context = host.context_for_apply(1000, cancel);
+    tokio::pin!(context);
+    assert!(futures_util::poll!(context.as_mut()).is_pending());
+    drop(safety);
+    // Начальная топология тестового хоста может ещё не иметь покрытия маршрутов.
+    assert!(matches!(
+        context.await,
+        Ok(_) | Err(ServiceError::Unavailable)
+    ));
+}
+
+#[tokio::test]
 async fn dropped_authorized_stop_caller_keeps_bounded_slot_until_cleanup_ack() {
     let host = actor_fixture();
     let sweep = std::sync::Arc::clone(&host.operations)
@@ -862,6 +1192,8 @@ async fn app_policy_denied_before_backend_resources() {
         engine: yonik_engine::Engine::Xray,
         kill_switch: false,
         policy: Some(policy),
+        fake_dns_domains: None,
+        fake_dns_policy_resolver: None,
         peer: None,
     };
     let (_keep, mut cancel) = crate::Cancellation::new();

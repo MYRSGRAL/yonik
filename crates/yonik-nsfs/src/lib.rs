@@ -8,6 +8,8 @@ pub mod kernel_probe;
 pub mod kernel_probe_v2;
 /// Fixed parent-death adapter локального sealed core; отдельное unsafe approval.
 pub mod local_parent_death;
+#[cfg(target_os = "linux")]
+pub mod nft_cgroup_fd;
 /// Только fixed SIOCGSKNS с независимой nsfs/type проверкой.
 pub mod socket_namespace;
 use std::{io, os::fd::AsFd};

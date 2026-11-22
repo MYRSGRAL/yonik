@@ -23,6 +23,382 @@ mod harness_diagnostics;
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 #[test]
+fn system_fake_dns_is_saved_and_enables_sing_box_only_in_system_mode() {
+    let directory = Directory::new();
+    let mut app = Harness::new(directory.config());
+    app.wait(|value| value["ready"] == true);
+    app.send(json!({"command":"set_system_fake_dns", "suffixes":"127.0.0.1"}));
+    let rejected = app.wait(|value| value["error"] == "invalid_input");
+    assert_eq!(rejected["system_fake_dns"], json!([]));
+
+    app.send(json!({"command":"set_system_fake_dns", "suffixes":"Sub.example.test, EXAMPLE.test, example.test."}));
+    let expected = json!(["example.test", "sub.example.test"]);
+    app.wait(|value| value["system_fake_dns"] == expected);
+    app.send(json!({"command":"set_engine", "engine":"sing-box"}));
+    app.wait(|value| value["error"] == "engine_unavailable");
+    app.send(json!({"command":"set_connection_mode", "mode":"system"}));
+    app.wait(|value| value["connection_mode"] == "system");
+    app.send(json!({"command":"routing_default", "expected_revision":0, "request_id":1, "action":"direct"}));
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 1);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], false);
+    app.send(json!({"command":"set_engine", "engine":"sing-box"}));
+    let state = app.wait(|value| value["error"] == "fake_dns_policy");
+    assert_eq!(state["engine"], "xray");
+    app.send(json!({"command":"routing_default", "expected_revision":1, "request_id":2, "action":"proxy"}));
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 2);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], true);
+    app.send(
+        json!({"command":"edit_routing","expected_revision":2,"request_id":3,
+        "create":true,"confirm_broad":false,"rule":{"id":17,"enabled":true,
+        "executables":[],"domains":["blocked.example.test"],"destinations":[],"action":"block"}}),
+    );
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 3);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], true);
+    app.send(json!({"command":"set_system_fake_dns","suffixes":"outside.test"}));
+    let state = app.wait(|value| value["system_fake_dns"] == json!(["outside.test"]));
+    assert_eq!(state["system_fake_dns_enabled"], false);
+    app.send(json!({"command":"set_system_fake_dns","suffixes":"example.test, sub.example.test"}));
+    let state = app.wait(|value| value["system_fake_dns"] == expected);
+    assert_eq!(state["system_fake_dns_enabled"], true);
+    app.send(
+        json!({"command":"edit_routing","expected_revision":3,"request_id":4,
+        "create":true,"confirm_broad":false,"rule":{"id":18,"enabled":true,
+        "executables":[],"domains":[],"destinations":["192.0.2.0/24"],"action":"block"}}),
+    );
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 4);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], false);
+    app.send(
+        json!({"command":"edit_routing","expected_revision":4,"request_id":5,
+        "create":false,"confirm_broad":false,"rule":{"id":17,"enabled":true,
+        "executables":[],"domains":["*.example.test"],"destinations":[],"action":"proxy"}}),
+    );
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 5);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], true);
+    app.send(
+        json!({"command":"edit_routing","expected_revision":5,"request_id":6,
+        "create":false,"confirm_broad":false,"rule":{"id":18,"enabled":true,
+        "executables":[],"domains":[],"destinations":["192.0.2.0/24"],"action":"direct"}}),
+    );
+    let state = app.wait(|value| value["routing_ack"]["request_id"] == 6);
+    assert!(state["routing_ack"]["error"].is_null());
+    assert_eq!(state["system_fake_dns_enabled"], true);
+    app.send(json!({"command":"set_engine", "engine":"sing-box"}));
+    app.wait(|value| value["engine"] == "sing-box");
+
+    let (url, server) = fixture(vec![
+        r#"[{"remarks":"Xray","outbounds":[{"tag":"b","protocol":"vless","settings":{"vnext":[{"address":"physical.invalid","port":8443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}}]}]"#,
+    ]);
+    app.send(json!({"command":"import_source","name":"Xray","url":url,"local_exception":true,"route":"direct"}));
+    app.wait(|value| value["pending"]["native_json"] == true && value["busy"] == false);
+    app.send(json!({"command":"approve_refresh"}));
+    let state =
+        app.wait(|value| value["pending"].is_null() && value["profiles"][0]["kind"] == "xray");
+    app.send(json!({"command":"select_catalog","kind":"xray","id":state["profiles"][0]["id"],"page":state["catalog_page"]}));
+    let state = app.wait(|value| value["selected_kind"] == "xray");
+    assert_eq!(state["engine"], "sing-box");
+    assert_eq!(state["system_fake_dns_enabled"], false);
+    assert_eq!(state["can_connect"], true);
+    app.close();
+    server.join().expect("тестовый источник Xray");
+
+    let mut reopened = Harness::new(directory.config());
+    let state = reopened.wait(|value| value["ready"] == true);
+    assert_eq!(state["system_fake_dns"], expected);
+    assert_eq!(state["engine"], "sing-box");
+    assert_eq!(state["connection_mode"], "local");
+    reopened.close();
+}
+
+#[test]
+fn system_fake_dns_policy_resolver_is_validated_saved_and_cleared() {
+    let directory = Directory::new();
+    let mut app = Harness::new(directory.config());
+    let state = app.wait(|state| state["ready"] == true);
+    assert_eq!(
+        state.get("system_fake_dns_policy_resolver"),
+        Some(&Value::Null)
+    );
+
+    app.send(json!({"command":"set_connection_mode","mode":"system"}));
+    app.wait(|state| state["connection_mode"] == "system");
+    app.send(json!({"command":"set_system_fake_dns","suffixes":"example.test"}));
+    app.wait(|state| state["system_fake_dns"] == json!(["example.test"]));
+    let state = add_fake_dns_rule(
+        &mut app,
+        0,
+        "block",
+        &["example.test"],
+        &["203.0.113.46/32"],
+    );
+    assert_eq!(state["system_fake_dns_enabled"], false);
+
+    let address = "[2001:db8::53]:5353";
+    app.send(json!({"command":"set_system_fake_dns_resolver","upstream":address}));
+    let state = app.wait(|state| state["system_fake_dns_policy_resolver"] == address);
+    assert_eq!(state["system_fake_dns_enabled"], true);
+    for rejected in [
+        "192.0.2.53",
+        "192.0.2.53:0",
+        "127.0.0.1:5353",
+        "198.19.224.2:5353",
+        "[::c000:235]:5353",
+    ] {
+        app.send(json!({"command":"set_system_fake_dns_resolver","upstream":rejected}));
+        let state = app.wait(|state| state["error"] == "invalid_input");
+        assert_eq!(state["system_fake_dns_policy_resolver"], address);
+        assert_eq!(state["system_fake_dns_enabled"], true);
+    }
+    app.close();
+
+    let mut app = Harness::new(directory.config());
+    let state = app.wait(|state| state["ready"] == true);
+    assert_eq!(state["system_fake_dns_policy_resolver"], address);
+    app.send(json!({"command":"set_connection_mode","mode":"system"}));
+    let state = app.wait(|state| state["connection_mode"] == "system");
+    assert_eq!(state["system_fake_dns_enabled"], true);
+    app.send(json!({"command":"set_system_fake_dns_resolver","upstream":""}));
+    let state =
+        app.wait(|state| state.get("system_fake_dns_policy_resolver") == Some(&Value::Null));
+    assert_eq!(state["system_fake_dns_enabled"], false);
+    app.close();
+
+    let mut app = Harness::new(directory.config());
+    let state = app.wait(|state| state["ready"] == true);
+    assert_eq!(
+        state.get("system_fake_dns_policy_resolver"),
+        Some(&Value::Null)
+    );
+    app.close();
+}
+
+fn add_fake_dns_rule(
+    app: &mut Harness,
+    revision: u64,
+    action: &str,
+    domains: &[&str],
+    destinations: &[&str],
+) -> Value {
+    let id = revision + 1;
+    app.send(json!({
+        "command":"edit_routing","expected_revision":revision,"request_id":id,
+        "create":true,"confirm_broad":false,"rule":{"id":id,"enabled":true,
+        "executables":[],"domains":domains,"destinations":destinations,"action":action},
+    }));
+    let state = app.wait(|state| state["routing_ack"]["request_id"] == id);
+    assert!(
+        state["routing_ack"]["error"].is_null(),
+        "{}",
+        state["routing_ack"]
+    );
+    state
+}
+
+#[test]
+#[ignore = "одноразовая QEMU VM со штатным helper, peer и тестовым TLS"]
+fn desktop_uses_installed_helper_for_system_fake_dns() {
+    desktop_fake_dns_through_helper(None);
+}
+
+#[test]
+#[ignore = "одноразовая QEMU VM со штатным helper, peer и DNS политики"]
+fn desktop_uses_installed_helper_for_mixed_fake_dns_policy() {
+    let resolver = std::env::var("YONIK_CHECK_FAKE_DNS_POLICY_RESOLVER")
+        .expect("адрес DNS политики тестового peer");
+    desktop_fake_dns_through_helper(Some(&resolver));
+}
+
+fn desktop_fake_dns_through_helper(policy_resolver: Option<&str>) {
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
+
+    assert_eq!(
+        std::env::var("YONIK_PRODUCTION_HELPER_VM").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+            .unwrap()
+            .trim(),
+        "QEMU"
+    );
+    let marker = "/etc/yonik-production-helper-vm";
+    let metadata = fs::symlink_metadata(marker).expect("маркер одноразовой VM");
+    assert!(metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0);
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        "yonik-production-helper-disposable-v1\n"
+    );
+    let certificate = std::env::var_os("YONIK_FAKE_DNS_TLS_CA").expect("CA тестового peer");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let addresses = Command::new("/usr/bin/ip")
+            .args([
+                "-6",
+                "-o",
+                "address",
+                "show",
+                "dev",
+                "yonik-outer",
+                "scope",
+                "link",
+                "-tentative",
+                "-dadfailed",
+            ])
+            .output()
+            .expect("IPv6 интерфейса стенда");
+        assert!(addresses.status.success());
+        if !addresses.stdout.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "IPv6 DAD стенда не завершился");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let (url, server) = fixture(vec![
+        "vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none",
+    ]);
+    let directory = Directory::new();
+    let mut app = Harness::with_hook(directory.config(), |snapshot| {
+        let value: Value = serde_json::from_str(snapshot).expect("состояние desktop");
+        if value["connection_mode"] == "system" {
+            eprintln!(
+                "DesktopHost: status={} state={} busy={} stop={} error={}",
+                value["status"],
+                value["system_state"],
+                value["system_busy"],
+                value["can_stop"],
+                value["error"]
+            );
+        }
+    });
+    app.wait(|value| value["ready"] == true);
+    app.send(json!({"command":"import_source","name":"Тестовый peer",
+        "url":url,"local_exception":true,"route":"direct"}));
+    let state =
+        app.wait(|value| value["pending"].is_null() && value["profiles"][0]["kind"] == "server");
+    server.join().expect("тестовая подписка");
+    app.send(json!({"command":"select_catalog","kind":"server","id":state["profiles"][0]["id"],"page":state["catalog_page"]}));
+    app.wait(|value| value["selected_kind"] == "server");
+    app.send(json!({"command":"set_connection_mode","mode":"system"}));
+    app.wait(|value| value["connection_mode"] == "system");
+    app.send(json!({"command":"set_system_fake_dns","suffixes":"example.test"}));
+    app.wait(|value| value["system_fake_dns_enabled"] == true);
+    if let Some(resolver) = policy_resolver {
+        add_fake_dns_rule(&mut app, 0, "proxy", &["early.example.test"], &[]);
+        add_fake_dns_rule(
+            &mut app,
+            1,
+            "block",
+            &["combined.example.test"],
+            &["203.0.113.50/32"],
+        );
+        add_fake_dns_rule(&mut app, 2, "proxy", &[], &["2001:db8:746f::2/128"]);
+        add_fake_dns_rule(&mut app, 3, "block", &[], &["203.0.113.46/32"]);
+        add_fake_dns_rule(&mut app, 4, "proxy", &["example.test"], &[]);
+        app.send(json!({"command":"set_system_fake_dns_resolver","upstream":resolver}));
+        let state = app.wait(|value| value["system_fake_dns_policy_resolver"] == resolver);
+        assert_eq!(state["system_fake_dns_enabled"], true);
+    }
+
+    for engine in ["xray", "sing-box"] {
+        app.send(json!({"command":"set_engine","engine":engine}));
+        app.wait(|value| value["engine"] == engine && value["can_connect"] == true);
+        app.send(json!({"command":"connect"}));
+        let state = app.wait_for(Duration::from_secs(40), |value| {
+            value["error"].is_string()
+                || (value["system_state"] == "TunnelStarting" && value["system_busy"] == false)
+        });
+        assert_eq!(state["error"], Value::Null);
+        assert_eq!(state["active_engine"], engine);
+        let response = Command::new("/usr/bin/curl")
+            .args([
+                "--noproxy",
+                "*",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                "5",
+                "--cacert",
+            ])
+            .arg(&certificate)
+            .arg("https://example.test/")
+            .output()
+            .expect("контрольный HTTPS");
+        assert!(
+            response.status.success(),
+            "{}",
+            String::from_utf8_lossy(&response.stderr)
+        );
+        assert_eq!(response.stdout, b"YONIK_TLS_FIXTURE");
+        if let Some(resolver) = policy_resolver {
+            check_desktop_mixed_fake_dns();
+            app.send(json!({"command":"set_system_fake_dns_resolver","upstream":""}));
+            let state = app.wait(|value| value["error"] == "busy");
+            assert_eq!(state["system_fake_dns_policy_resolver"], resolver);
+            eprintln!("DesktopHost → смешанная DNS-политика установленного helper: {engine}");
+        }
+        app.send(json!({"command":"stop"}));
+        app.wait(|value| value["can_unlock"] == true && value["can_stop"] == false);
+        app.send(json!({"command":"system_unlock"}));
+        app.wait(|value| value["system_state"] == "NoManagedPolicy");
+        eprintln!("DesktopHost → установленный helper → HTTPS через Fake-IP: {engine}");
+    }
+    app.close();
+}
+
+fn check_desktop_mixed_fake_dns() {
+    use std::net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket};
+
+    let resolve = |name: &str| {
+        (name, 40000_u16)
+            .to_socket_addrs()
+            .expect("системный Fake DNS")
+            .find(|address| {
+                matches!(address.ip(), IpAddr::V4(ip) if ip.octets()[..2] == [198, 19] && ip.octets()[2] >= 224)
+            })
+            .expect("синтетический IPv4 тестового домена")
+    };
+    let timeout = Duration::from_secs(2);
+    let allowed = resolve("early.example.test");
+    let payload = [47u8; 32];
+    let expected = [b"yonik-tun:".as_slice(), &payload].concat();
+    let mut tcp = TcpStream::connect_timeout(&allowed, timeout).expect("разрешённый TCP");
+    tcp.set_read_timeout(Some(timeout)).unwrap();
+    tcp.set_write_timeout(Some(timeout)).unwrap();
+    tcp.write_all(&payload).expect("отправка TCP");
+    let mut response = [0u8; 42];
+    tcp.read_exact(&mut response).expect("ответ TCP");
+    assert_eq!(response.as_slice(), expected);
+
+    let udp = UdpSocket::bind("0.0.0.0:0").expect("клиент UDP");
+    udp.set_read_timeout(Some(timeout)).unwrap();
+    udp.connect(allowed).expect("разрешённый UDP");
+    udp.send(&payload).expect("отправка UDP");
+    let mut response = [0u8; 43];
+    let len = udp.recv(&mut response).expect("ответ UDP");
+    assert_eq!(&response[..len], expected);
+
+    let blocked = resolve("combined.example.test");
+    if let Ok(mut tcp) = TcpStream::connect_timeout(&blocked, timeout) {
+        tcp.set_read_timeout(Some(timeout)).unwrap();
+        tcp.set_write_timeout(Some(timeout)).unwrap();
+        if tcp.write_all(&payload).is_ok() {
+            let mut response = [0u8; 42];
+            assert!(
+                tcp.read_exact(&mut response).is_err(),
+                "смешанный Block пропустил TCP"
+            );
+        }
+    }
+}
+
+#[test]
 fn stop_acknowledges_queued_routing_mutation_and_allows_retry() {
     let directory = Directory::new();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -156,9 +532,13 @@ impl Harness {
     }
     #[track_caller]
     pub(crate) fn wait(&mut self, predicate: impl Fn(&Value) -> bool) -> Value {
+        self.wait_for(Duration::from_secs(10), predicate)
+    }
+    #[track_caller]
+    fn wait_for(&mut self, timeout: Duration, predicate: impl Fn(&Value) -> bool) -> Value {
         let caller = std::panic::Location::caller();
         let started = Instant::now();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = started + timeout;
         loop {
             let snapshot = self
                 .receiver

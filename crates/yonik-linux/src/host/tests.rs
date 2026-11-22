@@ -63,10 +63,10 @@ async fn sealed_snapshot_executes_original_bytes_after_source_changes() {
     let path = directory.0.join("engine");
     fs::copy("/usr/bin/true", &path).unwrap();
     let bytes = fs::read(&path).unwrap();
-    let mut image =
+    let image =
         BinarySnapshot::load(&path, Sha256(Hasher::digest(bytes).into()), Engine::Xray).unwrap();
     fs::write(&path, b"changed").unwrap();
-    assert!(image.file.write_all(b"changed").is_err());
+    assert!(image.file().write_all(b"changed").is_err());
     assert!(image.command().status().await.unwrap().success());
 }
 

@@ -585,27 +585,27 @@ fn metadata_normalization_does_not_hide_routing_selectors() {
         nexthop_id: None,
         unknown: vec![],
     };
-    assert!(route_matches(&value, 7, route));
+    assert!(route_matches(&value, 7, None, route));
     value.flags = 16;
-    assert!(route_matches(&value, 7, route));
+    assert!(route_matches(&value, 7, None, route));
     value.flags = 17;
-    assert!(!route_matches(&value, 7, route));
+    assert!(!route_matches(&value, 7, None, route));
     value.flags = 0;
     value.gateway = Some("198.18.0.2".parse().unwrap());
-    assert!(!route_matches(&value, 7, route));
+    assert!(!route_matches(&value, 7, None, route));
     value.gateway = None;
     value.unknown.push(crate::NetworkAttribute {
         kind: 999,
         value: vec![0],
     });
-    assert!(!route_matches(&value, 7, route));
+    assert!(!route_matches(&value, 7, None, route));
     value.unknown = vec![crate::NetworkAttribute {
         kind: 12,
         value: vec![0; 32],
     }];
-    assert!(route_matches(&value, 7, route));
+    assert!(route_matches(&value, 7, None, route));
     value.unknown[0].value[8] = 1;
-    assert!(!route_matches(&value, 7, route));
+    assert!(!route_matches(&value, 7, None, route));
     assert_eq!(format!("{route:?}"), "TunRoute(<скрыто>)");
 }
 #[test]

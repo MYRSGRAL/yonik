@@ -1,11 +1,12 @@
 //! Клиент закрытого IPC v1. Потеря имени необратимо инвалидирует экземпляр.
 //!
 //! Отмена или deadline после отправки мутации означает неизвестный исход эффекта.
-//! Клиент никогда не повторяет RPC; controller должен явно запросить State.
+//! При неизвестном исходе controller должен явно запросить State.
+//! Prepare с политикой Fake DNS повторяется только после подтверждённого отказа.
 use crate::Cancellation;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use std::{fmt, time::Duration};
+use std::{fmt, net::SocketAddr, time::Duration};
 use tokio::{sync::watch, time::Instant};
 use zbus::{Connection, MatchRule, MessageStream, message::Type};
 const SERVICE_NAME: &str = "cloud.highpriority.yonik.Network1";
@@ -13,6 +14,12 @@ const SERVICE_PATH: &str = "/cloud/highpriority/yonik/Network";
 const SERVICE_INTERFACE: &str = SERVICE_NAME;
 
 const MAX_JSON: usize = 64 * 1024;
+
+struct FakeDnsProfile<'a> {
+    domains: &'a [String],
+    policy: Option<&'a yonik_engine::policy_wire::SystemPolicy>,
+    policy_resolver: Option<SocketAddr>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientError {
@@ -489,6 +496,125 @@ impl SystemClient {
         deadline: Instant,
         cancel: Cancellation,
     ) -> Result<Prepared, ClientError> {
+        self.prepare_profile_with_dns(server, engine, kill_switch, None, deadline, cancel)
+            .await
+    }
+
+    /// Стенд системного DNS использует обычный admission Prepare и ApplyOutputV1.
+    #[cfg(feature = "test-support")]
+    pub async fn prepare_fake_dns_profile(
+        &mut self,
+        server: &yonik_import::ServerIntent,
+        engine: yonik_engine::Engine,
+        kill_switch: bool,
+        domains: &[String],
+        deadline: Instant,
+        cancel: Cancellation,
+    ) -> Result<Prepared, ClientError> {
+        self.prepare_profile_with_dns(
+            server,
+            engine,
+            kill_switch,
+            Some(FakeDnsProfile {
+                domains,
+                policy: None,
+                policy_resolver: None,
+            }),
+            deadline,
+            cancel,
+        )
+        .await
+    }
+
+    /// Системный Fake DNS для явно заданных суффиксов с проверяемой политикой.
+    /// После Busy или Stale запрашивает новый Prepare в ограниченном окне.
+    #[allow(clippy::too_many_arguments)] // Явные границы IPC и отмены.
+    pub async fn prepare_fake_dns_policy_profile(
+        &mut self,
+        server: &yonik_import::ServerIntent,
+        engine: yonik_engine::Engine,
+        kill_switch: bool,
+        domains: &[String],
+        policy: &yonik_engine::policy_wire::SystemPolicy,
+        deadline: Instant,
+        cancel: Cancellation,
+    ) -> Result<Prepared, ClientError> {
+        self.prepare_fake_dns_policy_profile_with_resolver(
+            server,
+            engine,
+            kill_switch,
+            domains,
+            policy,
+            None,
+            deadline,
+            cancel,
+        )
+        .await
+    }
+
+    /// Явный адрес DNS-over-TCP для политики. При его отсутствии сохраняется
+    /// прежний wire-запрос.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_fake_dns_policy_profile_with_resolver(
+        &mut self,
+        server: &yonik_import::ServerIntent,
+        engine: yonik_engine::Engine,
+        kill_switch: bool,
+        domains: &[String],
+        policy: &yonik_engine::policy_wire::SystemPolicy,
+        policy_resolver: Option<SocketAddr>,
+        deadline: Instant,
+        mut cancel: Cancellation,
+    ) -> Result<Prepared, ClientError> {
+        let retry_window = Duration::from_secs(3);
+        let mut retry_until = deadline.min(Instant::now() + retry_window);
+        let mut saw_stale = false;
+        loop {
+            let result = self
+                .prepare_profile_with_dns(
+                    server,
+                    engine,
+                    kill_switch,
+                    Some(FakeDnsProfile {
+                        domains,
+                        policy: Some(policy),
+                        policy_resolver,
+                    }),
+                    deadline,
+                    cancel.clone(),
+                )
+                .await;
+            let now = Instant::now();
+            if matches!(result, Err(ClientError::Stale)) && !saw_stale {
+                // Первая проверка могла занять несколько секунд до смены сети.
+                saw_stale = true;
+                retry_until = deadline.min(now + retry_window);
+            }
+            if !matches!(result, Err(ClientError::Busy | ClientError::Stale)) || now >= retry_until
+            {
+                return result;
+            }
+            let retry_at = retry_until.min(now + Duration::from_millis(50));
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(ClientError::Cancelled),
+                () = tokio::time::sleep_until(retry_at) => {}
+            }
+            if Instant::now() >= retry_until {
+                return result;
+            }
+        }
+    }
+
+    async fn prepare_profile_with_dns(
+        &mut self,
+        server: &yonik_import::ServerIntent,
+        engine: yonik_engine::Engine,
+        kill_switch: bool,
+        fake_dns: Option<FakeDnsProfile<'_>>,
+        deadline: Instant,
+        cancel: Cancellation,
+    ) -> Result<Prepared, ClientError> {
         #[derive(serde::Serialize)]
         struct Request<'a> {
             version: u32,
@@ -496,16 +622,31 @@ impl SystemClient {
             engine: &'static str,
             kill_switch: bool,
             server: &'a yonik_import::ServerIntent,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            fake_dns_domains: Option<&'a [String]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            fake_dns_policy_resolver: Option<SocketAddr>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            policy: Option<&'a yonik_engine::policy_wire::SystemPolicy>,
         }
         let request = serde_json::to_string(&Request {
             version: 1,
-            mode: "system_profile",
+            mode: if fake_dns.is_some() {
+                "system_profile_fake_dns"
+            } else {
+                "system_profile"
+            },
             engine: match engine {
                 yonik_engine::Engine::Xray => "xray",
                 yonik_engine::Engine::SingBox => "sing-box",
             },
             kill_switch,
             server,
+            fake_dns_domains: fake_dns.as_ref().map(|profile| profile.domains),
+            fake_dns_policy_resolver: fake_dns
+                .as_ref()
+                .and_then(|profile| profile.policy_resolver),
+            policy: fake_dns.and_then(|profile| profile.policy),
         })
         .map_err(|_| ClientError::InvalidRequest)?;
         let reply: PreparedReply = decode(&self.call("Prepare", request, deadline, cancel).await?)?;

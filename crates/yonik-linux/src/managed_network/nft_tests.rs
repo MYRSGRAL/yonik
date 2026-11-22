@@ -127,7 +127,7 @@ async fn owned_test_child(
     let permit = Arc::clone(&gate).acquire_owned().await.unwrap();
     let global = PROCESS_LIMIT.acquire().await.unwrap();
     (
-        own_child(child, Vec::new(), permit, global, deadline).unwrap(),
+        own_child(child, Vec::new(), permit, global, None, deadline).unwrap(),
         pid,
         gate,
     )
@@ -306,8 +306,13 @@ async fn real_namespace_journal_create_reopen_foreign_and_stale_handle() {
 #[test]
 fn system_nft_trust_check_is_read_only() {
     // Установка nft не обязательна для запуска обычных unit-тестов.
-    if std::path::Path::new("/usr/bin/nft").exists() {
-        trusted_executable().expect("Установленный системный nft должен пройти строгую проверку");
+    if ["/usr/bin/nft", "/usr/sbin/nft"]
+        .iter()
+        .any(|name| std::path::Path::new(name).exists())
+    {
+        NetworkTool::Nft
+            .open()
+            .expect("Установленный системный nft должен пройти строгую проверку");
     }
 }
 

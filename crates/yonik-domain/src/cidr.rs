@@ -47,6 +47,14 @@ impl fmt::Display for Cidr {
 }
 
 impl Cidr {
+    pub fn network(self) -> IpAddr {
+        self.network
+    }
+
+    pub fn prefix_len(self) -> u8 {
+        self.prefix
+    }
+
     pub fn contains(&self, address: IpAddr) -> bool {
         match (self.network, address) {
             (IpAddr::V4(network), IpAddr::V4(address)) => {

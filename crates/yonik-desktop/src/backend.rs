@@ -19,7 +19,7 @@ pub use backend_startup::StartupPhase;
 #[path = "maintenance_job.rs"]
 mod maintenance_job;
 use crate::preferences::{Preferences, SaveError, SaveOutcome, Store};
-use crate::system_session::{ProfileRevision, SystemSession};
+use crate::system_session::{FakeDnsOptions, ProfileRevision, SystemSession};
 use batch_diagnostics::{BatchEvent, BatchPoll, BatchRunning, BatchState};
 use desktop_schedule::DesktopSchedule;
 #[path = "source_failure.rs"]
@@ -495,6 +495,12 @@ enum Command {
     SetProxyFetchDns {
         upstream: String,
     },
+    SetSystemFakeDns {
+        suffixes: String,
+    },
+    SetSystemFakeDnsResolver {
+        upstream: String,
+    },
     CheckTcp,
     CheckBatch,
     CancelBatch,
@@ -648,13 +654,44 @@ mod engine_availability_tests {
     }
 
     #[test]
+    fn sing_box_available_only_for_system_fake_dns_on_a_server_profile() {
+        let mut snapshot = Snapshot::new(true);
+        snapshot.selected_kind = Some("server");
+        snapshot.connection_mode = ConnectionMode::System;
+        assert!(
+            snapshot
+                .ensure_connection_engine(EngineChoice::SingBox)
+                .is_err()
+        );
+        snapshot.system_fake_dns.push("example.test".into());
+        assert!(
+            snapshot
+                .ensure_connection_engine(EngineChoice::SingBox)
+                .is_ok()
+        );
+        snapshot.connection_mode = ConnectionMode::Local;
+        assert!(
+            snapshot
+                .ensure_connection_engine(EngineChoice::SingBox)
+                .is_err()
+        );
+        snapshot.connection_mode = ConnectionMode::System;
+        snapshot.selected_kind = Some("xray");
+        assert!(
+            snapshot
+                .ensure_connection_engine(EngineChoice::SingBox)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn оба_connect_и_autoconnect_проходят_общий_запрет() {
         let source = include_str!("backend.rs");
         let dispatch = source
             .rsplit("let outcome: SourceResult<()> = match envelope.command {")
             .next()
             .expect("dispatch");
-        let guard = dispatch.find("Command::Connect | Command::RoutingApply { .. } if actor.state.engine.ensure_available().is_err()").expect("общий запрет");
+        let guard = dispatch.find("Command::Connect | Command::RoutingApply { .. } if actor.state.ensure_connection_engine(actor.state.engine).is_err()").expect("общий запрет");
         let system = dispatch.find("command @ (Command::Connect | Command::RoutingApply { .. }) if actor.state.connection_mode == ConnectionMode::System").expect("System Connect");
         let local = dispatch
             .find("Command::Connect => {")
@@ -1139,7 +1176,10 @@ fn validate(command: &Command) -> Result<()> {
         Command::SourcePage { offset } => *offset <= 40_000,
         Command::ReviewPage { offset } => *offset <= 160_000,
         Command::SetProbeTarget { url, .. } => text(url, 2048),
-        Command::SetProxyFetchDns { upstream } => text(upstream, 128),
+        Command::SetProxyFetchDns { upstream } | Command::SetSystemFakeDnsResolver { upstream } => {
+            text(upstream, 128)
+        }
+        Command::SetSystemFakeDns { suffixes } => text(suffixes, 1024),
         Command::SelectSource { id }
         | Command::Favorite { id, .. }
         | Command::DeleteSource { id }
@@ -1499,6 +1539,8 @@ struct Snapshot {
     active_name: Option<String>,
     active_engine: Option<EngineChoice>,
     proxy_fetch_dns: Option<SocketAddr>,
+    system_fake_dns: Vec<String>,
+    system_fake_dns_policy_resolver: Option<SocketAddr>,
     probe_custom: bool,
     probe_persistent: bool,
     probe_expected_status: u16,
@@ -1515,6 +1557,33 @@ struct Snapshot {
     tcp_invalidated: bool,
 }
 impl Snapshot {
+    fn system_fake_dns_configured(&self) -> bool {
+        self.connection_mode == ConnectionMode::System
+            && self.selected_kind != Some("xray")
+            && !self.system_fake_dns.is_empty()
+    }
+
+    fn validate_system_fake_dns_policy(&self) -> Result<()> {
+        let policy = self
+            .routing
+            .policy()
+            .map_err(|_| DesktopError("fake_dns_policy"))?;
+        crate::system_session::validate_fake_dns_policy(
+            &policy,
+            &self.system_fake_dns,
+            self.system_fake_dns_policy_resolver,
+        )
+        .map_err(|_| DesktopError("fake_dns_policy"))
+    }
+
+    fn ensure_connection_engine(&self, engine: EngineChoice) -> Result<()> {
+        if self.system_fake_dns_configured() {
+            self.validate_system_fake_dns_policy()
+        } else {
+            engine.ensure_available()
+        }
+    }
+
     fn new(ephemeral: bool) -> Self {
         Self {
             startup: startup_application::View::default(),
@@ -1587,6 +1656,8 @@ impl Snapshot {
             active_name: None,
             active_engine: None,
             proxy_fetch_dns: None,
+            system_fake_dns: Vec::new(),
+            system_fake_dns_policy_resolver: None,
             probe_custom: false,
             probe_persistent: true,
             probe_expected_status: 204,
@@ -1752,9 +1823,12 @@ impl Snapshot {
             snapshot: &'a Snapshot,
             listen_address: String,
             error_contexts: Vec<crate::diagnostics::context::ErrorContext>,
+            system_fake_dns_enabled: bool,
         }
         let view = View {
             snapshot: self,
+            system_fake_dns_enabled: self.system_fake_dns_configured()
+                && self.validate_system_fake_dns_policy().is_ok(),
             error_contexts: [
                 self.error_contexts.matching(Slot::Error, self.error, None),
                 self.error_contexts
@@ -2383,6 +2457,11 @@ impl Actor {
                     self.preferences.subscription_interval_seconds;
                 self.state.subscription_background = self.preferences.subscription_background;
                 self.state.proxy_fetch_dns = self.preferences.proxy_fetch_dns;
+                self.state.system_fake_dns_policy_resolver =
+                    self.preferences.system_fake_dns_policy_resolver;
+                self.state
+                    .system_fake_dns
+                    .clone_from(&self.preferences.system_fake_dns);
                 self.startup_view();
                 return Err(DesktopError("preferences_conflict"));
             }
@@ -2518,8 +2597,11 @@ impl Actor {
             self.state.presets.validation_scope = None;
         }
         self.state.can_connect = self.state.ready
-            && self.state.engine.ensure_available().is_ok()
-            && (self.selected.is_some()
+            && ((self.selected.is_some()
+                && self
+                    .state
+                    .ensure_connection_engine(self.state.engine)
+                    .is_ok())
                 || self.selected_native.as_ref().is_some_and(|profile| {
                     self.selected_native_token.is_some()
                         && Some(profile.source_id) == self.state.source_id
@@ -3471,6 +3553,57 @@ impl Actor {
                 self.state.proxy_fetch_dns = address;
                 Ok(())
             }
+            Command::SetSystemFakeDns { suffixes } => {
+                if self.state.can_stop
+                    || self.state.system_busy
+                    || self.state.system_recovery_pending
+                {
+                    return Err(DesktopError("busy"));
+                }
+                let mut suffixes = suffixes
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|suffix| !suffix.is_empty())
+                    .map(|suffix| {
+                        suffix
+                            .parse::<yonik_domain::DomainName>()
+                            .map(|name| name.as_str().to_owned())
+                            .map_err(|_| DesktopError("invalid_input"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if !crate::preferences::valid_system_fake_dns(&suffixes) {
+                    return Err(DesktopError("invalid_input"));
+                }
+                suffixes.sort_unstable();
+                suffixes.dedup();
+                let mut preferences = self.preferences.clone();
+                preferences.system_fake_dns.clone_from(&suffixes);
+                self.save_preferences(preferences)?;
+                self.state.system_fake_dns = suffixes;
+                Ok(())
+            }
+            Command::SetSystemFakeDnsResolver { upstream } => {
+                if self.state.can_stop
+                    || self.state.system_busy
+                    || self.state.system_recovery_pending
+                {
+                    return Err(DesktopError("busy"));
+                }
+                let upstream = upstream.trim();
+                let address = (!upstream.is_empty())
+                    .then(|| {
+                        let address = upstream
+                            .parse::<SocketAddr>()
+                            .map_err(|_| DesktopError("invalid_input"))?;
+                        yonik_linux::forward::PolicyProxyResolver::validate_upstream(address)
+                            .map_err(|_| DesktopError("invalid_input"))
+                    })
+                    .transpose()?;
+                let mut preferences = self.preferences.clone();
+                preferences.system_fake_dns_policy_resolver = address;
+                self.save_preferences(preferences)?;
+                self.state.system_fake_dns_policy_resolver = address;
+                Ok(())
+            }
             Command::SetLanguage { language } => {
                 if !matches!(language.as_str(), "ru" | "en") {
                     return Err(DesktopError("invalid_input"));
@@ -3497,7 +3630,9 @@ impl Actor {
                 if self.state.can_stop {
                     return Err(DesktopError("busy"));
                 }
-                engine.ensure_available()?;
+                if matches!(engine, EngineChoice::SingBox) {
+                    self.state.ensure_connection_engine(engine)?;
+                }
                 let mut preferences = self.preferences.clone();
                 preferences.engine = match engine {
                     EngineChoice::Xray => "xray",
@@ -4998,6 +5133,10 @@ async fn run(
     state.subscription_interval_seconds = preferences.subscription_interval_seconds;
     state.subscription_background = preferences.subscription_background;
     state.proxy_fetch_dns = preferences.proxy_fetch_dns;
+    state.system_fake_dns_policy_resolver = preferences.system_fake_dns_policy_resolver;
+    state
+        .system_fake_dns
+        .clone_from(&preferences.system_fake_dns);
     state.preferences_warning = warning;
     state.probe_custom = preferences.probe_url != DEFAULT_PROBE_URL;
     state.probe_expected_status = preferences.probe_status;
@@ -5435,11 +5574,20 @@ async fn run(
                                 actor.state.status = "Unknown";
                             } else {
                                 if flight.connecting || (flight.mutating && result.is_err()) { system_active = !matches!(result, Err(ClientError::Unsupported | ClientError::Denied | ClientError::InvalidRequest | ClientError::Busy)); }
-                                if !flight.connecting && system_stop { system_active = !matches!(result, Ok(SystemState::NoManagedPolicy | SystemState::VerifiedRules | SystemState::RecoveryRequired)); system_stop = false; }
+                                if flight.stopping {
+                                    system_active = !matches!(result, Ok(SystemState::NoManagedPolicy | SystemState::VerifiedRules | SystemState::RecoveryRequired));
+                                    system_stop = false;
+                                }
                                 match result {
                                     Ok(state) => {
-                                        if state == SystemState::NoManagedPolicy { system_active = false; }
-                                        else if matches!(state, SystemState::TunnelStarting | SystemState::Unknown) { system_active = true; }
+                                        match state {
+                                            SystemState::NoManagedPolicy => system_active = false,
+                                            SystemState::TunnelStarting | SystemState::Unknown => system_active = true,
+                                            // После State остаётся публичная блокировка, а worker
+                                            // и ресурсы сессии уже завершены самим helper.
+                                            SystemState::RecoveryRequired if !flight.mutating => system_active = false,
+                                            _ => {}
+                                        }
                                         record_system(&mut actor.state, state)
                                     },
                                     Err(error) => {
@@ -5539,7 +5687,7 @@ async fn run(
             }
             _ = network_changed(&mut network) => {
                 actor.state.system_tun_available = false;
-                if let Some(flight) = system_flight.as_ref().filter(|f| f.connecting) {
+                if let Some(flight) = system_flight.as_ref().filter(|f| f.cancel_on_network_change) {
                     flight.cancel.send_replace(true);
                     system_stop = true;
                 }
@@ -6217,8 +6365,12 @@ async fn run(
                             actor.state.status = "Unknown"; Ok(())
                         }
                     }
-                    Command::Connect | Command::RoutingApply { .. } if actor.state.engine.ensure_available().is_err() => {
-                        Err(DesktopError(if actor.state.can_stop || running.is_some() || refreshing.is_some() || system_flight.is_some() || system_stop { "busy" } else { "engine_unavailable" }).into())
+                    Command::Connect | Command::RoutingApply { .. } if actor.state.ensure_connection_engine(actor.state.engine).is_err() => {
+                        if actor.state.can_stop || running.is_some() || refreshing.is_some() || system_flight.is_some() || system_stop {
+                            Err(DesktopError("busy").into())
+                        } else {
+                            actor.state.ensure_connection_engine(actor.state.engine).map_err(Into::into)
+                        }
                     }
                     Command::Connect if actor.routing_revision.is_none() => Err(DesktopError("routing_storage").into()),
                     command @ (Command::Connect | Command::RoutingApply { .. }) if actor.state.connection_mode == ConnectionMode::System => {
@@ -6229,7 +6381,16 @@ async fn run(
                         else if let Some(profile) = actor.selected.as_ref() {
                             match yonik_import::ServerIntent::from_server(&profile.server).map_err(|_| DesktopError("engine_config")).and_then(|server| actor.current_inline_policy().map(|(policy, revision)| (server, policy, revision))) {
                                 Ok((server, policy, routing_revision)) => {
-                                    system_flight = Some(Flight::start(system_session.take(), Operation::PolicyConnect(Box::new(server), actor.state.engine.engine(), Box::new(policy), routing_revision), system_revision(&actor), envelope.generation, actor.event_log.clone()));
+                                    let suffixes = if actor.state.system_fake_dns_configured() {
+                                        actor.state.system_fake_dns.clone()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let fake_dns = FakeDnsOptions {
+                                        suffixes,
+                                        policy_resolver: actor.state.system_fake_dns_policy_resolver,
+                                    };
+                                    system_flight = Some(Flight::start(system_session.take(), Operation::PolicyConnect(Box::new(server), actor.state.engine.engine(), Box::new(policy), routing_revision, fake_dns), system_revision(&actor), envelope.generation, actor.event_log.clone()));
                                     if let Some(flight) = &mut system_flight { flight.request_id = request_id; flight.source_generation = actor.state.source_generation; }
                                     actor.state.system_tun_available = false;
                                     actor.state.routing_ack = None;
@@ -7750,6 +7911,7 @@ pub(crate) enum Operation {
         Engine,
         Box<yonik_linux::system_policy::InlinePolicy>,
         i64,
+        FakeDnsOptions,
     ),
     Stop,
     Unlock,
@@ -7767,7 +7929,9 @@ pub(crate) struct Flight {
     pub request_id: Option<u64>,
     pub source_generation: Option<i64>,
     pub connecting: bool,
+    stopping: bool,
     pub mutating: bool,
+    pub cancel_on_network_change: bool,
 }
 impl Flight {
     pub fn start(
@@ -7781,10 +7945,15 @@ impl Flight {
             operation,
             Operation::PolicyConnect(..) | Operation::FullProfile(..)
         );
+        // Helper проверяет исходную сеть, отличает свой TUN от внешних
+        // изменений и повторно сверяет маршруты перед выдачей Fake-IP.
+        let cancel_on_network_change = connecting
+            && !matches!(&operation, Operation::PolicyConnect(_, _, _, _, options) if !options.suffixes.is_empty());
         let routing_revision = match &operation {
-            Operation::PolicyConnect(_, _, _, revision) => Some(*revision),
+            Operation::PolicyConnect(_, _, _, revision, _) => Some(*revision),
             _ => None,
         };
+        let stopping = matches!(operation, Operation::Stop);
         let mutating = !matches!(operation, Operation::State);
         let (cancel, cancellation) = Cancellation::new();
         let task = tokio::spawn(async move {
@@ -7819,18 +7988,32 @@ impl Flight {
                         Err(error) => Err(error),
                     }
                 }
-                Operation::PolicyConnect(server, engine, policy, _) => {
-                    match session
-                        .prepare_policy(
-                            revision,
-                            &server,
-                            engine,
-                            &policy,
-                            deadline,
-                            cancellation.clone(),
-                        )
-                        .await
-                    {
+                Operation::PolicyConnect(server, engine, policy, _, options) => {
+                    let prepared = if options.suffixes.is_empty() {
+                        session
+                            .prepare_policy(
+                                revision,
+                                &server,
+                                engine,
+                                &policy,
+                                deadline,
+                                cancellation.clone(),
+                            )
+                            .await
+                    } else {
+                        session
+                            .prepare_fake_dns_policy(
+                                revision,
+                                &server,
+                                engine,
+                                &policy,
+                                &options,
+                                deadline,
+                                cancellation.clone(),
+                            )
+                            .await
+                    };
+                    match prepared {
                         Ok(()) => session.apply(revision, deadline, cancellation).await,
                         Err(error) => Err(error),
                     }
@@ -7850,7 +8033,9 @@ impl Flight {
             request_id: None,
             source_generation: None,
             connecting,
+            stopping,
             mutating,
+            cancel_on_network_change,
         }
     }
 }

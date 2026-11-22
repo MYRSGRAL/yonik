@@ -325,6 +325,8 @@ impl super::Backend {
         self.supervisor
             .as_mut()
             .ok_or(ServiceError::Unavailable)?
+            .systemd()
+            .map_err(super::unavailable)?
             .start_native(
                 Arc::clone(&pending.artifact.payload),
                 &pending.authority,
@@ -457,6 +459,10 @@ pub(super) async fn check_actual_boundaries_with_synthetic_inputs(
         )),
         memory: config_budget().reserve(1).unwrap(),
         native_owner_stamp: Some(backend.native_owner.reserve().unwrap()),
+        direct_egress: Vec::new(),
+        fake_dns: None,
+        resolver_tls: None,
+        bootstrap: None,
     });
     // Реальный producer: отсутствие peer/canonical prerequisites не выдаёт record.
     assert!(
@@ -588,6 +594,10 @@ pub(super) async fn check_actual_boundaries_with_synthetic_inputs(
         attribution_required: false,
         peer: artifact.peer.clone(),
         memory: config_budget().reserve(1).unwrap(),
+        direct_egress: Vec::new(),
+        fake_dns: None,
+        resolver_tls: None,
+        bootstrap: None,
         native_owner_stamp: Some(NativeArtifactStamp {
             session: artifact.native_owner_stamp.as_ref().unwrap().session,
             generation: artifact.native_owner_stamp.as_ref().unwrap().generation,

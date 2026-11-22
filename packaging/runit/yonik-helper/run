@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+umask 077
+exec 2>&1
+exec /usr/lib/yonik/yonik-helper --standalone-service

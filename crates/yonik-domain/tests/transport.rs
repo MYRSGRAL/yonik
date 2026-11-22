@@ -201,7 +201,8 @@ fn полная_таблица_составного_destination_правила()
                                         RuleOrigin::Default
                                     }
                                 },
-                                vpn: None
+                                vpn: None,
+                                selected_address: (!matched).then(|| address.parse().unwrap()),
                             }
                         );
                     }

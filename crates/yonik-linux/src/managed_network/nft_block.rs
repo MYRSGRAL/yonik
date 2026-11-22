@@ -1,5 +1,19 @@
 use super::*;
+use crate::helper::dhcp_networkd::{DHCP_PROBE_CONCURRENCY, DHCP_PROBE_TIMEOUT, DhcpNetworkdLease};
+use crate::managed_network::PublicPolicyPhase;
+use crate::managed_network::firewall::{
+    DHCP_RENEWAL_CHAIN, DHCP_RENEWAL_SET, DHCPCD_EGRESS_CHAIN, DHCPCD_ROUTE_CHAIN,
+    MAX_DHCP_RENEWALS, RESOLVED_CGROUP_PATH,
+};
+use futures_util::{StreamExt, stream};
 use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::{NonZeroU32, NonZeroU64},
+};
+
+const DHCP_ELEMENT_TIMEOUT: Duration = Duration::from_millis(650);
+pub(super) const DHCP_NFT_BUDGET: Duration = Duration::from_millis(300);
 
 pub(super) fn block_table(
     owner: Ownership,
@@ -76,13 +90,7 @@ fn normalize_rule(
             == Some("oif")
         {
             if let Some(name) = expression.pointer("/match/right").and_then(Value::as_str) {
-                let index = match resolve(name) {
-                    Ok(index) => index,
-                    Err(error) => match name.parse::<std::num::NonZeroU32>() {
-                        Ok(index) if index.to_string() == name => index.get(),
-                        _ => return Err(error),
-                    },
-                };
+                let index = resolve_nft_ifindex(name, resolve)?;
                 expression["match"]["right"] = json!(index);
             }
         }
@@ -107,18 +115,253 @@ fn normalize_rule(
     Ok(())
 }
 
+fn resolve_nft_ifindex(
+    name: &str,
+    resolve: &impl Fn(&str) -> Result<u32, NftError>,
+) -> Result<u32, NftError> {
+    resolve(name).or_else(|error| match name.parse::<std::num::NonZeroU32>() {
+        Ok(index) if index.to_string() == name => Ok(index.get()),
+        _ => Err(error),
+    })
+}
+
+fn is_cgroup_match(entry: &Value) -> bool {
+    entry
+        .pointer("/match/left/socket/key")
+        .and_then(Value::as_str)
+        == Some("cgroupv2")
+}
+
+fn normalize_cgroup(
+    rule: &mut Value,
+    path: &str,
+    cgroup: NonZeroU64,
+    expected_level: u8,
+) -> Result<(), NftError> {
+    let expressions = rule
+        .get_mut("expr")
+        .and_then(Value::as_array_mut)
+        .ok_or(NftError::Evidence)?;
+    let mut matches = expressions
+        .iter_mut()
+        .filter(|entry| is_cgroup_match(entry));
+    let entry = matches.next().ok_or(NftError::Evidence)?;
+    if matches.next().is_some() {
+        return Err(NftError::Evidence);
+    }
+    let right = entry.pointer("/match/right").ok_or(NftError::Evidence)?;
+    if right != path
+        && right.as_u64() != Some(cgroup.get())
+        && right.as_str() != Some(cgroup.to_string().as_str())
+    {
+        return Err(NftError::Evidence);
+    }
+    let left = entry
+        .pointer_mut("/match/left/socket")
+        .and_then(Value::as_object_mut)
+        .ok_or(NftError::Evidence)?;
+    let observed_level = left.remove("level");
+    if observed_level
+        .as_ref()
+        .is_some_and(|value| value.as_u64() != Some(u64::from(expected_level)))
+    {
+        return Err(NftError::Evidence);
+    }
+    entry["match"]["right"] = if path == RESOLVED_CGROUP_PATH {
+        json!(cgroup)
+    } else {
+        json!(path)
+    };
+    Ok(())
+}
+
+fn verify_dhcp_element(
+    elements: Value,
+    policy: &PublicBlockPolicy,
+    resolve: &impl Fn(&str) -> Result<u32, NftError>,
+) -> Result<(), NftError> {
+    let elements = elements.as_array().ok_or(NftError::Evidence)?;
+    if elements.len() > MAX_DHCP_RENEWALS {
+        return Err(NftError::Evidence);
+    }
+    let mut seen = BTreeSet::new();
+    for element in elements {
+        let index = element
+            .pointer("/elem/val/concat/2")
+            .ok_or(NftError::Evidence)?;
+        let ifindex = if let Some(name) = index.as_str() {
+            resolve_nft_ifindex(name, resolve)?
+        } else {
+            index
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or(NftError::Evidence)?
+        };
+        let ifindex = NonZeroU32::new(ifindex).ok_or(NftError::Evidence)?;
+        let key = policy.dhcp_renewal_key(ifindex).ok_or(NftError::Evidence)?;
+        // Без обоих полей таймера элемент мог бы оставаться в наборе бессрочно.
+        let expected = json!({"elem": {
+            "val":{"concat":[key.address,key.server,index,key.ifname]},
+            "timeout":0,"expires":0
+        }});
+        if !seen.insert(ifindex) || element != &expected {
+            return Err(NftError::Evidence);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct CgroupHandles {
+    dhcp: BTreeMap<NonZeroU64, (NonZeroU64, u8)>,
+    dhcpcd_route: BTreeMap<NonZeroU64, (NonZeroU64, u8)>,
+    resolver_tls: BTreeMap<NonZeroU64, (NonZeroU64, u8)>,
+}
+
+#[derive(Clone, Copy)]
+struct CgroupIdentity {
+    id: NonZeroU64,
+    level: u8,
+}
+
+fn normalize_dhcpcd_rule(
+    rule: &mut Value,
+    resolve: &impl Fn(&str) -> Result<u32, NftError>,
+) -> Result<(), NftError> {
+    let route = rule["chain"] == DHCPCD_ROUTE_CHAIN;
+    let expressions = rule["expr"].as_array_mut().ok_or(NftError::Evidence)?;
+    for expression in expressions {
+        if expression.pointer("/match/left/payload/protocol") == Some(&json!("ip"))
+            && expression.pointer("/match/left/payload/field") == Some(&json!("dscp"))
+        {
+            if let Some(dscp) = expression
+                .pointer("/match/right")
+                .and_then(Value::as_str)
+                .and_then(nft_dscp_number)
+            {
+                expression["match"]["right"] = json!(dscp);
+            }
+        }
+        if route {
+            if let Some(index) = expression.pointer_mut("/match/left/concat/2") {
+                if let Some(name) = index.as_str() {
+                    *index = json!(resolve_nft_ifindex(name, resolve)?);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn nft_dscp_number(name: &str) -> Option<u8> {
+    // nft использует символические обозначения даже при JSON-выводе.
+    match name.as_bytes() {
+        [b'c', b's', class @ b'0'..=b'7'] => Some((class - b'0') * 8),
+        [b'a', b'f', class @ b'1'..=b'4', drop @ b'1'..=b'3'] => {
+            Some((class - b'0') * 8 + (drop - b'0') * 2)
+        }
+        b"ef" => Some(46),
+        b"va" => Some(44),
+        b"le" => Some(1),
+        _ => None,
+    }
+}
+
+fn normalize_policy_rule(
+    rule: &mut Value,
+    policy: &PublicBlockPolicy,
+    resolve: &impl Fn(&str) -> Result<u32, NftError>,
+) -> Result<Option<CgroupIdentity>, NftError> {
+    normalize_rule(rule, resolve)?;
+    if matches!(
+        rule["chain"].as_str(),
+        Some(DHCPCD_ROUTE_CHAIN | DHCPCD_EGRESS_CHAIN)
+    ) {
+        normalize_dhcpcd_rule(rule, resolve)?;
+    }
+    let (path, id, level) = if rule["chain"] == DHCP_RENEWAL_CHAIN {
+        let index = rule["expr"]
+            .as_array()
+            .and_then(|expr| {
+                expr.iter().find(|entry| {
+                    entry
+                        .pointer("/match/left/meta/key")
+                        .and_then(Value::as_str)
+                        == Some("oif")
+                })
+            })
+            .and_then(|entry| entry.pointer("/match/right"))
+            .and_then(Value::as_u64)
+            .and_then(|index| u32::try_from(index).ok())
+            .and_then(NonZeroU32::new)
+            .ok_or(NftError::Evidence)?;
+        policy
+            .dhcp_cgroup_for_interface(index)
+            .ok_or(NftError::Evidence)?
+    } else if rule["chain"] == DHCPCD_ROUTE_CHAIN {
+        let timed_key = rule["expr"]
+            .as_array()
+            .and_then(|expr| {
+                expr.iter()
+                    .find(|entry| entry.pointer("/match/left/concat").is_some())
+            })
+            .and_then(|entry| entry.pointer("/match/left/concat"))
+            .and_then(Value::as_array)
+            .ok_or(NftError::Evidence)?;
+        if timed_key.len() != 4 {
+            return Err(NftError::Evidence);
+        }
+        let ifname = timed_key[3].as_str().ok_or(NftError::Evidence)?;
+        let ifindex = timed_key[2]
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .and_then(NonZeroU32::new)
+            .ok_or(NftError::Evidence)?;
+        if policy
+            .dhcp_renewal_key(ifindex)
+            .is_none_or(|key| key.ifname != ifname)
+        {
+            return Err(NftError::Evidence);
+        }
+        let (path, id, level) = policy
+            .dhcp_cgroup_for_interface(ifindex)
+            .ok_or(NftError::Evidence)?;
+        if crate::helper::dhcp_networkd::dhcpcd_instance_cgroup(ifname)
+            .is_some_and(|instance_path| instance_path == path && level != 3)
+        {
+            return Err(NftError::Evidence);
+        }
+        (path, id, level)
+    } else if rule["chain"] == "output"
+        && rule["expr"]
+            .as_array()
+            .is_some_and(|expr| expr.iter().any(is_cgroup_match))
+    {
+        (
+            std::borrow::Cow::Borrowed(RESOLVED_CGROUP_PATH),
+            policy.resolver_tls_identity().ok_or(NftError::Evidence)?.1,
+            2,
+        )
+    } else {
+        return Ok(None);
+    };
+    normalize_cgroup(rule, &path, id, level)?;
+    Ok(Some(CgroupIdentity { id, level }))
+}
+
 fn verify_rules(
     bytes: &[u8],
     table: &Table,
     policy: &PublicBlockPolicy,
     resolve: impl Fn(&str) -> Result<u32, NftError>,
-) -> Result<(), NftError> {
+) -> Result<CgroupHandles, NftError> {
     if bytes.len() > MAX_OUTPUT {
         return Err(NftError::OutputLimit);
     }
     let listing: Listing = serde_json::from_slice(bytes).map_err(|_| NftError::Evidence)?;
     let mut tables = Vec::new();
     let mut actual = Vec::new();
+    let mut handles = CgroupHandles::default();
     for item in listing.nftables {
         let object = item.as_object().ok_or(NftError::Evidence)?;
         if object.len() != 1 {
@@ -138,20 +381,47 @@ fn verify_rules(
             ("chain", chain.clone())
         } else if let Some(rule) = object.get("rule") {
             ("rule", rule.clone())
+        } else if let Some(set) = object.get("set").filter(|set| {
+            policy.has_dhcp_renewal_anchor()
+                && set.get("name").and_then(Value::as_str) == Some(DHCP_RENEWAL_SET)
+        }) {
+            ("set", set.clone())
         } else {
             return Err(NftError::Evidence);
         };
         let data_object = data.as_object_mut().ok_or(NftError::Evidence)?;
-        if data_object
+        let handle = data_object
             .remove("handle")
             .and_then(|v| v.as_u64())
-            .filter(|id| *id != 0)
-            .is_none()
-        {
-            return Err(NftError::Evidence);
+            .and_then(NonZeroU64::new)
+            .ok_or(NftError::Evidence)?;
+        if kind == "set" {
+            // nftables 1.1.7 выводит число элементов, включая истёкшие до сборки мусора.
+            if data_object
+                .remove("count")
+                .is_some_and(|count| !count.is_u64())
+            {
+                return Err(NftError::Evidence);
+            }
+            if let Some(elements) = data_object.remove("elem") {
+                verify_dhcp_element(elements, policy, &resolve)?;
+            }
         }
         if kind == "rule" {
-            normalize_rule(&mut data, &resolve)?;
+            if let Some(identity) = normalize_policy_rule(&mut data, policy, &resolve)? {
+                let binding = match data["chain"].as_str() {
+                    Some(DHCP_RENEWAL_CHAIN) => &mut handles.dhcp,
+                    Some(DHCPCD_ROUTE_CHAIN) => &mut handles.dhcpcd_route,
+                    Some("output") => &mut handles.resolver_tls,
+                    _ => return Err(NftError::Evidence),
+                };
+                if binding
+                    .insert(handle, (identity.id, identity.level))
+                    .is_some()
+                {
+                    return Err(NftError::Evidence);
+                }
+            }
         }
         actual.push(json!({kind: data}));
     }
@@ -170,17 +440,193 @@ fn verify_rules(
     for command in policy.commands(&table.name) {
         let mut data = command.get("add").cloned().ok_or(NftError::Evidence)?;
         if let Some(rule) = data.get_mut("rule") {
-            normalize_rule(rule, &resolve)?;
+            normalize_policy_rule(rule, policy, &resolve)?;
         }
         expected.push(data);
+    }
+    if policy.has_dhcp_renewal_anchor() {
+        // Порядок объектов разных типов и цепочек зависит от nft. Стабильная
+        // сортировка сохраняет порядок правил внутри каждой цепочки.
+        let rank = |item: &Value| {
+            if item.get("set").is_some() {
+                return 0;
+            }
+            let (chain, offset) = if let Some(chain) = item.pointer("/chain/name") {
+                (chain, 0)
+            } else if let Some(chain) = item.pointer("/rule/chain") {
+                (chain, 1)
+            } else {
+                return 9;
+            };
+            match chain.as_str() {
+                Some(DHCP_RENEWAL_CHAIN) => 1 + offset,
+                Some(DHCPCD_ROUTE_CHAIN) => 3 + offset,
+                Some(DHCPCD_EGRESS_CHAIN) => 5 + offset,
+                Some("output") => 7 + offset,
+                _ => 9,
+            }
+        };
+        actual.sort_by_key(rank);
+        expected.sort_by_key(rank);
     }
     if actual != expected {
         return Err(NftError::Evidence);
     }
-    Ok(())
+    Ok(handles)
 }
 
 impl NftExecutor {
+    /// Публикует только совпадающий с политикой свежий лизинг. Обновление
+    /// разрешения не меняет revision и не пишет временный элемент в журнал.
+    pub async fn refresh_dhcp_renewal(
+        &mut self,
+        journal: &Journal,
+        revision: u64,
+        lease: &mut DhcpNetworkdLease,
+        cancel: &mut crate::Cancellation,
+    ) -> Result<(), NftError> {
+        let (_, policy) = self.stable_dhcp_policy(journal, revision)?;
+        if policy.dhcp_rule_count() != 1 {
+            return Err(NftError::Invalid);
+        }
+        match self
+            .refresh_dhcp_renewals(journal, revision, std::slice::from_mut(lease), cancel, None)
+            .await?
+        {
+            1 => Ok(()),
+            _ => Err(NftError::Evidence),
+        }
+    }
+
+    /// Заменяет набор одним batch. Каждый просроченный или изменившийся
+    /// лизинг исключается самостоятельно, остальные сохраняют доступ.
+    pub(crate) async fn refresh_dhcp_renewals(
+        &mut self,
+        journal: &Journal,
+        revision: u64,
+        leases: &mut [DhcpNetworkdLease],
+        cancel: &mut crate::Cancellation,
+        dhcp_sleep: Option<&DhcpSleepTicket>,
+    ) -> Result<usize, NftError> {
+        let (table, policy) = self.stable_dhcp_policy(journal, revision)?;
+        if leases.len() > MAX_DHCP_RENEWALS {
+            return Err(NftError::Invalid);
+        }
+        self.verify_public_block(&table, policy).await?;
+        let result = async {
+            let refreshed: Vec<_> = stream::iter(leases.iter_mut())
+                .map(|lease| {
+                    let mut token = cancel.clone();
+                    async move {
+                        tokio::time::timeout(DHCP_PROBE_TIMEOUT, lease.revalidate(&mut token))
+                            .await
+                            .ok()?
+                            .ok()?;
+                        Some(lease)
+                    }
+                })
+                .buffer_unordered(DHCP_PROBE_CONCURRENCY)
+                .filter_map(std::future::ready)
+                .collect()
+                .await;
+            cancel.check().map_err(|_| NftError::Evidence)?;
+            let mut seen = BTreeSet::new();
+            let mut selected = Vec::new();
+            let mut keys = Vec::new();
+            for lease in refreshed {
+                if let Some(index) = policy.matches_dhcp_lease(lease) {
+                    if !seen.insert(index) {
+                        return Err(NftError::Evidence);
+                    }
+                    if lease.remaining().is_some_and(|remaining| {
+                        remaining >= DHCP_ELEMENT_TIMEOUT + DHCP_NFT_BUDGET
+                    }) {
+                        keys.push(policy.dhcp_renewal_key(index).ok_or(NftError::Evidence)?);
+                        selected.push(lease);
+                    }
+                }
+            }
+            let batch =
+                text::dhcp_renewal(&table.name, &keys, DHCP_ELEMENT_TIMEOUT.as_millis() as u64)?;
+            tokio::time::timeout(
+                DHCP_NFT_BUDGET,
+                self.run_batch(batch, true, false, dhcp_sleep, None),
+            )
+            .await
+            .map_err(|_| NftError::Timeout)??;
+            cancel.check().map_err(|_| NftError::Evidence)?;
+            let stale: Vec<_> = selected
+                .iter()
+                .zip(&keys)
+                .filter_map(|(lease, key)| {
+                    lease
+                        .remaining()
+                        .is_none_or(|remaining| remaining < DHCP_ELEMENT_TIMEOUT)
+                        .then_some(key)
+                })
+                .collect();
+            if !stale.is_empty() {
+                let delete = text::delete_dhcp_renewals(&table.name, &stale)?;
+                tokio::time::timeout(
+                    DHCP_NFT_BUDGET,
+                    self.run_batch(delete, true, false, None, None),
+                )
+                .await
+                .map_err(|_| NftError::Timeout)??;
+                cancel.check().map_err(|_| NftError::Evidence)?;
+            }
+            Ok(keys.len() - stale.len())
+        }
+        .await;
+        if result.is_err() {
+            self.clear_dhcp_renewal(&table).await?;
+        }
+        result
+    }
+
+    /// Явный отзыв сохраняет статическое правило и остальную защиту.
+    pub async fn revoke_dhcp_renewal(
+        &mut self,
+        journal: &Journal,
+        revision: u64,
+    ) -> Result<(), NftError> {
+        let (table, policy) = self.stable_dhcp_policy(journal, revision)?;
+        self.verify_public_block(&table, policy).await?;
+        self.clear_dhcp_renewal(&table).await
+    }
+
+    fn stable_dhcp_policy<'a>(
+        &self,
+        journal: &'a Journal,
+        revision: u64,
+    ) -> Result<(Table, &'a PublicBlockPolicy), NftError> {
+        self.check_namespace()?;
+        journal.check(self.owner)?;
+        let record = journal.public_policy().ok_or(NftError::Evidence)?;
+        let PublicPolicyPhase::Stable { policy } = record.phase() else {
+            return Err(NftError::Evidence);
+        };
+        if record.revision() != revision || policy.dhcp_rule_identity().is_none() {
+            return Err(NftError::Evidence);
+        }
+        Ok((
+            block_table(self.owner, record.id(), record.table_id(), policy),
+            policy,
+        ))
+    }
+
+    async fn clear_dhcp_renewal(&mut self, table: &Table) -> Result<(), NftError> {
+        self.run_batch(
+            text::dhcp_renewal(&table.name, &[], DHCP_ELEMENT_TIMEOUT.as_millis() as u64)?,
+            true,
+            false,
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Обновляет согласованные исключения без окна между снятием старой и
     /// установкой новой защиты. При конфликте handle откатывается весь batch.
     pub(super) async fn replace_public_block(
@@ -237,9 +683,61 @@ impl NftExecutor {
             None,
         )
         .map_err(|_| NftError::Io)?;
-        verify_rules(&bytes, table, policy, |name| {
-            rustix::net::netdevice::name_to_index(&socket, name).map_err(|_| NftError::Evidence)
-        })
+        let verify = |bytes| {
+            verify_rules(bytes, table, policy, |name| {
+                rustix::net::netdevice::name_to_index(&socket, name).map_err(|_| NftError::Evidence)
+            })
+        };
+        let handles = verify(&bytes)?;
+        let mut checked_kernel = false;
+        for (chain, expected, identity) in [
+            (
+                DHCP_RENEWAL_CHAIN,
+                &handles.dhcp,
+                policy.dhcp_rule_identity(),
+            ),
+            (
+                DHCPCD_ROUTE_CHAIN,
+                &handles.dhcpcd_route,
+                policy
+                    .dhcp_rule_identity()
+                    .filter(|_| !handles.dhcpcd_route.is_empty()),
+            ),
+            (
+                "output",
+                &handles.resolver_tls,
+                policy.resolver_tls_identity(),
+            ),
+        ] {
+            let Some((namespace, _)) = identity else {
+                continue;
+            };
+            checked_kernel = true;
+            let (_owner, mut cancel) = crate::Cancellation::new();
+            let (observed, matches) =
+                crate::read_nft_socket_cgroup_matches(&table.name, chain, &mut cancel, DEADLINE)
+                    .await
+                    .map_err(|_| NftError::Evidence)?;
+            if namespace != self.owner.namespace()
+                || namespace != (observed.device, observed.inode)
+                || matches.len() != expected.len()
+                || matches.iter().any(|rule| {
+                    expected.get(&rule.rule_handle) != Some(&(rule.cgroup_id, rule.level))
+                })
+                || matches
+                    .iter()
+                    .map(|rule| rule.rule_handle)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != expected.len()
+            {
+                return Err(NftError::Evidence);
+            }
+        }
+        if checked_kernel && verify(&self.run(Action::ListTable(table)).await?)? != handles {
+            return Err(NftError::Evidence);
+        }
+        Ok(())
     }
 
     /// Создание таблицы и всех правил — одна nft transaction. Повтор принимает

@@ -219,16 +219,15 @@ fn received_descriptors_are_cloexec_and_executable_is_copied() {
     )
     .unwrap();
     let config = sealed_config(b"safe").unwrap();
-    let header = Header {
+    let mut header = Header {
         mode: WorkerMode::Check,
         engine: Engine::Xray,
         length: 4,
         binary_hash: expected,
         config_hash: Hasher::digest(b"safe").into(),
-    }
-    .encode();
+    };
     let (sender, receiver) = UnixStream::pair().unwrap();
-    send_request(&sender, &header, &[&binary.file, &config]);
+    send_request(&sender, &header.encode(), &[binary.file(), &config]);
     if !rustix::process::getuid().is_root() {
         assert_eq!(
             receive(&receiver, WorkerMode::Check).err(),
@@ -238,12 +237,20 @@ fn received_descriptors_are_cloexec_and_executable_is_copied() {
     }
     let (copy, input) = receive(&receiver, WorkerMode::Check).unwrap();
     assert_ne!(
-        copy.file.metadata().unwrap().ino(),
-        binary.file.metadata().unwrap().ino()
+        copy.file().metadata().unwrap().ino(),
+        binary.file().metadata().unwrap().ino()
     );
-    assert!(fcntl_getfd(&copy.file).unwrap().contains(FdFlags::CLOEXEC));
+    assert!(fcntl_getfd(copy.file()).unwrap().contains(FdFlags::CLOEXEC));
     assert!(fcntl_getfd(&input).unwrap().contains(FdFlags::CLOEXEC));
     assert!(input.set_len(5).is_err());
+
+    header.binary_hash[0] ^= 1;
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    send_request(&sender, &header.encode(), &[binary.file(), &config]);
+    assert_eq!(
+        receive(&receiver, WorkerMode::Check).err(),
+        Some(WorkerError::Protocol)
+    );
 }
 
 #[test]

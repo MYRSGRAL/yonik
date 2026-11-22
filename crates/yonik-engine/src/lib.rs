@@ -14,7 +14,10 @@ pub use routing::{
     PolicyCapability, PolicyCompileError, PolicyMode, ProbeAccess, ProbeCredentials, compile_policy,
 };
 pub use system_tun::{
-    SystemTun, SystemTunAddress, compile_system, compile_system_bound_policy, compile_system_policy,
+    SystemFakeDnsBridge, SystemTun, SystemTunAddress, compile_system, compile_system_bound_policy,
+    compile_system_fake_dns_bridge, compile_system_fake_dns_bridge_at,
+    compile_system_fake_dns_policy, compile_system_fake_dns_policy_at, compile_system_policy,
+    validate_scoped_fake_dns_policy,
 };
 
 use std::{
@@ -403,3 +406,5 @@ pub mod resource_index;
 pub mod transport;
 
 pub mod dns_policy_plan;
+
+pub mod fake_dns;

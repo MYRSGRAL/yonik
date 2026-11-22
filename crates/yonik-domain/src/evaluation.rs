@@ -46,7 +46,7 @@ pub enum Resolution<'a> {
     Failed,
     Answer(AnswerSet<'a>),
 }
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct FakeMapping {
     pub address: IpAddr,
     pub name: DomainName,
@@ -94,17 +94,35 @@ pub enum Evaluation {
     Decided {
         decision: Decision,
         vpn: Option<VpnId>,
+        /// Адрес для подключения, когда путь зависит от проверенного ответа
+        /// DNS или вход уже содержит буквальный IP.
+        selected_address: Option<IpAddr>,
     },
     NeedResolution(ResolverPath),
     Rejected(PolicyFault),
 }
 
-fn decided(action: Route, origin: RuleOrigin, vpn: Option<VpnId>) -> Evaluation {
+fn decided(
+    action: Route,
+    origin: RuleOrigin,
+    vpn: Option<VpnId>,
+    selected_address: Option<IpAddr>,
+) -> Evaluation {
     Evaluation::Decided {
         decision: Decision { action, origin },
         vpn,
+        selected_address: if action == Route::Block {
+            None
+        } else {
+            selected_address
+        },
     }
 }
+
+fn lowest_address(addresses: &[IpAddr]) -> Option<IpAddr> {
+    addresses.iter().map(|address| address.to_canonical()).min()
+}
+
 fn unresolved() -> Evaluation {
     Evaluation::Rejected(PolicyFault::DnsPolicyUnresolved)
 }
@@ -231,18 +249,20 @@ impl Policy {
             }
         }
         if !zone_available {
-            return decided(Route::Block, RuleOrigin::PrivateDomain, None);
+            return decided(Route::Block, RuleOrigin::PrivateDomain, None, None);
         }
         let path = zone_owner.map_or(ResolverPath::Policy, ResolverPath::Vpn);
         let facts = match &literal {
             Some(addresses) => Addresses::Literal(addresses),
             None => Addresses::Lookup(resolution, path),
         };
+        let mut checked_addresses = literal.as_ref().map(|addresses| addresses.as_slice());
         if !self.private_networks.is_empty() || zone_owner.is_some() {
             let addresses = match facts.get(context) {
                 Ok(addresses) => addresses,
                 Err(result) => return result,
             };
+            checked_addresses = Some(addresses);
             let mut owner = None;
             let mut public = false;
             let mut available = true;
@@ -281,6 +301,7 @@ impl Policy {
                         RuleOrigin::PrivateNetwork
                     },
                     available.then_some(vpn),
+                    lowest_address(addresses),
                 );
             }
         }
@@ -289,12 +310,14 @@ impl Policy {
                 Ok(addresses) => addresses,
                 Err(result) => return result,
             };
-            if self.lan.iter().any(|cidr| {
-                addresses
-                    .iter()
-                    .any(|address| cidr.contains(address.to_canonical()))
-            }) {
-                return decided(Route::Direct, RuleOrigin::Lan, None);
+            checked_addresses = Some(addresses);
+            let selected = addresses
+                .iter()
+                .map(|address| address.to_canonical())
+                .filter(|&address| self.lan.iter().any(|cidr| cidr.contains(address)))
+                .min();
+            if selected.is_some() {
+                return decided(Route::Direct, RuleOrigin::Lan, None, selected);
             }
         }
         for (rules, origin) in [
@@ -325,25 +348,39 @@ impl Policy {
                 {
                     continue;
                 }
-                let mut matches = true;
-                if !condition.destinations.is_empty() || resources.has_cidrs(resource_rule) {
-                    let addresses = match facts.get(context) {
-                        Ok(addresses) => addresses,
-                        Err(result) => return result,
-                    };
-                    matches = condition.destinations.iter().any(|cidr| {
-                        addresses
+                let selected =
+                    if !condition.destinations.is_empty() || resources.has_cidrs(resource_rule) {
+                        let addresses = match facts.get(context) {
+                            Ok(addresses) => addresses,
+                            Err(result) => return result,
+                        };
+                        checked_addresses = Some(addresses);
+                        let selected = addresses
                             .iter()
-                            .any(|address| cidr.contains(address.to_canonical()))
-                    }) || addresses
-                        .iter()
-                        .any(|address| resources.matches_ip(resource_rule, address.to_canonical()));
-                }
-                if matches {
-                    return decided(rule.action.into(), origin(rule.id), None);
-                }
+                            .map(|address| address.to_canonical())
+                            .filter(|&address| {
+                                condition
+                                    .destinations
+                                    .iter()
+                                    .any(|cidr| cidr.contains(address))
+                                    || resources.matches_ip(resource_rule, address)
+                            })
+                            .min();
+                        if selected.is_none() {
+                            continue;
+                        }
+                        selected
+                    } else {
+                        checked_addresses.and_then(lowest_address)
+                    };
+                return decided(rule.action.into(), origin(rule.id), None, selected);
             }
         }
-        decided(self.default_action.into(), RuleOrigin::Default, None)
+        decided(
+            self.default_action.into(),
+            RuleOrigin::Default,
+            None,
+            checked_addresses.and_then(lowest_address),
+        )
     }
 }

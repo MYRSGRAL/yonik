@@ -81,6 +81,11 @@ class ArchiveTests(unittest.TestCase):
                     if change == "missing" and name == "usr/bin/yonik-desktop":
                         continue
                     content = content if content is not None else b"\x7fELFfixture"
+                    if name.endswith("/50-yonik-dhcp-sleep.conf"):
+                        if change == "missing_sleep_requirement":
+                            continue
+                        if change == "weakened_sleep_requirement":
+                            content = content.replace(b"Requires=", b"Wants=")
                     entry = tarfile.TarInfo(name)
                     entry.mode = mode
                     if change == "mode":
@@ -183,6 +188,8 @@ class ArchiveTests(unittest.TestCase):
             "traversal",
             "hook",
             "link",
+            "missing_sleep_requirement",
+            "weakened_sleep_requirement",
         ):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.check_fixture(change)

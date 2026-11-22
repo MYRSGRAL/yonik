@@ -28,7 +28,7 @@ impl fmt::Display for CredentialError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Unavailable => "Secret Service недоступен",
-            Self::Locked => "Разблокируйте хранилище секретов в KDE",
+            Self::Locked => "Разблокируйте хранилище секретов",
             Self::Missing => "Ключ существующей базы отсутствует в Secret Service",
             Self::Ambiguous => "Найдено несколько ключей yonik; требуется восстановление",
             Self::InvalidKey => "Неверный формат ключа yonik",
@@ -177,6 +177,14 @@ async fn load_key(allow_create: bool) -> Result<Zeroizing<[u8; 32]>, CredentialE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn сообщение_о_блокировке_подходит_для_любого_окружения() {
+        assert_eq!(
+            CredentialError::Locked.to_string(),
+            "Разблокируйте хранилище секретов"
+        );
+    }
 
     #[tokio::test]
     #[ignore = "Требует доступного Secret Service; только чтение, ключи не создаются"]
