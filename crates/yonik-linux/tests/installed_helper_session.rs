@@ -976,6 +976,22 @@ async fn production_helper_scoped_fake_dns_literal_cidr_control() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая VM с HTTPS по имени и буквальным IP за VLESS"]
+async fn production_helper_fake_dns_literal_tls_proxy() -> Result {
+    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralTls { proxy: true }, false)
+        .await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая VM с HTTPS по имени и буквальным IP за VLESS"]
+async fn production_helper_fake_dns_literal_tls_block() -> Result {
+    installed_fake_dns_with_domain_policy(FakeDnsPolicyWitness::LiteralTls { proxy: false }, false)
+        .await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "одноразовая VM с установленным helper и эхо-сервером за VLESS"]
 async fn production_helper_ip_only_policy_uses_the_literal_address() -> Result {
     check_ip_only_policy(false).await
@@ -1044,25 +1060,7 @@ async fn check_ip_only_policy(check_tls: bool) -> Result {
             )?;
             check_literal_cidr_traffic(permits_proxy).await?;
             if let Some(certificate) = &certificate {
-                for address in ["198.18.0.2:443", "[2001:db8:746f::2]:443"] {
-                    let client = reqwest::Client::builder()
-                        .https_only(true)
-                        .no_proxy()
-                        .timeout(Duration::from_secs(3))
-                        .add_root_certificate(certificate.clone())
-                        .resolve("example.test", address.parse()?)
-                        .build()?;
-                    let response = client.get("https://example.test/").send().await;
-                    if permits_proxy {
-                        require(
-                            response?.error_for_status()?.bytes().await?.as_ref()
-                                == b"YONIK_TLS_FIXTURE",
-                            "HTTPS не дошёл до сервера по выбранному буквальному адресу",
-                        )?;
-                    } else {
-                        require(response.is_err(), "TLS-имя обошло CIDR Block")?;
-                    }
-                }
+                check_literal_cidr_https(certificate, permits_proxy).await?;
                 eprintln!(
                     "{engine:?}: SNI example.test, Proxy={permits_proxy}, буквальные IPv4/IPv6"
                 );
@@ -3806,6 +3804,7 @@ async fn installed_fake_dns_with_domain_policy(
         FakeDnsPolicyWitness::Domains => None,
         FakeDnsPolicyWitness::LiteralBlock | FakeDnsPolicyWitness::LiteralDirect => Some("block"),
         FakeDnsPolicyWitness::LiteralProxy => Some("proxy"),
+        FakeDnsPolicyWitness::LiteralTls { proxy } => Some(if proxy { "proxy" } else { "block" }),
         FakeDnsPolicyWitness::ResolvedCidrs | FakeDnsPolicyWitness::ResolvedMixed { .. } => {
             unreachable!("У проверок DNS политики свой профиль")
         }
@@ -3847,6 +3846,7 @@ enum FakeDnsPolicyWitness {
     Domains,
     LiteralBlock,
     LiteralProxy,
+    LiteralTls { proxy: bool },
     LiteralDirect,
     ResolvedCidrs,
     ResolvedMixed { guarded_proxy: bool },
@@ -4483,6 +4483,16 @@ async fn installed_fake_dns(
                     check_literal_cidr_traffic(true).await?;
                     eprintln!("{engine:?} CIDR Proxy пропустил те же IPv4/IPv6 по TCP/UDP");
                 }
+                FakeDnsPolicyWitness::LiteralTls { proxy } => {
+                    let certificate =
+                        std::env::var_os("YONIK_FAKE_DNS_TLS_CA").ok_or_else(|| {
+                            io::Error::other("Стенду нужен корневой сертификат HTTPS")
+                        })?;
+                    check_literal_cidr_traffic(*proxy).await?;
+                    let certificate = reqwest::Certificate::from_pem(&fs::read(certificate)?)?;
+                    check_literal_cidr_https(&certificate, *proxy).await?;
+                    eprintln!("{engine:?}: SNI example.test, CIDR Proxy={proxy}, Fake DNS активен");
+                }
                 FakeDnsPolicyWitness::LiteralDirect => {
                     check_literal_cidr_traffic(false).await?;
                     check_literal_direct_traffic().await?;
@@ -5016,6 +5026,29 @@ async fn state_after_route_events_with_timeout(
         )
         .await;
     }
+}
+
+#[cfg(feature = "test-support")]
+async fn check_literal_cidr_https(certificate: &reqwest::Certificate, proxy: bool) -> Result {
+    for address in ["198.18.0.2:443", "[2001:db8:746f::2]:443"] {
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .add_root_certificate(certificate.clone())
+            .resolve("example.test", address.parse()?)
+            .build()?;
+        let response = client.get("https://example.test/").send().await;
+        if proxy {
+            require(
+                response?.error_for_status()?.bytes().await?.as_ref() == b"YONIK_TLS_FIXTURE",
+                "HTTPS не дошёл до сервера по выбранному буквальному адресу",
+            )?;
+        } else {
+            require(response.is_err(), "TLS-имя обошло CIDR Block")?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "test-support")]
