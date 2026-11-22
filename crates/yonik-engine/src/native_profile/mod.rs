@@ -10,7 +10,7 @@ pub use intent::{
 
 use crate::{CompiledConfig, SystemTun};
 pub use graph::{
-    EgressPlan, IngressRequirement, OwnedResourceRequirement, PhysicalEndpoint,
+    DnsIngressIdentity, EgressPlan, IngressRequirement, OwnedResourceRequirement, PhysicalEndpoint,
     PhysicalFirstHopBootstrap, ProbeRequirement, ProfileCompileError, ProviderIngressProtocol,
     ResolverRequirement, SystemResolverBinding, SystemResolverRequirement, TransportProtocol,
     ValidatedGraph, VerifiedNativeResources, VerifiedSystemResolver,
@@ -22,6 +22,7 @@ use yonik_import::NativeProfile;
 pub struct OwnedRuntimePlan {
     pub(super) port: NonZeroU16,
     pub(super) probe_port: NonZeroU16,
+    pub(super) local_http_port: Option<NonZeroU16>,
     pub(super) ingress: BTreeMap<String, OwnedIngress>,
     pub(super) tun: Option<SystemTun>,
     pub(super) system_resolver: Option<SystemResolverBinding>,
@@ -34,6 +35,7 @@ pub struct OwnedRuntimePlan {
 pub enum OwnedIngress {
     Local,
     System,
+    LocalHttp,
 }
 impl OwnedRuntimePlan {
     pub fn ingress_mappings(&self) -> impl Iterator<Item = (&str, OwnedIngress)> {
@@ -47,6 +49,9 @@ impl OwnedRuntimePlan {
     pub fn probe_port(&self) -> NonZeroU16 {
         self.probe_port
     }
+    pub fn local_http_port(&self) -> Option<NonZeroU16> {
+        self.local_http_port
+    }
     pub fn is_system(&self) -> bool {
         self.tun.is_some()
     }
@@ -57,11 +62,23 @@ impl OwnedRuntimePlan {
         Ok(Self {
             port,
             probe_port,
+            local_http_port: None,
             ingress: BTreeMap::new(),
             tun: None,
             system_resolver: None,
             resources: Vec::new(),
         })
+    }
+    pub fn with_local_http(mut self, port: NonZeroU16) -> Result<Self, ProfileCompileError> {
+        if self.is_system()
+            || self.local_http_port.is_some()
+            || port == self.port
+            || port == self.probe_port
+        {
+            return Err(ProfileCompileError::Ownership);
+        }
+        self.local_http_port = Some(port);
+        Ok(self)
     }
     pub fn with_system(mut self, tun: SystemTun) -> Self {
         self.tun = Some(tun);
@@ -139,6 +156,8 @@ impl OwnedRuntimePlan {
         if tag.is_empty()
             || tag.len() > 128
             || tag.starts_with("yonik-owned-")
+            || ingress == OwnedIngress::LocalHttp
+                && (self.local_http_port.is_none() || self.is_system())
             || self.ingress.len() >= 16
             || self.ingress.insert(tag.to_owned(), ingress).is_some()
         {

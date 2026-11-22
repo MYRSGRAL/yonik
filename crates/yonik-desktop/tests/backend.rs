@@ -1102,12 +1102,12 @@ fn stop_and_shutdown_finish_a_pending_tcp_task_before_acknowledgement() {
 fn xray_json_auto_import_exposes_profiles_only_after_review() {
     let directory = Directory::new();
     let body = json!([{"remarks":"JSON-сервер","outbounds":[{
-        "protocol":"vless", "settings":{"vnext":[{
+        "tag":"proxy", "protocol":"vless", "settings":{"vnext":[{
             "address":"example.invalid", "port":443,
             "users":[{"id":"11111111-1111-4111-8111-111111111111","encryption":"none"}]
         }]}, "streamSettings":{"network":"tcp","security":"tls",
             "tlsSettings":{"serverName":"example.invalid","enableSessionResumption":false}}
-    }]}])
+    }, {"tag":"direct","protocol":"freedom"}]}])
     .to_string();
     let (url, server) = fixture(vec![body]);
     let mut app = Harness::new(directory.config());
@@ -1120,11 +1120,22 @@ fn xray_json_auto_import_exposes_profiles_only_after_review() {
     assert_eq!(pending["can_connect"], false);
     app.send(json!({"command":"approve_refresh"}));
     let imported = app.wait(|v| v["total"] == 1 && v["pending"].is_null());
-    app.send(json!({"command":"select_profile","id":imported["profiles"][0]["id"],"revision":imported["revision"]}));
-    app.wait(|v| v["can_connect"] == true);
+    let profile = &imported["profiles"][0];
+    assert_eq!(profile["kind"], "xray");
+    assert_eq!(profile["name"], "JSON-сервер");
+    assert!(profile["host"].is_null() && profile["port"].is_null());
+    app.send(
+        json!({"command":"select_profile","id":profile["id"],"revision":imported["revision"]}),
+    );
+    let rejected = app.wait(|v| v["error"] == "profile_unavailable");
+    assert!(rejected["selected_profile"].is_null());
+    app.send(json!({"command":"select_catalog","kind":"xray","id":profile["id"],"page":imported["catalog_page"]}));
+    let selected = app.wait(|v| v["selected_kind"] == "xray");
+    assert_eq!(selected["selected_profile"], profile["id"]);
+    assert!(selected["error"].is_null());
+    assert_eq!(selected["can_connect"], false);
     app.send(json!({"command":"connect"}));
-    // До engine lookup прошла настоящая компиляция нормализованного профиля.
-    app.wait(|v| v["error"] == "engine_missing" && v["can_stop"] == false);
+    app.wait(|v| v["error"] == "profile_unavailable" && v["can_stop"] == false);
     app.close();
     server.join().expect("fixture");
     assert!(
@@ -1135,17 +1146,17 @@ fn xray_json_auto_import_exposes_profiles_only_after_review() {
 }
 
 #[test]
-fn native_json_requires_approval_and_never_becomes_profile() {
+fn sing_box_json_refresh_is_rejected_before_review() {
     let directory = Directory::new();
     let (url, server) = fixture(vec![r#"{"outbounds":[{"type":"direct"}]}"#]);
     let mut app = Harness::new(directory.config());
     app.wait(|v| v["ready"] == true);
-    app.send(json!({"command":"add_source","name":"Opaque","url":url,"local_exception":true,"route":"direct"}));
+    app.send(json!({"command":"add_source","name":"Sing-box","url":url,"local_exception":true,"route":"direct"}));
     app.wait(|v| v["source_id"].is_i64());
     app.send(json!({"command":"refresh"}));
-    app.wait(|v| v["pending"]["native_json"] == true);
-    app.send(json!({"command":"approve_refresh"}));
-    let value = app.wait(|v| v["revision"].as_i64().is_some_and(|r| r > 0));
+    let value = app.wait(|v| v["source_error"] == "import" && v["busy"] == false);
+    assert_eq!(value["revision"], 0);
+    assert!(value["pending"].is_null());
     assert_eq!(value["profiles"], json!([]));
     assert_eq!(value["can_connect"], false);
     app.close();
@@ -2732,21 +2743,38 @@ fn local_unknown_options_preserve_profile_but_block_activation() {
 }
 
 #[test]
-fn local_base64_and_both_json_formats_use_existing_importer() {
+fn local_import_distinguishes_base64_xray_and_unsupported_sing_box_json() {
     let inputs = [
-        "dHJvamFuOi8vc2VjcmV0QGV4YW1wbGUuY29tOjQ0MyN0ZXN0",
-        r#"{"outbounds":[{"protocol":"trojan","settings":{"servers":[{"address":"example.com","port":443,"password":"secret"}]},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"example.com"}}}]}"#,
-        r#"{"outbounds":[{"type":"trojan","server":"example.com","server_port":443,"password":"secret","tls":{"enabled":true,"server_name":"example.com"}}]}"#,
+        (
+            "dHJvamFuOi8vc2VjcmV0QGV4YW1wbGUuY29tOjQ0MyN0ZXN0",
+            Some("server"),
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"trojan","settings":{"servers":[{"address":"example.com","port":443,"password":"secret"}]},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"example.com"}}}]}"#,
+            Some("xray"),
+        ),
+        (
+            r#"{"outbounds":[{"type":"trojan","server":"example.com","server_port":443,"password":"secret","tls":{"enabled":true,"server_name":"example.com"}}]}"#,
+            None,
+        ),
     ];
-    for input in inputs {
+    for (input, expected_kind) in inputs {
         let directory = Directory::new();
         let mut app = Harness::new(directory.config());
         app.wait(|v| v["ready"] == true);
         local_backup(&mut app, &directory);
         app.send(json!({"command":"import_text", "name":"Local", "text":input}));
-        app.wait(|v| v["pending"]["accepted"] == 1);
-        app.send(json!({"command":"approve_refresh"}));
-        app.wait(|v| v["total"] == 1 && v["pending"].is_null());
+        if let Some(kind) = expected_kind {
+            let pending = app.wait(|v| v["pending"]["accepted"] == 1);
+            assert_eq!(pending["pending"]["native_json"], kind == "xray");
+            app.send(json!({"command":"approve_refresh"}));
+            let saved = app.wait(|v| v["total"] == 1 && v["pending"].is_null());
+            assert_eq!(saved["profiles"][0]["kind"], kind);
+        } else {
+            let rejected = app.wait(|v| v["source_error"] == "invalid_input" && v["busy"] == false);
+            assert!(rejected["pending"].is_null());
+            assert_eq!(rejected["sources_total"], 0);
+        }
         app.close();
     }
 }

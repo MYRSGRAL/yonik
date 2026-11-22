@@ -724,3 +724,219 @@ fn system_resolver_binding_rejects_empty_or_unbounded_snapshots() {
         ));
     }
 }
+
+#[test]
+fn local_dual_ingress_preserves_provider_routes_and_separate_socks_probe() {
+    let mut fixtures = profiles();
+    let mut value = provider_shape(fixtures.remove(3));
+    value["outbounds"][0]["streamSettings"] = fixtures[1]["outbounds"][0]["streamSettings"].clone();
+    value["outbounds"][0]["mux"] = json!({"enabled":true,"concurrency":8,"xudpConcurrency":16});
+    value["routing"]["rules"][1]["inboundTag"] = json!(["fixture-dns-b", "fixture-http"]);
+    let native = profile(&value);
+    let graph = validate_profile(&native).unwrap();
+    let runtime = plan()
+        .bind_resources(&graph, &SyntheticBindings)
+        .unwrap()
+        .with_local_http(10810.try_into().unwrap())
+        .unwrap()
+        .map_ingress("fixture-socks", OwnedIngress::Local)
+        .unwrap()
+        .map_ingress("fixture-http", OwnedIngress::LocalHttp)
+        .unwrap();
+    ProfileIntent::from_profile(&native)
+        .unwrap()
+        .validate_ingress_mapping(&runtime)
+        .unwrap();
+    let compiled = compile_profile_local(&native, &runtime).unwrap();
+    assert_eq!(compiled.local_http_port().unwrap().get(), 10810);
+    let config = emitted(&compiled);
+    let inbounds = config["inbounds"].as_array().unwrap();
+    assert_eq!(inbounds.len(), 3);
+    for (index, port, protocol, tag) in [
+        (0, 10808, "socks", "yonik-owned-local"),
+        (1, 10809, "socks", "yonik-owned-probe"),
+        (2, 10810, "http", "yonik-owned-http"),
+    ] {
+        assert_eq!(inbounds[index]["listen"], "127.0.0.1");
+        assert_eq!(inbounds[index]["port"], port);
+        assert_eq!(inbounds[index]["protocol"], protocol);
+        assert_eq!(inbounds[index]["tag"], tag);
+        assert_eq!(
+            inbounds[index]["sniffing"],
+            value["inbounds"][0]["sniffing"]
+        );
+    }
+    assert_eq!(inbounds[0]["settings"]["udp"], true);
+    assert_eq!(inbounds[1]["settings"]["auth"], "password");
+    assert_eq!(
+        config["routing"]["rules"][2]["inboundTag"],
+        json!(["yonik-owned-local", "yonik-owned-http", "yonik-owned-probe"])
+    );
+    assert_eq!(config["routing"]["rules"][2]["port"], "53");
+    assert_eq!(
+        config["routing"]["rules"][1]["inboundTag"],
+        json!(["fixture-dns-b", "yonik-owned-http"])
+    );
+    assert_eq!(config["outbounds"], value["outbounds"]);
+    assert_eq!(config["dns"]["hosts"], value["dns"]["hosts"]);
+}
+
+#[test]
+fn local_dual_ingress_rejects_conflicting_ports_and_unowned_aliases() {
+    for occupied in [10808, 10809] {
+        assert!(matches!(
+            plan().with_local_http(occupied.try_into().unwrap()),
+            Err(ProfileCompileError::Ownership)
+        ));
+    }
+    let value = provider_shape(profiles().remove(3));
+    let native = profile(&value);
+    let graph = validate_profile(&native).unwrap();
+    assert!(matches!(
+        plan().map_ingress("fixture-http", OwnedIngress::LocalHttp),
+        Err(ProfileCompileError::Ownership)
+    ));
+    for (socks, http) in [
+        (OwnedIngress::LocalHttp, OwnedIngress::Local),
+        (OwnedIngress::Local, OwnedIngress::Local),
+    ] {
+        let runtime = plan()
+            .bind_resources(&graph, &SyntheticBindings)
+            .unwrap()
+            .with_local_http(10810.try_into().unwrap())
+            .unwrap()
+            .map_ingress("fixture-socks", socks)
+            .unwrap()
+            .map_ingress("fixture-http", http)
+            .unwrap();
+        assert!(matches!(
+            ProfileIntent::from_profile(&native)
+                .unwrap()
+                .validate_ingress_mapping(&runtime),
+            Err(ProfileCompileError::Ownership)
+        ));
+        assert!(matches!(
+            compile_profile_local(&native, &runtime),
+            Err(ProfileCompileError::Ownership)
+        ));
+    }
+    let mut conflicting = value;
+    conflicting["outbounds"][0]["settings"]["servers"][0]["address"] = json!("127.0.0.1");
+    conflicting["outbounds"][0]["settings"]["servers"][0]["port"] = json!(10810);
+    let runtime = plan()
+        .bind_resources(&graph, &SyntheticBindings)
+        .unwrap()
+        .with_local_http(10810.try_into().unwrap())
+        .unwrap()
+        .map_ingress("fixture-socks", OwnedIngress::Local)
+        .unwrap()
+        .map_ingress("fixture-http", OwnedIngress::LocalHttp)
+        .unwrap();
+    assert!(matches!(
+        compile_profile_local(&profile(&conflicting), &runtime),
+        Err(ProfileCompileError::Ownership)
+    ));
+}
+
+#[test]
+fn france_ss2022_keeps_full_provider_graph_through_intent_and_compile() {
+    let source = include_str!("../../../tests/fixtures/xray-full-profile-france-synthetic.json");
+    let mut original: Vec<Value> = serde_json::from_str(source).unwrap();
+    let mut expected = original.remove(0);
+    let report = import_profiles(source.as_bytes().to_vec()).expect("Импорт массива France");
+    let [ProfileEntry::Xray(profile)] = report.entries.as_slice() else {
+        panic!("Ожидался один профиль Xray");
+    };
+    assert_eq!(profile.ordinal(), 0);
+    let graph = validate_profile(profile).expect("Валидация исходного France");
+    let intent = ProfileIntent::from_profile(profile).expect("Типизация исходного France");
+    let mut wire = Vec::new();
+    intent.write_sensitive(&mut wire).unwrap();
+    let envelope: Value = serde_json::from_slice(&wire).unwrap();
+    expected.as_object_mut().unwrap().remove("remarks");
+    assert_eq!(envelope["graph"], expected);
+    let decoded = ProfileIntent::decode(std::str::from_utf8(&wire).unwrap())
+        .expect("Декодирование и повторная валидация France");
+    let mut roundtrip = Vec::new();
+    decoded.write_sensitive(&mut roundtrip).unwrap();
+    assert_eq!(roundtrip, wire);
+
+    assert_eq!(graph.subjects(), ["edge", "direct", "block", "dns-out"]);
+    // Эти имена обозначают внутренний DNS ingress и сохраняются в правилах.
+    assert_eq!(
+        graph
+            .egress()
+            .resolvers()
+            .iter()
+            .map(|r| r.subject())
+            .collect::<Vec<_>>(),
+        [Some("dns-via-edge"), Some("dns-via-direct")]
+    );
+    assert_eq!(graph.egress().system_resolvers().len(), 1);
+    assert_eq!(graph.egress().system_resolvers()[0].subject(), None);
+    assert_eq!(
+        decoded
+            .branch_mask("edge", WireNetwork::Tcp, Some(443))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        decoded
+            .branch_mask("edge", WireNetwork::Udp, Some(443))
+            .unwrap(),
+        2
+    );
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    intent
+        .write_transport_sensitive("edge", &mut before)
+        .unwrap();
+    decoded
+        .write_transport_sensitive("edge", &mut after)
+        .unwrap();
+    assert_eq!(before, after);
+
+    for system in [false, true] {
+        let plan = bound_plan(&graph, system);
+        decoded.validate_ingress_mapping(&plan).unwrap();
+        let (config, owned_tag) = if system {
+            (
+                emitted(
+                    decoded
+                        .compile_system(&plan)
+                        .expect("Компиляция System")
+                        .config(),
+                ),
+                "system-tun",
+            )
+        } else {
+            (
+                emitted(&decoded.compile_local(&plan).expect("Компиляция Local")),
+                "yonik-owned-local",
+            )
+        };
+        assert_eq!(config["dns"], expected["dns"]);
+        let mut routing = expected["routing"].clone();
+        routing["rules"][2]["inboundTag"] = json!([owned_tag, "yonik-owned-probe"]);
+        assert_eq!(config["routing"], routing);
+
+        let mut outbounds = expected["outbounds"].clone();
+        if system {
+            for outbound in outbounds.as_array_mut().unwrap() {
+                if outbound["protocol"] != "blackhole" {
+                    outbound["streamSettings"]["sockopt"]["mark"] = json!(42);
+                }
+            }
+        }
+        assert_eq!(config["outbounds"], outbounds);
+        for tag in [owned_tag, "yonik-owned-probe"] {
+            let inbound = config["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|inbound| inbound["tag"] == tag)
+                .unwrap();
+            assert_eq!(inbound["sniffing"], expected["inbounds"][0]["sniffing"]);
+        }
+    }
+}

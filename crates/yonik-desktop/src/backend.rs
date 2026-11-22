@@ -286,6 +286,8 @@ enum Command {
     },
     PresetActivate {
         enabled: bool,
+        #[serde(default)]
+        builtin: bool,
         expected_revision: i64,
         request_id: u64,
     },
@@ -359,6 +361,11 @@ enum Command {
         expected_revision: i64,
         request_id: u64,
         action: String,
+    },
+    RoutingLocalVpn {
+        expected_revision: i64,
+        request_id: u64,
+        enabled: bool,
     },
     RoutingDelete {
         expected_revision: i64,
@@ -539,6 +546,7 @@ impl Command {
             | Self::EditRouting { request_id, .. }
             | Self::RoutingOrder { request_id, .. }
             | Self::RoutingDefault { request_id, .. }
+            | Self::RoutingLocalVpn { request_id, .. }
             | Self::RoutingDelete { request_id, .. } => Some(*request_id),
             _ => None,
         }
@@ -549,6 +557,7 @@ impl Command {
             Self::EditRouting { .. }
                 | Self::RoutingOrder { .. }
                 | Self::RoutingDefault { .. }
+                | Self::RoutingLocalVpn { .. }
                 | Self::RoutingDelete { .. }
                 | Self::SelectProfile { .. }
                 | Self::SelectCatalog { .. }
@@ -710,6 +719,124 @@ mod engine_availability_tests {
 enum ConnectionMode {
     Local,
     System,
+}
+
+// Только LocalSocks имеет доказанное software lowering transport, без process authority.
+fn unsupported_connect_policy(policy: &yonik_domain::Policy, mode: ConnectionMode) -> Option<u64> {
+    policy.unsupported_selector().or_else(|| {
+        if mode == ConnectionMode::System {
+            policy.unsupported_transport()
+        } else {
+            policy
+                .user_rules
+                .iter()
+                .chain(&policy.preset_rules)
+                .find(|rule| rule.enabled && !rule.conditions.executables.is_empty())
+                .map(|rule| rule.id)
+        }
+    })
+}
+
+/// Единственный compiler selection Local Connect; generic compile здесь недопустим.
+fn compile_local_connect(
+    server: &yonik_import::ParsedServer,
+    engine: Engine,
+    port: NonZeroU16,
+    probe_port: NonZeroU16,
+    policy: &yonik_domain::Policy,
+) -> Result<SessionConfig> {
+    if unsupported_connect_policy(policy, ConnectionMode::Local).is_some() {
+        return Err(DesktopError("unsupported_option"));
+    }
+    let mode = local_policy_mode(policy);
+    match yonik_engine::compile_policy(server, engine, port, probe_port, policy, mode) {
+        Ok(config) => Ok(SessionConfig::Server(config)),
+        Err(yonik_engine::PolicyCompileError::Server(
+            yonik_engine::CompileError::UnsupportedOption,
+        )) if engine == Engine::Xray => yonik_engine::PendingXrayRealityH2::compile_policy(
+            server, port, probe_port, policy, mode,
+        )
+        .map(SessionConfig::ServerRealityH2)
+        .map_err(|_| DesktopError("engine_config")),
+        Err(_) => Err(DesktopError("engine_config")),
+    }
+}
+
+fn local_policy_mode(policy: &yonik_domain::Policy) -> yonik_engine::PolicyMode {
+    let enabled = || {
+        policy
+            .user_rules
+            .iter()
+            .chain(&policy.preset_rules)
+            .filter(|rule| rule.enabled)
+    };
+    let has_names = enabled().any(|rule| !rule.conditions.domains.is_empty());
+    let has_ip_bypass = enabled().any(|rule| {
+        rule.action == yonik_domain::Action::Direct && !rule.conditions.destinations.is_empty()
+    });
+    let needs_resolved_ip = enabled().any(|rule| {
+        rule.action != yonik_domain::Action::Direct && !rule.conditions.destinations.is_empty()
+    });
+    if has_names || has_ip_bypass && !needs_resolved_ip {
+        yonik_engine::PolicyMode::Observed
+    } else {
+        yonik_engine::PolicyMode::IpOnly
+    }
+}
+
+fn add_local_vpn_routes(
+    policy: &mut yonik_domain::Policy,
+    prefixes: Vec<yonik_linux::IpPrefix>,
+) -> Result<()> {
+    if prefixes.is_empty() {
+        return Ok(());
+    }
+    let destinations = prefixes
+        .into_iter()
+        .map(|prefix| format!("{}/{}", prefix.address, prefix.length).parse())
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|_| DesktopError("routing_vpn_topology"))?;
+    policy.preset_rules.push(yonik_domain::Rule {
+        id: 3,
+        enabled: true,
+        conditions: yonik_domain::Conditions {
+            destinations,
+            ..Default::default()
+        },
+        action: yonik_domain::Action::Direct,
+    });
+    Ok(())
+}
+
+fn persisted_local_draft(
+    stored: Option<(i64, Zeroizing<Vec<u8>>)>,
+    expected_revision: Option<i64>,
+    current: &crate::editor::Draft,
+) -> Result<crate::editor::Draft> {
+    let (revision, draft) = match stored {
+        Some((revision, raw)) => (
+            revision,
+            crate::editor::Draft::parse(
+                std::str::from_utf8(&raw).map_err(|_| DesktopError("routing_storage"))?,
+            )
+            .map_err(|_| DesktopError("routing_storage"))?,
+        ),
+        None => (0, crate::editor::Draft::default()),
+    };
+    if expected_revision != Some(revision) || draft.json() != current.json() {
+        return Err(DesktopError("routing_stale"));
+    }
+    Ok(draft)
+}
+
+fn available_probe_port(listen: NonZeroU16) -> Result<NonZeroU16> {
+    for _ in 0..16 {
+        let probe = available_port(0)?;
+        if probe != listen {
+            return Ok(probe);
+        }
+    }
+    Err(DesktopError("listen_port_busy"))
 }
 
 struct Envelope {
@@ -1264,10 +1391,20 @@ mod full_profile_review_tests {
             include_bytes!("../../../tests/fixtures/xray-full-profile-seven.json").to_vec(),
         )
         .unwrap();
-        for entry in report.entries {
-            for mode in [super::ConnectionMode::Local, super::ConnectionMode::System] {
-                assert!(!super::native_subset_plannable(&entry, mode));
-            }
+        assert_eq!(report.entries.len(), 7);
+        for mode in [super::ConnectionMode::Local, super::ConnectionMode::System] {
+            let plannable = report
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    let yonik_import::ProfileEntry::Xray(profile) = entry else {
+                        panic!("Ожидался полный профиль Xray");
+                    };
+                    super::native_subset_plannable(entry, mode).then_some(profile.name())
+                })
+                .collect::<Vec<_>>();
+            // FranceSS достигает независимой проверки exact image для TCP и UDP.
+            assert_eq!(plannable, ["FranceSS"]);
         }
     }
     #[test]
@@ -1327,6 +1464,7 @@ enum RoutingMutation {
     Order(Vec<u64>),
     Delete(u64),
     Default(String),
+    LocalVpn(bool),
 }
 #[derive(Serialize)]
 struct Snapshot {
@@ -1748,6 +1886,65 @@ fn available_port(requested: u16) -> Result<NonZeroU16> {
     Err(DesktopError("listen_port_busy"))
 }
 
+fn available_distinct_local_port(
+    excluded: &[NonZeroU16],
+    mut candidate: impl FnMut() -> Result<NonZeroU16>,
+) -> Result<NonZeroU16> {
+    for _ in 0..16 {
+        let port = candidate()?;
+        if !excluded.contains(&port) {
+            return Ok(port);
+        }
+    }
+    Err(DesktopError("listen_port_busy"))
+}
+
+fn native_local_runtime_plan(
+    intent: &yonik_engine::native_profile::ProfileIntent,
+    port: NonZeroU16,
+    mut candidate: impl FnMut() -> Result<NonZeroU16>,
+) -> Result<yonik_engine::native_profile::OwnedRuntimePlan> {
+    use yonik_engine::native_profile::{OwnedIngress, OwnedRuntimePlan, ProviderIngressProtocol};
+
+    let graph = intent
+        .validate()
+        .map_err(|_| DesktopError("engine_config"))?;
+    let ingresses = graph.ingresses();
+    let has_http = ingresses
+        .iter()
+        .any(|ingress| ingress.protocol() == ProviderIngressProtocol::Http);
+    if has_http
+        && (ingresses.len() != 2
+            || !ingresses
+                .iter()
+                .any(|ingress| ingress.protocol() == ProviderIngressProtocol::Socks))
+    {
+        return Err(DesktopError("engine_config"));
+    }
+    let probe = if has_http {
+        available_distinct_local_port(&[port], &mut candidate)?
+    } else {
+        candidate()?
+    };
+    let mut plan = OwnedRuntimePlan::new(port, probe).map_err(|_| DesktopError("engine_config"))?;
+    if has_http {
+        let http = available_distinct_local_port(&[port, probe], candidate)?;
+        plan = plan
+            .with_local_http(http)
+            .map_err(|_| DesktopError("engine_config"))?;
+    }
+    for ingress in ingresses {
+        let owned = match ingress.protocol() {
+            ProviderIngressProtocol::Socks => OwnedIngress::Local,
+            ProviderIngressProtocol::Http => OwnedIngress::LocalHttp,
+        };
+        plan = plan
+            .map_ingress(ingress.tag(), owned)
+            .map_err(|_| DesktopError("engine_config"))?;
+    }
+    Ok(plan)
+}
+
 #[derive(Debug)]
 struct ContextFailure {
     error: DesktopError,
@@ -1951,6 +2148,12 @@ impl Actor {
     fn preset_policy(&self, draft: &crate::editor::Draft) -> Result<yonik_domain::Policy> {
         let base = draft.base_policy().map_err(DesktopError)?;
         match &draft.ru_direct {
+            Some(reference)
+                if reference.enabled && reference.snapshot == presets::BUILTIN_SNAPSHOT =>
+            {
+                presets::builtin_policy(base)
+                    .map_err(|error| DesktopError(presets::store_error(error)))
+            }
             Some(reference) if reference.enabled => self
                 .presets
                 .as_ref()
@@ -2010,14 +2213,77 @@ impl Actor {
         Ok(())
     }
 
+    fn local_only_routing(&self) -> bool {
+        self.state.routing.local_vpn_direct
+            || self
+                .state
+                .routing
+                .ru_direct
+                .as_ref()
+                .is_some_and(|preset| preset.enabled)
+    }
+
     fn current_inline_policy(&self) -> Result<(yonik_linux::system_policy::InlinePolicy, i64)> {
         let revision = self
             .routing_revision
             .ok_or(DesktopError("routing_storage"))?;
+        if self.local_only_routing() {
+            return Err(DesktopError("routing_local_only"));
+        }
         let policy = self.state.routing.policy().map_err(DesktopError)?;
         let inline = inline_policy_conversion::inline_policy(&policy)
             .map_err(|_| DesktopError("system_unsupported"))?;
         Ok((inline, revision))
+    }
+
+    async fn local_connect_config(&self) -> Result<(SessionConfig, NonZeroU16)> {
+        let selected = self
+            .selected
+            .as_ref()
+            .ok_or(DesktopError("profile_required"))?;
+        let fresh = self
+            .service()
+            .select_profile(selected.profile.id, selected.snapshot_revision)
+            .await
+            .map_err(|_| DesktopError("profile_unavailable"))?;
+        if self.state.selected_profile != Some(fresh.profile.id)
+            || self.state.source_id != Some(fresh.profile.source_id)
+            || self.state.revision != fresh.snapshot_revision
+            || self.state.source_generation != Some(fresh.source_generation)
+            || selected.source_generation != fresh.source_generation
+            || self
+                .service()
+                .schedule_generation(fresh.profile.source_id)
+                .await
+                .map_err(|_| DesktopError("profile_unavailable"))?
+                != Some(fresh.source_generation)
+        {
+            return Err(DesktopError("routing_stale"));
+        }
+        let stored = self
+            .routing_repository()
+            .routing_draft()
+            .await
+            .map_err(|_| DesktopError("routing_storage"))?;
+        let draft = persisted_local_draft(stored, self.routing_revision, &self.state.routing)?;
+        let port = NonZeroU16::new(self.state.port).ok_or(DesktopError("engine_config"))?;
+        let mut policy = self.preset_policy(&draft)?;
+        if draft.local_vpn_direct {
+            let (_keep, mut cancel) = Cancellation::new();
+            let prefixes =
+                yonik_linux::local_vpn_split_cidrs(&mut cancel, std::time::Duration::from_secs(2))
+                    .await
+                    .map_err(|_| DesktopError("routing_vpn_topology"))?;
+            add_local_vpn_routes(&mut policy, prefixes)?;
+        }
+        compile_local_connect(
+            &fresh.server,
+            self.state.engine.engine(),
+            port,
+            available_probe_port(port)?,
+            &policy,
+        )
+        .map(|config| (config, port))
     }
 
     async fn save_routing(
@@ -2136,6 +2402,7 @@ impl Actor {
                     candidate.rules.remove(index);
                 }
                 RoutingMutation::Default(action) => candidate.default_action = action,
+                RoutingMutation::LocalVpn(enabled) => candidate.local_vpn_direct = enabled,
             }
             self.save_routing(candidate, request_id).await
         }
@@ -2343,7 +2610,12 @@ impl Actor {
             && !self.state.can_stop
             && !self.state.system_busy
             && !self.state.busy
-            && self.state.pending.is_none();
+            && self.state.pending.is_none()
+            && (!self.local_only_routing()
+                || self.state.connection_mode == ConnectionMode::Local && self.selected.is_some())
+            && self.state.routing.base_policy().is_ok_and(|policy| {
+                unsupported_connect_policy(&policy, self.state.connection_mode).is_none()
+            });
         self.state.emit(&self.callback);
     }
     async fn native_connect_preflight(
@@ -2366,6 +2638,9 @@ impl Actor {
         }
         if self.pending.is_some() || self.state.pending.is_some() {
             return Err(DesktopError("review_required").into());
+        }
+        if self.local_only_routing() {
+            return Err(DesktopError("routing_local_only").into());
         }
         let intent = self.native_connect_intent(control, generation).await?;
         let mode = match self.state.connection_mode {
@@ -2880,6 +3155,7 @@ impl Actor {
         match command {
             Command::PresetActivate {
                 enabled,
+                builtin,
                 expected_revision,
                 request_id,
             } => {
@@ -2893,16 +3169,21 @@ impl Actor {
                     }
                     let mut candidate = self.state.routing.clone();
                     if enabled {
-                        let snapshot = self
-                            .presets
-                            .as_ref()
-                            .ok_or(DesktopError("storage"))?
-                            .reference()
-                            .map_err(|_| DesktopError("storage"))?;
+                        let snapshot = if builtin {
+                            presets::BUILTIN_SNAPSHOT.to_owned()
+                        } else {
+                            self.presets
+                                .as_ref()
+                                .ok_or(DesktopError("storage"))?
+                                .reference()
+                                .map_err(|_| DesktopError("storage"))?
+                        };
                         candidate.ru_direct =
                             Some(crate::editor::PresetReference { snapshot, enabled });
                     } else if let Some(reference) = &mut candidate.ru_direct {
-                        reference.enabled = false;
+                        if (reference.snapshot == presets::BUILTIN_SNAPSHOT) == builtin {
+                            reference.enabled = false;
+                        }
                     }
                     self.save_routing(candidate, request_id).await
                 }
@@ -3210,6 +3491,18 @@ impl Actor {
             } => {
                 self.mutate_routing(expected_revision, request_id, RoutingMutation::Delete(id))
                     .await
+            }
+            Command::RoutingLocalVpn {
+                expected_revision,
+                request_id,
+                enabled,
+            } => {
+                self.mutate_routing(
+                    expected_revision,
+                    request_id,
+                    RoutingMutation::LocalVpn(enabled),
+                )
+                .await
             }
             Command::RoutingDefault {
                 expected_revision,
@@ -4418,8 +4711,10 @@ struct TcpRunning {
 
 enum SessionConfig {
     Server(yonik_engine::CompiledConfig),
+    ServerRealityH2(yonik_engine::PendingXrayRealityH2),
     FullProfile(Box<NativeSessionConfig>),
 }
+
 struct NativeSessionConfig {
     intent: yonik_engine::native_profile::ProfileIntent,
     plan: yonik_engine::native_profile::OwnedRuntimePlan,
@@ -4460,7 +4755,7 @@ async fn session(
     }
     let native_image = match &mut config {
         SessionConfig::FullProfile(native) => native.image.take(),
-        SessionConfig::Server(_) => None,
+        SessionConfig::Server(_) | SessionConfig::ServerRealityH2(_) => None,
     };
     let Ok(session) = LocalSession::new() else {
         let _ = updates
@@ -4495,7 +4790,11 @@ async fn session(
         cancel.check().map_err(|_| "cancelled")?;
         let path = engine_dir.join(relative);
         let native = matches!(config, SessionConfig::FullProfile(..));
+        let reality_h2 = matches!(config, SessionConfig::ServerRealityH2(..));
         let binary = if native { native_image.ok_or("profile_unavailable")? } else {tokio::task::spawn_blocking(move || {
+            if reality_h2 {
+                return BinarySnapshot::load_xray_reality_h2(&engine_dir);
+            }
             BinarySnapshot::load(
                 &path,
                 digest.parse().map_err(|_| HostError::BinaryHash)?,
@@ -4508,6 +4807,7 @@ async fn session(
         cancel.check().map_err(|_| "cancelled")?;
         let checked = match config {
             SessionConfig::Server(config) => CheckedConfig::validate(binary, config, &mut cancel).await,
+            SessionConfig::ServerRealityH2(config) => CheckedConfig::validate_xray_reality_h2(binary, config, &mut cancel).await,
             SessionConfig::FullProfile(native) => CheckedConfig::validate_full_profile(binary, native.intent, native.plan, &mut cancel).await,
         }
             .map_err(|e| {
@@ -5849,11 +6149,7 @@ async fn run(
                                     } else {
                                         match actor.prepare_port().and_then(|()| {
                                             let port = NonZeroU16::new(actor.state.port).ok_or(DesktopError("invalid_input"))?;
-                                            let probe = available_port(0)?;
-                                            let graph = intent.validate().map_err(|_| DesktopError("engine_config"))?;
-                                            let mut plan = yonik_engine::native_profile::OwnedRuntimePlan::new(port, probe).map_err(|_| DesktopError("engine_config"))?;
-                                            for ingress in graph.ingresses() { plan = plan.map_ingress(ingress.tag(), yonik_engine::native_profile::OwnedIngress::Local).map_err(|_| DesktopError("engine_config"))?; }
-                                            Ok(plan)
+                                            native_local_runtime_plan(&intent, port, || available_port(0))
                                         }).and_then(|plan| actor.probe_target().map(|target| (plan, target))) {
                                             Err(error) => Err(error.into()),
                                             Ok((plan, target)) => {
@@ -6077,8 +6373,6 @@ async fn run(
                         }
                     }
                     Command::Connect if actor.routing_revision.is_none() => Err(DesktopError("routing_storage").into()),
-                    Command::Connect if actor.state.routing.policy().is_err() => Err(DesktopError("routing_storage").into()),
-                    Command::Connect if actor.state.routing.policy().ok().and_then(|p| p.unsupported_selector().or_else(|| p.unsupported_transport())).is_some() => Err(DesktopError("unsupported_option").into()),
                     command @ (Command::Connect | Command::RoutingApply { .. }) if actor.state.connection_mode == ConnectionMode::System => {
                         let request_id = if let Command::RoutingApply { request_id, .. } = &command { Some(*request_id) } else { None };
                         if let Err(error) = actor.check_routing_apply(&command).await { Err(error.into()) }
@@ -6118,20 +6412,21 @@ async fn run(
                         else if let Some(profile) = actor.selected.as_ref() {
                             if actor.pending.is_some() { Err(DesktopError("review_required").into()) }
                             else {
-                                match (NonZeroU16::new(actor.state.port).and_then(|port| yonik_engine::compile(&profile.server, actor.state.engine.engine(), port).ok()), actor.probe_target()) {
-                                    (Some(compiled), Ok(target)) => {
+                                let Some(compiled) = await_current_schedule(actor.local_connect_config(), &control.generation, envelope.generation).await else { continue; };
+                                match (compiled, actor.probe_target()) {
+                                    (Ok((compiled, listen_port)), Ok(target)) => {
                                         let (cancel, receiver) = Cancellation::new();
-                                        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, compiled.listen_port().get()));
+                                        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, listen_port.get()));
                                         session_generation = session_generation.saturating_add(1); actor.state.error_generation = session_generation;
                                         #[cfg(feature = "test-support")]
                                         let receiver = if let Some(gate) = config.lifecycle_gate.clone() { receiver.with_lifecycle_gate(gate, session_generation) } else { receiver };
-                                        let task = tokio::spawn(session(SessionConfig::Server(compiled), config.engine_dir.clone(), actor.state.engine.engine(), target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
+                                        let task = tokio::spawn(session(compiled, config.engine_dir.clone(), actor.state.engine.engine(), target, receiver, (updates.clone(), actor.event_log.clone(), session_generation), network.clone(), #[cfg(feature = "test-support")] config.cleanup_fault.clone()));
                                         running = Some(Running { lease: (session_generation, endpoint), cancel, task }); actor.state.can_stop = true;
                                         actor.state.active_name = Some(profile.profile.name.clone()); actor.state.active_engine = Some(actor.state.engine);
                                         actor.state.probe_result = None; actor.state.status = "Preparing"; Ok(())
                                     }
                                     (_, Err(error)) => Err(error.into()),
-                                    _ => Err(DesktopError("engine_config").into()),
+                                    (Err(error), _) => Err(error.into()),
                                 }
                             }
                         } else { Err(DesktopError("profile_required").into()) }
@@ -6926,6 +7221,121 @@ mod routing_regressions {
             let command: Command = serde_json::from_value(command).expect("command");
             assert!(super::validate(&command).is_err());
         }
+    }
+    #[tokio::test]
+    async fn local_vpn_toggle_is_global_and_revision_checked() {
+        let (mut actor, lock, path) = fixture().await;
+        assert!(!actor.state.routing.local_vpn_direct);
+        send(
+            &mut actor,
+            serde_json::json!({"command":"routing_local_vpn","enabled":true,
+                "expected_revision":0,"request_id":1}),
+        )
+        .await
+        .expect("сохранить пресет");
+        let (_, raw) = actor
+            .routing_repository()
+            .routing_draft()
+            .await
+            .expect("хранилище")
+            .expect("черновик");
+        let saved = crate::editor::Draft::parse(std::str::from_utf8(&raw).expect("UTF-8"))
+            .expect("черновик");
+        assert!(saved.local_vpn_direct);
+        assert_eq!(
+            actor
+                .current_inline_policy()
+                .err()
+                .expect("System недоступен")
+                .0,
+            "routing_local_only"
+        );
+        assert!(
+            send(
+                &mut actor,
+                serde_json::json!({"command":"routing_local_vpn","enabled":false,
+                "expected_revision":0,"request_id":2}),
+            )
+            .await
+            .is_err()
+        );
+        assert!(actor.state.routing.local_vpn_direct);
+        drop(actor);
+        drop(lock);
+        std::fs::remove_dir_all(path).expect("fixture");
+    }
+    #[tokio::test]
+    async fn builtin_ru_direct_activates_without_a_custom_snapshot() {
+        let (mut actor, lock, path) = fixture().await;
+        actor.presets = None;
+        send(
+            &mut actor,
+            serde_json::json!({"command":"preset_activate","enabled":true,"builtin":true,
+                "expected_revision":0,"request_id":1}),
+        )
+        .await
+        .expect("включение встроенного источника");
+        let policy = actor.preset_policy(&actor.state.routing).expect("политика");
+        assert_eq!(policy.preset_rules.len(), 2);
+        assert!(inline_policy_conversion::inline_policy(&policy).is_ok());
+        let domain = "api.gosuslugi.ru".parse().expect("домен");
+        assert!(
+            policy.preset_rules[0]
+                .conditions
+                .domains
+                .iter()
+                .any(|rule| rule.matches(&domain))
+        );
+        for (address, expected) in [
+            ("5.45.192.1", yonik_domain::Route::Direct),
+            ("2001:67c:28bc::1", yonik_domain::Route::Direct),
+            ("8.8.8.8", yonik_domain::Route::Proxy),
+        ] {
+            let decision = policy.evaluate(&yonik_domain::Flow {
+                executable: None,
+                destination: address.parse().expect("IP-адрес"),
+            });
+            assert_eq!(decision.action, expected);
+        }
+        let profile = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@127.0.0.1:24443".to_vec(),
+        )
+        .expect("профиль");
+        for engine in [yonik_engine::Engine::Xray, yonik_engine::Engine::SingBox] {
+            let config = super::compile_local_connect(
+                &profile.servers[0],
+                engine,
+                std::num::NonZeroU16::new(10808).expect("порт"),
+                std::num::NonZeroU16::new(10809).expect("порт проверки"),
+                &policy,
+            )
+            .expect("маршрутизация пресета в режиме Local");
+            let super::SessionConfig::Server(config) = config else {
+                panic!("ожидается обычная конфигурация");
+            };
+            let mut bytes = Vec::new();
+            config.write_sensitive(&mut bytes).expect("конфигурация");
+            let config = std::str::from_utf8(&bytes).expect("UTF-8");
+            assert!(config.contains("gosuslugi.ru"));
+            assert!(config.contains("5.45.192.0/"));
+        }
+        send(
+            &mut actor,
+            serde_json::json!({"command":"preset_activate","enabled":false,"builtin":true,
+                "expected_revision":1,"request_id":2}),
+        )
+        .await
+        .expect("выключение встроенного источника");
+        assert!(
+            actor
+                .preset_policy(&actor.state.routing)
+                .expect("политика")
+                .preset_rules
+                .is_empty()
+        );
+        drop(actor);
+        drop(lock);
+        std::fs::remove_dir_all(path).expect("fixture");
     }
     #[tokio::test]
     async fn preset_activation_is_revision_checked_and_preserves_user_rules() {
@@ -8354,3 +8764,307 @@ mod probe_context_tests {
 #[cfg(all(test, feature = "test-support"))]
 #[path = "disk_host_acceptance.rs"]
 mod disk_host_acceptance;
+
+#[cfg(test)]
+mod p07_local_transport_tests {
+    use super::{ConnectionMode, unsupported_connect_policy};
+    use yonik_domain::{Action, Conditions, Policy, Rule, TransportConditions};
+    #[test]
+    fn connect_gate_разделяет_local_и_system() {
+        let mut policy = Policy::default();
+        policy.user_rules.push(Rule {
+            id: 71,
+            enabled: true,
+            action: Action::Block,
+            conditions: Conditions {
+                transport: TransportConditions::parse(Some(&["udp"]), None).unwrap(),
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            unsupported_connect_policy(&policy, ConnectionMode::Local),
+            None
+        );
+        assert_eq!(
+            unsupported_connect_policy(&policy, ConnectionMode::System),
+            Some(71)
+        );
+        policy.user_rules[0]
+            .conditions
+            .executables
+            .push("/usr/bin/app".into());
+        assert_eq!(
+            unsupported_connect_policy(&policy, ConnectionMode::Local),
+            Some(71)
+        );
+        assert!(super::inline_policy_conversion::inline_policy(&policy).is_err());
+        policy.user_rules[0].enabled = false;
+        assert_eq!(
+            unsupported_connect_policy(&policy, ConnectionMode::Local),
+            None
+        );
+        assert_eq!(
+            unsupported_connect_policy(&policy, ConnectionMode::System),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod p07_connect_compiler_tests {
+    use super::compile_local_connect;
+    use serde_json::{Value, json};
+    use std::num::NonZeroU16;
+    use yonik_engine::Engine;
+
+    fn draft() -> crate::editor::Draft {
+        crate::editor::Draft::parse(&json!({"version":3,"default_action":"direct","rules":[{
+            "id":71,"enabled":true,"action":"block","executables":[],"domains":[],"destinations":[],"platform_sources":[],
+            "transport":{"transport_protocols":["udp"],"destination_ports":[[53,53],[8000,8010]]}
+        }]}).to_string()).unwrap()
+    }
+    fn compile(
+        engine: Engine,
+        draft: &crate::editor::Draft,
+        probe: u16,
+    ) -> super::Result<yonik_engine::CompiledConfig> {
+        let report = yonik_import::import_bytes(
+            b"vless://00112233-4455-6677-8899-aabbccddeeff@127.0.0.1:24443".to_vec(),
+        )
+        .unwrap();
+        let policy = draft
+            .policy()
+            .map_err(|_| super::DesktopError("unsupported_option"))?;
+        match compile_local_connect(
+            &report.servers[0],
+            engine,
+            NonZeroU16::new(10808).unwrap(),
+            NonZeroU16::new(probe).unwrap(),
+            &policy,
+        )? {
+            super::SessionConfig::Server(config) => Ok(config),
+            _ => panic!("Ожидался обычный конфиг сервера"),
+        }
+    }
+    fn value(config: &yonik_engine::CompiledConfig) -> Value {
+        let mut bytes = Vec::new();
+        config.write_sensitive(&mut bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    #[test]
+    fn connect_compiler_передаёт_udp_ports_block_и_private_probe_в_session_config() {
+        for engine in [Engine::Xray, Engine::SingBox] {
+            let config = compile(engine, &draft(), 10809).unwrap();
+            assert_eq!(config.listen_port().get(), 10808);
+            assert_eq!(config.probe_port().get(), 10809);
+            assert_eq!(config.probe_auth().unwrap().password().len(), 64);
+            let json = value(&config);
+            assert_eq!(json["inbounds"].as_array().unwrap().len(), 2);
+            let rules = &json[if engine == Engine::Xray {
+                "routing"
+            } else {
+                "route"
+            }]["rules"];
+            let rules = rules.as_array().unwrap();
+            let policy = &rules[rules.len() - 2];
+            if engine == Engine::Xray {
+                assert_eq!(policy["network"], "udp");
+                assert_eq!(policy["port"], "53,8000-8010");
+                assert_eq!(policy["outboundTag"], "block");
+                assert_eq!(rules[0]["inboundTag"], json!(["probe"]));
+                assert_eq!(rules.last().unwrap()["outboundTag"], "direct");
+            } else {
+                assert_eq!(policy["network"], json!(["udp"]));
+                assert_eq!(policy["port"], json!([53]));
+                assert_eq!(policy["port_range"], json!(["8000:8010"]));
+                assert_eq!(policy["action"], "reject");
+                assert_eq!(rules[0]["inbound"], json!(["probe"]));
+                assert_eq!(rules.last().unwrap()["outbound"], "direct");
+            }
+        }
+    }
+    #[test]
+    fn connect_compiler_не_делает_generic_или_inline_fallback() {
+        for engine in [Engine::Xray, Engine::SingBox] {
+            assert!(compile(engine, &draft(), 10808).is_err());
+            let mut draft = draft();
+            draft.ru_direct = Some(crate::editor::PresetReference {
+                snapshot: "a".repeat(64),
+                enabled: true,
+            });
+            assert_eq!(
+                compile(engine, &draft, 10809).unwrap_err().0,
+                "unsupported_option"
+            );
+            draft.ru_direct = None;
+            draft.rules[0].executables.push("/usr/bin/app".into());
+            assert_eq!(
+                compile(engine, &draft, 10809).unwrap_err().0,
+                "unsupported_option"
+            );
+            draft.rules[0].executables.clear();
+            draft.rules[0].domains.push("example.org".into());
+            let config = compile(engine, &draft, 10809).unwrap();
+            assert!(value(&config).to_string().contains("example.org"));
+            draft.rules[0].destinations.push("192.0.2.0/24".into());
+            assert!(compile(engine, &draft, 10809).is_err());
+        }
+    }
+    #[test]
+    fn явная_блокировка_важнее_пресета_vpn() {
+        let draft = crate::editor::Draft::parse(
+            &json!({
+                "version":1, "default_action":"proxy", "rules":[{
+                    "id":1, "enabled":true, "action":"block",
+                    "executables":[], "domains":[], "destinations":["10.10.0.1"]
+                }]
+            })
+            .to_string(),
+        )
+        .expect("черновик");
+        let mut policy = draft.base_policy().expect("политика");
+        super::add_local_vpn_routes(
+            &mut policy,
+            vec![yonik_linux::IpPrefix {
+                address: "10.10.0.0".parse().expect("адрес"),
+                length: 16,
+            }],
+        )
+        .expect("пресет");
+        assert_eq!(
+            super::local_policy_mode(&policy),
+            yonik_engine::PolicyMode::IpOnly
+        );
+        for (address, action) in [
+            ("10.10.0.1", yonik_domain::Route::Block),
+            ("10.10.0.2", yonik_domain::Route::Direct),
+            ("192.0.2.1", yonik_domain::Route::Proxy),
+        ] {
+            assert_eq!(
+                policy
+                    .evaluate(&yonik_domain::Flow {
+                        executable: None,
+                        destination: address.parse().expect("адрес"),
+                    })
+                    .action,
+                action
+            );
+        }
+        policy.user_rules.clear();
+        assert_eq!(
+            super::local_policy_mode(&policy),
+            yonik_engine::PolicyMode::Observed
+        );
+    }
+    #[test]
+    fn persisted_capture_требует_revision_и_точное_содержимое() {
+        let draft = draft();
+        let raw = super::Zeroizing::new(draft.json().into_bytes());
+        assert!(super::persisted_local_draft(Some((7, raw.clone())), Some(7), &draft).is_ok());
+        assert_eq!(
+            super::persisted_local_draft(Some((7, raw.clone())), Some(6), &draft)
+                .err()
+                .unwrap()
+                .0,
+            "routing_stale"
+        );
+        assert_eq!(
+            super::persisted_local_draft(None, Some(7), &draft)
+                .err()
+                .unwrap()
+                .0,
+            "routing_stale"
+        );
+        assert_eq!(
+            super::persisted_local_draft(
+                Some((7, super::Zeroizing::new(b"broken".to_vec()))),
+                Some(7),
+                &draft
+            )
+            .err()
+            .unwrap()
+            .0,
+            "routing_storage"
+        );
+        let mut changed = draft.clone();
+        changed.rules[0].enabled = false;
+        assert_eq!(
+            super::persisted_local_draft(Some((7, raw)), Some(7), &changed)
+                .err()
+                .unwrap()
+                .0,
+            "routing_stale"
+        );
+        let mut resource = draft;
+        resource.ru_direct = Some(crate::editor::PresetReference {
+            snapshot: "a".repeat(64),
+            enabled: true,
+        });
+        let captured = super::persisted_local_draft(
+            Some((8, super::Zeroizing::new(resource.json().into_bytes()))),
+            Some(8),
+            &resource,
+        )
+        .unwrap();
+        assert_eq!(
+            compile(Engine::SingBox, &captured, 10809).unwrap_err().0,
+            "unsupported_option"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_native_port_tests {
+    use super::*;
+    use yonik_engine::native_profile::{OwnedIngress, ProfileIntent};
+
+    #[test]
+    fn http_port_selection_skips_socks_and_probe() {
+        let excluded = [10808, 10809].map(|port| NonZeroU16::new(port).unwrap());
+        let mut candidates = [10808, 10809, 10810].into_iter();
+        let picked = available_distinct_local_port(&excluded, || {
+            Ok(NonZeroU16::new(candidates.next().unwrap()).unwrap())
+        });
+        assert_eq!(picked.unwrap().get(), 10810);
+        assert_eq!(
+            available_distinct_local_port(&excluded, || Ok(excluded[0]))
+                .unwrap_err()
+                .0,
+            "listen_port_busy"
+        );
+    }
+
+    #[test]
+    fn native_local_mapping_keeps_socks_and_http_separate() {
+        for dual in [false, true] {
+            let mut graph = serde_json::json!({
+                "inbounds":[{"tag":"socks","protocol":"socks","settings":{"udp":true}}],
+                "outbounds":[{"tag":"direct","protocol":"freedom"}]
+            });
+            if dual {
+                graph["inbounds"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"tag":"http","protocol":"http"}));
+            }
+            let intent =
+                ProfileIntent::decode(&serde_json::json!({"version":1,"graph":graph}).to_string())
+                    .unwrap();
+            let mut candidates = [10809, 10810].into_iter();
+            let plan = native_local_runtime_plan(&intent, 10808.try_into().unwrap(), || {
+                Ok(candidates.next().unwrap().try_into().unwrap())
+            })
+            .unwrap();
+            assert_eq!(plan.probe_port().get(), 10809);
+            assert_eq!(
+                plan.local_http_port().map(NonZeroU16::get),
+                dual.then_some(10810)
+            );
+            let mut expected = vec![("socks", OwnedIngress::Local)];
+            if dual {
+                expected.insert(0, ("http", OwnedIngress::LocalHttp));
+            }
+            assert_eq!(plan.ingress_mappings().collect::<Vec<_>>(), expected);
+        }
+    }
+}

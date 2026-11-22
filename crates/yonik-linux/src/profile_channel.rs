@@ -3313,6 +3313,33 @@ impl OwnedCapsule {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+    #[cfg(test)]
+    pub(crate) fn with_test_resolver_subject(
+        mut self,
+        digest: [u8; 32],
+        resolver: u16,
+        subject: u16,
+    ) -> Result<Self> {
+        // Стенд transport проверяет уже связанную wire-строку. Xray DNS ingress
+        // tag не задаёт такой outbound, поэтому эта запись создаётся отдельно.
+        let capsule = Capsule::decode(&self.bytes, &digest)?;
+        capsule.tables[0].row(subject)?;
+        let row = capsule.tables[4].row(resolver)?;
+        if row[0] != 1 || row[2..4] != NONE.to_be_bytes() {
+            return Err(Error::Reference);
+        }
+        let offset = row.as_ptr() as usize - self.bytes.as_ptr() as usize + 2;
+        put16(&mut self.bytes, offset, subject);
+        let mut hash = Sha256::new();
+        hash.update(b"YNKCAP-MANIFEST-v1\0");
+        hash.update(digest);
+        hash.update(&self.bytes[76..78]);
+        hash.update(&self.bytes[80..120]);
+        hash.update(&self.bytes[128..]);
+        self.bytes[..32].copy_from_slice(&hash.finalize());
+        Capsule::decode(&self.bytes, &digest)?;
+        Ok(self)
+    }
     pub(crate) fn build(
         intent: &yonik_engine::native_profile::ProfileIntent,
         plan: &yonik_engine::native_profile::OwnedRuntimePlan,
@@ -3371,7 +3398,9 @@ impl OwnedCapsule {
         admission_id: u64,
         retained_graph: Option<&yonik_engine::native_profile::ValidatedGraph>,
     ) -> Result<Self> {
-        use yonik_engine::native_profile::{OwnedIngress, ProviderIngressProtocol, WireNetwork};
+        use yonik_engine::native_profile::{
+            DnsIngressIdentity, OwnedIngress, ProviderIngressProtocol, WireNetwork,
+        };
         // До validate/typed graph/container allocation: один aggregate credit.
         let mut memory = crate::helper::memory::config_budget()
             .reserve(8 * 1024 * 1024)
@@ -3390,6 +3419,18 @@ impl OwnedCapsule {
         intent
             .validate_ingress_mapping(plan)
             .map_err(|_| Error::Reference)?;
+        let egress = graph.egress();
+        // Mapping 4 кодирует здесь только outbound subject index. Даже
+        // совпадающее имя DNS ingress не является ссылкой на этот subject.
+        if egress
+            .resolvers()
+            .iter()
+            .map(|r| r.dns_ingress())
+            .chain(egress.system_resolvers().iter().map(|r| r.dns_ingress()))
+            .any(|identity| matches!(identity, DnsIngressIdentity::Tagged(_)))
+        {
+            return Err(Error::Reference);
+        }
         let mode = if plan.is_system() {
             Mode::System
         } else {
@@ -3402,7 +3443,10 @@ impl OwnedCapsule {
                     .host()
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|ip| ip.is_loopback()))
-                && [plan.local_port().get(), plan.probe_port().get()].contains(&endpoint.port())
+                && ([plan.local_port().get(), plan.probe_port().get()].contains(&endpoint.port())
+                    || plan
+                        .local_http_port()
+                        .is_some_and(|port| port.get() == endpoint.port()))
             {
                 return Err(Error::Reference);
             }
@@ -3518,16 +3562,11 @@ impl OwnedCapsule {
                 t.push(8, row)?;
             }
         }
-        let subject_index = |name: Option<&str>| -> Result<u16> {
-            name.map_or(Ok(NONE), |n| {
-                indices.get(n).copied().ok_or(Error::Reference)
-            })
-        };
-        for resolver in graph.egress().resolvers() {
+        for resolver in egress.resolvers() {
             let endpoint = resolver.endpoint();
             let p = protocol(endpoint.protocol());
             let mut row = vec![1, p];
-            row.extend_from_slice(&subject_index(resolver.subject())?.to_be_bytes());
+            row.extend_from_slice(&NONE.to_be_bytes());
             row.extend_from_slice(&[0; 32]);
             row.extend_from_slice(&destination_bytes(endpoint.host(), endpoint.port(), p)?);
             t.push(4, row)?;
@@ -3542,22 +3581,17 @@ impl OwnedCapsule {
             {
                 return Err(Error::Reference);
             }
-            let mut resolver_subjects: Vec<_> = graph
-                .egress()
+            // Если есть только bootstrap, для него всё равно нужен один
+            // untagged набор snapshot peers. Повторы app resolvers сохраняются.
+            let resolver_count = egress
                 .system_resolvers()
-                .iter()
-                .map(|r| r.subject())
-                .collect();
-            // Bootstrap transport остаётся direct; app provider routing не меняется.
-            if !graph.egress().physical_bootstrap().is_empty() && !resolver_subjects.contains(&None)
-            {
-                resolver_subjects.push(None);
-            }
-            for resolver_subject in resolver_subjects {
+                .len()
+                .max(usize::from(!egress.physical_bootstrap().is_empty()));
+            for _ in 0..resolver_count {
                 for peer in binding.servers() {
                     for p in [6, 17] {
                         let mut row = vec![2, p];
-                        row.extend_from_slice(&subject_index(resolver_subject)?.to_be_bytes());
+                        row.extend_from_slice(&NONE.to_be_bytes());
                         row.extend_from_slice(&reference.source);
                         row.extend_from_slice(&destination_bytes(
                             &peer.ip().to_string(),
@@ -3608,7 +3642,12 @@ impl OwnedCapsule {
         for (kind, mask, port, name) in [
             (2, 3, plan.local_port().get(), "yonik-owned-local"),
             (4, 1, plan.probe_port().get(), "yonik-owned-probe"),
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            plan.local_http_port()
+                .map(|port| (3, 1, port.get(), "yonik-owned-http")),
+        ) {
             let mut row = vec![kind, mask];
             row.extend_from_slice(&port.to_be_bytes());
             string(&mut row, name, 160)?;
@@ -3627,14 +3666,12 @@ impl OwnedCapsule {
                 .ok_or(Error::Reference)?;
             let mut row = vec![];
             string(&mut row, ingress.tag(), 128)?;
-            row.extend_from_slice(
-                &(if owned == OwnedIngress::System {
-                    2u16
-                } else {
-                    0u16
-                })
-                .to_be_bytes(),
-            );
+            // Строка 2 принадлежит либо System TUN, либо Local HTTP.
+            let index: u16 = match owned {
+                OwnedIngress::Local => 0,
+                OwnedIngress::System | OwnedIngress::LocalHttp => 2,
+            };
+            row.extend_from_slice(&index.to_be_bytes());
             row.extend_from_slice(&[
                 match ingress.protocol() {
                     ProviderIngressProtocol::Socks => 1,
@@ -3670,7 +3707,8 @@ impl OwnedCapsule {
             string(&mut row, &path, 2048)?;
             row.extend_from_slice(&(probe.subjects().len() as u16).to_be_bytes());
             for name in probe.subjects() {
-                row.extend_from_slice(&subject_index(Some(name))?.to_be_bytes());
+                let index = indices.get(name.as_str()).ok_or(Error::Reference)?;
+                row.extend_from_slice(&index.to_be_bytes());
             }
             t.push(7, row)?;
         }
@@ -7287,6 +7325,98 @@ mod tests {
             epoch: 5,
         }
     }
+    #[test]
+    fn capsule_mapping4_local_dual_ingress_binds_http_as_tcp_only() {
+        use yonik_engine::native_profile::{OwnedIngress, OwnedRuntimePlan, ProfileIntent};
+        let intent = ProfileIntent::decode(
+            r#"{"version":1,"graph":{
+                "inbounds":[
+                    {"tag":"provider-http","protocol":"http"},
+                    {"tag":"provider-socks","protocol":"socks","settings":{"auth":"noauth","udp":true},
+                     "sniffing":{"enabled":true,"routeOnly":true,"destOverride":["tls"]}}
+                ],
+                "outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["provider-http"],"outboundTag":"block"}]},
+                "dns":{"servers":["192.0.2.53"]}
+            }}"#,
+        ).unwrap();
+        let make_plan = |http, socks| {
+            OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap())
+                .unwrap()
+                .with_local_http(1082.try_into().unwrap())
+                .unwrap()
+                .map_ingress("provider-http", http)
+                .unwrap()
+                .map_ingress("provider-socks", socks)
+                .unwrap()
+        };
+        let plan = make_plan(OwnedIngress::LocalHttp, OwnedIngress::Local);
+        let mut config = Vec::new();
+        intent
+            .compile_local(&plan)
+            .unwrap()
+            .write_sensitive(&mut config)
+            .unwrap();
+        let digest = Sha256::digest(&config).into();
+        let built = OwnedCapsule::build(&intent, &plan, None, digest, 1, 1).unwrap();
+        let decoded = Capsule::decode(built.bytes(), &digest).unwrap();
+        assert_eq!(decoded.mode, Mode::Local);
+        assert_eq!(decoded.tables[6].count, 3);
+        for (index, kind, mask, port, alias) in [
+            (0, 2, 3, 1080, "yonik-owned-local"),
+            (1, 4, 1, 1081, "yonik-owned-probe"),
+            (2, 3, 1, 1082, "yonik-owned-http"),
+        ] {
+            let mut row = Reader::new(decoded.tables[6].row(index).unwrap());
+            assert_eq!(
+                (row.u8().unwrap(), row.u8().unwrap(), row.u16().unwrap()),
+                (kind, mask, port)
+            );
+            assert_eq!(row.string(160).unwrap(), alias);
+            row.end().unwrap();
+        }
+        assert_eq!(decoded.tables[9].count, 2);
+        for (index, name, ingress, protocol) in
+            [(0, "provider-http", 2, 2), (1, "provider-socks", 0, 1)]
+        {
+            let mut row = Reader::new(decoded.tables[9].row(index).unwrap());
+            assert_eq!(row.string(128).unwrap(), name);
+            assert_eq!((row.u16().unwrap(), row.u8().unwrap()), (ingress, protocol));
+            row.zero(1).unwrap();
+            row.end().unwrap();
+        }
+        let mut loopback = [0; 16];
+        loopback[..4].copy_from_slice(&[127, 0, 0, 1]);
+        for (network, ingress, port, expected) in [
+            (6, 2, 1082, true),
+            (6, 2, 1080, false),
+            (17, 2, 1082, false),
+            (6, 1, 1081, false),
+        ] {
+            let target = destination_bytes("192.0.2.1", 443, network).unwrap();
+            let mut reader = Reader::new(&target);
+            let request = Message::OpenIngress {
+                ingress,
+                provenance: 2,
+                tuple: Tuple {
+                    protocol: network,
+                    family: 4,
+                    local_port: 32000,
+                    remote_port: port,
+                    local: loopback,
+                    remote: loopback,
+                },
+                original: Destination::read(&mut reader).unwrap(),
+            };
+            assert_eq!(decoded.validate_request(&request).is_ok(), expected);
+        }
+        let swapped = make_plan(OwnedIngress::Local, OwnedIngress::LocalHttp);
+        assert!(matches!(
+            OwnedCapsule::build(&intent, &swapped, None, digest, 1, 1),
+            Err(Error::Reference)
+        ));
+    }
+
     struct FakeResolver;
     impl yonik_engine::native_profile::VerifiedSystemResolver for FakeResolver {
         fn snapshot_digest(&self) -> [u8; 32] {
@@ -7379,6 +7509,119 @@ mod tests {
         verify_resolver_asset(&asset, reference).unwrap();
         (CapturedResolverFixture(peers), reference, asset)
     }
+    #[test]
+    fn capsule_mapping4_refuses_tagged_doh_even_when_tags_match_outbound_names() {
+        use serde_json::{Value, json};
+        use yonik_engine::native_profile::{
+            DnsIngressIdentity, OwnedIngress, OwnedRuntimePlan, ProfileIntent,
+        };
+
+        let [france]: [Value; 1] = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/xray-full-profile-france-synthetic.json"
+        ))
+        .unwrap();
+        let mut auto = france.clone();
+        auto["routing"]["rules"][1] =
+            json!({"type":"field","inboundTag":["dns-via-edge"],"balancerTag":"auto"});
+        auto["routing"]["balancers"] = json!([
+            {"tag":"auto","selector":["edge"],"strategy":{"type":"leastPing"},"fallbackTag":"direct"}
+        ]);
+        auto["observatory"] = json!({
+            "probeUrl":"https://probe.example.invalid/check","probeInterval":"30s",
+            "subjectSelector":["edge"],"enableConcurrency":true
+        });
+
+        let (resolver, snapshot, _) = captured_resolver_fixture(&["192.0.2.53:53"], true);
+        let build = |source: &Value| {
+            let report =
+                yonik_import::import_profiles(serde_json::to_vec(source).unwrap()).unwrap();
+            let [yonik_import::ProfileEntry::Xray(profile)] = report.entries.as_slice() else {
+                panic!("Ожидался один профиль Xray");
+            };
+            let intent = ProfileIntent::from_profile(profile).unwrap();
+            let graph = intent.validate().unwrap();
+            let expected_identity = |server_index: usize| {
+                source["dns"]["servers"][server_index]["tag"]
+                    .as_str()
+                    .map_or(DnsIngressIdentity::Untagged, |tag| {
+                        DnsIngressIdentity::Tagged(tag.into())
+                    })
+            };
+            let egress = graph.egress();
+            assert_eq!(
+                egress.system_resolvers()[0].dns_ingress(),
+                &expected_identity(0)
+            );
+            for (index, resolver) in egress.resolvers().iter().enumerate() {
+                assert_eq!(resolver.dns_ingress(), &expected_identity(index + 1));
+            }
+            let plan = OwnedRuntimePlan::new(1080.try_into().unwrap(), 1081.try_into().unwrap())
+                .unwrap()
+                .bind_system_resolver(&resolver)
+                .unwrap()
+                .with_local_http(1082.try_into().unwrap())
+                .unwrap()
+                .map_ingress("socks-in", OwnedIngress::Local)
+                .unwrap()
+                .map_ingress("http-in", OwnedIngress::LocalHttp)
+                .unwrap();
+            let mut config = Vec::new();
+            intent
+                .compile_local(&plan)
+                .unwrap()
+                .write_sensitive(&mut config)
+                .unwrap();
+            let emitted: Value = serde_json::from_slice(&config).unwrap();
+            let mut routing = source["routing"].clone();
+            for rule in routing["rules"].as_array_mut().unwrap() {
+                if rule["inboundTag"] == json!(["socks-in", "http-in"]) {
+                    rule["inboundTag"] =
+                        json!(["yonik-owned-local", "yonik-owned-http", "yonik-owned-probe"]);
+                }
+            }
+            assert_eq!(emitted["routing"], routing);
+            assert_eq!(emitted["dns"], source["dns"]);
+            let digest = Sha256::digest(&config).into();
+            OwnedCapsule::build(&intent, &plan, Some(snapshot), digest, 1, 1)
+                .map(|capsule| (capsule, digest))
+        };
+
+        for profile in [france, auto] {
+            // Контроль той же формы с DoH без внутренних ingress и их двух правил.
+            let mut untagged = profile.clone();
+            for server in &mut untagged["dns"]["servers"].as_array_mut().unwrap()[1..] {
+                server.as_object_mut().unwrap().remove("tag");
+            }
+            untagged["routing"]["rules"]
+                .as_array_mut()
+                .unwrap()
+                .drain(..2);
+            let mut tagged_system = untagged.clone();
+            tagged_system["dns"]["servers"][0]["tag"] = json!("edge");
+            assert_eq!(build(&tagged_system).err(), Some(Error::Reference));
+            let (untagged, digest) = build(&untagged).unwrap();
+            let capsule = Capsule::decode(untagged.bytes(), &digest).unwrap();
+            assert_eq!(
+                capsule.tables[4].rows().filter(|row| row[0] == 1).count(),
+                2
+            );
+            for index in [0, 1] {
+                let scope = capsule.resolver_scope(index).unwrap();
+                assert_eq!(scope.subject, NONE);
+                assert!(scope.scope.is_none());
+            }
+            assert_eq!(build(&profile).err(), Some(Error::Reference));
+
+            // Совпадение строк не связывает вход DNS с одноимённым outbound.
+            let mut collision = profile;
+            for (server_index, rule_index, name) in [(1, 1, "edge"), (2, 0, "direct")] {
+                collision["dns"]["servers"][server_index]["tag"] = json!(name);
+                collision["routing"]["rules"][rule_index]["inboundTag"][0] = json!(name);
+            }
+            assert_eq!(build(&collision).err(), Some(Error::Reference));
+        }
+    }
+
     #[test]
     fn capsule_mapping4_seven_public_roots_preserve_captured_peers_and_roles() {
         use yonik_engine::native_profile::{OwnedRuntimePlan, ProfileIntent};

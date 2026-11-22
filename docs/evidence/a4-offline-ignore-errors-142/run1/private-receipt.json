@@ -1,8 +1,0 @@
-{
-  "root": "local/validation/a4-offline-bootstrap/6affd300",
-  "mode": "0o700",
-  "manifest_sha256": "9144b811282e1a9a74a473d0beaee211b295c140a8897357e5461841ba7b451a",
-  "manifest_bytes": 6119,
-  "regular_bytes": 86500,
-  "executed_reader_matches_committed_source_candidate": true
-}

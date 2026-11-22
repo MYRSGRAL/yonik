@@ -8,9 +8,11 @@ pub(crate) use equivalence::{
     RenewedDhcpAddress, only_dhcp_lifetimes_changed, same_captured_kernel_route,
     same_captured_topology, same_external_topology, same_session_topology,
 };
+mod local_vpn;
 mod lookup;
 mod nft_cgroup;
 pub(crate) use equivalence::RouteCapture;
+pub use local_vpn::local_vpn_split_cidrs;
 pub(crate) use lookup::{lookup_route_captured, reread_changed_route};
 mod read;
 mod route;

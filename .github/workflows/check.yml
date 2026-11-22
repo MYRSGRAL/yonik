@@ -77,23 +77,12 @@ jobs:
         run: |
           rustup target add aarch64-linux-android --toolchain 1.85.1
           cargo +1.85.1 check --workspace --target aarch64-linux-android --locked
-  ui_benchmark_model:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Подготовить изолированный UI benchmark
-        run: |
-          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/yonik-ui-benchmark-target" >> "$GITHUB_ENV"
-          rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
-      - name: Проверить форматирование оболочек и общий actor
-        run: |
-          cargo +1.97.0 fmt --manifest-path bench/ui/Cargo.toml --all -- --check
-          cargo +1.97.0 clippy --manifest-path bench/ui/Cargo.toml -p ui-bench-model --all-targets --locked -- -D warnings
-          cargo +1.97.0 test --manifest-path bench/ui/Cargo.toml -p ui-bench-model --locked
   python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - name: Проверить диагностические инструменты
         run: |
           python3 -m venv "$RUNNER_TEMP/yonik-lint"

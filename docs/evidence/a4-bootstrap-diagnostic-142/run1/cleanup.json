@@ -1,8 +1,0 @@
-{
-  "task": "/var/tmp/codex-myrs/transient/a4-mtree4-pid1-hooks-70c91647e7d432157aeb8f917273b040",
-  "task_exists": false,
-  "references": [],
-  "base_sha256_after": "794eb4889b39e1f0ed7d5ae998b2a1ed2137db8cf8c3476cf2962c7437ecb003",
-  "vm_exit": 0,
-  "blocked_disk_retained": true
-}

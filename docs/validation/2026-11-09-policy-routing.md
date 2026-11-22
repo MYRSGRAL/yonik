@@ -1,6 +1,6 @@
 # Общая DNS-политика и нативная маршрутизация
 
-9 ноября 2026 года. [План](../superpowers/plans/2026-11-09-policy-compiler.md).
+9 ноября 2026 года. [План](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-09-policy-compiler.md).
 Продолжение FR-08/11/14/15/20/21, не закрытие полного G-DNS/G-LINUX/G-APP.
 
 ## Portable модель

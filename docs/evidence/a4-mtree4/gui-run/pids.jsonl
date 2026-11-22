@@ -1,4 +1,0 @@
-{"name": "bus", "pid": 3, "uid": 1000, "argv": ["/usr/bin/dbus-daemon", "--nofork", "--config-file=/home/fixture/bus.conf"]}
-{"name": "provider", "pid": 4, "uid": 1000, "argv": ["/usr/bin/ksecretd"]}
-{"name": "gui", "pid": 5, "uid": 1000, "argv": ["/usr/bin/yonik-desktop", "--data-dir", "/home/fixture/storage"]}
-{"name": "gui-reopen", "pid": 13, "uid": 1000, "argv": ["/usr/bin/yonik-desktop", "--data-dir", "/home/fixture/storage"]}

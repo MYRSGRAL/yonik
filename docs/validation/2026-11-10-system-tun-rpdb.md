@@ -63,7 +63,7 @@ Confirmed. Regression прошла (`cleanup-state-green.log`), узкое ре�
 
 Это необходимые executor и runtime gates, а не готовый пользовательский VPN.
 Registry/worker/systemd/session host/IPC/controller/GUI ещё интегрируются по
-[плану](../superpowers/plans/2026-11-10-system-session-integration.md).
+[плану](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-10-system-session-integration.md).
 system_tun capability остаётся false. DNS/Fake-IP, private VPN/LAN/reconcile,
 полная Linux-матрица и поставка не закрыты. P12/P13 остаются частичными;
 итог общего плана — **3/26 (11,5%)**, полностью закрыть осталось 23 пункта.

@@ -160,6 +160,8 @@ ApplicationWindow {
         catalogRequestSequence += 1
         return catalogRequestSequence
     }
+    readonly property bool routingPresetsEnabled: !!state.routing &&
+        (state.routing.local_vpn_direct === true || !!state.routing.ru_direct && state.routing.ru_direct.enabled)
     property bool routingPending: false
     property double routingRequestId: 0
     property double routingExpectedSavedId: 0
@@ -462,7 +464,9 @@ ApplicationWindow {
             routing_ack_identity: ["Ответ сохранения не совпал с правилом. Ввод сохранён; проверьте черновик.", "Save response did not match the rule. Input is preserved; check the draft."],
             routing_storage: ["Черновик не сохранён: повреждение или конфликт БД. Исходник сохранён; перезапустите приложение.", "Draft not saved: damaged database or conflict. Original preserved; restart the application."],
             domain: ["Некорректный домен", "Invalid domain"], cidr: ["Некорректный IP/CIDR: проверьте биты сети", "Invalid IP/CIDR: check network bits"],
-            executable: ["Нужен абсолютный путь без . и ..", "An absolute path without . and .. is required"],
+            executable: ["Введите абсолютный путь без . и .. или точное имя с префиксом name:", "Enter an absolute path without . and .. or an exact name with the name: prefix"],
+            routing_local_only: ["Этот пресет применяется в режиме Local", "This preset applies in Local mode"],
+            routing_vpn_topology: ["Не удалось прочитать маршруты локальных VPN", "Could not read local VPN routes"],
             broad: ["Подтвердите правило для любого трафика", "Confirm matching all traffic"],
             ports: ["Порты назначения: 1–65535, до 16 непустых диапазонов.", "Destination ports: 1–65535, up to 16 nonempty ranges."],
             ports_overlap: ["Диапазоны портов пересекаются или повторяются.", "Port ranges overlap or repeat."],
@@ -1119,7 +1123,7 @@ ApplicationWindow {
                 pages: [
                     {id: "routingRulesTab", label: window.tr("Правила", "Rules")},
                     {id: "routingEditorTab", label: window.tr("Редактор", "Editor")},
-                    {id: "routingListsTab", label: window.tr("Списки", "Lists")},
+                    {id: "routingListsTab", label: window.tr("Пресеты", "Presets")},
                     {id: "routingCheckTab", label: window.tr("Проверка", "Check")}
                 ]
                 onCurrentIndexChanged: if (routingScroll.contentItem) routingScroll.contentItem.contentY = 0
@@ -1177,7 +1181,9 @@ ApplicationWindow {
                         cidrInput.clear()
                         protocolInput.clear()
                         portInput.clear()
-                        actionInput.currentIndex = 0
+                        actionInput.currentIndex = 1
+                        domainSubdomains.checked = true
+                        editor.simpleGroup = 1
                         enabledInput.checked = true
                         broadInput.checked = false
                     }
@@ -1193,7 +1199,12 @@ ApplicationWindow {
                         formRevision = window.state.routing_revision
                         saveError = ""
                         executableInput.text = rule.executables.join("\n")
-                        domainInput.text = rule.domains.join("\n")
+                        const suffixesOnly = rule.domains.length > 0 && rule.domains.every(value => value.startsWith("*."))
+                        domainSubdomains.checked = suffixesOnly
+                        domainInput.text = rule.domains.map(value => suffixesOnly ? value.slice(2) : value).join("\n")
+                        const groups = [rule.executables, rule.domains, rule.destinations]
+                        const activeGroups = groups.map((values, index) => values.length ? index : -1).filter(index => index >= 0)
+                        editor.simpleGroup = activeGroups.length ? activeGroups[0] : 1
                         cidrInput.text = rule.destinations.join("\n")
                         actionInput.currentIndex = ["proxy", "direct", "block"].indexOf(rule.action)
                         enabledInput.checked = rule.enabled
@@ -1216,6 +1227,7 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.minimumWidth: 0
                         spacing: 8
+                        SmallLabel { Layout.fillWidth: true; text: window.tr("Один набор правил для серверных профилей всех подписок. Изменения действуют при следующем подключении.", "One rule list for server profiles from all subscriptions. Changes take effect on the next connection.") }
                         ActionButton { Layout.fillWidth: true; text: window.tr("Новое правило", "New rule"); highlighted: true; onClicked: { editor.newRule(); routingTabs.currentIndex = 1 } }
                         RowLayout {
                             objectName: "routingDefaultRow"
@@ -1243,8 +1255,13 @@ ApplicationWindow {
                         ActionButton {
                             objectName: "routingApplyButton"
                             text: window.tr("Применить к сети", "Apply to network")
-                            enabled: window.state.selected_kind !== "xray" && window.state.ready && !window.state.busy && !window.routingPending && window.state.connection_mode === "system" && (window.systemFakeDnsEnabled || (!(window.state.system_fake_dns || []).length && window.state.engine === "xray" && window.state.system_tun_available)) && !window.state.system_busy && !window.state.can_stop && !window.state.system_recovery_pending && !!window.state.selected_profile && window.state.source_generation !== null
+                            enabled: window.state.selected_kind !== "xray" && window.state.ready && !window.state.busy && !window.routingPending && window.state.connection_mode === "system" && !window.routingPresetsEnabled && (window.systemFakeDnsEnabled || (!(window.state.system_fake_dns || []).length && window.state.engine === "xray" && window.state.system_tun_available)) && !window.state.system_busy && !window.state.can_stop && !window.state.system_recovery_pending && !!window.state.selected_profile && window.state.source_generation !== null
                             onClicked: window.sendRouting({command: "routing_apply", source_generation: window.state.source_generation, snapshot_revision: window.state.revision, selected_profile_id: window.state.selected_profile})
+                        }
+                        SmallLabel {
+                            Layout.fillWidth: true
+                            visible: window.state.connection_mode === "system" && window.routingPresetsEnabled
+                            text: window.tr("Для включённых пресетов выберите режим Local.", "Select Local mode to use the enabled presets.")
                         }
                         SmallLabel { Layout.fillWidth: true; text: window.tr("Для применения правил системный помощник должен подтвердить доступ. Проверка правил сама по себе не проверяет подключение и привязку приложений.", "The system helper must confirm access before applying rules. Rule validation alone does not verify connectivity or application attribution.") }
                     }
@@ -1255,10 +1272,11 @@ ApplicationWindow {
                         spacing: 8
                         ActionButton { objectName: "routingModeButton"; text: editor.advanced ? window.tr("Простой режим", "Simple mode") : window.tr("Расширенный режим", "Advanced mode"); onClicked: editor.advanced = !editor.advanced }
                         SmallLabel { visible: editor.advanced; Layout.fillWidth: true; text: window.tr("Совпасть должны все группы. Внутри группы достаточно одной строки.", "All groups must match. Within each group, one matching line is enough.") }
-                        ChoiceBox { visible: !editor.advanced; model: [window.tr("Программа", "Executable"), window.tr("Домен", "Domain"), "IP / CIDR"]; onActivated: editor.simpleGroup = currentIndex }
+                        ChoiceBox { visible: !editor.advanced; model: [window.tr("Программа", "Executable"), window.tr("Домен", "Domain"), "IP / CIDR"]; currentIndex: editor.simpleGroup; onActivated: editor.simpleGroup = currentIndex }
                         PlainLabel { objectName: "routingRuleIdentity"; text: editor.selectedId ? window.tr("Редактирование #", "Editing #") + editor.selectedId : window.tr("Новое правило", "New rule") }
-                        SmallLabel { visible: editor.advanced || editor.simpleGroup === 0; Layout.fillWidth: true; text: window.tr("Путь к исполняемому файлу", "Path to the executable") }
-                        TextArea { visible: editor.advanced || editor.simpleGroup === 0; id: executableInput; objectName: "routingExecutable"; Layout.fillWidth: true; placeholderText: "/usr/bin/browser"; wrapMode: TextEdit.Wrap; selectByMouse: true }
+                        SmallLabel { visible: editor.advanced || editor.simpleGroup === 0; Layout.fillWidth: true; text: window.tr("Путь или точное имя процесса", "Path or exact process name") }
+                        TextArea { visible: editor.advanced || editor.simpleGroup === 0; id: executableInput; objectName: "routingExecutable"; Layout.fillWidth: true; placeholderText: "/usr/bin/browser\nname:browser"; wrapMode: TextEdit.Wrap; selectByMouse: true }
+                        SmallLabel { visible: editor.advanced || editor.simpleGroup === 0; Layout.fillWidth: true; text: window.tr("Для правил по процессам требуется системная атрибуция. Частичные имена ядро Xray не поддерживает.", "Process rules require system attribution. Xray does not support partial names.") }
                         ActionButton {
                             id: catalogToggle
                             objectName: "routingCatalogToggle"
@@ -1292,11 +1310,12 @@ ApplicationWindow {
                                 ActionButton { objectName: "routingCatalogNext"; text: window.tr("Далее", "Next"); enabled: !!editor.displayedCatalog && editor.displayedCatalog.offset + 32 < editor.displayedCatalog.total; onClicked: editor.requestCatalog(editor.displayedCatalog.offset + 32) }
                             }
                         }
-                        SmallLabel { visible: editor.advanced || editor.simpleGroup === 1; text: window.tr("Домен или *.суффикс", "Domain or *.suffix") }
+                        SmallLabel { visible: editor.advanced || editor.simpleGroup === 1; text: window.tr("Домен", "Domain") }
                         TextArea { visible: editor.advanced || editor.simpleGroup === 1; id: domainInput; objectName: "routingDomain"; Layout.fillWidth: true; placeholderText: "example.org"; wrapMode: TextEdit.Wrap; selectByMouse: true }
+                        CheckBox { id: domainSubdomains; objectName: "routingDomainSubdomains"; visible: editor.advanced || editor.simpleGroup === 1; text: window.tr("Включая поддомены", "Include subdomains") }
                         SmallLabel { visible: editor.advanced || editor.simpleGroup === 2; text: window.tr("IP или канонический CIDR", "IP or canonical CIDR") }
                         TextArea { visible: editor.advanced || editor.simpleGroup === 2; id: cidrInput; objectName: "routingCidr"; Layout.fillWidth: true; placeholderText: "192.0.2.0/24"; wrapMode: TextEdit.Wrap; selectByMouse: true }
-                        SmallLabel { visible: editor.advanced; Layout.fillWidth: true; text: window.tr("По одному значению на строку. Process name, UID, cgroup и PID не поддерживаются текущей моделью.", "One value per line. Process names, UID, cgroup and PID are unsupported by the current model.") }
+                        SmallLabel { visible: editor.advanced; Layout.fillWidth: true; text: window.tr("По одному значению на строку. Префикс *. включает поддомены для отдельной строки.", "One value per line. Prefix a domain with *. to include its subdomains.") }
                         SettingsGroup {
                             visible: editor.advanced || editor.transport !== undefined
                             SmallLabel { Layout.fillWidth: true; text: window.tr("Транспорт: TCP или UDP. До 16 диапазонов портов назначения (1–65535). Активация пока недоступна.", "Transport: TCP or UDP. Up to 16 destination port ranges (1–65535). Activation is unavailable.") }
@@ -1319,8 +1338,9 @@ ApplicationWindow {
                                     if (ports) editor.transport.destination_ports = ports.split(",").map(s => { const p = s.split("-").map(Number); return [p[0], p.length === 1 ? p[0] : p[1]] })
                                     const rules = window.state.routing.rules
                                     const id = editor.selectedId || (rules.reduce((n, r) => Math.max(n, r.id), 0) + 1)
+                                    const domains = editor.values(domainInput.text).map(value => domainSubdomains.checked && !value.startsWith("*.") ? "*." + value : value)
                                     editor.saveError = ""
-                                    editor.pendingRequest = window.sendRouting({command: "edit_routing", expected_revision: editor.formRevision, create: editor.selectedId === 0, confirm_broad: broadInput.checked, rule: {id: id, transport: editor.transport, platform_sources: editor.platformSources, enabled: enabledInput.checked, executables: editor.values(executableInput.text), domains: editor.values(domainInput.text), destinations: editor.values(cidrInput.text), action: ["proxy", "direct", "block"][actionInput.currentIndex]}})
+                                    editor.pendingRequest = window.sendRouting({command: "edit_routing", expected_revision: editor.formRevision, create: editor.selectedId === 0, confirm_broad: broadInput.checked, rule: {id: id, transport: editor.transport, platform_sources: editor.platformSources, enabled: enabledInput.checked, executables: editor.values(executableInput.text), domains: domains, destinations: editor.values(cidrInput.text), action: ["proxy", "direct", "block"][actionInput.currentIndex]}})
                                     editor.settle()
                                 }
                             }
@@ -1333,6 +1353,18 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.minimumWidth: 0
                         spacing: 8
+                        CheckBox {
+                            objectName: "routingLocalVpnDirect"
+                            text: window.tr("IP-подсети локальных VPN напрямую", "Route local VPN IP subnets directly")
+                            checked: !!window.state.routing && window.state.routing.local_vpn_direct === true
+                            nextCheckState: function() { return checkState }
+                            onClicked: window.sendRouting({command: "routing_local_vpn", enabled: !checked})
+                        }
+                        SmallLabel {
+                            Layout.fillWidth: true
+                            text: window.tr("В режиме Local при подключении берутся IP-подсети активных TUN и WireGuard из основной таблицы Linux. Правила Linux и отключение VPN могут изменить фактический маршрут.", "In Local mode, active TUN and WireGuard IP subnets are read from the main Linux routing table on connect. Linux routing rules and VPN disconnections can change the outgoing route.")
+                        }
+                        PlainLabel { Layout.fillWidth: true; visible: !!(window.routingFeedback && window.routingFeedback.error); text: window.errorText(window.routingFeedback ? window.routingFeedback.error : "") }
                         PresetPanel {
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
@@ -1365,7 +1397,7 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             property var explanation: window.state.routing_explanation
                             visible: !!explanation && explanation.revision === window.state.routing_revision && explanation.request_id === window.routingRequestId
-                            text: !explanation ? "" : explanation.result.status === "fixture" ? window.tr("Предварительный расчёт: ", "Preliminary evaluation: ") + explanation.result.action + " · " + explanation.result.origin : window.tr("Неизвестно: ", "Unknown: ") + (explanation.result.reason === "application_witness_missing" ? window.tr("нет подтверждённой атрибуции приложения", "no verified application attribution") : (explanation.result.reason === "dns_witness_missing" || explanation.result.reason === "dns_missing") ? window.tr("нет подтверждённых DNS-данных", "no verified DNS evidence") : window.isUnsupportedSelector(explanation.result.reason) ? window.tr("неприменимый селектор правила #", "unsupported selector in rule #") + explanation.result.rule_id : explanation.result.reason === "evaluation_rejected" ? window.tr("вход отклонён вычислителем", "input rejected by evaluator") : window.tr("причина недоступна", "reason unavailable")) + window.tr(". Это не проверка применения.", ". This does not verify application of routing.")
+                            text: !explanation ? "" : explanation.result.status === "fixture" ? window.tr("Предварительный расчёт: ", "Preliminary evaluation: ") + explanation.result.action + " · " + explanation.result.origin : window.tr("Неизвестно: ", "Unknown: ") + (explanation.result.reason === "application_witness_missing" ? window.tr("нет подтверждённой атрибуции приложения", "no verified application attribution") : (explanation.result.reason === "dns_witness_missing" || explanation.result.reason === "dns_missing") ? window.tr("нет подтверждённых DNS-данных", "no verified DNS evidence") : window.isUnsupportedSelector(explanation.result.reason) ? window.tr("неприменимый селектор правила #", "unsupported selector in rule #") + explanation.result.rule_id : explanation.result.reason === "vpn_topology_required" ? window.tr("нужен снимок маршрутов VPN", "VPN route snapshot required") : explanation.result.reason === "evaluation_rejected" ? window.tr("вход отклонён вычислителем", "input rejected by evaluator") : window.tr("причина недоступна", "reason unavailable")) + window.tr(". Это не проверка применения.", ". This does not verify application of routing.")
                         }
                         // Конец блока проверки маршрутов.
                     }

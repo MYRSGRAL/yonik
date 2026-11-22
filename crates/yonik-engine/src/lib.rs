@@ -75,6 +75,7 @@ pub struct CompiledConfig {
     engine: Engine,
     port: NonZeroU16,
     probe_port: NonZeroU16,
+    local_http_port: Option<NonZeroU16>,
     probe_access: ProbeAccess,
 }
 impl CompiledConfig {
@@ -96,6 +97,9 @@ impl CompiledConfig {
     pub fn probe_port(&self) -> NonZeroU16 {
         self.probe_port
     }
+    pub fn local_http_port(&self) -> Option<NonZeroU16> {
+        self.local_http_port
+    }
     pub fn probe_auth(&self) -> Option<&ProbeCredentials> {
         self.probe_access.auth()
     }
@@ -104,6 +108,15 @@ impl CompiledConfig {
     }
     pub fn write_sensitive(&self, writer: impl Write) -> Result<(), serde_json::Error> {
         serde_json::to_writer(writer, &self.value)
+    }
+
+    /// Legacy writer проверяет capability повторно перед передачей JSON ядру.
+    pub fn requires_xray_reality_h2(&self) -> bool {
+        self.engine == Engine::Xray
+            && self
+                .value
+                .pointer("/outbounds/0/streamSettings/realitySettings/alpn")
+                .is_some()
     }
 }
 impl fmt::Debug for CompiledConfig {
@@ -119,8 +132,20 @@ pub fn compile(
     engine: Engine,
     port: NonZeroU16,
 ) -> Result<CompiledConfig, CompileError> {
+    compile_server(server, engine, port, false)
+}
+
+mod xray_reality_h2;
+pub use xray_reality_h2::{PendingXrayRealityH2, XrayRealityH2};
+
+fn compile_server(
+    server: &ParsedServer,
+    engine: Engine,
+    port: NonZeroU16,
+    require_reality_h2: bool,
+) -> Result<CompiledConfig, CompileError> {
     validate_listener(server, port)?;
-    let options = options::validate(server, engine)?;
+    let options = options::validate(server, engine, require_reality_h2)?;
     validate_credentials(server, engine)?;
     let value = match engine {
         Engine::Xray => json!({
@@ -141,6 +166,7 @@ pub fn compile(
         engine,
         port,
         probe_port: port,
+        local_http_port: None,
         probe_access: ProbeAccess::default(),
     })
 }
@@ -209,6 +235,10 @@ fn xray_outbound(server: &ParsedServer, options: &Options) -> Result<Value, Comp
             "trojan",
             json!({"servers":[{"address":address,"port":port,"password":password.expose()}]}),
         ),
+        (Protocol::Hysteria2, Credentials::Password(_)) => (
+            "hysteria",
+            json!({"version":2,"address":address,"port":port}),
+        ),
         (Protocol::Shadowsocks, Credentials::Shadowsocks { method, password }) => (
             "shadowsocks",
             json!({"servers":[{
@@ -237,6 +267,7 @@ fn xray_outbound(server: &ParsedServer, options: &Options) -> Result<Value, Comp
     };
     let mut stream = json!({"network":match server.transport() {
         Transport::Tcp => "tcp", Transport::WebSocket => "ws", Transport::Grpc => "grpc", Transport::Xhttp => "xhttp",
+        Transport::Quic if server.protocol() == Protocol::Hysteria2 => "hysteria",
         _ => return Err(CompileError::UnsupportedTransport),
     }, "security":match server.security() {
         Security::None => "none", Security::Tls => "tls", Security::Reality => "reality",
@@ -280,9 +311,22 @@ fn xray_outbound(server: &ParsedServer, options: &Options) -> Result<Value, Comp
             stream["xhttpSettings"] =
                 json!({"host":options.host,"path":options.path,"mode":options.mode})
         }
+        Transport::Quic => {
+            let Credentials::Password(auth) = server.credentials() else {
+                return Err(CompileError::InvalidCredentials);
+            };
+            stream["hysteriaSettings"] = json!({"version":2,"auth":auth.expose()});
+        }
         _ => {}
     }
-    Ok(json!({"tag":"proxy","protocol":protocol,"settings":settings,"streamSettings":stream}))
+    let mut outbound =
+        json!({"tag":"proxy","protocol":protocol,"settings":settings,"streamSettings":stream});
+    if options.xudp_mux {
+        // Положительная ёмкость включает XUDP. Один UDP-поток на worker
+        // не разделяет соединение с другими потоками. UDP/443 остаётся на default Xray.
+        outbound["mux"] = json!({"enabled":true,"concurrency":-1,"xudpConcurrency":1});
+    }
+    Ok(outbound)
 }
 
 fn sing_outbound(server: &ParsedServer, options: &Options) -> Result<Value, CompileError> {
@@ -293,6 +337,7 @@ fn sing_outbound(server: &ParsedServer, options: &Options) -> Result<Value, Comp
         Protocol::Shadowsocks => "shadowsocks",
         Protocol::HttpConnect => "http",
         Protocol::Socks5 => "socks",
+        Protocol::Hysteria2 => return Err(CompileError::UnsupportedTransport),
     };
     let mut value = json!({"type":protocol,"tag":"proxy","server":server.endpoint().host(),"server_port":server.endpoint().port()});
     match server.credentials() {

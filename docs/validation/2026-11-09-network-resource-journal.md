@@ -74,7 +74,7 @@ RED: повторных parent sync было 0 вместо обязательн
 
 ## Следующая интеграция
 
-[План системного helper](../superpowers/plans/2026-11-09-linux-network-helper.md)
+[План системного helper](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-09-linux-network-helper.md)
 включает peer/polkit, immutable Prepare/Apply, trusted engine registry, настоящие
 Netlink/nft/resolved эффекты, компенсацию, сверку после аварии и настройки UI.
 Наличие journal не является подтверждением установки helper, фактической

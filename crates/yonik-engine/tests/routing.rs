@@ -200,7 +200,13 @@ fn p07_both_compilers_refuse_before_routes() {
 }
 
 #[test]
-fn transport_native_adapters_refuse_enabled_preserve_disabled() {
+fn transport_system_refuses_enabled_while_local_lowers_and_disabled_preserved() {
+    let report = yonik_import::import_bytes(
+        b"vless://00112233-4455-6677-8899-aabbccddeeff@127.0.0.1:24443".to_vec(),
+    )
+    .unwrap();
+    let tun =
+        yonik_engine::SystemTun::new(1, 1500, 99, vec!["198.18.0.1/30".parse().unwrap()]).unwrap();
     let mut policy = Policy::default();
     policy.user_rules.push(Rule {
         id: 51,
@@ -212,13 +218,94 @@ fn transport_native_adapters_refuse_enabled_preserve_disabled() {
         },
     });
     for engine in [Engine::Xray, Engine::SingBox] {
+        let result = yonik_engine::compile_system_policy(
+            &report.servers[0],
+            engine,
+            NonZeroU16::new(10808).unwrap(),
+            NonZeroU16::new(10809).unwrap(),
+            &policy,
+            &tun,
+        );
         assert_eq!(
-            compile(engine, &policy, PolicyMode::IpOnly).unwrap_err(),
+            result.unwrap_err(),
             PolicyCompileError::UnsupportedTransport(51)
         );
+        assert!(compile(engine, &policy, PolicyMode::IpOnly).is_ok());
     }
     policy.user_rules[0].enabled = false;
     for engine in [Engine::Xray, Engine::SingBox] {
         assert!(compile(engine, &policy, PolicyMode::IpOnly).is_ok());
+        assert!(
+            yonik_engine::compile_system_policy(
+                &report.servers[0],
+                engine,
+                NonZeroU16::new(10808).unwrap(),
+                NonZeroU16::new(10809).unwrap(),
+                &policy,
+                &tun,
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[test]
+fn observed_routing_accepts_domain_and_literal_ip_bypasses() {
+    let policy = Policy {
+        user_rules: vec![
+            Rule {
+                id: 1,
+                enabled: true,
+                conditions: Conditions {
+                    domains: vec![DomainPattern::Suffix("example.org".parse().unwrap())],
+                    ..Default::default()
+                },
+                action: Action::Direct,
+            },
+            Rule {
+                id: 2,
+                enabled: true,
+                conditions: Conditions {
+                    destinations: vec!["192.0.2.0/24".parse().unwrap()],
+                    ..Default::default()
+                },
+                action: Action::Direct,
+            },
+        ],
+        ..Default::default()
+    };
+    for engine in [Engine::Xray, Engine::SingBox] {
+        let config = compile(engine, &policy, PolicyMode::Observed).unwrap();
+        let rules = if engine == Engine::Xray {
+            &config["routing"]["rules"]
+        } else {
+            &config["route"]["rules"]
+        };
+        assert!(rules[2].to_string().contains("example.org"));
+        assert!(rules[3].to_string().contains("192.0.2.0/24"));
+    }
+}
+
+#[test]
+fn observed_names_do_not_weaken_ip_block() {
+    let policy = Policy {
+        user_rules: vec![Rule {
+            id: 1,
+            enabled: true,
+            conditions: Conditions {
+                destinations: vec!["192.0.2.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+            action: Action::Block,
+        }],
+        ..Default::default()
+    };
+    for engine in [Engine::Xray, Engine::SingBox] {
+        assert_eq!(
+            compile(engine, &policy, PolicyMode::Observed),
+            Err(PolicyCompileError::Unsupported(
+                PolicyCapability::RequiredRealResolution
+            )),
+        );
     }
 }

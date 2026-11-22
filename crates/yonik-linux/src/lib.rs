@@ -53,8 +53,8 @@ pub use network::{
     NexthopMember, NftSocketCgroupMatch, RouteKind, RouteNexthop, RouteQuery, TransportProtocol,
     WireGuardDevice, WireGuardPacketLease, WireGuardPeer, WireGuardReadReceipt,
     WireGuardSocketObservation, WireGuardSocketObserver, WireGuardUdpPath,
-    WireGuardUdpRouteSnapshot, lookup_route, read_nft_socket_cgroup_matches, read_topology,
-    read_wireguard_device, read_wireguard_device_observed,
+    WireGuardUdpRouteSnapshot, local_vpn_split_cidrs, lookup_route, read_nft_socket_cgroup_matches,
+    read_topology, read_wireguard_device, read_wireguard_device_observed,
 };
 #[cfg(target_os = "linux")]
 mod resolver;

@@ -118,7 +118,13 @@ async fn backup_restore_reopen_and_refuse_overwrite() {
     );
     assert!(!dir.join("bad.sqlite").exists());
     let connection = rusqlite::Connection::open(&source).unwrap();
-    connection.execute_batch("DROP TABLE profiles; DROP TABLE profile_catalog; DROP TABLE source_sequence; PRAGMA user_version=1;").unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE native_profiles; DROP TABLE profile_projection;
+             DROP TABLE profiles; DROP TABLE profile_catalog; DROP TABLE source_sequence;
+             PRAGMA user_version=1;",
+        )
+        .unwrap();
     let sentinel: Vec<u8> = connection
         .query_row("SELECT sentinel FROM repository", [], |r| r.get(0))
         .unwrap();
@@ -307,6 +313,9 @@ async fn legacy_schema_and_optional_draft_matrix() {
                 repo.close().await.unwrap();
             }
             let connection = rusqlite::Connection::open(&source).unwrap();
+            connection
+                .execute_batch("DROP TABLE native_profiles; DROP TABLE profile_projection")
+                .unwrap();
             if version < 3 {
                 connection
                     .execute_batch("DROP TABLE source_sequence")

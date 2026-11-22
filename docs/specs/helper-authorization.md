@@ -2,7 +2,7 @@
 
 Контракт реализуемого компонента `yonik_linux::helper`; основание —
 [границы Linux](platforms.md#2-linux-границы-доверия) и
-[план helper](../superpowers/plans/2026-11-09-linux-network-helper.md).
+[план helper](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-09-linux-network-helper.md).
 Компонент не запускает engine, не применяет сеть и не устанавливает системный сервис.
 
 ## Вход и доверие

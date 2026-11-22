@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tarfile
 from pathlib import Path
 
 SOURCE_URL = "https://github.com/SagerNet/sing-box.git"
@@ -36,6 +37,12 @@ XRAY_URL = "https://github.com/XTLS/Xray-core.git"
 XRAY_TAG = "v26.10.31"
 XRAY_COMMIT = "a4a3dff5b20c2faae567b742c172c7b95e75c083"
 PROFILE_PATCH = "3666161f1210c374675f4a4b67afeedea426990953889f9a1212d12cc1158339"
+XRAY_REALITY_H2_BASE = (
+    "2d1799dd9d6f07dcbf86e40b79497f1f473c3720d411b28e8c97e86b15ecf061"
+)
+XRAY_REALITY_H2_PATCH = (
+    "5942863d6866cd651fcc9dbd6c8438d175b496e5818726ac47ec08e40d40320c"
+)
 LOG = logging.getLogger("yonik.native_adapter")
 COMMAND_TIMEOUT = 180
 BUILD_TIMEOUT = 900
@@ -718,6 +725,110 @@ def build_locked(
     return manifest_path
 
 
+def build_xray_reality_h2(root: Path, output: Path, archive: Path) -> Path:
+    """Собрать отдельный compile-only ELF из проверенного retained source."""
+    root = root.resolve()
+    output = output.resolve()
+    if output.is_relative_to(root) or output.is_relative_to(TRANSIENT):
+        raise BuildError("--output-dir должен быть вне transient/build root")
+    if output.exists():
+        raise BuildError("Выходной каталог REALITY h2 уже существует")
+    patch = DEFAULT_PATCH.parents[2] / "xray" / XRAY_TAG / "client-reality-h2.patch"
+    if (
+        sha256(archive) != XRAY_REALITY_H2_BASE
+        or sha256(patch) != XRAY_REALITY_H2_PATCH
+    ):
+        raise BuildError("Неверный source или patch pin для REALITY h2")
+    root.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        runner = Runner(root)
+        runner.env.update(GOPROXY="off", GOSUMDB="off")
+        stage = root / "reality-h2-source"
+        stage.mkdir()
+        with tarfile.open(archive) as source_archive:
+            source_archive.extractall(stage, filter="data")
+        if sha256(archive) != XRAY_REALITY_H2_BASE:
+            raise BuildError("Retained source изменился при распаковке")
+        source = stage / "src"
+        runner.run(["git", "apply", "--check", str(patch)], source)
+        runner.run(["git", "apply", str(patch)], source)
+        tree = source_digest(source)
+        compiler = toolchain_digest(runner, source)
+        go_env = json.loads(
+            runner.run(["go", "env", "-json", "GOOS", "GOARCH", "GOEXPERIMENT"], source)
+        )
+        if go_env["GOOS"] != "linux" or go_env["GOARCH"] != "amd64":
+            raise BuildError("REALITY h2 требует Linux amd64")
+        binary = root / "build-native-adapter-xray"
+        args = build_arguments(binary, [], "xray")
+        tests = [
+            "go",
+            "test",
+            "-mod=readonly",
+            "./infra/conf",
+            "./transport/internet/reality",
+            "-run",
+            "^TestYonikReality",
+            "-count=1",
+        ]
+        record = {
+            "contract": "yonik-xray-client-reality-h2-v1",
+            "validation": "COMPILE_ONLY",
+            "source_commit": XRAY_COMMIT,
+            "retained_source_sha256": XRAY_REALITY_H2_BASE,
+            "source_tree_sha256": tree,
+            "patch_sha256": XRAY_REALITY_H2_PATCH,
+            "builder_sha256": sha256(Path(__file__)),
+            "toolchain_sha256": compiler,
+            "go_version": runner.run(["go", "version"], source).strip(),
+            "go_env": go_env,
+            "module_sha256": {
+                name: sha256(source / name) for name in ("go.mod", "go.sum")
+            },
+            "build_args": args,
+            "test_args": tests,
+        }
+        prebuild = runner.logs / "prebuild.json"
+        prebuild.write_text(json.dumps(record, indent=2) + "\n")
+        runner.run(tests, source)
+        runner.run(args, source)
+        if (
+            source_digest(source) != tree
+            or sha256(patch) != XRAY_REALITY_H2_PATCH
+            or toolchain_digest(runner, source) != compiler
+            or sha256(Path(__file__)) != record["builder_sha256"]
+        ):
+            raise BuildError("Входы REALITY h2 изменились при сборке")
+        with binary.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                raise BuildError("REALITY h2 требует ELF")
+        output.mkdir(parents=True)
+        image = output / "xray"
+        shutil.copy2(binary, image)
+        digest = sha256(binary)
+        if sha256(image) != digest:
+            raise BuildError("SHA256 ELF REALITY h2 не совпал")
+        shutil.copy2(prebuild, output / "prebuild.json")
+        manifest = output / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    **record,
+                    "binary_sha256": digest,
+                    "binary_version_executed": False,
+                    "prebuild_sha256": sha256(prebuild),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        return manifest
+    finally:
+        os.close(descriptor)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", choices=("sing-box", "xray"), default="sing-box")
@@ -739,6 +850,11 @@ def main() -> int:
     parser.add_argument("--build-root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--patch", type=Path, default=DEFAULT_PATCH)
+    parser.add_argument(
+        "--client-reality-h2-source",
+        type=Path,
+        help="Retained source Xray для отдельной compile-only сборки REALITY h2",
+    )
     options = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -747,15 +863,30 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, terminate)
     try:
-        manifest = build(
-            options.build_root,
-            options.output_dir,
-            options.patch,
-            options.engine,
-            native_codec=options.native_codec,
-            compile_only=options.compile_only,
-            experimental_profile=options.experimental_profile,
-        )
+        if options.client_reality_h2_source is not None:
+            if (
+                options.engine != "xray"
+                or not options.compile_only
+                or options.experimental_profile
+                or options.native_codec
+                or options.patch != DEFAULT_PATCH
+            ):
+                raise BuildError(
+                    "REALITY h2 требует отдельную Xray compile-only сборку"
+                )
+            manifest = build_xray_reality_h2(
+                options.build_root, options.output_dir, options.client_reality_h2_source
+            )
+        else:
+            manifest = build(
+                options.build_root,
+                options.output_dir,
+                options.patch,
+                options.engine,
+                native_codec=options.native_codec,
+                compile_only=options.compile_only,
+                experimental_profile=options.experimental_profile,
+            )
     except (BuildError, OSError, ValueError) as error:
         LOG.error("Сборка остановлена: %s", error)
         return 1

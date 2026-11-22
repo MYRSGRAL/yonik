@@ -68,3 +68,122 @@ mod tests {
         }
     }
 }
+
+/// Только LocalSocks: transport — conjunct всей destination-группы, включая OR ресурсов.
+pub(crate) fn apply_local(
+    engine: crate::Engine,
+    rule: &mut serde_json::Value,
+    transport: &yonik_domain::TransportConditions,
+) {
+    use serde_json::json;
+    if !transport.constrained() {
+        return;
+    }
+    if engine == crate::Engine::Xray {
+        if let Some(protocols) = transport.protocols() {
+            rule["network"] = json!(protocols.join(","));
+        }
+        if let Some(ports) = transport.ports() {
+            rule["port"] = json!(
+                ports
+                    .ranges()
+                    .iter()
+                    .map(|&(first, last)| {
+                        if first == last {
+                            first.to_string()
+                        } else {
+                            format!("{first}-{last}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        return;
+    }
+    let mut predicate = json!({});
+    if let Some(protocols) = transport.protocols() {
+        predicate["network"] = json!(protocols);
+    }
+    if let Some(ports) = transport.ports() {
+        let mut singles = Vec::new();
+        let mut ranges = Vec::new();
+        for &(first, last) in ports.ranges() {
+            if first == last {
+                singles.push(first);
+            } else {
+                ranges.push(format!("{first}:{last}"));
+            }
+        }
+        if !singles.is_empty() {
+            predicate["port"] = json!(singles);
+        }
+        if !ranges.is_empty() {
+            predicate["port_range"] = json!(ranges);
+        }
+    }
+    let mut destination = rule.take();
+    let action = destination.as_object_mut().and_then(|o| o.remove("action"));
+    let outbound = destination
+        .as_object_mut()
+        .and_then(|o| o.remove("outbound"));
+    *rule = if destination.as_object().is_some_and(|o| o.is_empty()) {
+        predicate
+    } else {
+        json!({"type":"logical", "mode":"and", "rules":[destination, predicate]})
+    };
+    if let Some(action) = action {
+        rule["action"] = action;
+    }
+    if let Some(outbound) = outbound {
+        rule["outbound"] = outbound;
+    }
+}
+
+#[cfg(test)]
+mod lowering_tests {
+    use super::apply_local;
+    use serde_json::json;
+    #[test]
+    fn transport_only_не_создаёт_пустой_destination() {
+        let transport = yonik_domain::TransportConditions::parse(Some(&["udp"]), None).unwrap();
+        for (action, outbound) in [
+            ("route", Some("direct")),
+            ("route", Some("proxy")),
+            ("reject", None),
+        ] {
+            let mut rule = json!({"action":action});
+            if let Some(outbound) = outbound {
+                rule["outbound"] = json!(outbound);
+            }
+            apply_local(crate::Engine::SingBox, &mut rule, &transport);
+            assert_eq!(rule["network"], json!(["udp"]));
+            assert_eq!(rule["action"], action);
+            assert_eq!(rule.get("outbound"), outbound.map(|o| json!(o)).as_ref());
+            assert!(rule.get("rules").is_none());
+        }
+    }
+    #[test]
+    fn transport_охватывает_resource_or_и_сохраняет_inbound_action() {
+        let destination = json!({"type":"logical","mode":"and","inbound":["local"],
+            "rules":[{"type":"logical","mode":"or","rules":[{"domain":["example.org"]},{"rule_set":["domains"]}]},
+                     {"type":"logical","mode":"or","rules":[{"ip_cidr":["192.0.2.0/24"]},{"rule_set":["cidrs"]}]}]});
+        for (action, outbound) in [
+            ("route", Some("direct")),
+            ("route", Some("proxy")),
+            ("reject", None),
+        ] {
+            let mut rule = destination.clone();
+            rule["action"] = json!(action);
+            if let Some(outbound) = outbound {
+                rule["outbound"] = json!(outbound);
+            }
+            let transport = yonik_domain::TransportConditions::parse(Some(&["udp"]), None).unwrap();
+            apply_local(crate::Engine::SingBox, &mut rule, &transport);
+            assert_eq!(rule["rules"][0], destination);
+            assert_eq!(rule["rules"][1], json!({"network":["udp"]}));
+            assert_eq!(rule["action"], action);
+            assert_eq!(rule.get("outbound"), outbound.map(|o| json!(o)).as_ref());
+        }
+    }
+}

@@ -21,6 +21,8 @@ pub(crate) struct Options {
     pub authority: String,
     pub spider_path: String,
     pub cipher: String,
+    pub xudp_mux: bool,
+    pub reality_h2: bool,
 }
 
 type Parameters = BTreeMap<String, String>;
@@ -71,7 +73,11 @@ fn vmess_parameters(server: &ParsedServer) -> Result<Parameters, CompileError> {
     Ok(parameters)
 }
 
-pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options, CompileError> {
+pub(crate) fn validate(
+    server: &ParsedServer,
+    engine: Engine,
+    require_reality_h2: bool,
+) -> Result<Options, CompileError> {
     if server.review_flags().iter().any(|flag| {
         matches!(
             flag,
@@ -87,19 +93,19 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
     let protocol = server.protocol();
     let transport = server.transport();
     let security = server.security();
-    if !(matches!(
-        transport,
-        Transport::Tcp | Transport::WebSocket | Transport::Grpc
-    ) || transport == Transport::Xhttp && engine == Engine::Xray)
-    {
-        return Err(CompileError::UnsupportedTransport);
+    match (protocol, transport, engine) {
+        (Protocol::Hysteria2, Transport::Quic, Engine::Xray) => {}
+        (Protocol::Hysteria2, _, _) => return Err(CompileError::UnsupportedTransport),
+        (_, Transport::Tcp | Transport::WebSocket | Transport::Grpc, _)
+        | (_, Transport::Xhttp, Engine::Xray) => {}
+        _ => return Err(CompileError::UnsupportedTransport),
     }
     if security == Security::Unsupported {
         return Err(CompileError::UnsupportedSecurity);
     }
     if !matches!(
         protocol,
-        Protocol::Vless | Protocol::Vmess | Protocol::Trojan
+        Protocol::Vless | Protocol::Vmess | Protocol::Trojan | Protocol::Hysteria2
     ) && transport != Transport::Tcp
     {
         return Err(CompileError::UnsupportedTransport);
@@ -107,10 +113,15 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
     if matches!(protocol, Protocol::Shadowsocks | Protocol::Socks5) && security != Security::None {
         return Err(CompileError::UnsupportedSecurity);
     }
-    if protocol == Protocol::Trojan && security != Security::Tls {
+    if matches!(protocol, Protocol::Trojan | Protocol::Hysteria2) && security != Security::Tls {
         return Err(CompileError::UnsupportedSecurity);
     }
-    if security == Security::Reality && (protocol != Protocol::Vless || transport != Transport::Tcp)
+    // Xray 26.10.31 разрешает REALITY для RAW, gRPC и XHTTP.
+    if security == Security::Reality
+        && !(protocol == Protocol::Vless
+            && (transport == Transport::Tcp
+                || engine == Engine::Xray
+                    && matches!(transport, Transport::Grpc | Transport::Xhttp)))
     {
         return Err(CompileError::UnsupportedSecurity);
     }
@@ -168,6 +179,21 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
     {
         return Err(CompileError::UnsupportedOption);
     }
+    if let Some(packet_encoding) = parameters.remove("packetEncoding") {
+        if packet_encoding != "xudp"
+            || protocol != Protocol::Vless
+            || engine != Engine::Xray
+            || security != Security::Reality
+        {
+            return Err(CompileError::UnsupportedOption);
+        }
+        match transport {
+            // VLESS outbound сам кодирует UDP как XUDP при Vision.
+            Transport::Tcp if options.flow == "xtls-rprx-vision" => {}
+            Transport::Grpc | Transport::Xhttp => options.xudp_mux = true,
+            _ => return Err(CompileError::UnsupportedOption),
+        }
+    }
     if security != Security::None {
         options.sni = take(&mut parameters, "sni");
         if options.sni.is_empty() {
@@ -203,6 +229,21 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
                 }
             }
         } else {
+            // Пустой ALPN оставляет fingerprint по умолчанию. Явный h2
+            // остаётся в отложенном конфиге до проверки отдельного ELF.
+            if engine == Engine::Xray {
+                match parameters.remove("alpn").as_deref() {
+                    None | Some("") => {}
+                    Some("h2")
+                        if require_reality_h2
+                            && options.xudp_mux
+                            && options.fingerprint == "chrome" =>
+                    {
+                        options.reality_h2 = true;
+                    }
+                    _ => return Err(CompileError::UnsupportedOption),
+                }
+            }
             options.public_key = take(&mut parameters, "pbk");
             if URL_SAFE_NO_PAD
                 .decode(&options.public_key)
@@ -306,7 +347,7 @@ pub(crate) fn validate(server: &ParsedServer, engine: Engine) -> Result<Options,
             return Err(CompileError::UnsupportedOption);
         }
     }
-    if !parameters.is_empty() {
+    if !parameters.is_empty() || require_reality_h2 != options.reality_h2 {
         return Err(CompileError::UnsupportedOption);
     }
     Ok(options)

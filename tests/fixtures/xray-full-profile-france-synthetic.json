@@ -1,0 +1,293 @@
+[
+  {
+    "remarks": "Synthetic France shape",
+    "log": {
+      "loglevel": "warning"
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "port": 20000,
+        "listen": "127.0.0.1",
+        "protocol": "socks",
+        "settings": {
+          "udp": true,
+          "auth": "noauth"
+        },
+        "sniffing": {
+          "enabled": true,
+          "routeOnly": true,
+          "destOverride": [
+            "http",
+            "tls",
+            "quic"
+          ]
+        }
+      },
+      {
+        "tag": "http-in",
+        "port": 20001,
+        "listen": "127.0.0.1",
+        "protocol": "http",
+        "sniffing": {
+          "enabled": true,
+          "routeOnly": true,
+          "destOverride": [
+            "http",
+            "tls",
+            "quic"
+          ]
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "edge",
+        "protocol": "shadowsocks",
+        "settings": {
+          "servers": [
+            {
+              "address": "edge.example.invalid",
+              "port": 443,
+              "method": "2022-blake3-aes-256-gcm",
+              "password": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+              "uot": false,
+              "UoTVersion": 2
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none",
+          "tcpSettings": {},
+          "finalmask": {
+            "tcp": [
+              {
+                "type": "header-custom",
+                "settings": {
+                  "clients": [
+                    [],
+                    [
+                      {
+                        "type": "str",
+                        "packet": "client-a"
+                      },
+                      {
+                        "type": "base64",
+                        "packet": "AQI="
+                      },
+                      {
+                        "type": "str",
+                        "packet": "client-b"
+                      },
+                      {
+                        "rand": 4
+                      },
+                      {
+                        "type": "base64",
+                        "packet": "AwQ="
+                      },
+                      {
+                        "rand": 8
+                      }
+                    ],
+                    [
+                      {
+                        "type": "str",
+                        "packet": "client-c"
+                      },
+                      {
+                        "type": "base64",
+                        "packet": "BQY="
+                      },
+                      {
+                        "rand": 12
+                      }
+                    ],
+                    [
+                      {
+                        "type": "base64",
+                        "packet": "Bwg="
+                      },
+                      {
+                        "type": "str",
+                        "packet": "client-d"
+                      },
+                      {
+                        "rand": 16
+                      }
+                    ]
+                  ],
+                  "servers": [
+                    [
+                      {
+                        "type": "str",
+                        "packet": "server-a"
+                      }
+                    ],
+                    [
+                      {
+                        "type": "str",
+                        "packet": "server-b"
+                      },
+                      {
+                        "type": "base64",
+                        "packet": "CQo="
+                      },
+                      {
+                        "rand": 6
+                      },
+                      {
+                        "type": "str",
+                        "packet": "server-c"
+                      },
+                      {
+                        "rand": 10
+                      }
+                    ],
+                    [
+                      {
+                        "type": "base64",
+                        "packet": "Cww="
+                      },
+                      {
+                        "type": "str",
+                        "packet": "server-d"
+                      },
+                      {
+                        "rand": 3
+                      },
+                      {
+                        "rand": 7
+                      },
+                      {
+                        "type": "base64",
+                        "packet": "DQ4="
+                      },
+                      {
+                        "type": "str",
+                        "packet": "server-e"
+                      },
+                      {
+                        "rand": 14
+                      }
+                    ]
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "mux": {
+          "enabled": true,
+          "concurrency": -1,
+          "xudpConcurrency": 8,
+          "xudpProxyUDP443": "allow"
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {
+          "domainStrategy": "UseIP"
+        }
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole"
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns"
+      }
+    ],
+    "dns": {
+      "hosts": {
+        "alias.example.invalid": "192.0.2.42"
+      },
+      "servers": [
+        {
+          "address": "localhost",
+          "domains": [
+            "domain:local.example.invalid"
+          ],
+          "skipFallback": true
+        },
+        {
+          "address": "https://resolver-edge.example.invalid/dns-query",
+          "tag": "dns-via-edge",
+          "domains": [
+            "domain:remote.example.invalid"
+          ],
+          "finalQuery": true
+        },
+        {
+          "address": "https://resolver-direct.example.invalid/dns-query",
+          "tag": "dns-via-direct",
+          "domains": [
+            "domain:direct.example.invalid"
+          ],
+          "skipFallback": true
+        }
+      ],
+      "queryStrategy": "UseIP",
+      "disableFallbackIfMatch": true
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "inboundTag": [
+            "dns-via-direct"
+          ],
+          "outboundTag": "direct"
+        },
+        {
+          "type": "field",
+          "inboundTag": [
+            "dns-via-edge"
+          ],
+          "outboundTag": "edge"
+        },
+        {
+          "type": "field",
+          "port": "53",
+          "inboundTag": [
+            "socks-in",
+            "http-in"
+          ],
+          "outboundTag": "dns-out"
+        },
+        {
+          "type": "field",
+          "ip": [
+            "192.0.2.0/24"
+          ],
+          "outboundTag": "direct"
+        },
+        {
+          "type": "field",
+          "domain": [
+            "domain:first.example.invalid"
+          ],
+          "outboundTag": "direct"
+        },
+        {
+          "type": "field",
+          "domain": [
+            "domain:second.example.invalid"
+          ],
+          "outboundTag": "direct"
+        },
+        {
+          "type": "field",
+          "ip": [
+            "198.51.100.0/24"
+          ],
+          "outboundTag": "direct"
+        }
+      ]
+    }
+  }
+]

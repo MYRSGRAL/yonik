@@ -63,7 +63,7 @@ Go-интеграции обоих закреплённых ядер с Rust bro
 ## Историческая очередь (10 ноября; не текущий статус)
 
 Продолжается полное выполнение спецификации по
-[плану волн](superpowers/plans/2026-11-10-spec-completion-waves.md).
+[плану волн](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-10-spec-completion-waves.md).
 Первая волна влита в main: PR #43 (`374ec75`) — переводы и CI,
 #44 (`3768988`) — переносимый scheduler, #45 (`830af0d`) — матрица импорта,
 #46 (`e33fa19`) — проверки восстановления хранения. На принятых heads все пять
@@ -135,7 +135,7 @@ Arch-пакет и ранний Android gate. Завершение волны н
    Шесть протоколов DTO и configure/capture/external-check/cleanup проверены;
    [evidence](validation/2026-11-10-session-plan.md). Сам SystemSessionHost ещё нужен.
    Следом нужны системная установка/клиент, live reconcile и TUN-сессия с явным
-   владением ресурсами и cleanup по [плану интеграции](superpowers/plans/2026-11-10-system-session-integration.md);
+   владением ресурсами и cleanup по [плану интеграции](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-10-system-session-integration.md);
    затем DNS/Fake-IP и атрибуцию приложений.
 3. Интегрировать приватные VPN/LAN/ru-direct, сценарии смены сети и полную
    Linux-матрицу. При включённом kill switch после исчерпания retries сеть
@@ -183,7 +183,7 @@ Arch-пакет и ранний Android gate. Завершение волны н
 | P20 | Два редактора правил и каталог приложений | Частично | Редакторы, каталог и диагностика имеют component evidence; [L15](validation/2026-11-11-editor-policy-diagnostics.md). Software замены активной сессии отсутствует в текущих LocalSocks и System; необходимо реализовать и доказать атомарный actual Apply одного поколения и полную приёмку A-04/A-07/A-08 без потери семантики. [Спецификация](specs/routing-and-tray.md). |
 | P21 | Трей и desktop lifecycle | Частично | Принят настоящий private Plasma restart для обоих pinned cores × RU/EN: hidden traffic с peer-sensitive oracle, сохранение процесса, повторная SNI регистрация, Stop/Connect/active Quit и cleanup. Перезапускались plasmashell/kded, KWin сохранялся. Это изолированная desktop-приёмка; физические G-UI/G-POWER остаются отложенными. [Plasma evidence](validation/2026-11-12-fr19-private-plasma.md). PR214 принят на `e358653dfd8e0d74e29a2a28ec73e7969626072d`: отдельные autostart/autoconnect, оба default OFF, software scope. Physical PAM/reboot/lock OPEN. |
 | P22 | Пакетные проверки серверов и диагностика | Готов | Исходный критерий покрыт HTTPS/TLS/refusal, тремя TCP-пробами, bounded API до 10 000 целей, actual GUI/CancelBatch/Stop и source/revision/network/generation fences. Сохраняются source bounds исторических runtime proofs; перенос на принятый код проверен по связанным producer-инвариантам. [GUI evidence](validation/2026-11-14-p07-production-gui.md), [решение и границы](validation/2026-11-14-linux-p06-p22-readiness.md). Новый current merged-runtime PASS и final A5 не заявлены. |
-| P23 | Выбор toolkit, G-UI и G-POWER | Частично | Toolkit campaign v6 PR191 принят в software-only scope; physical G-UI/G-POWER этим не закрыты. Qt UI и отдельный стенд есть. Нужны реальные замеры Qt/GTK4/Slint в разблокированной сессии, продуктовая приёмка ввода/clipboard/масштабов/трея и P-01…P-08 с idle/hidden/attribution. [Стенд](../bench/ui/README.md), [бюджеты](specs/performance.md). Физические G-UI/G-POWER пока отложены пользователем, без waiver/PASS; критерии и статус частичного выполнения сохранены. Экран блокировки и питание без согласования не менять. |
+| P23 | Выбор toolkit, G-UI и G-POWER | Частично | Qt UI есть. Нужны продуктовая приёмка ввода/clipboard/масштабов/трея и P-01…P-08 с idle/hidden/attribution. [бюджеты](specs/performance.md). Физические G-UI/G-POWER пока отложены пользователем, без waiver/PASS; критерии и статус частичного выполнения сохранены. Экран блокировки и питание без согласования не менять. |
 | P24 | Arch-поставка, обновления и откат | Частично | PR119 принят в main: source package и изолированные old→new→old/uninstall/userdata проверки подтверждают свои frozen refs. Они не заменяют итоговый package из конечного source freeze с production helper/ядрами. Host install не выполняется. [Arch source](validation/2026-11-11-arch-source-6cf65a4.md), [production custody](validation/2026-11-11-arch-production-custody.md). |
 | P25 | Открытая Linux-поставка и release-приёмка | Частично | P25 capture PR215 и postcapture attribution join PR217 приняты как инструменты/source integration; actual final build и итоговая release-приёмка OPEN. GPL и README RU/EN есть. Нужны notices/SPDX и аудит условий зависимостей, пользовательские инструкции, зелёные проверки, evidence всех FR и явные ограничения. Релиз/публикация выполняются только в разрешённом объёме. [Лицензия](../LICENSE), [приёмка](specs/validation-and-roadmap.md). |
 | P26 | Android-приложение и поставка | Отложен | После P03: нативный UI/VpnService, встроенный WG, оба worker, protect/revoke/lifecycle/UID/package, полная матрица и измерения на физическом телефоне. [Платформы](specs/platforms.md), [этап 6](specs/validation-and-roadmap.md). |

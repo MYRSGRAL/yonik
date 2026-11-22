@@ -48,7 +48,7 @@ Rule cleanup требует exact actual rule и confirmed parent anchor; пот
 сверяется как Absent; удаление не получает broad selectors или flush.
 
 Общая потеря worker, kill switch и восстановление обычной сети остаются
-обязанностями [интеграции системной сессии](../superpowers/plans/2026-11-10-system-session-integration.md).
+обязанностями [интеграции системной сессии](https://github.com/MYRSGRAL/yonik/blob/c454a0d7398529aaf095dc70c6329aa4e3370052/docs/superpowers/plans/2026-11-10-system-session-integration.md).
 Эти операции пока не исполняются в пользовательском host namespace.
 
 ## Приёмка

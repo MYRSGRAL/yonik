@@ -195,3 +195,43 @@ async fn event_log_pinned_native_exit_status() {
     assert_eq!(page.events[0].code, EventCode::ProcessExited);
     assert_eq!(page.events[0].value, Some(0));
 }
+
+#[tokio::test]
+async fn legacy_reality_h2_refuses_unpinned_snapshot_before_engine_execution() {
+    use super::CheckedConfig;
+    use std::num::NonZeroU16;
+    use yonik_engine::{PendingXrayRealityH2, XrayRealityH2};
+
+    let directory = Fixture::new();
+    let path = directory.0.join(XrayRealityH2::RELATIVE_PATH);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Валидна только подпись ELF, поэтому тест не может запустить этот образ.
+    fs::write(&path, b"\x7fELF unapproved reality h2 fixture").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        BinarySnapshot::load_xray_reality_h2(&directory.0).err(),
+        Some(HostError::BinaryHash)
+    );
+
+    let uri = b"vless://00112233-4455-6677-8899-aabbccddeeff@synthetic.example:443?type=grpc&mode=gun&security=reality&sni=synthetic.example&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&serviceName=sample&packetEncoding=xudp&alpn=h2";
+    let report = yonik_import::import_bytes(uri.to_vec()).unwrap();
+    let pending =
+        PendingXrayRealityH2::compile(&report.servers[0], NonZeroU16::new(10808).unwrap()).unwrap();
+    let (_sender, mut cancel) = Cancellation::new();
+    assert_eq!(
+        CheckedConfig::validate_xray_reality_h2(snapshot(&path), pending, &mut cancel)
+            .await
+            .err(),
+        Some(HostError::ConfigRejected)
+    );
+
+    let pending =
+        PendingXrayRealityH2::compile(&report.servers[0], NonZeroU16::new(10808).unwrap()).unwrap();
+    let proof = XrayRealityH2::for_snapshot(Engine::Xray, XrayRealityH2::ELF_SHA256).unwrap();
+    assert_eq!(
+        CheckedConfig::validate(snapshot(&path), pending.authorize(proof), &mut cancel)
+            .await
+            .err(),
+        Some(HostError::ConfigRejected)
+    );
+}

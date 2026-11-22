@@ -760,7 +760,9 @@ pub(super) fn validate(profile: &NativeProfile) -> Result<ValidatedGraph> {
         // core/xray.go устанавливает localdns.New при отсутствии DNS app.
         (
             Vec::new(),
-            vec![SystemResolverRequirement { subject: None }],
+            vec![SystemResolverRequirement {
+                dns_ingress: DnsIngressIdentity::Untagged,
+            }],
         )
     };
     let mut ingresses = Vec::new();
@@ -909,7 +911,7 @@ fn dns_validate(
     if servers.is_empty() {
         // DNS app с пустым clients также включает NewLocalDNSClient.
         system_resolvers.push(SystemResolverRequirement {
-            subject: dns.get("tag").and_then(Value::as_str).map(str::to_owned),
+            dns_ingress: DnsIngressIdentity::from_tag(dns.get("tag").and_then(Value::as_str)),
         });
     }
     for server in servers {
@@ -936,14 +938,14 @@ fn dns_validate(
             }
             text(server, "address")?
         };
+        let dns_ingress = DnsIngressIdentity::from_tag(
+            server
+                .get("tag")
+                .or_else(|| dns.get("tag"))
+                .and_then(Value::as_str),
+        );
         if address.eq_ignore_ascii_case("localhost") {
-            system_resolvers.push(SystemResolverRequirement {
-                subject: server
-                    .get("tag")
-                    .or_else(|| dns.get("tag"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            });
+            system_resolvers.push(SystemResolverRequirement { dns_ingress });
             continue;
         }
         let (host, port, protocol) = if address.parse::<std::net::IpAddr>().is_err() {
@@ -985,11 +987,7 @@ fn dns_validate(
                 port,
                 protocol,
             },
-            subject: server
-                .get("tag")
-                .or_else(|| dns.get("tag"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            dns_ingress,
         });
     }
     Ok((resolvers, system_resolvers))
