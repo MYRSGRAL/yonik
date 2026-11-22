@@ -299,6 +299,18 @@ helper из `dac82ec8` поверх пакета `54334d03` на CPU `max` пр�
   Stop и Unlock. `pacman -Qkk` подтвердил целостность пакета.
   SHA-256 установленных ELF совпали с архивом. `/etc/resolv.conf` совпал
   до и после прогона.
+  Тест `production_helper_fake_dns_after_engine_exit` проверил тот же
+  сбой через установленный helper на Debian 13.7, Ubuntu 24.04.5 LTS
+  и Fedora Cloud 45 x86-64. В Debian и Ubuntu установлены тестовые
+  `.deb` с ELF из `eebcca65`, а в Fedora — RPM `0.1.0-911.fc45`
+  с SELinux Enforcing. Стенд сверил PID, cgroup и SHA-256 процесса
+  перед SIGKILL через pidfd. На Xray с kill switch старые Fake-IP
+  оставались заблокированы до Unlock. После выхода обоих движков DNS-зона
+  была отозвана, а старые Fake-IP блокировались на физическом выходе
+  и после переподключения. В пределах исходного TTL новая сессия выдала
+  другие Fake A/AAAA. Прошли IPv4/IPv6 TCP/UDP, HTTPS, DoH, Stop и
+  восстановление обычного DNS. Содержимое и метаданные
+  `/etc/resolv.conf` совпали. Проверки пакетов `dpkg -V` и `rpm -V` прошли.
 - [x] Прогнать системный Fake DNS в Debian 13.7 с Xfce/X11 в двух режимах.
   С systemd-resolved обычный пользователь получил Fake A/AAAA через NSS.
   С `resolvconf` и неактивным systemd-resolved NSS и отдельные запросы по

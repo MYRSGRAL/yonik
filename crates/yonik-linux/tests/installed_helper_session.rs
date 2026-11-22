@@ -1202,6 +1202,13 @@ async fn production_helper_fake_dns_after_route_switch() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая VM для проверки остановки процесса установленного движка"]
+async fn production_helper_fake_dns_after_engine_exit() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::EngineExit).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная Debian VM с активным systemd-resolved"]
 async fn production_helper_fake_dns_after_resolver_revert() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::ResolverLink).await
@@ -2296,6 +2303,7 @@ async fn dhcp_networkd_lease_is_bound_to_kernel_socket_and_revoked_after_renewal
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FakeDnsNetworkChange {
     PeerRoute,
+    EngineExit,
     ResolverLink,
     ResolverDotMode(Engine),
     ResolverRestart,
@@ -2717,6 +2725,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         }
         match change {
             FakeDnsNetworkChange::PeerRoute => change_fixture_peer_route("add")?,
+            FakeDnsNetworkChange::EngineExit => kill_fixture_engine(engine)?,
             FakeDnsNetworkChange::ResolverLink => revoke_fixture_link_dns(&mut token).await?,
             FakeDnsNetworkChange::ResolverDotMode(_) => {
                 switch_fixture_dot_mode(&connection, engine).await?
@@ -2755,8 +2764,8 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 unreachable!("Сценарий продления завершён")
             }
         }
-        // До закрытия вывода не обращаемся к helper по D-Bus. Только его
-        // наблюдатель сетевых событий может остановить этот worker.
+        // До закрытия вывода не обращаемся к helper по D-Bus, чтобы
+        // проверить самостоятельную реакцию на изменение или выход движка.
         let dot_mode_change = matches!(change, FakeDnsNetworkChange::ResolverDotMode(_));
         let drain_timeout = if resolver_restart || dot_mode_change {
             // Смена владельца D-Bus подтверждается и плановой сверкой DNS.
@@ -2799,6 +2808,11 @@ async fn installed_fake_dns_after_network_change_in_vm(
             )?;
         }
         if kill_switch {
+            if change == FakeDnsNetworkChange::EngineExit {
+                for old in [old_v4, old_v6] {
+                    check_fake_flow_blocked((old, 40000).into()).await?;
+                }
+            }
             call(&connection, "Unlock", empty.clone()).await?;
         }
         if dhcp {
@@ -2892,7 +2906,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         if kill_switch {
             call(&connection, "Unlock", empty.clone()).await?;
         }
-        if resolver_restart || dot_mode_change {
+        if resolver_restart || dot_mode_change || change == FakeDnsNetworkChange::EngineExit {
             check_fallback_dns_in_vm("restored.test").await?;
         }
         if change == FakeDnsNetworkChange::PeerRoute {
@@ -4892,6 +4906,40 @@ async fn check_fallback_dns_in_vm(domain: &str) -> Result {
         getent_fake_dns("ahostsv4", domain).await? == std::net::Ipv4Addr::new(192, 0, 2, 99),
         "NSS не получил реальный ответ от резервного DNS",
     )
+}
+
+#[cfg(feature = "test-support")]
+fn kill_fixture_engine(engine: Engine) -> Result {
+    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+    use sha2::{Digest, Sha256};
+
+    let main_pid = networkmanager_dhcp_worker_pid()?;
+    let pid = Pid::from_raw(i32::try_from(main_pid)?)
+        .ok_or_else(|| io::Error::other("Нет PID запущенного движка"))?;
+    let pidfd = pidfd_open(pid, PidfdFlags::empty())?;
+    let members =
+        fs::read_to_string("/sys/fs/cgroup/system.slice/yonik-worker.service/cgroup.procs")?;
+    require(
+        members.trim().parse::<u32>()? == main_pid,
+        "В cgroup ожидался только процесс движка",
+    )?;
+    let installed = match engine {
+        Engine::Xray => "/usr/lib/yonik/engines/xray",
+        Engine::SingBox => "/usr/lib/yonik/engines/sing-box",
+    };
+    let digest = |path: &str| -> Result<_> {
+        let mut file = fs::File::open(path)?;
+        let mut hash = Sha256::new();
+        io::copy(&mut file, &mut hash)?;
+        Ok(hash.finalize())
+    };
+    require(
+        digest(&format!("/proc/{main_pid}/exe"))? == digest(installed)?,
+        "Исполняемый образ отличается от установленного движка",
+    )?;
+    pidfd_send_signal(pidfd, Signal::KILL)?;
+    eprintln!("{engine:?}: SIGKILL отправлен проверенному процессу PID {main_pid}");
+    Ok(())
 }
 
 #[cfg(feature = "test-support")]
