@@ -1160,6 +1160,22 @@ async fn production_helper_fake_dns_after_resolver_revert() -> Result {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+#[ignore = "одноразовая VM с DNS-over-TLS на линке yonik-outer"]
+async fn production_helper_xray_after_dot_mode_change() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::ResolverDotMode(Engine::Xray))
+        .await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая VM с DNS-over-TLS на линке yonik-outer"]
+async fn production_helper_sing_box_after_dot_mode_change() -> Result {
+    installed_fake_dns_after_network_change(FakeDnsNetworkChange::ResolverDotMode(Engine::SingBox))
+        .await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "выделенная VM с активным systemd-resolved и постоянным DNS-стендом"]
 async fn production_helper_fake_dns_after_resolver_restart() -> Result {
     installed_fake_dns_after_network_change(FakeDnsNetworkChange::ResolverRestart).await
@@ -2037,6 +2053,7 @@ async fn dhcp_networkd_lease_is_bound_to_kernel_socket_and_revoked_after_renewal
 enum FakeDnsNetworkChange {
     PeerRoute,
     ResolverLink,
+    ResolverDotMode(Engine),
     ResolverRestart,
     ResolverRestartAfterTtl,
     WireGuard,
@@ -2254,7 +2271,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         dhcp_links.push(("yonik-dhcp2", "10.203.3.10", "10.203.3.1"));
     }
     for (engine, kill_switch) in [(Engine::Xray, true), (Engine::SingBox, false)] {
-        if matches!(change, FakeDnsNetworkChange::NetworkManagerSuspend(Some(selected)) if selected != engine)
+        if matches!(change, FakeDnsNetworkChange::NetworkManagerSuspend(Some(selected)) | FakeDnsNetworkChange::ResolverDotMode(selected) if selected != engine)
         {
             continue;
         }
@@ -2457,6 +2474,9 @@ async fn installed_fake_dns_after_network_change_in_vm(
         match change {
             FakeDnsNetworkChange::PeerRoute => change_fixture_peer_route("add")?,
             FakeDnsNetworkChange::ResolverLink => revoke_fixture_link_dns(&mut token).await?,
+            FakeDnsNetworkChange::ResolverDotMode(_) => {
+                switch_fixture_dot_mode(&connection, engine).await?
+            }
             FakeDnsNetworkChange::ResolverRestart
             | FakeDnsNetworkChange::ResolverRestartAfterTtl => {
                 restart_fixture_resolver(&connection).await?
@@ -2493,14 +2513,21 @@ async fn installed_fake_dns_after_network_change_in_vm(
         }
         // До закрытия вывода не обращаемся к helper по D-Bus. Только его
         // наблюдатель сетевых событий может остановить этот worker.
-        let drain_timeout = if resolver_restart {
+        let dot_mode_change = matches!(change, FakeDnsNetworkChange::ResolverDotMode(_));
+        let drain_timeout = if resolver_restart || dot_mode_change {
             // Смена владельца D-Bus подтверждается и плановой сверкой DNS.
             Duration::from_secs(25)
         } else {
             Duration::from_secs(10)
         };
         require(
-            tokio::time::timeout(drain_timeout, drain.drained()).await?,
+            tokio::time::timeout(drain_timeout, drain.drained())
+                .await
+                .map_err(|_| {
+                    io::Error::other(format!(
+                        "{engine:?}: worker не завершился за {drain_timeout:?} после {change:?}"
+                    ))
+                })?,
             "Сетевой наблюдатель не остановил worker",
         )?;
         let state =
@@ -2607,7 +2634,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
                 check_fake_flow_blocked((old, 40000).into()).await?;
             }
         }
-        if resolver_restart {
+        if resolver_restart || dot_mode_change {
             check_fallback_dns_in_vm("real.test").await?;
         }
         if let Some(certificate) = std::env::var_os("YONIK_FAKE_DNS_TLS_CA") {
@@ -2621,7 +2648,7 @@ async fn installed_fake_dns_after_network_change_in_vm(
         if kill_switch {
             call(&connection, "Unlock", empty.clone()).await?;
         }
-        if resolver_restart {
+        if resolver_restart || dot_mode_change {
             check_fallback_dns_in_vm("restored.test").await?;
         }
         if change == FakeDnsNetworkChange::PeerRoute {
@@ -3579,6 +3606,45 @@ async fn reject_overlapping_wireguard_route(
     eprintln!(
         "{engine:?}: WireGuard сохранил интерфейс и маршруты, пересечение с Fake-IP отклонено"
     );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn switch_fixture_dot_mode(connection: &zbus::Connection, engine: Engine) -> Result {
+    let index: i32 = fs::read_to_string("/sys/class/net/yonik-outer/ifindex")?
+        .trim()
+        .parse()?;
+    let manager = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.resolve1",
+        "/org/freedesktop/resolve1",
+        "org.freedesktop.resolve1.Manager",
+    )
+    .await?;
+    let path: zbus::zvariant::OwnedObjectPath = manager.call("GetLink", &(index,)).await?;
+    let link = zbus::proxy::Builder::<zbus::Proxy<'_>>::new(connection)
+        .destination("org.freedesktop.resolve1")?
+        .path(path)?
+        .interface("org.freedesktop.resolve1.Link")?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
+    let (initial, updated) = match engine {
+        Engine::Xray => ("yes", "opportunistic"),
+        Engine::SingBox => ("opportunistic", "yes"),
+    };
+    require(
+        link.get_property::<String>("DNSOverTLS").await? == initial,
+        "Исходный режим DNS-over-TLS не совпал с настройкой стенда",
+    )?;
+    manager
+        .call::<_, _, ()>("SetLinkDNSOverTLS", &(index, updated))
+        .await?;
+    require(
+        link.get_property::<String>("DNSOverTLS").await? == updated,
+        "systemd-resolved не подтвердил новый режим DNS-over-TLS",
+    )?;
+    eprintln!("{engine:?}: режим DNS-over-TLS изменён с {initial} на {updated}");
     Ok(())
 }
 
