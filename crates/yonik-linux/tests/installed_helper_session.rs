@@ -1385,6 +1385,14 @@ async fn installed_fake_dns_blocks_unbound_wireguard(engine: Engine) -> Result {
     let _lock = vm_lock::acquire()?;
     wait_for_fixture_link().await?;
     let resolver_before = resolver_file_state()?;
+    let check_public_fallback = std::env::var_os("YONIK_CHECK_D06_PUBLIC_DNS").is_some();
+    if check_public_fallback {
+        require(
+            getent_fake_dns("ahostsv4", "canary.wg.test").await?
+                == std::net::Ipv4Addr::new(192, 0, 2, 99),
+            "Публичный DNS стенда не ответил для приватного суффикса",
+        )?;
+    }
     let connection = zbus::Connection::system().await?;
     let imported = yonik_import::import_bytes(
         b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
@@ -1486,11 +1494,29 @@ async fn installed_fake_dns_blocks_unbound_wireguard(engine: Engine) -> Result {
         )?;
     }
     eprintln!("{engine:?}: YONIK_PRIVATE_ZONE_RESTART_WITHOUT_WIREGUARD");
+    if check_public_fallback {
+        require(
+            getent_fake_dns("ahostsv4", "unreachable.wg.test")
+                .await
+                .is_err(),
+            "NSS получил ответ для приватной зоны при отключённом WireGuard",
+        )?;
+        eprintln!("{engine:?}: YONIK_PRIVATE_ZONE_NSS_WITHOUT_WIREGUARD");
+    }
     call(&connection, "Stop", json!({"version":1})).await?;
     require(
         tokio::time::timeout(Duration::from_secs(3), drain.drained()).await?,
         "Не остановлен worker повторной сессии",
     )?;
+    if check_public_fallback {
+        control_fixture_wireguard("connect")?;
+        control_fixture_wireguard("split-dns")?;
+        check_wireguard_dns("restored.wg.test").await?;
+        check_wireguard_traffic().await?;
+        control_fixture_wireguard("stop-dns")?;
+        control_fixture_wireguard("disconnect")?;
+        eprintln!("{engine:?}: YONIK_PRIVATE_DNS_AFTER_WIREGUARD_RETURN");
+    }
     require(
         resolver_file_state()? == resolver_before,
         "Проверка изменила /etc/resolv.conf",
