@@ -978,12 +978,39 @@ async fn production_helper_scoped_fake_dns_literal_cidr_control() -> Result {
 #[tokio::test]
 #[ignore = "одноразовая VM с установленным helper и эхо-сервером за VLESS"]
 async fn production_helper_ip_only_policy_uses_the_literal_address() -> Result {
+    check_ip_only_policy(false).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "одноразовая VM с публичным DNS и HTTPS за VLESS"]
+async fn production_helper_ip_only_tls_uses_the_literal_address() -> Result {
+    check_ip_only_policy(true).await
+}
+
+#[cfg(feature = "test-support")]
+async fn check_ip_only_policy(check_tls: bool) -> Result {
     use yonik_engine::policy_wire::SystemPolicy;
 
     guard()?;
     let _lock = vm_lock::acquire()?;
     wait_for_fixture_link().await?;
     let resolver_before = resolver_file_state()?;
+    let certificate = if check_tls {
+        for (database, expected) in [("ahostsv4", "198.18.0.3"), ("ahostsv6", "2001:db8:746f::3")] {
+            require(
+                getent_fake_dns(database, "example.test").await?
+                    == expected.parse::<std::net::IpAddr>()?,
+                "DNS стенда не вернул контрольный адрес из другого CIDR",
+            )?;
+        }
+        Some(reqwest::Certificate::from_pem(&fs::read(
+            std::env::var_os("YONIK_FAKE_DNS_TLS_CA")
+                .ok_or_else(|| io::Error::other("Стенду нужен корневой сертификат HTTPS"))?,
+        )?)?)
+    } else {
+        None
+    };
     let imported = yonik_import::import_bytes(
         b"vless://00112233-4455-6677-8899-aabbccddeeff@10.203.0.2:24443?security=none".to_vec(),
     )?;
@@ -1016,6 +1043,30 @@ async fn production_helper_ip_only_policy_uses_the_literal_address() -> Result {
                 "Профиль с буквальными IP не запустил TUN",
             )?;
             check_literal_cidr_traffic(permits_proxy).await?;
+            if let Some(certificate) = &certificate {
+                for address in ["198.18.0.2:443", "[2001:db8:746f::2]:443"] {
+                    let client = reqwest::Client::builder()
+                        .https_only(true)
+                        .no_proxy()
+                        .timeout(Duration::from_secs(3))
+                        .add_root_certificate(certificate.clone())
+                        .resolve("example.test", address.parse()?)
+                        .build()?;
+                    let response = client.get("https://example.test/").send().await;
+                    if permits_proxy {
+                        require(
+                            response?.error_for_status()?.bytes().await?.as_ref()
+                                == b"YONIK_TLS_FIXTURE",
+                            "HTTPS не дошёл до сервера по выбранному буквальному адресу",
+                        )?;
+                    } else {
+                        require(response.is_err(), "TLS-имя обошло CIDR Block")?;
+                    }
+                }
+                eprintln!(
+                    "{engine:?}: SNI example.test, Proxy={permits_proxy}, буквальные IPv4/IPv6"
+                );
+            }
             require(
                 client.stop(deadline(), cancel.clone()).await? == State::NoManagedPolicy,
                 "Stop не снял профиль с буквальными IP",
